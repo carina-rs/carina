@@ -7,9 +7,9 @@ wit_bindgen::generate!({
     pub_export_macro: true,
     default_bindings_module: "$crate",
     with: {
-        "carina:provider/types@0.2.0": carina_plugin_bindings_diagnostics::carina::provider::types,
-        "carina:provider/diagnostics@0.2.0": carina_plugin_bindings_diagnostics::carina::provider::diagnostics,
-        "carina:provider/protected-material@0.2.0": carina_plugin_bindings_diagnostics::carina::provider::protected_material,
+        "carina:provider/types@0.3.0": carina_plugin_bindings_diagnostics::carina::provider::types,
+        "carina:provider/diagnostics@0.3.0": carina_plugin_bindings_diagnostics::carina::provider::diagnostics,
+        "carina:provider/protected-material@0.3.0": carina_plugin_bindings_diagnostics::carina::provider::protected_material,
         "wasi:io/poll@0.2.6": wasi::io::poll,
         "wasi:io/error@0.2.6": wasi::io::error,
         "wasi:io/streams@0.2.6": wasi::io::streams,

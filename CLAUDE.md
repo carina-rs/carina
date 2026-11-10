@@ -657,11 +657,11 @@ A struct type represents a nested object with typed fields.
   across or explicitly bound and documented as unavailable on the destination
   side. Never use a catch-all `_` or `..` at this seam; a silently dropped field
   is invisible in production and cost carina#3034 its effect (carina#3772).
-- **Provider diagnostics** (carina#4334): protocol 25 and WIT package 0.2.0
+- **Provider diagnostics** (carina#4334): protocol 28 and WIT package 0.3.0
   require `diagnostics` and `protected-material` imports in every provider
   world. Component type scanning rejects a legacy package before linking or
   executing any start/info code, naming the found package and the required
-  `carina:provider@0.2.0` / protocol 25. `ProviderDiagnostics::emit` accepts only typed events borrowing
+  `carina:provider@0.3.0` / protocol 28. `ProviderDiagnostics::emit` accepts only typed events borrowing
   provider errors/diagnostics or carrying structured value candidates. The
   host binds them through the same private text kernel as returned errors.
   Only that kernel mints `BoundProviderEvent`; its presenter consumes Bound
@@ -742,6 +742,13 @@ A struct type represents a nested object with typed fields.
   schemas. Native OS output
   remains outside this channel. Diagnostics are not persisted and do
   not change the state format.
+- **Provider error retryability** (carina#4350): Provider errors carry a required
+  exclusive retryability class: Unclassified, Transient (including throttling),
+  or DependencyBlocked. Message, cause and code never infer this class; the wire
+  preserves the provider's typed verdict. Reference errors expose only
+  AccessDenied and InvalidReference. Temporary resolution failures use
+  InvalidReference with an inner Transient class; reference variants never
+  encode retryability.
 - **Desired normalization is per leaf** (carina#4194). The normalization opacity policy,
   `carina_core::resource::is_deferred_desired_leaf`, marks every
   `Value::Deferred` leaf (references, unknowns, secrets, other unresolved

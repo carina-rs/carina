@@ -1671,6 +1671,13 @@ pub(crate) fn wit_to_core_resource(
 #[cfg(test)]
 pub(crate) fn wire_to_wit_provider_error(err: proto::ProviderError) -> wit::ProviderError {
     let wit_detail = wit::ErrorDetail {
+        retryability: match err.retryability {
+            proto::ProviderErrorRetryability::Unclassified => wit::ErrorRetryability::Unclassified,
+            proto::ProviderErrorRetryability::Transient => wit::ErrorRetryability::Transient,
+            proto::ProviderErrorRetryability::DependencyBlocked => {
+                wit::ErrorRetryability::DependencyBlocked
+            }
+        },
         message: err.message,
         resource_id: err.resource_id.map(|id| wit::ResourceId {
             provider: id.provider,
@@ -1703,6 +1710,13 @@ pub(crate) fn wit_to_wire_provider_error(err: wit::ProviderError) -> proto::Prov
     };
     proto::ProviderError {
         kind,
+        retryability: match detail.retryability {
+            wit::ErrorRetryability::Unclassified => proto::ProviderErrorRetryability::Unclassified,
+            wit::ErrorRetryability::Transient => proto::ProviderErrorRetryability::Transient,
+            wit::ErrorRetryability::DependencyBlocked => {
+                proto::ProviderErrorRetryability::DependencyBlocked
+            }
+        },
         message: detail.message,
         resource_id: detail.resource_id.map(wit_to_wire_resource_id),
         cause: detail.cause,
@@ -1750,7 +1764,8 @@ pub(super) fn decode_provider_error(error: proto::ProviderError) -> CoreProvider
             kind,
             ProviderDiagnostic::message(error.message.into()),
         ),
-    };
+    }
+    .with_retryability(error.retryability.into());
     if let Some(id) = error.resource_id {
         decoded = decoded.for_resource(carina_core::protocol_convert::protocol_to_resource_id(&id));
     }
@@ -1789,9 +1804,6 @@ pub(crate) fn decode_reference_results(
             Err(wit::ReferenceError::AccessDenied(error)) => Err(ReferenceError::AccessDenied(
                 wit_to_core_provider_error(error).into(),
             )),
-            Err(wit::ReferenceError::Transient(error)) => Err(ReferenceError::Transient(
-                wit_to_core_provider_error(error).into(),
-            )),
             Err(wit::ReferenceError::InvalidReference(error)) => Err(
                 ReferenceError::InvalidReference(wit_to_core_provider_error(error).into()),
             ),
@@ -1809,6 +1821,7 @@ mod reference_tests {
     fn provider_text_reference_error_decode_sanitizes_every_outcome() {
         let guest_error = || {
             wit::ProviderError::NotFound(wit::ErrorDetail {
+                retryability: wit::ErrorRetryability::Unclassified,
                 message: "\x1b]52;c;ZXZpbA==\x07\x1b[2J".into(),
                 resource_id: None,
                 cause: None,
@@ -1822,7 +1835,6 @@ mod reference_tests {
         let results = decode_reference_results(vec![
             Ok(wit::ReferenceOutcome::NotFound(guest_error())),
             Err(wit::ReferenceError::AccessDenied(guest_error())),
-            Err(wit::ReferenceError::Transient(guest_error())),
             Err(wit::ReferenceError::InvalidReference(guest_error())),
         ]);
         for result in results {
@@ -1837,9 +1849,6 @@ mod reference_tests {
                     ReferenceError::AccessDenied(error) => ReferenceError::AccessDenied(
                         std::sync::Arc::new(error.as_ref().clone().into_host_for_test()),
                     ),
-                    ReferenceError::Transient(error) => ReferenceError::Transient(
-                        std::sync::Arc::new(error.as_ref().clone().into_host_for_test()),
-                    ),
                     ReferenceError::InvalidReference(error) => ReferenceError::InvalidReference(
                         std::sync::Arc::new(error.as_ref().clone().into_host_for_test()),
                     ),
@@ -1851,6 +1860,56 @@ mod reference_tests {
             };
             assert!(!rendered.contains(['\x1b', '\x07']));
             assert!(rendered.contains("\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J"));
+        }
+    }
+
+    #[test]
+    fn reference_error_decode_preserves_retryability_class() {
+        use carina_core::provider_text::Retryability;
+
+        for (wit_retryability, retryability) in [
+            (
+                wit::ErrorRetryability::Unclassified,
+                Retryability::Unclassified,
+            ),
+            (wit::ErrorRetryability::Transient, Retryability::Transient),
+            (
+                wit::ErrorRetryability::DependencyBlocked,
+                Retryability::DependencyBlocked,
+            ),
+        ] {
+            let error = wit::ProviderError::ApiError(wit::ErrorDetail {
+                retryability: wit_retryability,
+                message: "lookup failed".into(),
+                resource_id: None,
+                cause: Some("transport diagnostic".into()),
+                provider_name: None,
+                operation: None,
+                status: None,
+                code: None,
+                request_id: None,
+            });
+            let results = decode_reference_results(vec![
+                Err(wit::ReferenceError::AccessDenied(error.clone())),
+                Err(wit::ReferenceError::InvalidReference(error)),
+            ]);
+            for (index, result) in results.into_iter().enumerate() {
+                let error = match result {
+                    Err(ReferenceError::AccessDenied(error)) => {
+                        assert_eq!(index, 0);
+                        error
+                    }
+                    Err(ReferenceError::InvalidReference(error)) => {
+                        assert_eq!(index, 1);
+                        error
+                    }
+                    other => panic!("expected a reference failure: {other:?}"),
+                };
+                assert_eq!(error.retryability(), retryability);
+                let wire = error.to_wire();
+                assert_eq!(wire.message, "lookup failed");
+                assert_eq!(wire.cause.as_deref(), Some("transport diagnostic"));
+            }
         }
     }
 
@@ -4768,6 +4827,7 @@ mod tests {
     fn provider_error_wit_decode_sanitizes_all_guest_diagnostics() {
         let attack = "\x1b]52;c;ZXZpbA==\x07 \x1b[2J\r\u{9b}";
         let error = wit::ProviderError::ApiError(wit::ErrorDetail {
+            retryability: wit::ErrorRetryability::Unclassified,
             message: attack.into(),
             resource_id: Some(wit::ResourceId {
                 provider: attack.into(),
@@ -4843,6 +4903,62 @@ mod tests {
             assert!(!text.contains(['\x1b', '\x07']));
             assert!(text.contains("\\u{1b}"));
             assert!(text.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
+        }
+    }
+
+    #[test]
+    fn provider_error_retryability_round_trip_through_wit() {
+        use carina_core::provider_text::Retryability;
+        for (retryability, wire_retryability, wit_retryability) in [
+            (
+                Retryability::Unclassified,
+                proto::ProviderErrorRetryability::Unclassified,
+                wit::ErrorRetryability::Unclassified,
+            ),
+            (
+                Retryability::Transient,
+                proto::ProviderErrorRetryability::Transient,
+                wit::ErrorRetryability::Transient,
+            ),
+            (
+                Retryability::DependencyBlocked,
+                proto::ProviderErrorRetryability::DependencyBlocked,
+                wit::ErrorRetryability::DependencyBlocked,
+            ),
+        ] {
+            let error = CoreProviderError::api_error_caused_by(
+                "CreateFlowLogs partially applied: Rate exceeded",
+                std::io::Error::other("InvalidParameterValue DependencyViolation"),
+            )
+            .with_code("ThrottlingException")
+            .with_retryability(retryability);
+            // The SDK's native guest-encoding test uses this same core seam;
+            // wasm_guest is available only in actual guests and SDK unit tests.
+            let wire = carina_core::test_utils::provider_text::NativeWireFixture::to_wire(&error);
+            assert_eq!(wire.retryability, wire_retryability);
+            let mut missing_class = serde_json::to_value(&wire).unwrap();
+            missing_class
+                .as_object_mut()
+                .unwrap()
+                .remove("retryability");
+            assert!(serde_json::from_value::<proto::ProviderError>(missing_class).is_err());
+            let wit_error = wire_to_wit_provider_error(wire);
+            let wit::ProviderError::ApiError(ref detail) = wit_error else {
+                panic!("expected an API error");
+            };
+            assert_eq!(detail.retryability, wit_retryability);
+            let wire = wit_to_wire_provider_error(wit_error);
+            assert_eq!(wire.retryability, wire_retryability);
+            let decoded = decode_provider_error(wire);
+            assert_eq!(decoded.retryability(), retryability);
+            assert_eq!(
+                decoded.is_transient(),
+                retryability == Retryability::Transient
+            );
+            assert_eq!(
+                decoded.is_delete_dependency(),
+                retryability == Retryability::DependencyBlocked,
+            );
         }
     }
 

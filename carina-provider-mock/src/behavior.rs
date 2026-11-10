@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use carina_core::provider::Sent;
+use carina_core::provider_text::Retryability;
 use carina_core::resource::ResourceId;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -129,6 +130,8 @@ pub struct MockBehavior {
     pub update_fail_for: Option<ResourceSelector>,
     pub delete_fail_for: Option<ResourceSelector>,
     pub delete_fail_identifier: Option<String>,
+    /// Explicit classification for an injected delete failure.
+    pub delete_retryability: Retryability,
     pub delete_timeout_for: Option<ResourceSelector>,
     pub create_delay: Option<SelectedDelay>,
     pub create_release: Option<PathBuf>,
@@ -217,6 +220,11 @@ pub fn decode_controls(environment: &carina_core::EnvironmentSnapshot) -> Decode
             update_fail_for: text("UPDATE_FAIL_FOR").map(ResourceSelector::parse),
             delete_fail_for: text("DELETE_FAIL_FOR").map(ResourceSelector::parse),
             delete_fail_identifier: text("DELETE_FAIL_IDENTIFIER"),
+            delete_retryability: if text("DELETE_DEPENDENCY_BLOCKED").as_deref() == Some("true") {
+                Retryability::DependencyBlocked
+            } else {
+                Retryability::Unclassified
+            },
             delete_timeout_for: text("DELETE_TIMEOUT_FOR").map(ResourceSelector::parse),
             create_delay: delay("CREATE_DELAY_MS_FOR", "CREATE_DELAY_MS"),
             create_release: path("CREATE_RELEASE_PATH"),
@@ -264,6 +272,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delete_failure_retryability_requires_explicit_control() {
+        use carina_core::provider_text::Retryability;
+        for (control, expected) in [
+            (None, Retryability::Unclassified),
+            (Some("false"), Retryability::Unclassified),
+            (Some("true"), Retryability::DependencyBlocked),
+        ] {
+            let mut values = std::collections::BTreeMap::<String, std::ffi::OsString>::from([(
+                "CARINA_MOCK_DELETE_FAIL_FOR".to_string(),
+                "test.resource.DependencyViolation".into(),
+            )]);
+            if let Some(control) = control {
+                values.insert(
+                    "CARINA_MOCK_DELETE_DEPENDENCY_BLOCKED".into(),
+                    control.into(),
+                );
+            }
+            assert_eq!(
+                decode_controls(&carina_core::EnvironmentSnapshot::new(values))
+                    .behavior
+                    .delete_retryability,
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn decodes_all_mock_controls_from_supplied_values() {
         let raw = [
             (
@@ -279,6 +314,7 @@ mod tests {
             ("UPDATE_FAIL_FOR", "*"),
             ("DELETE_FAIL_FOR", "mock.test.resource.a"),
             ("DELETE_FAIL_IDENTIFIER", "old-id"),
+            ("DELETE_DEPENDENCY_BLOCKED", "true"),
             ("DELETE_TIMEOUT_FOR", "test.resource.timeout"),
             ("CREATE_DELAY_MS_FOR", "test.resource.create"),
             ("CREATE_DELAY_MS", "11"),
@@ -332,6 +368,7 @@ mod tests {
                 update_fail_for: Some(ResourceSelector::Any),
                 delete_fail_for: Some(ResourceSelector::Address("mock.test.resource.a".to_owned())),
                 delete_fail_identifier: Some("old-id".to_owned()),
+                delete_retryability: Retryability::DependencyBlocked,
                 delete_timeout_for: Some(ResourceSelector::Address(
                     "test.resource.timeout".to_owned()
                 )),

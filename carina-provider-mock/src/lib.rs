@@ -1118,9 +1118,12 @@ impl MockProvider {
         {
             return None;
         }
-        Some(ProviderError::internal(format!(
-            "CARINA_MOCK_DELETE_FAIL_FOR requested delete failure for {key} ({identifier})"
-        )))
+        Some(
+            ProviderError::internal(format!(
+                "CARINA_MOCK_DELETE_FAIL_FOR requested delete failure for {key} ({identifier})"
+            ))
+            .with_retryability(self.behavior.delete_retryability),
+        )
     }
 
     fn delete_timeout_error_for(&self, id: &ResourceId) -> Option<ProviderError> {
@@ -1721,9 +1724,6 @@ impl Provider for MockProvider {
                     Err(WireError::AccessDenied(error)) => {
                         Err(ReferenceError::AccessDenied((*error).into()))
                     }
-                    Err(WireError::Transient(error)) => {
-                        Err(ReferenceError::Transient((*error).into()))
-                    }
                     Err(WireError::InvalidReference(error)) => {
                         Err(ReferenceError::InvalidReference((*error).into()))
                     }
@@ -2281,6 +2281,37 @@ mod tests {
             carina_core::resource::Current::CreateOutcomeUnknown(unknown) => {
                 panic!("resume fixture loaded as outcome unknown: {unknown:?}")
             }
+        }
+    }
+
+    #[test]
+    fn delete_failure_retryability_is_authored_independently_of_marker_text() {
+        use carina_core::provider_text::Retryability;
+        let id = ResourceId::with_identity("test.resource", "DependencyViolation_Rate exceeded");
+        for retryability in [
+            Retryability::Unclassified,
+            Retryability::Transient,
+            Retryability::DependencyBlocked,
+        ] {
+            let provider = ConfiguredBuiltinMock::new(
+                MockBehavior {
+                    delete_fail_for: Some(behavior::ResourceSelector::Any),
+                    delete_retryability: retryability,
+                    ..MockBehavior::default()
+                },
+                MockScope::memory(),
+            )
+            .create_provider();
+            let error = provider.delete_fail_error_for(&id, "id").unwrap();
+            assert_eq!(error.retryability(), retryability);
+            assert_eq!(
+                error.is_transient(),
+                retryability == Retryability::Transient
+            );
+            assert_eq!(
+                error.is_delete_dependency(),
+                retryability == Retryability::DependencyBlocked
+            );
         }
     }
 

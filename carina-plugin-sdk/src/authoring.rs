@@ -6,10 +6,11 @@ pub enum ReferenceOutcome {
     Resolved(String),
     NotFound(Box<ProviderError>),
 }
+/// Reference-resolution failure; retryability comes only from the inner error.
 #[derive(Debug, Clone)]
 pub enum ReferenceError {
     AccessDenied(Box<ProviderError>),
-    Transient(Box<ProviderError>),
+    /// Includes temporary resolution failures with `Retryability::Transient`.
     InvalidReference(Box<ProviderError>),
 }
 #[derive(Debug, Clone)]

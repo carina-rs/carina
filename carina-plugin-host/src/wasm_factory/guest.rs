@@ -76,7 +76,7 @@ mod version_checked_bindings {
     use basic::CarinaProvider;
     use http::CarinaProviderWithHttp;
 
-    const WIT_PACKAGE_VERSION: semver::Version = semver::Version::new(0, 2, 0);
+    const WIT_PACKAGE_VERSION: semver::Version = semver::Version::new(0, 3, 0);
     fn provider_interface_export() -> String {
         [
             "carina:provider/provider@",
@@ -1116,6 +1116,7 @@ pub(super) fn wasm_trap_provider_error(
 #[cfg(any(test, feature = "test-utils"))]
 pub fn decode_initialize_string_error_for_test(message: impl Into<String>) -> ProviderError {
     let wit_error = wit_types::ProviderError::InvalidInput(wit_types::ErrorDetail {
+        retryability: wit_types::ErrorRetryability::Unclassified,
         message: message.into(),
         resource_id: None,
         cause: None,

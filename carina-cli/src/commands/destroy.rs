@@ -2390,7 +2390,10 @@ mod tests {
                 &effect,
                 DeleteRetryFailure {
                     attempts,
-                    last_error: ProviderError::api_error("DependencyViolation: eni-distinctive"),
+                    last_error: ProviderError::api_error("DependencyViolation: eni-distinctive")
+                        .with_retryability(
+                            carina_core::provider_text::Retryability::DependencyBlocked,
+                        ),
                 }
                 .stopped(DeleteRetryStop::NoProgress),
             );
@@ -2429,6 +2432,7 @@ mod tests {
                 "DependencyViolation",
                 std::io::Error::other("blocking ENI eni-distinctive"),
             )
+            .with_retryability(carina_core::provider_text::Retryability::DependencyBlocked)
             .into_host_for_test(),
         }
         .stopped(DeleteRetryStop::NoProgress);
@@ -3459,16 +3463,19 @@ mod tests {
     }
 
     #[test]
-    fn is_retryable_detects_dependency_violation() {
+    fn is_retryable_uses_typed_dependency_class() {
         let err = ProviderError::api_error(
             "DependencyViolation: Network vpc-xxx has some mapped public address(es)",
-        );
+        )
+        .with_retryability(carina_core::provider_text::Retryability::DependencyBlocked);
         assert!(is_retryable_delete_error(&err));
     }
 
     #[test]
-    fn is_retryable_detects_has_dependent_object() {
-        let err = ProviderError::api_error("resource has a dependent object");
+    fn is_retryable_inherits_typed_dependency_cause() {
+        let cause = ProviderError::api_error("resource has a dependent object")
+            .with_retryability(carina_core::provider_text::Retryability::DependencyBlocked);
+        let err = ProviderError::api_error_caused_by("delete waits", cause);
         assert!(is_retryable_delete_error(&err));
     }
 
@@ -3480,7 +3487,8 @@ mod tests {
 
     #[test]
     fn is_retryable_returns_false_for_timeout() {
-        let err = ProviderError::timeout("DependencyViolation: something");
+        let err = ProviderError::timeout("DependencyViolation: something")
+            .with_retryability(carina_core::provider_text::Retryability::DependencyBlocked);
         assert!(!is_retryable_delete_error(&err));
     }
 

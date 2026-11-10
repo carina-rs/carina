@@ -35,14 +35,26 @@ pub enum ReferenceOutcome<S: TextState = Unbound> {
 pub type ReferenceResults<S = Unbound> =
     crate::provider::ProviderResult<Vec<Result<ReferenceOutcome<S>, ReferenceError<S>>>, S>;
 
+/// Reference-resolution failure; retryability comes only from the inner error.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ReferenceError<S: TextState = Unbound> {
-    #[error("reference access denied")] // error-chain: caller-renders-sources
     AccessDenied(#[source] Arc<ProviderFailure<S>>),
-    #[error("reference resolution temporarily failed")] // error-chain: caller-renders-sources
-    Transient(#[source] Arc<ProviderFailure<S>>),
-    #[error("invalid reference")] // error-chain: caller-renders-sources
     InvalidReference(#[source] Arc<ProviderFailure<S>>),
+}
+
+impl<S: TextState> std::fmt::Display for ReferenceError<S> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::AccessDenied(_) => "reference access denied",
+            Self::InvalidReference(error) => {
+                if error.is_transient() {
+                    "reference resolution temporarily failed"
+                } else {
+                    "invalid reference"
+                }
+            }
+        })
+    }
 }
 
 impl ReferenceOutcome {
@@ -89,13 +101,14 @@ impl crate::resource::InsideSecret for ReferencePlanError {
         fn redact(error: Arc<HostError>) -> Arc<HostError> {
             use crate::provider::ProviderErrorKind;
             let message = crate::resource::INSIDE_SECRET_MESSAGE;
-            Arc::new(match error.kind() {
+            let redacted = match error.kind() {
                 ProviderErrorKind::InvalidInput => HostError::invalid_input(message),
                 ProviderErrorKind::ApiError => HostError::api_error(message),
                 ProviderErrorKind::NotFound => HostError::not_found(message),
                 ProviderErrorKind::Timeout => HostError::timeout(message),
                 ProviderErrorKind::Internal => HostError::internal(message),
-            })
+            };
+            Arc::new(redacted.with_retryability(error.retryability()))
         }
         let source = match self.source {
             ReferenceFailure::DesiredNotFound(error) => {
@@ -104,7 +117,6 @@ impl crate::resource::InsideSecret for ReferencePlanError {
             ReferenceFailure::Call(error) => ReferenceFailure::Call(redact(error)),
             ReferenceFailure::Resolution(error) => ReferenceFailure::Resolution(match error {
                 ReferenceError::AccessDenied(error) => ReferenceError::AccessDenied(redact(error)),
-                ReferenceError::Transient(error) => ReferenceError::Transient(redact(error)),
                 ReferenceError::InvalidReference(error) => {
                     ReferenceError::InvalidReference(redact(error))
                 }

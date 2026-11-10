@@ -1280,6 +1280,7 @@ pub(super) fn include_protected_values<'a, P: crate::resource::ValueKind + 'a>(
 fn wire_error_bytes(error: &protocol::ProviderError) -> Option<usize> {
     let protocol::ProviderError {
         kind: _kind,
+        retryability: _retryability,
         message,
         resource_id,
         cause,

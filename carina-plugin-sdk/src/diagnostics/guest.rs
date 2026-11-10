@@ -141,6 +141,7 @@ fn value_to_wit(value: protocol::Value) -> types::Value {
 fn error_to_wit(error: protocol::ProviderError) -> types::ProviderError {
     let protocol::ProviderError {
         kind,
+        retryability,
         message,
         resource_id,
         cause,
@@ -151,6 +152,7 @@ fn error_to_wit(error: protocol::ProviderError) -> types::ProviderError {
         request_id,
     } = error;
     let detail = types::ErrorDetail {
+        retryability: crate::wasm_guest::proto_to_wit_retryability(retryability),
         message,
         resource_id: resource_id.map(id_to_wit),
         cause,

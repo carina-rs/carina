@@ -54,10 +54,11 @@ pub enum ReferenceOutcome {
     NotFound(Box<ProviderError>),
 }
 
+/// Reference-resolution failure; retryability comes only from the inner error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ReferenceError {
     AccessDenied(Box<ProviderError>),
-    Transient(Box<ProviderError>),
+    /// Includes temporary resolution failures with a Transient error class.
     InvalidReference(Box<ProviderError>),
 }
 
@@ -1665,6 +1666,16 @@ pub enum ProviderErrorKind {
     Internal,
 }
 
+/// Exclusive provider-authored retry policy, carried without text inference.
+/// Mirrors `error-retryability` in `wit/types.wit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderErrorRetryability {
+    Unclassified,
+    Transient,
+    DependencyBlocked,
+}
+
 /// Provider error returned from operations.
 ///
 /// Mirrors `(provider-error, error-detail)` in `wit/types.wit`. The
@@ -1682,6 +1693,8 @@ pub enum ProviderErrorKind {
 pub struct ProviderError {
     #[serde(default)]
     pub kind: ProviderErrorKind,
+    /// Required typed retry policy. Message, cause and code are display metadata.
+    pub retryability: ProviderErrorRetryability,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_id: Option<ResourceId>,
@@ -3632,6 +3645,80 @@ mod tests {
             back.capabilities,
             vec!["normalize_desired", "normalize_state"]
         );
+    }
+
+    #[test]
+    fn reference_error_rejects_removed_transient_variant() {
+        for variant in ["Transient", "transient"] {
+            let error = serde_json::from_value::<ReferenceError>(serde_json::json!({
+                (variant): {
+                    "kind": "api_error",
+                    "retryability": "transient",
+                    "message": "temporary lookup failure",
+                },
+            }))
+            .expect_err("reference retryability belongs only to the inner error class");
+            assert!(error.to_string().contains("unknown variant"), "{error}");
+        }
+    }
+
+    #[test]
+    fn reference_error_roundtrip_preserves_retryability_class() {
+        for variant in ["AccessDenied", "InvalidReference"] {
+            for retryability in ["unclassified", "transient", "dependency_blocked"] {
+                let record = serde_json::json!({
+                    (variant): {
+                        "kind": "api_error",
+                        "retryability": retryability,
+                        "message": "lookup failure",
+                        "cause": "transport diagnostic",
+                    },
+                });
+                let error: ReferenceError = serde_json::from_value(record.clone()).unwrap();
+                assert_eq!(serde_json::to_value(error).unwrap(), record);
+            }
+        }
+    }
+
+    #[test]
+    fn provider_error_retryability_is_required_and_exclusive() {
+        for (retryability, value) in [
+            (ProviderErrorRetryability::Unclassified, "unclassified"),
+            (ProviderErrorRetryability::Transient, "transient"),
+            (
+                ProviderErrorRetryability::DependencyBlocked,
+                "dependency_blocked",
+            ),
+        ] {
+            let record = serde_json::json!({
+                "kind": "api_error", "message": "failed", "retryability": value,
+            });
+            let error: ProviderError = serde_json::from_value(record).unwrap();
+            assert_eq!(error.retryability, retryability);
+            assert_eq!(serde_json::to_value(error).unwrap()["retryability"], value);
+        }
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("throttled"),
+            serde_json::json!(["transient", "dependency_blocked"]),
+        ] {
+            assert!(
+                serde_json::from_value::<ProviderError>(serde_json::json!({
+                    "message": "failed", "retryability": value,
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn provider_error_requires_retryability_on_the_wire() {
+        let error = serde_json::from_value::<ProviderError>(serde_json::json!({
+            "kind": "api_error",
+            "message": "DependencyViolation Rate exceeded",
+        }))
+        .expect_err("missing retryability must be rejected");
+        assert!(error.to_string().contains("retryability"), "{error}");
     }
 
     #[test]

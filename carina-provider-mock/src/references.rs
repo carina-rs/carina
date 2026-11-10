@@ -97,7 +97,8 @@ fn configured_error(input: ConfiguredError) -> Box<ProviderError> {
         None => {
             ProviderError::from_diagnostic(kind, ProviderDiagnostic::message(input.message.into()))
         }
-    };
+    }
+    .with_retryability(input.retryability.into());
     if let Some(resource_id) = input.resource_id {
         authored = authored.for_resource(carina_core::protocol_convert::protocol_to_resource_id(
             &resource_id,
@@ -146,13 +147,90 @@ pub fn resolve_authoring(
                 Err(ConfiguredReferenceError::AccessDenied(input)) => {
                     Err(ReferenceError::AccessDenied(configured_error(*input)))
                 }
-                Err(ConfiguredReferenceError::Transient(input)) => {
-                    Err(ReferenceError::Transient(configured_error(*input)))
-                }
                 Err(ConfiguredReferenceError::InvalidReference(input)) => {
                     Err(ReferenceError::InvalidReference(configured_error(*input)))
                 }
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carina_core::provider_text::Retryability;
+    use carina_core::test_utils::provider_text::NativeWireFixture;
+
+    #[test]
+    fn configured_reference_results_preserve_retryability() {
+        for retryability in [
+            Retryability::Unclassified,
+            Retryability::Transient,
+            Retryability::DependencyBlocked,
+        ] {
+            for cause in [false, true] {
+                let error = if cause {
+                    ProviderError::api_error_caused_by(
+                        "lookup failed",
+                        std::io::Error::other("transport diagnostic"),
+                    )
+                } else {
+                    ProviderError::api_error("lookup failed")
+                }
+                .with_retryability(retryability)
+                .to_wire();
+                let table = ReferenceTable::from([
+                    (
+                        "gone".into(),
+                        Ok(ConfiguredOutcome::NotFound(Box::new(error.clone()))),
+                    ),
+                    (
+                        "denied".into(),
+                        Err(ConfiguredReferenceError::AccessDenied(Box::new(
+                            error.clone(),
+                        ))),
+                    ),
+                    (
+                        "invalid".into(),
+                        Err(ConfiguredReferenceError::InvalidReference(Box::new(error))),
+                    ),
+                ]);
+                // Exercise the JSON consumed by both native and WASM controls.
+                let table = serde_json::from_str(&serde_json::to_string(&table).unwrap()).unwrap();
+                let requests = ["gone", "denied", "invalid"]
+                    .into_iter()
+                    .map(|value| ReferenceRequest {
+                        ty: carina_plugin_sdk::types::TypeIdentity {
+                            provider: "mock".into(),
+                            segments: vec!["keys".into(), "Key".into()],
+                            kind: "Reference".into(),
+                        },
+                        value: value.into(),
+                    })
+                    .collect();
+                for result in resolve_authoring(&table, requests) {
+                    let error = match result {
+                        Ok(ReferenceOutcome::NotFound(error))
+                        | Err(ReferenceError::AccessDenied(error))
+                        | Err(ReferenceError::InvalidReference(error)) => error,
+                        other => panic!("expected a configured failure: {other:?}"),
+                    };
+                    assert_eq!(error.retryability(), retryability);
+                    assert_eq!(error.to_wire().cause.is_some(), cause);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reference_table_rejects_removed_transient_variant() {
+        for variant in ["Transient", "transient"] {
+            let error = ProviderError::api_error("temporary lookup failure")
+                .with_retryability(Retryability::Transient)
+                .to_wire();
+            let table = serde_json::json!({"retry": {"Err": {(variant): error}}});
+            let error = serde_json::from_value::<ReferenceTable>(table).unwrap_err();
+            assert!(error.to_string().contains("unknown variant"), "{error}");
+        }
+    }
 }

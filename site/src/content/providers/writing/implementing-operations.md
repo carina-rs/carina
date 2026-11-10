@@ -206,9 +206,16 @@ let verdict = ProviderError::internal_caused_by("read-back failed", source);
 
 `from_diagnostic(kind, source)` adopts the complete diagnostic without adding context. Its text is rendered once. `ProviderDiagnostic::message(ProviderText)` creates an explicitly message-only reason. Errors and diagnostics do not convert to `ProviderText`; there is no `from_text` replacement-text API.
 
-A cause-bearing error inherits retryability automatically. Foreign errors start as `Unclassified`; attach SDK or provider policy to the composed error with `with_retryability(Retryability::Transient)`. `with_retryability(Retryability::Unclassified)` explicitly clears inherited retryability. A foreign wrapper inherits the nearest `Transient` classification in its source chain. `is_transient()` is true only for `Transient`; the `Timeout` kind alone does not imply it.
+A cause-bearing error inherits retryability automatically. Foreign errors without a Carina error in their cause chain are `Unclassified`; attach SDK or provider policy to the composed error with `with_retryability(Retryability::Transient)`. `with_retryability(Retryability::Unclassified)` explicitly clears inherited retryability. The nearest Carina error that authors a verdict in the cause chain decides the class, and an explicit `Unclassified` is final; foreign frames and Carina pass-through wrappers are skipped. Structural validation wrappers inherit from their child; validation alternatives are `Unclassified` because their verdict is ambiguous. Use `DependencyBlocked` when deletion must wait for a dependent resource to go away; `is_delete_dependency()` checks only that typed class. A `Timeout`-kind error is never delete-retried, regardless of its retryability class. Throttling uses `Transient`. Message, cause and code never infer retryability. `is_transient()` is true only for `Transient`; the `Timeout` kind alone does not imply it.
 
-Diagnostics share immutable causal storage when cloned. Each handle has its own text view, so binding one handle does not change another. There is one causal parent; combining independent typed causes is unsupported. SDK encoding flattens native causes and partial reasons to the existing version-24 wire records. In wasm provider code, encoding returns plain wire records containing flattened text and metadata. These records retain neither typed sources nor retryability, and the wire decoder is private to the host. Keep the authored error or diagnostic when composing another failure; use the encoded record for transport.
+Diagnostics share immutable causal storage when cloned. Each handle has its own text view, so binding one handle does not change another. There is one causal parent; combining independent typed causes is unsupported. SDK encoding flattens native causes and partial reasons to protocol-28 wire records. In wasm provider code, encoding returns plain wire records containing flattened text and metadata. Error records preserve the required typed retryability class; partial reasons remain strings. Neither record retains typed sources, and the wire decoder is private to the host. Keep the authored error or diagnostic when composing another failure; use the encoded record for transport.
+
+Reference resolution returns only `ReferenceError::AccessDenied` or
+`ReferenceError::InvalidReference`. For a temporary lookup failure, return
+`InvalidReference` with the inner error classified using
+`with_retryability(Retryability::Transient)`. Both variants stop plan-time
+comparison; a temporary failure keeps the message
+`reference resolution temporarily failed` based on its typed class.
 
 ## read
 

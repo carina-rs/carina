@@ -2921,35 +2921,47 @@ mod error_composition_tests {
 
     #[test]
     fn sdk_error_authoring_retains_cause_until_encoding() {
-        let error = types::ProviderError::api_error_caused_by(
-            "outer",
-            carina_core::provider::ProviderError::timeout_caused_by(
-                "inner",
-                std::io::Error::other("typed leaf"),
-            )
-            .with_retryability(Retryability::Transient),
-        );
-        assert!(error.is_transient());
-        assert!(
-            error
-                .detail()
-                .cause()
-                .unwrap()
-                .source_is::<std::io::Error>()
-        );
         use carina_core::test_utils::provider_text::NativeWireFixture;
-        let decoded = error.round_trip();
-        let wire = wasm_guest::encode_provider_error(error);
-        assert_eq!(wire.message, "outer");
-        assert_eq!(wire.cause.as_deref(), Some("inner: typed leaf"));
-        assert_eq!(decoded.retryability(), Retryability::Unclassified);
-        assert!(
-            !decoded
-                .detail()
-                .cause()
-                .unwrap()
-                .as_cause()
-                .matches_for_test::<std::io::Error>(|_| true)
-        );
+        for (retryability, wire_retryability) in [
+            (
+                Retryability::Transient,
+                carina_provider_protocol::types::ProviderErrorRetryability::Transient,
+            ),
+            (
+                Retryability::DependencyBlocked,
+                carina_provider_protocol::types::ProviderErrorRetryability::DependencyBlocked,
+            ),
+        ] {
+            let error = types::ProviderError::api_error_caused_by(
+                "outer",
+                carina_core::provider::ProviderError::timeout_caused_by(
+                    "inner",
+                    std::io::Error::other("typed leaf"),
+                )
+                .with_retryability(retryability),
+            );
+            assert_eq!(error.retryability(), retryability);
+            assert!(
+                error
+                    .detail()
+                    .cause()
+                    .unwrap()
+                    .source_is::<std::io::Error>()
+            );
+            let decoded = error.round_trip();
+            let wire = wasm_guest::encode_provider_error(error);
+            assert_eq!(wire.retryability, wire_retryability);
+            assert_eq!(wire.message, "outer");
+            assert_eq!(wire.cause.as_deref(), Some("inner: typed leaf"));
+            assert_eq!(decoded.retryability(), retryability);
+            assert!(
+                !decoded
+                    .detail()
+                    .cause()
+                    .unwrap()
+                    .as_cause()
+                    .matches_for_test::<std::io::Error>(|_| true)
+            );
+        }
     }
 }

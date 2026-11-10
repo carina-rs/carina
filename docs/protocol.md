@@ -1,9 +1,10 @@
 # Provider protocol versions
 
-The current protocol and minimum supported provider protocol are both **25**.
+The current protocol and minimum supported provider protocol are both **28**.
 
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
+| 28 | 28 | WIT 0.3.0 required exclusive provider error retryability; removed the redundant reference-error variant. |
 | 25 | 25 | WIT 0.2.0 typed diagnostics and credential registration; guest stdout/stderr discarded. |
 | 24 | 24 | Required typed pattern specifications with explicit Full or justified Substring matching. |
 | 23 | 23 | Required scoped desired-input rules on every resource schema. |
@@ -17,9 +18,38 @@ The current protocol and minimum supported provider protocol are both **25**.
 | 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
 
+## Version 28
+
+WIT package `carina:provider@0.3.0` adds required `error-detail.retryability`.
+Every protocol `ProviderError` record also requires a `retryability` field with
+one of `unclassified`, `transient`, or `dependency_blocked` (WIT:
+`dependency-blocked`). Missing and unknown classes fail decoding. `Transient`
+includes throttling; `DependencyBlocked` means deletion must wait for a dependent
+resource to go away. Message, cause and code remain diagnostic metadata and do
+not change the class. Context errors inherit their typed cause's retryability;
+providers may explicitly replace it with `with_retryability`, including
+`Unclassified`. The nearest Carina error that authors a verdict in the cause
+chain decides the class; an explicit `Unclassified` is final. Foreign frames
+and Carina pass-through wrappers are skipped. Structural validation wrappers
+inherit from their child; validation alternatives are `Unclassified` because
+their verdict is ambiguous.
+
+Reference errors now have only `AccessDenied` and `InvalidReference` variants
+(WIT: `access-denied` and `invalid-reference`). The `Transient` reference-error
+variant is removed; its JSON tag is rejected. Temporary resolution failures use
+`InvalidReference` with the inner error's `retryability` set to `transient`
+(`with_retryability(Retryability::Transient)` in provider code). Both variants
+abort a plan-time comparison on either side. The host renders
+`reference resolution temporarily failed` when an `InvalidReference` error's
+typed class is `Transient`, preserving the former variant's message.
+
+The current and minimum supported protocol are both 28. Providers built for
+protocol 27 or earlier must rebuild against the current SDK. WIT 0.1.0 and 0.2.0
+components are rejected before linking or executing guest code.
+
 ## Version 25
 
-WIT package `carina:provider@0.2.0` requires the `diagnostics` and
+WIT package 0.2.0 of `carina:provider` introduced the `diagnostics` and
 `protected-material` imports in every provider world. The host discards guest
 stdout and stderr from metadata loading through teardown. Provider errors,
 warnings, panic payloads, value diagnostics and HTTP traces use typed events
@@ -60,8 +90,8 @@ is exempt from count/rate limits, with a finite 256 KiB input cap.
 Legacy `0.1.0` WIT providers are rejected with a typed incompatibility before
 linking or executing guest code. Older packages require rebuilding the provider
 against the current Carina protocol; newer packages require upgrading Carina.
-Both the current and minimum supported protocol are 25. Providers built for
-protocol 24 or earlier must rebuild against the current SDK.
+At that boundary, both the protocol and its minimum became 25, requiring
+providers built for protocol 24 or earlier to rebuild.
 
 ## Version 24
 
@@ -164,11 +194,11 @@ are not serialized. Saved-plan input re-admission under the apply lock remains
 an explicitly typed TODO for phase 5.
 
 Version 23 introduced the required `input_rules`, `scope` and `target` fields.
-The current host requires protocol 25, including explicit pattern modes, and
+The current host requires protocol 28, including explicit pattern modes, and
 rejects older providers before schema decoding. The v12 migration adapter has
 been removed. The SDK's schema JSON export carries these rules; no WIT function
 or CRUD request field is added. AWS, AWSCC, and GitHub providers must rebuild
-against protocol 25.
+against protocol 28.
 
 ## Version 22
 
@@ -220,7 +250,7 @@ identity conversion; the existing length and range checks still apply, and sink
 validators still run on values during validation, planning, and apply.
 
 Version 21 introduced this required edge array. Hosts and providers must rebuild
-together; the current minimum is 25. Protocol-12 metadata is rejected, including
+together; the current minimum is 28. Protocol-12 metadata is rejected, including
 on read-only schema loading paths.
 
 ## Version 20
@@ -325,7 +355,8 @@ typed source chains; secret payloads are never included in diagnostics.
 Protocol v18 adds string-valued reference schema leaves and the initialized
 provider's `resolve-references` export. Requests carry a structured type
 identity and raw string; positional outcomes are a resolved canonical string,
-NotFound, or a typed AccessDenied, Transient, or InvalidReference failure.
+NotFound, or a typed reference-resolution failure. The current failure variants
+and their retryability classes are described in [Version 28](#version-28).
 Core rejects batch length mismatches and empty resolved values for every
 provider, native or WASM. Guests
 validate their canonical value shapes. Reference validation remains offline;

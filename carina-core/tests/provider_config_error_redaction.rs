@@ -15,10 +15,20 @@ const ORIGINAL: &str = "original failure ThrottlingException cause-secret-round2
 const REPLACEMENT: &str = "configuration containing a secret failed validation";
 
 fn assert_config_redaction(error: ProviderError, expected_cause: Option<&str>) {
+    for retryability in [Retryability::Transient, Retryability::DependencyBlocked] {
+        assert_config_redaction_with_retryability(error.clone(), expected_cause, retryability);
+    }
+}
+
+fn assert_config_redaction_with_retryability(
+    error: ProviderError,
+    expected_cause: Option<&str>,
+    retryability: Retryability,
+) {
     let marker =
         HostErrorCause::ValidationSuspended(SuspendedValidationId::from_keyed_fingerprint([7; 32]));
     let error = error
-        .with_retryability(Retryability::Transient)
+        .with_retryability(retryability)
         .for_resource(ResourceId::with_identity("mock", "resource"))
         .for_provider("mock")
         .with_operation("validate_config")
@@ -70,8 +80,20 @@ fn assert_config_redaction(error: ProviderError, expected_cause: Option<&str>) {
         assert!(error.detail().cause().unwrap().is::<std::io::Error>());
     }
     assert_eq!(error.kind(), kind);
-    assert_eq!(error.retryability(), Retryability::Transient);
-    assert!(error.is_throttled(), "policy must survive text suppression");
+    assert_eq!(
+        error.retryability(),
+        retryability,
+        "policy must survive text suppression"
+    );
+    assert_eq!(
+        error.is_transient(),
+        retryability == Retryability::Transient
+    );
+    assert_eq!(
+        error.is_delete_dependency(),
+        retryability == Retryability::DependencyBlocked
+    );
+    assert_eq!(wire.retryability, wire_before.retryability);
     assert_eq!(error.detail().host_cause(), Some(marker));
     assert_eq!(wire.kind, wire_before.kind);
     assert_eq!(wire.resource_id, wire_before.resource_id);

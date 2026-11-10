@@ -895,11 +895,7 @@ pub fn unresolved_data_source_inputs<S, D>(
         .collect()
 }
 
-fn is_throttling_error(err: &HostError) -> bool {
-    err.is_throttled() || err.is_transient()
-}
-
-/// Read a data source through the provider with the same throttling retry
+/// Read a data source through the provider with the same transient-error retry
 /// policy the CLI refresh path uses.
 pub async fn read_data_source_with_retry(
     provider: &dyn HostProvider,
@@ -909,10 +905,10 @@ pub async fn read_data_source_with_retry(
     for attempt in 0..=max_retries {
         match provider.read_data_source(resource).await {
             Ok(state) => return Ok(state.into()),
-            Err(e) if attempt < max_retries && is_throttling_error(&e) => {
+            Err(e) if attempt < max_retries && e.is_transient() => {
                 let delay = Duration::from_secs(1 << attempt);
                 eprintln!(
-                    "  Throttled reading {}, retrying in {}s...",
+                    "  Transient error reading {}, retrying in {}s...",
                     resource.id,
                     delay.as_secs()
                 );
