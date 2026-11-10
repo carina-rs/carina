@@ -2426,6 +2426,7 @@ fn create_test_module() -> ParsedFile {
         template_placeholder: std::marker::PhantomData,
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
+        authored_inputs: None,
     }
 }
 
@@ -2651,6 +2652,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
         template_placeholder: std::marker::PhantomData,
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
+        authored_inputs: None,
     }
 }
 
@@ -2871,6 +2873,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
         template_placeholder: std::marker::PhantomData,
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
+        authored_inputs: None,
     }
 }
 
@@ -3081,6 +3084,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
         template_placeholder: std::marker::PhantomData,
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
+        authored_inputs: None,
     }
 }
 
@@ -3249,6 +3253,7 @@ fn create_module_with_attributes() -> ParsedFile {
         template_placeholder: std::marker::PhantomData,
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
+        authored_inputs: None,
     }
 }
 
@@ -3617,6 +3622,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         template_placeholder: std::marker::PhantomData,
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
+        authored_inputs: None,
     };
 
     crate::validation::deferred_types::with_session_for_test(
@@ -5113,6 +5119,7 @@ fn create_module_with_interpolation() -> ParsedFile {
         template_placeholder: std::marker::PhantomData,
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
+        authored_inputs: None,
     }
 }
 
@@ -5869,6 +5876,7 @@ fn create_module_with_port_validation() -> ParsedFile {
         template_placeholder: std::marker::PhantomData,
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
+        authored_inputs: None,
     }
 }
 
@@ -6066,6 +6074,7 @@ let root = outer { outer_port = producer.port }
         template_placeholder: std::marker::PhantomData,
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
+        authored_inputs: None,
     };
     crate::validation::deferred_types::with_session_for_test(
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
@@ -6300,6 +6309,7 @@ fn test_argument_validation_no_message_uses_default() {
         template_placeholder: std::marker::PhantomData,
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
+        authored_inputs: None,
     };
 
     crate::validation::deferred_types::with_session_for_test(
@@ -6378,6 +6388,7 @@ fn test_argument_validation_len_with_list() {
         template_placeholder: std::marker::PhantomData,
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
+        authored_inputs: None,
     };
 
     crate::validation::deferred_types::with_session_for_test(
@@ -6486,6 +6497,7 @@ fn test_require_block_passes() {
         template_placeholder: std::marker::PhantomData,
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
+        authored_inputs: None,
     };
 
     crate::validation::deferred_types::with_session_for_test(
@@ -6573,6 +6585,7 @@ fn test_require_block_fails_with_not_expr() {
         template_placeholder: std::marker::PhantomData,
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
+        authored_inputs: None,
     };
 
     crate::validation::deferred_types::with_session_for_test(
@@ -6659,6 +6672,7 @@ fn test_require_block_len_function() {
         template_placeholder: std::marker::PhantomData,
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
+        authored_inputs: None,
     };
 
     crate::validation::deferred_types::with_session_for_test(
@@ -6763,6 +6777,7 @@ fn test_require_block_multiple_constraints() {
         template_placeholder: std::marker::PhantomData,
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
+        authored_inputs: None,
     };
 
     crate::validation::deferred_types::with_session_for_test(
@@ -8848,6 +8863,7 @@ fn create_module_with_environment_union() -> ParsedFile {
         template_placeholder: std::marker::PhantomData,
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
+        authored_inputs: None,
     }
 }
 

@@ -6409,6 +6409,7 @@ pub trait ValueKind: Clone + PartialEq + fmt::Debug + fmt::Display + serde::Seri
 mod evaluable_leaf {
     pub trait Sealed {
         fn substitution_kind(&self) -> super::knowledge::SubstitutionKind;
+        fn into_preview(self) -> super::ParserPlaceholder;
     }
 }
 
@@ -10711,6 +10712,12 @@ pub(crate) fn require_known_for_apply<'a>(
 pub(crate) fn require_known_value<'a>(
     value: knowledge::Classification<'a>,
 ) -> Result<knowledge::KnownValue<'a>, crate::value::SerializationError> {
+    require_known_classification(value)
+}
+
+pub(crate) fn require_known_classification<'a, P: PlaceholderKind>(
+    value: knowledge::Classification<'a, P>,
+) -> Result<knowledge::KnownValue<'a, P>, crate::value::SerializationError> {
     value.project_known(|value| {
         serialization_rejection(value).unwrap_or_else(|| {
             knowledge_serialization_error(knowledge::KnowledgeError::InvalidStage {
@@ -10720,8 +10727,8 @@ pub(crate) fn require_known_value<'a>(
     })
 }
 
-fn serialization_rejection(
-    value: &knowledge::Classification<'_>,
+fn serialization_rejection<P: PlaceholderKind>(
+    value: &knowledge::Classification<'_, P>,
 ) -> Option<crate::value::SerializationError> {
     use knowledge::{Classification, ShapeView};
     match value {
@@ -10779,14 +10786,16 @@ pub(crate) fn knowledge_serialization_error(
 
 // Select the established diagnostic for a pending expression. Availability is
 // decided by Classification before this formatter is entered.
-fn unresolved_value_error(value: &Value) -> Result<(), crate::value::SerializationError> {
+fn unresolved_value_error<P: PlaceholderKind>(
+    value: &Value<P>,
+) -> Result<(), crate::value::SerializationError> {
     let context = crate::value::SerializationContext::WasmBoundary;
     match value {
         Value::Deferred(DeferredValue::ModuleIf(_)) => {
             Err(crate::value::SerializationError::UnexpandedModuleIf { context })
         }
         Value::Deferred(DeferredValue::Secret(inner)) => inner.try_inspect(|value| {
-            require_known_value(
+            require_known_classification(
                 value
                     .knowledge(&knowledge::KnowledgeContext::validation())
                     .map(|proof| proof.into_classification())
@@ -10839,7 +10848,16 @@ fn unresolved_value_error(value: &Value) -> Result<(), crate::value::Serializati
                 context,
             })
         }
-        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        Value::Deferred(DeferredValue::Placeholder(_)) => {
+            let knowledge = value
+                .knowledge(&knowledge::KnowledgeContext::validation())
+                .map_err(knowledge_serialization_error)?;
+            Err(knowledge_serialization_error(
+                knowledge::KnowledgeError::UnresolvedAtBoundary {
+                    sites: knowledge.sites().collect(),
+                },
+            ))
+        }
         Value::Concrete(_) => Err(knowledge_serialization_error(
             knowledge::KnowledgeError::InvalidStage {
                 operation: "known-value projection",

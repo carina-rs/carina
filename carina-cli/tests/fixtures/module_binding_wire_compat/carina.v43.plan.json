@@ -1790,14 +1790,14 @@
             "kind": "resource",
             "resource_type": "test.resource",
             "fingerprint": {
-              "present": "b6e3a52cf83a3ba1c1d819469fffd0274eb98efe967cc2304921c5ab7aca946e"
+              "present": "a9ed659d07184f4b8da20c4a3c5bf9911dfdeabd98b14d1b47dc0cb2a67cba11"
             }
           },
           {
             "kind": "data_source",
             "resource_type": "iam.Roles",
             "fingerprint": {
-              "present": "eb666254fcbffb997ceed215bbdd03b6d68330300cd10b96cd6fa610d792f009"
+              "present": "d3f96603a4d6aff6492f664747411f3ef030955c1ec38296472b3e4c5ce0f824"
             }
           }
         ]

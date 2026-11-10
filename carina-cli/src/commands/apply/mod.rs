@@ -260,7 +260,8 @@ async fn prepare_bootstrap_creation(
         context.provider_configs.as_provider_configs(),
         context.schemas,
         [resource_id],
-    )?;
+    )?
+    .with_provider_context(context.provider_context);
     let checked = match bootstrap_plan.check_inputs_with_types(context.schemas, &input_types) {
         Ok(checked) => checked,
         Err(plan) => {
@@ -4163,7 +4164,7 @@ async fn run_apply_from_plan_locked_owned(
                 raw_provider_configs,
                 wiring.schemas(),
                 rehydrated_plan_file.plan().effects().iter().map(|effect| effect.resource_id()),
-            )?;
+            )?.with_provider_context(wiring.provider_context());
             let checked_plan_file = rehydrated_plan_file
                 .check_inputs(wiring.schemas(), &managed_current, &input_types)
                 .map_err(|failure| {

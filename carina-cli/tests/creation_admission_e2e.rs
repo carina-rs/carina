@@ -236,11 +236,28 @@ fn import_of_legacy_name_is_suppressed_before_creation_admission() {
 }
 
 #[test]
-fn validate_has_no_creation_findings_for_legacy_name() {
+fn validate_warns_but_succeeds_for_legacy_create_only_name() {
     let fixture = Fixture::new();
     let output = fixture.run(&["validate", "."]);
     assert!(output.status.success(), "{}", text(&output));
-    assert!(!text(&output).contains("mock.name.not_ipv4"));
+    assert!(text(&output).contains(
+        "mock.test.creation_constrained.legacy: name [mock.name.not_ipv4]: has IPv4 dotted-quad form (rejected if this resource is created)"
+    ), "{}", text(&output));
+}
+
+#[test]
+fn validate_json_includes_create_only_warning_and_succeeds() {
+    let fixture = Fixture::new();
+    let output = fixture.run(&["validate", ".", "--json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["status"], "ok");
+    let warnings = json["warnings"].as_array().unwrap();
+    let finding = warnings.iter().find(|w| w["type"] == "input_rule").unwrap();
+    assert_eq!(
+        finding["message"],
+        "mock.test.creation_constrained.legacy: name [mock.name.not_ipv4]: has IPv4 dotted-quad form (rejected if this resource is created)"
+    );
 }
 
 #[test]
@@ -710,7 +727,7 @@ fn input_default_tags_reserved_prefix_is_rejected_before_plan_output() {
 }
 
 #[test]
-fn input_validate_reports_every_write_but_not_create_only_in_multi_file_directory() {
+fn input_validate_reports_every_write_error_and_create_only_warning_in_multi_file_directory() {
     let fixture = Fixture::new();
     fs::write(
         fixture.0.path().join("values.crn"),
@@ -729,7 +746,9 @@ fn input_validate_reports_every_write_but_not_create_only_in_multi_file_director
         "{}",
         text(&output)
     );
-    assert!(!text(&output).contains("mock.name.not_ipv4"));
+    assert!(text(&output).contains(
+        "mock.test.input_constrained.tagged: name [mock.name.not_ipv4]: has IPv4 dotted-quad form (rejected if this resource is created)"
+    ), "{}", text(&output));
     assert!(!text(&output).contains("aWs:private-key"));
     assert!(!text(&output).contains("secret-tag-value"));
 }

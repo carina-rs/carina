@@ -2558,7 +2558,15 @@ mod judgement {
         InferenceError::UnknownType {
             reason: expression.static_type().map_or_else(
                 |_| format!("expected {sink}, got collection"),
-                |actual| crate::schema::MismatchTypeNames::for_type_exprs(sink, actual).to_string(),
+                |actual| {
+                    // Expression diagnostics keep authored collection spelling;
+                    // equal nominal names still expand their differing bounds.
+                    if sink.to_string() == actual.to_string() {
+                        crate::schema::MismatchTypeNames::for_type_exprs(sink, actual).to_string()
+                    } else {
+                        format!("expected {sink}, got {actual}")
+                    }
+                },
             ),
         }
     }

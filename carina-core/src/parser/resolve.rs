@@ -2277,6 +2277,24 @@ fn resolve_provider_unresolved_attributes_mapped<E, B: ProviderAttributeBindingP
 where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
+    resolve_provider_unresolved_attributes_reporting(parsed, config, |index, key, error| {
+        std::ops::ControlFlow::Break(map_error(index, key, error))
+    })
+}
+
+fn resolve_provider_unresolved_attributes_reporting<
+    E,
+    B: ProviderAttributeBindingPhase,
+    D,
+    Failure,
+>(
+    parsed: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    config: &ProviderContext,
+    mut report_error: impl FnMut(usize, &str, ParseError) -> std::ops::ControlFlow<Failure>,
+) -> Result<(), Failure>
+where
+    D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
     let mut binding_map: HashMap<String, HashMap<String, GenericValue<ParserPlaceholder, B>>> =
         HashMap::new();
     // carina#3181: walk every top-level resource — managed, data source,
@@ -2307,14 +2325,19 @@ where
     for (index, provider) in parsed.providers.iter_mut().enumerate() {
         let mut resolved = IndexMap::new();
         for (key, expr) in &provider.unresolved_attributes {
-            let r = resolve_value_with_config(
+            let r = match resolve_value_with_config(
                 expr,
                 &binding_map,
                 config,
                 None,
                 strict_resolution_context(),
-            )
-            .map_err(|error| map_error(index, key, error))?;
+            ) {
+                Ok(value) => value,
+                Err(error) => match report_error(index, key, error) {
+                    std::ops::ControlFlow::Break(error) => return Err(error),
+                    std::ops::ControlFlow::Continue(()) => expr.clone(),
+                },
+            };
             resolved.insert(key.clone(), r);
         }
         provider.unresolved_attributes = resolved;
@@ -2465,24 +2488,9 @@ fn finalize_provider_configs_mapped<E, B: BindingAddress, D, Failure>(
 ) -> Result<(), Failure> {
     for (index, provider) in parsed.providers.iter_mut().enumerate() {
         if let Some(value) = provider.unresolved_attributes.shift_remove("default_tags") {
-            match value {
-                GenericValue::Concrete(GenericConcreteValue::Map(tags)) => {
-                    provider.default_tags = tags;
-                }
-                other => {
-                    return Err(map_error(
-                        index,
-                        "default_tags",
-                        ParseError::InvalidExpression {
-                            line: 0,
-                            message: format!(
-                                "Provider '{}': default_tags must resolve to a map, got {other:?}",
-                                provider.name
-                            ),
-                        },
-                    ));
-                }
-            }
+            provider.default_tags = provider_default_tags_map(&provider.name, &value)
+                .map_err(|error| map_error(index, "default_tags", error))?
+                .clone();
         }
         debug_assert!(
             provider.unresolved_attributes.is_empty(),
@@ -2490,6 +2498,88 @@ fn finalize_provider_configs_mapped<E, B: BindingAddress, D, Failure>(
         );
     }
     Ok(())
+}
+
+fn provider_default_tags_map<'a, B: BindingAddress>(
+    name: &str,
+    value: &'a GenericValue<ParserPlaceholder, B>,
+) -> Result<&'a IndexMap<String, GenericValue<ParserPlaceholder, B>>, ParseError> {
+    match value {
+        GenericValue::Concrete(GenericConcreteValue::Map(tags)) => Ok(tags),
+        other => Err(ParseError::InvalidExpression {
+            line: 0,
+            message: format!(
+                "Provider '{name}': default_tags must resolve to a map, got {other:?}"
+            ),
+        }),
+    }
+}
+
+/// A provider's preview and its resolution status have one private owner.
+pub(crate) struct ProviderInputPreview {
+    config: super::ProviderConfig<ParserPlaceholder, AbsoluteBindingAddress>,
+    status: ProviderInputStatus,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ProviderInputStatus {
+    Complete,
+    Failed,
+}
+
+impl ProviderInputPreview {
+    pub(crate) fn config(
+        &self,
+    ) -> &super::ProviderConfig<ParserPlaceholder, AbsoluteBindingAddress> {
+        &self.config
+    }
+    pub(crate) fn status(&self) -> ProviderInputStatus {
+        self.status
+    }
+}
+
+/// Diagnostic preview shares the ordinary resolver and default-map gate, but
+/// retains each failed expression and continues with independent providers.
+pub(crate) fn preview_expanded_provider_inputs<E>(
+    source: &super::ModuleResolvedFile<E>,
+    config: &ProviderContext,
+) -> Vec<ProviderInputPreview>
+where
+    E: ExportParamLike<ParserPlaceholder, AbsoluteBindingAddress> + Clone,
+{
+    let mut file = source.clone();
+    let mut statuses = vec![ProviderInputStatus::Complete; file.providers.len()];
+    let resolved: Result<(), std::convert::Infallible> =
+        resolve_provider_unresolved_attributes_reporting(
+            &mut file,
+            config,
+            |index, _key, _error| {
+                statuses[index] = ProviderInputStatus::Failed;
+                std::ops::ControlFlow::Continue(())
+            },
+        );
+    match resolved {
+        Ok(()) => {}
+        Err(never) => match never {},
+    }
+    for (index, provider) in file.providers.iter_mut().enumerate() {
+        if let Some(value) = provider.unresolved_attributes.shift_remove("default_tags") {
+            match provider_default_tags_map(&provider.name, &value) {
+                Ok(tags) => provider.default_tags = tags.clone(),
+                Err(_error) => {
+                    statuses[index] = ProviderInputStatus::Failed;
+                    provider
+                        .unresolved_attributes
+                        .insert("default_tags".into(), value);
+                }
+            }
+        }
+    }
+    file.providers
+        .into_iter()
+        .zip(statuses)
+        .map(|(config, status)| ProviderInputPreview { config, status })
+        .collect()
 }
 
 #[cfg(test)]

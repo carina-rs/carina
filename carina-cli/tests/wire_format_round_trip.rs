@@ -594,7 +594,7 @@ fn v44_plan_fixtures_record_current_schema_fingerprints() {
         }
         assert_eq!(
             actual, expected,
-            "format 44 fixtures must carry v13 fingerprints"
+            "format 44 fixtures must carry current fingerprints"
         );
     }
 }

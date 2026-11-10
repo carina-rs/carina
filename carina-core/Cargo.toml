@@ -40,6 +40,7 @@ log = "0.4"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = "0.7"
 tracing = "0.1"
+yoke = { version = "=0.8.1", features = ["derive"] }
 chrono = "0.4"
 dirs = "6"
 tempfile = { version = "3", optional = true }

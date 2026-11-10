@@ -161,6 +161,14 @@ fn mark_strings<P: ValueKind, B: BindingAddress>(value: &mut Value<P, B>) {
 }
 
 impl<P: ValueKind, B: BindingAddress> SecretPayload<P, B> {
+    /// Schema alias normalization mutates the payload without copying recursive
+    /// subtrees or removing its protection wrapper.
+    pub(crate) fn canonicalize_schema_aliases(
+        &mut self,
+        canonicalize: impl FnOnce(&mut Value<P, B>),
+    ) {
+        canonicalize(&mut self.value);
+    }
     /// Transform the inner value, protecting errors and collapsing repeated wrappers.
     pub fn try_map<Q: ValueKind, C: BindingAddress, E: InsideSecret>(
         &self,

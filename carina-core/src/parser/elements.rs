@@ -2,7 +2,10 @@
 use pest::iterators::{Pair, Pairs};
 
 use super::{DeclarationLocation, Located, PreprocessedFile, Rule};
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{Arc, OnceLock},
+};
 
 /// A key occurrence, including its path through maps, lists and repeated blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,11 +43,25 @@ pub(crate) enum ElementKind {
     Iterable,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct ElementLocations {
-    pub(crate) keys: Vec<AttributeKeyLocation>,
-    pub(crate) attribute_values: Vec<AttributeValueLocation>,
-    pub(crate) values: Vec<(ElementKind, DeclarationLocation)>,
+    keys: Vec<AttributeKeyLocation>,
+    attribute_values: Vec<AttributeValueLocation>,
+    values: Vec<(ElementKind, DeclarationLocation)>,
+    diagnostic_index: OnceLock<super::analysis::AttributeLocationIndex>,
+}
+
+impl Clone for ElementLocations {
+    fn clone(&self) -> Self {
+        Self {
+            keys: self.keys.clone(),
+            attribute_values: self.attribute_values.clone(),
+            values: self.values.clone(),
+            // Arc clones share the immutable cache. A mutable provenance fork
+            // starts a fresh index rather than copying an index it will invalidate.
+            diagnostic_index: OnceLock::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -105,46 +122,106 @@ fn value_location(
     }
 }
 
-impl ElementLocations {
-    pub(crate) fn rename_attribute_path(
-        &mut self,
-        from: &[super::AttributePathSegment],
-        name: &str,
-    ) {
+#[derive(Default)]
+struct AttributeRenames {
+    attributes: std::collections::HashMap<String, Self>,
+    fields: std::collections::HashMap<String, Self>,
+    indices: std::collections::HashMap<usize, Self>,
+    attribute_names: std::collections::HashMap<String, String>,
+    field_names: std::collections::HashMap<String, String>,
+}
+impl AttributeRenames {
+    fn insert(&mut self, path: &[super::AttributePathSegment], name: String) {
         use super::AttributePathSegment as Segment;
-        let rename = |path: &mut [Segment]| {
-            // Map literals and block syntax use different segment variants
-            // for the same schema field. The schema walker resolves both.
-            if !from.is_empty()
-                && path.len() >= from.len()
-                && path
-                    .iter()
-                    .zip(from)
-                    .all(|(actual, expected)| match (actual, expected) {
-                        (
-                            Segment::StructField(a) | Segment::Key(a),
-                            Segment::StructField(b) | Segment::Key(b),
-                        ) => a == b,
-                        _ => actual == expected,
-                    })
-            {
-                match &mut path[from.len() - 1] {
-                    Segment::Attribute(value)
-                    | Segment::StructField(value)
-                    | Segment::Key(value) => {
-                        name.clone_into(value);
-                    }
-                    Segment::ListIndex(_) => {
-                        unreachable!("an attribute rename cannot rename an index")
-                    }
-                }
-            }
+        let Some((last, parents)) = path.split_last() else {
+            return;
         };
+        let mut node = self;
+        for segment in parents {
+            node = match segment {
+                Segment::Attribute(name) => node.attributes.entry(name.clone()).or_default(),
+                Segment::StructField(name) | Segment::Key(name) => {
+                    node.fields.entry(name.clone()).or_default()
+                }
+                Segment::ListIndex(index) => node.indices.entry(*index).or_default(),
+            };
+        }
+        match last {
+            Segment::Attribute(from) => {
+                node.attribute_names.insert(from.clone(), name);
+            }
+            Segment::StructField(from) | Segment::Key(from) => {
+                node.field_names.insert(from.clone(), name);
+            }
+            Segment::ListIndex(_) => unreachable!("an attribute rename cannot rename an index"),
+        }
+    }
+    fn rewrite(&self, path: &mut [super::AttributePathSegment]) {
+        use super::AttributePathSegment as Segment;
+        let mut node = Some(self);
+        for segment in path {
+            let Some(current) = node else {
+                break;
+            };
+            #[cfg(test)]
+            super::analysis::record_attribute_location_work(1);
+            node = match segment {
+                Segment::Attribute(name) => {
+                    if let Some(canonical) = current.attribute_names.get(name) {
+                        canonical.clone_into(name);
+                    }
+                    current.attributes.get(name)
+                }
+                Segment::StructField(name) | Segment::Key(name) => {
+                    if let Some(canonical) = current.field_names.get(name) {
+                        canonical.clone_into(name);
+                    }
+                    current.fields.get(name)
+                }
+                Segment::ListIndex(index) => current.indices.get(index),
+            };
+        }
+    }
+}
+
+impl ElementLocations {
+    pub(crate) fn keys(&self) -> &[AttributeKeyLocation] {
+        &self.keys
+    }
+    pub(crate) fn attribute_values(&self) -> &[AttributeValueLocation] {
+        &self.attribute_values
+    }
+    pub(super) fn diagnostic_index(&self) -> &super::analysis::AttributeLocationIndex {
+        self.diagnostic_index
+            .get_or_init(|| super::analysis::AttributeLocationIndex::build(self))
+    }
+    pub(super) fn push_element(&mut self, kind: ElementKind, location: DeclarationLocation) {
+        self.values.push((kind, location));
+    }
+    #[cfg(test)]
+    pub(super) fn clear_attribute_values(&mut self) {
+        self.attribute_values.clear();
+        self.diagnostic_index.take();
+    }
+    pub(crate) fn rename_attribute_paths(
+        &mut self,
+        renames: impl IntoIterator<Item = (Vec<super::AttributePathSegment>, String)>,
+    ) {
+        let mut index = AttributeRenames::default();
+        let mut changed = false;
+        for (path, name) in renames {
+            index.insert(&path, name);
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        self.diagnostic_index.take();
         for key in &mut self.keys {
-            rename(&mut key.path);
+            index.rewrite(&mut key.path);
         }
         for value in &mut self.attribute_values {
-            rename(&mut value.path);
+            index.rewrite(&mut value.path);
         }
     }
 
@@ -195,6 +272,7 @@ impl ElementLocations {
             keys,
             attribute_values,
             values: Vec::new(),
+            diagnostic_index: OnceLock::new(),
         }
     }
 

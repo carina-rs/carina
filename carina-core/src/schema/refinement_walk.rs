@@ -147,6 +147,7 @@ fn visit<'a>(
             fields,
             name: _,
             field_groups: _,
+            input_rules: _,
         } => fields.iter().all(|field| {
             descend(
                 &field.field_type,
@@ -250,6 +251,7 @@ fn counts_for_refinements(kind: &AttrTypeKind<super::Compiled>) -> bool {
             fields: _,
             name: _,
             field_groups: _,
+            input_rules: _,
         }
         | AttrTypeKind::List {
             element_type: _,

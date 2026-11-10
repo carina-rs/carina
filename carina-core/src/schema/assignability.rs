@@ -152,6 +152,7 @@ fn identity_leaf<R: PatternForm>(kind: &AttrTypeKind<R>) -> Option<IdentityLeaf<
             name: _,
             fields: _,
             field_groups: _,
+            input_rules: _,
         }
         | AttrTypeKind::Union(_)
         | AttrTypeKind::Ref(_) => None,
@@ -261,6 +262,7 @@ impl<'a, R: PatternForm> AssignmentSink<'a, R> {
                 name: _,
                 fields: _,
                 field_groups: _,
+                input_rules: _,
             }
             | AttrTypeKind::Union(_)
             | AttrTypeKind::Ref(_) => None,
@@ -475,6 +477,7 @@ fn identity_scalar_constraints<'a, R: PatternForm>(
             name: _,
             fields: _,
             field_groups: _,
+            input_rules: _,
         }
         | AttrTypeKind::Union(_)
         | AttrTypeKind::Ref(_) => None,
@@ -539,6 +542,7 @@ fn sink_scalar_constraints<'a, R: PatternForm>(
             name: _,
             fields: _,
             field_groups: _,
+            input_rules: _,
         }
         | AttrTypeKind::Union(_)
         | AttrTypeKind::Ref(_) => None,
@@ -1033,6 +1037,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -1092,6 +1097,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -1147,6 +1153,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -1198,6 +1205,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | Bool
                 | Duration
@@ -1273,11 +1281,13 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     fields: left,
                     name: _,
                     field_groups: _,
+                    input_rules: _,
                 },
                 Struct {
                     fields: right,
                     name: _,
                     field_groups: _,
+                    input_rules: _,
                 },
             ) => {
                 if left.len() != right.len() {
@@ -1304,6 +1314,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     fields,
                     name: _,
                     field_groups: _,
+                    input_rules: _,
                 },
                 Map {
                     value,
@@ -1521,6 +1532,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | Bool
                 | Duration
@@ -1571,6 +1583,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | Bool
                 | Duration
@@ -1621,6 +1634,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | Bool
                 | Duration
@@ -1671,6 +1685,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | Bool
                 | Duration
@@ -1681,6 +1696,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 },
                 String {
                     identity_layer: _,

@@ -28,15 +28,15 @@ fn empty_input_rules_survive_json_round_trip() {
 
 #[test]
 fn input_rule_protocol_is_current() {
-    assert_eq!(PROTOCOL_VERSION, 26);
-    assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 26);
+    assert_eq!(PROTOCOL_VERSION, 27);
+    assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 27);
 }
 
 #[test]
 fn input_rules_require_scope_and_typed_target() {
     let rule = serde_json::json!({
         "scope":"every_write", "target":{"kind":"map_keys","path":"tags"},
-        "code":"tags.reserved", "predicate":{"kind":"forbidden_prefix","value":{"prefix":"aws:","ignore_ascii_case":true}}
+        "code":"tags.reserved", "condition":{"kind":"always"}, "predicate":{"kind":"forbidden_prefix","value":{"prefix":"aws:","ignore_ascii_case":true}}
     });
     let decoded: types::InputRule = serde_json::from_value(rule.clone()).unwrap();
     assert_eq!(serde_json::to_value(decoded).unwrap(), rule);

@@ -2294,7 +2294,7 @@
             "kind": "resource",
             "resource_type": "test.resource",
             "fingerprint": {
-              "present": "82cdedaca687a182496a4b5aa0dfc12f248add777254bb3771b28c2f307dd0a5"
+              "present": "7d229d9da47489cd2dcc3f7134b06d4b890604011249dc97950a94a977172eea"
             }
           },
           {

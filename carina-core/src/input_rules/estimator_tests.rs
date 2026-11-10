@@ -37,7 +37,7 @@ fn estimate(predicate: InputPredicate<crate::schema::PatternSpec>, value: Value)
     let site = classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
         .unwrap()
         .unwrap();
-    site.applicable_rules().next().unwrap().evaluate()
+    site.applicable_rules().next().unwrap().verdict_for_test()
 }
 
 #[test]
@@ -251,17 +251,8 @@ fn typed_target_estimate(
     );
     let resource =
         Resource::with_provider("mock", "Target", "target", None).with_attribute("name", value);
-    let mut site =
-        classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
-            .unwrap()
-            .unwrap();
-    site.types = Some(&types.facts);
-    // Exercise the estimator for map literals too (a template effect has no
-    // evaluated attributes). The classifier still owns the authored projection.
-    if keys {
-        site.attributes = None;
-    }
-    site.applicable_rules().next().unwrap().evaluate()
+    let site = authored_fixture_with_types(&resource, &schemas, &types);
+    site.applicable_rules().next().unwrap().verdict_for_test()
 }
 
 fn outcome(verdict: InputVerdict) -> &'static str {
@@ -1131,12 +1122,8 @@ fn estimate_in_context<S>(
 ) -> InputVerdict {
     let resource =
         Resource::with_provider("mock", "Target", "target", None).with_attribute("name", value);
-    let mut site =
-        classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), schemas)
-            .unwrap()
-            .unwrap();
-    site.types = Some(&types.facts);
-    site.applicable_rules().next().unwrap().evaluate()
+    let site = authored_fixture_with_types(&resource, schemas, types);
+    site.applicable_rules().next().unwrap().verdict_for_test()
 }
 
 #[test]
@@ -1445,13 +1432,9 @@ fn estimator_default_tags_are_checked_through_the_host_merge_for_unknown_maps() 
             InputTypeContext::from_sources(&unresolved, &[], std::iter::empty(), &[], &schemas)
                 .with_default_tags(&[config], &schemas, [&target.id])
                 .unwrap();
-        let mut site =
-            classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&target), &schemas)
-                .unwrap()
-                .unwrap();
-        site.types = Some(&types.facts);
+        let site = authored_fixture_with_types(&target, &schemas, &types);
         assert_eq!(
-            outcome(site.applicable_rules().next().unwrap().evaluate()),
+            outcome(site.applicable_rules().next().unwrap().verdict_for_test()),
             expected
         );
     }
@@ -1503,7 +1486,7 @@ fn estimator_deferred_template_uses_retained_literals_and_defers_loop_slots() {
         .unwrap()
         .unwrap();
         assert_eq!(
-            outcome(site.applicable_rules().next().unwrap().evaluate()),
+            outcome(site.applicable_rules().next().unwrap().verdict_for_test()),
             expected
         );
     }
@@ -1624,16 +1607,20 @@ fn estimator_literal_map_keys_use_the_provider_api_spelling() {
             .unwrap()
             .unwrap();
     assert_eq!(
-        outcome(concrete.applicable_rules().next().unwrap().evaluate()),
+        outcome(
+            concrete
+                .applicable_rules()
+                .next()
+                .unwrap()
+                .verdict_for_test()
+        ),
         "violation"
     );
-    let mut site =
-        classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
-            .unwrap()
-            .unwrap();
-    site.attributes = None;
+    let site = classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        outcome(site.applicable_rules().next().unwrap().evaluate()),
+        outcome(site.applicable_rules().next().unwrap().verdict_for_test()),
         "violation"
     );
     for (source_key_type, expected) in [
@@ -1675,13 +1662,9 @@ fn estimator_literal_map_keys_use_the_provider_api_spelling() {
         );
         let target = Resource::with_provider("mock", "Tagged", "target", None)
             .with_attribute("tags", reference());
-        let mut site =
-            classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&target), &schemas)
-                .unwrap()
-                .unwrap();
-        site.types = Some(&types.facts);
+        let site = authored_fixture_with_types(&target, &schemas, &types);
         assert_eq!(
-            outcome(site.applicable_rules().next().unwrap().evaluate()),
+            outcome(site.applicable_rules().next().unwrap().verdict_for_test()),
             expected
         );
     }
@@ -1906,6 +1889,35 @@ fn explicit_full_pattern_mode_proves_a_whole_value_character_class() {
             )),
             "proven",
             "{regex}"
+        );
+    }
+}
+
+#[test]
+fn rule_input_estimator_intersects_both_string_layers() {
+    use crate::schema::{PatternMatch, PatternSpec, StringIdentityLayer, StringMemberConstraints};
+    let ty = AttributeType::string_member(
+        StringIdentityLayer::new(
+            Some(crate::schema::TypeIdentity::bare("Name")),
+            Some(PatternSpec::new("[a-z0-9]{1,20}", PatternMatch::Full)),
+            Some((Some(1), Some(100))),
+            None,
+        ),
+        StringMemberConstraints::new(
+            Some(PatternSpec::new("[m-z]{2,8}", PatternMatch::Full)),
+            Some((Some(3), Some(5))),
+        ),
+    );
+    for predicate in [
+        InputPredicate::Length {
+            min: Some(3),
+            max: Some(5),
+        },
+        InputPredicate::AllowedChars(CharSet::new([('m', 'z')]).unwrap()),
+    ] {
+        assert_eq!(
+            outcome(typed_estimate(predicate, reference(), ty.clone())),
+            "proven"
         );
     }
 }

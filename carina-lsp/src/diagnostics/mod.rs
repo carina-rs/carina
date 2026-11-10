@@ -1219,7 +1219,7 @@ impl DiagnosticRun<'_> {
             // The shared authority owns ordinary direct bare-binding sinks
             // even when they succeed. Admitted single builtin string
             // constructions retain their enclosing schema value checks.
-            // Native interpolation keeps its existing operand suppression.
+            // Native interpolation leaves its enclosing schema check active.
             // An enum-typed argument must not
             // be reinterpreted by the LSP's legacy BindingIndex pass using a
             // differently enriched bootstrap identity. Nested uses keep the
@@ -1274,43 +1274,77 @@ impl DiagnosticRun<'_> {
             });
             let semantic_tree = semantic_file
                 .and_then(|file| carina_core::parser::AnalysisTree::try_from_file(file).ok());
-            let input_resolution = carina_core::parser::resolve_resource_refs_from_analysis(
-                preferred_tree,
-                self.provider_context,
-            );
-            let input_findings = match input_resolution {
-                Ok(resolved) => {
-                    carina_core::input_rules::check_authored_inputs(&resolved, &self.schemas)
+            let authored_inputs = if let Some(graph) = expanded_graph {
+                graph.authored_inputs().cloned()
+            } else {
+                match directory.as_ref() {
+                    Some(directory) => Ok(
+                        carina_core::input_rules::AuthoredInputs::for_directory_in_session(
+                            &directory.parsed,
+                            self.provider_context,
+                        ),
+                    ),
+                    None => doc
+                        .parsed()
+                        .ok_or(carina_core::input_rules::AuthoredInputUnavailable)
+                        .and_then(|parsed| parsed.authored_inputs())
+                        .map(|inputs| inputs.resolved_in_session(self.provider_context)),
                 }
-                Err(_) => carina_core::input_rules::check_authored_inputs(
-                    pre_expansion_input,
-                    &self.schemas,
-                ),
             };
+            let input_findings = authored_inputs
+                .map_err(carina_core::provider::HostError::from)
+                .map(|inputs| {
+                    carina_core::input_rules::check_authored_inputs(&inputs, &self.schemas)
+                });
+            let input_owners = preferred_tree
+                .resources()
+                .map(|resource| (resource.id(), resource))
+                .collect::<std::collections::HashMap<_, _>>();
             match input_findings {
-                Ok(findings) => {
-                    for finding in findings {
-                        let Some(resource) = preferred_tree
-                            .resources()
-                            .find(|resource| resource.id() == &finding.resource_id)
-                        else {
-                            continue;
+                Ok(report) => {
+                    for outcome in report {
+                        use carina_core::input_rules::{
+                            AuthoredInputOutcome, InputFindingSeverity,
                         };
-                        let attribute = finding
-                            .violation
-                            .path()
-                            .segments()
-                            .next()
-                            .expect("admitted path is nonempty");
-                        let location = if resource.attribute_keys().iter().any(|key| matches!(key.path().first(), Some(carina_core::parser::AttributePathSegment::Attribute(name)) if name == attribute)) {
-                            resource.attribute_key_location(attribute)
-                        } else { resource.type_location() };
-                        diagnostics.extend(render_merged(
-                            doc,
-                            &carina_core::parser::Located::new(location.clone(), ()),
-                            DiagnosticSeverity::ERROR,
-                            finding.to_string(),
-                        ));
+                        let (resource_id, location, severity, message) = match &outcome {
+                            AuthoredInputOutcome::Finding(finding) => (
+                                finding.resource_id(),
+                                finding.authored_location(),
+                                match finding.severity() {
+                                    InputFindingSeverity::Error => DiagnosticSeverity::ERROR,
+                                    InputFindingSeverity::Warning => DiagnosticSeverity::WARNING,
+                                },
+                                finding.to_string(),
+                            ),
+                            AuthoredInputOutcome::Pending(_) => continue,
+                            AuthoredInputOutcome::PreparationFailed(error) => (
+                                error.resource_id(),
+                                error.authored_location(),
+                                DiagnosticSeverity::ERROR,
+                                error.to_string(),
+                            ),
+                        };
+                        let location = location.or_else(|| {
+                            input_owners
+                                .get(resource_id)
+                                .map(|resource| resource.type_location())
+                        });
+                        if let Some(location) = location {
+                            diagnostics.extend(render_merged(
+                                doc,
+                                &carina_core::parser::Located::new(location.clone(), ()),
+                                severity,
+                                message,
+                            ));
+                        } else {
+                            diagnostics.push(Diagnostic {
+                                range: Range::default(),
+                                severity: Some(severity),
+                                source: Some("carina".into()),
+                                message,
+                                ..Default::default()
+                            });
+                        }
                     }
                 }
                 Err(error) => diagnostics.push(Diagnostic {

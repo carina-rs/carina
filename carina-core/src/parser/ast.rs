@@ -3270,7 +3270,7 @@ pub trait IntoExpandedExportParam<B: BindingAddress = RelativeBindingName>:
 pub trait ResolveExportBindingPhase<P: ValueKind>:
     ExportParamLike<P, RelativeBindingName> + Sized
 {
-    type Absolute: ExportParamLike<P, AbsoluteBindingAddress>;
+    type Absolute: ExportParamLike<P, AbsoluteBindingAddress> + Clone;
 
     fn resolve_export_bindings(
         self,
@@ -6577,6 +6577,7 @@ pub struct File<
     /// opaque phase parameter. The marker has no runtime representation.
     pub(crate) template_placeholder: std::marker::PhantomData<fn() -> T>,
     pub deferred_module_ifs: Vec<super::DeferredStructuralIf<P, B>>,
+    pub(crate) authored_inputs: Option<std::sync::Arc<crate::input_rules::AuthoredInputs>>,
     pub expansion_trace: crate::resource::ExpansionTrace,
 }
 
@@ -6677,6 +6678,7 @@ where
             template_placeholder: std::marker::PhantomData,
             deferred_module_ifs: Vec::new(),
             expansion_trace: crate::resource::ExpansionTrace::new(),
+            authored_inputs: None,
         }
     }
 }
@@ -6846,8 +6848,10 @@ impl<E, B: BindingAddress>
             template_placeholder: _,
             deferred_module_ifs,
             expansion_trace,
+            authored_inputs: _,
         } = source;
 
+        self.authored_inputs = None;
         self.providers.extend(providers);
         self.resources.extend(resources);
         self.data_sources.extend(data_sources);
@@ -6913,6 +6917,7 @@ impl<E, B: BindingAddress>
             template_placeholder,
             deferred_module_ifs,
             expansion_trace,
+            authored_inputs,
         } = self;
         let (expressions, auxiliary) = map(deferred_for_phase.expressions);
         (
@@ -6943,6 +6948,7 @@ impl<E, B: BindingAddress>
                 template_placeholder,
                 deferred_module_ifs,
                 expansion_trace,
+                authored_inputs,
             },
             auxiliary,
         )
@@ -7015,6 +7021,7 @@ where
             template_placeholder,
             deferred_module_ifs,
             expansion_trace,
+            authored_inputs,
         } = self;
 
         File {
@@ -7234,6 +7241,7 @@ where
                 .map(|deferred| deferred.resolve_bindings(resolve))
                 .collect(),
             expansion_trace,
+            authored_inputs,
         }
     }
 }
@@ -7280,6 +7288,7 @@ where
             template_placeholder: _template_placeholder,
             deferred_module_ifs,
             expansion_trace: _expansion_trace,
+            authored_inputs: _authored_inputs,
         } = self;
 
         for provider in providers {
@@ -7518,6 +7527,7 @@ where
             template_placeholder: _template_placeholder,
             deferred_module_ifs: _deferred_module_ifs,
             expansion_trace: _expansion_trace,
+            authored_inputs: _authored_inputs,
         } = self;
     }
 
@@ -7547,6 +7557,7 @@ where
             template_placeholder,
             deferred_module_ifs,
             expansion_trace,
+            authored_inputs,
         } = self;
 
         File {
@@ -7574,6 +7585,7 @@ where
             template_placeholder,
             deferred_module_ifs,
             expansion_trace,
+            authored_inputs,
         }
     }
 
@@ -8162,6 +8174,7 @@ where
         template_placeholder: _template_placeholder,
         deferred_module_ifs,
         expansion_trace,
+        authored_inputs,
     } = file;
     let _non_value_fields = (
         uses,
@@ -8173,6 +8186,7 @@ where
         parsed_binding_uses,
         warnings,
         expansion_trace,
+        authored_inputs,
     );
 
     let mut errors = Vec::new();
@@ -8565,6 +8579,7 @@ impl<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
             template_placeholder: _template_placeholder,
             deferred_module_ifs,
             expansion_trace,
+            authored_inputs,
         } = self;
 
         Ok(File {
@@ -8638,6 +8653,7 @@ impl<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
                 Vec::new()
             },
             expansion_trace,
+            authored_inputs,
         })
     }
 }
@@ -9653,6 +9669,7 @@ mod substitute_placeholder_tests {
             template_placeholder: _,
             deferred_module_ifs: _,
             expansion_trace: _,
+            authored_inputs: _,
         } = parsed;
     }
 
@@ -11096,5 +11113,25 @@ where
             }
         }
         plan
+    }
+}
+
+impl<E, P, T, D, B> File<E, P, T, D, B>
+where
+    P: ValueKind,
+    T: ValueKind,
+    B: BindingAddress,
+{
+    /// Immutable parser/admission evidence, independent of public AST mutations.
+    pub fn authored_inputs(
+        &self,
+    ) -> Result<&crate::input_rules::AuthoredInputs, crate::input_rules::AuthoredInputUnavailable>
+    {
+        self.authored_inputs
+            .as_deref()
+            .ok_or(crate::input_rules::AuthoredInputUnavailable)
+    }
+    pub(crate) fn attach_authored_inputs(&mut self, inputs: crate::input_rules::AuthoredInputs) {
+        self.authored_inputs = Some(std::sync::Arc::new(inputs));
     }
 }

@@ -44,13 +44,13 @@ use crate::schema::{
     AttributeType as DraftAttributeType, CharSet, Compiled,
     CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
     CompiledStructField as StructField, ConfigSchemaValidationError, FieldGroup, FieldGroupKind,
-    IdentityMode, InputMode, InputPath, InputPredicate, InputRule, InputRuleCode, InputRuleError,
-    InputRuleParts, InputRuleScope, InputRuleTarget, NonEmptyString, RawShape,
-    ResourceSchema as DraftResourceSchema, ResourceSchemaParts, ResourceSchemaValidationError,
-    ResourceValidation, SchemaKind, SchemaValidationIssueLocation, StructField as DraftStructField,
-    StructFieldParts, TypeIdentity, UniqueNameSpec, ValidatedConfigSchema,
-    ValidatedProviderSchemaWitness, ValidatedResourceSchema, empty_defs_for_schema_walks,
-    identity_leaf_is_scalar_or_enum,
+    IdentityMode, InputCondition, InputLiteral, InputMode, InputPath, InputPredicate, InputRule,
+    InputRuleCode, InputRuleError, InputRuleParts, InputRuleScope, InputRuleTarget, NonEmptyString,
+    RawShape, ResourceSchema as DraftResourceSchema, ResourceSchemaParts,
+    ResourceSchemaValidationError, ResourceValidation, SchemaKind, SchemaValidationIssueLocation,
+    StructField as DraftStructField, StructFieldParts, TypeIdentity, UniqueNameSpec,
+    ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+    empty_defs_for_schema_walks, identity_leaf_is_scalar_or_enum,
 };
 
 fn field_group_to_protocol(group: &FieldGroup) -> protocol::FieldGroup {
@@ -667,14 +667,116 @@ fn input_charset_to_protocol(set: &CharSet) -> protocol::CharSet {
     }
 }
 
+fn input_literal_to_protocol(literal: &InputLiteral) -> protocol::InputLiteral {
+    match literal {
+        InputLiteral::Bool(value) => protocol::InputLiteral::Bool(*value),
+        InputLiteral::Int(value) => protocol::InputLiteral::Int(*value),
+        InputLiteral::Float(value) => protocol::InputLiteral::Float(*value),
+        InputLiteral::String(value) => protocol::InputLiteral::String(value.clone()),
+        InputLiteral::Enum {
+            identity,
+            api_value,
+        } => {
+            let TypeIdentity {
+                provider,
+                segments,
+                kind,
+            } = identity;
+            protocol::InputLiteral::Enum {
+                identity: protocol::TypeIdentity {
+                    provider: provider.clone().unwrap_or_default(),
+                    segments: segments.clone(),
+                    kind: kind.clone(),
+                },
+                api_value: api_value.clone(),
+            }
+        }
+    }
+}
+
+fn protocol_to_input_literal(literal: &protocol::InputLiteral) -> InputLiteral {
+    match literal {
+        protocol::InputLiteral::Bool(value) => InputLiteral::Bool(*value),
+        protocol::InputLiteral::Int(value) => InputLiteral::Int(*value),
+        protocol::InputLiteral::Float(value) => InputLiteral::Float(*value),
+        protocol::InputLiteral::String(value) => InputLiteral::String(value.clone()),
+        protocol::InputLiteral::Enum {
+            identity,
+            api_value,
+        } => {
+            let protocol::TypeIdentity {
+                provider,
+                segments,
+                kind,
+            } = identity;
+            InputLiteral::Enum {
+                identity: TypeIdentity {
+                    provider: if provider.is_empty() {
+                        None
+                    } else {
+                        Some(provider.clone())
+                    },
+                    segments: segments.clone(),
+                    kind: kind.clone(),
+                },
+                api_value: api_value.clone(),
+            }
+        }
+    }
+}
+
+fn input_condition_to_protocol(condition: &InputCondition) -> protocol::InputCondition {
+    match condition {
+        InputCondition::Always => protocol::InputCondition::Always,
+        InputCondition::Present(path) => {
+            protocol::InputCondition::Present(path.as_str().to_owned())
+        }
+        InputCondition::Equals { path, literal } => protocol::InputCondition::Equals {
+            path: path.as_str().to_owned(),
+            literal: input_literal_to_protocol(literal),
+        },
+        InputCondition::Not(inner) => {
+            protocol::InputCondition::Not(Box::new(input_condition_to_protocol(inner)))
+        }
+    }
+}
+
+fn protocol_to_input_condition(
+    condition: &protocol::InputCondition,
+    depth: usize,
+) -> Result<InputCondition, InputRuleError> {
+    if depth > crate::schema::MAX_INPUT_CONDITION_DEPTH {
+        return Err(InputRuleError::ConditionTooDeep);
+    }
+    Ok(match condition {
+        protocol::InputCondition::Always => InputCondition::Always,
+        protocol::InputCondition::Present(path) => {
+            InputCondition::Present(InputPath::new(path.clone())?)
+        }
+        protocol::InputCondition::Equals { path, literal } => InputCondition::Equals {
+            path: InputPath::new(path.clone())?,
+            literal: protocol_to_input_literal(literal),
+        },
+        protocol::InputCondition::Not(inner) => {
+            InputCondition::Not(Box::new(protocol_to_input_condition(inner, depth + 1)?))
+        }
+    })
+}
+
 fn input_rule_to_protocol(rule: &InputRule<Compiled>) -> protocol::InputRule {
     let InputRuleParts {
         scope,
         target,
         code,
+        condition,
         predicate,
     } = rule.parts();
     let predicate = match predicate {
+        InputPredicate::Present => protocol::InputPredicate::Present,
+        InputPredicate::Absent => protocol::InputPredicate::Absent,
+        InputPredicate::Equals(literal) => {
+            protocol::InputPredicate::Equals(input_literal_to_protocol(literal))
+        }
         InputPredicate::Length { min, max } => protocol::InputPredicate::Length {
             min: *min,
             max: *max,
@@ -730,6 +832,7 @@ fn input_rule_to_protocol(rule: &InputRule<Compiled>) -> protocol::InputRule {
             }
         },
         code: code.as_str().to_owned(),
+        condition: input_condition_to_protocol(condition),
         predicate,
     }
 }
@@ -753,6 +856,7 @@ fn protocol_to_input_rule(rule: &protocol::InputRule) -> Result<InputRule, Input
         scope,
         target,
         code,
+        condition,
         predicate,
     } = rule;
     let scope = match scope {
@@ -769,6 +873,11 @@ fn protocol_to_input_rule(rule: &protocol::InputRule) -> Result<InputRule, Input
     };
     let code = InputRuleCode::new(code.clone())?;
     let predicate = match predicate {
+        protocol::InputPredicate::Present => InputPredicate::Present,
+        protocol::InputPredicate::Absent => InputPredicate::Absent,
+        protocol::InputPredicate::Equals(literal) => {
+            InputPredicate::Equals(protocol_to_input_literal(literal))
+        }
         protocol::InputPredicate::Length { min, max } => InputPredicate::Length {
             min: *min,
             max: *max,
@@ -808,7 +917,8 @@ fn protocol_to_input_rule(rule: &protocol::InputRule) -> Result<InputRule, Input
             InputPredicate::NotMatches(pattern.clone())
         }
     };
-    Ok(InputRule::new(scope, target, code, predicate))
+    Ok(InputRule::new(scope, target, code, predicate)
+        .with_condition(protocol_to_input_condition(condition, 1)?))
 }
 
 /// Convert a validated resource schema into its current protocol record.
@@ -1242,6 +1352,7 @@ pub fn attribute_type_to_protocol(
             name,
             fields,
             field_groups,
+            input_rules,
         } => Ok(protocol::AttributeType::Struct {
             name: name.to_string(),
             fields: fields
@@ -1249,6 +1360,7 @@ pub fn attribute_type_to_protocol(
                 .map(struct_field_to_protocol)
                 .collect::<Result<_, _>>()?,
             field_groups: field_groups.iter().map(field_group_to_protocol).collect(),
+            input_rules: input_rules.iter().map(input_rule_to_protocol).collect(),
         }),
         RawShape::Union(members) => Ok(protocol::AttributeType::Union {
             members: members
@@ -1734,7 +1846,8 @@ pub fn protocol_to_attribute_type(
             name,
             fields,
             field_groups,
-        } => Ok(DraftAttributeType::struct_with_field_groups(
+            input_rules,
+        } => Ok(DraftAttributeType::struct_with_rules(
             name.clone(),
             fields
                 .iter()
@@ -1746,6 +1859,19 @@ pub fn protocol_to_attribute_type(
                 .map(|(index, group)| {
                     protocol_to_field_group(group)
                         .map_err(|error| error.prepend_attribute(&format!("field_groups[{index}]")))
+                })
+                .collect::<Result<_, _>>()?,
+            input_rules
+                .iter()
+                .enumerate()
+                .map(|(index, rule)| {
+                    protocol_to_input_rule(rule).map_err(|error| SchemaDecodeError::InvalidSchema {
+                        detail: "input rule is invalid".into(),
+                        resource_type: None,
+                        attribute_path: vec![format!("input_rules[{index}]").into()],
+                        schema_issue_location: None,
+                        source: Some(Box::new(error)),
+                    })
                 })
                 .collect::<Result<_, _>>()?,
         )),
@@ -2037,6 +2163,7 @@ fn protocol_legacy_custom_to_core(
             name: _base_name,
             fields: _base_fields,
             field_groups: _base_field_groups,
+            input_rules: _base_input_rules,
         } => Err(SchemaDecodeError::unsupported_custom_base(
             enclosing_name,
             "Struct",
@@ -4686,6 +4813,7 @@ mod tests {
 
         let mut wire = resource_schema_to_protocol(&schema).unwrap();
         wire.attributes.get_mut("only").unwrap().attr_type = protocol::AttributeType::Struct {
+            input_rules: Vec::new(),
             name: "Nested".to_string(),
             fields: vec![protocol::StructField {
                 name: "nested_only".to_string(),
@@ -4977,6 +5105,7 @@ mod tests {
         let mut wire = resource_schema_to_protocol(&schema).unwrap();
         wire.attributes.get_mut("config").unwrap().attr_type = protocol::AttributeType::Union {
             members: vec![protocol::AttributeType::Struct {
+                input_rules: Vec::new(),
                 name: "Config".to_string(),
                 fields: vec![protocol::StructField {
                     name: "immutable".to_string(),
@@ -5028,6 +5157,7 @@ mod tests {
         use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
         let identity_struct = || protocol::AttributeType::Struct {
+            input_rules: Vec::new(),
             name: "Element".to_string(),
             fields: vec![protocol::StructField {
                 name: "key".to_string(),
@@ -5207,6 +5337,7 @@ mod tests {
                     name: _name,
                     fields: _fields,
                     field_groups: _field_groups,
+                    input_rules: _input_rules,
                 } => panic!("unexpected Struct builtin wire shape for {identity}"),
                 RawShape::Union(_members) => {
                     panic!("unexpected Union builtin wire shape for {identity}")

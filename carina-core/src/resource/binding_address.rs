@@ -26,6 +26,12 @@ mod private {
         ) -> super::super::knowledge::KnowledgeDiagnostic
         where
             Self: super::BindingAddress;
+
+        fn input_preview<P: super::super::ValueKind>(
+            value: super::super::Value<P, Self>,
+        ) -> super::super::Value<P>
+        where
+            Self: super::BindingAddress;
     }
 }
 
@@ -258,6 +264,13 @@ pub trait BindingAddress:
 }
 
 impl private::Sealed for RelativeBindingName {
+    fn input_preview<P: super::ValueKind>(value: super::Value<P, Self>) -> super::Value<P> {
+        // Parser-owned directories have root-relative bindings. Qualification
+        // preserves their structure; preview knowledge never resolves them.
+        let scope = super::RootScope::new();
+        value.resolve_bindings(&mut |binding| scope.resolve(binding))
+    }
+
     fn knowledge_diagnostic(
         error: super::knowledge::KnowledgeError<Self>,
     ) -> super::knowledge::KnowledgeDiagnostic {
@@ -313,6 +326,10 @@ impl BindingAddress for RelativeBindingName {
 }
 
 impl private::Sealed for AbsoluteBindingAddress {
+    fn input_preview<P: super::ValueKind>(value: super::Value<P, Self>) -> super::Value<P> {
+        value
+    }
+
     fn knowledge_diagnostic(
         error: super::knowledge::KnowledgeError<Self>,
     ) -> super::knowledge::KnowledgeDiagnostic {
@@ -369,6 +386,12 @@ pub(crate) fn knowledge_diagnostic<B: BindingAddress>(
     error: super::knowledge::KnowledgeError<B>,
 ) -> super::knowledge::KnowledgeDiagnostic {
     <B as private::Sealed>::knowledge_diagnostic(error)
+}
+
+pub(crate) fn input_preview<P: super::ValueKind, B: BindingAddress>(
+    value: super::Value<P, B>,
+) -> super::Value<P> {
+    <B as private::Sealed>::input_preview(value)
 }
 
 pub(crate) fn deferred_template_binding<B: BindingAddress>(binding: &B) -> B {

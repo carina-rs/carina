@@ -1855,7 +1855,7 @@ mod tests {
         for state_bucket in [false, true] {
             let preparation = carina_core::executor::ProviderPreparationError::InputDischarge(
                 carina_core::executor::EffectFailureKind::UnresolvedInputRule {
-                    path: carina_core::schema::InputPath::new("name").unwrap(),
+                    path: carina_core::schema::InputPath::new("name").unwrap().into(),
                     code: carina_core::schema::InputRuleCode::new("test.name.not_ipv4").unwrap(),
                 },
             );
@@ -1883,7 +1883,7 @@ mod tests {
         for state_bucket in [false, true] {
             let preparation =
                 ProviderPreparationError::InputDischarge(EffectFailureKind::UnresolvedInputRule {
-                    path: carina_core::schema::InputPath::new("name").unwrap(),
+                    path: carina_core::schema::InputPath::new("name").unwrap().into(),
                     code: carina_core::schema::InputRuleCode::new("test.name.not_ipv4").unwrap(),
                 });
             let error = if state_bucket {

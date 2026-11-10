@@ -9,14 +9,79 @@ use crate::{
     resource::{AbsoluteBindingAddress, DataSource},
 };
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct TypeFacts {
-    pub authored: HashMap<ResourceId, IndexMap<String, Value>>,
+    pub selection: super::union_fits::InputSelectionAuthority,
     pub bindings: HashMap<AbsoluteBindingAddress, Declaration>,
     pub aliases: HashMap<AbsoluteBindingAddress, AbsoluteBindingAddress>,
-    pub default_keys: HashMap<ResourceId, Vec<(String, bool)>>,
+    pub defaults: Vec<DefaultTagEvidence>,
 }
 
+#[derive(Clone)]
+pub(super) struct DefaultTagEvidence {
+    pub route: crate::provider::ProviderInstanceKey,
+    pub values: InputAttributes,
+    pub completeness: DefaultTagCompleteness,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum DefaultTagCompleteness {
+    Complete,
+    Unavailable(DefaultTagUnavailable),
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum DefaultTagUnavailable {
+    Unresolved,
+    ProviderConfigurationFailed,
+}
+
+impl DefaultTagCompleteness {
+    pub fn is_complete(self) -> bool {
+        match self {
+            Self::Complete => true,
+            Self::Unavailable(reason) => match reason {
+                DefaultTagUnavailable::Unresolved
+                | DefaultTagUnavailable::ProviderConfigurationFailed => false,
+            },
+        }
+    }
+}
+
+impl DefaultTagEvidence {
+    pub fn for_config<P: crate::resource::PlaceholderKind, B: crate::resource::BindingAddress>(
+        config: &crate::parser::ProviderConfig<P, B>,
+    ) -> Self {
+        Self {
+            route: crate::provider::ProviderInstanceKey::from(config),
+            values: project_attributes(&config.default_tags),
+            completeness: if config.unresolved_attributes.contains_key("default_tags") {
+                DefaultTagCompleteness::Unavailable(DefaultTagUnavailable::Unresolved)
+            } else {
+                DefaultTagCompleteness::Complete
+            },
+        }
+    }
+
+    pub fn for_preview(preview: &crate::parser::ProviderInputPreview) -> Self {
+        let evidence = Self::for_config(preview.config());
+        match preview.status() {
+            crate::parser::ProviderInputStatus::Complete => evidence,
+            crate::parser::ProviderInputStatus::Failed => evidence.after_config_failure(),
+        }
+    }
+
+    pub fn after_config_failure(mut self) -> Self {
+        if let DefaultTagCompleteness::Unavailable(_) = self.completeness {
+            self.completeness = DefaultTagCompleteness::Unavailable(
+                DefaultTagUnavailable::ProviderConfigurationFailed,
+            );
+        }
+        self
+    }
+}
+
+#[derive(Clone)]
 pub(super) enum Declaration {
     Schema(Arc<ValidatedResourceSchema>),
     Outputs(IndexMap<String, Value>),
@@ -69,6 +134,10 @@ pub struct InputTypeContext<S = ModuleSource> {
 }
 
 impl<S> InputTypeContext<S> {
+    pub fn with_provider_context(mut self, context: &crate::parser::LoadedProviderContext) -> Self {
+        self.facts.selection = super::union_fits::InputSelectionAuthority::in_catalog(context);
+        self
+    }
     /// Build the complete input context shared by live, saved, and bootstrap
     /// admission, including declarations and host-merged default tag keys.
     pub fn for_plan<'a, D>(
@@ -121,10 +190,6 @@ impl<S> InputTypeContext<S> {
         let mut context = Self::empty();
         for source in resources {
             let resource = source.as_resource();
-            context
-                .facts
-                .authored
-                .insert(resource.id.clone(), resource.attributes.clone());
             if let Some((binding, schema)) =
                 resource.binding.as_ref().zip(schemas.get_for(resource))
             {
@@ -175,38 +240,22 @@ impl<S> InputTypeContext<S> {
     /// merge as concrete desired inputs. An unresolved tag value may be skipped
     /// now but merge later; its key can block proof, never force a violation.
     pub fn with_default_tags<'a>(
-        mut self,
+        self,
         configs: &[crate::parser::ExpandedProviderConfig],
         schemas: &SchemaRegistry,
         write_ids: impl IntoIterator<Item = &'a ResourceId>,
     ) -> crate::provider::HostResult<Self> {
-        let mut mandatory = write_ids
-            .into_iter()
-            .map(|id| {
-                crate::resource::Resource::from_id(id.clone())
-                    .with_attribute("tags", Value::Concrete(ConcreteValue::Map(IndexMap::new())))
-            })
-            .collect::<Vec<_>>();
-        let mut possible = mandatory.clone();
-        for config in configs {
-            crate::provider::merge_default_tags(config, &mut mandatory, schemas)?;
-            let mut all_keys = config.clone();
-            for value in all_keys.default_tags.values_mut() {
-                *value = Value::Concrete(ConcreteValue::String("".into()));
-            }
-            crate::provider::merge_default_tags(&all_keys, &mut possible, schemas)?;
-        }
-        for (possible, mandatory) in possible.iter().zip(&mandatory) {
-            if let Some(Value::Concrete(ConcreteValue::Map(keys))) = possible.attributes.get("tags")
-            {
-                self.facts.default_keys.insert(
-                    possible.id.clone(),
-                    keys.keys()
-                        .map(|key| (key.clone(), mandatory.default_tag_keys.contains(key)))
-                        .collect(),
-                );
-            }
-        }
+        self.with_default_tag_projection(configs, schemas, write_ids)
+    }
+
+    pub(super) fn with_default_tag_projection<'a, P: crate::resource::PlaceholderKind>(
+        mut self,
+        configs: &[crate::parser::ProviderConfig<P, AbsoluteBindingAddress>],
+        schemas: &SchemaRegistry,
+        write_ids: impl IntoIterator<Item = &'a ResourceId>,
+    ) -> crate::provider::HostResult<Self> {
+        let _ = (schemas, write_ids);
+        self.facts.defaults = configs.iter().map(DefaultTagEvidence::for_config).collect();
         Ok(self)
     }
 }

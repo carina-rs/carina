@@ -36,6 +36,137 @@ fn string(value: &str) -> Value {
     Value::Concrete(ConcreteValue::String(value.into()))
 }
 
+async fn assert_late_secret_map_failure_is_protected(update: bool) {
+    const PRIVATE_KEY: &str = "private-late-rule-key";
+    let mut schemas = SchemaRegistry::new();
+    let local = PatternAttributeType::struct_with_rules(
+        "Object",
+        vec![
+            PatternStructField::optional("guard", PatternAttributeType::bool()).build(),
+            PatternStructField::optional("target", PatternAttributeType::string()).build(),
+        ],
+        vec![],
+        vec![
+            InputRule::value(
+                InputRuleScope::EveryWrite,
+                InputPath::new("target").unwrap(),
+                InputRuleCode::new("test.late.target").unwrap(),
+                InputPredicate::Present,
+            )
+            .with_condition(crate::schema::InputCondition::Equals {
+                path: InputPath::new("guard").unwrap(),
+                literal: crate::schema::InputLiteral::Bool(true),
+            }),
+        ],
+    );
+    schemas.insert(
+        "",
+        PatternResourceSchema::new("test")
+            .attribute(
+                PatternAttributeSchema::optional("value", PatternAttributeType::bool()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("objects", PatternAttributeType::map(local))
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let objects = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+        PRIVATE_KEY.into(),
+        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+            "guard".into(),
+            Value::root_resource_ref("source", "value", vec![]),
+        )]))),
+    )])))
+    .into_secret();
+    let mut consumer = Resource::new("test", "consumer").with_attribute("objects", objects);
+    consumer.binding = Some(absolute_binding("consumer"));
+    consumer
+        .dependencies
+        .value_bindings
+        .insert(absolute_binding("source"));
+    let mut resources = resolved_fixture_resources(vec![source(), consumer]);
+    let consumer = resources.remove(1);
+    let source = resources.remove(0);
+    let provider = MockProvider::new();
+    provider.push_create(Ok(State::existing(
+        source.id.clone(),
+        crate::test_support::snapshot_attributes(HashMap::from([(
+            "value".into(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        )])),
+    )
+    .with_identifier("source-id")));
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(source));
+    if update {
+        provider.push_update(Ok(ok_state(&consumer.id)));
+        plan.add(Effect::Update {
+            from: Box::new(
+                State::existing(
+                    consumer.id.clone(),
+                    crate::test_support::snapshot_attributes(HashMap::from([(
+                        "objects".into(),
+                        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                            PRIVATE_KEY.into(),
+                            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                                "guard".into(),
+                                Value::Concrete(ConcreteValue::Bool(false)),
+                            )]))),
+                        )]))),
+                    )])),
+                )
+                .with_identifier("old-id"),
+            ),
+            identifier: AppliedIdentifier::new("old-id").unwrap(),
+            to: consumer,
+            changed_attributes: vec!["objects".into()],
+        });
+    } else {
+        provider.push_create(Ok(ok_state(&consumer.id)));
+        plan.add(Effect::Create(consumer));
+    }
+    let checked = FinalizedPlan::new(plan.clone())
+        .check_inputs(&schemas, &HashMap::new())
+        .unwrap();
+    assert_eq!(checked.pending_inputs().len(), 1);
+    let (result, _) = run(
+        &provider,
+        plan,
+        &schemas,
+        HashMap::new(),
+        Default::default(),
+        &NoopNormalizer,
+    )
+    .await;
+    assert_eq!((result.success_count, result.failure_count()), (1, 1));
+    assert_eq!(provider.captured_create_resources().len(), 1);
+    assert!(provider.captured_update_requests().is_empty());
+    let failure = result.failures()[0].kind();
+    assert_eq!(failure.label(), "input rule violation");
+    assert!(!format!("{:?}", result.failures()[0]).contains(PRIVATE_KEY));
+    let mut error: Option<&dyn std::error::Error> = Some(failure);
+    while let Some(current) = error {
+        let rendered = format!("{current}\n{current:?}");
+        assert!(
+            !rendered.contains(PRIVATE_KEY),
+            "secret map key leaked at dispatch: {rendered}"
+        );
+        error = current.source();
+    }
+}
+
+#[tokio::test]
+async fn input_discharge_create_protects_secret_map_keys_in_late_rule_failures() {
+    assert_late_secret_map_failure_is_protected(false).await;
+}
+
+#[tokio::test]
+async fn input_discharge_update_protects_secret_map_keys_in_late_rule_failures() {
+    assert_late_secret_map_failure_is_protected(true).await;
+}
+
 #[tokio::test]
 async fn input_discharge_enum_identifier_is_proven_on_its_wire_string() {
     let mut schemas = SchemaRegistry::new();
@@ -809,6 +940,172 @@ async fn input_discharge_every_write_update_uses_runtime_value() {
             assert_eq!(result.failures()[0].kind().label(), "input rule violation");
         }
     }
+}
+
+#[tokio::test]
+async fn input_discharge_refreshes_resolved_guard_outside_the_update_patch() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        PatternResourceSchema::new("test")
+            .attribute(
+                PatternAttributeSchema::optional("guard", PatternAttributeType::bool()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("target", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("value", PatternAttributeType::bool()).build(),
+            )
+            .input_rule(
+                InputRule::value(
+                    InputRuleScope::EveryWrite,
+                    InputPath::new("target").unwrap(),
+                    InputRuleCode::new("test.target.suffix").unwrap(),
+                    InputPredicate::NoSuffix(crate::schema::NonEmptyString::new(".fifo").unwrap()),
+                )
+                .with_condition(crate::schema::InputCondition::Equals {
+                    path: InputPath::new("guard").unwrap(),
+                    literal: crate::schema::InputLiteral::Bool(true),
+                }),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let mut target = Resource::new("test", "consumer")
+        .with_attribute("guard", Value::root_resource_ref("source", "value", vec![]))
+        .with_attribute("target", string("valid-update"));
+    target.binding = Some(absolute_binding("consumer"));
+    target
+        .dependencies
+        .value_bindings
+        .insert(absolute_binding("source"));
+    let mut resources = resolved_fixture_resources(vec![source(), target]);
+    let target = resources.remove(1);
+    let provider = MockProvider::new();
+    provider.push_create(Ok(State::existing(
+        resources[0].id.clone(),
+        crate::test_support::snapshot_attributes(HashMap::from([(
+            "value".into(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        )])),
+    )
+    .with_identifier("source-id")));
+    provider.push_update(Ok(ok_state(&target.id)));
+    let previous = State::existing(
+        target.id.clone(),
+        crate::test_support::snapshot_attributes(HashMap::from([
+            ("guard".into(), Value::Concrete(ConcreteValue::Bool(true))),
+            ("target".into(), string("previous-name")),
+        ])),
+    )
+    .with_identifier("old-id");
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(resources.remove(0)));
+    plan.add(Effect::Update {
+        from: Box::new(previous),
+        identifier: AppliedIdentifier::new("old-id").unwrap(),
+        to: target,
+        changed_attributes: vec!["target".into()],
+    });
+    let admission = FinalizedPlan::new(plan.clone())
+        .check_inputs(&schemas, &HashMap::new())
+        .unwrap();
+    assert_eq!(admission.pending_inputs().len(), 1);
+    let (result, events) = run(
+        &provider,
+        plan,
+        &schemas,
+        HashMap::new(),
+        Default::default(),
+        &NoopNormalizer,
+    )
+    .await;
+    assert_eq!(
+        (result.success_count, result.failure_count()),
+        (2, 0),
+        "{events:?}"
+    );
+    let requests = provider.captured_update_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].patch().ops.len(), 1);
+    assert_eq!(requests[0].patch().ops[0].key(), "target");
+    assert_eq!(
+        requests[0].patch().ops[0].sent_value(),
+        Some(&string("valid-update"))
+    );
+}
+
+#[tokio::test]
+async fn input_discharge_keeps_ignored_unsent_target_unresolved() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        PatternResourceSchema::new("test")
+            .attribute(
+                PatternAttributeSchema::optional("guard", PatternAttributeType::bool()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("target", PatternAttributeType::string()).build(),
+            )
+            .input_rule(
+                InputRule::value(
+                    InputRuleScope::EveryWrite,
+                    InputPath::new("target").unwrap(),
+                    InputRuleCode::new("test.target.required").unwrap(),
+                    InputPredicate::Equals(crate::schema::InputLiteral::String("required".into())),
+                )
+                .with_condition(crate::schema::InputCondition::Equals {
+                    path: InputPath::new("guard").unwrap(),
+                    literal: crate::schema::InputLiteral::Bool(true),
+                }),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let mut desired = Resource::new("test", "consumer")
+        .with_attribute("guard", Value::Concrete(ConcreteValue::Bool(true)))
+        .with_attribute("target", string("required"));
+    desired.directives.ignore_changes = vec![crate::resource::ParsedIgnorePath::new(vec![
+        crate::resource::ParsedIgnorePathSegment::Attribute("target".into()),
+    ])];
+    let desired =
+        crate::resource::ResolvedResource::resolve_raw_fixture(desired, &schemas).unwrap();
+    let previous = State::existing(
+        desired.id.clone(),
+        crate::test_support::snapshot_attributes(HashMap::from([
+            ("guard".into(), Value::Concrete(ConcreteValue::Bool(false))),
+            ("target".into(), string("other")),
+        ])),
+    )
+    .with_identifier("existing");
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        from: Box::new(previous),
+        identifier: AppliedIdentifier::new("existing").unwrap(),
+        to: desired.clone(),
+        changed_attributes: vec!["guard".into()],
+    });
+    let provider = MockProvider::new();
+    provider.push_update(Ok(ok_state(&desired.id)));
+    let (result, events) = run(
+        &provider,
+        plan,
+        &schemas,
+        HashMap::new(),
+        Default::default(),
+        &NoopNormalizer,
+    )
+    .await;
+    assert_eq!(
+        (result.success_count, result.failure_count()),
+        (0, 1),
+        "{events:?}"
+    );
+    assert!(provider.captured_update_requests().is_empty());
+    assert!(
+        matches!(result.failures()[0].kind(), EffectFailureKind::UnresolvedInputRule { path, .. } if path.as_str() == "target")
+    );
 }
 
 #[tokio::test]
@@ -1807,6 +2104,114 @@ async fn input_discharge_identifierless_conflicting_resume_checks_before_old_del
             ));
             assert_eq!(calls, vec![("create".into(), source().id.to_string())]);
             assert!(result.successfully_deleted.is_empty());
+        }
+    }
+}
+
+struct ActivatingConditionalNormalizer;
+impl crate::provider::ProviderNormalizer for ActivatingConditionalNormalizer {
+    fn normalize_desired<'a>(
+        &'a self,
+        resources: &'a mut [crate::resource::ProviderResource],
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async move {
+            for resource in resources {
+                resource.set_attr("enabled", Value::Concrete(ConcreteValue::Bool(true)));
+                resource.set_attr("name", string("192.168.1.1"));
+            }
+            Ok(())
+        })
+    }
+    fn normalize_state<'a>(
+        &'a self,
+        _: &'a mut crate::provider::StateTransformMap,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn hydrate_read_state<'a>(
+        &'a self,
+        _: &'a mut crate::provider::StateTransformMap,
+        _: &'a crate::provider::SavedAttrs,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn conditional_rules_recheck_normalized_guards_at_create_and_update_dispatch() {
+    use crate::schema::{InputCondition, InputLiteral};
+    for scope in [InputRuleScope::CreateOnly, InputRuleScope::EveryWrite] {
+        for update in [false, true] {
+            let mut schemas = SchemaRegistry::new();
+            schemas.insert(
+                "",
+                PatternResourceSchema::new("test")
+                    .attribute(
+                        PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                            .build(),
+                    )
+                    .attribute(
+                        PatternAttributeSchema::optional("enabled", PatternAttributeType::bool())
+                            .build(),
+                    )
+                    .input_rule(
+                        InputRule::value(
+                            scope,
+                            InputPath::new("name").unwrap(),
+                            InputRuleCode::new("test.conditional_name").unwrap(),
+                            InputPredicate::NotIpv4,
+                        )
+                        .with_condition(InputCondition::Equals {
+                            path: InputPath::new("enabled").unwrap(),
+                            literal: InputLiteral::Bool(true),
+                        }),
+                    )
+                    .validate()
+                    .unwrap(),
+            );
+            let resource = resolved_fixture_resources(vec![
+                Resource::new("test", "conditional")
+                    .with_attribute("name", string("valid-name"))
+                    .with_attribute("enabled", Value::Concrete(ConcreteValue::Bool(false))),
+            ])
+            .remove(0);
+            let provider = MockProvider::new();
+            let mut plan = Plan::new();
+            if update {
+                provider.push_update(Ok(ok_state(&resource.id)));
+                plan.add(Effect::Update {
+                    from: Box::new(ok_state(&resource.id)),
+                    identifier: AppliedIdentifier::new("existing").unwrap(),
+                    to: resource,
+                    changed_attributes: vec!["name".into(), "enabled".into()],
+                });
+            } else {
+                provider.push_create(Ok(ok_state(&resource.id)));
+                plan.add(Effect::Create(resource));
+            }
+            let (result, events) = run(
+                &provider,
+                plan,
+                &schemas,
+                HashMap::new(),
+                Default::default(),
+                &ActivatingConditionalNormalizer,
+            )
+            .await;
+            let rejected = !update || scope == InputRuleScope::EveryWrite;
+            assert_eq!(
+                result.failure_count(),
+                usize::from(rejected),
+                "{scope:?}, update={update}: {events:?}"
+            );
+            if rejected {
+                assert!(provider.calls().is_empty());
+                assert!(
+                    matches!(result.failures()[0].kind(),EffectFailureKind::InputRule { violation } if violation.code().as_str() == "test.conditional_name")
+                );
+            } else {
+                assert_eq!(result.success_count, 1, "{events:?}");
+            }
         }
     }
 }

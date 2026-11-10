@@ -470,8 +470,7 @@ fn path_may_be_absent<'a>(
                     return true;
                 };
                 if fields
-                    .iter()
-                    .find(|field| field.name == *name)
+                    .field(name)
                     .is_none_or(|field| field.parts().declared_input_mode == InputMode::Optional)
                 {
                     return true;
@@ -804,66 +803,32 @@ impl Estimator<'_> {
     }
 }
 
-/// Private entry point: no arbitrary value/type API can bypass a WriteSite.
+/// Every owner enters through its bound, admitted rule and concrete instance.
 pub(super) fn estimate(
-    site: &WriteSite<'_>,
-    rule: &InputRule<Compiled>,
-    path: &[String],
+    applicable: &BoundInputRule<'_, '_>,
+    input: rule_input::EstimatorInput<'_>,
 ) -> InputVerdict {
+    let (expression, keys) = input.into_parts();
+    let rule = applicable.rule;
     if matches!(
         rule.predicate(),
         InputPredicate::Matches(_) | InputPredicate::NotMatches(_)
     ) {
         return InputVerdict::Undecided;
     }
+    let defs = applicable.site.schema.as_schema().defs();
     let mut estimator = Estimator {
-        types: site.types,
-        literal_key_type: site
-            .schema
-            .effective_type_at_attribute_path(path)
-            .ok()
-            .and_then(|node| match node.shape() {
-                crate::schema::Shape::Map { key, .. } => Some((key, node.defs())),
+        types: Some(expression.declarations()),
+        literal_key_type: literal_type(applicable, rule.path()).and_then(|ty| {
+            match ty.shape_with_defs(defs) {
+                crate::schema::Shape::Map { key, .. } => Some((key, defs)),
                 _ => None,
-            }),
+            }
+        }),
         query: Query::new(rule.predicate()),
         steps: 0,
     };
-    match &site.authored {
-        Some(AuthoredAttributes::Resource(attributes)) => {
-            from_authored(attributes, path, site.schema, &mut estimator, rule)
-        }
-        Some(AuthoredAttributes::Template(attributes)) => {
-            from_authored(attributes, path, site.schema, &mut estimator, rule)
-        }
-        None => InputVerdict::Undecided,
-    }
-}
-
-fn from_authored<P: ValueKind>(
-    attributes: &IndexMap<String, Value<P>>,
-    path: &[String],
-    schema: &ValidatedResourceSchema,
-    estimator: &mut Estimator<'_>,
-    rule: &InputRule<Compiled>,
-) -> InputVerdict {
-    if omitted_optional(attributes, path, schema) {
-        return InputVerdict::Proven;
-    }
-    let Some(value) = attributes.get(rule.path().root()) else {
-        return InputVerdict::Undecided;
-    };
-    let tail = path[1..]
-        .iter()
-        .map(|name| PathSegment::Field { name: name.clone() })
-        .collect::<Vec<_>>();
-    let summary = estimator.at_path(
-        value,
-        &tail,
-        matches!(rule.target(), InputRuleTarget::MapKeys(_)),
-        0,
-    );
-    // A concrete map's exact keys obey existential failure.
+    let summary = estimator.at_path(expression.value(), &[], keys, 0);
     decide(summary, rule, &estimator.query)
 }
 
@@ -892,25 +857,6 @@ fn key_spelling_is_stable(
         }
         _ => false,
     }
-}
-
-pub(super) fn omitted_optional<P: ValueKind>(
-    mut fields: &IndexMap<String, Value<P>>,
-    path: &[String],
-    schema: &ValidatedResourceSchema,
-) -> bool {
-    for (index, name) in path.iter().enumerate() {
-        let Some(value) = fields.get(name) else {
-            return schema
-                .effective_node_at_path(&path[..=index])
-                .is_some_and(|node| node.effective_input_mode() == InputMode::Optional);
-        };
-        match peel_secret(value) {
-            Value::Concrete(ConcreteValue::Map(map)) => fields = map,
-            _ => return false,
-        }
-    }
-    false
 }
 
 fn decide(summary: Summary, rule: &InputRule<Compiled>, query: &Query<'_>) -> InputVerdict {
@@ -990,7 +936,7 @@ fn decide(summary: Summary, rule: &InputRule<Compiled>, query: &Query<'_>) -> In
                 .iter()
                 .any(|window| window_can_be_ipv4(window)))
             .then_some(true),
-            Matches(_) | NotMatches(_) => None,
+            Present | Absent | Equals(_) | Matches(_) | NotMatches(_) => None,
         }
     };
     match result {
@@ -1082,11 +1028,7 @@ fn window_can_be_ipv4(window: &[Characters]) -> bool {
 }
 
 fn violation(rule: &InputRule<Compiled>) -> InputViolation {
-    InputViolation {
-        path: rule.path().clone(),
-        code: rule.code().clone(),
-        reason: rule.predicate().violation_reason(),
-    }
+    rule_violation(rule)
 }
 
 #[cfg(test)]

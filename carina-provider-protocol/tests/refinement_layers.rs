@@ -1,9 +1,9 @@
 use carina_provider_protocol::{MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION, types};
 
 #[test]
-fn refinement_layers_require_protocol_26() {
-    assert_eq!(PROTOCOL_VERSION, 26);
-    assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 26);
+fn refinement_layers_require_protocol_27() {
+    assert_eq!(PROTOCOL_VERSION, 27);
+    assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 27);
 }
 
 #[test]
@@ -76,7 +76,7 @@ fn existing_attribute_variants_keep_unknown_field_compatibility() {
     for value in [
         serde_json::json!({"type":"list", "inner":{"type":"Bool"}, "elements":"allow_duplicates", "future":"ignored"}),
         serde_json::json!({"type":"map", "inner":{"type":"Bool"}, "key":{"type":"Bool"}, "future":"ignored"}),
-        serde_json::json!({"type":"struct", "name":"Example", "fields":[], "field_groups":[], "future":"ignored"}),
+        serde_json::json!({"type":"struct", "name":"Example", "fields":[], "field_groups":[], "input_rules":[], "future":"ignored"}),
         serde_json::json!({"type":"union", "members":[{"type":"Bool"}], "future":"ignored"}),
         serde_json::json!({"type":"custom", "name":"Example", "base":{"type":"Bool"}, "future":"ignored"}),
         serde_json::json!({"type":"custom_enum", "name":"Example", "namespace":"test", "base":{"type":"Bool"}, "future":"ignored"}),

@@ -14,6 +14,14 @@
 //!   translating its `HttpRequest`/`SdkBody` into the same neutral core,
 //!   so AWS SDK operations work inside a WASM component too.
 //!
+//! Both adapters send fully buffered bodies with explicit `Content-Length`
+//! framing. Each request the transport accepts emits one completed HTTP event,
+//! including early transport failures. The synchronous AWS connector rejects
+//! streaming or already-taken SDK bodies before conversion to a transport
+//! request. The SDK receives a user `ConnectorError` with `UnbufferedRequestBody`
+//! as its source, without an HTTP event. The connector does not consume or poll
+//! those bodies.
+//!
 //! Keeping the wasi:http body-framing fixes (carina#3254 Content-Length,
 //! carina#3320 handle-before-write ordering, carina#3318 blocking-write
 //! chunking) in the single [`execute`] core means every caller — AWS SDK
@@ -60,6 +68,8 @@ use wasi::http::types::{
 };
 use wasi::io::streams::StreamError;
 
+#[cfg(feature = "aws")]
+pub use crate::wasi_http_body::UnbufferedRequestBody;
 use crate::wasi_http_body::{
     BLOCKING_WRITE_AND_FLUSH_MAX_BYTES, RequestBody, chunks_for_blocking_write,
     inject_content_length_header,
@@ -493,8 +503,8 @@ struct WasiRequest {
     uri: String,
     /// Header name/value pairs. Values are bytes to allow non-UTF-8.
     headers: Vec<(String, Vec<u8>)>,
-    /// Request body (empty `Vec` for body-less requests).
-    body: Vec<u8>,
+    /// Fully buffered request body, classified for explicit length framing.
+    body: RequestBody,
 }
 
 /// The response from the wasi:http transport core. Internal to this module.
@@ -546,17 +556,15 @@ fn prepare_request(request: WasiRequest) -> Result<PreparedRequest, PreSendError
         method,
         uri,
         mut headers,
-        body: body_bytes,
+        body,
     } = request;
 
     let parsed = uri
         .parse::<http::Uri>()
         .map_err(|error| PreSendError::new(format!("Invalid URI: {error}")))?;
 
-    // Classify the body into Empty / Sized so the wire framing is explicit.
-    // Without this, body-less requests lose their length signal at the
-    // wasi:http boundary and hyper falls back to chunked transfer encoding.
-    let body = RequestBody::from_sdk_body(&body_bytes);
+    // Preserve the body's explicit length signal so body-less requests do not
+    // fall back to chunked transfer encoding at the wasi:http boundary.
     inject_content_length_header(&mut headers, &body);
     let fields = Fields::from_list(&headers)
         .map_err(|error| PreSendError::new(format!("Failed to create headers: {error:?}")))?;
@@ -654,7 +662,7 @@ fn execute_observed(
     let (method, uri, request_body_bytes) = (
         request.method.clone(),
         request.uri.clone(),
-        request.body.len() as u64,
+        request.body.content_length() as u64,
     );
     let headers = request.headers.clone();
     let mut phases_ms = [0; 7];
@@ -807,7 +815,7 @@ pub fn send_request(
         method: parts.method.as_str().to_string(),
         uri: parts.uri.to_string(),
         headers,
-        body,
+        body: body.into(),
     };
 
     build_http_response(execute(
@@ -842,6 +850,8 @@ fn make_request(
     options: Option<RequestOptions>,
     _diagnostics: &crate::ProviderDiagnostics,
 ) -> Result<Response<SdkBody>, ConnectorError> {
+    let body = RequestBody::try_from(request.body())
+        .map_err(|error| ConnectorError::user(Box::new(error)))?;
     let headers = request
         .headers()
         .iter()
@@ -851,7 +861,7 @@ fn make_request(
         method: request.method().to_string(),
         uri: request.uri().to_string(),
         headers,
-        body: request.body().bytes().unwrap_or(&[]).to_vec(),
+        body,
     };
 
     let wasi_resp = execute(
@@ -1060,6 +1070,85 @@ mod tests {
 
     #[cfg(all(feature = "aws", not(target_arch = "wasm32")))]
     #[tokio::test]
+    async fn unbuffered_sdk_body_is_rejected_before_send() {
+        let session =
+            carina_core::provider::ProviderPlan::state_only().session("native", None, None);
+        let connector = WasiHttpConnector {
+            diagnostics: crate::ProviderDiagnostics::from_session(&session),
+            connect_timeout: None,
+            read_timeout: None,
+        };
+        for body in [
+            SdkBody::taken(),
+            SdkBody::from_body_1_x(SdkBody::from("streamed payload")),
+            SdkBody::retryable(|| SdkBody::from_body_1_x(SdkBody::from("streamed payload"))),
+        ] {
+            let capture = NativeRequestCapture::start();
+            let request = HttpRequest::try_from(
+                http::Request::builder()
+                    .method("PUT")
+                    .uri("https://example.com/object")
+                    .body(body)
+                    .unwrap(),
+            )
+            .unwrap();
+
+            let result = connector.call(request).await;
+            assert!(capture.finish().is_empty(), "unbuffered body reached send");
+            let error = result.expect_err("unbuffered SDK body must be rejected");
+            assert!(error.is_user());
+            assert!(!error.is_io());
+            assert!(!error.is_timeout());
+            assert!(
+                error
+                    .source()
+                    .is_some_and(|source| source.is::<UnbufferedRequestBody>()),
+                "typed unbuffered-body error must remain in the source chain"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "aws", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn buffered_sdk_bodies_keep_their_length_framing() {
+        let session =
+            carina_core::provider::ProviderPlan::state_only().session("native", None, None);
+        let connector = WasiHttpConnector {
+            diagnostics: crate::ProviderDiagnostics::from_session(&session),
+            connect_timeout: None,
+            read_timeout: None,
+        };
+        for (body, expected) in [
+            (SdkBody::empty(), RequestBody::Empty),
+            (SdkBody::from(Vec::new()), RequestBody::Empty),
+            (
+                SdkBody::from("hello"),
+                RequestBody::Sized(b"hello".to_vec()),
+            ),
+        ] {
+            let capture = NativeRequestCapture::start();
+            let request = HttpRequest::try_from(
+                http::Request::builder()
+                    .method("PUT")
+                    .uri("https://example.com/object")
+                    .body(body)
+                    .unwrap(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                connector.call(request).await.unwrap().status().as_u16(),
+                200
+            );
+            let requests = capture.finish();
+            assert_eq!(requests.len(), 1);
+            let request = requests.first().unwrap();
+            assert_eq!(request.body, expected);
+        }
+    }
+
+    #[cfg(all(feature = "aws", not(target_arch = "wasm32")))]
+    #[tokio::test]
     async fn two_thousand_signed_requests_do_not_grow_the_inventory() {
         use crate::protected_material::{AwsSessionMaterial, GithubTokenMaterial};
         use crate::{ProviderDiagnostics, aws_session_tests::StaticSource};
@@ -1182,7 +1271,7 @@ mod tests {
             method: "POST".into(),
             uri: "https://example.com/".into(),
             headers: vec![("x-request-id".into(), b"request-123".to_vec())],
-            body: b"request".to_vec(),
+            body: b"request".to_vec().into(),
         };
         let mut events = Vec::new();
         let response = super::execute_observed(
@@ -1217,7 +1306,7 @@ mod tests {
                 method: "GET".into(),
                 uri: "https://example.com/".into(),
                 headers: vec![("x-request-id".into(), b"early".to_vec())],
-                body: vec![],
+                body: RequestBody::Empty,
             };
             let expected = code.as_ref().map(super::trace_transport_code);
             let mut events = Vec::new();

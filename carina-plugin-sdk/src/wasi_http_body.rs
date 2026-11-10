@@ -1,11 +1,15 @@
 //! Body framing for wasi:http outgoing requests.
 //!
-//! # Two invariants enforced here
+//! # Three invariants enforced here
 //!
-//! 1. **Every buffered body crosses the wasi:http boundary with an explicit
+//! 1. **Only fully buffered request bodies enter the transport** —
+//!    `TryFrom<&SdkBody>` rejects streaming or already-taken AWS SDK bodies
+//!    with `UnbufferedRequestBody`, without consuming or polling them
+//!    (carina-rs/carina#4342).
+//! 2. **Every buffered body crosses the wasi:http boundary with an explicit
 //!    `Content-Length`** — see `RequestBody` / `inject_content_length_header`
 //!    below (carina-rs/carina#3254).
-//! 2. **Every call into `wasi:io::OutputStream::blocking_write_and_flush`
+//! 3. **Every call into `wasi:io::OutputStream::blocking_write_and_flush`
 //!    carries at most `BLOCKING_WRITE_AND_FLUSH_MAX_BYTES` bytes** — see
 //!    `chunks_for_blocking_write` below (carina-rs/carina#3318). The
 //!    wasi:io contract caps a single `blocking-write-and-flush` at
@@ -42,27 +46,24 @@
 //! # The fix
 //!
 //! Restore the invariant at the wasi:http boundary: **every outgoing
-//! request body that the SDK has fully buffered (which is every body the
-//! current `WasiHttpConnector` ever sees) crosses the boundary with an
-//! explicit `Content-Length`**. The header is added when missing and
-//! left alone when already present.
+//! request body crosses the boundary with an explicit `Content-Length`**.
+//! The synchronous `WasiHttpConnector` accepts only bodies whose bytes are
+//! already in memory. Streaming and already-taken SDK bodies are rejected
+//! before sending as user connector errors; they are never treated as empty
+//! bodies. The header is added when missing and left alone when already present.
 //!
 //! The classification is encoded as a tagged union so the broken state
 //! ("body bytes known but Content-Length missing") is unrepresentable
-//! after `RequestBody::from_sdk_body` runs: every constructor of
+//! after conversion to `RequestBody`: every constructor of
 //! `RequestBody` produces a value that, when handed to
 //! `inject_content_length_header`, emits a sized framing on the wire.
 
 /// The body of an outgoing request, classified by what we know about its
 /// size at the wasi:http boundary.
 ///
-/// The AWS SDK Rust's `HttpRequest` body is always fully buffered by the
-/// time `WasiHttpConnector` sees it (the smithy runtime collects it
-/// before calling the connector), so only the `Empty` and `Sized`
-/// variants are reachable from the current connector. A `Streaming`
-/// variant would be added if/when the connector grows to handle
-/// chunked-upload paths — encoded explicitly so the wasi:http bridge
-/// knows when *not* to inject `Content-Length`.
+/// Only fully buffered bodies can be represented. AWS SDK bodies must pass
+/// the fallible `TryFrom<&SdkBody>` conversion; the generic HTTP adapter
+/// supplies owned bytes through `From<Vec<u8>>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RequestBody {
     /// No request body. The SDK either passed no bytes or passed a
@@ -75,21 +76,48 @@ pub(crate) enum RequestBody {
     Sized(Vec<u8>),
 }
 
-impl RequestBody {
-    /// Classify a buffered SDK body into `Empty` / `Sized`.
-    ///
-    /// The input is the byte slice the AWS SDK handed down through
-    /// `request.body().bytes().unwrap_or(&[])`. Empty buffers — the
-    /// case that triggers carina-rs/carina#3254 — collapse to
-    /// `RequestBody::Empty`.
-    pub(crate) fn from_sdk_body(bytes: &[u8]) -> Self {
+impl From<Vec<u8>> for RequestBody {
+    fn from(bytes: Vec<u8>) -> Self {
         if bytes.is_empty() {
             RequestBody::Empty
         } else {
-            RequestBody::Sized(bytes.to_vec())
+            RequestBody::Sized(bytes)
         }
     }
+}
 
+/// The AWS SDK body's bytes are not in memory (streaming or already taken).
+///
+/// The synchronous WASI HTTP transport cannot send these bodies. This error
+/// carries no request or payload contents.
+#[cfg(feature = "aws")]
+#[derive(Debug)]
+pub struct UnbufferedRequestBody;
+
+#[cfg(feature = "aws")]
+impl std::fmt::Display for UnbufferedRequestBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "AWS SDK request body bytes are not in memory (streaming or already taken); \
+             the WASI HTTP transport requires a fully buffered body",
+        )
+    }
+}
+
+#[cfg(feature = "aws")]
+impl std::error::Error for UnbufferedRequestBody {}
+
+#[cfg(feature = "aws")]
+impl TryFrom<&aws_smithy_types::body::SdkBody> for RequestBody {
+    type Error = UnbufferedRequestBody;
+
+    fn try_from(body: &aws_smithy_types::body::SdkBody) -> Result<Self, Self::Error> {
+        let bytes = body.bytes().ok_or(UnbufferedRequestBody)?;
+        Ok(Self::from(bytes.to_vec()))
+    }
+}
+
+impl RequestBody {
     /// The number of bytes the receiver should expect on the wire.
     pub(crate) fn content_length(&self) -> usize {
         match self {
@@ -166,17 +194,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn from_sdk_body_empty_slice_is_empty() {
-        assert_eq!(RequestBody::from_sdk_body(&[]), RequestBody::Empty);
+    fn from_owned_bytes_empty_is_empty() {
+        assert_eq!(RequestBody::from(Vec::new()), RequestBody::Empty);
     }
 
     #[test]
-    fn from_sdk_body_non_empty_is_sized() {
+    fn from_owned_bytes_non_empty_is_sized() {
         let bytes = b"hello".to_vec();
         assert_eq!(
-            RequestBody::from_sdk_body(b"hello"),
+            RequestBody::from(b"hello".to_vec()),
             RequestBody::Sized(bytes)
         );
+    }
+
+    #[cfg(feature = "aws")]
+    #[test]
+    fn sdk_body_empty_is_empty() {
+        let body = aws_smithy_types::body::SdkBody::empty();
+        assert_eq!(RequestBody::try_from(&body).unwrap(), RequestBody::Empty);
+        assert_eq!(body.bytes(), Some(&b""[..]));
+    }
+
+    #[cfg(feature = "aws")]
+    #[test]
+    fn sdk_body_non_empty_is_sized() {
+        let body = aws_smithy_types::body::SdkBody::from("hello");
+        assert_eq!(
+            RequestBody::try_from(&body).unwrap(),
+            RequestBody::Sized(b"hello".to_vec())
+        );
+        assert_eq!(body.bytes(), Some(&b"hello"[..]));
     }
 
     #[test]

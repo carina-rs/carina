@@ -39,6 +39,10 @@ pub(crate) fn print_provider_type_warning(warning: &carina_core::parser::ParseWa
     );
 }
 
+pub(crate) fn print_input_warning(warning: &carina_core::input_rules::InputFinding) {
+    eprintln!("  ⚠ {warning}");
+}
+
 /// Test-only entry point for the validate pipeline (#2247).
 ///
 /// Runs the same pipeline `run_validate` runs (parse → resolve →
@@ -64,6 +68,9 @@ pub fn validate_with_factories(
     for warning in &diagnostics.warnings {
         print_provider_type_warning(warning);
     }
+    for warning in &diagnostics.input_warnings {
+        print_input_warning(warning);
+    }
     diagnostics
         .errors
         .iter()
@@ -76,6 +83,7 @@ pub fn validate_with_factories(
 pub struct ValidateDiagnostics {
     pub errors: Vec<AppError>,
     pub warnings: Vec<carina_core::parser::ParseWarning>,
+    pub input_warnings: Vec<carina_core::input_rules::InputFinding>,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -96,6 +104,7 @@ pub fn validate_diagnostics_with_factories(
             return ValidateDiagnostics {
                 errors: vec![AppError::Config(e.to_string())],
                 warnings: Vec::new(),
+                input_warnings: Vec::new(),
             };
         }
     };
@@ -108,10 +117,10 @@ pub fn validate_diagnostics_with_factories(
         load_errors,
     );
 
-    let (errors, warnings) = providers
+    providers
         .validation_report(&parsed, base_dir, false, &loaded.duplicate_declarations)
-        .into_test_diagnostics();
-    ValidateDiagnostics { errors, warnings }
+        .check_authored_inputs()
+        .into_test_diagnostics()
 }
 
 /// Test-support twin of [`validate_with_factories`] that returns the
@@ -329,8 +338,10 @@ pub fn run_validate(
     let (providers, provider_load_error) =
         ProviderLoad::load_reporting(runtime, &parsed.providers, base_dir)?;
     error_reports.extend(provider_load_error.iter().map(ToString::to_string));
-    let validation_report =
-        providers.validation_report(&parsed, base_dir, false, &loaded.duplicate_declarations);
+    let validation_report = providers
+        .validation_report(&parsed, base_dir, false, &loaded.duplicate_declarations)
+        .check_authored_inputs();
+    let input_warnings = validation_report.input_warnings().to_vec();
     // Publish unresolved provider checks even if another validation/load error
     // prevents a resolved file from being returned.
     let (validation_result, schemas) = validation_report.into_parts();
@@ -352,21 +363,6 @@ pub fn run_validate(
 
     if !error_reports.is_empty() {
         return Err(AppError::Validation(error_reports.join("\n")));
-    }
-
-    // Only explicit authoring validation checks effect-independent rules here.
-    // Plan/apply use finalized write sites, so Import, adoption and other
-    // non-writing effects never inherit an early desired-input check.
-    let input_findings = carina_core::input_rules::check_authored_inputs(&parsed, schemas)
-        .map_err(AppError::Provider)?;
-    if !input_findings.is_empty() {
-        return Err(AppError::Validation(
-            input_findings
-                .into_iter()
-                .map(|finding| finding.to_string())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ));
     }
 
     // Check for unused let bindings (warnings, not errors)
@@ -403,6 +399,13 @@ pub fn run_validate(
 
     if json {
         let mut warnings = Vec::new();
+        for finding in input_warnings {
+            warnings.push(ValidateWarning {
+                warning_type: "input_rule",
+                message: finding.to_string(),
+                file: None,
+            });
+        }
         for binding in &unused_warnings {
             warnings.push(ValidateWarning {
                 warning_type: "unused_binding",

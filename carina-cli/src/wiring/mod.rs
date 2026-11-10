@@ -980,8 +980,40 @@ impl ValidationProviderCatalogExt for ValidationProviderCatalog<'_> {
 /// Terminal validation output, constructed only from a scoped settlement.
 pub(crate) struct ValidationReport<'a, T = carina_core::parser::ModuleResolvedInferredFile> {
     result: Result<T, NonEmptyValidationErrors>,
+    authored_inputs: carina_core::input_rules::AuthoredInputs,
     warnings: Vec<carina_core::parser::ParseWarning>,
+    input_warnings: Vec<carina_core::input_rules::InputFinding>,
     schemas: &'a SchemaRegistry,
+}
+
+impl ValidationReport<'_> {
+    /// Explicit validate/editor preview only. Execution-oriented validation
+    /// retains the effect-specific input gate instead.
+    pub(crate) fn check_authored_inputs(mut self) -> Self {
+        let mut errors = Vec::new();
+        for outcome in
+            carina_core::input_rules::check_authored_inputs(&self.authored_inputs, self.schemas)
+        {
+            match outcome {
+                carina_core::input_rules::AuthoredInputOutcome::Finding(finding) => {
+                    match finding.severity() {
+                        carina_core::input_rules::InputFindingSeverity::Error => {
+                            errors.push(AppError::Validation(finding.to_string()));
+                        }
+                        carina_core::input_rules::InputFindingSeverity::Warning => {
+                            self.input_warnings.push(finding);
+                        }
+                    }
+                }
+                carina_core::input_rules::AuthoredInputOutcome::Pending(_) => {}
+                carina_core::input_rules::AuthoredInputOutcome::PreparationFailed(error) => {
+                    errors.push(AppError::Provider(error.into_host_error()));
+                }
+            }
+        }
+        self.result = append_load_findings(self.result, errors);
+        self
+    }
 }
 
 struct ValidationReportSink {
@@ -999,22 +1031,37 @@ impl carina_core::validation::deferred_types::ProviderTypeCheckSink for Validati
         }
     }
 }
+
+fn settle_provider_checks<T>(
+    checks: carina_core::validation::deferred_types::ProviderTypeCheckResult<T>,
+) -> (T, ValidationReportSink) {
+    let mut sink = ValidationReportSink {
+        warnings: Vec::new(),
+        errors: Vec::new(),
+    };
+    (checks.publish(&mut sink), sink)
+}
+
 impl<'a, T> ValidationReport<'a, T> {
     fn settle(
         checks: carina_core::validation::deferred_types::ProviderTypeCheckResult<
-            Result<T, NonEmptyValidationErrors>,
+            crate::commands::ConfigurationValidation<T>,
         >,
         schemas: &'a SchemaRegistry,
     ) -> Self {
-        let mut sink = ValidationReportSink {
-            warnings: Vec::new(),
-            errors: Vec::new(),
-        };
-        let result = checks.publish(&mut sink);
+        let (
+            crate::commands::ConfigurationValidation {
+                result,
+                authored_inputs,
+            },
+            sink,
+        ) = settle_provider_checks(checks);
         let result = append_load_findings(result, sink.errors);
         Self {
             result,
+            authored_inputs,
             warnings: sink.warnings,
+            input_warnings: Vec::new(),
             schemas,
         }
     }
@@ -1030,14 +1077,16 @@ impl<'a, T> ValidationReport<'a, T> {
         }
     }
     #[cfg(any(test, feature = "test-utils"))]
-    pub(crate) fn into_test_diagnostics(
-        self,
-    ) -> (Vec<AppError>, Vec<carina_core::parser::ParseWarning>) {
+    pub(crate) fn into_test_diagnostics(self) -> crate::commands::validate::ValidateDiagnostics {
         let errors = match self.result {
             Ok(_) => Vec::new(),
             Err(errors) => errors.into_vec(),
         };
-        (errors, self.warnings)
+        crate::commands::validate::ValidateDiagnostics {
+            errors,
+            warnings: self.warnings,
+            input_warnings: self.input_warnings,
+        }
     }
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn into_errors(self) -> Vec<AppError> {
@@ -1054,7 +1103,14 @@ impl<'a, T> ValidationReport<'a, T> {
         for warning in self.warnings {
             crate::commands::validate::print_provider_type_warning(&warning);
         }
+        for warning in self.input_warnings {
+            crate::commands::validate::print_input_warning(&warning);
+        }
         (self.result, self.schemas)
+    }
+
+    pub(crate) fn input_warnings(&self) -> &[carina_core::input_rules::InputFinding] {
+        &self.input_warnings
     }
     #[cfg(test)]
     pub(crate) fn schemas(&self) -> &SchemaRegistry {
@@ -1103,7 +1159,10 @@ fn validation_report_with<'a, T>(
     );
     let checks =
         carina_core::validation::deferred_types::TypeCheckSession::run(&catalog, |catalog| {
-            let result = match crate::commands::validate_and_resolve_errors_inner(
+            let crate::commands::ConfigurationValidation {
+                result,
+                authored_inputs,
+            } = crate::commands::validate_and_resolve_report_inner(
                 &ValidationPipelineAccess::new(),
                 parsed.clone(),
                 base_dir,
@@ -1113,7 +1172,8 @@ fn validation_report_with<'a, T>(
                 skip_resource_validation,
                 duplicate_declarations,
                 crate::commands::ConfigNameResolution::EvaluatedOnly,
-            ) {
+            );
+            let result = match result {
                 Ok(crate::commands::ResolvedConfig::Evaluated { parsed }) => {
                     finish(*parsed, catalog).map_err(|error| {
                         NonEmptyValidationErrors::try_from(vec![error])
@@ -1125,7 +1185,10 @@ fn validation_report_with<'a, T>(
                 }
                 Err(errors) => Err(errors),
             };
-            append_load_findings(result, load_findings)
+            crate::commands::ConfigurationValidation {
+                result: append_load_findings(result, load_findings),
+                authored_inputs,
+            }
         });
     ValidationReport::settle(checks, context.schemas())
 }
@@ -1275,9 +1338,11 @@ fn resolve_config_pair_errors_with_catalog(
             });
             append_load_findings(result, load_findings)
         });
-    ValidationReport::settle(checks, context.schemas())
-        .into_parts()
-        .0
+    let (result, sink) = settle_provider_checks(checks);
+    for warning in sink.warnings {
+        crate::commands::validate::print_provider_type_warning(&warning);
+    }
+    append_load_findings(result, sink.errors)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7280,7 +7345,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                     provider_configs,
                     context.schemas(),
                     plan.effects().iter().map(|effect| effect.resource_id()),
-                )?;
+                )?.with_provider_context(context.provider_context());
                 let outcome = prepare_plan_outcome(
                     plan,
                     prepared.references,

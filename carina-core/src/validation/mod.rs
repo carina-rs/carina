@@ -2005,13 +2005,9 @@ where
             let sink = expected.as_ref().unwrap_or(&fallback);
             let sink_judged = expression.for_sink(sink, context.raw_provider_context());
             if sink_judged.is_interpolation() {
-                // Native interpolation keeps main's operand suppression.
-                if matches!(
-                    record.authored.owner,
-                    crate::parser::BindingUseOwner::ModuleArgument { .. }
-                ) {
-                    report.expression_owned_uses.push(record.authored.clone());
-                }
+                // Suppress the operand check without claiming the enclosing
+                // destination: its resolved String still owes the slot check.
+                report.expression_owned_uses.push(record.authored.clone());
                 continue;
             }
             if sink_judged.is_single_string_construction()
