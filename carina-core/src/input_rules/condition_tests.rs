@@ -264,7 +264,6 @@ fn failed_guard_is_a_failure_even_under_negation_and_after_authored_projection()
                         .unwrap(),
                     schemas.get_for(&resource).unwrap().schema(),
                     Arc::new(TypeFacts::default()),
-                    &schemas,
                 )
                 .unwrap(),
             },

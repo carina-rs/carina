@@ -122,6 +122,68 @@ fn value_location(
     }
 }
 
+#[derive(Default)]
+struct AttributeRenames {
+    attributes: std::collections::HashMap<String, Self>,
+    fields: std::collections::HashMap<String, Self>,
+    indices: std::collections::HashMap<usize, Self>,
+    attribute_names: std::collections::HashMap<String, String>,
+    field_names: std::collections::HashMap<String, String>,
+}
+impl AttributeRenames {
+    fn insert(&mut self, path: &[super::AttributePathSegment], name: String) {
+        use super::AttributePathSegment as Segment;
+        let Some((last, parents)) = path.split_last() else {
+            return;
+        };
+        let mut node = self;
+        for segment in parents {
+            node = match segment {
+                Segment::Attribute(name) => node.attributes.entry(name.clone()).or_default(),
+                Segment::StructField(name) | Segment::Key(name) => {
+                    node.fields.entry(name.clone()).or_default()
+                }
+                Segment::ListIndex(index) => node.indices.entry(*index).or_default(),
+            };
+        }
+        match last {
+            Segment::Attribute(from) => {
+                node.attribute_names.insert(from.clone(), name);
+            }
+            Segment::StructField(from) | Segment::Key(from) => {
+                node.field_names.insert(from.clone(), name);
+            }
+            Segment::ListIndex(_) => unreachable!("an attribute rename cannot rename an index"),
+        }
+    }
+    fn rewrite(&self, path: &mut [super::AttributePathSegment]) {
+        use super::AttributePathSegment as Segment;
+        let mut node = Some(self);
+        for segment in path {
+            let Some(current) = node else {
+                break;
+            };
+            #[cfg(test)]
+            super::analysis::record_attribute_location_work(1);
+            node = match segment {
+                Segment::Attribute(name) => {
+                    if let Some(canonical) = current.attribute_names.get(name) {
+                        canonical.clone_into(name);
+                    }
+                    current.attributes.get(name)
+                }
+                Segment::StructField(name) | Segment::Key(name) => {
+                    if let Some(canonical) = current.field_names.get(name) {
+                        canonical.clone_into(name);
+                    }
+                    current.fields.get(name)
+                }
+                Segment::ListIndex(index) => current.indices.get(index),
+            };
+        }
+    }
+}
+
 impl ElementLocations {
     pub(crate) fn keys(&self) -> &[AttributeKeyLocation] {
         &self.keys
@@ -141,46 +203,25 @@ impl ElementLocations {
         self.attribute_values.clear();
         self.diagnostic_index.take();
     }
-    pub(crate) fn rename_attribute_path(
+    pub(crate) fn rename_attribute_paths(
         &mut self,
-        from: &[super::AttributePathSegment],
-        name: &str,
+        renames: impl IntoIterator<Item = (Vec<super::AttributePathSegment>, String)>,
     ) {
+        let mut index = AttributeRenames::default();
+        let mut changed = false;
+        for (path, name) in renames {
+            index.insert(&path, name);
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
         self.diagnostic_index.take();
-        use super::AttributePathSegment as Segment;
-        let rename = |path: &mut [Segment]| {
-            // Map literals and block syntax use different segment variants
-            // for the same schema field. The schema walker resolves both.
-            if !from.is_empty()
-                && path.len() >= from.len()
-                && path
-                    .iter()
-                    .zip(from)
-                    .all(|(actual, expected)| match (actual, expected) {
-                        (
-                            Segment::StructField(a) | Segment::Key(a),
-                            Segment::StructField(b) | Segment::Key(b),
-                        ) => a == b,
-                        _ => actual == expected,
-                    })
-            {
-                match &mut path[from.len() - 1] {
-                    Segment::Attribute(value)
-                    | Segment::StructField(value)
-                    | Segment::Key(value) => {
-                        name.clone_into(value);
-                    }
-                    Segment::ListIndex(_) => {
-                        unreachable!("an attribute rename cannot rename an index")
-                    }
-                }
-            }
-        };
         for key in &mut self.keys {
-            rename(&mut key.path);
+            index.rewrite(&mut key.path);
         }
         for value in &mut self.attribute_values {
-            rename(&mut value.path);
+            index.rewrite(&mut value.path);
         }
     }
 

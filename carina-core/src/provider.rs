@@ -1195,6 +1195,7 @@ pub(crate) struct ProtectedUpdateInput {
     attributes: IndexMap<String, Value>,
     ignored: crate::resource::ResolvedIgnoreChanges,
     patch: UpdatePatch,
+    selection: crate::input_rules::InputSelectionAuthority,
 }
 
 impl fmt::Debug for ProtectedUpdateInput {
@@ -1204,6 +1205,9 @@ impl fmt::Debug for ProtectedUpdateInput {
 }
 
 impl ProtectedUpdateInput {
+    pub(crate) fn selection_authority(&self) -> &crate::input_rules::InputSelectionAuthority {
+        &self.selection
+    }
     pub(crate) fn id(&self) -> &ResourceId {
         &self.id
     }
@@ -1313,6 +1317,7 @@ impl UpdateRequest {
             attributes: protected.attributes().clone(),
             ignored: protected.ignored().clone(),
             patch: annotated_patch,
+            selection: protected.selection_authority().clone(),
         });
         Ok(Self {
             #[cfg(any(test, feature = "test-utils"))]

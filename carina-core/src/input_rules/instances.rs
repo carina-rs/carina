@@ -130,7 +130,6 @@ fn bind<'s, 'a>(
 
 pub(super) fn for_site<'s, 'a>(site: &'s WriteSite<'a>) -> Vec<ApplicableInputRule<'s, 'a>> {
     let mut instances = Vec::new();
-    let mut fits = site.union_fits.borrow_mut();
     for &rule in &site.rules {
         instances.extend(
             bind(
@@ -170,7 +169,6 @@ pub(super) fn for_site<'s, 'a>(site: &'s WriteSite<'a>) -> Vec<ApplicableInputRu
             &mut HashSet::new(),
             &mut instances,
             DiagnosticScope::Public,
-            &mut fits,
         );
     }
     instances
@@ -185,7 +183,6 @@ fn walk<'s, 'a>(
     visited_refs: &mut HashSet<String>,
     out: &mut Vec<ApplicableInputRule<'s, 'a>>,
     scope: DiagnosticScope,
-    fits: &mut super::union_fits::UnionFits<'a>,
 ) {
     let defs = site.schema.as_schema().defs();
     if !site
@@ -221,16 +218,7 @@ fn walk<'s, 'a>(
                 return;
             }
             if let Some(definition) = defs.get(name) {
-                walk(
-                    site,
-                    definition,
-                    value,
-                    owner,
-                    visited_refs,
-                    out,
-                    scope,
-                    fits,
-                );
+                walk(site, definition, value, owner, visited_refs, out, scope);
             }
             visited_refs.remove(name);
         }
@@ -274,7 +262,6 @@ fn walk<'s, 'a>(
                     },
                     out,
                     scope,
-                    fits,
                 );
                 owner.pop();
             }
@@ -295,7 +282,6 @@ fn walk<'s, 'a>(
                         &mut HashSet::new(),
                         out,
                         scope,
-                        fits,
                     );
                     owner.pop();
                 }
@@ -319,22 +305,43 @@ fn walk<'s, 'a>(
                         &mut HashSet::new(),
                         out,
                         scope,
-                        fits,
                     );
                     owner.pop();
                 }
             }
         }
         AttrTypeKind::Union(_) => {
-            let mut ref_path = visited_refs
-                .iter()
-                .filter_map(|name| defs.get_key_value(name).map(|(name, _)| name.as_str()))
-                .collect();
-            if let Some(member) = value
-                .node(&site.input)
-                .and_then(|value| fits.select(ty, &value, defs, &mut ref_path))
-            {
-                walk(site, member, value, owner, visited_refs, out, scope, fits);
+            match value.node(&site.input).map(|node| node.union_selection(ty)) {
+                Some(super::union_fits::UnionSelection::Selected(index)) => {
+                    let crate::schema::RawShape::Union(members) = ty.raw_shape() else {
+                        unreachable!("union declaration")
+                    };
+                    walk(
+                        site,
+                        &members[index],
+                        value,
+                        owner,
+                        visited_refs,
+                        out,
+                        scope,
+                    );
+                }
+                Some(
+                    super::union_fits::UnionSelection::Withheld
+                    | super::union_fits::UnionSelection::Rejected,
+                )
+                | None => {
+                    let mut declarations = Vec::new();
+                    collect_deferred(
+                        site,
+                        ty,
+                        value.deferred(&site.input),
+                        owner,
+                        &mut HashSet::new(),
+                        &mut declarations,
+                    );
+                    out.extend(ApplicableInputRule::deferred(declarations));
+                }
             }
         }
         AttrTypeKind::UnloadedSchemaType(_)

@@ -701,6 +701,11 @@ A struct type represents a nested object with typed fields.
   findings and pending obligations; only the private single-rule evaluator
   returns a verdict. Dispatch retains every established finding. Each write site owns one immutable `RuleInput`,
   constructed only at authored, plan or protected dispatch stage boundaries.
+  Those constructors seal ordinary union fits with their stage's provider
+  lookup, retaining nested choices in the graph. Evaluation consumes that
+  authority; unavailable provider validation remains pending and never selects
+  a branch by structural declaration order alone. The same authority travels
+  through admitted provider-ready values and their protected update capability.
   Authored checks require immutable parser/admission-minted `AuthoredInputs`;
   mutating public AST fields cannot reseal their snapshot. Every successful module
   publication retains resource authority even if provider configuration fails;
@@ -710,6 +715,11 @@ A struct type represents a nested object with typed fields.
   consumers exhaustively render their typed outcomes. Schema fields are read literally
   through immutable ordered declarations with a shared name index; ordinary
   validation, aliases and rule metadata use that index. Only declared rule paths use `InputPath` parsing.
+  Alias binding covers Struct, List, Map, selected Union and Secret instances,
+  retaining protection and authored locations. Canonical root identities precede
+  patch, default-membership and ignore queries. Shared schema canonicalization
+  uses mutable path prefixes and renders only actual renames or errors; authored
+  location renames are indexed and applied in one batch.
   Guards, targets,
   instance enumeration and bound-expression estimation share the graph and
   ignore policy. Classification and diagnostic protection travel together on

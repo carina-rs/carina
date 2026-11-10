@@ -1198,7 +1198,6 @@ fn withheld_nested_map_keys_cannot_inspect_the_ancestor_expression() {
             &authored.resources().next().unwrap(),
             schema,
             Arc::new(types.facts.clone()),
-            &schemas,
         )
         .unwrap();
         let site = classify_write_site::<ModuleSource>(

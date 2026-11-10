@@ -436,8 +436,17 @@ impl DeclarationProvenance {
         from: &[super::AttributePathSegment],
         name: &str,
     ) {
-        let elements = Arc::make_mut(&mut self.elements);
-        elements.rename_attribute_path(from, name);
+        self.rename_attribute_paths([(from.to_vec(), name.to_owned())]);
+    }
+
+    pub(crate) fn rename_attribute_paths(
+        &mut self,
+        renames: impl IntoIterator<Item = (Vec<super::AttributePathSegment>, String)>,
+    ) {
+        let renames = renames.into_iter().collect::<Vec<_>>();
+        if !renames.is_empty() {
+            Arc::make_mut(&mut self.elements).rename_attribute_paths(renames);
+        }
     }
 
     pub(in crate::parser) fn set_iterable(&mut self, location: DeclarationLocation) {
@@ -2877,6 +2886,67 @@ pub(super) fn record_attribute_location_work(steps: usize) {
 #[cfg(test)]
 mod location_tests {
     use super::*;
+
+    #[test]
+    fn aliased_collection_input_construction_updates_locations_in_one_pass() {
+        use crate::schema::{
+            AttributeSchema, AttributeType, InputCondition, InputPath, InputPredicate, InputRule,
+            InputRuleCode, InputRuleScope, ResourceSchema, SchemaRegistry, StructField,
+        };
+        const COUNT: usize = 128;
+        let entry = AttributeType::struct_with_rules(
+            "Entry",
+            vec![
+                StructField::optional(
+                    "rules",
+                    AttributeType::list(AttributeType::struct_("Rule", vec![])),
+                )
+                .with_block_name("rule")
+                .build(),
+                StructField::optional("target", AttributeType::bool()).build(),
+            ],
+            vec![],
+            vec![
+                InputRule::value(
+                    InputRuleScope::EveryWrite,
+                    InputPath::new("target").unwrap(),
+                    InputRuleCode::new("entry.target").unwrap(),
+                    InputPredicate::Present,
+                )
+                .with_condition(InputCondition::Present(InputPath::new("rules").unwrap())),
+            ],
+        );
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("Review")
+                .attribute(AttributeSchema::optional("items", AttributeType::map(entry)).build())
+                .validate()
+                .unwrap(),
+        );
+        let entries = (0..COUNT)
+            .map(|index| format!("key{index} = {{ rule {{}} }}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let parsed = super::super::parse_file(
+            &format!("let example = mock.Review {{ items = {{ {entries} }} }}"),
+            Path::new("main.crn"),
+            &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        ATTRIBUTE_LOCATION_WORK.set(Some(0));
+        let report =
+            crate::input_rules::check_authored_inputs(parsed.authored_inputs().unwrap(), &schemas);
+        assert_eq!(report.findings().len(), COUNT);
+        for finding in report.findings() {
+            assert!(finding.authored_location().is_some());
+        }
+        let work = ATTRIBUTE_LOCATION_WORK.replace(None).unwrap();
+        assert!(
+            work <= COUNT * 128,
+            "{work} location visits for {COUNT} aliased instances, including construction"
+        );
+    }
 
     #[test]
     fn collection_input_findings_use_a_linear_authored_location_budget() {

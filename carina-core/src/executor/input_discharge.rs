@@ -709,6 +709,181 @@ mod tests {
     use crate::resource::Value;
 
     #[test]
+    fn provider_selected_union_rules_are_enforced_at_create_and_update_dispatch() {
+        use crate::schema::{
+            AttributeSchema, AttributeType, InputCondition, InputLiteral, InputPath,
+            InputPredicate, InputRule, InputRuleCode, InputRuleScope, ResourceSchema, StructField,
+            TypeIdentity,
+        };
+        let arm = |name: &str, scalar: &str, rules| {
+            AttributeType::struct_with_rules(
+                name,
+                vec![
+                    StructField::required(
+                        "kind",
+                        AttributeType::refined_string(
+                            Some(TypeIdentity::bare(scalar)),
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                    .build(),
+                    StructField::optional("guard", AttributeType::bool()).build(),
+                    StructField::optional("target", AttributeType::bool()).build(),
+                ],
+                vec![],
+                rules,
+            )
+        };
+        let required = InputRule::value(
+            InputRuleScope::EveryWrite,
+            InputPath::new("target").unwrap(),
+            InputRuleCode::new("union.target").unwrap(),
+            InputPredicate::Present,
+        )
+        .with_condition(InputCondition::Equals {
+            path: InputPath::new("guard").unwrap(),
+            literal: InputLiteral::Bool(true),
+        });
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("UnionInput")
+                .attribute(
+                    AttributeSchema::optional(
+                        "node",
+                        AttributeType::union(vec![
+                            arm("A", "First", vec![]),
+                            arm("B", "Second", vec![required]),
+                        ]),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let mut catalog = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::clone(&callbacks);
+        catalog.custom_types = crate::parser::ProviderCustomTypes::loaded(
+            HashSet::new(),
+            Box::new(move |target, _| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let crate::parser::CustomTypeValidationTarget::Annotation(identity) = target else {
+                    panic!("provider annotation callback")
+                };
+                if identity.identity().kind == "First" {
+                    Err(crate::parser::CustomTypeValidationError::Rejected {
+                        owner: "mock".into(),
+                        identity: identity.identity().clone(),
+                        message: "first arm rejected".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            }),
+        );
+        let node = |guard| {
+            Value::Concrete(crate::resource::ConcreteValue::Map(
+                indexmap::IndexMap::from([
+                    (
+                        "kind".into(),
+                        Value::Concrete(crate::resource::ConcreteValue::String("b".into())),
+                    ),
+                    (
+                        "guard".into(),
+                        Value::Concrete(crate::resource::ConcreteValue::Bool(guard)),
+                    ),
+                ]),
+            ))
+        };
+        let bindings = crate::binding_index::ResolvedBindings::default();
+        let gate = super::super::ModuleConstraintGate::from_live_compositions(&[]);
+        crate::validation::deferred_types::with_session_for_test(&catalog, |type_checks| {
+            let context = ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &[],
+                &crate::provider::NoopNormalizer,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            for update in [false, true] {
+                let resource =
+                    crate::resource::Resource::with_provider("mock", "UnionInput", "example", None)
+                        .with_attribute("node", node(false));
+                let initial = futures::executor::block_on(super::super::prepare_create_request(
+                    resource.clone(),
+                    &context,
+                ))
+                .unwrap();
+                let from = SnapshotState::existing(
+                    resource.id.clone(),
+                    crate::test_support::snapshot_attributes(HashMap::from([(
+                        "node".into(),
+                        node(false),
+                    )])),
+                )
+                .with_identifier("existing");
+                let mut plan = Plan::<crate::resource::ProviderModuleSource>::default();
+                plan.add(if update {
+                    Effect::Update {
+                        from: Box::new(from.clone()),
+                        identifier: AppliedIdentifier::new("existing").unwrap(),
+                        to: initial.resource().as_inner().clone(),
+                        changed_attributes: vec!["node".into()],
+                    }
+                } else {
+                    Effect::Create(initial.resource().as_inner().clone())
+                });
+                let checked = FinalizedPlan::new(plan)
+                    .check_inputs(&schemas, &HashMap::new())
+                    .unwrap();
+                let check = ExecutionInputChecks::new(
+                    checked.execution_input_checks(),
+                    checked.effects(),
+                    &[0],
+                )
+                .unwrap()
+                .take_write(0)
+                .unwrap();
+                let request = futures::executor::block_on(super::super::prepare_create_request(
+                    resource.with_attribute("node", node(true)),
+                    &context,
+                ))
+                .unwrap();
+                let attributes = request.resource().as_resource().resolved_attributes();
+                let writeback =
+                    SecretPreservingAttributes::from_provider_values(&attributes, &attributes);
+                let result = if update {
+                    check
+                        .prepare_update(
+                            from,
+                            &["node".into()],
+                            request.resource().clone(),
+                            writeback,
+                            &schemas,
+                        )
+                        .map(|_| ())
+                } else {
+                    check
+                        .prepare_create(request, writeback, &schemas)
+                        .map(|_| ())
+                };
+                assert!(callbacks.load(std::sync::atomic::Ordering::SeqCst) > 0);
+                let error = result
+                    .expect_err("provider-selected B must enforce its local rule at dispatch");
+                assert!(
+                    error.to_string().contains("[union.target]"),
+                    "update={update}: {error}"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn create_and_update_discharge_preserve_every_late_input_finding() {
         use crate::schema::{
             AttributeSchema, AttributeType, InputPath, InputPredicate, InputRule, InputRuleCode,

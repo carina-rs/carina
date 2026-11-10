@@ -47,11 +47,13 @@ impl Scopes {
 pub(crate) struct InputRuleDeclarations {
     nodes: HashMap<DeclarationNode, Scopes>,
     resource: Scopes,
+    aliases: HashSet<DeclarationNode>,
 }
 
 impl InputRuleDeclarations {
     pub(crate) fn new(schema: &CompiledResourceSchema) -> Self {
         let mut nodes = HashMap::new();
+        let mut aliases = HashSet::new();
         let mut parents: HashMap<DeclarationNode, Vec<DeclarationNode>> = HashMap::new();
         let mut pending = schema
             .attributes
@@ -73,6 +75,9 @@ impl InputRuleDeclarations {
                     input_rules,
                     ..
                 } => {
+                    if fields.has_block_names() {
+                        aliases.insert(node);
+                    }
                     children.extend(fields.iter().map(|field| &field.field_type));
                     Scopes::rules(input_rules)
                 }
@@ -138,7 +143,22 @@ impl InputRuleDeclarations {
         for attribute in schema.attributes.values() {
             resource.extend(nodes[&DeclarationNode::of(&attribute.attr_type)]);
         }
-        Self { nodes, resource }
+        let mut alias_work = aliases.iter().copied().collect::<VecDeque<_>>();
+        while let Some(child) = alias_work.pop_front() {
+            for &parent in parents.get(&child).into_iter().flatten() {
+                if aliases.insert(parent) {
+                    alias_work.push_back(parent);
+                }
+            }
+        }
+        Self {
+            nodes,
+            resource,
+            aliases,
+        }
+    }
+    pub(crate) fn aliases_reachable(&self, ty: &CompiledAttributeType) -> bool {
+        self.aliases.contains(&DeclarationNode::of(ty))
     }
     pub(super) fn reachable(&self, ty: &CompiledAttributeType, context: InputWriteContext) -> bool {
         self.nodes

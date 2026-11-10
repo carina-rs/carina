@@ -284,7 +284,14 @@ impl<'a> IgnoreCursor<'a> {
     }
 }
 
+struct RootSource<'a> {
+    name: &'a str,
+    value: &'a InputValue,
+    proof: Option<(Classification<'a, ParserPlaceholder>, DiagnosticScope)>,
+}
+
 struct InputStorage {
+    schema: ValidatedResourceSchema,
     desired: InputAttributes,
     update: Option<UpdateOverlay>,
     declarations: Arc<TypeFacts>,
@@ -294,11 +301,14 @@ struct InputStorage {
 }
 
 #[derive(Yokeable)]
-struct EvidenceGraph<'a> {
+pub(super) struct EvidenceGraph<'a> {
     nodes: Vec<EvidenceNode<'a>>,
     roots: HashMap<String, NodeId>,
     removed: HashSet<String>,
     update: bool,
+    selections: super::union_fits::UnionSelections,
+    declaration: crate::parser::DeclarationProvenance,
+    alias_conflicts: Vec<String>,
 }
 
 struct EvidenceNode<'a> {
@@ -351,34 +361,21 @@ impl RuleInput {
         source: &authored::AuthoredResource<'_>,
         schema: &ValidatedResourceSchema,
         declarations: Arc<TypeFacts>,
-        schemas: &SchemaRegistry,
     ) -> crate::provider::HostResult<Arc<Self>> {
         let resource = source.resource();
-        let mut projected = crate::resource::Resource::<ModuleSource, ParserPlaceholder>::from_id(
+        let input = Self::complete(
             resource.id.clone(),
-        );
-        projected.attributes = project_attributes(&resource.attributes);
-        projected.declaration = resource.declaration.clone();
-        let conflicts = crate::schema::resolve_block_names_detailed(
-            std::slice::from_mut(&mut projected),
-            schemas,
-        );
-        if !conflicts.is_empty() {
-            return Err(crate::provider::HostError::invalid_input(
-                conflicts
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ));
-        }
-        Ok(Self::complete(
-            projected.id,
-            projected.attributes,
-            projected.declaration,
+            project_attributes(&resource.attributes),
+            resource.declaration.clone(),
             schema,
             declarations,
-        ))
+        );
+        if !input.graph().alias_conflicts.is_empty() {
+            return Err(crate::provider::HostError::invalid_input(
+                input.graph().alias_conflicts.join("\n"),
+            ));
+        }
+        Ok(input)
     }
 
     pub(super) fn for_plan_create<S>(
@@ -437,6 +434,7 @@ impl RuleInput {
         let patch =
             crate::provider::plan_update_patch(changed, resource, previous, schema.as_schema())?;
         Ok(Self::construct(InputStorage {
+            schema: schema.clone(),
             desired: project_attributes(&resource.attributes),
             update: Some(UpdateOverlay::new(
                 &patch,
@@ -458,7 +456,10 @@ impl RuleInput {
             project_attributes(desired.attributes()),
             Default::default(),
             schema,
-            Arc::new(TypeFacts::default()),
+            Arc::new(TypeFacts {
+                selection: desired.selection_authority().clone(),
+                ..Default::default()
+            }),
         )
     }
 
@@ -467,9 +468,13 @@ impl RuleInput {
         schema: &ValidatedResourceSchema,
     ) -> Arc<Self> {
         Self::construct(InputStorage {
+            schema: schema.clone(),
             desired: project_attributes(input.attributes()),
             update: Some(UpdateOverlay::new(input.patch(), input.ignored().clone())),
-            declarations: Arc::new(TypeFacts::default()),
+            declarations: Arc::new(TypeFacts {
+                selection: input.selection_authority().clone(),
+                ..Default::default()
+            }),
             id: input.id().clone(),
             accepts_defaults: accepts_defaults(schema),
             declaration: Default::default(),
@@ -484,6 +489,7 @@ impl RuleInput {
         declarations: Arc<TypeFacts>,
     ) -> Arc<Self> {
         Self::construct(InputStorage {
+            schema: schema.clone(),
             desired,
             update: None,
             declarations,
@@ -503,7 +509,7 @@ impl RuleInput {
         &self.storage().id
     }
     pub(super) fn declaration(&self) -> &crate::parser::DeclarationProvenance {
-        &self.storage().declaration
+        &self.graph().declaration
     }
     pub(super) fn is_update(&self) -> bool {
         self.graph().update
@@ -719,17 +725,79 @@ impl<'a> EvidenceGraph<'a> {
             roots: HashMap::new(),
             removed: HashSet::new(),
             update: input.update.is_some(),
+            selections: Default::default(),
+            declaration: input.declaration.clone(),
+            alias_conflicts: Vec::new(),
         };
-        let mut sources = input
-            .desired
-            .iter()
-            .map(|(key, value)| (key.as_str(), value))
-            .collect::<IndexMap<_, _>>();
+        // Bind logical root identities before patch membership, defaults or
+        // ignore masks can answer any evidence query.
+        let schema = input.schema.as_schema();
+        let fields = crate::schema::BlockFields::for_resource(schema);
+        let mut sources: IndexMap<&str, RootSource<'a>> = IndexMap::new();
+        let mut renames = Vec::new();
+        for (source, value) in &input.desired {
+            let scalar_name = fields.canonical_name(source, false, schema.defs());
+            let list_name = fields.canonical_name(source, true, schema.defs());
+            let mut proof = None;
+            let canonical = if scalar_name == list_name {
+                scalar_name
+            } else {
+                let classified = classify(value);
+                let (classified, scope) =
+                    ClassifiedRef::from(&classified).for_input_rules(&InputEvidenceAuthority(()));
+                let is_list = ClassifiedRef::from(&classified).list_len().is_some();
+                proof = Some((classified, scope));
+                fields.canonical_name(source, is_list, schema.defs())
+            }
+            .unwrap_or(source.as_str());
+            if canonical != source {
+                renames.push((
+                    vec![crate::parser::AttributePathSegment::Attribute(
+                        source.clone(),
+                    )],
+                    canonical.to_owned(),
+                ));
+            }
+            if input
+                .update
+                .as_ref()
+                .is_some_and(|update| update.operations.contains_key(canonical))
+            {
+                continue; // The exact operation owns this logical slot.
+            }
+            if let Some(previous) = sources.get(canonical) {
+                let alias = if canonical != source {
+                    source.as_str()
+                } else {
+                    previous.name
+                };
+                graph.alias_conflicts.push(
+                    crate::schema::block_name_conflict(&input.id.to_string(), "", alias, canonical)
+                        .to_string(),
+                );
+                continue;
+            }
+            sources.insert(
+                canonical,
+                RootSource {
+                    name: source,
+                    value,
+                    proof,
+                },
+            );
+        }
         if let Some(update) = &input.update {
             for (key, op) in &update.operations {
                 match op {
                     PatchOperation::Set(value) => {
-                        sources.insert(key, value);
+                        sources.insert(
+                            key.as_str(),
+                            RootSource {
+                                name: key,
+                                value,
+                                proof: None,
+                            },
+                        );
                     }
                     PatchOperation::Remove => {
                         sources.shift_remove(key.as_str());
@@ -738,8 +806,11 @@ impl<'a> EvidenceGraph<'a> {
                 }
             }
         }
-        for (key, value) in sources {
-            let proof = classify(value);
+        for (key, source) in sources {
+            let (proof, scope) = source.proof.unwrap_or_else(|| {
+                let classified = classify(source.value);
+                ClassifiedRef::from(&classified).for_input_rules(&InputEvidenceAuthority(()))
+            });
             let completeness = if input
                 .update
                 .as_ref()
@@ -751,7 +822,7 @@ impl<'a> EvidenceGraph<'a> {
             };
             let id = graph.push(
                 ClassifiedRef::from(&proof),
-                DiagnosticScope::Public,
+                scope,
                 false,
                 completeness,
                 input
@@ -769,7 +840,270 @@ impl<'a> EvidenceGraph<'a> {
         {
             graph.default_nodes(input);
         }
+        graph.bind_declarations(input, renames);
         graph
+    }
+
+    pub(super) fn proof(&self, id: NodeId) -> Option<&Classification<'a, ParserPlaceholder>> {
+        self.nodes[id.0].proof.as_ref()
+    }
+    pub(super) fn children(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        let (map, list) = match &self.nodes[id.0].children {
+            Children::Map { members, .. } => (Some(members.values()), None),
+            Children::List(items) => (None, Some(items.iter())),
+            Children::Scalar => (None, None),
+        };
+        map.into_iter()
+            .flatten()
+            .chain(list.into_iter().flatten())
+            .copied()
+    }
+
+    fn bind_declarations(
+        &mut self,
+        input: &'a InputStorage,
+        mut renames: Vec<(Vec<crate::parser::AttributePathSegment>, String)>,
+    ) {
+        use crate::schema::FieldAncestry;
+        let schema = input.schema.as_schema();
+        let context = if self.update {
+            InputWriteContext::Update
+        } else {
+            InputWriteContext::AuthoredDesired
+        };
+        let need_choices = input
+            .schema
+            .input_rule_declarations()
+            .has_declarations(context);
+        let mut selections = super::union_fits::UnionSelections::default();
+        let mut visited = HashSet::new();
+        let mut path = Vec::new();
+        for (name, attribute) in schema.attributes() {
+            let Some(&node) = self.roots.get(name) else {
+                continue;
+            };
+            path.push(crate::parser::AttributePathSegment::Attribute(name.clone()));
+            self.bind_node(
+                &attribute.attr_type,
+                node,
+                input,
+                FieldAncestry::from_input_mode(attribute.input_mode),
+                &mut path,
+                &mut visited,
+                &mut selections,
+                need_choices,
+                &mut renames,
+            );
+            path.pop();
+        }
+        self.selections = selections;
+        self.declaration.rename_attribute_paths(renames);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_node(
+        &mut self,
+        ty: &'a CompiledAttributeType,
+        node: NodeId,
+        input: &'a InputStorage,
+        ancestry: crate::schema::FieldAncestry,
+        path: &mut Vec<crate::parser::AttributePathSegment>,
+        visited: &mut HashSet<(super::declarations::DeclarationNode, NodeId)>,
+        selections: &mut super::union_fits::UnionSelections,
+        need_choices: bool,
+        renames: &mut Vec<(Vec<crate::parser::AttributePathSegment>, String)>,
+    ) {
+        use super::union_fits::UnionSelection;
+        use crate::schema::AttrTypeKind;
+        if self.nodes[node.0].blocked
+            || !visited.insert((super::declarations::DeclarationNode::of(ty), node))
+        {
+            return;
+        }
+        #[cfg(test)]
+        crate::schema::record_block_name_path_work(1);
+        let defs = input.schema.as_schema().defs();
+        match ty.kind() {
+            AttrTypeKind::Ref(name) => {
+                if let Some(ty) = defs.get(name) {
+                    self.bind_node(
+                        ty,
+                        node,
+                        input,
+                        ancestry,
+                        path,
+                        visited,
+                        selections,
+                        need_choices,
+                        renames,
+                    );
+                }
+            }
+            AttrTypeKind::Union(_) if need_choices => {
+                if !self.nodes[node.0].full_proof {
+                    return;
+                }
+                if !matches!(selections.selection(ty, node), UnionSelection::Selected(_)) {
+                    selections.admitted(
+                        ty,
+                        node,
+                        self,
+                        defs,
+                        &input.declarations.selection,
+                        &input.id.provider,
+                    );
+                }
+                match selections.selection(ty, node) {
+                    UnionSelection::Selected(index) => {
+                        let crate::schema::RawShape::Union(members) = ty.raw_shape() else {
+                            unreachable!("union declaration")
+                        };
+                        self.bind_node(
+                            &members[index],
+                            node,
+                            input,
+                            ancestry,
+                            path,
+                            visited,
+                            selections,
+                            need_choices,
+                            renames,
+                        );
+                    }
+                    UnionSelection::Withheld => {}
+                    UnionSelection::Rejected => self.nodes[node.0].derived_failure = true,
+                }
+            }
+            AttrTypeKind::Struct { fields, .. } => {
+                if fields.has_block_names() {
+                    let names = crate::schema::BlockFields::for_struct(fields, ancestry);
+                    let entries = match &self.nodes[node.0].children {
+                        Children::Map { members, .. } => members
+                            .iter()
+                            .map(|(&key, &value)| (key, value))
+                            .collect::<Vec<_>>(),
+                        _ => return,
+                    };
+                    for (source, child) in entries {
+                        let Some(canonical) = names.canonical_name(
+                            source,
+                            matches!(self.nodes[child.0].children, Children::List(_)),
+                            defs,
+                        ) else {
+                            continue;
+                        };
+                        if canonical == source {
+                            continue;
+                        }
+                        let Children::Map { members, .. } = &mut self.nodes[node.0].children else {
+                            unreachable!("map membership")
+                        };
+                        if members.contains_key(canonical) {
+                            self.alias_conflicts.push(
+                                crate::schema::block_name_conflict(
+                                    &input.id.to_string(),
+                                    "",
+                                    source,
+                                    canonical,
+                                )
+                                .to_string(),
+                            );
+                            self.nodes[node.0].derived_failure = true;
+                            continue;
+                        }
+                        let index = members.get_index_of(source).expect("known source key");
+                        members.shift_remove(source);
+                        members.shift_insert(index, canonical, child);
+                        path.push(crate::parser::AttributePathSegment::StructField(
+                            source.into(),
+                        ));
+                        #[cfg(test)]
+                        crate::schema::record_block_name_path_work(path.len());
+                        renames.push((path.clone(), canonical.to_owned()));
+                        path.pop();
+                    }
+                }
+                let children = match &self.nodes[node.0].children {
+                    Children::Map { members, .. } => members
+                        .iter()
+                        .map(|(&key, &id)| (key, id))
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+                for (key, child) in children {
+                    if let Some(field) = fields.field(key) {
+                        path.push(crate::parser::AttributePathSegment::StructField(
+                            field.name.clone(),
+                        ));
+                        self.bind_node(
+                            &field.field_type,
+                            child,
+                            input,
+                            ancestry.descend(field),
+                            path,
+                            visited,
+                            selections,
+                            need_choices,
+                            renames,
+                        );
+                        path.pop();
+                    }
+                }
+            }
+            AttrTypeKind::List { element_type, .. } => {
+                let children = self.children(node).collect::<Vec<_>>();
+                for (index, child) in children.into_iter().enumerate() {
+                    path.push(crate::parser::AttributePathSegment::ListIndex(index));
+                    self.bind_node(
+                        element_type,
+                        child,
+                        input,
+                        ancestry,
+                        path,
+                        visited,
+                        selections,
+                        need_choices,
+                        renames,
+                    );
+                    path.pop();
+                }
+            }
+            AttrTypeKind::Map { value, .. } => {
+                let children = match &self.nodes[node.0].children {
+                    Children::Map { members, .. } => members
+                        .iter()
+                        .map(|(&key, &id)| (key, id))
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+                for (key, child) in children {
+                    path.push(crate::parser::AttributePathSegment::Key(key.into()));
+                    self.bind_node(
+                        value,
+                        child,
+                        input,
+                        ancestry,
+                        path,
+                        visited,
+                        selections,
+                        need_choices,
+                        renames,
+                    );
+                    path.pop();
+                }
+            }
+            AttrTypeKind::Union(_)
+            | AttrTypeKind::UnloadedSchemaType(_)
+            | AttrTypeKind::ResourceHandle { .. }
+            | AttrTypeKind::String { .. }
+            | AttrTypeKind::Reference { .. }
+            | AttrTypeKind::StringLiteralSet { .. }
+            | AttrTypeKind::Int { .. }
+            | AttrTypeKind::Float { .. }
+            | AttrTypeKind::Bool
+            | AttrTypeKind::Duration
+            | AttrTypeKind::Enum { .. } => {}
+        }
     }
 
     fn push(
@@ -999,6 +1333,12 @@ pub(super) fn with_ignore_path_work<R>(operation: impl FnOnce() -> R) -> (R, usi
 }
 
 impl<'a> NodeRef<'a> {
+    pub(super) fn union_selection(
+        &self,
+        ty: &CompiledAttributeType,
+    ) -> super::union_fits::UnionSelection {
+        self.input.graph().selections.selection(ty, self.id)
+    }
     fn raw(self) -> &'a EvidenceNode<'a> {
         &self.input.graph().nodes[self.id.0]
     }

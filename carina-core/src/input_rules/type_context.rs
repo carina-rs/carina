@@ -11,6 +11,7 @@ use crate::{
 
 #[derive(Clone, Default)]
 pub(super) struct TypeFacts {
+    pub selection: super::union_fits::InputSelectionAuthority,
     pub bindings: HashMap<AbsoluteBindingAddress, Declaration>,
     pub aliases: HashMap<AbsoluteBindingAddress, AbsoluteBindingAddress>,
     pub defaults: Vec<DefaultTagEvidence>,
@@ -133,6 +134,10 @@ pub struct InputTypeContext<S = ModuleSource> {
 }
 
 impl<S> InputTypeContext<S> {
+    pub fn with_provider_context(mut self, context: &crate::parser::LoadedProviderContext) -> Self {
+        self.facts.selection = super::union_fits::InputSelectionAuthority::in_catalog(context);
+        self
+    }
     /// Build the complete input context shared by live, saved, and bootstrap
     /// admission, including declarations and host-merged default tag keys.
     pub fn for_plan<'a, D>(

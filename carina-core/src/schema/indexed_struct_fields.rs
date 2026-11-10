@@ -15,6 +15,9 @@ struct FieldNames {
 }
 
 impl<R: PatternForm> IndexedStructFields<R> {
+    pub(crate) fn has_block_names(&self) -> bool {
+        !self.names.aliases.is_empty()
+    }
     pub fn field(&self, name: &str) -> Option<&PatternStructField<R>> {
         #[cfg(test)]
         crate::input_rules::record_declaration_lookup_work(1);

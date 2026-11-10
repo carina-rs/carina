@@ -197,9 +197,13 @@ pub(crate) struct ProtectedDesiredTree<'a> {
     resource_id: &'a ResourceId,
     attributes: &'a IndexMap<String, Value>,
     ignored: &'a crate::resource::ResolvedIgnoreChanges,
+    selection: &'a crate::input_rules::InputSelectionAuthority,
 }
 
 impl ProtectedDesiredTree<'_> {
+    pub(crate) fn selection_authority(&self) -> &crate::input_rules::InputSelectionAuthority {
+        self.selection
+    }
     pub(crate) fn id(&self) -> &ResourceId {
         self.resource_id
     }
@@ -216,6 +220,7 @@ impl ProviderReadyResource {
             resource_id: &self.id,
             attributes: &self.diagnostic_attributes,
             ignored: self.ignore_changes(),
+            selection: self.admission.selection_authority(),
         }
     }
 }
@@ -1085,6 +1090,22 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
         )?
     };
 
+    let alias_conflicts = crate::schema::resolve_resource_block_names_in_session(
+        &mut value,
+        context.schemas,
+        context.type_checks,
+    );
+    if !alias_conflicts.is_empty() {
+        return Err(ProviderPreparationError::Provider(
+            crate::provider::HostError::invalid_input(
+                alias_conflicts
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        ));
+    }
     let (normalized, restored) = apply_dispatch_desired_normalization(
         value,
         context.provider_configs,
@@ -1093,6 +1114,12 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
     )
     .await?;
     let resource = normalized.into_resource();
+    super::normalized::reject_provider_boundary_block_aliases_with_authority(
+        std::slice::from_ref(&resource),
+        context.schemas,
+        admitted.selection_authority(),
+    )
+    .map_err(ProviderPreparationError::Provider)?;
     crate::resource::assert_resource_known_for_apply(
         &resource,
         &crate::resource::knowledge::KnowledgeContext::apply(context.bindings),

@@ -7345,7 +7345,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                     provider_configs,
                     context.schemas(),
                     plan.effects().iter().map(|effect| effect.resource_id()),
-                )?;
+                )?.with_provider_context(context.provider_context());
                 let outcome = prepare_plan_outcome(
                     plan,
                     prepared.references,

@@ -6,6 +6,217 @@ use carina_core::schema::{
     InputRuleScope,
 };
 
+fn provider_selected_rule_factories() -> Vec<Box<dyn ProviderFactory>> {
+    provider_selected_rule_factories_for(InputCondition::Equals {
+        path: InputPath::new("guard").unwrap(),
+        literal: InputLiteral::Bool(true),
+    })
+}
+
+fn provider_selected_rule_factories_for(
+    condition: InputCondition,
+) -> Vec<Box<dyn ProviderFactory>> {
+    use carina_core::schema::StructField;
+    let arm = |name: &str, scalar: &str, rules| {
+        AttributeType::struct_with_rules(
+            name,
+            vec![
+                StructField::required(
+                    "kind",
+                    AttributeType::refined_string(
+                        Some(carina_core::schema::TypeIdentity::bare(scalar)),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+                StructField::optional("guard", AttributeType::bool()).build(),
+                StructField::optional("target", AttributeType::bool()).build(),
+                StructField::optional(
+                    "rules",
+                    AttributeType::list(AttributeType::struct_("Rule", vec![])),
+                )
+                .with_block_name("rule")
+                .build(),
+            ],
+            vec![],
+            rules,
+        )
+    };
+    let required = InputRule::value(
+        InputRuleScope::EveryWrite,
+        InputPath::new("target").unwrap(),
+        InputRuleCode::new("test.union_target").unwrap(),
+        InputPredicate::Present,
+    )
+    .with_condition(condition);
+    let schema = ResourceSchema::new("test.Conditional")
+        .attribute(
+            AttributeSchema::optional(
+                "node",
+                AttributeType::union(vec![
+                    arm("A", "VpcId", vec![]),
+                    arm("B", "SubnetId", vec![required]),
+                ]),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    vec![Box::new(WasmStyleProviderFactory {
+        name: "awsccmock".into(),
+        schemas: vec![schema],
+    })]
+}
+
+fn provider_selected_rule_fixture() -> TempDir {
+    write_fixture(&[
+        ("providers.crn", "provider awsccmock {}\n"),
+        (
+            "main.crn",
+            "let example = awsccmock.test.Conditional { node = { kind = 'subnet-b', guard = true } }\n",
+        ),
+    ])
+}
+
+#[test]
+fn provider_selected_union_rules_are_reported_by_cli() {
+    let fixture = provider_selected_rule_fixture();
+    let errors = cli_diagnostics(provider_selected_rule_factories(), &fixture);
+    assert_eq!(
+        errors
+            .iter()
+            .flat_map(|text| text.lines())
+            .filter(|text| text.contains("[test.union_target]"))
+            .count(),
+        1,
+        "provider callback rejects A and admits B; B's rule must survive: {errors:#?}"
+    );
+}
+
+#[test]
+fn provider_selected_union_rules_are_reported_by_lsp() {
+    let fixture = provider_selected_rule_fixture();
+    let loaded = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(provider_selected_rule_factories()),
+        SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
+    );
+    let engine = DiagnosticEngine::new(Arc::new(loaded), vec!["awsccmock".into()]);
+    let diagnostics = lsp_diagnostics(&engine, &fixture, "main.crn");
+    let findings = diagnostics
+        .iter()
+        .filter(|finding| finding.message.contains("[test.union_target]"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        findings.len(),
+        1,
+        "provider-selected B must retain its rule: {diagnostics:#?}"
+    );
+    assert_eq!(findings[0].severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn provider_selected_union_aliases_and_secrets_have_directory_parity() {
+    for body in [
+        "{ kind = 'subnet-b', rules = [{}] }",
+        "{ kind = 'subnet-b', rule {} }",
+        "secret({ kind = 'subnet-b', rules = [{}] })",
+        "secret({ kind = 'subnet-b', rule {} })",
+    ] {
+        let main = format!("let example = awsccmock.test.Conditional {{\n node = {body}\n}}\n");
+        let fixture = write_fixture(&[
+            ("providers.crn", "provider awsccmock {}\n"),
+            ("main.crn", &main),
+        ]);
+        let factories = || {
+            provider_selected_rule_factories_for(InputCondition::Present(
+                InputPath::new("rules").unwrap(),
+            ))
+        };
+        let errors = cli_diagnostics(factories(), &fixture);
+        let message = errors
+            .iter()
+            .flat_map(|text| text.lines())
+            .find(|text| text.contains("[test.union_target]"))
+            .unwrap_or_else(|| panic!("{body}: missing provider-selected alias rule: {errors:#?}"));
+        let loaded = carina_core::provider::loaded_provider_snapshot_from_factories(
+            Arc::new(factories()),
+            SchemaRegistry::new(),
+            carina_core::EnvironmentSnapshot::empty(),
+        );
+        let engine = DiagnosticEngine::new(Arc::new(loaded), vec!["awsccmock".into()]);
+        let diagnostics = lsp_diagnostics(&engine, &fixture, "main.crn");
+        let findings = diagnostics
+            .iter()
+            .filter(|finding| finding.message == message)
+            .collect::<Vec<_>>();
+        assert_eq!(findings.len(), 1, "{body}: {diagnostics:#?}");
+        assert_eq!(findings[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(findings[0].range.start.line, 1);
+    }
+}
+
+#[test]
+fn block_aliases_in_maps_and_secrets_have_directory_cli_lsp_parity() {
+    use carina_core::schema::StructField;
+    let entry = AttributeType::struct_with_rules(
+        "Entry",
+        vec![
+            StructField::optional(
+                "rules",
+                AttributeType::list(AttributeType::struct_("Rule", vec![])),
+            )
+            .with_block_name("rule")
+            .build(),
+            StructField::optional("target", AttributeType::bool()).build(),
+        ],
+        vec![],
+        vec![
+            InputRule::value(
+                InputRuleScope::EveryWrite,
+                InputPath::new("target").unwrap(),
+                InputRuleCode::new("test.map_target").unwrap(),
+                InputPredicate::Present,
+            )
+            .with_condition(InputCondition::Present(InputPath::new("rules").unwrap())),
+        ],
+    );
+    let schemas = single_schema_map(
+        ResourceSchema::new("test.Conditional")
+            .attribute(AttributeSchema::optional("entries", AttributeType::map(entry)).build()),
+    );
+    for (entries, protected) in [
+        ("{ one = { rules = [{}] } }", false),
+        ("{ one = { rule {} } }", false),
+        ("secret({ 'private-key' = { rules = [{}] } })", true),
+        ("secret({ 'private-key' = { rule {} } })", true),
+    ] {
+        let main = format!("let example = test.test.Conditional {{\n entries = {entries}\n}}\n");
+        let fixture =
+            write_fixture(&[("providers.crn", "provider test {}\n"), ("main.crn", &main)]);
+        let errors = cli_diagnostics(factories_for(&schemas), &fixture);
+        let message = errors
+            .iter()
+            .flat_map(|text| text.lines())
+            .find(|text| text.contains("[test.map_target]"))
+            .unwrap_or_else(|| panic!("missing map rule for {entries}: {errors:#?}"));
+        let diagnostics =
+            lsp_diagnostics(&engine_with_schemas(schemas.clone()), &fixture, "main.crn");
+        let findings = diagnostics
+            .iter()
+            .filter(|finding| finding.message == message)
+            .collect::<Vec<_>>();
+        assert_eq!(findings.len(), 1, "{entries}: {diagnostics:#?}");
+        assert_eq!(findings[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(findings[0].range.start.line, 1);
+        if protected {
+            assert!(!message.contains("private-key"), "{message}");
+        }
+    }
+}
+
 #[test]
 fn missing_intermediate_objects_have_cli_lsp_directory_parity_at_the_nearest_parent() {
     use carina_core::schema::StructField;

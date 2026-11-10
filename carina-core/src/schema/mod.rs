@@ -12919,14 +12919,14 @@ impl fmt::Display for BlockNameConflict {
 }
 
 #[derive(Clone, Copy)]
-struct BlockFieldRef<'a> {
+pub(crate) struct BlockFieldRef<'a> {
     name: &'a str,
     block_name: Option<&'a str>,
     field_type: &'a CompiledAttributeType,
     child_ancestry: FieldAncestry,
 }
 
-struct BlockFields<'a> {
+pub(crate) struct BlockFields<'a> {
     ordered: Vec<BlockFieldRef<'a>>,
     canonical: HashMap<&'a str, usize>,
     aliases: HashMap<&'a str, usize>,
@@ -12953,6 +12953,56 @@ impl<'a> FromIterator<BlockFieldRef<'a>> for BlockFields<'a> {
     }
 }
 impl<'a> BlockFields<'a> {
+    pub(crate) fn for_resource(schema: &'a CompiledResourceSchema) -> Self {
+        block_fields(schema)
+    }
+    pub(crate) fn for_struct(
+        fields: &'a IndexedStructFields<Compiled>,
+        ancestry: FieldAncestry,
+    ) -> Self {
+        fields
+            .iter()
+            .map(|field| BlockFieldRef {
+                name: &field.name,
+                block_name: ancestry.block_name(field),
+                field_type: &field.field_type,
+                child_ancestry: ancestry.descend(field),
+            })
+            .collect()
+    }
+    pub(crate) fn canonical_name(
+        &self,
+        key: &str,
+        is_list: bool,
+        defs: &BTreeMap<String, CompiledAttributeType>,
+    ) -> Option<&'a str> {
+        self.selected_field(key, is_list, defs)
+            .map(|field| field.name)
+    }
+    fn selected_field(
+        &self,
+        key: &str,
+        is_list: bool,
+        defs: &BTreeMap<String, CompiledAttributeType>,
+    ) -> Option<BlockFieldRef<'a>> {
+        let (canonical, alias) = self.candidates(key);
+        match (canonical, alias) {
+            // Parser blocks are lists. A concrete list selects the alias only
+            // when the real field with that name cannot itself accept a list.
+            (Some(canonical), Some(alias))
+                if is_list
+                    && !matches!(
+                        canonical.field_type.shape_with_defs(defs),
+                        Shape::List { .. }
+                    ) =>
+            {
+                Some(alias)
+            }
+            (Some(canonical), _) => Some(canonical),
+            (None, Some(alias)) => Some(alias),
+            (None, None) => None,
+        }
+    }
     fn candidates(&self, key: &str) -> (Option<BlockFieldRef<'a>>, Option<BlockFieldRef<'a>>) {
         #[cfg(test)]
         crate::input_rules::record_declaration_lookup_work(2);
@@ -12976,7 +13026,35 @@ enum BlockFieldMatch<'a> {
     Alias(BlockFieldRef<'a>),
 }
 
+#[cfg(test)]
+thread_local! { static BLOCK_NAME_PATH_WORK: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
+
+#[cfg(test)]
+pub(crate) fn record_block_name_path_work(count: usize) {
+    BLOCK_NAME_PATH_WORK.with(|work| {
+        if let Some(current) = work.get() {
+            work.set(Some(current + count));
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn with_block_name_path_work<R>(operation: impl FnOnce() -> R) -> (R, usize) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BLOCK_NAME_PATH_WORK.set(None);
+        }
+    }
+    BLOCK_NAME_PATH_WORK.set(Some(0));
+    let _reset = Reset;
+    let result = operation();
+    (result, BLOCK_NAME_PATH_WORK.get().unwrap())
+}
+
 fn nested_path(parent: &str, name: &str) -> String {
+    #[cfg(test)]
+    record_block_name_path_work(parent.len() + name.len() + 1);
     if parent.is_empty() {
         name.to_string()
     } else {
@@ -12990,30 +13068,22 @@ fn match_block_field<'a, P: PlaceholderKind, B: BindingAddress>(
     fields: &BlockFields<'a>,
     defs: &BTreeMap<String, CompiledAttributeType>,
 ) -> Option<BlockFieldMatch<'a>> {
-    let (canonical, alias) = fields.candidates(key);
-
-    match (canonical, alias) {
-        // In the otherwise ambiguous case, a concrete list belongs to the
-        // aliased field when the real field cannot itself accept a list. This
-        // covers parser-produced block syntax as well as expressions already
-        // inlined to lists in the authored snapshot. Every other value shape,
-        // and a real list field, keeps the real-field meaning.
-        (Some(canonical), Some(alias))
-            if matches!(value, Value::Concrete(ConcreteValue::List(_)))
-                && !matches!(
-                    canonical.field_type.shape_with_defs(defs),
-                    Shape::List { .. }
-                ) =>
-        {
-            Some(BlockFieldMatch::Alias(alias))
-        }
-        (Some(_), _) => Some(BlockFieldMatch::Canonical),
-        (None, Some(alias)) => Some(BlockFieldMatch::Alias(alias)),
-        (None, None) => None,
-    }
+    fields
+        .selected_field(
+            key,
+            matches!(value, Value::Concrete(ConcreteValue::List(_))),
+            defs,
+        )
+        .map(|field| {
+            if field.name == key {
+                BlockFieldMatch::Canonical
+            } else {
+                BlockFieldMatch::Alias(field)
+            }
+        })
 }
 
-fn block_name_conflict(
+pub(crate) fn block_name_conflict(
     resource_id: &str,
     parent_path: &str,
     alias: &str,
@@ -13045,17 +13115,97 @@ fn value_for_field<'a, P: PlaceholderKind, B: BindingAddress>(
     .then_some(value)
 }
 
-fn resolve_block_names_in_map<P: PlaceholderKind, B: BindingAddress, AB: BindingAddress>(
+fn opened_block_fit<'f, 'schema>(mut fit: Option<&'f Fit<'schema>>) -> Option<&'f Fit<'schema>> {
+    while let Some(Fit {
+        kind: FitKind::Secret(inner),
+        ..
+    }) = fit
+    {
+        fit = Some(inner);
+    }
+    fit
+}
+
+fn block_authored_value<P: PlaceholderKind, B: BindingAddress>(
+    mut value: Option<&Value<P, B>>,
+) -> Option<&Value<P, B>> {
+    while let Some(Value::Deferred(DeferredValue::Secret(payload))) = value {
+        value = Some(payload.expose_plaintext());
+    }
+    value
+}
+
+fn block_union_fit<'schema, P: PlaceholderKind, B: BindingAddress>(
+    attr_type: &'schema CompiledAttributeType,
+    value: &Value<P, B>,
+    context: BlockNameResolutionContext<'schema>,
+) -> Option<value_validation::SelectedInputUnion<'schema>> {
+    let resolved = attr_type.resolve_refs_with_defs(context.defs).as_attr();
+    let RawShape::Union(members) = resolved.raw_shape() else {
+        return None;
+    };
+    let proof = value
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .ok()?
+        .into_classification();
+    if !matches!(proof, crate::resource::knowledge::Classification::Known(_)) {
+        return None;
+    }
+    match context.authority.admit(
+        members,
+        &proof,
+        context.defs,
+        context.owner,
+        &mut Vec::new(),
+    ) {
+        crate::input_rules::InputUnionAdmission::Selected(selected) => Some(selected),
+        crate::input_rules::InputUnionAdmission::Withheld
+        | crate::input_rules::InputUnionAdmission::Rejected => None,
+    }
+}
+
+fn block_struct_fits<'fit, 'schema, P: PlaceholderKind, B: BindingAddress>(
+    map: &IndexMap<String, Value<P, B>>,
+    fields: &BlockFields<'_>,
+    fit: Option<&'fit Fit<'schema>>,
+    defs: &BTreeMap<String, CompiledAttributeType>,
+) -> HashMap<String, &'fit Fit<'schema>> {
+    let Some(Fit {
+        kind: FitKind::Struct(fits),
+        ..
+    }) = opened_block_fit(fit)
+    else {
+        return HashMap::new();
+    };
+    map.iter()
+        .zip(fits)
+        .filter_map(|((key, value), fit)| {
+            fields
+                .canonical_name(
+                    key,
+                    matches!(value, Value::Concrete(ConcreteValue::List(_))),
+                    defs,
+                )
+                .map(|canonical| (canonical.to_owned(), fit))
+        })
+        .collect()
+}
+
+fn resolve_block_names_in_map<
+    'schema,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    AB: BindingAddress,
+>(
     map: &mut IndexMap<String, Value<P, B>>,
     authored_map: Option<&IndexMap<String, Value<P, AB>>>,
-    fields: &BlockFields<'_>,
-    context: BlockNameResolutionContext<'_>,
-    parent_path: BlockNamePath<'_>,
-    conflicts: &mut Vec<BlockNameConflict>,
+    fields: &BlockFields<'schema>,
+    context: BlockNameResolutionContext<'schema>,
+    edits: &mut BlockNameEdits,
+    fit: Option<&Fit<'schema>>,
 ) {
-    // Preserve the source map's order, matching the pre-walker resolver: each
-    // renamed key is removed in authored order and appended under its canonical
-    // spelling in that same order.
+    let fits = block_struct_fits(map, fields, fit, context.defs);
+    // Keep the established authored rename order and canonical append order.
     let keys = map.keys().cloned().collect::<Vec<_>>();
     for key in keys {
         let Some(value) = map.get(&key) else {
@@ -13068,156 +13218,277 @@ fn resolve_block_names_in_map<P: PlaceholderKind, B: BindingAddress, AB: Binding
         let Some(BlockFieldMatch::Alias(field)) = field_match else {
             continue;
         };
-
         if map.contains_key(field.name) {
-            conflicts.push(block_name_conflict(
+            edits.conflicts.push(block_name_conflict(
                 context.resource_id,
-                parent_path.display,
+                &edits.path.display(),
                 &key,
                 field.name,
             ));
             continue;
         }
         if let Some(value) = map.shift_remove(&key) {
-            let mut path = parent_path.attributes.to_vec();
-            path.push(if path.is_empty() {
-                crate::parser::AttributePathSegment::Attribute(key.clone())
-            } else {
-                crate::parser::AttributePathSegment::StructField(key.clone())
-            });
-            context
+            edits.path.push_field(&key);
+            edits
                 .renames
-                .borrow_mut()
-                .push((path, field.name.to_string()));
-            map.insert(field.name.to_string(), value);
+                .push((edits.path.source_path(), field.name.to_owned()));
+            edits.path.pop();
+            map.insert(field.name.to_owned(), value);
         }
     }
-
     for field in fields {
-        let authored_value = authored_map
-            .and_then(|authored| value_for_field(authored, *field, fields, context.defs));
+        if !context.declarations.aliases_reachable(field.field_type) {
+            continue;
+        }
+        let authored =
+            authored_map.and_then(|map| value_for_field(map, *field, fields, context.defs));
         let Some(value) = map.get_mut(field.name) else {
             continue;
         };
-        let mut child_path = parent_path.attributes.to_vec();
-        child_path.push(if child_path.is_empty() {
-            crate::parser::AttributePathSegment::Attribute(field.name.to_string())
-        } else {
-            crate::parser::AttributePathSegment::StructField(field.name.to_string())
-        });
+        edits.path.push_field(field.name);
         resolve_block_names_in_value(
             value,
-            authored_value,
+            authored,
             field.field_type,
             field.child_ancestry,
             context,
-            BlockNamePath {
-                display: &nested_path(parent_path.display, field.name),
-                attributes: &child_path,
-            },
-            conflicts,
+            edits,
+            fits.get(field.name).copied(),
         );
+        edits.path.pop();
     }
 }
 
-fn resolve_block_names_in_value<P: PlaceholderKind, B: BindingAddress, AB: BindingAddress>(
+fn resolve_block_names_in_value<
+    'schema,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    AB: BindingAddress,
+>(
     value: &mut Value<P, B>,
     authored_value: Option<&Value<P, AB>>,
-    attr_type: &PatternAttributeType<Compiled>,
+    attr_type: &'schema CompiledAttributeType,
     ancestry: FieldAncestry,
-    context: BlockNameResolutionContext<'_>,
-    path: BlockNamePath<'_>,
-    conflicts: &mut Vec<BlockNameConflict>,
+    context: BlockNameResolutionContext<'schema>,
+    edits: &mut BlockNameEdits,
+    fit: Option<&Fit<'schema>>,
 ) {
+    let fit = opened_block_fit(fit);
+    let authored_value = block_authored_value(authored_value);
+    if let Value::Deferred(DeferredValue::Secret(payload)) = value {
+        let old_scope = edits.path.secret;
+        edits.path.secret = true;
+        payload.canonicalize_schema_aliases(|inner| {
+            resolve_block_names_in_value(
+                inner,
+                authored_value,
+                attr_type,
+                ancestry,
+                context,
+                edits,
+                fit,
+            )
+        });
+        edits.path.secret = old_scope;
+        return;
+    }
     match attr_type.shape_with_defs(context.defs) {
         Shape::Struct { .. } => {
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
                 return;
             };
-            let Some(struct_fields) = struct_fields_with_defs(attr_type, context.defs) else {
+            let Some(fields) = struct_fields_with_defs(attr_type, context.defs) else {
                 return;
             };
-            let fields = struct_fields
-                .iter()
-                .map(|field| BlockFieldRef {
-                    name: &field.name,
-                    block_name: ancestry.block_name(field),
-                    field_type: &field.field_type,
-                    child_ancestry: ancestry.descend(field),
-                })
-                .collect::<BlockFields<'_>>();
-            let authored_map = match authored_value {
+            let fields = BlockFields::for_struct(fields, ancestry);
+            let authored = match authored_value {
                 Some(Value::Concrete(ConcreteValue::Map(map))) => Some(map),
                 _ => None,
             };
-            resolve_block_names_in_map(map, authored_map, &fields, context, path, conflicts);
+            resolve_block_names_in_map(map, authored, &fields, context, edits, fit);
         }
         Shape::List { element_type, .. } => {
-            if !matches!(
-                element_type.shape_with_defs(context.defs),
-                Shape::Struct { .. }
-            ) {
-                return;
-            }
             let Value::Concrete(ConcreteValue::List(items)) = value else {
                 return;
             };
-            let Some(struct_fields) = struct_fields_with_defs(element_type, context.defs) else {
-                return;
+            let authored = match authored_value {
+                Some(Value::Concrete(ConcreteValue::List(items))) => Some(items),
+                _ => None,
             };
-            let fields = struct_fields
-                .iter()
-                .map(|field| BlockFieldRef {
-                    name: &field.name,
-                    block_name: ancestry.block_name(field),
-                    field_type: &field.field_type,
-                    child_ancestry: ancestry.descend(field),
-                })
-                .collect::<BlockFields<'_>>();
-            let authored_items = match authored_value {
-                Some(Value::Concrete(ConcreteValue::List(items))) => Some(items.as_slice()),
+            let fits = match fit {
+                Some(Fit {
+                    kind: FitKind::List(fits) | FitKind::StringList(fits),
+                    ..
+                }) => Some(fits),
                 _ => None,
             };
             for (index, item) in items.iter_mut().enumerate() {
-                let Value::Concrete(ConcreteValue::Map(map)) = item else {
-                    continue;
-                };
-                let authored_map = authored_items
-                    .and_then(|authored| authored.get(index))
-                    .and_then(|item| match item {
-                        Value::Concrete(ConcreteValue::Map(map)) => Some(map),
-                        _ => None,
-                    });
-                let mut item_path = path.attributes.to_vec();
-                item_path.push(crate::parser::AttributePathSegment::ListIndex(index));
-                resolve_block_names_in_map(
-                    map,
-                    authored_map,
-                    &fields,
+                edits.path.push_index(index);
+                resolve_block_names_in_value(
+                    item,
+                    authored.and_then(|items| items.get(index)),
+                    element_type,
+                    ancestry,
                     context,
-                    BlockNamePath {
-                        display: &format!("{}[{index}]", path.display),
-                        attributes: &item_path,
-                    },
-                    conflicts,
+                    edits,
+                    fits.and_then(|fits| fits.get(index)),
+                );
+                edits.path.pop();
+            }
+        }
+        Shape::Map {
+            value: value_type, ..
+        } => {
+            let Value::Concrete(ConcreteValue::Map(map)) = value else {
+                return;
+            };
+            let authored = match authored_value {
+                Some(Value::Concrete(ConcreteValue::Map(map))) => Some(map),
+                _ => None,
+            };
+            let fits = match fit {
+                Some(Fit {
+                    kind: FitKind::Map(fits),
+                    ..
+                }) => Some(fits),
+                _ => None,
+            };
+            for (index, (key, value)) in map.iter_mut().enumerate() {
+                edits.path.push_key(key);
+                resolve_block_names_in_value(
+                    value,
+                    authored.and_then(|map| map.get(key)),
+                    value_type,
+                    ancestry,
+                    context,
+                    edits,
+                    fits.and_then(|fits| fits.get(index)).map(|fit| &fit.value),
+                );
+                edits.path.pop();
+            }
+        }
+        Shape::Union => {
+            if let Some(Fit {
+                kind: FitKind::Union { member, fit },
+                ..
+            }) = fit
+            {
+                resolve_block_names_in_value(
+                    value,
+                    authored_value,
+                    member,
+                    ancestry,
+                    context,
+                    edits,
+                    Some(fit),
+                );
+            } else if let Some(selected) = block_union_fit(attr_type, value, context) {
+                resolve_block_names_in_value(
+                    value,
+                    authored_value,
+                    selected.member,
+                    ancestry,
+                    context,
+                    edits,
+                    Some(&selected.fit),
                 );
             }
         }
-        _ => {}
+        Shape::UnloadedSchemaType(_)
+        | Shape::Reference { .. }
+        | Shape::String { .. }
+        | Shape::Int { .. }
+        | Shape::Float { .. }
+        | Shape::Bool
+        | Shape::Duration
+        | Shape::Enum { .. } => {}
     }
 }
 
-#[derive(Clone, Copy)]
-struct BlockNamePath<'a> {
-    display: &'a str,
-    attributes: &'a [crate::parser::AttributePathSegment],
+#[derive(Default)]
+struct BlockNameEdits {
+    path: BlockNamePath,
+    renames: Vec<AttributePathRename>,
+    conflicts: Vec<BlockNameConflict>,
+}
+
+#[derive(Default)]
+struct BlockNamePath {
+    attributes: Vec<crate::parser::AttributePathSegment>,
+    protected: Vec<usize>,
+    secret: bool,
+}
+impl BlockNamePath {
+    fn push_field(&mut self, name: &str) {
+        #[cfg(test)]
+        record_block_name_path_work(name.len() + 1);
+        self.attributes.push(if self.attributes.is_empty() {
+            crate::parser::AttributePathSegment::Attribute(name.to_owned())
+        } else {
+            crate::parser::AttributePathSegment::StructField(name.to_owned())
+        });
+    }
+    fn push_index(&mut self, index: usize) {
+        #[cfg(test)]
+        record_block_name_path_work(1);
+        self.attributes
+            .push(crate::parser::AttributePathSegment::ListIndex(index));
+    }
+    fn push_key(&mut self, key: &str) {
+        #[cfg(test)]
+        record_block_name_path_work(key.len() + 1);
+        if self.secret {
+            self.protected.push(self.attributes.len());
+        }
+        self.attributes
+            .push(crate::parser::AttributePathSegment::Key(key.to_owned()));
+    }
+    fn pop(&mut self) {
+        if self.protected.last().copied() == self.attributes.len().checked_sub(1) {
+            self.protected.pop();
+        }
+        self.attributes.pop();
+    }
+    fn source_path(&self) -> Vec<crate::parser::AttributePathSegment> {
+        #[cfg(test)]
+        record_block_name_path_work(self.attributes.len());
+        self.attributes.clone()
+    }
+    fn display(&self) -> String {
+        use crate::parser::AttributePathSegment as Segment;
+        use std::fmt::Write;
+        let mut text = String::new();
+        let mut protected = self.protected.iter().copied().peekable();
+        for (index, segment) in self.attributes.iter().enumerate() {
+            #[cfg(test)]
+            record_block_name_path_work(1);
+            match segment {
+                Segment::Attribute(name) | Segment::StructField(name) => {
+                    let nested = !text.is_empty();
+                    write_path_field(&mut text, name, nested).expect("write String");
+                }
+                Segment::ListIndex(index) => write!(text, "[{index}]").expect("write String"),
+                Segment::Key(key) => {
+                    if protected.peek() == Some(&index) {
+                        protected.next();
+                        text.push_str("[\"<secret>\"]");
+                    } else {
+                        write!(text, "[{key:?}]").expect("write String");
+                    }
+                }
+            }
+        }
+        text
+    }
 }
 
 #[derive(Clone, Copy)]
 struct BlockNameResolutionContext<'a> {
     defs: &'a BTreeMap<String, CompiledAttributeType>,
+    declarations: &'a crate::input_rules::InputRuleDeclarations,
     resource_id: &'a str,
-    renames: &'a std::cell::RefCell<Vec<AttributePathRename>>,
+    owner: &'a str,
+    authority: &'a crate::input_rules::InputSelectionAuthority,
 }
 
 type AttributePathRename = (Vec<crate::parser::AttributePathSegment>, String);
@@ -13240,7 +13511,7 @@ fn resolve_attribute_block_names<P: PlaceholderKind, B: BindingAddress>(
     attributes: &mut IndexMap<String, Value<P, B>>,
     declaration: &mut crate::parser::DeclarationProvenance,
     authored_attributes: Option<&IndexMap<String, Value<P, B>>>,
-    schema: &CompiledResourceSchema,
+    schema: &ValidatedResourceSchema,
 ) -> Vec<BlockNameConflict> {
     resolve_attribute_block_names_with_authored(
         resource_id,
@@ -13260,140 +13531,276 @@ fn resolve_attribute_block_names_with_authored<
     attributes: &mut IndexMap<String, Value<P, B>>,
     declaration: &mut crate::parser::DeclarationProvenance,
     authored_attributes: Option<&IndexMap<String, Value<P, AB>>>,
-    schema: &CompiledResourceSchema,
+    schema: &ValidatedResourceSchema,
 ) -> Vec<BlockNameConflict> {
-    let fields = block_fields(schema);
-    let mut conflicts = Vec::new();
-    let renames = std::cell::RefCell::new(Vec::new());
-    let resource_id = resource_id.to_string();
+    resolve_attribute_block_names_with_authority(
+        resource_id,
+        attributes,
+        declaration,
+        authored_attributes,
+        schema,
+        &crate::input_rules::InputSelectionAuthority::default(),
+    )
+}
+
+fn resolve_attribute_block_names_with_authority<
+    P: PlaceholderKind,
+    B: BindingAddress,
+    AB: BindingAddress,
+>(
+    resource_id: &ResourceId,
+    attributes: &mut IndexMap<String, Value<P, B>>,
+    declaration: &mut crate::parser::DeclarationProvenance,
+    authored_attributes: Option<&IndexMap<String, Value<P, AB>>>,
+    schema: &ValidatedResourceSchema,
+    authority: &crate::input_rules::InputSelectionAuthority,
+) -> Vec<BlockNameConflict> {
+    let fields = block_fields(schema.as_schema());
+    let mut edits = BlockNameEdits::default();
     resolve_block_names_in_map(
         attributes,
         authored_attributes,
         &fields,
         BlockNameResolutionContext {
-            defs: &schema.defs,
-            resource_id: &resource_id,
-            renames: &renames,
+            defs: schema.as_schema().defs(),
+            declarations: schema.input_rule_declarations(),
+            resource_id: &resource_id.to_string(),
+            owner: &resource_id.provider,
+            authority,
         },
-        BlockNamePath {
-            display: "",
-            attributes: &[],
-        },
-        &mut conflicts,
+        &mut edits,
+        None,
     );
-    for (path, name) in renames.into_inner() {
-        declaration.rename_attribute_path(&path, &name);
-    }
-    conflicts
+    declaration.rename_attribute_paths(edits.renames);
+    edits.conflicts
 }
 
-fn find_block_name_alias_in_map<P: PlaceholderKind, B: BindingAddress>(
+pub(crate) fn resolve_resource_block_names_in_session<
+    S,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    D,
+>(
+    resource: &mut Resource<S, P, B, D>,
+    schemas: &SchemaRegistry,
+    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+) -> Vec<BlockNameConflict> {
+    let Some(schema) = schemas.get_for(resource) else {
+        return Vec::new();
+    };
+    resolve_attribute_block_names_with_authority(
+        &resource.id,
+        &mut resource.attributes,
+        &mut resource.declaration,
+        None::<&IndexMap<String, Value<P, B>>>,
+        schema.schema(),
+        &crate::input_rules::InputSelectionAuthority::in_catalog(session.catalog()),
+    )
+}
+
+fn find_block_name_alias_in_map<'schema, P: PlaceholderKind, B: BindingAddress>(
     map: &IndexMap<String, Value<P, B>>,
-    fields: &BlockFields<'_>,
-    defs: &BTreeMap<String, CompiledAttributeType>,
-    resource_id: &str,
-    parent_path: &str,
+    fields: &BlockFields<'schema>,
+    context: BlockNameResolutionContext<'schema>,
+    path: &mut BlockNamePath,
+    fit: Option<&Fit<'schema>>,
 ) -> Option<BlockNameConflict> {
     for (key, value) in map {
-        if let Some(BlockFieldMatch::Alias(field)) = match_block_field(key, value, fields, defs) {
+        if let Some(BlockFieldMatch::Alias(field)) =
+            match_block_field(key, value, fields, context.defs)
+        {
             return Some(block_name_conflict(
-                resource_id,
-                parent_path,
+                context.resource_id,
+                &path.display(),
                 key,
                 field.name,
             ));
         }
     }
-
+    let fits = block_struct_fits(map, fields, fit, context.defs);
     for field in fields {
+        if !context.declarations.aliases_reachable(field.field_type) {
+            continue;
+        }
         let Some(value) = map.get(field.name) else {
             continue;
         };
-        if let Some(alias) = find_block_name_alias_in_value(
+        path.push_field(field.name);
+        let found = find_block_name_alias_in_value(
             value,
             field.field_type,
-            defs,
             field.child_ancestry,
-            resource_id,
-            &nested_path(parent_path, field.name),
-        ) {
-            return Some(alias);
+            context,
+            path,
+            fits.get(field.name).copied(),
+        );
+        path.pop();
+        if found.is_some() {
+            return found;
         }
     }
     None
 }
 
-fn find_block_name_alias_in_value<P: PlaceholderKind, B: BindingAddress>(
+fn find_block_name_alias_in_value<'schema, P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
-    attr_type: &PatternAttributeType<Compiled>,
-    defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
+    attr_type: &'schema CompiledAttributeType,
     ancestry: FieldAncestry,
-    resource_id: &str,
-    path: &str,
+    context: BlockNameResolutionContext<'schema>,
+    path: &mut BlockNamePath,
+    fit: Option<&Fit<'schema>>,
 ) -> Option<BlockNameConflict> {
-    match attr_type.shape_with_defs(defs) {
+    let fit = opened_block_fit(fit);
+    if let Value::Deferred(DeferredValue::Secret(payload)) = value {
+        let old_scope = path.secret;
+        path.secret = true;
+        let found = find_block_name_alias_in_value(
+            payload.expose_plaintext(),
+            attr_type,
+            ancestry,
+            context,
+            path,
+            fit,
+        );
+        path.secret = old_scope;
+        return found;
+    }
+    match attr_type.shape_with_defs(context.defs) {
         Shape::Struct { .. } => {
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
                 return None;
             };
-            let fields = struct_fields_with_defs(attr_type, defs)?
-                .iter()
-                .map(|field| BlockFieldRef {
-                    name: &field.name,
-                    block_name: ancestry.block_name(field),
-                    field_type: &field.field_type,
-                    child_ancestry: ancestry.descend(field),
-                })
-                .collect::<BlockFields<'_>>();
-            find_block_name_alias_in_map(map, &fields, defs, resource_id, path)
+            let fields = BlockFields::for_struct(
+                struct_fields_with_defs(attr_type, context.defs)?,
+                ancestry,
+            );
+            find_block_name_alias_in_map(map, &fields, context, path, fit)
         }
-        Shape::List { element_type, .. }
-            if matches!(element_type.shape_with_defs(defs), Shape::Struct { .. }) =>
-        {
+        Shape::List { element_type, .. } => {
             let Value::Concrete(ConcreteValue::List(items)) = value else {
                 return None;
             };
-            let fields = struct_fields_with_defs(element_type, defs)?
-                .iter()
-                .map(|field| BlockFieldRef {
-                    name: &field.name,
-                    block_name: ancestry.block_name(field),
-                    field_type: &field.field_type,
-                    child_ancestry: ancestry.descend(field),
-                })
-                .collect::<BlockFields<'_>>();
-            items.iter().enumerate().find_map(|(index, item)| {
-                let Value::Concrete(ConcreteValue::Map(map)) = item else {
-                    return None;
-                };
-                find_block_name_alias_in_map(
-                    map,
-                    &fields,
-                    defs,
-                    resource_id,
-                    &format!("{path}[{index}]"),
-                )
-            })
+            let fits = match fit {
+                Some(Fit {
+                    kind: FitKind::List(fits) | FitKind::StringList(fits),
+                    ..
+                }) => Some(fits),
+                _ => None,
+            };
+            for (index, value) in items.iter().enumerate() {
+                path.push_index(index);
+                let found = find_block_name_alias_in_value(
+                    value,
+                    element_type,
+                    ancestry,
+                    context,
+                    path,
+                    fits.and_then(|fits| fits.get(index)),
+                );
+                path.pop();
+                if found.is_some() {
+                    return found;
+                }
+            }
+            None
         }
-        _ => None,
+        Shape::Map {
+            value: value_type, ..
+        } => {
+            let Value::Concrete(ConcreteValue::Map(map)) = value else {
+                return None;
+            };
+            let fits = match fit {
+                Some(Fit {
+                    kind: FitKind::Map(fits),
+                    ..
+                }) => Some(fits),
+                _ => None,
+            };
+            for (index, (key, value)) in map.iter().enumerate() {
+                path.push_key(key);
+                let found = find_block_name_alias_in_value(
+                    value,
+                    value_type,
+                    ancestry,
+                    context,
+                    path,
+                    fits.and_then(|fits| fits.get(index)).map(|fit| &fit.value),
+                );
+                path.pop();
+                if found.is_some() {
+                    return found;
+                }
+            }
+            None
+        }
+        Shape::Union => {
+            if let Some(Fit {
+                kind: FitKind::Union { member, fit },
+                ..
+            }) = fit
+            {
+                find_block_name_alias_in_value(value, member, ancestry, context, path, Some(fit))
+            } else if let Some(selected) = block_union_fit(attr_type, value, context) {
+                find_block_name_alias_in_value(
+                    value,
+                    selected.member,
+                    ancestry,
+                    context,
+                    path,
+                    Some(&selected.fit),
+                )
+            } else {
+                None
+            }
+        }
+        Shape::UnloadedSchemaType(_)
+        | Shape::Reference { .. }
+        | Shape::String { .. }
+        | Shape::Int { .. }
+        | Shape::Float { .. }
+        | Shape::Bool
+        | Shape::Duration
+        | Shape::Enum { .. } => None,
     }
 }
 
-/// Find the first block alias without cloning or mutating the resource.
-///
-/// This uses the same field matcher as the rename pass, including the narrow
-/// ambiguous-name rule for parser-produced lists. Union values are left to
-/// normal schema validation.
+/// Find the first provable block alias with shared declaration/fit facts and
+/// protected, lazily rendered paths. Unavailable union authority never guesses.
+#[cfg(test)]
 pub(crate) fn find_resource_block_name_alias<S, P: PlaceholderKind, B: BindingAddress, D>(
     resource: &Resource<S, P, B, D>,
-    schema: &CompiledResourceSchema,
+    schema: &ValidatedResourceSchema,
+) -> Option<BlockNameConflict> {
+    find_resource_block_name_alias_with_authority(
+        resource,
+        schema,
+        &crate::input_rules::InputSelectionAuthority::default(),
+    )
+}
+
+pub(crate) fn find_resource_block_name_alias_with_authority<
+    S,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    D,
+>(
+    resource: &Resource<S, P, B, D>,
+    schema: &ValidatedResourceSchema,
+    authority: &crate::input_rules::InputSelectionAuthority,
 ) -> Option<BlockNameConflict> {
     find_block_name_alias_in_map(
         &resource.attributes,
-        &block_fields(schema),
-        &schema.defs,
-        &resource.id.to_string(),
-        "",
+        &block_fields(schema.as_schema()),
+        BlockNameResolutionContext {
+            defs: schema.as_schema().defs(),
+            declarations: schema.input_rule_declarations(),
+            resource_id: &resource.id.to_string(),
+            owner: &resource.id.provider,
+            authority,
+        },
+        &mut BlockNamePath::default(),
+        None,
     )
 }
 
@@ -13434,7 +13841,7 @@ fn resolve_managed_attribute_block_names<
         attributes,
         declaration,
         authored_attributes,
-        schema.as_schema(),
+        schema.schema(),
     )
 }
 
@@ -13522,7 +13929,7 @@ fn resolve_file_block_names<
                         &mut data_source.attributes,
                         &mut data_source.declaration,
                         None,
-                        schema.as_schema(),
+                        schema.schema(),
                     ));
                 }
             }
@@ -13636,7 +14043,7 @@ where
                         &mut data_source.attributes,
                         &mut data_source.declaration,
                         authored_attributes,
-                        schema.as_schema(),
+                        schema.schema(),
                     ));
                 }
             }

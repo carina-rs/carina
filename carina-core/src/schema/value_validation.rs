@@ -529,9 +529,9 @@ impl<'a> CheckedValue<'a> {
     }
 }
 
-struct ValueValidator<'a> {
+struct ValueValidator<'a, 'lookup> {
     defs: &'a BTreeMap<String, CompiledAttributeType>,
-    lookup: Option<CustomTypeLookup<'a>>,
+    lookup: Option<CustomTypeLookup<'lookup>>,
 }
 
 pub(crate) fn untyped_symbolic_errors(errors: Vec<TypeError>) -> ValueValidationFindings {
@@ -598,21 +598,25 @@ pub(crate) fn select_input_union_fit_on_path<
     value: &Classification<'v, P, B, T>,
     defs: &'a BTreeMap<String, CompiledAttributeType>,
     visited: &mut Vec<&'a str>,
+    lookup: CustomTypeLookup<'_>,
 ) -> Option<SelectedInputUnion<'a>> {
-    ValueValidator { defs, lookup: None }
-        .union_with_assignment(
-            members,
-            value.into(),
-            &FieldPath::new(),
-            FieldAncestry::WRITABLE,
-            visited,
-            None,
-        )
-        .ok()
-        .map(|admitted| SelectedInputUnion {
-            member: admitted.selected.member,
-            fit: admitted.selected.fit,
-        })
+    ValueValidator {
+        defs,
+        lookup: Some(lookup),
+    }
+    .union_with_assignment(
+        members,
+        value.into(),
+        &FieldPath::new(),
+        FieldAncestry::WRITABLE,
+        visited,
+        None,
+    )
+    .ok()
+    .map(|admitted| SelectedInputUnion {
+        member: admitted.selected.member,
+        fit: admitted.selected.fit,
+    })
 }
 
 #[cfg(test)]
@@ -628,7 +632,18 @@ pub(crate) fn select_union_member_from_knowledge_on_path<
     defs: &'a BTreeMap<String, CompiledAttributeType>,
     visited: &mut Vec<&'a str>,
 ) -> Option<&'a CompiledAttributeType> {
-    select_input_union_fit_on_path(members, value, defs, visited).map(|selected| selected.member)
+    // This test-only helper exercises structural fitting, not stage input authority.
+    ValueValidator { defs, lookup: None }
+        .union_with_assignment(
+            members,
+            value.into(),
+            &FieldPath::new(),
+            FieldAncestry::WRITABLE,
+            visited,
+            None,
+        )
+        .ok()
+        .map(|admitted| admitted.selected.member)
 }
 
 #[cfg(test)]
@@ -819,7 +834,7 @@ pub(crate) fn validate_value_for_admission<
     checked
 }
 
-impl<'a> ValueValidator<'a> {
+impl<'a> ValueValidator<'a, '_> {
     fn walk<'v, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'v, P, B>>(
         &self,
         attr: &'a CompiledAttributeType,

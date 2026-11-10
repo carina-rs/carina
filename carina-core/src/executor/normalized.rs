@@ -71,7 +71,7 @@ use crate::resource::{
     ConcreteValue, DeferredValue, ModuleSource, Resource, ResourceId, State,
     UnexpandedDependencyFields, Value, value_contains_unknown,
 };
-use crate::schema::{SchemaRegistry, find_resource_block_name_alias};
+use crate::schema::SchemaRegistry;
 
 /// A `Resource` that has been through the full plan-time desired-side
 /// normalization pipeline.
@@ -589,12 +589,32 @@ fn reject_provider_boundary_block_aliases<S, D>(
     >],
     schemas: &SchemaRegistry,
 ) -> HostResult<()> {
+    reject_provider_boundary_block_aliases_with_authority(
+        resources,
+        schemas,
+        &crate::input_rules::InputSelectionAuthority::default(),
+    )
+}
+
+pub(super) fn reject_provider_boundary_block_aliases_with_authority<S, D>(
+    resources: &[Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >],
+    schemas: &SchemaRegistry,
+    authority: &crate::input_rules::InputSelectionAuthority,
+) -> HostResult<()> {
     for resource in resources {
         let Some(schema) = schemas.get_for(resource) else {
             continue;
         };
-        let schema = schema.as_schema();
-        if let Some(alias) = find_resource_block_name_alias(resource, schema) {
+        if let Some(alias) = crate::schema::find_resource_block_name_alias_with_authority(
+            resource,
+            schema.schema(),
+            authority,
+        ) {
             return Err(crate::provider::HostError::invalid_input(format!(
                 "{}: block-name alias `{}` reached the provider boundary at `{}`; expected canonical attribute `{}`",
                 alias.resource_id(),

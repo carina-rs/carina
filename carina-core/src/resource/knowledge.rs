@@ -751,10 +751,6 @@ pub struct KnownValue<
     source: &'a Value<P, B>,
 }
 
-/// Identity of an immutable classified node within its knowledge cohort.
-/// Cloned proofs share it; reclassifying the same source produces a new node.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct KnownNodeId(usize);
 #[derive(Clone)]
 pub struct KnownList<'a, P: PlaceholderKind, B: BindingAddress> {
     items: Vec<KnownValue<'a, P, B>>,
@@ -1371,12 +1367,6 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> Pending<'a, P, B> {
     }
 }
 impl<'a, P: PlaceholderKind, B: BindingAddress> Classification<'a, P, B> {
-    pub(crate) fn known_node_id(&self) -> Option<KnownNodeId> {
-        match self {
-            Self::Known(value) => Some(KnownNodeId(Arc::as_ptr(&value.node) as usize)),
-            Self::ShapeKnown(_) | Self::Pending(_) | Self::Failed(_) => None,
-        }
-    }
     pub(crate) fn module_iteration_violation(&self) -> Option<PhaseViolation<B>> {
         match self {
             Self::Known(_) => None,

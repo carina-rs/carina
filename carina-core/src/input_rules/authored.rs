@@ -18,6 +18,7 @@ impl From<AuthoredInputUnavailable> for crate::provider::HostError {
 /// public AST edits cannot change it or manufacture another complete input.
 #[derive(Clone)]
 pub struct AuthoredInputs {
+    selection: super::union_fits::InputSelectionAuthority,
     parser_source: Option<Arc<crate::parser::ParsedFile>>,
     resources: Vec<crate::resource::Resource<ModuleSource, ParserPlaceholder>>,
     defaults: Vec<type_context::DefaultTagEvidence>,
@@ -79,6 +80,7 @@ impl AuthoredInputs {
             resources,
             defaults,
             parser_source: None,
+            selection: Default::default(),
         }
     }
 
@@ -94,7 +96,8 @@ impl AuthoredInputs {
         &self,
         session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Self {
-        self.parser_source
+        let mut snapshot = self
+            .parser_source
             .as_ref()
             .and_then(|source| {
                 let tree = crate::parser::AnalysisTree::try_from_file(source).ok()?;
@@ -102,7 +105,10 @@ impl AuthoredInputs {
             })
             .as_ref()
             .map(Self::snapshot)
-            .unwrap_or_else(|| self.clone())
+            .unwrap_or_else(|| self.clone());
+        snapshot.selection =
+            super::union_fits::InputSelectionAuthority::in_catalog(session.catalog());
+        snapshot
     }
 
     pub fn for_directory<E>(source: &crate::config_loader::RootDirectoryParse<E>) -> Self {
@@ -117,10 +123,13 @@ impl AuthoredInputs {
         E: crate::parser::ExportParamLike + Clone,
     {
         let mut resolved = source.clone();
-        match resolved.resolve_resource_refs_in_session(session) {
+        let mut inputs = match resolved.resolve_resource_refs_in_session(session) {
             Ok(()) => Self::for_directory(&resolved),
             Err(_) => Self::for_directory(source),
-        }
+        };
+        inputs.selection =
+            super::union_fits::InputSelectionAuthority::in_catalog(session.catalog());
+        inputs
     }
 
     pub(crate) fn for_module_admission<E>(
@@ -134,6 +143,7 @@ impl AuthoredInputs {
             > + Clone,
     {
         let mut inputs = Self::snapshot(source.file());
+        inputs.selection = super::union_fits::InputSelectionAuthority::in_catalog(config);
         if source
             .file()
             .providers
@@ -154,6 +164,9 @@ impl AuthoredInputs {
     }
     pub(super) fn defaults(&self) -> &[type_context::DefaultTagEvidence] {
         &self.defaults
+    }
+    pub(super) fn selection(&self) -> &super::union_fits::InputSelectionAuthority {
+        &self.selection
     }
 
     #[cfg(test)]
@@ -183,6 +196,7 @@ impl AuthoredInputs {
             resources: vec![projected],
             defaults: Vec::new(),
             parser_source: None,
+            selection: Default::default(),
         }
     }
 }

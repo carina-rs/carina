@@ -20,7 +20,10 @@ mod type_context;
 mod union_fits;
 use type_context::TypeFacts;
 pub use type_context::{InputCompositions, InputTypeContext};
+pub(crate) use union_fits::{InputSelectionAuthority, InputUnionAdmission};
 
+#[cfg(test)]
+mod boundary_tests;
 #[cfg(test)]
 mod condition_tests;
 #[cfg(test)]
@@ -169,7 +172,6 @@ pub struct WriteSite<'a> {
     schema: &'a ValidatedResourceSchema,
     rules: Vec<&'a InputRule<Compiled>>,
     paired_deletes: Vec<PairedInputDelete>,
-    union_fits: std::cell::RefCell<union_fits::UnionFits<'a>>,
 }
 
 impl<'a> WriteSite<'a> {
@@ -491,9 +493,8 @@ fn classify_write_site<'a, S>(
             let schema = schema.schema();
             let authored = AuthoredInputs::resource_for_test(resource);
             let source = authored.resources().next().unwrap();
-            let input =
-                RuleInput::for_authored(&source, schema, Arc::new(TypeFacts::default()), schemas)
-                    .expect("fixture canonicalization");
+            let input = RuleInput::for_authored(&source, schema, Arc::new(TypeFacts::default()))
+                .expect("fixture canonicalization");
             (
                 None,
                 resource.id.clone(),
@@ -646,7 +647,6 @@ fn classify_write_site<'a, S>(
         schema,
         rules,
         paired_deletes,
-        union_fits: Default::default(),
     }))
 }
 
@@ -1106,16 +1106,16 @@ fn scalar_value<'a>(
         return ScalarEvidence::Failed;
     };
     while matches!(ty.kind(), crate::schema::AttrTypeKind::Union(_)) {
-        let Some(selected) =
-            applicable
-                .site
-                .union_fits
-                .borrow_mut()
-                .select(ty, evidence, defs, &mut Vec::new())
-        else {
-            return ScalarEvidence::Failed;
+        match evidence.union_selection(ty) {
+            union_fits::UnionSelection::Selected(index) => {
+                let crate::schema::RawShape::Union(members) = ty.raw_shape() else {
+                    unreachable!("union declaration")
+                };
+                ty = members[index].resolve_refs_with_defs(defs).as_attr();
+            }
+            union_fits::UnionSelection::Withheld => return ScalarEvidence::Pending,
+            union_fits::UnionSelection::Rejected => return ScalarEvidence::Failed,
         };
-        ty = selected.resolve_refs_with_defs(defs).as_attr();
     }
     let resolver = EnumValueResolver::with_defs(ty, defs);
     let enum_literal = |result: Result<
@@ -1571,6 +1571,7 @@ pub fn check_authored_inputs(
 ) -> AuthoredInputReport {
     let mut types = InputTypeContext::<ModuleSource>::empty();
     types.facts.defaults = parsed.defaults().to_vec();
+    types.facts.selection = parsed.selection().clone();
     let mut report = AuthoredInputReport::default();
     let declarations = Arc::new(types.facts);
     for source in parsed.resources() {
@@ -1578,18 +1579,14 @@ pub fn check_authored_inputs(
         let Some(schema) = schemas.get_for(resource) else {
             continue;
         };
-        let input = match RuleInput::for_authored(
-            &source,
-            schema.schema(),
-            Arc::clone(&declarations),
-            schemas,
-        ) {
-            Ok(input) => input,
-            Err(error) => {
-                report.preparation_failed(&resource.id, &resource.declaration, error);
-                continue;
-            }
-        };
+        let input =
+            match RuleInput::for_authored(&source, schema.schema(), Arc::clone(&declarations)) {
+                Ok(input) => input,
+                Err(error) => {
+                    report.preparation_failed(&resource.id, &resource.declaration, error);
+                    continue;
+                }
+            };
         let site = match classify_write_site::<ModuleSource>(
             WriteSiteSource::Preview {
                 resource_id: resource.id.clone(),
@@ -1841,7 +1838,7 @@ fn authored_fixture_with_types<'a, S, P: crate::resource::PlaceholderKind>(
     let schema = schemas.get_for(resource).expect("fixture schema").schema();
     let authored = AuthoredInputs::resource_for_test(resource);
     let source = authored.resources().next().unwrap();
-    let input = RuleInput::for_authored(&source, schema, Arc::new(types.facts.clone()), schemas)
+    let input = RuleInput::for_authored(&source, schema, Arc::new(types.facts.clone()))
         .expect("fixture authored input");
     classify_write_site::<ModuleSource>(
         WriteSiteSource::Preview {
