@@ -62,3 +62,37 @@ fn member_refined_directory_annotations_have_lsp_validate_parity() {
         }
     }
 }
+
+#[test]
+fn round14_member_obligation_has_validate_and_lsp_parity() {
+    let snapshot = Arc::new(fixture::snapshot());
+    let engine = DiagnosticEngine::new(Arc::clone(&snapshot), vec!["awscc".into()]);
+    for length in [5, 50] {
+        let main = format!(
+            "fn make_name(): aws.Name {{ '{}' }}\nlet named = make_name()\nlet sink = awscc.MemberSink {{ name = named }}\n",
+            "A".repeat(length)
+        );
+        let dir = fixture::directory(&main, "exports {}\n");
+        let result = fixture::validate(dir.path(), &snapshot);
+        assert_eq!(result.is_ok(), length == 5, "{result:?}");
+        let path = dir.path().join("main.crn");
+        let doc = Document::new_with_path(
+            std::fs::read_to_string(&path).unwrap(),
+            path.clone(),
+            Arc::new(snapshot.provider_context().as_provider_context().clone()),
+        );
+        let diagnostics = engine.analyze(&doc, Some(&path));
+        let constraints: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("outside allowed range"))
+            .collect();
+        assert_eq!(
+            constraints.len(),
+            usize::from(length == 50),
+            "{diagnostics:#?}"
+        );
+        if let Err(error) = result {
+            assert_eq!(error.matches("outside allowed range").count(), 1, "{error}");
+        }
+    }
+}

@@ -659,7 +659,9 @@ A struct type represents a nested object with typed fields.
   nested unions. Every emitted position, including an identity-only String/Int,
   consumes budget. Plain scalar leaves and bare References emit nothing and cost
   no budget; only actual omissions mark truncation. Anonymous refinements use
-  structural labels rather than identity/member labels. Shared provider docgen
+  structural labels with intersected bounds and every pattern rather than
+  identity/member labels; identified leaves show every identity-conjunction
+  pattern. Shared provider docgen
   must render both layers too. WIT stays 0.2.0.
   Schema fingerprints use v13 and saved plans use format 44; format 43 plans
   must fail the version gate before decoding the payload. Saved module
@@ -673,8 +675,13 @@ A struct type represents a nested object with typed fields.
   to the local check; provably disjoint bounds reject statically. Different-identity
   widening requires source identity bounds to be contained by destination identity
   bounds. Strict declaration compatibility retains main's containment checks.
-  Member constraints defer unless source identity bounds are provably disjoint
-  from the effective destination bounds. Int-to-Float widening uses identity-bound
+  Member constraints yield `Assignable` only when source identity evidence proves
+  containment; otherwise `NeedsLocal` carries the admitted destination check.
+  Proven disjointness yields `Mismatch`. Loading or recording unavailable schemas
+  preserves local obligations. Consumers exhaustively choose an existing resolved
+  value check, explicit deferral, or diagnostic; a boolean type check cannot erase
+  `NeedsLocal`. Completion may offer such candidates with a pending-check label.
+  Int-to-Float widening uses identity-bound
   containment too. Float retains main's strict range containment and same-identity
   reference deferral; Enum/unloaded reference leaves retain that deferral too.
   Unproven regex containment defers to the value check. At annotated sinks,

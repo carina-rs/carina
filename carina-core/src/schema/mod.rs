@@ -200,11 +200,12 @@ pub use carina_provider_protocol::types::{
     EmptyPatternReason, PatternMatch, PatternReason, PatternSpec, PatternSpecParts,
 };
 pub use pattern_display::{DiagnosticPatternSpec, PatternSpecDisplay};
+pub use refinement_layers::intersect_bounds;
 pub use refinement_layers::{
     IntIdentityLayer, IntIdentityParts, IntMemberConstraints, IntMemberParts, StringIdentityLayer,
     StringIdentityParts, StringMemberConstraints, StringMemberParts,
 };
-pub(crate) use refinement_layers::{ScalarIdentityParts, bounds_are_empty, intersect_bounds};
+pub(crate) use refinement_layers::{ScalarIdentityParts, bounds_are_empty};
 mod refinement_walk;
 pub use refinement_walk::{RefinedScalarPosition, RefinementPathSegment, RefinementPositions};
 pub(crate) mod length_interval;
@@ -245,6 +246,10 @@ use crate::value::{
 };
 
 pub(crate) mod assignability;
+mod assignment_obligation;
+pub use assignment_obligation::{
+    AdmittedTypeAssignment, DestinationObligation, LoadedTypeAssignment,
+};
 mod assignability_edges;
 mod fingerprint;
 mod resolved_attr_type;
@@ -3878,8 +3883,15 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     /// source would re-introduce the silent-false-positive class that #2218
     /// closed. Both exceptions above are limited to identity-less sinks and
     /// do not weaken those comparisons.
-    pub fn is_assignable_to(self, sink: AssignmentSink<'_, R>) -> bool {
-        matches!(self.assignment_to(sink), TypeAssignability::Assignable)
+    #[cfg(test)]
+    pub(crate) fn is_assignable_to(self, sink: AssignmentSink<'_, R>) -> bool {
+        match self.assignment_to(sink) {
+            TypeAssignability::Assignable => true,
+            TypeAssignability::Mismatch | TypeAssignability::Unchecked(_) => false,
+            TypeAssignability::NeedsLocal(obligation) => {
+                panic!("test must explicitly check the pending destination: {obligation:?}")
+            }
+        }
     }
 }
 
@@ -13980,14 +13992,41 @@ pub fn format_refinement_bounds<T: fmt::Display>((min, max): (Option<T>, Option<
 }
 
 impl<R: PatternForm> PatternAttributeType<R> {
-    fn scalar_diagnostic_name(&self) -> String {
-        let mut constraints = Vec::new();
+    pub(crate) fn identity_patterns(&self) -> BTreeSet<&PatternSpec> {
         match &self.kind {
             AttrTypeKind::String {
                 identity_layer:
                     StringIdentityLayer {
                         binding,
                         pattern,
+                        length: _,
+                        to_dsl: _,
+                    },
+                member_layer: _,
+            } => {
+                let mut patterns: BTreeSet<_> =
+                    pattern.as_ref().map(AsRef::as_ref).into_iter().collect();
+                if let Some(annotation) = binding.annotation() {
+                    patterns.extend(annotation.owner_patterns().map(AsRef::as_ref));
+                }
+                patterns
+            }
+            AttrTypeKind::Reference {
+                identity: _,
+                pattern,
+                length: _,
+            } => pattern.as_ref().map(AsRef::as_ref).into_iter().collect(),
+            _ => BTreeSet::new(),
+        }
+    }
+    fn scalar_diagnostic_name(&self) -> String {
+        let mut constraints = Vec::new();
+        match &self.kind {
+            AttrTypeKind::String {
+                identity_layer:
+                    StringIdentityLayer {
+                        binding: _,
+                        pattern: _,
                         length,
                         ..
                     },
@@ -13997,12 +14036,7 @@ impl<R: PatternForm> PatternAttributeType<R> {
                     "length {}",
                     format_refinement_bounds(length.unwrap_or_default())
                 ));
-                let mut patterns: BTreeSet<&PatternSpec> =
-                    pattern.as_ref().map(AsRef::as_ref).into_iter().collect();
-                if let Some(annotation) = binding.annotation() {
-                    patterns.extend(annotation.owner_patterns().map(AsRef::as_ref));
-                }
-                for pattern in patterns {
+                for pattern in self.identity_patterns() {
                     constraints.push(format!(
                         "pattern {}",
                         PatternSpecDisplay::new(pattern).quoted()

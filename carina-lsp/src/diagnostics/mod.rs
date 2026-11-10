@@ -1824,6 +1824,9 @@ impl DiagnosticRun<'_> {
                                             match error {
                                                 DeferredAccessTypeError::InvalidAccess {
                                                     ..
+                                                }
+                                                | DeferredAccessTypeError::LocalConstraint {
+                                                    ..
                                                 } => DiagnosticSeverity::ERROR,
                                                 DeferredAccessTypeError::TypeMismatch {
                                                     ..
@@ -2080,12 +2083,14 @@ impl DiagnosticRun<'_> {
                             {
                                 continue;
                             }
-                            if matches!(&error, TypeError::Reference { .. })
-                                && error.attribute_name().is_some_and(|name| {
-                                    binding_error_sinks
-                                        .contains(&(resource_id.clone(), name.to_string()))
-                                })
-                            {
+                            // The binding-use authority checks the resolved value,
+                            // including its destination member constraints. Its
+                            // diagnostic owns this sink even when the schema pass
+                            // sees a concrete local error instead of a reference.
+                            if error.attribute_name().is_some_and(|name| {
+                                binding_error_sinks
+                                    .contains(&(resource_id.clone(), name.to_string()))
+                            }) {
                                 continue;
                             }
                             if error

@@ -57,7 +57,10 @@ fn loaded_schema_lookup_rejects_cross_provider_identity_mismatch() {
         assert_eq!(
             carina_core::schema::TypeInSchema::schemaless(&source)
                 .assignment_to(schema.assignment_sink(sink, &context.custom_types))
-                .require_loaded(),
+                .require_loaded()
+                .map(|assignment| assignment
+                    .require_proven()
+                    .expect("test expects a static assignment proof")),
             Ok(false),
             "{key}: loaded cross-provider mismatches must not report ProvidersNotLoaded",
         );

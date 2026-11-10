@@ -97,9 +97,13 @@ Same-identity value admission, including admission with a declared source,
 defers overlapping identity bounds through `NeedsLocal`; provably disjoint bounds
 reject statically. Different-identity widening retains String length / Int range
 containment checks. Strict declaration compatibility retains main's containment
-checks. Destination member constraints retain the existing `NeedsLocal` check,
-with only proven disjointness rejecting statically;
-unproven pattern containment defers (#4349). Int-to-Float widening uses identity
+checks. Destination member constraints yield `Assignable` only when the source's
+identity evidence proves containment. Otherwise `NeedsLocal` carries the admitted
+destination obligation; proven disjointness yields `Mismatch`. Loading schemas
+preserves this distinction. Every consumer must explicitly check the resolved
+value, defer that check through its existing admission path, or report the pending
+obligation. Completion can offer pending candidates with a value-check label.
+Unproven pattern containment defers (#4349). Int-to-Float widening uses identity
 bound containment too. Float retains main's strict range containment and
 same-identity reference deferral, also retained for Enum/unloaded leaves. Annotated
 sink mismatches render the differing constraints or scalar kinds when the nominal

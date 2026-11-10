@@ -246,6 +246,7 @@ impl dyn ProviderTypeCheckContext + '_ {
 ///     let target = lift_type_expr(&carina_core::parser::TypeExpr::String).unwrap();
 ///     TypeInSchema::schemaless(&source).assignment_to(target.assignment_sink(&session.catalog().custom_types))
 ///         .record_unchecked(session)
+///         .require_proven().expect("the plain String sink has no member constraints")
 /// });
 /// assert!(result.publish(&mut Vec::new()));
 /// ```
@@ -1327,7 +1328,7 @@ mod producer_tests {
                 else {
                     panic!("typed argument")
                 };
-                source
+                let assignment = source
                     .is_assignable_to_sink(
                         crate::schema::TypeInSchema::schemaless(
                             &crate::schema::CompiledAttributeType::string(),
@@ -1339,6 +1340,12 @@ mod producer_tests {
                         &bindings,
                     )
                     .unwrap();
+                match assignment {
+                    crate::schema::AdmittedTypeAssignment::Assignable => {}
+                    crate::schema::AdmittedTypeAssignment::NeedsLocal(obligation) => {
+                        panic!("plain String has no member obligation: {obligation:?}")
+                    }
+                }
             },
         ));
         assert_eq!(warnings.len(), 1, "{warnings:#?}");

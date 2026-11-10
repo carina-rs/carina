@@ -64,7 +64,38 @@ impl ProviderFactory for Factory {
                 Some((None, Some(64))),
             ),
         );
+        let name_identity = || {
+            StringIdentityLayer::new(
+                Some(TypeIdentity::from_dotted("aws.Name")),
+                None,
+                Some((Some(1), Some(100))),
+                None,
+            )
+        };
         vec![
+            ResourceSchema::new("MemberSource")
+                .attribute(
+                    AttributeSchema::provider_populated(
+                        "name",
+                        AttributeType::string_member(name_identity(), Default::default()),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+            ResourceSchema::new("MemberSink")
+                .attribute(
+                    AttributeSchema::optional(
+                        "name",
+                        AttributeType::string_member(
+                            name_identity(),
+                            StringMemberConstraints::new(None, Some((Some(1), Some(10)))),
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
             ResourceSchema::new("organizations.Account")
                 .attribute(
                     AttributeSchema::provider_populated("account_id", account("aws.AccountId"))

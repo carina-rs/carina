@@ -286,24 +286,45 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
                 ))
             };
             let declaration = declared.declaration_type();
-            let relation = K::reference_assignment(declaration, sink, self);
-            if matches!(relation, AssignmentRelation::Mismatch) {
-                return Err(mismatch(crate::schema::MismatchTypeNames::for_types(
-                    *sink,
-                    declaration,
-                )));
-            }
+            let relation = match K::reference_assignment(declaration, sink, self) {
+                AssignmentRelation::Mismatch => {
+                    return Err(mismatch(crate::schema::MismatchTypeNames::for_types(
+                        *sink,
+                        declaration,
+                    )));
+                }
+                AssignmentRelation::Assignable => AssignmentRelation::Assignable,
+                AssignmentRelation::Unchecked(missing) => AssignmentRelation::Unchecked(missing),
+                AssignmentRelation::NeedsLocal(obligation) => {
+                    AssignmentRelation::NeedsLocal(obligation)
+                }
+            };
             let original = match declared.original().reference_assignment(sink, |source| {
                 K::reference_original_assignment(source, sink, self)
             }) {
                 Ok(relation) => relation,
-                Err(_) if declared.incoming_mismatch(bindings) => return Ok(()),
-                Err(error) => return Err(mismatch(error.type_names().clone())),
+                Err(error) => {
+                    match declared.incoming_assignment(bindings) {
+                        AssignmentRelation::Mismatch => return Ok(()),
+                        AssignmentRelation::Assignable => {
+                            return Err(mismatch(error.type_names().clone()));
+                        }
+                        AssignmentRelation::Unchecked(missing) => {
+                            drop(missing); // The proven original rejection owns the diagnostic.
+                            return Err(mismatch(error.type_names().clone()));
+                        }
+                        AssignmentRelation::NeedsLocal(obligation) => {
+                            drop(obligation); // Pending incoming checks cannot suppress a proven rejection.
+                            return Err(mismatch(error.type_names().clone()));
+                        }
+                    }
+                }
             };
             match AssignmentRelation::all([relation, original]) {
                 AssignmentRelation::Assignable => {}
-                AssignmentRelation::NeedsLocal(missing) => {
-                    defer_reference_check::<K>(path, findings);
+                AssignmentRelation::NeedsLocal(obligation) => {
+                    let (destination, missing) = obligation.into_parts();
+                    destination.defer_to_value_check(|| defer_reference_check::<K>(path, findings));
                     if let Some(missing) = missing {
                         findings
                             .schema
@@ -348,8 +369,10 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
                         .map(|source| K::reference_assignment(source, sink, self)),
                 ) {
                     AssignmentRelation::Assignable => {}
-                    AssignmentRelation::NeedsLocal(missing) => {
-                        defer_reference_check::<K>(path, findings);
+                    AssignmentRelation::NeedsLocal(obligation) => {
+                        let (destination, missing) = obligation.into_parts();
+                        destination
+                            .defer_to_value_check(|| defer_reference_check::<K>(path, findings));
                         if let Some(missing) = missing {
                             findings
                                 .schema

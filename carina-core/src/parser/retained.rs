@@ -2240,6 +2240,10 @@ mod judgement {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum ExpressionAdmission {
+        LocalValueCheck {
+            destination: crate::schema::DestinationObligation,
+            provider: Option<ProviderAuthorityUnavailable>,
+        },
         ValueCheck,
         DeferredInterpolation,
         ProviderPending(ProviderAuthorityUnavailable),
@@ -2249,8 +2253,45 @@ mod judgement {
         left: ExpressionAdmission,
         right: ExpressionAdmission,
     ) -> ExpressionAdmission {
-        use ExpressionAdmission::{DeferredInterpolation, ProviderPending, ValueCheck};
+        use ExpressionAdmission::{
+            DeferredInterpolation, LocalValueCheck, ProviderPending, ValueCheck,
+        };
         match (left, right) {
+            (
+                LocalValueCheck {
+                    destination: left,
+                    provider: a,
+                },
+                LocalValueCheck {
+                    destination: right,
+                    provider: b,
+                },
+            ) => LocalValueCheck {
+                destination: left.merge(right),
+                provider: a.or(b),
+            },
+            (
+                LocalValueCheck {
+                    destination,
+                    provider,
+                },
+                ProviderPending(pending),
+            ) => LocalValueCheck {
+                destination,
+                provider: provider.or(Some(pending)),
+            },
+            (
+                ProviderPending(pending),
+                LocalValueCheck {
+                    destination,
+                    provider,
+                },
+            ) => LocalValueCheck {
+                destination,
+                provider: Some(pending).or(provider),
+            },
+            (local @ LocalValueCheck { .. }, ValueCheck | DeferredInterpolation)
+            | (ValueCheck | DeferredInterpolation, local @ LocalValueCheck { .. }) => local,
             (
                 pending @ ProviderPending(_),
                 ValueCheck | DeferredInterpolation | ProviderPending(_),
@@ -2456,6 +2497,22 @@ mod judgement {
                 crate::schema::TypeAssignability::Assignable => Ok(ValueCheck),
                 crate::schema::TypeAssignability::Mismatch => {
                     Err(assignment_error(&expression, sink))
+                }
+                crate::schema::TypeAssignability::NeedsLocal(obligation) => {
+                    let (destination, missing) = obligation.into_parts();
+                    let provider = match missing {
+                        Some(evidence) => Some(
+                            evidence
+                                .into_types()
+                                .find_map(|ty| pending_type(&ty))
+                                .ok_or_else(|| assignment_error(&expression, sink))?,
+                        ),
+                        None => None,
+                    };
+                    Ok(ExpressionAdmission::LocalValueCheck {
+                        destination,
+                        provider,
+                    })
                 }
                 crate::schema::TypeAssignability::Unchecked(evidence) => evidence
                     .into_types()

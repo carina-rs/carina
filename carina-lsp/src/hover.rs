@@ -103,31 +103,45 @@ fn refinement_hover(walk: carina_core::schema::RefinementPositions<'_>) -> Strin
                 identity_layer,
                 member_layer,
             } => {
-                let (pattern_labels, length_labels) = if identity.is_some() {
-                    (
-                        ["Identity pattern", "Member pattern"],
-                        ["Identity length", "Member length"],
-                    )
-                } else {
-                    (["Pattern", "Pattern"], ["Length", "Length"])
-                };
-                for (label, spec) in pattern_labels
-                    .into_iter()
-                    .zip([identity_layer.pattern, member_layer.pattern])
-                {
-                    if let Some(spec) = spec {
+                let mut patterns = position.value_type().identity_patterns();
+                if identity.is_some() {
+                    for spec in patterns {
                         refinements.push_str(&format!(
-                            "\n- **{label}**: {}",
+                            "\n- **Identity pattern**: {}",
                             PatternSpecDisplay::new(spec)
                         ));
                     }
-                }
-                for (label, length) in length_labels
-                    .into_iter()
-                    .zip([identity_layer.length, member_layer.length])
-                {
-                    if let Some(bounds) = length.map(format_refinement_bounds) {
-                        refinements.push_str(&format!("\n- **{label}**: {bounds}"));
+                    if let Some(spec) = member_layer.pattern {
+                        refinements.push_str(&format!(
+                            "\n- **Member pattern**: {}",
+                            PatternSpecDisplay::new(spec)
+                        ));
+                    }
+                    for (label, length) in [
+                        ("Identity length", identity_layer.length),
+                        ("Member length", member_layer.length),
+                    ] {
+                        if let Some(bounds) = length.map(format_refinement_bounds) {
+                            refinements.push_str(&format!("\n- **{label}**: {bounds}"));
+                        }
+                    }
+                } else {
+                    patterns.extend(member_layer.pattern);
+                    if !patterns.is_empty() {
+                        let conjunction = patterns
+                            .into_iter()
+                            .map(|spec| PatternSpecDisplay::new(spec).to_string())
+                            .collect::<Vec<_>>()
+                            .join(" AND ");
+                        refinements.push_str(&format!("\n- **Pattern**: {conjunction}"));
+                    }
+                    if let Some(bounds) = carina_core::schema::intersect_bounds(
+                        identity_layer.length,
+                        member_layer.length,
+                    )
+                    .map(format_refinement_bounds)
+                    {
+                        refinements.push_str(&format!("\n- **Length**: {bounds}"));
                     }
                 }
             }
@@ -135,18 +149,20 @@ fn refinement_hover(walk: carina_core::schema::RefinementPositions<'_>) -> Strin
                 identity_layer,
                 member_layer,
             } => {
-                let labels = if identity.is_some() {
-                    ["Identity range", "Member range"]
-                } else {
-                    ["Range", "Range"]
-                };
-                for (label, range) in labels
-                    .into_iter()
-                    .zip([identity_layer.range, member_layer.range])
-                {
-                    if let Some(bounds) = range.map(format_refinement_bounds) {
-                        refinements.push_str(&format!("\n- **{label}**: {bounds}"));
+                if identity.is_some() {
+                    for (label, range) in [
+                        ("Identity range", identity_layer.range),
+                        ("Member range", member_layer.range),
+                    ] {
+                        if let Some(bounds) = range.map(format_refinement_bounds) {
+                            refinements.push_str(&format!("\n- **{label}**: {bounds}"));
+                        }
                     }
+                } else if let Some(bounds) =
+                    carina_core::schema::intersect_bounds(identity_layer.range, member_layer.range)
+                        .map(format_refinement_bounds)
+                {
+                    refinements.push_str(&format!("\n- **Range**: {bounds}"));
                 }
             }
             _ => {}
@@ -3511,5 +3527,95 @@ EOT
                 );
             }
         }
+    }
+    #[test]
+    fn round14_anonymous_hover_intersects_bounds_and_keeps_all_patterns() {
+        use carina_core::schema::{
+            IntIdentityLayer, IntMemberConstraints, PatternMatch, PatternSpec, StringIdentityLayer,
+            StringMemberConstraints,
+        };
+        for (declaration, label, effective) in [
+            (
+                AttributeType::string_member(
+                    StringIdentityLayer::new(
+                        None,
+                        Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                        Some((Some(1), Some(100))),
+                        None,
+                    ),
+                    StringMemberConstraints::new(
+                        Some(PatternSpec::new("a.*", PatternMatch::Full)),
+                        Some((Some(2), Some(8))),
+                    ),
+                ),
+                "Length",
+                "2..=8",
+            ),
+            (
+                AttributeType::int_member(
+                    IntIdentityLayer::new(None, Some((Some(1), Some(100)))),
+                    IntMemberConstraints::new(Some((Some(2), Some(8)))),
+                ),
+                "Range",
+                "2..=8",
+            ),
+        ] {
+            let content = hover_for_refinement_fields(vec![
+                StructField::optional("value", declaration).build(),
+            ]);
+            assert_eq!(
+                content.matches(&format!("**{label}**:")).count(),
+                1,
+                "{content}"
+            );
+            assert!(
+                content.contains(&format!("**{label}**: {effective}")),
+                "{content}"
+            );
+            if label == "Length" {
+                assert_eq!(content.matches("**Pattern**:").count(), 1, "{content}");
+                for pattern in ["[a-z]+", "a.*"] {
+                    assert!(content.contains(pattern), "{content}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round14_hover_renders_the_entire_identity_pattern_conjunction() {
+        use carina_core::schema::{
+            PatternMatch, PatternSpec, RefinedScalarKind, TypeIdentity, TypeInSchema,
+        };
+        let identity = TypeIdentity::from_dotted("test.Name");
+        let mut wire = serde_json::json!({
+            "owners": [{ "Provider": "test" }],
+            "identity": identity,
+            "scalar_kind": RefinedScalarKind::String,
+            "declaration": { "String": identity }
+        });
+        wire["origin"] = serde_json::json!("Annotation");
+        wire["projection_fingerprint"] = serde_json::Value::Null;
+        wire["constraints"] = serde_json::json!({
+            "scalar": { "String": { "identity_layer": {
+                "length": { "min": "Unbounded", "max": "Unbounded" },
+                "patterns": [PatternSpec::new("^.*z$", PatternMatch::Full), PatternSpec::new("^a.*$", PatternMatch::Full)]
+            }}},
+            "empty_intersection": false
+        });
+        let owned = serde_json::from_value(wire).unwrap();
+        let ty =
+            carina_core::validation::lift_type_expr(&carina_core::parser::TypeExpr::SchemaType {
+                owned,
+            })
+            .unwrap();
+        let content = refinement_hover(TypeInSchema::schemaless(&ty).refinement_positions(64));
+        for pattern in ["^.*z$", "^a.*$"] {
+            assert!(content.contains(pattern), "missing {pattern}: {content}");
+        }
+        assert_eq!(
+            content.matches("**Identity pattern**").count(),
+            2,
+            "{content}"
+        );
     }
 }

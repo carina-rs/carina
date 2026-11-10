@@ -50,3 +50,20 @@ fn directory_annotations_reject_unrelated_identities() {
         );
     }
 }
+
+#[test]
+fn round14_declared_directory_binding_discharges_members_once() {
+    let loaded = fixture::snapshot();
+    for length in [5, 50] {
+        let main = format!(
+            "fn make_name(): aws.Name {{ '{}' }}\nlet named = make_name()\nlet sink = awscc.MemberSink {{ name = named }}\n",
+            "A".repeat(length)
+        );
+        let dir = fixture::directory(&main, "exports {}\n");
+        let result = fixture::validate(dir.path(), &loaded);
+        assert_eq!(result.is_ok(), length == 5, "{main}\n{result:?}");
+        if let Err(error) = result {
+            assert_eq!(error.matches("outside allowed range").count(), 1, "{error}");
+        }
+    }
+}

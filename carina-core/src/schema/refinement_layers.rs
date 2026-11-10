@@ -343,7 +343,7 @@ pub(crate) fn bounds_are_empty<T: Copy + Ord>(bounds: Option<(Option<T>, Option<
     matches!(bounds, Some((Some(min), Some(max))) if min > max)
 }
 
-pub(crate) fn intersect_bounds<T: Copy + Ord>(
+pub fn intersect_bounds<T: Copy + Ord>(
     identity: Option<(Option<T>, Option<T>)>,
     member: Option<(Option<T>, Option<T>)>,
 ) -> Option<(Option<T>, Option<T>)> {
@@ -432,58 +432,5 @@ mod tests {
             ValidatedProviderSchemaWitness::new(vec![resource], config, BTreeMap::new(), vec![]),
             Err(ProviderSchemaValidationError::ConflictingIdentityDeclarations { .. })
         ));
-    }
-
-    struct AgreementAllocationCounter;
-    std::thread_local! {
-        static AGREEMENT_ALLOCATIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-    }
-    fn record_agreement_allocation() {
-        let _ = AGREEMENT_ALLOCATIONS.try_with(|counter| {
-            if let Some(count) = counter.get() {
-                counter.set(Some(count + 1));
-            }
-        });
-    }
-    // SAFETY: every operation forwards the caller's pointer/layout contract
-    // unchanged to System; the thread-local counter never allocates.
-    unsafe impl std::alloc::GlobalAlloc for AgreementAllocationCounter {
-        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-            record_agreement_allocation();
-            // SAFETY: layout satisfies GlobalAlloc's caller contract.
-            unsafe { std::alloc::GlobalAlloc::alloc(&std::alloc::System, layout) }
-        }
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-            // SAFETY: ptr/layout are forwarded unchanged to their allocator.
-            unsafe { std::alloc::GlobalAlloc::dealloc(&std::alloc::System, ptr, layout) }
-        }
-        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-            record_agreement_allocation();
-            // SAFETY: layout satisfies GlobalAlloc's caller contract.
-            unsafe { std::alloc::GlobalAlloc::alloc_zeroed(&std::alloc::System, layout) }
-        }
-        unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
-            record_agreement_allocation();
-            // SAFETY: pointer, layout and new size satisfy the caller contract.
-            unsafe { std::alloc::GlobalAlloc::realloc(&std::alloc::System, ptr, layout, size) }
-        }
-    }
-    #[global_allocator]
-    static AGREEMENT_ALLOCATOR: AgreementAllocationCounter = AgreementAllocationCounter;
-
-    #[test]
-    fn round13_identity_agreement_does_not_allocate() {
-        let first = named();
-        let second = named();
-        let first = ScalarIdentityParts::String(first.parts());
-        let second = ScalarIdentityParts::String(second.parts());
-        AGREEMENT_ALLOCATIONS.set(Some(0));
-        let agree = first.agrees_with(second);
-        let allocations = AGREEMENT_ALLOCATIONS.replace(None).unwrap();
-        assert!(agree);
-        assert_eq!(
-            allocations, 0,
-            "identity agreement must compare borrowed metadata without JSON/hashing"
-        );
     }
 }

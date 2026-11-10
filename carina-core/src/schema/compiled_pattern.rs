@@ -36,6 +36,8 @@ mod sealed {
 /// Pattern representation carried by a draft or admitted schema tree.
 pub trait PatternForm: sealed::Sealed + Copy + fmt::Debug + Eq + Send + Sync + 'static {
     type Pattern: Clone + fmt::Debug + Eq + AsRef<PatternSpec> + Send + Sync;
+    #[doc(hidden)]
+    fn assignment_destination(ty: super::TypeInSchema<'_, Self>) -> super::DestinationObligation;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,10 +51,16 @@ impl sealed::Sealed for Compiled {}
 
 impl PatternForm for Draft {
     type Pattern = PatternSpec;
+    fn assignment_destination(ty: super::TypeInSchema<'_, Self>) -> super::DestinationObligation {
+        super::DestinationObligation::draft(ty)
+    }
 }
 
 impl PatternForm for Compiled {
     type Pattern = CompiledPattern;
+    fn assignment_destination(ty: super::TypeInSchema<'_, Self>) -> super::DestinationObligation {
+        super::DestinationObligation::compiled(ty)
+    }
 }
 
 /// A regex in Carina's schema-pattern dialect, constructed only by [`Self::try_new`].

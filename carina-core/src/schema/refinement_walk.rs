@@ -60,6 +60,11 @@ impl<'a> RefinementPositions<'a> {
 }
 
 impl<'a> EffectiveType<'a> {
+    /// All identity patterns, including owner conjunctions, in diagnostic order.
+    pub fn identity_patterns(&self) -> std::collections::BTreeSet<&super::PatternSpec> {
+        self.attr_type.identity_patterns()
+    }
+
     /// Visit at most `max_nodes` refined String/Int/Reference leaves and
     /// structural nodes, including every Ref and nested Union. Plain scalar
     /// leaves are omitted. Every reported leaf consumes budget; a bare
@@ -76,6 +81,14 @@ impl<'a> EffectiveType<'a> {
             positions,
             truncated: !complete,
         }
+    }
+}
+
+impl<'a> super::TypeInSchema<'a, super::Compiled> {
+    /// Inspect refinement metadata on an already resolved declaration. This
+    /// read-only view does not confer value-validation or placement authority.
+    pub fn refinement_positions(self, max_nodes: usize) -> RefinementPositions<'a> {
+        EffectiveType::for_value_walk(self.attr, self.defs).refinement_positions(max_nodes)
     }
 }
 
