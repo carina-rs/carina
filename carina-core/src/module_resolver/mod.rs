@@ -40,6 +40,10 @@ pub use loader::{
     load_module_from_directory, load_module_with_diagnostics,
     load_module_with_diagnostics_and_schemas,
 };
+pub(crate) use resolver::{
+    AuthoredModuleGraph, expand_root_directory_file, resolve_upstream_modules_with_config,
+    resolve_upstream_modules_with_providerless_config,
+};
 pub use resolver::{
     ModuleCallConstraintReport, ModuleCallConstraintReports, ModuleResolutionDiagnosticResult,
     ResidualModuleResolutionDiagnostic, ResidualModuleResolutionError,
@@ -49,10 +53,6 @@ pub use resolver::{
     resolve_modules_providerless, resolve_modules_with_config, resolve_modules_with_diagnostics,
     resolve_modules_with_diagnostics_and_overrides, resolve_modules_with_providerless_config,
     resolve_modules_with_providerless_diagnostics,
-};
-pub(crate) use resolver::{
-    expand_root_directory_file, resolve_upstream_modules_with_config,
-    resolve_upstream_modules_with_providerless_config,
 };
 pub use signature::{
     ResolvedModuleSignature, ResolvedModuleSignatures, load_resolved_module_signatures,

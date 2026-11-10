@@ -714,7 +714,8 @@ pub struct PlanFileContents<S = ModuleSource, P = SnapshotPlan<S>, V: PlanValueK
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
-    /// Plan format 43 requires explicit schema-pattern modes and reasons.
+    /// Since format 43, schema patterns carry explicit modes and reasons.
+    /// Format 44 retains separate identity and member constraint layers.
     /// Plan format 42 retains replacement history and create-first dependency
     /// requirements for schema admission when loading saved plans.
     /// Plan format 41 encodes secret(...) only as a typed Secret node.
@@ -1197,6 +1198,8 @@ impl PlanFile {
 /// source identity captured at plan time. Format 41 removes the ordinary
 /// secret FunctionCall identity in favor of typed Secret nodes. Format 42 adds
 /// replacement previous_attributes, required_by, and required_children.
+/// Format 43 requires explicit schema-pattern modes. Format 44 records v13
+/// schema fingerprints and separate identity/member constraint layers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanFileWire {
     version: u32,
@@ -2147,7 +2150,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 43;
+    pub const CURRENT_VERSION: u32 = 44;
 
     #[cfg(test)]
     pub(crate) fn decode_for_test(self) -> DecodedPlanFile {
@@ -5362,6 +5365,8 @@ fn build_plan_file_contents<E>(
     let wire_plan = recorded.into_wire();
 
     let contents = PlanFileContents::<ModuleSource, UnresolvedSavedPlan> {
+        // carina#4348: bumped 43→44 — v13 fingerprints and retained scalar
+        // identity/member layers change saved schema and pending-constraint evidence.
         // carina#4292: bumped 42→43 — pattern modes change schema semantics;
         // reject older headers before schema-fingerprint verification.
         // carina#4283: bumped 41→42 — retain replacement history and dependency

@@ -1866,7 +1866,12 @@ macro_rules! host_sources {
         impl DiagnosticSource<Bound> for $ty { fn into_diagnostic(self) -> HostDiagnostic { HostDiagnostic::capture_host_or_provider(self) } }
     )* };
 }
-host_sources!(crate::provider::HostError, InvalidRequiredPermission);
+host_sources!(
+    crate::provider::HostError,
+    InvalidRequiredPermission,
+    crate::input_rules::AuthoredInputUnavailable,
+    crate::provider::UpdatePatchError
+);
 impl diagnostic_source_sealed::Sealed<Bound> for HostDiagnostic {}
 impl DiagnosticSource<Bound> for HostDiagnostic {
     fn into_diagnostic(self) -> HostDiagnostic {

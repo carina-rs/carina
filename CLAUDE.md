@@ -579,6 +579,87 @@ A struct type represents a nested object with typed fields.
   `NativeDesiredNormalization`. Keep `ProviderWireError`
   terminal: render its typed conversion reason once, without input values,
   and access the typed reason through `conversion_error()`.
+- **Refinement layers** (carina#4348): protocol 27 and later require
+  separate `identity_layer` and `member_layer` records for String and Int.
+  `StringIdentityLayer`/`IntIdentityLayer` own reusable definitions;
+  `StringMemberConstraints`/`IntMemberConstraints` add declaration-local bounds.
+  `string_member` and `int_member` take these distinct types once and preserve
+  the complete identity. Each String layer has one optional `PatternSpec` and
+  one optional length interval; each Int layer has one optional range. Float
+  is unchanged. Validate the identity pattern then bounds, member pattern then
+  bounds, and finally the semantic callback; retain first-failure diagnostics.
+  Never repeat structural checks in callbacks. Within one provider, every
+  occurrence of a String/Int/Float identity must have the same identity-layer
+  definition (including Float ranges);
+  aggregate admission rejects `ConflictingIdentityDeclarations`. Provider
+  migrations must move resource-specific bounds into the member layer rather
+  than redeclaring an identity with different constraints. Across different
+  owners (for example AWS and AWSCC), annotation constraints are conjoined:
+  values must satisfy every owner's identity layer. Annotation-origin evidence
+  uses an identity-only payload with no member slots. Read-value projections
+  are identity-only too: their typed declarations preserve enum values,
+  reference kind and semantic callbacks but cannot store member constraints.
+  Projection fingerprints cover identity/value metadata, never slot members.
+  Decoding either value-evidence origin with member fields must fail.
+  Native single-owner and multi-owner annotations are distinct
+  forms: a single holds one `SchemaTypeOwner`, and a multi holds a checked map
+  keyed by at least two `SchemaTypeOwner`s. Wire single-owner annotations omit
+  `owner_layers`; multi-owner annotations retain exactly one identity layer per
+  owner. Decoding verifies the exact conjunction of owner layers, including
+  empty bounds from same-owner repeats, and recomputes the empty-intersection
+  marker after Float normalization. Owner sets derive from layer keys. Annotation
+  pattern conjunctions are sorted, deduplicated sets, including same-owner repeats.
+  Structural scalar reads use the same canonical evidence as identity annotations,
+  so equal identity-level types compare and serialize equally. Callbacks,
+  transforms, enums and references retain exact projection provenance.
+  A member layer belongs to its destination slot. Enforce it on writes through
+  identity admission and the deferred destination check; identified source bounds
+  are identity-layer bounds only. Anonymous String/Int declarations retain both
+  layers as structural evidence (matching patterns and intersected bounds). Unannotated collections, conditionals and coalesce
+  require identical `TypeExpr`s, as on main. Reads of slots differing only in
+  member constraints infer equal types. An explicit compatible annotation is
+  the way to accept otherwise mixed declarations; inference never widens them.
+  Enum definition and canonical-spelling disagreements remain typed errors.
+  Enum bases describe definitions, never slots: schema admission rejects String/Int
+  member constraints inside a base with `EnumBaseMemberLayerError`.
+  Built-in and aggregate comparisons accept identity-only typed projections. Exact
+  declarations and their fingerprints preserve both layers. Hover renders
+  both layers through the core's read-only bounded refinement walk, which counts
+  refined String/Int/Reference leaves and structural nodes, including Refs and
+  nested unions. Every emitted position, including an identity-only String/Int,
+  consumes budget. Plain scalar leaves and bare References emit nothing and cost
+  no budget; only actual omissions mark truncation. Anonymous refinements use
+  structural labels with intersected bounds and every pattern rather than
+  identity/member labels; identified leaves show every identity-conjunction
+  pattern. Shared provider docgen
+  must render both layers too. This change needs no WIT change.
+  Schema fingerprints use v13 and saved plans use format 44; format 43 plans
+  must fail the version gate before decoding the payload. Saved module
+  `pending_constraints` contain `ValidateExpr` values, not retained types;
+  replay reloads refinement layers from fingerprint-checked provider schemas.
+  Every typed sink uses the same String/Int identity-admission rule for
+  equal identities and allowed widenings (#4349), including annotations,
+  exports, module arguments, and function parameters/returns. All destination
+  kinds can retain the existing `NeedsLocal` resolved-value obligation. Same-identity
+  value admission, including a declared source, defers overlapping identity bounds
+  to the local check; provably disjoint bounds reject statically. Different-identity
+  widening requires source identity bounds to be contained by destination identity
+  bounds. Strict declaration compatibility retains main's containment checks.
+  Declaration compatibility admits types; only value admission grants placement.
+  `NeedsLocal` exists only in the admission-facing reference relation, requiring
+  a `ReferenceCandidate`; it cannot convert back into general type compatibility.
+  Admission consumes it by registering the existing `LocalPath` on the destination
+  contract. `PendingAdmission::discharge` re-enters `admit_apply`, checking the
+  resolved value against that destination's complete declaration and both layers.
+  Known binding values also enter the destination's ordinary value validator after
+  declaration compatibility. Member String failures keep their structured pattern/
+  length category and label the slot's member constraint; identity failures run first.
+  Int-to-Float widening uses identity-bound
+  containment too. Float retains main's strict range containment and same-identity
+  reference deferral; Enum/unloaded reference leaves retain that deferral too.
+  Unproven regex containment defers to the value check. At annotated sinks,
+  declaration equality and display-name equality do not replace identity
+  admission; mismatch names expose differing constraints or scalar kinds.
 - **Schema field transport**: `StructField` and `AttributeSchema` cross the
   WASM boundary as JSON via the `schemas: func() -> string` WIT export. The
   sole typed core/protocol boundary is `carina_core::protocol_convert`: the SDK
@@ -601,8 +682,8 @@ A struct type represents a nested object with typed fields.
   declarations share the identity's callback set, and separately allocated
   callbacks from repeated type-constructor calls are valid. This is the honest
   current-protocol (`PROTOCOL_VERSION`) behavior: the wire names an identity,
-  not a schema declaration, so the identity is the guest-side type and its
-  constraints are per provider. The current WIT keeps
+  not a schema declaration, for semantic callback dispatch. Structural identity
+  and member constraints are transported separately and checked by the host. The current WIT keeps
   `validate-custom-type(TypeIdentity, string)`: the guest parses canonical text
   with the binding's stored kind, and aggregate schema admission rejects an
   identity reused with another scalar kind. Resource/config schema walks pass
@@ -635,10 +716,12 @@ A struct type represents a nested object with typed fields.
   `Custom` decoder preserves the first outer record's name as the only
   identity, including an empty name; nested `Custom.name` and primitive-base
   identities never fill it in. Enclosing String/int refinements take
-  precedence over nested/base metadata, falling back to the inner metadata
-  only when the enclosing record omits it. Anonymous legacy `Custom` records
-  with a List base remain ordinary refined lists. A named List base is the one
-  intentional legacy-Custom tightening: core cannot retain that enclosing
+  precedence over nested/base identity-layer metadata, falling back to the inner
+  identity metadata only when the enclosing record omits it. Legacy `Custom`
+  has no member layer: a terminal String/Int base with non-empty member metadata
+  is incompatible and returns a typed decode error, regardless of outer fields.
+  Anonymous legacy `Custom` records with a List base remain ordinary refined
+  lists. A named List base is also rejected: core cannot retain that enclosing
   identity, so decode returns a typed error instead of silently dropping it.
   Metadata incompatible with the terminal shape remains a typed error. The
   `ResourceSchema`, `AttributeSchema`, and `StructField` conversions destructure
@@ -652,7 +735,77 @@ A struct type represents a nested object with typed fields.
   24 also requires a typed pattern spec (regex plus explicit mode, and a reason
   containing visible text for Substring); convert the complete spec
   exhaustively, including its reason. Never supply a default mode or admit a bare
-  string, including on the schema-only migration path. Adding
+  string, including on the schema-only migration path. Protocol 25 requires
+  the WIT 0.2.0 `diagnostics` and `protected-material` imports described below.
+  Protocol 26 adds required `InputRule.condition` and Struct `input_rules`, even when the
+  condition is `Always` or the collection is empty; neither field has a serde default.
+  Conditions and Struct rules travel once in the existing schema JSON, with no
+  further WIT change beyond the diagnostics imports. Resource and Struct
+  declarations use the same admitted rule type,
+  with Struct paths relative to each object instance (including recursive defs).
+  The shared input-rule admission gate checks writable canonical paths, typed
+  scalar literals, enum identity and canonical membership, predicate compatibility,
+  duplicate target/code pairs, and a condition depth limit of 16. The one evaluator
+  uses runtime knowledge for presence and equality; unknown guards remain pending,
+  including under negation. Equality and string predicates share typed scalar
+  extraction: enum aliases use canonical API values, and invalid known values
+  remain failures. Public binding and site evaluation return complete typed
+  findings and pending obligations; only the private single-rule evaluator
+  returns a verdict. Dispatch retains every established finding. Each write site owns one immutable `RuleInput`,
+  constructed only at authored, plan or protected dispatch stage boundaries.
+  Those constructors seal ordinary union fits with their stage's provider
+  lookup, retaining nested choices in the graph. Evaluation consumes that
+  authority; unavailable provider validation remains pending and never selects
+  a branch by structural declaration order alone. The same authority travels
+  through admitted provider-ready values and their protected update capability.
+  Recursive admission memoizes declaration/node judgements, including provider
+  callbacks, ancestry and reference guards. Fit children share immutable witnesses
+  rather than copying subtrees on memo hits. Schema walkers consume cached
+  protected classifications through a scoped capability that protects results
+  before returning; they never reopen those payloads for classification.
+  Authored checks require immutable parser/admission-minted `AuthoredInputs`;
+  mutating public AST fields cannot reseal their snapshot. Every successful module
+  publication retains resource authority even if provider configuration fails;
+  unavailable default-map membership remains pending. Missing authority is an
+  explicit error, never an empty successful report. Authored reports retain each
+  resource's preparation errors alongside findings and pending obligations;
+  consumers exhaustively render their typed outcomes. Schema fields are read literally
+  through immutable ordered declarations with a shared name index; ordinary
+  validation, aliases and rule metadata use that index. Only declared rule paths use `InputPath` parsing.
+  Alias binding covers Struct, List, Map, selected Union and Secret instances,
+  retaining protection and authored locations. Canonical root identities precede
+  patch, default-membership and ignore queries. Shared schema canonicalization
+  uses mutable path prefixes and renders only actual renames or errors; authored
+  location renames are indexed and applied in one batch.
+  Guards, targets,
+  instance enumeration and bound-expression estimation share the graph and
+  ignore policy. Classification and diagnostic protection travel together on
+  every graph edge. Key cursors preserve withheld completeness and masked
+  membership; the estimator never recovers proof from an unsent map expression.
+  Withheld ancestors carry protection without granting a target-node capability.
+  Owner prefixes are shared, and diagnostic paths are materialized only for
+  findings or pending results, which are then sorted. The shared validator also
+  shares path prefixes; published diagnostic keys have immutable concrete storage.
+  Diagnostic identity and ordering use structured segments; protected map keys
+  retain opaque instance ordinals and redact only their presentation. Literal field names
+  are quoted when needed. Parser-owned locations share one structured index,
+  invalidated only by their owning mutation methods, and missing intermediate
+  objects retain the deepest authored containing location. Dispatch secret restoration
+  establishes plaintext correspondence once and carries paired child cursors.
+  Only complete replacement nodes and
+  explicit removals prove absence; unsent omissions remain withheld at every
+  depth. Default membership belongs to that graph and is recomputed at dispatch.
+  An erased normalized expression has no authored fallback without carried
+  correspondence. Update inputs overlay the exact annotated patch on the full
+  protected desired tree, never observed state. `UpdateRequest::checked` mints
+  their sealed `ProtectedUpdateInput` together; dispatch cannot accept a desired
+  tree and a patch independently. Both owners use
+  the same write-scope classifier; `AuthoredDesired` evaluates `CreateOnly` as
+  warnings with core-rendered rejected-if-created wording, while `EveryWrite`
+  remains an error. The core finding derives severity from rule scope and write
+  context once; CLI and LSP render that fact. Unknown guards remain pending.
+  Plans reject `CreateOnly` violations only at create-capable write sites.
+  Semantic fingerprints encode conditions and nested rules in encoding v13. Adding
   a protocol field must break compilation until it is consciously carried
   across or explicitly bound and documented as unavailable on the destination
   side. Never use a catch-all `_` or `..` at this seam; a silently dropped field
@@ -661,7 +814,7 @@ A struct type represents a nested object with typed fields.
   require `diagnostics` and `protected-material` imports in every provider
   world. Component type scanning rejects a legacy package before linking or
   executing any start/info code, naming the found package and the required
-  `carina:provider@0.3.0` / protocol 28. `ProviderDiagnostics::emit` accepts only typed events borrowing
+  `carina:provider@0.3.0` and the current host protocol. `ProviderDiagnostics::emit` accepts only typed events borrowing
   provider errors/diagnostics or carrying structured value candidates. The
   host binds them through the same private text kernel as returned errors.
   Only that kernel mints `BoundProviderEvent`; its presenter consumes Bound

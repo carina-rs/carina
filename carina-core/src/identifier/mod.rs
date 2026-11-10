@@ -1879,7 +1879,11 @@ fn canonical_create_only_value_string<P: crate::resource::ValueKind>(
         (
             Value::Concrete(ConcreteValue::String(value)),
             Some(Shape::String {
-                identity, to_dsl, ..
+                identity_layer:
+                    crate::schema::StringIdentityParts {
+                        identity, to_dsl, ..
+                    },
+                ..
             }),
         ) => Some(
             context

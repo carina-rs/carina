@@ -193,9 +193,22 @@ pub fn admit_plan_attributes<K: RechecksResolved>(
 
 /// Every selected writable attribute declared by the schema passed apply admission.
 /// The `KnownWritableOnly` walk skips keys absent from the schema.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct AdmittedAttributes<K: RechecksResolved> {
     kind: PhantomData<K>,
+    selection: crate::input_rules::InputSelectionAuthority,
+}
+// Authority is transient evidence, not part of a prepared payload's semantics.
+impl<K: RechecksResolved> PartialEq for AdmittedAttributes<K> {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl<K: RechecksResolved> Eq for AdmittedAttributes<K> {}
+impl<K: RechecksResolved> AdmittedAttributes<K> {
+    pub(crate) fn selection_authority(&self) -> &crate::input_rules::InputSelectionAuthority {
+        &self.selection
+    }
 }
 
 pub(crate) enum ApplyAdmissionErrors {
@@ -350,7 +363,10 @@ fn admit_apply_attributes<K: RechecksResolved>(
     if report.errors().next().is_some() {
         return Err(ApplyAdmissionErrors::Constraints(report));
     }
-    Ok(AdmittedAttributes { kind: PhantomData })
+    Ok(AdmittedAttributes {
+        kind: PhantomData,
+        selection: crate::input_rules::InputSelectionAuthority::in_catalog(session.catalog()),
+    })
 }
 
 /// The retained expression check used by the authored attribute walk.

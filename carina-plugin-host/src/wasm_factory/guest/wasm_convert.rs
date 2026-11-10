@@ -2193,6 +2193,7 @@ fn proto_struct_field_to_core(
     field: &proto::StructField,
 ) -> Result<CoreStructField, SchemaDecodeError> {
     let admitted = proto_attr_type_to_core(&proto::AttributeType::Struct {
+        input_rules: Vec::new(),
         name: "TestField".to_string(),
         fields: vec![field.clone()],
         field_groups: Vec::new(),
@@ -2653,11 +2654,14 @@ mod tests {
 
     fn proto_string() -> proto::AttributeType {
         proto::AttributeType::String {
-            pattern: None,
-            length: None,
-            validate: None,
-            to_dsl: None,
-            identity: None,
+            identity_layer: proto::StringIdentityLayer {
+                pattern: None,
+                length: None,
+                validate: None,
+                to_dsl: None,
+                identity: None,
+            },
+            member_layer: Default::default(),
         }
     }
 
@@ -3135,6 +3139,7 @@ mod tests {
         schema.defs.insert(
             "Tag".to_string(),
             proto::AttributeType::Struct {
+                input_rules: Vec::new(),
                 name: "Tag".to_string(),
                 field_groups: vec![],
                 fields: vec![proto::StructField {
@@ -3180,6 +3185,7 @@ mod tests {
         let mut output = proto_attr(
             "output",
             proto::AttributeType::Struct {
+                input_rules: Vec::new(),
                 name: "Output".to_string(),
                 field_groups: vec![],
                 fields: vec![proto::StructField {
@@ -3267,6 +3273,7 @@ mod tests {
         let destination = proto::StructField {
             name: "destination".to_string(),
             field_type: proto::AttributeType::Struct {
+                input_rules: Vec::new(),
                 name: "Destination".to_string(),
                 field_groups: vec![],
                 fields: vec![illegal_leaf],
@@ -3284,6 +3291,7 @@ mod tests {
         let metadata = proto_attr(
             "metadata_configuration",
             proto::AttributeType::Struct {
+                input_rules: Vec::new(),
                 name: "MetadataConfiguration".to_string(),
                 field_groups: vec![],
                 fields: vec![destination],
@@ -3309,6 +3317,7 @@ mod tests {
         let mut config = proto_attr(
             "config",
             proto::AttributeType::Struct {
+                input_rules: Vec::new(),
                 name: "Config".to_string(),
                 field_groups: vec![],
                 fields: vec![proto::StructField {
@@ -3354,6 +3363,7 @@ mod tests {
             let mut attribute = proto_attr(
                 name,
                 proto::AttributeType::Struct {
+                    input_rules: Vec::new(),
                     name: "Config".to_string(),
                     field_groups: vec![],
                     fields: vec![proto::StructField {
@@ -3420,6 +3430,7 @@ mod tests {
                 members: vec![
                     proto_string(),
                     proto::AttributeType::Struct {
+                        input_rules: Vec::new(),
                         name: "OidcConfig".to_string(),
                         field_groups: vec![],
                         fields: vec![proto::StructField {
@@ -5442,6 +5453,26 @@ mod tests {
     }
 
     #[test]
+    fn refinement_layers_reject_protocol_25_before_schema_decoding() {
+        let error = check_protocol_version(
+            r#"{"name":"old","display_name":"Old","version":"1.0.0","protocol_version":25}"#,
+        )
+        .expect_err("protocol 25 cannot carry required refinement layers");
+        assert!(error.contains("protocol version 25"), "{error}");
+        assert!(error.contains("requires at least version 27"), "{error}");
+    }
+
+    #[test]
+    fn refinement_layers_reject_protocol_26_before_schema_decoding() {
+        let error = check_protocol_version(
+            r#"{"name":"old","display_name":"Old","version":"1.0.0","protocol_version":26}"#,
+        )
+        .expect_err("protocol 26 cannot carry required refinement layers");
+        assert!(error.contains("protocol version 26"), "{error}");
+        assert!(error.contains("requires at least version 27"), "{error}");
+    }
+
+    #[test]
     fn test_check_protocol_version_accepts_host_version() {
         let json = format!(
             r#"{{"name":"aws","display_name":"AWS Provider","version":"1.0.0","protocol_version":{}}}"#,
@@ -5559,7 +5590,10 @@ mod tests {
             let rejected_legacy_identity_bool =
                 json.contains("\"identity\":false") && rendered.contains("expected value");
             assert!(
-                rendered.contains("missing field `keyed_partial_update`")
+                rendered.contains("expected `identity_layer` or `member_layer`")
+                    || rendered.contains("missing field `identity_layer`")
+                    || rendered.contains("missing field `member_layer`")
+                    || rendered.contains("missing field `keyed_partial_update`")
                     || rendered.contains("missing field `field_groups`")
                     || rendered.contains("missing field `create_only`")
                     || rendered.contains("missing field `identity`")
@@ -5584,10 +5618,10 @@ mod tests {
                             "element_type":{
                                 "type":"struct",
                                 "name":"DomainValidation",
-                                "field_groups":[],
+                                "input_rules": [], "field_groups":[],
                                 "fields":[{
                                     "name":"domain_name",
-                                    "field_type":{"type":"String"},
+                                    "field_type":{"type":"String", "identity_layer": {}, "member_layer": {}},
                                     "required":true,
                                     "read_only":false,
                                     "write_only":false,
@@ -5600,10 +5634,10 @@ mod tests {
                                     "field_type":{
                                         "type":"struct",
                                         "name":"HttpRedirect",
-                                        "field_groups":[],
+                                        "input_rules": [], "field_groups":[],
                                         "fields":[{
                                             "name":"redirect_from",
-                                            "field_type":{"type":"String"},
+                                            "field_type":{"type":"String", "identity_layer": {}, "member_layer": {}},
                                             "required":false,
                                             "read_only":false,
                                             "write_only":false,
@@ -5613,7 +5647,7 @@ mod tests {
                                             "provider_name":"RedirectFrom"
                                         },{
                                             "name":"redirect_to",
-                                            "field_type":{"type":"String"},
+                                            "field_type":{"type":"String", "identity_layer": {}, "member_layer": {}},
                                             "required":false,
                                             "read_only":false,
                                             "write_only":false,
@@ -5635,10 +5669,10 @@ mod tests {
                                     "field_type":{
                                         "type":"struct",
                                         "name":"ResourceRecord",
-                                        "field_groups":[],
+                                        "input_rules": [], "field_groups":[],
                                         "fields":[{
                                             "name":"name",
-                                            "field_type":{"type":"String"},
+                                            "field_type":{"type":"String", "identity_layer": {}, "member_layer": {}},
                                             "required":true,
                                             "read_only":false,
                                             "write_only":false,
@@ -5664,7 +5698,7 @@ mod tests {
                                             "provider_name":"Type"
                                         },{
                                             "name":"value",
-                                            "field_type":{"type":"String"},
+                                            "field_type":{"type":"String", "identity_layer": {}, "member_layer": {}},
                                             "required":true,
                                             "read_only":false,
                                             "write_only":false,
@@ -5683,7 +5717,7 @@ mod tests {
                                     "provider_name":"ResourceRecord"
                                 },{
                                     "name":"validation_domain",
-                                    "field_type":{"type":"String"},
+                                    "field_type":{"type":"String", "identity_layer": {}, "member_layer": {}},
                                     "required":false,
                                     "read_only":false,
                                     "write_only":false,
@@ -5695,7 +5729,7 @@ mod tests {
                                     "name":"validation_emails",
                                     "field_type":{
                                         "type":"list", "elements": "allow_duplicates",
-                                        "element_type":{"type":"String","identity":"Email"},
+                                        "element_type":{"type":"String", "identity_layer": {"identity":"Email"}, "member_layer": {}},
                                         "ordered":true
                                     },
                                     "required":false,
@@ -5842,10 +5876,10 @@ mod tests {
                         "attr_type":{
                             "type":"struct",
                             "name":"Config",
-                            "field_groups":[],
+                            "input_rules": [], "field_groups":[],
                             "fields":[{
                                 "name":"client_secret",
-                                "field_type":{"type":"String"},
+                                "field_type":{"type":"String", "identity_layer": {}, "member_layer": {}},
                                 "required":true
                             }]
                         },
@@ -5873,7 +5907,7 @@ mod tests {
                 "attributes":{
                     "name":{
                         "name":"name",
-                        "attr_type":{"type":"String"},
+                        "attr_type":{"type":"String", "identity_layer": {}, "member_layer": {}},
                         "required":true
                     }
                 },
@@ -5927,7 +5961,7 @@ mod tests {
             "attributes": {
               "group_name": {
                 "name": "group_name",
-                "attr_type": { "type": "String" },
+                "attr_type": {"type": "String", "identity_layer": {}, "member_layer": {}},
                 "required": true,
                 "keyed_partial_update": null,
                 "description": "Group name",
@@ -5946,11 +5980,11 @@ mod tests {
                       {
                         "type": "struct",
                         "name": "IngressRule",
-                        "field_groups": [],
+                        "input_rules": [], "field_groups": [],
                         "fields": [
                           {
                             "name": "from_port",
-                            "field_type": { "type": "Int" },
+                            "field_type": {"type": "Int", "identity_layer": {}, "member_layer": {}},
                             "required": true,
                             "write_only": false,
                             "create_only": false,
@@ -5961,7 +5995,7 @@ mod tests {
                           },
                           {
                             "name": "protocol",
-                            "field_type": { "type": "String" },
+                            "field_type": {"type": "String", "identity_layer": {}, "member_layer": {}},
                             "required": true,
                             "write_only": false,
                             "create_only": false,
@@ -5972,7 +6006,7 @@ mod tests {
                           }
                         ]
                       },
-                      { "type": "String" }
+                      {"type": "String", "identity_layer": {}, "member_layer": {}}
                     ]
                   },
                   "ordered": false
@@ -5990,7 +6024,7 @@ mod tests {
               },
               "description": {
                 "name": "description",
-                "attr_type": { "type": "String" },
+                "attr_type": {"type": "String", "identity_layer": {}, "member_layer": {}},
                 "required": true,
                 "keyed_partial_update": null,
                 "description": "Group description",
@@ -6012,7 +6046,7 @@ mod tests {
               },
               "priority": {
                 "name": "priority",
-                "attr_type": { "type": "Int" },
+                "attr_type": {"type": "Int", "identity_layer": {}, "member_layer": {}},
                 "required": false,
                 "keyed_partial_update": null,
                 "description": null,
@@ -6319,6 +6353,7 @@ mod tests {
         schema.defs.insert(
             "Tag".to_string(),
             proto::AttributeType::Struct {
+                input_rules: Vec::new(),
                 name: "Tag".to_string(),
                 field_groups: vec![],
                 fields: vec![proto::StructField {
@@ -6739,7 +6774,7 @@ mod tests {
         let json = r#"{
             "type":"custom_enum",
             "name":"ZoneName",
-            "base":{"type":"String"},
+            "base":{"type":"String", "identity_layer": {}, "member_layer": {}},
             "namespace":"aws.AvailabilityZone",
             "dsl_transform":{"type":"FutureTransform"}
         }"#;
@@ -6805,9 +6840,13 @@ mod tests {
         let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::String {
-                identity,
-                pattern,
-                length,
+                identity_layer:
+                    carina_core::schema::StringIdentityParts {
+                        identity,
+                        pattern,
+                        length,
+                        ..
+                    },
                 ..
             } => {
                 assert_eq!(
@@ -6832,7 +6871,7 @@ mod tests {
         let json = r#"{
             "type":"custom",
             "name":"aws.route53.HostedZone.Name",
-            "base":{"type":"String"},
+            "base":{"type":"String", "identity_layer": {}, "member_layer": {}},
             "pattern":{"regex":"^[a-z.]+$","mode":{"kind":"full"}},
             "length":[1,1024],
             "to_dsl":{"type":"StripSuffix","value":"."}
@@ -6842,10 +6881,14 @@ mod tests {
 
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::String {
-                identity,
-                pattern,
-                length,
-                to_dsl,
+                identity_layer:
+                    carina_core::schema::StringIdentityParts {
+                        identity,
+                        pattern,
+                        length,
+                        to_dsl,
+                        ..
+                    },
                 ..
             } => {
                 assert_eq!(identity.map(|id| id.kind.as_str()), Some("Name"));
@@ -6868,7 +6911,7 @@ mod tests {
         let json = r#"{
             "type":"custom",
             "name":"aws.ec2.Port",
-            "base":{"type":"Int"},
+            "base":{"type":"Int", "identity_layer": {}, "member_layer": {}},
             "length":[0,65535]
         }"#;
         let proto_attr: proto::AttributeType = serde_json::from_str(json).unwrap();
@@ -6876,7 +6919,11 @@ mod tests {
 
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::Int {
-                identity, range, ..
+                identity_layer:
+                    carina_core::schema::IntIdentityParts {
+                        identity, range, ..
+                    },
+                ..
             } => {
                 assert_eq!(identity.map(|id| id.kind.as_str()), Some("Port"));
                 assert_eq!(range, Some((Some(0), Some(65535))));
@@ -6932,15 +6979,23 @@ mod tests {
         ) {
             (
                 carina_core::schema::Shape::String {
-                    identity: nested_identity,
-                    pattern: nested_pattern,
-                    length: nested_length,
+                    identity_layer:
+                        carina_core::schema::StringIdentityParts {
+                            identity: nested_identity,
+                            pattern: nested_pattern,
+                            length: nested_length,
+                            ..
+                        },
                     ..
                 },
                 carina_core::schema::Shape::String {
-                    identity: flat_identity,
-                    pattern: flat_pattern,
-                    length: flat_length,
+                    identity_layer:
+                        carina_core::schema::StringIdentityParts {
+                            identity: flat_identity,
+                            pattern: flat_pattern,
+                            length: flat_length,
+                            ..
+                        },
                     ..
                 },
             ) => {
@@ -6982,7 +7037,11 @@ mod tests {
         let core_attr = proto_attr_type_to_core(&nested).unwrap();
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::String {
-                pattern, length, ..
+                identity_layer:
+                    carina_core::schema::StringIdentityParts {
+                        pattern, length, ..
+                    },
+                ..
             } => {
                 assert_eq!(
                     pattern,
@@ -7020,7 +7079,11 @@ mod tests {
         let core_attr = proto_attr_type_to_core(&fallback).unwrap();
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::String {
-                pattern, length, ..
+                identity_layer:
+                    carina_core::schema::StringIdentityParts {
+                        pattern, length, ..
+                    },
+                ..
             } => {
                 assert_eq!(
                     pattern,
@@ -7047,8 +7110,11 @@ mod tests {
             proto_custom(
                 "aws.GenericPort",
                 proto::AttributeType::Int {
-                    range: None,
-                    identity: None,
+                    identity_layer: proto::IntIdentityLayer {
+                        range: None,
+                        identity: None,
+                    },
+                    member_layer: Default::default(),
                 },
                 None,
                 Some((Some(0), Some(65535))),
@@ -7059,7 +7125,11 @@ mod tests {
         let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::Int {
-                identity, range, ..
+                identity_layer:
+                    carina_core::schema::IntIdentityParts {
+                        identity, range, ..
+                    },
+                ..
             } => {
                 assert_eq!(identity.map(|id| id.kind.as_str()), Some("Port"));
                 assert_eq!(range, Some((Some(0), Some(65535))));
@@ -7095,7 +7165,11 @@ mod tests {
         let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::String {
-                identity, pattern, ..
+                identity_layer:
+                    carina_core::schema::StringIdentityParts {
+                        identity, pattern, ..
+                    },
+                ..
             } => {
                 assert_eq!(identity.map(|id| id.kind.as_str()), Some("Id"));
                 assert_eq!(
@@ -7138,21 +7212,17 @@ mod tests {
     #[test]
     fn non_null_opaque_validator_payload_is_rejected() {
         let payloads = [
-            r#"{
-                "type":"String",
-                "identity":"test.ValidatedString",
-                "validate":true
-            }"#,
+            r#"{"type":"String", "identity_layer": {"identity":"test.ValidatedString", "validate":true}, "member_layer": {}}"#,
             r#"{
                 "type":"list", "elements": "allow_duplicates",
-                "element_type":{"type":"String"},
+                "element_type":{"type":"String", "identity_layer": {}, "member_layer": {}},
                 "ordered":true,
                 "validate":{"legacy":"callback"}
             }"#,
             r#"{
                 "type":"custom",
                 "name":"test.Legacy",
-                "base":{"type":"String"},
+                "base":{"type":"String", "identity_layer": {}, "member_layer": {}},
                 "validate":"opaque"
             }"#,
         ];
@@ -7186,7 +7256,7 @@ mod tests {
                             "base":{
                                 "type":"custom",
                                 "name":"aws.ResourceId",
-                                "base":{"type":"String"}
+                                "base":{"type":"String", "identity_layer": {}, "member_layer": {}}
                             }
                         },
                         "required":false,
@@ -7200,7 +7270,10 @@ mod tests {
         let schemas = json_to_schemas(json).unwrap();
         let attr_type = schemas[0].parts().attributes["id"].attr_type();
         match attr_type.shape_ref_free().expect("test schema is Ref-free") {
-            carina_core::schema::Shape::String { identity, .. } => {
+            carina_core::schema::Shape::String {
+                identity_layer: carina_core::schema::StringIdentityParts { identity, .. },
+                ..
+            } => {
                 assert_eq!(
                     identity.map(|id| id.to_string()),
                     Some("aws.ec2.VpcCidrBlockAssociation.Id".to_string())
@@ -7217,7 +7290,7 @@ mod tests {
             "name":"awscc.wafv2.StatementList",
             "base":{
                 "type":"list", "elements": "allow_duplicates",
-                "inner":{"type":"String"},
+                "inner":{"type":"String", "identity_layer": {}, "member_layer": {}},
                 "ordered":false
             },
             "length":[1,5],
@@ -7240,18 +7313,12 @@ mod tests {
     #[test]
     fn new_primitive_payloads_lift_to_refined_core_shapes() {
         let cases = [
-            r#"{
-                "type":"String",
-                "identity":"aws.route53.HostedZone.Name",
-                "pattern":{"regex":"^[a-z.]+$","mode":{"kind":"full"}},
-                "length":[1,1024],
-                "to_dsl":{"type":"StripSuffix","value":"."}
-            }"#,
-            r#"{"type":"Int","identity":"aws.ec2.Port","range":[-1,65535]}"#,
+            r#"{"type":"String", "identity_layer": {"identity":"aws.route53.HostedZone.Name", "pattern":{"regex":"^[a-z.]+$","mode":{"kind":"full"}}, "length":[1,1024], "to_dsl":{"type":"StripSuffix","value":"."}}, "member_layer": {}}"#,
+            r#"{"type":"Int", "identity_layer": {"identity":"aws.ec2.Port", "range":[-1,65535]}, "member_layer": {}}"#,
             r#"{"type":"Float","identity":"awscc.wafv2.Size","range":[0.0,1.0]}"#,
             r#"{
                 "type":"list", "elements": "allow_duplicates",
-                "element_type":{"type":"String"},
+                "element_type":{"type":"String", "identity_layer": {}, "member_layer": {}},
                 "ordered":true,
                 "length":[1,3]
             }"#,
@@ -7262,10 +7329,14 @@ mod tests {
             let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
             match core_attr.shape_ref_free().expect("test schema is Ref-free") {
                 carina_core::schema::Shape::String {
-                    identity,
-                    pattern,
-                    length,
-                    to_dsl,
+                    identity_layer:
+                        carina_core::schema::StringIdentityParts {
+                            identity,
+                            pattern,
+                            length,
+                            to_dsl,
+                            ..
+                        },
                     ..
                 } => {
                     assert_eq!(identity.map(|id| id.kind.as_str()), Some("Name"));
@@ -7280,7 +7351,11 @@ mod tests {
                     assert_eq!(to_dsl.unwrap().apply("example.com."), "example.com");
                 }
                 carina_core::schema::Shape::Int {
-                    identity, range, ..
+                    identity_layer:
+                        carina_core::schema::IntIdentityParts {
+                            identity, range, ..
+                        },
+                    ..
                 } => {
                     assert_eq!(identity.map(|id| id.kind.as_str()), Some("Port"));
                     assert_eq!(range, Some((Some(-1), Some(65535))));
@@ -7312,15 +7387,21 @@ mod tests {
         for (kind, expected_identity) in carina_core::schema::builtin_validator_registry().keys() {
             let wire_type = match kind {
                 carina_core::schema::RefinedScalarKind::String => proto::AttributeType::String {
-                    pattern: None,
-                    length: None,
-                    validate: None,
-                    to_dsl: None,
-                    identity: Some(expected_identity.to_string()),
+                    identity_layer: proto::StringIdentityLayer {
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                        identity: Some(expected_identity.to_string()),
+                    },
+                    member_layer: Default::default(),
                 },
                 carina_core::schema::RefinedScalarKind::Int => proto::AttributeType::Int {
-                    range: None,
-                    identity: Some(expected_identity.to_string()),
+                    identity_layer: proto::IntIdentityLayer {
+                        range: None,
+                        identity: Some(expected_identity.to_string()),
+                    },
+                    member_layer: Default::default(),
                 },
                 carina_core::schema::RefinedScalarKind::Float => proto::AttributeType::Float {
                     range: None,
@@ -7335,16 +7416,24 @@ mod tests {
 
             let (actual_identity, has_callback) = match decoded.raw_shape() {
                 carina_core::schema::RawShape::String {
-                    identity,
-                    pattern: _,
-                    length: _,
-                    validate,
-                    to_dsl: _,
+                    identity_layer:
+                        carina_core::schema::StringIdentityParts {
+                            identity,
+                            pattern: _,
+                            length: _,
+                            validate,
+                            to_dsl: _,
+                        },
+                    member_layer: _,
                 } => (identity, validate.is_some()),
                 carina_core::schema::RawShape::Int {
-                    identity,
-                    range: _,
-                    validate,
+                    identity_layer:
+                        carina_core::schema::IntIdentityParts {
+                            identity,
+                            range: _,
+                            validate,
+                        },
+                    member_layer: _,
                 } => (identity, validate.is_some()),
                 carina_core::schema::RawShape::Float {
                     identity,
@@ -7575,12 +7664,12 @@ mod pattern_mode_tests {
             serde_json::json!({"regex": "abc", "mode": {"kind": "substring", "reason": ""}}),
         ] {
             for terminal in [
-                serde_json::json!({"type": "String", "pattern": pattern}),
-                serde_json::json!({"type": "custom", "name": "test.Name", "base": {"type": "String"}, "pattern": pattern}),
+                serde_json::json!({"type": "String", "identity_layer": {"pattern": pattern}, "member_layer": {}}),
+                serde_json::json!({"type": "custom", "name": "test.Name", "base": {"type": "String", "identity_layer": {}, "member_layer": {}}, "pattern": pattern}),
                 serde_json::json!({"type": "reference", "identity": {"provider": "test", "segments": [], "kind": "Id"}, "pattern": pattern}),
             ] {
                 // All current-protocol metadata is present, isolating the pattern failure.
-                let nested = serde_json::json!({"type": "struct", "name": "Nested", "field_groups": [], "fields": [{
+                let nested = serde_json::json!({"type": "struct", "name": "Nested", "input_rules": [], "field_groups": [], "fields": [{
                     "name": "value", "required": false, "read_only": false, "write_only": false,
                     "create_only": false, "identity": "none", "field_type": terminal
                 }]});
@@ -7623,7 +7712,7 @@ mod pattern_mode_tests {
 mod removed_legacy_pattern_window_tests {
     #[test]
     fn pattern_specs_require_supported_protocol_including_schema_only_loading() {
-        for version in [12, 22, 23, 24] {
+        for version in [12, 22, 23, 24, 25] {
             let info = serde_json::json!({"name": "old", "display_name": "Old", "version": "1.0.0", "protocol_version": version});
             let error = super::check_protocol_version(&info.to_string()).unwrap_err();
             assert!(error.contains(&format!(
@@ -7704,6 +7793,70 @@ mod pattern_mode_roundtrip_tests {
             serde_json::from_str::<serde_json::Value>(&config_json).unwrap(),
             serde_json::from_str::<serde_json::Value>(
                 &carina_plugin_sdk::provider_config_schema_to_json(&decoded_config).unwrap()
+            )
+            .unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod conditional_input_rule_roundtrip_tests {
+    use super::*;
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, InputCondition, InputLiteral, InputPath, InputPredicate,
+        InputRule, InputRuleCode, InputRuleScope, ResourceSchema, StructField,
+        ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+    };
+
+    #[test]
+    fn sdk_json_host_roundtrip_preserves_conditions_and_struct_local_rules() {
+        let condition = InputCondition::Not(Box::new(InputCondition::Equals {
+            path: InputPath::new("guard").unwrap(),
+            literal: InputLiteral::Bool(true),
+        }));
+        let rule = InputRule::value(
+            InputRuleScope::EveryWrite,
+            InputPath::new("target").unwrap(),
+            InputRuleCode::new("test.guard").unwrap(),
+            InputPredicate::Present,
+        )
+        .with_condition(condition);
+        let nested = AttributeType::struct_with_rules(
+            "Nested",
+            vec![
+                StructField::optional("guard", AttributeType::bool()).build(),
+                StructField::optional("target", AttributeType::string()).build(),
+            ],
+            vec![],
+            vec![rule.clone()],
+        );
+        let schema = ResourceSchema::new("test.Conditional")
+            .attribute(AttributeSchema::optional("guard", AttributeType::bool()).build())
+            .attribute(AttributeSchema::optional("target", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "nested",
+                    AttributeType::list(AttributeType::ref_("Nested")),
+                )
+                .build(),
+            )
+            .with_def("Nested", nested)
+            .input_rule(rule)
+            .validate()
+            .unwrap();
+        let witness = ValidatedProviderSchemaWitness::new(
+            vec![schema],
+            ValidatedConfigSchema::default(),
+            BTreeMap::new(),
+            vec![],
+        )
+        .unwrap();
+        let json = carina_plugin_sdk::provider_schema_to_json(&witness).unwrap();
+        let decoded = json_to_provider_schema(&json, ValidatedConfigSchema::default()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            serde_json::from_str::<serde_json::Value>(
+                &carina_plugin_sdk::provider_schema_to_json(&decoded).unwrap()
             )
             .unwrap()
         );

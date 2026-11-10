@@ -19,6 +19,17 @@ impl PatternAttributeType<Draft> {
         location: SchemaValidationIssueLocation,
         issues: &mut Vec<SchemaDefinitionIssue>,
     ) -> Option<CompiledAttributeType> {
+        let empty_bounds = self.has_empty_refinement_bounds();
+        if empty_bounds {
+            push_schema_issue(
+                issues,
+                &location,
+                format!(
+                    "{} has an empty intersection of scalar constraints",
+                    self.type_name()
+                ),
+            );
+        }
         let kind = match self.kind {
             AttrTypeKind::UnloadedSchemaType(unloaded) => {
                 AttrTypeKind::UnloadedSchemaType(unloaded)
@@ -48,31 +59,35 @@ impl PatternAttributeType<Draft> {
                 length,
             },
             AttrTypeKind::String {
-                binding,
-                pattern,
-                length,
-                to_dsl,
-            } => AttrTypeKind::String {
-                binding,
-                pattern: match pattern {
-                    Some(pattern) => match CompiledPattern::try_new(&pattern) {
-                        Ok(pattern) => Some(pattern),
-                        Err(error) => {
-                            issues.push(SchemaDefinitionIssue {
-                                input_rule_error: None,
-                                path: location.raw_path().into(),
-                                location,
-                                message: error.to_string().into(),
-                                pattern_error: Some(error),
-                            });
-                            return None;
-                        }
+                identity_layer,
+                member_layer,
+            } => {
+                let StringIdentityLayer {
+                    binding,
+                    pattern,
+                    length,
+                    to_dsl,
+                } = identity_layer;
+                let StringMemberConstraints {
+                    pattern: member_pattern,
+                    length: member_length,
+                } = member_layer;
+                let identity_pattern = compile_layer_pattern(pattern, &location, issues);
+                let member_pattern = compile_layer_pattern(
+                    member_pattern,
+                    &location.with_suffix(".member_layer"),
+                    issues,
+                );
+                AttrTypeKind::String {
+                    identity_layer: StringIdentityLayer {
+                        binding,
+                        pattern: identity_pattern?,
+                        length,
+                        to_dsl,
                     },
-                    None => None,
-                },
-                length,
-                to_dsl,
-            },
+                    member_layer: StringMemberConstraints::new(member_pattern?, member_length),
+                }
+            }
             AttrTypeKind::ResourceHandle {
                 provider,
                 resource_type,
@@ -81,7 +96,13 @@ impl PatternAttributeType<Draft> {
                 resource_type,
             },
             AttrTypeKind::StringLiteralSet { values } => AttrTypeKind::StringLiteralSet { values },
-            AttrTypeKind::Int { binding, range } => AttrTypeKind::Int { binding, range },
+            AttrTypeKind::Int {
+                identity_layer,
+                member_layer,
+            } => AttrTypeKind::Int {
+                identity_layer,
+                member_layer,
+            },
             AttrTypeKind::Float { binding, range } => AttrTypeKind::Float { binding, range },
             AttrTypeKind::Bool => AttrTypeKind::Bool,
             AttrTypeKind::Duration => AttrTypeKind::Duration,
@@ -128,14 +149,27 @@ impl PatternAttributeType<Draft> {
                 name,
                 fields,
                 field_groups,
-            } => AttrTypeKind::Struct {
-                name,
-                fields: compile_all(fields, |field| {
-                    let field_location = location.with_suffix(format_args!(".{}", field.name));
-                    field.compile_patterns(field_location, issues)
-                })?,
-                field_groups,
-            },
+                input_rules,
+            } => {
+                let fields: Option<super::IndexedStructFields<Compiled>> =
+                    compile_all(fields, |field| {
+                        let field_location = location.with_suffix(format_args!(".{}", field.name));
+                        field.compile_patterns(field_location, issues)
+                    });
+                let input_rules =
+                    compile_all(input_rules.into_iter().enumerate(), |(index, rule)| {
+                        rule.compile_patterns(
+                            location.with_suffix(format_args!(".input_rules[{index}]")),
+                            issues,
+                        )
+                    });
+                AttrTypeKind::Struct {
+                    name,
+                    fields: fields?,
+                    field_groups,
+                    input_rules: input_rules?,
+                }
+            }
             AttrTypeKind::Union(members) => {
                 AttrTypeKind::Union(UnionMemberTypes::new(compile_all(
                     members.into_raw_vec().into_iter().enumerate(),
@@ -149,7 +183,7 @@ impl PatternAttributeType<Draft> {
             }
             AttrTypeKind::Ref(name) => AttrTypeKind::Ref(name),
         };
-        Some(PatternAttributeType { kind })
+        (!empty_bounds).then_some(PatternAttributeType { kind })
     }
 }
 
@@ -259,7 +293,7 @@ impl PatternResourceSchema<Draft> {
             ty.compile_patterns(location, issues).map(|ty| (name, ty))
         });
         let input_rules = compile_all(input_rules.into_iter().enumerate(), |(index, rule)| {
-            rule.compile_patterns(index, issues)
+            rule.compile_patterns(SchemaValidationIssueLocation::InputRule(index), issues)
         });
         Some(PatternResourceSchema {
             resource_type,
@@ -277,5 +311,28 @@ impl PatternResourceSchema<Draft> {
             default_wait_interval,
             defs: defs?,
         })
+    }
+}
+
+fn compile_layer_pattern(
+    pattern: Option<PatternSpec>,
+    location: &SchemaValidationIssueLocation,
+    issues: &mut Vec<SchemaDefinitionIssue>,
+) -> Option<Option<CompiledPattern>> {
+    match pattern {
+        None => Some(None),
+        Some(pattern) => match CompiledPattern::try_new(&pattern) {
+            Ok(pattern) => Some(Some(pattern)),
+            Err(error) => {
+                issues.push(SchemaDefinitionIssue {
+                    input_rule_error: None,
+                    path: location.raw_path().into(),
+                    location: location.clone(),
+                    message: error.to_string().into(),
+                    pattern_error: Some(error),
+                });
+                None
+            }
+        },
     }
 }

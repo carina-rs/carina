@@ -16,11 +16,11 @@ use carina_core::schema::{
 };
 use tempfile::TempDir;
 
-struct AwsTestFactory;
+struct AwsTestFactory(&'static str);
 
 impl ProviderFactory for AwsTestFactory {
     fn name(&self) -> &str {
-        "aws"
+        self.0
     }
 
     fn display_name(&self) -> &str {
@@ -58,6 +58,27 @@ impl ProviderFactory for AwsTestFactory {
     }
 
     fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+        // Different reusable definitions belong to separate owners. Keep the
+        // same identity and bounds used by the inference assertions below.
+        if self.0 == "awscc" {
+            return vec![
+                ResourceSchema::new("NameSource")
+                    .attribute(
+                        AttributeSchema::provider_populated(
+                            "wide",
+                            AttributeType::refined_string(
+                                Some(TypeIdentity::from_schema_type("aws", "iam.Role", "Name")),
+                                None,
+                                Some((Some(1), Some(128))),
+                                None,
+                            ),
+                        )
+                        .build(),
+                    )
+                    .validate()
+                    .expect("wide name definition in its own schema owner"),
+            ];
+        }
         let role_name = AttributeType::refined_string(
             Some(TypeIdentity::from_schema_type("aws", "iam.Role", "Name")),
             None,
@@ -72,23 +93,11 @@ impl ProviderFactory for AwsTestFactory {
             ResourceSchema::new("NameSource")
                 .attribute(AttributeSchema::provider_populated("narrow", role_name.clone()).build())
                 .attribute(
-                    AttributeSchema::provider_populated(
-                        "wide",
-                        AttributeType::refined_string(
-                            Some(TypeIdentity::from_schema_type("aws", "iam.Role", "Name")),
-                            None,
-                            Some((Some(1), Some(128))),
-                            None,
-                        ),
-                    )
-                    .build(),
-                )
-                .attribute(
                     AttributeSchema::provider_populated("names", AttributeType::list(role_name))
                         .build(),
                 )
                 .validate()
-                .expect("name source schema with distinct exact bounds"),
+                .expect("name source schema with one reusable identity definition"),
         ]
     }
 }
@@ -107,8 +116,11 @@ impl Fixture {
         std::fs::create_dir(&caller).expect("caller directory");
         std::fs::write(module.join("main.crn"), module_source).expect("module main.crn");
         std::fs::write(caller.join("main.crn"), caller_source).expect("caller main.crn");
-        std::fs::write(caller.join("providers.crn"), "provider aws {}\n")
-            .expect("caller providers.crn");
+        std::fs::write(
+            caller.join("providers.crn"),
+            "provider aws {}\nprovider awscc {}\n",
+        )
+        .expect("caller providers.crn");
         Self {
             _temp: temp,
             caller,
@@ -118,7 +130,10 @@ impl Fixture {
     fn validate(&self) -> Vec<String> {
         carina_cli::commands::validate::validate_with_factories(
             &carina_core::paths::ResolvedPath::new(&self.caller).unwrap(),
-            LoadedProviderFactory::for_test(vec![Box::new(AwsTestFactory)]),
+            LoadedProviderFactory::for_test(vec![
+                Box::new(AwsTestFactory("aws")),
+                Box::new(AwsTestFactory("awscc")),
+            ]),
         )
     }
 }
@@ -232,7 +247,7 @@ fn computed_access_rejects_heterogeneous_collection_in_directory_validation() {
             format!("role_module {{ x = (src.names ?? {fallback})[1] }}"),
         ] {
             let source = format!(
-                "let role_module = use {{ source = '../module' }}\nlet src = aws.NameSource {{}}\n{sink}\n"
+                "let role_module = use {{ source = '../module' }}\nlet narrow = aws.NameSource {{}}\nlet wide = awscc.NameSource {{}}\nlet src = {{ narrow = narrow.narrow, wide = wide.wide, names = narrow.names }}\n{sink}\n"
             );
             let diagnostics = Fixture::new(NAMED_ARGUMENT_MODULE, &source).validate();
             match expected_error {

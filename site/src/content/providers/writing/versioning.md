@@ -23,7 +23,10 @@ Since v0.5.0, the first release that checks the version, every release has set t
 
 | Carina release | Protocol version | Oldest provider protocol it loads |
 |----------------|------------------|-----------------------------------|
-| Development snapshot after v0.13.1 (unreleased) | 28 | 28 |
+| Current development protocol (unreleased) | 28 | 28 |
+| Refinement-layer snapshot (unreleased) | 27 | 27 |
+| Conditional input-rule snapshot (unreleased) | 26 | 26 |
+| Development snapshot after v0.13.1 (unreleased) | 25 | 25 |
 | v0.13.1 | 24 | 24 |
 | v0.13.0 | 24 | 24 |
 | v0.12.1 | 23 | 23 |
@@ -44,19 +47,23 @@ Since v0.5.0, the first release that checks the version, every release has set t
 | v0.6.0 | 10 | 10 |
 | v0.5.0 | 10 | 10 |
 
-The current development SDK and minimum supported provider protocol are both 28 (WIT 0.3.0). Protocol 28 requires an exclusive typed error retryability class that survives transport; message, cause and code never infer retry policy. Protocol 25 introduced typed diagnostics, discarded guest stdout/stderr, and required credential registration before adoption, including each AWS refresh through `AwsSdkParts`. `CARINA_WASI_HTTP_TRACE` is host-only, and legacy WIT packages are rejected before linking. Released Carina v0.13.0 and v0.13.1 use protocol 24; v0.12.0 and v0.12.1 use protocol 23, v0.11.0 uses protocol 21 and v0.10.0 uses protocol 19. Protocol 24 requires [explicit pattern match modes and reasons containing visible text for substring exceptions](/providers/writing/schemas/#attribute-types). Protocol 23 requires every resource schema to carry an `input_rules` array, `[]` when the resource declares no rules. Each rule names a scope (`create_only` or `every_write`), a typed target, a stable diagnostic code and a predicate, and Carina checks it on the inputs of the writes in that scope, never on read-back or state values. Protocol 22 added an optional entry-count bound to map attribute types, the same `length` shape that list types use. Providers built for protocol 27 or earlier must rebuild against the current SDK, including for metadata-only state migration checks.
+The current development SDK and minimum supported provider protocol are both 28 (WIT 0.3.0). Protocol 28 requires an exclusive typed error retryability class that survives transport; message, cause and code never infer retry policy. Protocol 27 requires separate identity and member constraint records for refined String and Int, including explicit empty records and rejection of unknown layer fields; within-provider identity definitions must agree, and legacy Custom bases cannot carry member constraints. Protocol 26 requires typed input-rule conditions and Struct-local rule arrays. Protocol 25 introduced typed diagnostics, discarded guest stdout/stderr, and required credential registration before adoption, including each AWS refresh through `AwsSdkParts`. `CARINA_WASI_HTTP_TRACE` is host-only, and legacy WIT packages are rejected before linking. Released Carina v0.13.0 and v0.13.1 use protocol 24; v0.12.0 and v0.12.1 use protocol 23, v0.11.0 uses protocol 21 and v0.10.0 uses protocol 19. Protocol 24 requires [explicit pattern match modes and reasons containing visible text for substring exceptions](/providers/writing/schemas/#attribute-types). Protocol 23 requires every resource schema to carry an `input_rules` array, `[]` when the resource declares no rules. Each rule names a scope (`create_only` or `every_write`), a typed target, a stable diagnostic code and a predicate, and Carina checks it on the inputs of the writes in that scope, never on read-back or state values. Protocol 22 added an optional entry-count bound to map attribute types, the same `length` shape that list types use. Providers built for protocol 27 or earlier must rebuild against the current SDK, including for metadata-only state migration checks.
 
 For protocol 28 AWS configuration, use `AwsSessionMaterial`, `AwsSessionSource`, `AwsSessionFuture` and `AwsSdkParts` (SDK feature `aws`). Sources return `AwsSessionMaterial::new(credentials)` with the complete SDK value; registration retains expiry, account ID, provider name and feature/custom properties. Registration and acknowledged snapshots remain internal; snapshots cannot provide credentials independently or prepare unsigned requests. The SDK installs the refreshing provider and HTTP client together and registers every returned generation; later AWS config changes remain under caller control.
+
+Protocol 26 introduced required `InputRule.condition` and Struct `input_rules` arrays to the protocol-25 diagnostics contract, retaining WIT 0.2.0. CreateOnly input-rule violations are validate/LSP warnings with `(rejected if this resource is created)` wording and plan errors only at create-capable sites; EveryWrite violations remain errors. The current host requires the matching protocol-28 SDK; released v0.13.1 remains protocol 24/24. Schema fingerprint encoding stays v13.
 
 The protocol 21 schema envelope requires `assignability_edges`, even when empty, and SDK providers must implement `CarinaProvider::assignability_edges`. Both endpoints must be declared by that provider as scalar String, Int, or Float identities with the same scalar kind. Enum, Reference, and core built-in identities cannot be endpoints; self edges, duplicates, and cycles are rejected. Each provider's transitive closure is retained separately, so paths never combine different providers' declarations.
 
 Assignment first checks structural identity. When identities differ, a provider attribute uses its sink owner's edges. Type annotations and module boundaries require a path declared by every owner of the sink identity. The existing length and range checks still apply, and sink validators still run on values during validation, planning, and apply.
 
-Protocols 14 through 25 came before protocol 28, and their changes remain part of it:
+Protocols 14 through 27 came before protocol 28, and their changes remain part of it:
 
 | Protocol | Change |
 |----------------------|--------|
-| 25 | Typed diagnostics and credential registration; guest stdout/stderr discarded. |
+| 27 | Separate String/Int identity and member constraint records. |
+| 26 | Required conditional input rules and Struct-local rule arrays. |
+| 25 | WIT 0.2.0 typed diagnostics and credential registration. |
 | 24 | Required explicit pattern match modes and justified substring exceptions. |
 | 23 | Required scoped desired-input rules on resource schemas. |
 | 22 | Optional entry-count bound on map attribute types. |

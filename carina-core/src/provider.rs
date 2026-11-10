@@ -1125,6 +1125,42 @@ impl CreateRequest {
 #[derive(Debug, Clone, Default)]
 pub struct ReadRequest;
 
+/// Protected desired evidence and its exact checked patch, minted together
+/// only by UpdateRequest::checked. No constructor accepts an existing request
+/// alongside a different desired resource.
+#[derive(Clone)]
+pub(crate) struct ProtectedUpdateInput {
+    id: ResourceId,
+    attributes: IndexMap<String, Value>,
+    ignored: crate::resource::ResolvedIgnoreChanges,
+    patch: UpdatePatch,
+    selection: crate::input_rules::InputSelectionAuthority,
+}
+
+impl fmt::Debug for ProtectedUpdateInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProtectedUpdateInput(<protected>)")
+    }
+}
+
+impl ProtectedUpdateInput {
+    pub(crate) fn selection_authority(&self) -> &crate::input_rules::InputSelectionAuthority {
+        &self.selection
+    }
+    pub(crate) fn id(&self) -> &ResourceId {
+        &self.id
+    }
+    pub(crate) fn attributes(&self) -> &IndexMap<String, Value> {
+        &self.attributes
+    }
+    pub(crate) fn ignored(&self) -> &crate::resource::ResolvedIgnoreChanges {
+        &self.ignored
+    }
+    pub(crate) fn patch(&self) -> &UpdatePatch {
+        &self.patch
+    }
+}
+
 /// Per-operation request record for [`Provider::update`].
 ///
 /// Mirrors `update-request` in `wit/types.wit`. `from` is the current
@@ -1178,7 +1214,9 @@ pub struct UpdateRequest {
     patch: WireReady<UpdatePatch>,
     /// Effective directives resolved from the managed resource schema.
     directives: ProviderDirectives,
-    diagnostic_values: Vec<Value>,
+    input: Arc<ProtectedUpdateInput>,
+    #[cfg(any(test, feature = "test-utils"))]
+    desired_for_fixture: ProviderReadyResource,
 }
 
 impl UpdateRequest {
@@ -1190,23 +1228,49 @@ impl UpdateRequest {
     ) -> Result<Self, crate::executor::ProviderPreparationError> {
         let patch = build_update_patch(changed_attributes, resource, &from, schema)?;
         let patch = WireReady::try_new(patch, ProviderWireTarget::Resource(resource.id.clone()))?;
-        let diagnostic_values = patch
-            .as_inner()
-            .ops
-            .iter()
-            .filter_map(|op| match op {
-                PatchOp::Add { key, value }
-                | PatchOp::Replace { key, value }
-                | PatchOp::Reassert { key, value } => Some(resource.diagnostic_value(key, value)),
-                PatchOp::Remove { .. } => None,
-            })
-            .collect();
+        let protected = resource.protected_desired_tree();
+        let annotated_patch = UpdatePatch {
+            ops: patch
+                .as_inner()
+                .ops
+                .iter()
+                .map(|op| match op {
+                    PatchOp::Add { key, value } => PatchOp::Add {
+                        key: key.clone(),
+                        value: resource.diagnostic_value(key, value),
+                    },
+                    PatchOp::Replace { key, value } => PatchOp::Replace {
+                        key: key.clone(),
+                        value: resource.diagnostic_value(key, value),
+                    },
+                    PatchOp::Reassert { key, value } => PatchOp::Reassert {
+                        key: key.clone(),
+                        value: resource.diagnostic_value(key, value),
+                    },
+                    PatchOp::Remove { key } => PatchOp::Remove { key: key.clone() },
+                })
+                .collect(),
+        };
+        let input = Arc::new(ProtectedUpdateInput {
+            id: protected.id().clone(),
+            attributes: protected.attributes().clone(),
+            ignored: protected.ignored().clone(),
+            patch: annotated_patch,
+            selection: protected.selection_authority().clone(),
+        });
         Ok(Self {
+            #[cfg(any(test, feature = "test-utils"))]
+            desired_for_fixture: resource.clone(),
             from,
             patch,
             directives: *resource.directives(),
-            diagnostic_values,
+            input,
         })
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn desired_for_fixture(&self) -> &ProviderReadyResource {
+        &self.desired_for_fixture
     }
 
     /// Current provider-side state.
@@ -1220,7 +1284,11 @@ impl UpdateRequest {
     }
 
     pub(crate) fn diagnostic_values(&self) -> impl Iterator<Item = &Value> {
-        self.diagnostic_values.iter()
+        self.input.patch.ops.iter().filter_map(PatchOp::sent_value)
+    }
+
+    pub(crate) fn protected_input(&self) -> &ProtectedUpdateInput {
+        &self.input
     }
 
     /// The checked projection consumed by provider transport adapters.
@@ -1474,17 +1542,6 @@ impl PatchOp {
 }
 
 impl UpdatePatch {
-    /// Desired values actually sent by this patch, including reasserted inputs.
-    pub(crate) fn sent_projection(&self) -> IndexMap<String, Value> {
-        self.ops
-            .iter()
-            .filter_map(|op| {
-                op.sent_value()
-                    .map(|value| (op.key().to_owned(), value.clone()))
-            })
-            .collect()
-    }
-
     pub(crate) fn sent_attributes(&self) -> SentAttributes {
         SentAttributes::from_update_patch(self)
     }
@@ -6715,17 +6772,16 @@ impl From<&ResourceId> for ProviderInstanceKey {
 
 /// Check a default-tag value before host-owned merging. Unresolved values are
 /// skippable; redacted secrets are fatal.
-fn assert_default_tag_value_encodable(
-    value: &crate::resource::knowledge::Classification<'_>,
+pub(crate) fn assert_default_tag_value_encodable<P: crate::resource::PlaceholderKind>(
+    value: &crate::resource::knowledge::Classification<'_, P>,
 ) -> Result<(), SerializationError> {
     use crate::resource::knowledge::{Classification, KnownValue, KnownView, ShapeView};
-    if crate::resource::knowledge::ClassifiedRef::from(value)
-        .secret()
-        .is_some()
-    {
+    if crate::resource::knowledge::ClassifiedRef::from(value).is_protected() {
         return Ok(());
     }
-    fn known(value: &KnownValue<'_>) -> Result<(), SerializationError> {
+    fn known<P: crate::resource::PlaceholderKind>(
+        value: &KnownValue<'_, P>,
+    ) -> Result<(), SerializationError> {
         value.visit(
             |value| match value {
                 KnownView::EnumIdentifier(value) => {
@@ -6780,7 +6836,8 @@ fn assert_default_tag_value_encodable(
             |_| Ok(()),
         ),
         Classification::Pending(value) => {
-            crate::resource::require_known_value(Classification::Pending(value.clone())).map(|_| ())
+            crate::resource::require_known_classification(Classification::Pending(value.clone()))
+                .map(|_| ())
         }
     }
 }
@@ -6826,6 +6883,15 @@ pub fn merge_default_tags<S, D>(
         crate::resource::AbsoluteBindingAddress,
         D,
     >],
+    registry: &SchemaRegistry,
+) -> HostResult<()> {
+    merge_default_tags_with_placeholders(config, resources, registry)
+}
+
+/// The same merge policy also accepts transient authored substitution evidence.
+pub(crate) fn merge_default_tags_with_placeholders<S, D, P: crate::resource::PlaceholderKind>(
+    config: &ProviderConfig<P, crate::resource::AbsoluteBindingAddress>,
+    resources: &mut [Resource<S, P, crate::resource::AbsoluteBindingAddress, D>],
     registry: &SchemaRegistry,
 ) -> HostResult<()> {
     if config.default_tags.is_empty() {
@@ -8144,8 +8210,14 @@ pub fn identified_custom_type_identity(attribute_type: &AttributeType) -> Option
     match attribute_type.raw_shape() {
         RawShape::UnloadedSchemaType(unloaded) => Some(unloaded.identity()),
         RawShape::Reference { .. } => None,
-        RawShape::String { identity, .. }
-        | RawShape::Int { identity, .. }
+        RawShape::String {
+            identity_layer: crate::schema::StringIdentityParts { identity, .. },
+            ..
+        }
+        | RawShape::Int {
+            identity_layer: crate::schema::IntIdentityParts { identity, .. },
+            ..
+        }
         | RawShape::Float { identity, .. } => identity,
         RawShape::Enum { identity, .. } => Some(identity),
         RawShape::Bool
@@ -8172,17 +8244,31 @@ pub fn identified_custom_type_scalar_kind(
             length: _length,
         } => Some(RefinedScalarKind::String),
         RawShape::String {
-            identity: Some(_), ..
+            identity_layer:
+                crate::schema::StringIdentityParts {
+                    identity: Some(_), ..
+                },
+            ..
         } => Some(RefinedScalarKind::String),
         RawShape::Int {
-            identity: Some(_), ..
+            identity_layer:
+                crate::schema::IntIdentityParts {
+                    identity: Some(_), ..
+                },
+            ..
         } => Some(RefinedScalarKind::Int),
         RawShape::Float {
             identity: Some(_), ..
         } => Some(RefinedScalarKind::Float),
         RawShape::Enum { base, .. } => scalar_kind_from_base(base),
-        RawShape::String { identity: None, .. }
-        | RawShape::Int { identity: None, .. }
+        RawShape::String {
+            identity_layer: crate::schema::StringIdentityParts { identity: None, .. },
+            ..
+        }
+        | RawShape::Int {
+            identity_layer: crate::schema::IntIdentityParts { identity: None, .. },
+            ..
+        }
         | RawShape::Float { identity: None, .. }
         | RawShape::Bool
         | RawShape::Duration
@@ -8260,29 +8346,41 @@ pub(crate) fn canonicalize_custom_type_value(
         }
         (
             RawShape::String {
-                identity: _,
-                pattern: _,
-                length: _,
-                validate: _,
-                to_dsl: _,
+                identity_layer:
+                    crate::schema::StringIdentityParts {
+                        identity: _,
+                        pattern: _,
+                        length: _,
+                        validate: _,
+                        to_dsl: _,
+                    },
+                member_layer: _,
             },
             Value::Concrete(ConcreteValue::String(value)),
         ) => Ok(Some(CanonicalCustomTypeValue::from_literal_string(value))),
         (
             RawShape::String {
-                identity: _,
-                pattern: _,
-                length: _,
-                validate: _,
-                to_dsl: _,
+                identity_layer:
+                    crate::schema::StringIdentityParts {
+                        identity: _,
+                        pattern: _,
+                        length: _,
+                        validate: _,
+                        to_dsl: _,
+                    },
+                member_layer: _,
             },
             Value::Concrete(ConcreteValue::EnumIdentifier(raw)),
         ) => Ok(Some(CanonicalCustomTypeValue(raw.as_str().to_string()))),
         (
             RawShape::Int {
-                identity: _,
-                range: _,
-                validate: _,
+                identity_layer:
+                    crate::schema::IntIdentityParts {
+                        identity: _,
+                        range: _,
+                        validate: _,
+                    },
+                member_layer: _,
             },
             Value::Concrete(ConcreteValue::Int(value)),
         ) => Ok(Some(CanonicalCustomTypeValue(value.to_string()))),
@@ -8748,10 +8846,18 @@ fn collect_type_names_from_type(
             names.insert(identity.clone());
         }
         RawShape::String {
-            identity: Some(id), ..
+            identity_layer:
+                crate::schema::StringIdentityParts {
+                    identity: Some(id), ..
+                },
+            ..
         }
         | RawShape::Int {
-            identity: Some(id), ..
+            identity_layer:
+                crate::schema::IntIdentityParts {
+                    identity: Some(id), ..
+                },
+            ..
         }
         | RawShape::Float {
             identity: Some(id), ..
@@ -8766,8 +8872,14 @@ fn collect_type_names_from_type(
         } => {
             names.insert(id.clone());
         }
-        RawShape::String { identity: None, .. }
-        | RawShape::Int { identity: None, .. }
+        RawShape::String {
+            identity_layer: crate::schema::StringIdentityParts { identity: None, .. },
+            ..
+        }
+        | RawShape::Int {
+            identity_layer: crate::schema::IntIdentityParts { identity: None, .. },
+            ..
+        }
         | RawShape::Float { identity: None, .. } => {}
         RawShape::List {
             element_type: inner,
@@ -8810,8 +8922,14 @@ fn local_custom_validator(
             pattern: _pattern,
             length: _length,
         } => None,
-        RawShape::String { validate, .. }
-        | RawShape::Int { validate, .. }
+        RawShape::String {
+            identity_layer: crate::schema::StringIdentityParts { validate, .. },
+            ..
+        }
+        | RawShape::Int {
+            identity_layer: crate::schema::IntIdentityParts { validate, .. },
+            ..
+        }
         | RawShape::Float { validate, .. }
         | RawShape::Enum { validate, .. } => validate,
         RawShape::Bool
@@ -9223,6 +9341,10 @@ fn enum_definition_signature(attribute_type: &AttributeType) -> Option<EnumDefin
 struct OwnerCustomTypeIndex {
     factory_index: usize,
     declarations: BTreeMap<TypeIdentity, Vec<AttributeType>>,
+    identity_declarations: BTreeMap<
+        TypeIdentity,
+        Result<crate::parser::ResolvedSchemaType, crate::parser::CustomTypeValidationError>,
+    >,
 }
 
 struct ProviderFactorySchemaSnapshot {
@@ -9328,8 +9450,7 @@ where
                 declarations_by_identity
                     .entry((identity.clone(), owned.scalar_kind()))
                     .and_modify(|existing| {
-                        *existing =
-                            existing.with_merged_owners(existing.owners().union(owned.owners()));
+                        *existing = existing.conjoin(&owned);
                     })
                     .or_insert(owned);
             }
@@ -9382,21 +9503,20 @@ where
                 owner: owner.clone(),
                 identity: owned.identity().clone(),
             };
-            let declarations = self
+            let declaration = self
                 .index
                 .get(owner)
-                .and_then(|index| index.declarations.get(owned.identity()))
-                .filter(|declarations| !declarations.is_empty())
-                .ok_or_else(missing)?;
-            for declaration in declarations {
-                let declaration = ResolvedSchemaType::from_schema_declaration(owner, declaration)
-                    .filter(|declaration| declaration.scalar_kind() == owned.scalar_kind())
-                    .ok_or_else(missing)?;
-                resolved = Some(match resolved {
-                    Some(existing) => existing.conjoin(&declaration),
-                    None => declaration,
-                });
+                .and_then(|index| index.identity_declarations.get(owned.identity()))
+                .ok_or_else(missing)?
+                .as_ref()
+                .map_err(Clone::clone)?;
+            if declaration.scalar_kind() != owned.scalar_kind() {
+                return Err(missing());
             }
+            resolved = Some(match resolved {
+                Some(existing) => existing.conjoin(declaration),
+                None => declaration.clone(),
+            });
         }
         Ok(resolved
             .expect("nonempty owners and declarations")
@@ -9422,7 +9542,13 @@ where
                             identity: owned.identity().clone(),
                         }
                     })?;
-                Ok((owner.to_string(), declarations.clone()))
+                Ok((
+                    owner.to_string(),
+                    declarations
+                        .iter()
+                        .map(AttributeType::identity_only_declaration)
+                        .collect(),
+                ))
             })
             .collect()
     }
@@ -9532,11 +9658,43 @@ fn build_owner_custom_type_index(
             for (identity, declaration) in factory.witness.identified_declarations() {
                 declarations.entry(identity).or_default().push(declaration);
             }
+            // Aggregate witness admission already proved agreement within
+            // this owner, once. Different owners are conjoined at resolution.
+            let identity_declarations = declarations
+                .iter()
+                .map(|(identity, declarations)| {
+                    let mut layers = declarations.iter().map(|declaration| {
+                        crate::parser::ResolvedSchemaType::from_annotation_declaration(
+                            &factory.name,
+                            declaration,
+                        )
+                        .ok_or_else(|| {
+                            crate::parser::CustomTypeValidationError::MissingDeclaration {
+                                owner: factory.name.clone(),
+                                identity: identity.clone(),
+                            }
+                        })
+                    });
+                    // Every grouped identity has a declaration. Enum/Reference
+                    // bases contribute constraints too; unsupported bases keep
+                    // a typed failure in the index instead of dropping its key.
+                    let resolved = layers
+                        .next()
+                        .expect("nonempty identity declaration group")
+                        .and_then(|first| {
+                            layers.try_fold(first, |resolved, layer| {
+                                layer.map(|layer| resolved.conjoin(&layer))
+                            })
+                        });
+                    (identity.clone(), resolved)
+                })
+                .collect();
             (
                 factory.name.clone(),
                 OwnerCustomTypeIndex {
                     factory_index,
                     declarations,
+                    identity_declarations,
                 },
             )
         })
@@ -10074,6 +10232,47 @@ mod tests {
         }
 
         #[test]
+        fn round11_owner_index_is_total_for_scalar_and_enum_declarations() {
+            use crate::provider::{ProviderFactorySchemaSnapshot, build_owner_custom_type_index};
+            use crate::schema::PatternAttributeType;
+            use std::collections::BTreeMap;
+            let id = TypeIdentity::from_dotted("test.X");
+            let scalar = PatternAttributeType::refined_string(Some(id.clone()), None, None, None);
+            let enumeration = PatternAttributeType::enum_with_base(
+                id.clone(),
+                PatternAttributeType::string(),
+                Some(vec!["yes".into()]),
+                Vec::new(),
+                None,
+                None,
+            );
+            let witness = ValidatedProviderSchemaWitness::new(
+                Vec::new(),
+                ValidatedConfigSchema::validate(BTreeMap::from([
+                    ("scalar".into(), scalar),
+                    ("enum".into(), enumeration),
+                ]))
+                .unwrap(),
+                Default::default(),
+                Vec::new(),
+            )
+            .unwrap();
+            let snapshots = [ProviderFactorySchemaSnapshot {
+                name: "test".into(),
+                witness,
+            }];
+            let index = build_owner_custom_type_index(&snapshots);
+            assert!(
+                index["test"]
+                    .identity_declarations
+                    .get(&id)
+                    .is_some_and(Result::is_ok),
+                "an enum base must not drop the identity's scalar index"
+            );
+            assert_eq!(index["test"].declarations[&id].len(), 2);
+        }
+
+        #[test]
         fn registry_witness_edges_reach_loaded_catalog_without_a_factory() {
             let mut registry = SchemaRegistry::new();
             registry
@@ -10370,6 +10569,36 @@ mod tests {
 
     fn initialized(provider: impl Provider + 'static) -> InitializedProvider {
         InitializedProvider::for_test(Box::new(provider), ReferenceScope::Unavailable)
+    }
+
+    #[test]
+    fn round13_annotation_resolution_requires_the_total_identity_index() {
+        use crate::parser::{CustomTypeResolver, CustomTypeValidationError, OwnedTypeIdentity};
+        let identity = TypeIdentity::from_dotted("test.Indexed");
+        let declaration = AttributeType::refined_string(Some(identity.clone()), None, None, None);
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(ConfigOnlyCustomTypeFactory)];
+        let index = BTreeMap::from([(
+            "config-owner".into(),
+            OwnerCustomTypeIndex {
+                factory_index: 0,
+                declarations: BTreeMap::from([(identity.clone(), vec![declaration])]),
+                identity_declarations: BTreeMap::new(),
+            },
+        )]);
+        let resolver = FactoryCustomTypeResolver::with_index(
+            factories.as_slice(),
+            index,
+            &SchemaRegistry::new(),
+        );
+        let owned =
+            OwnedTypeIdentity::provider("config-owner", identity, RefinedScalarKind::String);
+        assert!(
+            matches!(
+                resolver.annotation_declaration(&owned),
+                Err(CustomTypeValidationError::MissingDeclaration { .. })
+            ),
+            "raw declarations cannot replace missing indexed evidence"
+        );
     }
 
     #[test]
@@ -11045,6 +11274,7 @@ mod tests {
             "config-owner".into(),
             OwnerCustomTypeIndex {
                 factory_index: 0,
+                identity_declarations: BTreeMap::new(),
                 declarations: BTreeMap::from([(identity.clone(), vec![declaration])]),
             },
         )]);
@@ -11093,6 +11323,7 @@ mod tests {
             "config-owner".into(),
             OwnerCustomTypeIndex {
                 factory_index: 0,
+                identity_declarations: BTreeMap::new(),
                 declarations: BTreeMap::from([(identity.clone(), vec![AttributeType::string()])]),
             },
         )]);
@@ -12202,6 +12433,23 @@ mod tests {
                 protected
             )]))))
         );
+    }
+
+    #[test]
+    fn default_tag_preview_does_not_invent_read_back_provenance() {
+        let source: crate::resource::Value<crate::resource::ParserPlaceholder> =
+            crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                crate::resource::ParserPlaceholder::ModuleArgument {
+                    name: "environment".into(),
+                    diagnostic: Default::default(),
+                },
+            ));
+        let preview = source.input_preview();
+        let proof = preview
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .unwrap();
+        let error = assert_default_tag_value_encodable(&proof).unwrap_err();
+        assert!(!error.to_string().contains("read after apply"), "{error}");
     }
 
     #[test]

@@ -13,13 +13,13 @@ use super::{
     AssignabilityEdge, AttrTypeKind, CharSet, Compiled, CompiledAttributeSchema as AttributeSchema,
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
     CompiledStructField as StructField, DslTransform, FieldGroup, FieldGroupKind, IdentityMode,
-    InputMode, InputPredicate, InputRule, InputRuleParts, InputRuleScope, InputRuleTarget,
-    OwnerBoundResourceSchema, ReferenceForm, ReferenceForms, ResourceValidation, SchemaKind,
-    TypeIdentity, UniqueNameSpec, ValidatorType,
+    InputCondition, InputLiteral, InputMode, InputPredicate, InputRule, InputRuleParts,
+    InputRuleScope, InputRuleTarget, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms,
+    ResourceValidation, SchemaKind, TypeIdentity, UniqueNameSpec, ValidatorType,
 };
 use crate::resource::Value;
 
-const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v12";
+const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v13";
 
 #[derive(Default)]
 struct CanonicalEncoder {
@@ -253,6 +253,57 @@ fn encode_input_charset(encoder: &mut CanonicalEncoder, set: &CharSet) {
     }
 }
 
+fn encode_input_literal(encoder: &mut CanonicalEncoder, literal: &InputLiteral) {
+    match literal {
+        InputLiteral::Bool(value) => {
+            encoder.tag(0);
+            encoder.bool(*value);
+        }
+        InputLiteral::Int(value) => {
+            encoder.tag(1);
+            encoder.i64(*value);
+        }
+        InputLiteral::Float(value) => {
+            encoder.tag(2);
+            encoder.u64(if value.get() == 0.0 {
+                0
+            } else {
+                value.get().to_bits()
+            });
+        }
+        InputLiteral::String(value) => {
+            encoder.tag(3);
+            encoder.string(value);
+        }
+        InputLiteral::Enum {
+            identity,
+            api_value,
+        } => {
+            encoder.tag(4);
+            encode_type_identity(encoder, identity);
+            encoder.string(api_value);
+        }
+    }
+}
+fn encode_input_condition(encoder: &mut CanonicalEncoder, condition: &InputCondition) {
+    match condition {
+        InputCondition::Always => encoder.tag(0),
+        InputCondition::Present(path) => {
+            encoder.tag(1);
+            encoder.string(path.as_str());
+        }
+        InputCondition::Equals { path, literal } => {
+            encoder.tag(2);
+            encoder.string(path.as_str());
+            encode_input_literal(encoder, literal);
+        }
+        InputCondition::Not(inner) => {
+            encoder.tag(3);
+            encode_input_condition(encoder, inner);
+        }
+    }
+}
+
 fn encode_input_rules(encoder: &mut CanonicalEncoder, rules: &[InputRule<Compiled>]) {
     let mut encoded: Vec<_> = rules
         .iter()
@@ -261,6 +312,7 @@ fn encode_input_rules(encoder: &mut CanonicalEncoder, rules: &[InputRule<Compile
                 scope,
                 target,
                 code,
+                condition,
                 predicate,
             } = rule.parts();
             let mut encoder = CanonicalEncoder::default();
@@ -279,7 +331,14 @@ fn encode_input_rules(encoder: &mut CanonicalEncoder, rules: &[InputRule<Compile
                 }
             }
             encoder.string(code.as_str());
+            encode_input_condition(&mut encoder, condition);
             match predicate {
+                InputPredicate::Present => encoder.tag(12),
+                InputPredicate::Absent => encoder.tag(13),
+                InputPredicate::Equals(literal) => {
+                    encoder.tag(14);
+                    encode_input_literal(&mut encoder, literal);
+                }
                 InputPredicate::Length { min, max } => {
                     encoder.tag(0);
                     encoder.option(*min, CanonicalEncoder::u64);
@@ -423,15 +482,25 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
             encode_optional_u64_range(encoder, *length);
         }
         AttrTypeKind::String {
-            binding,
-            pattern,
-            length,
-            to_dsl,
+            identity_layer:
+                crate::schema::StringIdentityLayer {
+                    binding,
+                    pattern,
+                    length,
+                    to_dsl,
+                },
+            member_layer,
         } => {
+            let super::StringMemberParts {
+                pattern: member_pattern,
+                length: member_length,
+            } = member_layer.parts();
             encoder.tag(0);
             encoder.option(binding.identity(), encode_type_identity);
             encoder.option(pattern.as_ref().map(AsRef::as_ref), encode_pattern);
             encode_optional_u64_range(encoder, *length);
+            encoder.option(member_pattern, encode_pattern);
+            encode_optional_u64_range(encoder, member_length);
             encode_callback_presence(encoder, binding.callback().is_some());
             encoder.option(to_dsl.as_ref(), encode_dsl_transform);
         }
@@ -452,10 +521,17 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
             encoder.strings(&values);
             encode_callback_presence(encoder, false);
         }
-        AttrTypeKind::Int { binding, range } => {
+        AttrTypeKind::Int {
+            identity_layer: crate::schema::IntIdentityLayer { binding, range },
+            member_layer,
+        } => {
             encoder.tag(3);
             encoder.option(binding.identity(), encode_type_identity);
             encode_optional_i64_range(encoder, *range);
+            let super::IntMemberParts {
+                range: member_range,
+            } = member_layer.parts();
+            encode_optional_i64_range(encoder, member_range);
             encode_callback_presence(encoder, binding.callback().is_some());
         }
         AttrTypeKind::Float { binding, range } => {
@@ -525,6 +601,7 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
             name,
             fields,
             field_groups,
+            input_rules,
         } => {
             encoder.tag(10);
             encoder.string(name);
@@ -535,6 +612,7 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
                 encode_struct_field(encoder, field);
             }
             encode_field_groups(encoder, field_groups);
+            encode_input_rules(encoder, input_rules);
         }
         AttrTypeKind::Union(members) => {
             encoder.tag(11);
@@ -765,7 +843,7 @@ mod tests {
     fn callback_presence_markers_reflect_the_new_binding_model() {
         assert_eq!(
             attribute_type_encoding(AttributeType::string()),
-            vec![0, 0, 0, 0, 0, 0],
+            vec![0, 0, 0, 0, 0, 0, 0, 0],
             "String encodes validate before to_dsl"
         );
         assert_eq!(
@@ -780,7 +858,7 @@ mod tests {
         );
         assert_eq!(
             attribute_type_encoding(AttributeType::int()),
-            vec![3, 0, 0, 0],
+            vec![3, 0, 0, 0, 0],
             "Int encodes validate"
         );
         assert_eq!(
@@ -1067,6 +1145,73 @@ mod pattern_mode_tests {
             })
             .collect();
             assert_eq!(fingerprints.len(), 3, "{kind}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod conditional_input_rule_tests {
+    use crate::schema::{
+        AttributeSchema, AttributeType, InputCondition, InputLiteral, InputPath, InputPredicate,
+        InputRule, InputRuleCode, InputRuleScope, ResourceSchema as DraftSchema, StructField,
+    };
+
+    #[test]
+    fn guards_and_nested_rules_change_semantic_fingerprints() {
+        let rule = |condition| {
+            InputRule::value(
+                InputRuleScope::EveryWrite,
+                InputPath::new("target").unwrap(),
+                InputRuleCode::new("test.condition").unwrap(),
+                InputPredicate::Present,
+            )
+            .with_condition(condition)
+        };
+        let schema = |condition, nested: bool| {
+            let mut draft = DraftSchema::new("test.Conditional")
+                .attribute(AttributeSchema::optional("guard", AttributeType::bool()).build())
+                .attribute(AttributeSchema::optional("target", AttributeType::string()).build());
+            if nested {
+                draft = draft.attribute(
+                    AttributeSchema::optional(
+                        "nested",
+                        AttributeType::struct_with_rules(
+                            "Nested",
+                            vec![
+                                StructField::optional("guard", AttributeType::bool()).build(),
+                                StructField::optional("target", AttributeType::string()).build(),
+                            ],
+                            vec![],
+                            vec![rule(condition)],
+                        ),
+                    )
+                    .build(),
+                );
+            } else {
+                draft = draft.input_rule(rule(condition));
+            }
+            draft.validate().unwrap().as_schema().semantic_fingerprint()
+        };
+        for nested in [false, true] {
+            let present = InputCondition::Present(InputPath::new("guard").unwrap());
+            let equal = InputCondition::Equals {
+                path: InputPath::new("guard").unwrap(),
+                literal: InputLiteral::Bool(true),
+            };
+            let negated = InputCondition::Not(Box::new(equal.clone()));
+            let fingerprints = [
+                schema(InputCondition::Always, nested),
+                schema(present, nested),
+                schema(equal, nested),
+                schema(negated, nested),
+            ];
+            assert_eq!(
+                fingerprints
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                4
+            );
         }
     }
 }

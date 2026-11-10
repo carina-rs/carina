@@ -42,7 +42,7 @@ fn parser_iterable<'s, 'a>(
     let value = ClassifiedRef::from(value);
     match value {
         ClassifiedRef::Known(_) | ClassifiedRef::Shape(_) => {
-            if value.secret().is_some() {
+            if value.is_protected() {
                 return ParserIterable::Deferred;
             }
             if let Some(items) = value.list() {

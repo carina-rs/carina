@@ -1858,10 +1858,36 @@ pub struct CharSet {
     pub ranges: Vec<CharRange>,
 }
 
+/// A finite typed scalar used by an admitted condition or equality predicate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum InputLiteral {
+    Bool(bool),
+    Int(i64),
+    Float(crate::FiniteF64),
+    String(String),
+    Enum {
+        identity: TypeIdentity,
+        api_value: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum InputCondition {
+    Always,
+    Present(String),
+    Equals { path: String, literal: InputLiteral },
+    Not(Box<InputCondition>),
+}
+
 /// Portable desired-input predicates. Regexes use the schema dialect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum InputPredicate {
+    Present,
+    Absent,
+    Equals(InputLiteral),
     Length {
         min: Option<u64>,
         max: Option<u64>,
@@ -1904,6 +1930,7 @@ pub struct InputRule {
     pub scope: InputRuleScope,
     pub target: InputRuleTarget,
     pub code: String,
+    pub condition: InputCondition,
     pub predicate: InputPredicate,
 }
 
@@ -2076,6 +2103,47 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
+/// Protocol-27 identity metadata, independent of any member restrictions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StringIdentityLayer {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<PatternSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub length: Option<(Option<u64>, Option<u64>)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validate: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_dsl: Option<DslTransform>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StringMemberConstraints {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<PatternSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub length: Option<(Option<u64>, Option<u64>)>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntIdentityLayer {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<(Option<i64>, Option<i64>)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntMemberConstraints {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<(Option<i64>, Option<i64>)>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AttributeType {
@@ -2089,22 +2157,12 @@ pub enum AttributeType {
         length: Option<(Option<u64>, Option<u64>)>,
     },
     String {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pattern: Option<PatternSpec>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        length: Option<(Option<u64>, Option<u64>)>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        validate: Option<serde_json::Value>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        to_dsl: Option<DslTransform>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        identity: Option<String>,
+        identity_layer: StringIdentityLayer,
+        member_layer: StringMemberConstraints,
     },
     Int {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        range: Option<(Option<i64>, Option<i64>)>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        identity: Option<String>,
+        identity_layer: IntIdentityLayer,
+        member_layer: IntMemberConstraints,
     },
     Float {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2175,6 +2233,8 @@ pub enum AttributeType {
         fields: Vec<StructField>,
         /// Required in protocol v16, including when empty.
         field_groups: Vec<FieldGroup>,
+        /// Required in protocol v26, including when empty.
+        input_rules: Vec<InputRule>,
     },
     #[serde(rename = "union")]
     Union {
@@ -2440,11 +2500,14 @@ mod tests {
 
     fn string_attr() -> AttributeType {
         AttributeType::String {
-            pattern: None,
-            length: None,
-            validate: None,
-            to_dsl: None,
-            identity: None,
+            identity_layer: StringIdentityLayer {
+                pattern: None,
+                length: None,
+                validate: None,
+                to_dsl: None,
+                identity: None,
+            },
+            member_layer: Default::default(),
         }
     }
 
@@ -3014,6 +3077,7 @@ mod tests {
     #[test]
     fn test_attribute_type_roundtrip() {
         let attr = AttributeType::Struct {
+            input_rules: Vec::new(),
             name: "Config".into(),
             fields: vec![StructField {
                 name: "enabled".into(),
@@ -3047,7 +3111,7 @@ mod tests {
         let error = serde_json::from_str::<StructField>(
             r#"{
                 "name":"provider_id",
-                "field_type":{"type":"String"},
+                "field_type":{"type":"String", "identity_layer": {}, "member_layer": {}},
                 "required":false
             }"#,
         )
@@ -3061,7 +3125,7 @@ mod tests {
         let missing_create_only = serde_json::from_str::<StructField>(
             r#"{
                 "name":"budget_name",
-                "field_type":{"type":"String"},
+                "field_type":{"type":"String", "identity_layer": {}, "member_layer": {}},
                 "required":false,
                 "write_only":false,
                 "identity":"required"
@@ -3077,7 +3141,7 @@ mod tests {
         let missing_identity = serde_json::from_str::<StructField>(
             r#"{
                 "name":"budget_name",
-                "field_type":{"type":"String"},
+                "field_type":{"type":"String", "identity_layer": {}, "member_layer": {}},
                 "required":false,
                 "write_only":false,
                 "create_only":true
@@ -3096,7 +3160,7 @@ mod tests {
         let attr: AttributeSchema = serde_json::from_str(
             r#"{
                 "name":"status",
-                "attr_type":{"type":"String"},
+                "attr_type":{"type":"String", "identity_layer": {}, "member_layer": {}},
                 "required":false,
                 "keyed_partial_update":null,
                 "identity":"none"
@@ -3123,7 +3187,7 @@ mod tests {
         let missing_attribute_identity =
             serde_json::from_value::<AttributeSchema>(serde_json::json!({
                 "name": "name",
-                "attr_type": {"type": "String"},
+                "attr_type": {"type": "String", "identity_layer": {}, "member_layer": {}},
                 "required": false,
                 "keyed_partial_update": null
             }))
@@ -3136,7 +3200,7 @@ mod tests {
 
         let missing_field_identity = serde_json::from_value::<StructField>(serde_json::json!({
             "name": "name",
-            "field_type": {"type": "String"},
+            "field_type": {"type": "String", "identity_layer": {}, "member_layer": {}},
             "required": false,
             "write_only": false,
             "create_only": false
@@ -3154,7 +3218,7 @@ mod tests {
         let error = serde_json::from_str::<AttributeSchema>(
             r#"{
                 "name":"settings",
-                "attr_type":{"type":"list", "elements": "allow_duplicates","element_type":{"type":"String"}},
+                "attr_type":{"type":"list", "elements": "allow_duplicates","element_type":{"type":"String", "identity_layer": {}, "member_layer": {}}},
                 "required":false
             }"#,
         )
@@ -3172,7 +3236,7 @@ mod tests {
         for keyed_partial_update in [serde_json::Value::Null, serde_json::json!("key")] {
             let mut json = serde_json::json!({
                 "name": "settings",
-                "attr_type": {"type": "list", "elements": "allow_duplicates", "element_type": {"type": "String"}},
+                "attr_type": {"type": "list", "elements": "allow_duplicates", "element_type": {"type": "String", "identity_layer": {}, "member_layer": {}}},
                 "required": false,
                 "keyed_partial_update": keyed_partial_update,
                 "identity": "none",
@@ -3242,18 +3306,24 @@ mod tests {
     fn refined_primitive_attribute_types_round_trip() {
         let attrs = [
             AttributeType::String {
-                pattern: Some(crate::types::PatternSpec::new(
-                    "^[a-z]+$".to_string(),
-                    crate::types::PatternMatch::Full,
-                )),
-                length: Some((Some(1), Some(63))),
-                validate: Some(serde_json::json!(true)),
-                to_dsl: Some(DslTransform::StripSuffix(".".to_string())),
-                identity: Some("aws.route53.HostedZone.Name".to_string()),
+                identity_layer: StringIdentityLayer {
+                    pattern: Some(crate::types::PatternSpec::new(
+                        "^[a-z]+$".to_string(),
+                        crate::types::PatternMatch::Full,
+                    )),
+                    length: Some((Some(1), Some(63))),
+                    validate: Some(serde_json::json!(true)),
+                    to_dsl: Some(DslTransform::StripSuffix(".".to_string())),
+                    identity: Some("aws.route53.HostedZone.Name".to_string()),
+                },
+                member_layer: Default::default(),
             },
             AttributeType::Int {
-                range: Some((Some(-1), Some(65535))),
-                identity: Some("aws.ec2.Port".to_string()),
+                identity_layer: IntIdentityLayer {
+                    range: Some((Some(-1), Some(65535))),
+                    identity: Some("aws.ec2.Port".to_string()),
+                },
+                member_layer: Default::default(),
             },
             AttributeType::Float {
                 range: Some((Some(crate::finite(0.0)), Some(crate::finite(1.0)))),
@@ -3305,18 +3375,22 @@ mod tests {
     #[test]
     fn primitive_attribute_types_default_missing_refinements() {
         for json in [
-            r#"{"type":"String"}"#,
-            r#"{"type":"Int"}"#,
+            r#"{"type":"String", "identity_layer": {}, "member_layer": {}}"#,
+            r#"{"type":"Int", "identity_layer": {}, "member_layer": {}}"#,
             r#"{"type":"Float"}"#,
         ] {
             let attr: AttributeType = serde_json::from_str(json).unwrap();
             match attr {
                 AttributeType::String {
-                    pattern,
-                    length,
-                    validate,
-                    to_dsl,
-                    identity,
+                    identity_layer:
+                        StringIdentityLayer {
+                            pattern,
+                            length,
+                            validate,
+                            to_dsl,
+                            identity,
+                        },
+                    member_layer: _,
                 } => {
                     assert!(pattern.is_none());
                     assert!(length.is_none());
@@ -3324,7 +3398,10 @@ mod tests {
                     assert!(to_dsl.is_none());
                     assert!(identity.is_none());
                 }
-                AttributeType::Int { range, identity } => {
+                AttributeType::Int {
+                    identity_layer: IntIdentityLayer { range, identity },
+                    member_layer: _,
+                } => {
                     assert!(range.is_none());
                     assert!(identity.is_none());
                 }
@@ -3341,7 +3418,7 @@ mod tests {
     fn list_inner_alias_deserializes_and_emits_element_type() {
         let json = r#"{
             "type":"list", "elements": "allow_duplicates",
-            "inner":{"type":"String"},
+            "inner":{"type":"String", "identity_layer": {}, "member_layer": {}},
             "ordered":false,
             "length":[1,3],
             "validate":true
@@ -3373,7 +3450,7 @@ mod tests {
     fn list_elements_refinement_is_required() {
         let error = serde_json::from_value::<AttributeType>(serde_json::json!({
             "type": "list",
-            "element_type": { "type": "String" },
+            "element_type": {"type": "String", "identity_layer": {}, "member_layer": {}},
             "ordered": true
         }))
         .expect_err("a list declaration must explicitly carry its elements refinement");
@@ -3585,6 +3662,7 @@ mod tests {
             defs: std::collections::BTreeMap::from([(
                 "Statement".to_string(),
                 AttributeType::Struct {
+                    input_rules: Vec::new(),
                     name: "Statement".into(),
                     fields: vec![StructField {
                         name: "and_statement".into(),
@@ -3767,6 +3845,7 @@ mod tests {
         let attr = AttributeType::Union {
             members: vec![
                 AttributeType::Struct {
+                    input_rules: Vec::new(),
                     name: "IamPolicyPrincipal".into(),
                     fields: vec![StructField {
                         name: "service".into(),
@@ -4046,7 +4125,7 @@ mod tests {
         let json = r#"{
             "type":"custom_enum",
             "name":"ZoneName",
-            "base":{"type":"String"},
+            "base":{"type":"String", "identity_layer": {}, "member_layer": {}},
             "namespace":"aws.AvailabilityZone",
             "dsl_transform":{"type":"FutureTransform","value":[["a","b"]]}
         }"#;
@@ -4071,7 +4150,7 @@ mod tests {
         let json = r#"{
             "type":"custom_enum",
             "name":"ZoneName",
-            "base":{"type":"String"},
+            "base":{"type":"String", "identity_layer": {}, "member_layer": {}},
             "namespace":"aws.AvailabilityZone",
             "dsl_transform":{"type":"Other","value":{"x":1}}
         }"#;
@@ -4217,8 +4296,8 @@ mod pattern_mode_tests {
             serde_json::json!({"regex": "abc", "mode": {"kind": "substring", "reason": reason}})
         })) {
             for ty in [
-                serde_json::json!({"type": "String", "pattern": pattern}),
-                serde_json::json!({"type": "custom", "name": "test.Name", "base": {"type": "String"}, "pattern": pattern}),
+                serde_json::json!({"type": "String", "identity_layer": {"pattern": pattern}, "member_layer": {}}),
+                serde_json::json!({"type": "custom", "name": "test.Name", "base": {"type": "String", "identity_layer": {}, "member_layer": {}}, "pattern": pattern}),
                 serde_json::json!({"type": "reference", "identity": {"provider": "test", "segments": [], "kind": "Id"}, "pattern": pattern}),
             ] {
                 assert!(

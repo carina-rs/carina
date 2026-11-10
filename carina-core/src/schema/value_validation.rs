@@ -324,6 +324,7 @@ impl ResourceValueValidation {
 
 /// Acceptance and diagnostic ranking are separate: a locally rejected value
 /// cannot carry a fit that an enclosing Union could mistake for acceptance.
+#[derive(Clone)]
 enum LocalOutcome<F> {
     Accepted(F),
     Rejected { primary: (FieldPath, TypeError) },
@@ -361,10 +362,10 @@ impl<F> LocalOutcome<F> {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CheckedFindings {
     local: Vec<(FieldPath, TypeError)>,
-    pub(super) located: Vec<(LeafPath, TypeError)>,
+    pub(super) located: Vec<(FieldPath, TypeError)>,
     assignment: AssignmentFindings,
     // Other undecided branches have independent primary local errors. Ordinary
     // containers still retain their established first-error CLI precedence.
@@ -374,7 +375,7 @@ struct CheckedFindings {
 
 impl CheckedFindings {
     fn push_local(&mut self, path: FieldPath, error: TypeError) {
-        self.located.push((path.canonical(), error.clone()));
+        self.located.push((path.clone(), error.clone()));
         self.local.push((path, error));
     }
 }
@@ -395,6 +396,7 @@ impl InsideSecret for CheckedFindings {
     }
 }
 
+#[derive(Clone)]
 struct CheckedValue<'a> {
     local: LocalOutcome<Fit<'a>>,
     findings: CheckedFindings,
@@ -404,7 +406,7 @@ impl InsideSecret for CheckedValue<'_> {
     fn inside_secret(self) -> Self {
         Self {
             local: match self.local {
-                LocalOutcome::Accepted(fit) => LocalOutcome::Accepted(fit),
+                LocalOutcome::Accepted(fit) => LocalOutcome::Accepted(fit.inside_secret()),
                 LocalOutcome::Rejected { primary } => LocalOutcome::Rejected {
                     primary: primary.inside_secret(),
                 },
@@ -443,7 +445,7 @@ impl<'a> CheckedValue<'a> {
                 primary: primary.clone(),
             },
             findings: CheckedFindings {
-                located: vec![(path.canonical(), primary.1.clone())],
+                located: vec![(path.clone(), primary.1.clone())],
                 local: vec![primary],
                 ..Default::default()
             },
@@ -494,7 +496,7 @@ impl<'a> CheckedValue<'a> {
         {
             self.findings
                 .located
-                .push((primary.0.canonical(), primary.1.clone()));
+                .push((primary.0.clone(), primary.1.clone()));
         }
     }
 
@@ -515,7 +517,12 @@ impl<'a> CheckedValue<'a> {
                 } => Some(error),
             },
             local: self.findings.local,
-            located: self.findings.located,
+            located: self
+                .findings
+                .located
+                .into_iter()
+                .map(|(path, error)| (path.canonical(), error))
+                .collect(),
             assignment: self.findings.assignment,
             symbolic: Vec::new(),
             additional_local_errors: self.findings.additional_local_errors,
@@ -524,9 +531,31 @@ impl<'a> CheckedValue<'a> {
     }
 }
 
-struct ValueValidator<'a> {
+struct ValueValidator<'a, 'lookup> {
     defs: &'a BTreeMap<String, CompiledAttributeType>,
-    lookup: Option<CustomTypeLookup<'a>>,
+    lookup: Option<CustomTypeLookup<'lookup>>,
+    checked: std::cell::RefCell<HashMap<CheckedNode<'a>, CheckedValue<'a>>>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CheckedNode<'a> {
+    declaration: *const CompiledAttributeType,
+    evidence: crate::resource::knowledge::KnownNodeId,
+    ancestry: FieldAncestry,
+    references: Vec<&'a str>,
+}
+
+impl<'a, 'lookup> ValueValidator<'a, 'lookup> {
+    fn new(
+        defs: &'a BTreeMap<String, CompiledAttributeType>,
+        lookup: Option<CustomTypeLookup<'lookup>>,
+    ) -> Self {
+        Self {
+            defs,
+            lookup,
+            checked: Default::default(),
+        }
+    }
 }
 
 pub(crate) fn untyped_symbolic_errors(errors: Vec<TypeError>) -> ValueValidationFindings {
@@ -562,7 +591,7 @@ pub(super) fn validate_value_locally<
     defs: &BTreeMap<String, CompiledAttributeType>,
     ancestry: FieldAncestry,
 ) -> ValueValidationFindings {
-    let mut findings = ValueValidator { defs, lookup: None }
+    let mut findings = ValueValidator::new(defs, None)
         .walk(
             attr,
             value.into(),
@@ -573,6 +602,69 @@ pub(super) fn validate_value_locally<
         .into_findings();
     findings.structure = value_structure(value);
     findings
+}
+
+/// Consume the ordinary validator's selected fit, retaining the caller's
+/// non-consuming reference path while comparing declaration-ordered members.
+pub(crate) struct SelectedInputUnion<'a> {
+    pub(crate) member: &'a CompiledAttributeType,
+    pub(crate) fit: Fit<'a>,
+}
+
+pub(crate) fn select_input_union_fit_on_path<
+    'a,
+    'v,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    T: StructuralPending<'v, P, B>,
+>(
+    members: &'a [CompiledAttributeType],
+    value: &Classification<'v, P, B, T>,
+    defs: &'a BTreeMap<String, CompiledAttributeType>,
+    visited: &mut Vec<&'a str>,
+    lookup: CustomTypeLookup<'_>,
+) -> Option<SelectedInputUnion<'a>> {
+    ValueValidator::new(defs, Some(lookup))
+        .union_with_assignment(
+            members,
+            value.into(),
+            &FieldPath::new(),
+            FieldAncestry::WRITABLE,
+            visited,
+            None,
+        )
+        .ok()
+        .map(|admitted| SelectedInputUnion {
+            member: admitted.selected.member,
+            fit: admitted.selected.fit,
+        })
+}
+
+#[cfg(test)]
+pub(crate) fn select_union_member_from_knowledge_on_path<
+    'a,
+    'v,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    T: StructuralPending<'v, P, B>,
+>(
+    members: &'a [CompiledAttributeType],
+    value: &Classification<'v, P, B, T>,
+    defs: &'a BTreeMap<String, CompiledAttributeType>,
+    visited: &mut Vec<&'a str>,
+) -> Option<&'a CompiledAttributeType> {
+    // This test-only helper exercises structural fitting, not stage input authority.
+    ValueValidator::new(defs, None)
+        .union_with_assignment(
+            members,
+            value.into(),
+            &FieldPath::new(),
+            FieldAncestry::WRITABLE,
+            visited,
+            None,
+        )
+        .ok()
+        .map(|admitted| admitted.selected.member)
 }
 
 #[cfg(test)]
@@ -586,16 +678,7 @@ pub(super) fn select_union_member_on_path<'a>(
         .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
         .map(|proof| proof.into_classification())
         .expect("evaluable union fixture");
-    ValueValidator { defs, lookup: None }
-        .union(
-            members,
-            (&knowledge).into(),
-            &FieldPath::new(),
-            FieldAncestry::WRITABLE,
-            visited,
-        )
-        .ok()
-        .map(|selected| selected.member)
+    select_union_member_from_knowledge_on_path(members, &knowledge, defs, visited)
 }
 
 pub(crate) fn validate_value_with_lookup<
@@ -610,18 +693,15 @@ pub(crate) fn validate_value_with_lookup<
     ancestry: FieldAncestry,
     lookup: CustomTypeLookup<'_>,
 ) -> ValueValidationFindings {
-    let mut findings = ValueValidator {
-        defs,
-        lookup: Some(lookup),
-    }
-    .walk(
-        attr,
-        value.into(),
-        &FieldPath::new(),
-        ancestry,
-        &mut Vec::new(),
-    )
-    .into_findings();
+    let mut findings = ValueValidator::new(defs, Some(lookup))
+        .walk(
+            attr,
+            value.into(),
+            &FieldPath::new(),
+            ancestry,
+            &mut Vec::new(),
+        )
+        .into_findings();
     findings.structure = value_structure(value);
     findings
 }
@@ -634,10 +714,7 @@ pub(crate) fn validate_custom_type_leaf<'a, R>(
     value: &KnownValue<'_>,
     validated: impl FnOnce(Option<LocallyValidatedCustomType<'a>>) -> R,
 ) -> Result<R, TypeError> {
-    let validator = ValueValidator {
-        defs: empty_defs_for_schema_walks(),
-        lookup: None,
-    };
+    let validator = ValueValidator::new(empty_defs_for_schema_walks(), None);
     let checked = validator.walk(
         declaration.declared_type(),
         ClassifiedRef::<crate::resource::NoPlaceholder,crate::resource::AbsoluteBindingAddress>::Known(value),
@@ -665,10 +742,7 @@ pub(crate) fn validate_custom_type_annotation_leaf<'a, R>(
     declaration
         .declared_type()
         .validate_leaf_value(&value.to_value())?;
-    let validator = ValueValidator {
-        defs: empty_defs_for_schema_walks(),
-        lookup: None,
-    };
+    let validator = ValueValidator::new(empty_defs_for_schema_walks(), None);
     let proof = validator
         .canonical_leaf(declaration.declared_type(), value, None)
         .map_err(|failure| *failure.error)?;
@@ -755,24 +829,21 @@ pub(crate) fn validate_value_for_admission<
     lookup: CustomTypeLookup<'_>,
     assignment: AssignmentCheck<'_, P, B>,
 ) -> ValueValidationFindings {
-    let mut checked = ValueValidator {
-        defs,
-        lookup: Some(lookup),
-    }
-    .walk_with_assignment(
-        attr,
-        value.into(),
-        &FieldPath::new(),
-        ancestry,
-        &mut Vec::new(),
-        assignment,
-    )
-    .into_findings();
+    let mut checked = ValueValidator::new(defs, Some(lookup))
+        .walk_with_assignment(
+            attr,
+            value.into(),
+            &FieldPath::new(),
+            ancestry,
+            &mut Vec::new(),
+            assignment,
+        )
+        .into_findings();
     checked.structure = value_structure(value);
     checked
 }
 
-impl<'a> ValueValidator<'a> {
+impl<'a> ValueValidator<'a, '_> {
     fn walk<'v, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'v, P, B>>(
         &self,
         attr: &'a CompiledAttributeType,
@@ -782,19 +853,6 @@ impl<'a> ValueValidator<'a> {
         visited: &mut Vec<&'a str>,
     ) -> CheckedValue<'a> {
         self.walk_with_assignment(attr, value, path, ancestry, visited, None)
-    }
-
-    #[cfg(test)]
-    fn union<'v, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'v, P, B>>(
-        &self,
-        members: &'a [CompiledAttributeType],
-        value: ClassifiedRef<'_, 'v, P, B, T>,
-        path: &FieldPath,
-        ancestry: FieldAncestry,
-        visited: &mut Vec<&'a str>,
-    ) -> Result<UnionFit<'a>, Box<UnionFailure<'a>>> {
-        self.union_with_assignment(members, value, path, ancestry, visited, None)
-            .map(|admitted| admitted.selected)
     }
 
     fn walk_with_assignment<
@@ -811,8 +869,26 @@ impl<'a> ValueValidator<'a> {
         visited: &mut Vec<&'a str>,
         assignment: AssignmentCheck<'_, P, B>,
     ) -> CheckedValue<'a> {
+        let node = match value {
+            ClassifiedRef::Known(value) => Some(CheckedNode {
+                declaration: attr,
+                evidence: value.node_id(),
+                ancestry,
+                references: visited.clone(),
+            }),
+            ClassifiedRef::Shape(_) | ClassifiedRef::Pending(_) | ClassifiedRef::Failed(_) => None,
+        };
+        if let Some(checked) = node
+            .as_ref()
+            .and_then(|node| self.checked.borrow().get(node).cloned())
+        {
+            return checked;
+        }
         let mut checked = self.walk_value(attr, value, path, ancestry, visited, assignment);
         checked.retain_primary_finding();
+        if let Some(node) = node {
+            self.checked.borrow_mut().insert(node, checked.clone());
+        }
         checked
     }
 
@@ -825,38 +901,17 @@ impl<'a> ValueValidator<'a> {
         visited: &mut Vec<&'a str>,
         assignment: AssignmentCheck<'_, P, B>,
     ) -> CheckedValue<'a> {
-        if let Some(inner) = value.secret() {
-            // The proof stays inside this boundary. Only masked findings leave.
-            let checked = inner.try_project_plaintext(|value| {
-                let knowledge = value
-                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-                    .map(|proof| proof.into_classification())
-                    .map_err(|error| {
-                        Box::new(CheckedValue::rejected(path, TypeError::from(error)))
-                    })?;
-                let checked = self.walk_with_assignment(
+        if let Some(inner) = value.protected_for_schema(&SchemaEvidenceAuthority(())) {
+            return inner.validate(|evidence| {
+                self.walk_with_assignment(
                     attr,
-                    (&knowledge).into(),
+                    evidence,
                     path,
                     ancestry.inside_secret(),
                     visited,
                     assignment,
-                );
-                if checked.first_error().is_some() {
-                    Err(Box::new(checked))
-                } else {
-                    Ok(checked)
-                }
+                )
             });
-            let mut checked = checked.unwrap_or_else(|checked| *checked);
-            // Successful symbolic checks also carry protected location metadata.
-            checked.findings.assignment = checked.findings.assignment.inside_secret();
-            return CheckedValue {
-                local: checked
-                    .local
-                    .map(|fit| Fit::with_kind(fit.exactness, attr, FitKind::Secret(Box::new(fit)))),
-                findings: checked.findings,
-            };
         }
         if let Some((left_value, default)) = value.coalesce() {
             // A coalesce has an authored assignment of its own. Retain that
@@ -905,8 +960,8 @@ impl<'a> ValueValidator<'a> {
                         exactness,
                         attr,
                         FitKind::Coalesce {
-                            value: Box::new(value),
-                            default: Box::new(default),
+                            value: Arc::new(value),
+                            default: Arc::new(default),
                         },
                     ))
                 }
@@ -999,7 +1054,12 @@ impl<'a> ValueValidator<'a> {
                     checked
                         .findings
                         .located
-                        .extend(findings.errors.iter().cloned());
+                        .extend(findings.errors.iter().map(|(path, error)| {
+                            (
+                                FieldPath::from_canonical_segments(path.segments().iter().cloned()),
+                                error.clone(),
+                            )
+                        }));
                     checked.findings.assignment = findings;
                     return checked;
                 }
@@ -1075,7 +1135,7 @@ impl<'a> ValueValidator<'a> {
                         admitted.selected.fit.exactness,
                         FitKind::Union {
                             member: admitted.selected.member,
-                            fit: Box::new(admitted.selected.fit),
+                            fit: Arc::new(admitted.selected.fit),
                         },
                     );
                     checked.findings.assignment = admitted.assignment;
@@ -1088,7 +1148,7 @@ impl<'a> ValueValidator<'a> {
                             attr,
                             FitKind::Union {
                                 member: selected.member,
-                                fit: Box::new(selected.fit),
+                                fit: Arc::new(selected.fit),
                             },
                         )
                     }),
@@ -1165,11 +1225,7 @@ impl<'a> ValueValidator<'a> {
                     .collect::<Vec<_>>();
                 // The provider walk visits ordinary Lists only. State and
                 // provider StringLists retain their local element checks.
-                ValueValidator {
-                    defs: self.defs,
-                    lookup: None,
-                }
-                .list(
+                ValueValidator::new(self.defs, None).list(
                     attr,
                     element_type,
                     *constraints,
@@ -1185,11 +1241,15 @@ impl<'a> ValueValidator<'a> {
                     name,
                     fields,
                     field_groups,
+                    input_rules: _,
                 },
                 ConcreteValueRef::Map(map),
             ) => {
-                let mut checked =
-                    CheckedValue::accepted(attr, FitExactness::EXACT, FitKind::Struct(Vec::new()));
+                let mut checked = CheckedValue::accepted(
+                    attr,
+                    FitExactness::EXACT,
+                    FitKind::Struct(Vec::new().into()),
+                );
                 for field in fields {
                     if ancestry.effective_input_mode(field).is_required()
                         && !struct_field_is_present(fields, map, field, ancestry)
@@ -1282,7 +1342,7 @@ impl<'a> ValueValidator<'a> {
                 }
                 checked.local = checked
                     .local
-                    .map(|_| Fit::with_kind(exactness, attr, FitKind::Struct(fits)));
+                    .map(|_| Fit::with_kind(exactness, attr, FitKind::Struct(fits.into())));
                 checked
             }
             (
@@ -1296,7 +1356,7 @@ impl<'a> ValueValidator<'a> {
                 let mut checked = CheckedValue::accepted(
                     attr,
                     FitExactness::GENERIC_MAP,
-                    FitKind::Map(Vec::new()),
+                    FitKind::Map(Vec::new().into()),
                 );
                 if let Err(error) = constraints.check(map.len()) {
                     checked.reject(path, error.clone());
@@ -1319,11 +1379,7 @@ impl<'a> ValueValidator<'a> {
                         Err(error) => return CheckedValue::rejected(path, error.into()),
                     };
                     // Map keys have local constraints, but main dispatches only values.
-                    let key_checked = ValueValidator {
-                        defs: self.defs,
-                        lookup: None,
-                    }
-                    .walk_with_assignment(
+                    let key_checked = ValueValidator::new(self.defs, None).walk_with_assignment(
                         key,
                         (&key_proof).into(),
                         &next_path,
@@ -1412,7 +1468,7 @@ impl<'a> ValueValidator<'a> {
                 );
                 checked.local = checked
                     .local
-                    .map(|_| Fit::with_kind(exactness, attr, FitKind::Map(fits)));
+                    .map(|_| Fit::with_kind(exactness, attr, FitKind::Map(fits.into())));
                 checked
             }
             (AttrTypeKind::Struct { name, .. }, ConcreteValueRef::List(_)) => {
@@ -1480,7 +1536,7 @@ impl<'a> ValueValidator<'a> {
         }
         let mut child_fits = child_fits.into_iter();
         let mut checked =
-            CheckedValue::accepted(attr, FitExactness::EXACT, FitKind::List(Vec::new()));
+            CheckedValue::accepted(attr, FitExactness::EXACT, FitKind::List(Vec::new().into()));
         let mut fits = Vec::new();
         let mut exactness = FitExactness::EXACT;
         let mut constraints_errors = Vec::new();
@@ -1534,9 +1590,9 @@ impl<'a> ValueValidator<'a> {
                 exactness,
                 attr,
                 if string_list {
-                    FitKind::StringList(fits)
+                    FitKind::StringList(fits.into())
                 } else {
-                    FitKind::List(fits)
+                    FitKind::List(fits.into())
                 },
             )
         });
@@ -1587,12 +1643,6 @@ impl<'a> ValueValidator<'a> {
                 }
                 continue;
             }
-            let judgement = value
-                .concrete()
-                .map(|concrete| {
-                    union_member_judgement_on_path(member, concrete, self.defs, ancestry, visited)
-                })
-                .unwrap_or_else(UnionMemberJudgement::no_match);
             let error = match checked.local {
                 LocalOutcome::Accepted(fit) => {
                     // This is a local fit only. It supports list uniqueness
@@ -1621,6 +1671,12 @@ impl<'a> ValueValidator<'a> {
                     primary: (_, error),
                 } => error,
             };
+            let judgement = value
+                .concrete()
+                .map(|concrete| {
+                    union_member_judgement_on_path(member, concrete, self.defs, ancestry, visited)
+                })
+                .unwrap_or_else(UnionMemberJudgement::no_match);
             if !judgement.failure_rank.is_match() {
                 continue;
             }
@@ -1816,8 +1872,14 @@ impl<'a> ValueValidator<'a> {
 
 fn has_native_validator(attr: &CompiledAttributeType) -> bool {
     match &attr.kind {
-        AttrTypeKind::String { binding, .. }
-        | AttrTypeKind::Int { binding, .. }
+        AttrTypeKind::String {
+            identity_layer: crate::schema::StringIdentityLayer { binding, .. },
+            ..
+        }
+        | AttrTypeKind::Int {
+            identity_layer: crate::schema::IntIdentityLayer { binding, .. },
+            ..
+        }
         | AttrTypeKind::Float { binding, .. } => binding.callback().is_some(),
         AttrTypeKind::Enum { validate, .. } => validate.is_some(),
         _ => false,
@@ -2178,11 +2240,7 @@ mod tests {
                 },
             )),
         ] {
-            let checked = ValueValidator {
-                defs: &defs,
-                lookup: Some(&lookup),
-            }
-            .walk(
+            let checked = ValueValidator::new(&defs, Some(&lookup)).walk(
                 &ty,
                 (&(value)
                     .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
@@ -2360,11 +2418,7 @@ mod tests {
         };
         for members in [vec![map.clone(), named.clone()], vec![named, map]] {
             let ty = AT::union(members);
-            let checked = ValueValidator {
-                defs: empty_defs_for_schema_walks(),
-                lookup: Some(&lookup),
-            }
-            .walk(
+            let checked = ValueValidator::new(empty_defs_for_schema_walks(), Some(&lookup)).walk(
                 &ty,
                 (&(value)
                     .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
@@ -2668,11 +2722,7 @@ mod tests {
             None,
         ));
         let value = Value::Concrete(ConcreteValue::List(vec![text("abcd"), text("bad")]));
-        let checked = ValueValidator {
-            defs: empty_defs_for_schema_walks(),
-            lookup: Some(no_lookup()),
-        }
-        .walk(
+        let checked = ValueValidator::new(empty_defs_for_schema_walks(), Some(no_lookup())).walk(
             &ty,
             (&(value)
                 .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())

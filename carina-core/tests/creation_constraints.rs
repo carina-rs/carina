@@ -42,7 +42,7 @@ fn evaluate_schema(
     schema: &carina_core::schema::ValidatedResourceSchema,
     value: &str,
 ) -> Result<(), carina_core::schema::InputViolation> {
-    use carina_core::{effect::Effect, input_rules::InputVerdict, plan::Plan, resource::*};
+    use carina_core::{effect::Effect, plan::Plan, resource::*};
     let mut registry = carina_core::schema::SchemaRegistry::new();
     registry.insert("mock", schema.clone());
     let resource = Resource::with_provider("mock", "test.Bucket", "example", None)
@@ -55,12 +55,13 @@ fn evaluate_schema(
     let current = std::collections::HashMap::new();
     for site in finalized.write_sites(&registry, &current) {
         let site = site.unwrap();
-        for rule in site.applicable_rules() {
-            match rule.evaluate() {
-                InputVerdict::Proven => {}
-                InputVerdict::Violation(violation) => return Err(violation),
-                InputVerdict::Undecided => panic!("literal fixture must be decidable"),
-            }
+        let evaluation = site.evaluate();
+        assert!(
+            evaluation.pending().is_empty(),
+            "literal fixture must be decidable"
+        );
+        if let Some(finding) = evaluation.findings().first() {
+            return Err(finding.violation().clone());
         }
     }
     Ok(())
@@ -486,31 +487,31 @@ fn creation_protocol_admission_preserves_typed_declaration_errors() {
     let base = serde_json::to_value(resource_schema_to_protocol(&original).unwrap()).unwrap();
     for (rule, expected) in [
         (
-            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name"}, "code":"INVALID", "predicate":{"kind":"not_ipv4"}}),
+            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name"}, "code":"INVALID", "condition":{"kind":"always"}, "predicate":{"kind":"not_ipv4"}}),
             InputRuleError::InvalidCode,
         ),
         (
-            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name[0]"}, "code":"test.rule", "predicate":{"kind":"not_ipv4"}}),
+            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name[0]"}, "code":"test.rule", "condition":{"kind":"always"}, "predicate":{"kind":"not_ipv4"}}),
             InputRuleError::InvalidPath,
         ),
         (
-            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name"}, "code":"test.rule", "predicate":{"kind":"no_prefix", "value":""}}),
+            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name"}, "code":"test.rule", "condition":{"kind":"always"}, "predicate":{"kind":"no_prefix", "value":""}}),
             InputRuleError::EmptyToken,
         ),
         (
-            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name"}, "code":"test.rule", "predicate":{"kind":"allowed_chars", "value":{"ranges":[]}}}),
+            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name"}, "code":"test.rule", "condition":{"kind":"always"}, "predicate":{"kind":"allowed_chars", "value":{"ranges":[]}}}),
             InputRuleError::EmptyCharSet,
         ),
         (
-            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name"}, "code":"test.rule", "predicate":{"kind":"first_char", "value":{"ranges":[{"start":122,"end":97}]}}}),
+            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name"}, "code":"test.rule", "condition":{"kind":"always"}, "predicate":{"kind":"first_char", "value":{"ranges":[{"start":122,"end":97}]}}}),
             InputRuleError::InvertedCharRange,
         ),
         (
-            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name"}, "code":"test.rule", "predicate":{"kind":"last_char", "value":{"ranges":[{"start":55296,"end":57343}]}}}),
+            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name"}, "code":"test.rule", "condition":{"kind":"always"}, "predicate":{"kind":"last_char", "value":{"ranges":[{"start":55296,"end":57343}]}}}),
             InputRuleError::InvalidUnicodeScalar,
         ),
         (
-            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name"}, "code":"test.rule", "predicate":{"kind":"last_char", "value":{"ranges":[{"start":1114112,"end":1114112}]}}}),
+            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name"}, "code":"test.rule", "condition":{"kind":"always"}, "predicate":{"kind":"last_char", "value":{"ranges":[{"start":1114112,"end":1114112}]}}}),
             InputRuleError::InvalidUnicodeScalar,
         ),
     ] {

@@ -26,7 +26,7 @@ pub use elements::{
     ReferenceLocations, ReferenceProvenance, SyntaxInventory,
 };
 mod entry;
-pub(crate) use entry::scope_parse_failure;
+pub(crate) use entry::{AuthoredParse, scope_parse_failure};
 mod error;
 mod expressions;
 mod functions;
@@ -35,6 +35,7 @@ mod let_binding;
 mod resolve;
 pub mod retained;
 mod scalar_constraints;
+mod value_type;
 pub(crate) use resolve::resolve_resource_refs_in_session_unsealed;
 pub use resolve::{
     AnalysisResolutionError, finalize_provider_configs_for_analysis,
@@ -167,7 +168,8 @@ pub use resolve::{
     resolve_resource_refs_in_session, resolve_resource_refs_with_config,
 };
 pub(crate) use resolve::{
-    RootInputFailure, collect_seed_bindings_from_parts, reject_cyclic_let_bindings_in_variables,
+    ProviderInputPreview, ProviderInputStatus, RootInputFailure, collect_seed_bindings_from_parts,
+    preview_expanded_provider_inputs, reject_cyclic_let_bindings_in_variables,
     resolve_resource_refs_for_diagnostics, resolve_resource_refs_in_context,
     resolve_resource_refs_with_backend_failure, resolve_snapshot_function_calls_in_context,
 };

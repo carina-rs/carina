@@ -2,9 +2,16 @@
 
 The current protocol and minimum supported provider protocol are both **28**.
 
+Protocol 28 adds typed provider error retryability after protocol 27's
+refinement layers and protocol 26's conditional input rules. All three are
+unreleased development protocols after the protocol-25 snapshot. Released Carina
+v0.13.1 speaks protocol **24**, with minimum provider protocol **24**.
+
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
 | 28 | 28 | WIT 0.3.0 required exclusive provider error retryability; removed the redundant reference-error variant. |
+| 27 | 27 | Required separate String/Int identity and member records, strict layer decoding and reusable within-provider identities. |
+| 26 | 26 | Required typed input-rule conditions, Struct-local rules, and CreateOnly authoring previews; fingerprint encoding v13. |
 | 25 | 25 | WIT 0.2.0 typed diagnostics and credential registration; guest stdout/stderr discarded. |
 | 24 | 24 | Required typed pattern specifications with explicit Full or justified Substring matching. |
 | 23 | 23 | Required scoped desired-input rules on every resource schema. |
@@ -46,6 +53,190 @@ typed class is `Transient`, preserving the former variant's message.
 The current and minimum supported protocol are both 28. Providers built for
 protocol 27 or earlier must rebuild against the current SDK. WIT 0.1.0 and 0.2.0
 components are rejected before linking or executing guest code.
+
+## Version 27
+
+Refined `String` and `Int` declarations carry two required records:
+`identity_layer` and `member_layer`. The new String/Int layer records use `deny_unknown_fields`, so unknown keys
+are rejected. Empty layers are explicit `{}` records;
+missing records are rejected. A String identity owns its nominal identity,
+optional pattern and character-length interval, semantic validator binding and
+DSL transform. Its member record adds an optional pattern and length interval.
+An Int identity owns its nominal identity and range; its member adds a range. Enum bases
+are definitions rather than destination slots: schema admission rejects any
+String/Int member constraints inside an Enum base with a typed
+`EnumBaseMemberLayerError`.
+Float and typed Reference schemas retain their existing shapes.
+
+A legacy `Custom` wrapper has no member layer. A non-empty String/Int member
+layer on its base is incompatible metadata and fails with a typed decode error;
+it is neither discarded nor conjoined. Outer-over-inner precedence applies only
+to identity-layer metadata. Named List bases remain rejected as before.
+
+Validation keeps first-failure semantics: identity pattern, identity length or
+range, member pattern, member length or range, then the semantic callback.
+Structural constraints remain schema metadata and are never delegated to a
+callback. Every pattern retains its authored regex, explicit match mode and
+substring reason. Identity consistency and built-in admission compare only a
+typed identity projection; full declaration fingerprints include both layers.
+A core Email identity with a member length is valid, while changing Email's
+identity definition remains a built-in collision.
+
+Provider migration requirement: within one provider's aggregate resource and
+configuration schemas, a String/Int/Float identity has one reusable identity-layer
+definition, including its Float range.
+Different definitions fail with `ConflictingIdentityDeclarations`; move
+resource-specific restrictions into the member layer. Across different schema
+owners, such as AWS and AWSCC, annotations conjoin the owners' identity
+constraints, so a value must satisfy every owner. Different identity constraints
+across owners are allowed. Enum definition and canonical-spelling disagreement
+remain typed errors. Authored annotations name an identity: their retained
+constraint payload has no member layer. The static type of a value read from an
+attribute or field is identity-only too. Typed value projections retain enum
+values, reference kind, semantic callbacks and an identity-only fingerprint,
+and have no member pattern, length or range fields. Either value-evidence origin
+rejects member fields during decoding, including empty member records.
+Native annotations have
+distinct single-owner and checked multi-owner forms; the latter maps at least
+two `SchemaTypeOwner`s to their identity constraints. Single-owner retained
+annotations omit `owner_layers`. Multi-owner records key exactly one identity
+layer by each schema owner's provider name; missing, extra, or duplicate owners
+are invalid. Owner sets derive from layer keys. Retained records accept empty
+same-owner bounds as well as empty cross-owner intersections: after normalizing
+Float bounds, decoding verifies the exact conjunction of the owner layers and
+recomputes the `empty_intersection` marker. Exact projection records reject
+unknown constraint fields. Annotation pattern conjunctions retain a sorted,
+deduplicated set of every pattern, including same-owner repeats. Structural
+scalar reads use the same canonical evidence as identity annotations: equal
+identity-level types compare and serialize equally. Callbacks, transforms, enums
+and references retain exact projection provenance, excluding slot members.
+
+Member constraints belong to the destination slot, and are enforced when writing
+resource/config attributes, nested fields and annotated sinks through identity
+admission and the existing deferred destination obligation. Different-identity widening requires source identity
+bounds to be contained by destination identity bounds. Member constraints defer
+unless source identity bounds are provably disjoint from effective destination
+bounds. Anonymous String/Int declarations retain both layers as structural
+evidence, using both patterns and intersecting bounds.
+
+Unannotated collections, conditionals and coalesce retain main's equality-only
+rule: all alternatives must infer identical `TypeExpr`s. Slot reads differing
+only in member layers therefore compare equal. An explicit compatible annotation
+accepts otherwise mixed declarations; inference does not widen their types.
+
+Schema fingerprint encoding is v13. Saved-plan format 44 supersedes 43 because
+the schema fingerprint encoding changed. Saved module `pending_constraints`
+contain value expressions (`ValidateExpr`), not retained type records. Saved-plan
+replay reloads identity/member constraints from fingerprint-checked provider
+schemas. Format-43 plans must be regenerated; their version gate fails
+before payload decoding or fingerprint verification.
+
+Every typed destination uses one String/Int identity rule: same identity
+or an allowed structural/provider widening. This includes binding/export
+annotations, map/list element annotations, module arguments, and user-function
+parameters and returns. Destination member constraints remain resolved-value
+obligations; every destination kind supports the existing `NeedsLocal` path.
+Same-identity value admission, including admission with a declared source,
+defers overlapping identity bounds through `NeedsLocal`; provably disjoint bounds
+reject statically. Different-identity widening retains String length / Int range
+containment checks. Strict declaration compatibility retains main's containment
+checks. General declaration compatibility is distinct from value admission.
+Only the admission-facing reference relation produces `NeedsLocal`; callers need
+reference evidence, and the result cannot convert to a general type-compatibility
+result. Admission registers its existing `LocalPath` under the actual destination
+contract. On resolution, `PendingAdmission::discharge` re-enters `admit_apply` and
+validates against the complete destination declaration, including both layers.
+Known binding values use that destination's ordinary value check too. String
+pattern/length errors retain their structured category and identify member failures
+as the slot's member constraint; identity failures still run first.
+Unproven pattern containment defers (#4349). Int-to-Float widening uses identity
+bound containment too. Float retains main's strict range containment and
+same-identity reference deferral, also retained for Enum/unloaded leaves. Annotated
+sink mismatches render the differing constraints or scalar kinds when the nominal
+names alone would be identical.
+
+At version 27, both `PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION`
+were 27. Protocol-26 providers had to rebuild against the protocol-27 SDK before
+they could load, including on schema-only migration paths. Version 27 kept WIT
+`carina:provider@0.2.0`: schemas already cross the boundary as JSON, and
+`validate-custom-type` continues to identify semantic checks by type identity. This is the next unreleased protocol after the conditional input rules in version 26.
+
+## Version 26
+
+### Conditional input rules (#4263)
+
+Providers targeting this unreleased host must use the matching SDK. The host
+checks the version before decoding schemas, including schema-only loading.
+These input-rule additions travel in the existing schema JSON; they add no
+further WIT changes or provider CRUD request fields.
+
+Every `InputRule` requires `condition`, alongside `scope`, `target`, `code` and
+`predicate`. There is no decoding default. Unconditional rules send
+`{"kind":"always"}` explicitly. The four condition forms are:
+
+```json
+{"kind":"always"}
+```
+
+```json
+{"kind":"present","value":"recovery_period_in_days"}
+```
+
+```json
+{"kind":"equals","value":{"path":"fifo_queue","literal":{"kind":"bool","value":true}}}
+```
+
+```json
+{"kind":"not","value":{"kind":"present","value":"recovery_period_in_days"}}
+```
+
+Literals use tagged `kind`/`value` records: `bool`, `int`, finite `float`,
+`string`, or `enum`. An enum's `value` contains `identity` (the structured
+`TypeIdentity`) and `api_value` (a declared canonical API value). Admission
+checks literal type and scalar refinements, enum identity and membership,
+canonical writable guard and target paths, duplicate target/code pairs and a
+maximum condition depth of 16. DSL aliases compare equal to their canonical
+API spelling for the same enum identity.
+
+Every Struct declaration requires its own `input_rules` array, including `[]`
+when empty. This applies to nested Structs and declarations in `defs`. Struct
+rules reuse `InputRule`; their paths are relative to the declaring object and
+run for each existing instance, including list elements and map values.
+Diagnostics include concrete instance paths and indices. Unselected union
+branches do not supply rules.
+
+The existing predicate family also includes `{"kind":"present"}`,
+`{"kind":"absent"}` and `{"kind":"equals","value":<literal>}`. These
+predicates target values; map-key targets accept only string predicates.
+`present` and `equals` fail on proven absence even for optional inputs.
+Existing string predicates retain their omitted-optional behavior.
+
+One evaluator checks the condition first: true evaluates the target predicate,
+false skips it, and unknown retains a Pending obligation. Equality on proven
+absence is false; negation preserves Pending. A known key with a pending
+payload is present, but unknown parent membership stays Pending. Attempted
+failures remain failures, including under negation. Pending produces neither a
+finding nor an established pass.
+
+In `validate` and LSP diagnostics, EveryWrite violations are errors. CreateOnly
+violations are warnings with the core-rendered suffix
+`(rejected if this resource is created)`. During planning, CreateOnly violations
+are errors only for Create, replacement create, unissued ResumeCreate,
+DeferredCreate and DeferredReplacement. Import, adoption, Update, Move and
+Remove do not error on CreateOnly rules. The same evaluator verdict feeds both
+stages; scope and write context determine the finding kind and severity.
+
+EveryWrite update rules become active when their target or any guard changes,
+including removal. Guard evidence comes from admitted desired inputs overlaid
+with the exact patch, refreshed from resolved desired inputs at dispatch.
+Unsent omissions at every depth and ignored inputs remain Pending. Both guards
+and targets consume the same immutable stage input; neither reads observed state. Dispatch rejects a remaining unresolved
+obligation.
+
+Schema fingerprint encoding is **v13**. It includes each rule's condition and
+literal payload, scope, target, code and predicate, plus Struct-local rules.
+Saved-plan format remains 43; plans carrying older schema fingerprints require
+replanning. Checked plans and pending input obligations are not serialized.
 
 ## Version 25
 
@@ -90,8 +281,8 @@ is exempt from count/rate limits, with a finite 256 KiB input cap.
 Legacy `0.1.0` WIT providers are rejected with a typed incompatibility before
 linking or executing guest code. Older packages require rebuilding the provider
 against the current Carina protocol; newer packages require upgrading Carina.
-At that boundary, both the protocol and its minimum became 25, requiring
-providers built for protocol 24 or earlier to rebuild.
+For this protocol generation, both version numbers were 25. Providers built for
+protocol 24 or earlier had to rebuild against the protocol-25 SDK.
 
 ## Version 24
 
@@ -112,24 +303,27 @@ containing visible text:
 These specifications are required on String, Reference, and legacy Custom
 schema records, including nested fields and provider configuration, and on
 `matches`/`not_matches` input predicates. Bare strings, missing or unknown modes,
-and substring reasons without visible text are rejected. Providers must rebuild
-against protocol 24; the protocol-12 schema-only migration admission window is
-removed. WIT is unchanged: schema specifications travel inside JSON exports.
+and substring reasons without visible text are rejected. Version 24 required
+providers to rebuild against protocol 24 and removed the protocol-12 schema-only
+migration admission window. WIT is unchanged: schema specifications travel inside JSON exports.
 
-Schema fingerprint encoding is v12. Saved-plan format is 43 so older plans fail
-with the typed unsupported-format error before schema-fingerprint verification.
+Version 24 advanced schema fingerprint encoding to v12 and saved-plan format
+to 43, so older formats fail with the typed unsupported-format error before
+schema-fingerprint verification.
 
 ## Version 23
 
 Every resource schema requires an `input_rules` array, including `[]` when
 no rules are declared. Each rule requires a `scope`, a typed `target`, a stable
-lowercase dotted diagnostic `code`, and a tagged `predicate`:
+lowercase dotted diagnostic `code`, and a tagged `predicate`. Current protocol-28
+examples also include the required `condition`:
 
 ```json
 {
   "scope": "create_only",
   "target": {"kind": "value", "path": "name"},
   "code": "s3.name.length",
+  "condition": {"kind": "always"},
   "predicate": {"kind": "length", "value": {"min": 3, "max": 63}}
 }
 ```
@@ -139,16 +333,17 @@ Create, every replacement create half, deferred creates/replacements, and
 ResumeCreate without a known identifier. Every-write rules additionally check
 Update's desired resource. Issued resumes, reads, import/adoption, moves and
 removals are excluded. Rules never inspect read-back, current, refresh or loaded
-state values. Validation and LSP diagnostics check known every-write inputs;
-create-only rules remain silent because the eventual effect is unknown there.
+state values. Current validation and LSP diagnostics report known every-write
+violations as errors and create-only violations as warnings, with
+`(rejected if this resource is created)`. Pending inputs produce no finding.
 
-A target is either `{"kind":"value","path":"name"}` for a writable
-String-based leaf or `{"kind":"map_keys","path":"tags"}` for the keys of a
+For the string predicates introduced in version 23, a target is either
+`{"kind":"value","path":"name"}` for a writable String-based leaf or `{"kind":"map_keys","path":"tags"}` for the keys of a
 writable map with String-based keys. Paths are canonical dotted attributes or
 struct fields without collection indices, wildcards or block aliases. Schema
 admission checks the target type and inherited provider-populated mode.
 
-The predicates are `length`, `allowed_chars`, `first_char`, `last_char`,
+Version 23 introduced `length`, `allowed_chars`, `first_char`, `last_char`,
 `no_substring`, `no_prefix`, `forbidden_prefix`, `no_suffix`, `no_adjacent`,
 `not_ipv4`, `matches`, and `not_matches`. A reserved tag-key declaration is:
 
@@ -157,6 +352,7 @@ The predicates are `length`, `allowed_chars`, `first_char`, `last_char`,
   "scope": "every_write",
   "target": {"kind": "map_keys", "path": "tags"},
   "code": "tags.reserved_prefix",
+  "condition": {"kind": "always"},
   "predicate": {
     "kind": "forbidden_prefix",
     "value": {"prefix": "aws:", "ignore_ascii_case": true}
@@ -175,11 +371,13 @@ schema-pattern dialect and are compiled once at schema admission.
 Admission rejects unknown or provider-populated paths, incorrect target types,
 duplicate target/code declarations, invalid diagnostic codes, empty
 character sets or forbidden tokens, and missing or inverted length bounds.
-Rules are conjunctive. An absent optional input is exempt when no value is sent.
+Rules are conjunctive. String predicates exempt an absent optional input when
+no value is sent; version-26 presence and equality predicates do not.
 Schema attribute defaults are currently authoring metadata: the host does not
 insert them into requests. Values materialized by normalization are checked.
 Unknown desired inputs retain pending obligations, including on Updates; live
-apply fails closed until apply-time discharge is implemented.
+apply discharges them against resolved desired inputs and the exact provider
+request, rejecting any obligation that remains unresolved.
 
 Finalized plans expose only classified desired write sites. Predicate evaluation
 requires an applicable rule bound to such a site; arbitrary strings and state
@@ -189,16 +387,19 @@ validation reuses that same merge before checking desired inputs. Diagnostics
 name only the attribute, code and reason, including for secret values.
 
 The semantic schema fingerprint includes each rule's scope, target and complete
-predicate payload; the current encoding is v12. Checked plans and pending obligations
-are not serialized. Saved-plan input re-admission under the apply lock remains
-an explicitly typed TODO for phase 5.
+predicate payload; protocol 26 also includes conditions and Struct rules, and
+the current encoding is v13. Checked plans and pending obligations are not
+serialized. Saved plans are re-admitted under the apply lock, and dispatch
+discharges pending rules against resolved desired inputs and exact requests.
 
 Version 23 introduced the required `input_rules`, `scope` and `target` fields.
-The current host requires protocol 28, including explicit pattern modes, and
-rejects older providers before schema decoding. The v12 migration adapter has
-been removed. The SDK's schema JSON export carries these rules; no WIT function
-or CRUD request field is added. AWS, AWSCC, and GitHub providers must rebuild
-against protocol 28.
+For this development host, the version-28 requirements include explicit
+pattern modes, conditions, Struct rule arrays, String/Int refinement layers,
+and typed error retryability. Older providers are rejected before schema
+decoding. The v12 migration adapter has been removed. The SDK's schema JSON
+export carries these input rules without adding WIT functions or CRUD request
+fields; the diagnostic imports are separate. AWS, AWSCC, and GitHub providers
+must rebuild against protocol 28 to target this unreleased host.
 
 ## Version 22
 
@@ -250,8 +451,9 @@ identity conversion; the existing length and range checks still apply, and sink
 validators still run on values during validation, planning, and apply.
 
 Version 21 introduced this required edge array. Hosts and providers must rebuild
-together; the current minimum is 28. Protocol-12 metadata is rejected, including
-on read-only schema loading paths.
+together; the current minimum is stated above, while released v0.13.1 requires
+24. Protocol-12 metadata is rejected, including on read-only schema loading
+paths.
 
 ## Version 20
 

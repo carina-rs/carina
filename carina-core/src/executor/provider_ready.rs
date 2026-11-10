@@ -183,7 +183,47 @@ impl<T: ResourceWirePayload, K: RechecksResolved> Deref for ProviderReady<T, K> 
 }
 
 /// A fully resolved managed resource whose known value constraints have run.
+/// Its transport attributes are distinct from protected input-rule evidence:
+/// the latter can only be constructed inside provider preparation.
+///
+/// ```compile_fail,E0603
+/// use carina_core::executor::provider_ready::ProtectedDesiredTree;
+/// ```
 pub type ProviderReadyResource = ProviderReady<ResolvedResource<ProviderModuleSource>>;
+
+/// Full resolved desired tree, with protection annotations intact. Only provider
+/// preparation owns this capability; a transport attribute map cannot forge it.
+pub(crate) struct ProtectedDesiredTree<'a> {
+    resource_id: &'a ResourceId,
+    attributes: &'a IndexMap<String, Value>,
+    ignored: &'a crate::resource::ResolvedIgnoreChanges,
+    selection: &'a crate::input_rules::InputSelectionAuthority,
+}
+
+impl ProtectedDesiredTree<'_> {
+    pub(crate) fn selection_authority(&self) -> &crate::input_rules::InputSelectionAuthority {
+        self.selection
+    }
+    pub(crate) fn id(&self) -> &ResourceId {
+        self.resource_id
+    }
+    pub(crate) fn attributes(&self) -> &IndexMap<String, Value> {
+        self.attributes
+    }
+    pub(crate) fn ignored(&self) -> &crate::resource::ResolvedIgnoreChanges {
+        self.ignored
+    }
+}
+impl ProviderReadyResource {
+    pub(crate) fn protected_desired_tree(&self) -> ProtectedDesiredTree<'_> {
+        ProtectedDesiredTree {
+            resource_id: &self.id,
+            attributes: &self.diagnostic_attributes,
+            ignored: self.ignore_changes(),
+            selection: self.admission.selection_authority(),
+        }
+    }
+}
 
 /// A fully resolved data source whose known input constraints have run.
 pub type ProviderReadyDataSource =
@@ -1050,6 +1090,22 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
         )?
     };
 
+    let alias_conflicts = crate::schema::resolve_resource_block_names_in_session(
+        &mut value,
+        context.schemas,
+        context.type_checks,
+    );
+    if !alias_conflicts.is_empty() {
+        return Err(ProviderPreparationError::Provider(
+            crate::provider::HostError::invalid_input(
+                alias_conflicts
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        ));
+    }
     let (normalized, restored) = apply_dispatch_desired_normalization(
         value,
         context.provider_configs,
@@ -1058,6 +1114,12 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
     )
     .await?;
     let resource = normalized.into_resource();
+    super::normalized::reject_provider_boundary_block_aliases_with_authority(
+        std::slice::from_ref(&resource),
+        context.schemas,
+        admitted.selection_authority(),
+    )
+    .map_err(ProviderPreparationError::Provider)?;
     crate::resource::assert_resource_known_for_apply(
         &resource,
         &crate::resource::knowledge::KnowledgeContext::apply(context.bindings),
@@ -1173,7 +1235,7 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
     let protected = ResolvedDataSource::new(value.clone());
     WireReady::try_new(protected, ProviderWireTarget::Resource(value.id.clone()))?;
     for attribute in value.attributes.values_mut() {
-        *attribute = unwrap_secret(attribute.clone());
+        *attribute = unwrap_secret(attribute);
     }
     let value = ResolvedDataSource::new(value);
     let directives = context.schemas.resolve_directives(
@@ -2325,23 +2387,26 @@ mod provider_config_tests {
     #[test]
     fn resource_lookup_validates_only_the_exact_declared_type() {
         let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
-        let own_declaration = PatternAttributeType::refined_string(
-            Some(identity.clone()),
-            Some(crate::schema::PatternSpec::new(
-                "^own$".to_string(),
-                crate::schema::PatternMatch::Full,
-            )),
-            None,
-            None,
+        let base = crate::schema::StringIdentityLayer::new(Some(identity), None, None, None);
+        let own_declaration = PatternAttributeType::string_member(
+            base.clone(),
+            crate::schema::StringMemberConstraints::new(
+                Some(crate::schema::PatternSpec::new(
+                    "^own$",
+                    crate::schema::PatternMatch::Full,
+                )),
+                None,
+            ),
         );
-        let sibling_declaration = PatternAttributeType::refined_string(
-            Some(identity),
-            Some(crate::schema::PatternSpec::new(
-                "^sibling$".to_string(),
-                crate::schema::PatternMatch::Full,
-            )),
-            None,
-            None,
+        let sibling_declaration = PatternAttributeType::string_member(
+            base,
+            crate::schema::StringMemberConstraints::new(
+                Some(crate::schema::PatternSpec::new(
+                    "^sibling$",
+                    crate::schema::PatternMatch::Full,
+                )),
+                None,
+            ),
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(RoutingFactory {
@@ -2623,11 +2688,14 @@ mod provider_config_tests {
         ];
         let decoded = crate::protocol_convert::protocol_to_attribute_type(
             &carina_provider_protocol::types::AttributeType::String {
-                pattern: None,
-                length: None,
-                validate: None,
-                to_dsl: None,
-                identity: Some("shared.Identifier".to_string()),
+                identity_layer: carina_provider_protocol::types::StringIdentityLayer {
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                    identity: Some("shared.Identifier".to_string()),
+                },
+                member_layer: Default::default(),
             },
         )
         .expect("callback-free protocol refinement must decode");

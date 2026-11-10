@@ -527,7 +527,13 @@ async fn legacy_aws_import_is_rejected_before_linking() {
             let text = message.as_str();
             assert!(text.contains("carina:provider@0.1.0"), "{text}");
             assert!(text.contains("carina:provider@0.3.0"), "{text}");
-            assert!(text.contains("protocol 28"), "{text}");
+            assert!(
+                text.contains(&format!(
+                    "protocol {}",
+                    carina_provider_protocol::PROTOCOL_VERSION
+                )),
+                "{text}"
+            );
         }
         _other => panic!(
             "legacy imports must produce the typed WIT incompatibility before linker failure"
@@ -587,7 +593,10 @@ async fn legacy_start_executes_zero_guest_code() {
                         .contains(&format!("carina:provider@{version}"))
                 );
                 assert!(message.as_str().contains("carina:provider@0.3.0"));
-                assert!(message.as_str().contains("protocol 28"));
+                assert!(message.as_str().contains(&format!(
+                    "protocol {}",
+                    carina_provider_protocol::PROTOCOL_VERSION
+                )));
             }
             _other => panic!("a legacy component must be rejected before instantiation"),
         }

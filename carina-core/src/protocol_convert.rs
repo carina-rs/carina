@@ -44,13 +44,13 @@ use crate::schema::{
     AttributeType as DraftAttributeType, CharSet, Compiled,
     CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
     CompiledStructField as StructField, ConfigSchemaValidationError, FieldGroup, FieldGroupKind,
-    IdentityMode, InputMode, InputPath, InputPredicate, InputRule, InputRuleCode, InputRuleError,
-    InputRuleParts, InputRuleScope, InputRuleTarget, NonEmptyString, RawShape,
-    ResourceSchema as DraftResourceSchema, ResourceSchemaParts, ResourceSchemaValidationError,
-    ResourceValidation, SchemaKind, SchemaValidationIssueLocation, StructField as DraftStructField,
-    StructFieldParts, TypeIdentity, UniqueNameSpec, ValidatedConfigSchema,
-    ValidatedProviderSchemaWitness, ValidatedResourceSchema, empty_defs_for_schema_walks,
-    identity_leaf_is_scalar_or_enum,
+    IdentityMode, InputCondition, InputLiteral, InputMode, InputPath, InputPredicate, InputRule,
+    InputRuleCode, InputRuleError, InputRuleParts, InputRuleScope, InputRuleTarget, NonEmptyString,
+    RawShape, ResourceSchema as DraftResourceSchema, ResourceSchemaParts,
+    ResourceSchemaValidationError, ResourceValidation, SchemaKind, SchemaValidationIssueLocation,
+    StructField as DraftStructField, StructFieldParts, TypeIdentity, UniqueNameSpec,
+    ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+    empty_defs_for_schema_walks, identity_leaf_is_scalar_or_enum,
 };
 
 fn field_group_to_protocol(group: &FieldGroup) -> protocol::FieldGroup {
@@ -667,14 +667,116 @@ fn input_charset_to_protocol(set: &CharSet) -> protocol::CharSet {
     }
 }
 
+fn input_literal_to_protocol(literal: &InputLiteral) -> protocol::InputLiteral {
+    match literal {
+        InputLiteral::Bool(value) => protocol::InputLiteral::Bool(*value),
+        InputLiteral::Int(value) => protocol::InputLiteral::Int(*value),
+        InputLiteral::Float(value) => protocol::InputLiteral::Float(*value),
+        InputLiteral::String(value) => protocol::InputLiteral::String(value.clone()),
+        InputLiteral::Enum {
+            identity,
+            api_value,
+        } => {
+            let TypeIdentity {
+                provider,
+                segments,
+                kind,
+            } = identity;
+            protocol::InputLiteral::Enum {
+                identity: protocol::TypeIdentity {
+                    provider: provider.clone().unwrap_or_default(),
+                    segments: segments.clone(),
+                    kind: kind.clone(),
+                },
+                api_value: api_value.clone(),
+            }
+        }
+    }
+}
+
+fn protocol_to_input_literal(literal: &protocol::InputLiteral) -> InputLiteral {
+    match literal {
+        protocol::InputLiteral::Bool(value) => InputLiteral::Bool(*value),
+        protocol::InputLiteral::Int(value) => InputLiteral::Int(*value),
+        protocol::InputLiteral::Float(value) => InputLiteral::Float(*value),
+        protocol::InputLiteral::String(value) => InputLiteral::String(value.clone()),
+        protocol::InputLiteral::Enum {
+            identity,
+            api_value,
+        } => {
+            let protocol::TypeIdentity {
+                provider,
+                segments,
+                kind,
+            } = identity;
+            InputLiteral::Enum {
+                identity: TypeIdentity {
+                    provider: if provider.is_empty() {
+                        None
+                    } else {
+                        Some(provider.clone())
+                    },
+                    segments: segments.clone(),
+                    kind: kind.clone(),
+                },
+                api_value: api_value.clone(),
+            }
+        }
+    }
+}
+
+fn input_condition_to_protocol(condition: &InputCondition) -> protocol::InputCondition {
+    match condition {
+        InputCondition::Always => protocol::InputCondition::Always,
+        InputCondition::Present(path) => {
+            protocol::InputCondition::Present(path.as_str().to_owned())
+        }
+        InputCondition::Equals { path, literal } => protocol::InputCondition::Equals {
+            path: path.as_str().to_owned(),
+            literal: input_literal_to_protocol(literal),
+        },
+        InputCondition::Not(inner) => {
+            protocol::InputCondition::Not(Box::new(input_condition_to_protocol(inner)))
+        }
+    }
+}
+
+fn protocol_to_input_condition(
+    condition: &protocol::InputCondition,
+    depth: usize,
+) -> Result<InputCondition, InputRuleError> {
+    if depth > crate::schema::MAX_INPUT_CONDITION_DEPTH {
+        return Err(InputRuleError::ConditionTooDeep);
+    }
+    Ok(match condition {
+        protocol::InputCondition::Always => InputCondition::Always,
+        protocol::InputCondition::Present(path) => {
+            InputCondition::Present(InputPath::new(path.clone())?)
+        }
+        protocol::InputCondition::Equals { path, literal } => InputCondition::Equals {
+            path: InputPath::new(path.clone())?,
+            literal: protocol_to_input_literal(literal),
+        },
+        protocol::InputCondition::Not(inner) => {
+            InputCondition::Not(Box::new(protocol_to_input_condition(inner, depth + 1)?))
+        }
+    })
+}
+
 fn input_rule_to_protocol(rule: &InputRule<Compiled>) -> protocol::InputRule {
     let InputRuleParts {
         scope,
         target,
         code,
+        condition,
         predicate,
     } = rule.parts();
     let predicate = match predicate {
+        InputPredicate::Present => protocol::InputPredicate::Present,
+        InputPredicate::Absent => protocol::InputPredicate::Absent,
+        InputPredicate::Equals(literal) => {
+            protocol::InputPredicate::Equals(input_literal_to_protocol(literal))
+        }
         InputPredicate::Length { min, max } => protocol::InputPredicate::Length {
             min: *min,
             max: *max,
@@ -730,6 +832,7 @@ fn input_rule_to_protocol(rule: &InputRule<Compiled>) -> protocol::InputRule {
             }
         },
         code: code.as_str().to_owned(),
+        condition: input_condition_to_protocol(condition),
         predicate,
     }
 }
@@ -753,6 +856,7 @@ fn protocol_to_input_rule(rule: &protocol::InputRule) -> Result<InputRule, Input
         scope,
         target,
         code,
+        condition,
         predicate,
     } = rule;
     let scope = match scope {
@@ -769,6 +873,11 @@ fn protocol_to_input_rule(rule: &protocol::InputRule) -> Result<InputRule, Input
     };
     let code = InputRuleCode::new(code.clone())?;
     let predicate = match predicate {
+        protocol::InputPredicate::Present => InputPredicate::Present,
+        protocol::InputPredicate::Absent => InputPredicate::Absent,
+        protocol::InputPredicate::Equals(literal) => {
+            InputPredicate::Equals(protocol_to_input_literal(literal))
+        }
         protocol::InputPredicate::Length { min, max } => InputPredicate::Length {
             min: *min,
             max: *max,
@@ -808,7 +917,8 @@ fn protocol_to_input_rule(rule: &protocol::InputRule) -> Result<InputRule, Input
             InputPredicate::NotMatches(pattern.clone())
         }
     };
-    Ok(InputRule::new(scope, target, code, predicate))
+    Ok(InputRule::new(scope, target, code, predicate)
+        .with_condition(protocol_to_input_condition(condition, 1)?))
 }
 
 /// Convert a validated resource schema into its current protocol record.
@@ -1086,32 +1196,58 @@ pub fn attribute_type_to_protocol(
             length,
         }),
         RawShape::String {
-            identity,
-            pattern,
-            length,
-            validate,
-            to_dsl,
+            identity_layer,
+            member_layer,
         } => {
+            let crate::schema::StringIdentityParts {
+                identity,
+                pattern,
+                length,
+                validate,
+                to_dsl,
+            } = identity_layer;
+            let crate::schema::StringMemberParts {
+                pattern: member_pattern,
+                length: member_length,
+            } = member_layer;
             ensure_validator_identity("String", identity, validate)?;
             let _validate_via_identity = validate;
             Ok(protocol::AttributeType::String {
-                pattern: pattern.cloned(),
-                length,
-                validate: None,
-                to_dsl: to_dsl.cloned(),
-                identity: identity.map(type_identity_to_protocol),
+                identity_layer: protocol::StringIdentityLayer {
+                    pattern: pattern.cloned(),
+                    length,
+                    validate: None,
+                    to_dsl: to_dsl.cloned(),
+                    identity: identity.map(type_identity_to_protocol),
+                },
+                member_layer: protocol::StringMemberConstraints {
+                    pattern: member_pattern.cloned(),
+                    length: member_length,
+                },
             })
         }
         RawShape::Int {
-            identity,
-            range,
-            validate,
+            identity_layer,
+            member_layer,
         } => {
+            let crate::schema::IntIdentityParts {
+                identity,
+                range,
+                validate,
+            } = identity_layer;
+            let crate::schema::IntMemberParts {
+                range: member_range,
+            } = member_layer;
             ensure_validator_identity("Int", identity, validate)?;
             let _validate_via_identity = validate;
             Ok(protocol::AttributeType::Int {
-                range,
-                identity: identity.map(type_identity_to_protocol),
+                identity_layer: protocol::IntIdentityLayer {
+                    range,
+                    identity: identity.map(type_identity_to_protocol),
+                },
+                member_layer: protocol::IntMemberConstraints {
+                    range: member_range,
+                },
             })
         }
         RawShape::Float {
@@ -1147,11 +1283,17 @@ pub fn attribute_type_to_protocol(
                     if !matches!(
                         base.raw_shape(),
                         RawShape::String {
-                            identity: None,
-                            pattern: None,
-                            length: None,
-                            validate: None,
-                            to_dsl: None,
+                            identity_layer: crate::schema::StringIdentityParts {
+                                identity: None,
+                                pattern: None,
+                                length: None,
+                                validate: None,
+                                to_dsl: None,
+                            },
+                            member_layer: crate::schema::StringMemberParts {
+                                pattern: None,
+                                length: None
+                            }
                         }
                     ) {
                         return Err(ProtocolConvertError::ClosedEnumUnsupportedBase {
@@ -1210,6 +1352,7 @@ pub fn attribute_type_to_protocol(
             name,
             fields,
             field_groups,
+            input_rules,
         } => Ok(protocol::AttributeType::Struct {
             name: name.to_string(),
             fields: fields
@@ -1217,6 +1360,7 @@ pub fn attribute_type_to_protocol(
                 .map(struct_field_to_protocol)
                 .collect::<Result<_, _>>()?,
             field_groups: field_groups.iter().map(field_group_to_protocol).collect(),
+            input_rules: input_rules.iter().map(input_rule_to_protocol).collect(),
         }),
         RawShape::Union(members) => Ok(protocol::AttributeType::Union {
             members: members
@@ -1614,24 +1758,45 @@ pub fn protocol_to_attribute_type(
             ))
         }
         protocol::AttributeType::String {
-            pattern,
-            length,
-            validate,
-            to_dsl,
-            identity,
+            identity_layer,
+            member_layer,
         } => {
+            let protocol::StringIdentityLayer {
+                pattern,
+                length,
+                validate,
+                to_dsl,
+                identity,
+            } = identity_layer;
+            let protocol::StringMemberConstraints {
+                pattern: member_pattern,
+                length: member_length,
+            } = member_layer;
             reject_opaque_validator("String", validate)?;
-            Ok(decoded_refined_string(
+            let identity_layer = decoded_string_identity(
                 decode_optional_identity(identity),
                 pattern.clone(),
                 *length,
                 to_dsl.clone(),
+            );
+            Ok(DraftAttributeType::string_member(
+                identity_layer,
+                crate::schema::StringMemberConstraints::new(member_pattern.clone(), *member_length),
             ))
         }
-        protocol::AttributeType::Int { range, identity } => Ok(decoded_refined_int(
-            decode_optional_identity(identity),
-            *range,
-        )),
+        protocol::AttributeType::Int {
+            identity_layer,
+            member_layer,
+        } => {
+            let protocol::IntIdentityLayer { range, identity } = identity_layer;
+            let protocol::IntMemberConstraints {
+                range: member_range,
+            } = member_layer;
+            Ok(DraftAttributeType::int_member(
+                decoded_int_identity(decode_optional_identity(identity), *range),
+                crate::schema::IntMemberConstraints::new(*member_range),
+            ))
+        }
         protocol::AttributeType::Float { range, identity } => Ok(decoded_refined_float(
             decode_optional_identity(identity),
             *range,
@@ -1681,7 +1846,8 @@ pub fn protocol_to_attribute_type(
             name,
             fields,
             field_groups,
-        } => Ok(DraftAttributeType::struct_with_field_groups(
+            input_rules,
+        } => Ok(DraftAttributeType::struct_with_rules(
             name.clone(),
             fields
                 .iter()
@@ -1693,6 +1859,19 @@ pub fn protocol_to_attribute_type(
                 .map(|(index, group)| {
                     protocol_to_field_group(group)
                         .map_err(|error| error.prepend_attribute(&format!("field_groups[{index}]")))
+                })
+                .collect::<Result<_, _>>()?,
+            input_rules
+                .iter()
+                .enumerate()
+                .map(|(index, rule)| {
+                    protocol_to_input_rule(rule).map_err(|error| SchemaDecodeError::InvalidSchema {
+                        detail: "input rule is invalid".into(),
+                        resource_type: None,
+                        attribute_path: vec![format!("input_rules[{index}]").into()],
+                        schema_issue_location: None,
+                        source: Some(Box::new(error)),
+                    })
                 })
                 .collect::<Result<_, _>>()?,
         )),
@@ -1754,41 +1933,43 @@ fn reject_opaque_validator(
     }
 }
 
-fn decoded_refined_string(
+fn decoded_string_identity(
     identity: Option<TypeIdentity>,
     pattern: Option<crate::schema::PatternSpec>,
     length: Option<(Option<u64>, Option<u64>)>,
     to_dsl: Option<protocol::DslTransform>,
-) -> DraftAttributeType {
+) -> crate::schema::StringIdentityLayer {
     match identity {
         Some(identity) => match crate::schema::builtin_validator(
             crate::schema::RefinedScalarKind::String,
             &identity,
         ) {
-            Some(validate) => DraftAttributeType::refined_string_with_validator(
+            Some(validate) => crate::schema::StringIdentityLayer::with_validator(
                 identity, pattern, length, validate, to_dsl,
             ),
-            None => DraftAttributeType::refined_string(Some(identity), pattern, length, to_dsl),
+            None => {
+                crate::schema::StringIdentityLayer::new(Some(identity), pattern, length, to_dsl)
+            }
         },
-        None => DraftAttributeType::refined_string(None, pattern, length, to_dsl),
+        None => crate::schema::StringIdentityLayer::new(None, pattern, length, to_dsl),
     }
 }
 
-fn decoded_refined_int(
+fn decoded_int_identity(
     identity: Option<TypeIdentity>,
     range: Option<(Option<i64>, Option<i64>)>,
-) -> DraftAttributeType {
+) -> crate::schema::IntIdentityLayer {
     match identity {
         Some(identity) => {
             match crate::schema::builtin_validator(crate::schema::RefinedScalarKind::Int, &identity)
             {
                 Some(validate) => {
-                    DraftAttributeType::refined_int_with_validator(identity, range, validate)
+                    crate::schema::IntIdentityLayer::with_validator(identity, range, validate)
                 }
-                None => DraftAttributeType::refined_int(Some(identity), range),
+                None => crate::schema::IntIdentityLayer::new(Some(identity), range),
             }
         }
-        None => DraftAttributeType::refined_int(None, range),
+        None => crate::schema::IntIdentityLayer::new(None, range),
     }
 }
 
@@ -1850,23 +2031,59 @@ fn protocol_legacy_custom_to_core(
             "Reference",
         )),
         protocol::AttributeType::String {
-            pattern: base_pattern,
-            length: base_length,
-            validate: base_validate,
-            to_dsl: base_to_dsl,
-            identity: _base_identity,
+            identity_layer:
+                protocol::StringIdentityLayer {
+                    pattern: base_pattern,
+                    length: base_length,
+                    validate: base_validate,
+                    to_dsl: base_to_dsl,
+                    identity: _base_identity,
+                },
+            member_layer:
+                protocol::StringMemberConstraints {
+                    pattern: member_pattern,
+                    length: member_length,
+                },
         } => {
+            reject_legacy_custom_metadata(
+                enclosing_name,
+                "member_layer",
+                member_pattern.as_ref(),
+                "String",
+            )?;
+            reject_legacy_custom_metadata(
+                enclosing_name,
+                "member_layer",
+                member_length.as_ref(),
+                "String",
+            )?;
             reject_opaque_validator("String", base_validate)?;
             let identity = legacy_custom_identity(enclosing_name);
             let pattern = prefer_outer_legacy_custom_metadata(pattern, base_pattern.clone());
             let length = prefer_outer_legacy_custom_metadata(length, *base_length);
             let to_dsl = prefer_outer_legacy_custom_metadata(to_dsl, base_to_dsl.clone());
-            Ok(decoded_refined_string(identity, pattern, length, to_dsl))
+            Ok(DraftAttributeType::string_member(
+                decoded_string_identity(identity, pattern, length, to_dsl),
+                crate::schema::StringMemberConstraints::default(),
+            ))
         }
         protocol::AttributeType::Int {
-            range: base_range,
-            identity: _base_identity,
+            identity_layer:
+                protocol::IntIdentityLayer {
+                    range: base_range,
+                    identity: _base_identity,
+                },
+            member_layer:
+                protocol::IntMemberConstraints {
+                    range: member_range,
+                },
         } => {
+            reject_legacy_custom_metadata(
+                enclosing_name,
+                "member_layer",
+                member_range.as_ref(),
+                "Int",
+            )?;
             reject_legacy_custom_metadata(enclosing_name, "pattern", pattern.as_ref(), "Int")?;
             reject_legacy_custom_metadata(enclosing_name, "to_dsl", to_dsl.as_ref(), "Int")?;
             let identity = legacy_custom_identity(enclosing_name);
@@ -1879,7 +2096,10 @@ fn protocol_legacy_custom_to_core(
                 })
                 .transpose()?;
             let range = prefer_outer_legacy_custom_metadata(outer_range, *base_range);
-            Ok(decoded_refined_int(identity, range))
+            Ok(DraftAttributeType::int_member(
+                decoded_int_identity(identity, range),
+                crate::schema::IntMemberConstraints::default(),
+            ))
         }
         protocol::AttributeType::Float {
             range: base_range,
@@ -1943,6 +2163,7 @@ fn protocol_legacy_custom_to_core(
             name: _base_name,
             fields: _base_fields,
             field_groups: _base_field_groups,
+            input_rules: _base_input_rules,
         } => Err(SchemaDecodeError::unsupported_custom_base(
             enclosing_name,
             "Struct",
@@ -3205,23 +3426,29 @@ mod tests {
     fn decode_rejects_uncompilable_string_patterns() {
         use carina_provider_protocol::types as protocol;
         let string = protocol::AttributeType::String {
-            identity: None,
-            pattern: Some(protocol::PatternSpec::new(
-                "(?=x)".to_string(),
-                protocol::PatternMatch::Full,
-            )),
-            length: None,
-            validate: None,
-            to_dsl: None,
+            identity_layer: protocol::StringIdentityLayer {
+                identity: None,
+                pattern: Some(protocol::PatternSpec::new(
+                    "(?=x)".to_string(),
+                    protocol::PatternMatch::Full,
+                )),
+                length: None,
+                validate: None,
+                to_dsl: None,
+            },
+            member_layer: Default::default(),
         };
         let legacy = protocol::AttributeType::Custom {
             name: "DomainName".to_string(),
             base: Box::new(protocol::AttributeType::String {
-                identity: None,
-                pattern: None,
-                length: None,
-                validate: None,
-                to_dsl: None,
+                identity_layer: protocol::StringIdentityLayer {
+                    identity: None,
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                },
+                member_layer: Default::default(),
             }),
             pattern: Some(protocol::PatternSpec::new(
                 "(?=x)".to_string(),
@@ -3249,14 +3476,17 @@ mod tests {
 
     fn bad_pattern(pattern: &str) -> protocol::AttributeType {
         protocol::AttributeType::String {
-            identity: None,
-            pattern: Some(protocol::PatternSpec::new(
-                pattern,
-                protocol::PatternMatch::Full,
-            )),
-            length: None,
-            validate: None,
-            to_dsl: None,
+            identity_layer: protocol::StringIdentityLayer {
+                identity: None,
+                pattern: Some(protocol::PatternSpec::new(
+                    pattern,
+                    protocol::PatternMatch::Full,
+                )),
+                length: None,
+                validate: None,
+                to_dsl: None,
+            },
+            member_layer: Default::default(),
         }
     }
 
@@ -3330,7 +3560,11 @@ mod tests {
             .unwrap();
         let mut wire = resource_schema_to_protocol(&schema).unwrap();
         let mut bad = bad_pattern("valid");
-        let protocol::AttributeType::String { validate, .. } = &mut bad else {
+        let protocol::AttributeType::String {
+            identity_layer: protocol::StringIdentityLayer { validate, .. },
+            member_layer: _,
+        } = &mut bad
+        else {
             unreachable!()
         };
         *validate = Some(serde_json::json!(true));
@@ -3388,14 +3622,17 @@ mod tests {
     #[test]
     fn legacy_custom_compiles_only_the_surviving_pattern() {
         let invalid_string = protocol::AttributeType::String {
-            identity: None,
-            pattern: Some(protocol::PatternSpec::new(
-                "(?=x)",
-                protocol::PatternMatch::Full,
-            )),
-            length: None,
-            validate: None,
-            to_dsl: None,
+            identity_layer: protocol::StringIdentityLayer {
+                identity: None,
+                pattern: Some(protocol::PatternSpec::new(
+                    "(?=x)",
+                    protocol::PatternMatch::Full,
+                )),
+                length: None,
+                validate: None,
+                to_dsl: None,
+            },
+            member_layer: Default::default(),
         };
         let invalid_custom = protocol::AttributeType::Custom {
             name: "Inner".into(),
@@ -3424,10 +3661,10 @@ mod tests {
                 protocol_to_attribute_type(&wire).expect("shadowed patterns must not be compiled");
             assert!(matches!(
                 decoded.raw_shape(),
-                RawShape::String {
+                RawShape::String { identity_layer: crate::schema::StringIdentityParts {
                     pattern: Some(pattern),
                     ..
-                } if pattern == &crate::schema::PatternSpec::new("^valid$", crate::schema::PatternMatch::Full)
+                }, .. } if pattern == &crate::schema::PatternSpec::new("^valid$", crate::schema::PatternMatch::Full)
             ));
             ValidatedConfigSchema::validate(BTreeMap::from([("value".to_string(), decoded)]))
                 .expect("only the surviving pattern may reach admission");
@@ -3440,8 +3677,11 @@ mod tests {
             (
                 "Int",
                 protocol::AttributeType::Int {
-                    identity: None,
-                    range: None,
+                    identity_layer: protocol::IntIdentityLayer {
+                        identity: None,
+                        range: None,
+                    },
+                    member_layer: Default::default(),
                 },
             ),
             (
@@ -3496,8 +3736,8 @@ mod tests {
     fn map_length_round_trip_through_protocol_json() {
         for length in [Some((Some(0), Some(10))), Some((Some(2), None)), None] {
             let wire = serde_json::from_value(serde_json::json!({
-                "type": "map", "inner": {"type": "String"},
-                "key": {"type": "String"}, "length": length,
+                "type": "map", "inner": {"type": "String", "identity_layer": {}, "member_layer": {}},
+                "key": {"type": "String", "identity_layer": {}, "member_layer": {}}, "length": length,
             }))
             .unwrap();
             let schema =
@@ -3523,7 +3763,7 @@ mod tests {
     #[test]
     fn map_length_missing_json_decodes_as_unbounded() {
         let wire = serde_json::from_value(serde_json::json!({
-            "type": "map", "inner": {"type": "String"}, "key": {"type": "String"},
+            "type": "map", "inner": {"type": "String", "identity_layer": {}, "member_layer": {}}, "key": {"type": "String", "identity_layer": {}, "member_layer": {}},
         }))
         .unwrap();
         let schema = protocol_to_config_schema(BTreeMap::from([("value".into(), wire)])).unwrap();
@@ -4573,15 +4813,19 @@ mod tests {
 
         let mut wire = resource_schema_to_protocol(&schema).unwrap();
         wire.attributes.get_mut("only").unwrap().attr_type = protocol::AttributeType::Struct {
+            input_rules: Vec::new(),
             name: "Nested".to_string(),
             fields: vec![protocol::StructField {
                 name: "nested_only".to_string(),
                 field_type: protocol::AttributeType::String {
-                    pattern: None,
-                    length: None,
-                    validate: None,
-                    to_dsl: None,
-                    identity: None,
+                    identity_layer: protocol::StringIdentityLayer {
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                        identity: None,
+                    },
+                    member_layer: Default::default(),
                 },
                 required: false,
                 description: None,
@@ -4678,11 +4922,14 @@ mod tests {
         let wire = protocol::StructField {
             name: "budget_name".to_string(),
             field_type: protocol::AttributeType::String {
-                pattern: None,
-                length: None,
-                validate: None,
-                to_dsl: None,
-                identity: None,
+                identity_layer: protocol::StringIdentityLayer {
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                    identity: None,
+                },
+                member_layer: Default::default(),
             },
             required: false,
             description: None,
@@ -4772,11 +5019,14 @@ mod tests {
         attribute.attr_type = protocol::AttributeType::List {
             elements: carina_provider_protocol::types::ListElements::AllowDuplicates,
             element_type: Box::new(protocol::AttributeType::String {
-                pattern: None,
-                length: None,
-                validate: None,
-                to_dsl: None,
-                identity: None,
+                identity_layer: protocol::StringIdentityLayer {
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                    identity: None,
+                },
+                member_layer: Default::default(),
             }),
             ordered: true,
             length: None,
@@ -4818,11 +5068,14 @@ mod tests {
         wire.field_type = protocol::AttributeType::List {
             elements: carina_provider_protocol::types::ListElements::AllowDuplicates,
             element_type: Box::new(protocol::AttributeType::String {
-                pattern: None,
-                length: None,
-                validate: None,
-                to_dsl: None,
-                identity: None,
+                identity_layer: protocol::StringIdentityLayer {
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                    identity: None,
+                },
+                member_layer: Default::default(),
             }),
             ordered: true,
             length: None,
@@ -4852,15 +5105,19 @@ mod tests {
         let mut wire = resource_schema_to_protocol(&schema).unwrap();
         wire.attributes.get_mut("config").unwrap().attr_type = protocol::AttributeType::Union {
             members: vec![protocol::AttributeType::Struct {
+                input_rules: Vec::new(),
                 name: "Config".to_string(),
                 fields: vec![protocol::StructField {
                     name: "immutable".to_string(),
                     field_type: protocol::AttributeType::String {
-                        pattern: None,
-                        length: None,
-                        validate: None,
-                        to_dsl: None,
-                        identity: None,
+                        identity_layer: protocol::StringIdentityLayer {
+                            pattern: None,
+                            length: None,
+                            validate: None,
+                            to_dsl: None,
+                            identity: None,
+                        },
+                        member_layer: Default::default(),
                     },
                     required: false,
                     description: None,
@@ -4900,15 +5157,19 @@ mod tests {
         use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
         let identity_struct = || protocol::AttributeType::Struct {
+            input_rules: Vec::new(),
             name: "Element".to_string(),
             fields: vec![protocol::StructField {
                 name: "key".to_string(),
                 field_type: protocol::AttributeType::String {
-                    pattern: None,
-                    length: None,
-                    validate: None,
-                    to_dsl: None,
-                    identity: None,
+                    identity_layer: protocol::StringIdentityLayer {
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                        identity: None,
+                    },
+                    member_layer: Default::default(),
                 },
                 required: true,
                 description: None,
@@ -4939,11 +5200,14 @@ mod tests {
                     length: None,
                     inner: Box::new(identity_struct()),
                     key: Box::new(protocol::AttributeType::String {
-                        pattern: None,
-                        length: None,
-                        validate: None,
-                        to_dsl: None,
-                        identity: None,
+                        identity_layer: protocol::StringIdentityLayer {
+                            pattern: None,
+                            length: None,
+                            validate: None,
+                            to_dsl: None,
+                            identity: None,
+                        },
+                        member_layer: Default::default(),
                     }),
                 },
             ),
@@ -4989,15 +5253,21 @@ mod tests {
         for (kind, identity) in crate::schema::builtin_validator_registry().keys() {
             let wire = match kind {
                 crate::schema::RefinedScalarKind::String => protocol::AttributeType::String {
-                    pattern: None,
-                    length: None,
-                    validate: None,
-                    to_dsl: None,
-                    identity: Some(identity.to_string()),
+                    identity_layer: protocol::StringIdentityLayer {
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                        identity: Some(identity.to_string()),
+                    },
+                    member_layer: Default::default(),
                 },
                 crate::schema::RefinedScalarKind::Int => protocol::AttributeType::Int {
-                    range: None,
-                    identity: Some(identity.to_string()),
+                    identity_layer: protocol::IntIdentityLayer {
+                        range: None,
+                        identity: Some(identity.to_string()),
+                    },
+                    member_layer: Default::default(),
                 },
                 crate::schema::RefinedScalarKind::Float => protocol::AttributeType::Float {
                     range: None,
@@ -5017,16 +5287,24 @@ mod tests {
                     length: _length,
                 } => (Some(identity), false),
                 RawShape::String {
-                    identity,
-                    pattern: _pattern,
-                    length: _length,
-                    validate,
-                    to_dsl: _to_dsl,
+                    identity_layer:
+                        crate::schema::StringIdentityParts {
+                            identity,
+                            pattern: _pattern,
+                            length: _length,
+                            validate,
+                            to_dsl: _to_dsl,
+                        },
+                    member_layer: _,
                 } => (identity, validate.is_some()),
                 RawShape::Int {
-                    identity,
-                    range: _range,
-                    validate,
+                    identity_layer:
+                        crate::schema::IntIdentityParts {
+                            identity,
+                            range: _range,
+                            validate,
+                        },
+                    member_layer: _,
                 } => (identity, validate.is_some()),
                 RawShape::Float {
                     identity,
@@ -5059,6 +5337,7 @@ mod tests {
                     name: _name,
                     fields: _fields,
                     field_groups: _field_groups,
+                    input_rules: _input_rules,
                 } => panic!("unexpected Struct builtin wire shape for {identity}"),
                 RawShape::Union(_members) => {
                     panic!("unexpected Union builtin wire shape for {identity}")
@@ -5081,8 +5360,11 @@ mod tests {
                 protocol::AttributeSchema {
                     name: "count".to_string(),
                     attr_type: protocol::AttributeType::Int {
-                        range: None,
-                        identity: Some(positive_int.to_string()),
+                        identity_layer: protocol::IntIdentityLayer {
+                            range: None,
+                            identity: Some(positive_int.to_string()),
+                        },
+                        member_layer: Default::default(),
                     },
                     required: false,
                     keyed_partial_update: None,
@@ -5126,11 +5408,14 @@ mod tests {
         let wire = protocol::AttributeType::CustomEnum {
             name: "Mode".to_string(),
             base: Box::new(protocol::AttributeType::String {
-                pattern: None,
-                length: None,
-                validate: None,
-                to_dsl: None,
-                identity: None,
+                identity_layer: protocol::StringIdentityLayer {
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                    identity: None,
+                },
+                member_layer: Default::default(),
             }),
             namespace: String::new(),
             dsl_transform: None,
@@ -5154,14 +5439,17 @@ mod tests {
         let wire = protocol::AttributeType::Custom {
             name: "test.StringId".to_string(),
             base: Box::new(protocol::AttributeType::String {
-                pattern: Some(protocol::PatternSpec::new(
-                    "^base-[a-z]+$".to_string(),
-                    protocol::PatternMatch::Full,
-                )),
-                length: Some((Some(5), Some(32))),
-                validate: None,
-                to_dsl: Some(protocol::DslTransform::HyphenToUnderscore),
-                identity: None,
+                identity_layer: protocol::StringIdentityLayer {
+                    pattern: Some(protocol::PatternSpec::new(
+                        "^base-[a-z]+$".to_string(),
+                        protocol::PatternMatch::Full,
+                    )),
+                    length: Some((Some(5), Some(32))),
+                    validate: None,
+                    to_dsl: Some(protocol::DslTransform::HyphenToUnderscore),
+                    identity: None,
+                },
+                member_layer: Default::default(),
             }),
             pattern: None,
             length: None,
@@ -5172,13 +5460,13 @@ mod tests {
         let decoded = protocol_to_attribute_type(&wire).expect("base metadata is representable");
         assert!(matches!(
             decoded.raw_shape(),
-            RawShape::String {
+            RawShape::String { identity_layer: crate::schema::StringIdentityParts {
                 identity: Some(identity),
                 pattern: Some(pattern),
                 length: Some((Some(5), Some(32))),
                 validate: None,
                 to_dsl: Some(protocol::DslTransform::HyphenToUnderscore),
-            } if identity == &TypeIdentity::from_dotted("test.StringId")
+            }, member_layer: _ } if identity == &TypeIdentity::from_dotted("test.StringId")
                 && pattern == &crate::schema::PatternSpec::new("^base-[a-z]+$", crate::schema::PatternMatch::Full)
         ));
     }
@@ -5188,11 +5476,14 @@ mod tests {
         let wire = protocol::AttributeType::Custom {
             name: String::new(),
             base: Box::new(protocol::AttributeType::String {
-                pattern: None,
-                length: None,
-                validate: None,
-                to_dsl: None,
-                identity: Some("base.Identity".to_string()),
+                identity_layer: protocol::StringIdentityLayer {
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                    identity: Some("base.Identity".to_string()),
+                },
+                member_layer: Default::default(),
             }),
             pattern: None,
             length: None,
@@ -5204,7 +5495,10 @@ mod tests {
             .expect("an anonymous legacy Custom string remains representable");
         assert!(matches!(
             decoded.raw_shape(),
-            RawShape::String { identity: None, .. }
+            RawShape::String {
+                identity_layer: crate::schema::StringIdentityParts { identity: None, .. },
+                ..
+            }
         ));
     }
 
@@ -5215,11 +5509,14 @@ mod tests {
             base: Box::new(protocol::AttributeType::Custom {
                 name: "nested.Identity".to_string(),
                 base: Box::new(protocol::AttributeType::String {
-                    pattern: None,
-                    length: None,
-                    validate: None,
-                    to_dsl: None,
-                    identity: None,
+                    identity_layer: protocol::StringIdentityLayer {
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                        identity: None,
+                    },
+                    member_layer: Default::default(),
                 }),
                 pattern: None,
                 length: None,
@@ -5236,7 +5533,10 @@ mod tests {
             .expect("a nested reusable Custom does not supply the outer identity");
         assert!(matches!(
             decoded.raw_shape(),
-            RawShape::String { identity: None, .. }
+            RawShape::String {
+                identity_layer: crate::schema::StringIdentityParts { identity: None, .. },
+                ..
+            }
         ));
     }
 
@@ -5247,11 +5547,14 @@ mod tests {
             base: Box::new(protocol::AttributeType::List {
                 elements: carina_provider_protocol::types::ListElements::AllowDuplicates,
                 element_type: Box::new(protocol::AttributeType::String {
-                    pattern: None,
-                    length: None,
-                    validate: None,
-                    to_dsl: None,
-                    identity: None,
+                    identity_layer: protocol::StringIdentityLayer {
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                        identity: None,
+                    },
+                    member_layer: Default::default(),
                 }),
                 ordered: false,
                 length: Some((Some(2), Some(4))),
@@ -5280,8 +5583,11 @@ mod tests {
         let int_wire = protocol::AttributeType::Custom {
             name: "test.Port".to_string(),
             base: Box::new(protocol::AttributeType::Int {
-                range: Some((Some(1), Some(65_535))),
-                identity: None,
+                identity_layer: protocol::IntIdentityLayer {
+                    range: Some((Some(1), Some(65_535))),
+                    identity: None,
+                },
+                member_layer: Default::default(),
             }),
             pattern: None,
             length: None,
@@ -5305,7 +5611,10 @@ mod tests {
         assert!(matches!(
             int_decoded.raw_shape(),
             RawShape::Int {
-                range: Some((Some(1), Some(65_535))),
+                identity_layer: crate::schema::IntIdentityParts {
+                    range: Some((Some(1), Some(65_535))),
+                    ..
+                },
                 ..
             }
         ));
@@ -5327,11 +5636,14 @@ mod tests {
             base: Box::new(protocol::AttributeType::List {
                 elements: carina_provider_protocol::types::ListElements::AllowDuplicates,
                 element_type: Box::new(protocol::AttributeType::String {
-                    pattern: None,
-                    length: None,
-                    validate: None,
-                    to_dsl: None,
-                    identity: None,
+                    identity_layer: protocol::StringIdentityLayer {
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                        identity: None,
+                    },
+                    member_layer: Default::default(),
                 }),
                 ordered: true,
                 length: None,
@@ -5345,14 +5657,17 @@ mod tests {
         let duplicate_wire = protocol::AttributeType::Custom {
             name: "test.ConflictingString".to_string(),
             base: Box::new(protocol::AttributeType::String {
-                pattern: Some(protocol::PatternSpec::new(
-                    "^base$".to_string(),
-                    protocol::PatternMatch::Full,
-                )),
-                length: None,
-                validate: None,
-                to_dsl: None,
-                identity: None,
+                identity_layer: protocol::StringIdentityLayer {
+                    pattern: Some(protocol::PatternSpec::new(
+                        "^base$".to_string(),
+                        protocol::PatternMatch::Full,
+                    )),
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                    identity: None,
+                },
+                member_layer: Default::default(),
             }),
             pattern: Some(protocol::PatternSpec::new(
                 "^outer$".to_string(),
@@ -5377,10 +5692,10 @@ mod tests {
             .expect("v16 defines the enclosing Custom refinement as authoritative");
         assert!(matches!(
             decoded.raw_shape(),
-            RawShape::String {
+            RawShape::String { identity_layer: crate::schema::StringIdentityParts {
                 pattern: Some(pattern),
                 ..
-            } if pattern == &crate::schema::PatternSpec::new("^outer$", crate::schema::PatternMatch::Full)
+            }, .. } if pattern == &crate::schema::PatternSpec::new("^outer$", crate::schema::PatternMatch::Full)
         ));
     }
 
@@ -5414,6 +5729,73 @@ mod explicit_pattern_mode_tests {
     use crate::schema::{PatternMatch, PatternReason, PatternSpec};
 
     #[test]
+    fn round12_legacy_custom_rejects_nonempty_base_members() {
+        let pattern = protocol::PatternSpec::new("inner", protocol::PatternMatch::Full);
+        let bases = [
+            protocol::AttributeType::String {
+                identity_layer: protocol::StringIdentityLayer {
+                    identity: None,
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                },
+                member_layer: protocol::StringMemberConstraints {
+                    pattern: Some(pattern.clone()),
+                    length: None,
+                },
+            },
+            protocol::AttributeType::String {
+                identity_layer: protocol::StringIdentityLayer {
+                    identity: None,
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                },
+                member_layer: protocol::StringMemberConstraints {
+                    pattern: None,
+                    length: Some((Some(1), Some(8))),
+                },
+            },
+            protocol::AttributeType::Int {
+                identity_layer: protocol::IntIdentityLayer {
+                    identity: None,
+                    range: None,
+                },
+                member_layer: protocol::IntMemberConstraints {
+                    range: Some((Some(1), Some(8))),
+                },
+            },
+        ];
+        for base in bases {
+            let kind = if matches!(base, protocol::AttributeType::Int { .. }) {
+                "Int"
+            } else {
+                "String"
+            };
+            for outer_present in [false, true] {
+                for name in ["", "test.X"] {
+                    let wire = protocol::AttributeType::Custom {
+                        name: name.into(),
+                        base: Box::new(base.clone()),
+                        pattern: (outer_present && kind == "String").then(|| pattern.clone()),
+                        length: outer_present.then_some((Some(1), Some(32))),
+                        validate: None,
+                        to_dsl: None,
+                    };
+                    let error = protocol_to_attribute_type(&wire)
+                        .expect_err("legacy Custom cannot carry member metadata through its base");
+                    assert!(
+                        matches!(std::error::Error::source(&error).and_then(|cause| cause.downcast_ref::<ProtocolConvertError>()), Some(ProtocolConvertError::LegacyCustomUnsupportedMetadata { field: "member_layer", base_kind, .. }) if *base_kind == kind),
+                        "{error:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn legacy_custom_precedence_selects_the_entire_pattern_spec() {
         let inner = protocol::PatternSpec::new(
             "abc",
@@ -5423,11 +5805,14 @@ mod explicit_pattern_mode_tests {
         );
         let outer = protocol::PatternSpec::new("abc", protocol::PatternMatch::Full);
         let base = protocol::AttributeType::String {
-            pattern: Some(inner.clone()),
-            length: None,
-            validate: None,
-            to_dsl: None,
-            identity: None,
+            identity_layer: protocol::StringIdentityLayer {
+                pattern: Some(inner.clone()),
+                length: None,
+                validate: None,
+                to_dsl: None,
+                identity: None,
+            },
+            member_layer: Default::default(),
         };
         for (outer_pattern, expected) in [
             (Some(outer), PatternSpec::new("abc", PatternMatch::Full)),
@@ -5451,11 +5836,15 @@ mod explicit_pattern_mode_tests {
             };
             let decoded = protocol_to_attribute_type(&wire).unwrap();
             let RawShape::String {
-                identity: _identity,
-                pattern,
-                length: _length,
-                validate: _validate,
-                to_dsl: _to_dsl,
+                identity_layer:
+                    crate::schema::StringIdentityParts {
+                        identity: _identity,
+                        pattern,
+                        length: _length,
+                        validate: _validate,
+                        to_dsl: _to_dsl,
+                    },
+                member_layer: _,
             } = decoded.raw_shape()
             else {
                 panic!("String refinement");

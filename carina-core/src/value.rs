@@ -6044,7 +6044,7 @@ fn canonicalize_with_fit<H: ValueKind, B: BindingAddress, P: CanonicalizationErr
             debug_assert_eq!(items.len(), fits.len());
             let items = items
                 .into_iter()
-                .zip(fits)
+                .zip(fits.iter())
                 .enumerate()
                 .map(|(index, (item, fit))| {
                     canonicalize_with_fit(item, fit, defs, purpose, error_policy)
@@ -6070,7 +6070,7 @@ fn canonicalize_with_fit<H: ValueKind, B: BindingAddress, P: CanonicalizationErr
             debug_assert_eq!(items.len(), fits.len());
             let canonicalized = items
                 .into_iter()
-                .zip(fits)
+                .zip(fits.iter())
                 .map(|(item, fit)| {
                     canonicalize_with_fit(
                         Value::Concrete(ConcreteValue::String(item)),
@@ -6104,7 +6104,7 @@ fn canonicalize_with_fit<H: ValueKind, B: BindingAddress, P: CanonicalizationErr
             debug_assert_eq!(map.len(), fits.len());
             let entries = map
                 .into_iter()
-                .zip(fits)
+                .zip(fits.iter())
                 .map(|((key, value), fit)| {
                     let canonical_key = fit.canonical_key.clone().unwrap_or_else(|| key.clone());
                     let value =
@@ -6121,7 +6121,7 @@ fn canonicalize_with_fit<H: ValueKind, B: BindingAddress, P: CanonicalizationErr
             debug_assert_eq!(map.len(), fits.len());
             let fields = map
                 .into_iter()
-                .zip(fits)
+                .zip(fits.iter())
                 .filter_map(|((key, value), fit)| {
                     let resolved_type = fit.attr;
                     canonicalize_with_fit(value, fit, defs, purpose, error_policy)

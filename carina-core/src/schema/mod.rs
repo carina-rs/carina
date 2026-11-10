@@ -192,13 +192,25 @@
 //! let _ = ResourceSchema::new("test.Widget").with_validator(|_| Ok(()));
 //! ```
 
+mod indexed_struct_fields;
+pub use indexed_struct_fields::IndexedStructFields;
+
 mod compile_schema;
 mod compiled_pattern;
 mod pattern_display;
+mod refinement_layers;
 pub use carina_provider_protocol::types::{
     EmptyPatternReason, PatternMatch, PatternReason, PatternSpec, PatternSpecParts,
 };
 pub use pattern_display::{DiagnosticPatternSpec, PatternSpecDisplay};
+pub use refinement_layers::intersect_bounds;
+pub use refinement_layers::{
+    IntIdentityLayer, IntIdentityParts, IntMemberConstraints, IntMemberParts, StringIdentityLayer,
+    StringIdentityParts, StringMemberConstraints, StringMemberParts,
+};
+pub(crate) use refinement_layers::{ScalarIdentityParts, bounds_are_empty};
+mod refinement_walk;
+pub use refinement_walk::{RefinedScalarPosition, RefinementPathSegment, RefinementPositions};
 pub(crate) mod length_interval;
 use crate::resource::knowledge::{
     Classification, ClassifiedRef, KnownValue, PendingFit, StructuralPending,
@@ -208,16 +220,19 @@ mod input_rules;
 pub use compiled_pattern::{
     Compiled, CompiledPattern, Draft, PatternCompileError, PatternCompileErrorSource, PatternForm,
 };
+pub(crate) use input_rules::MAX_INPUT_CONDITION_DEPTH;
 pub use input_rules::{
-    CharSet, InputPath, InputPredicate, InputRule, InputRuleCode, InputRuleError, InputRuleParts,
-    InputRuleScope, InputRuleTarget, InputViolation, InputViolationReason, NonEmptyString,
+    CharSet, InputCondition, InputDiagnosticPath, InputLiteral, InputPath, InputPredicate,
+    InputRule, InputRuleCode, InputRuleError, InputRuleParts, InputRuleScope, InputRuleTarget,
+    InputViolation, InputViolationMessage, InputViolationReason, NonEmptyString,
 };
+pub(crate) use input_rules::{InputDiagnosticKey, InputDiagnosticSegment};
 
 use crate::provider_text::{DiagnosticText, DiagnosticTextBuilder, ProviderKey};
 use crate::resource::InsideSecret;
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
@@ -1169,15 +1184,49 @@ pub enum LeafPathSegment {
 }
 
 /// Location of one write-only field inside a top-level attribute value.
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
-pub struct LeafPath(Vec<LeafPathSegment>);
+pub struct LeafPath(Vec<LeafPathSegment>, #[serde(skip)] LeafPathRendering);
+
+#[derive(Debug, Clone, Copy, Default)]
+enum LeafPathRendering {
+    #[default]
+    Literal,
+    Redacted,
+}
+
+impl fmt::Debug for LeafPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("LeafPath").field(&self.0).finish()
+    }
+}
+
+// Diagnostic protection never changes the canonical identity or wire shape.
+impl PartialEq for LeafPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl Eq for LeafPath {}
+impl PartialOrd for LeafPath {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for LeafPath {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+impl std::hash::Hash for LeafPath {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
 
 impl LeafPath {
     pub fn from_segments(segments: impl IntoIterator<Item = LeafPathSegment>) -> Self {
-        Self(segments.into_iter().collect())
+        Self(segments.into_iter().collect(), LeafPathRendering::Literal)
     }
 
     /// Borrow the typed steps from the containing attribute to this leaf.
@@ -1190,12 +1239,15 @@ impl fmt::Display for LeafPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (index, segment) in self.0.iter().enumerate() {
             match segment {
-                LeafPathSegment::StructField(name) => {
-                    if index > 0 {
-                        f.write_str(".")?;
+                LeafPathSegment::StructField(name) => match self.1 {
+                    LeafPathRendering::Literal => write_path_field(f, name, index > 0)?,
+                    LeafPathRendering::Redacted => {
+                        if index > 0 {
+                            f.write_str(".")?;
+                        }
+                        f.write_str(SECRET_VALUE_MASK)?;
                     }
-                    f.write_str(name)?;
-                }
+                },
                 LeafPathSegment::ListIndex(index) => write!(f, "[{index}]")?,
                 LeafPathSegment::MapKey(key) => write!(f, "[{key:?}]")?,
             }
@@ -1373,10 +1425,8 @@ pub(crate) enum AttrTypeKind<R: PatternForm = Draft> {
     },
     /// String
     String {
-        binding: RefinementBinding,
-        pattern: Option<R::Pattern>,
-        length: Option<(Option<u64>, Option<u64>)>,
-        to_dsl: Option<DslTransform>,
+        identity_layer: StringIdentityLayer<R>,
+        member_layer: StringMemberConstraints<R>,
     },
     /// A resource handle used only by the schema-level boundary relation.
     ///
@@ -1393,8 +1443,8 @@ pub(crate) enum AttrTypeKind<R: PatternForm = Draft> {
     StringLiteralSet { values: Vec<String> },
     /// Integer
     Int {
-        binding: RefinementBinding,
-        range: Option<(Option<i64>, Option<i64>)>,
+        identity_layer: IntIdentityLayer,
+        member_layer: IntMemberConstraints,
     },
     /// Floating-point number
     Float {
@@ -1448,8 +1498,9 @@ pub(crate) enum AttrTypeKind<R: PatternForm = Draft> {
     /// Struct (named object with typed fields)
     Struct {
         name: String,
-        fields: Vec<PatternStructField<R>>,
+        fields: IndexedStructFields<R>,
         field_groups: Vec<FieldGroup>,
+        input_rules: Vec<InputRule<R>>,
     },
     /// Union of multiple types (value is valid if it matches any member)
     Union(UnionMemberTypes<R>),
@@ -1497,17 +1548,13 @@ pub enum Shape<'a, R: PatternForm = Draft> {
     },
     /// String — see [`AttrTypeKind::String { .. }`].
     String {
-        identity: Option<&'a TypeIdentity>,
-        pattern: Option<&'a PatternSpec>,
-        length: Option<(Option<u64>, Option<u64>)>,
-        validate: Option<&'a CustomValidator>,
-        to_dsl: Option<&'a DslTransform>,
+        identity_layer: StringIdentityParts<'a>,
+        member_layer: StringMemberParts<'a>,
     },
     /// Integer — see [`AttrTypeKind::Int { .. }`].
     Int {
-        identity: Option<&'a TypeIdentity>,
-        range: Option<(Option<i64>, Option<i64>)>,
-        validate: Option<&'a CustomValidator>,
+        identity_layer: IntIdentityParts<'a>,
+        member_layer: IntMemberParts,
     },
     /// Floating-point — see [`AttrTypeKind::Float { .. }`].
     Float {
@@ -1568,11 +1615,15 @@ impl ShapeWalkBudget {
     }
 
     pub(crate) fn take(&mut self) -> bool {
-        let Some(next) = self.remaining.checked_sub(1) else {
+        if self.is_exhausted() {
             return false;
-        };
-        self.remaining = next;
+        }
+        self.remaining -= 1;
         true
+    }
+
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.remaining == 0
     }
 }
 
@@ -1594,25 +1645,32 @@ impl<R: PatternForm> fmt::Debug for Shape<'_, R> {
                 .field("length", length)
                 .finish(),
             Shape::String {
-                identity,
-                pattern,
-                length,
-                validate: _,
-                to_dsl: _,
+                identity_layer:
+                    StringIdentityParts {
+                        identity,
+                        pattern,
+                        length,
+                        ..
+                    },
+                member_layer,
             } => f
                 .debug_struct("Shape::String { .. }")
                 .field("identity", identity)
                 .field("pattern", pattern)
                 .field("length", length)
+                .field("member_layer", &member_layer)
                 .finish_non_exhaustive(),
             Shape::Int {
-                identity,
-                range,
-                validate: _,
+                identity_layer:
+                    IntIdentityParts {
+                        identity, range, ..
+                    },
+                member_layer,
             } => f
                 .debug_struct("Shape::Int { .. }")
                 .field("identity", identity)
                 .field("range", range)
+                .field("member_layer", &member_layer)
                 .finish_non_exhaustive(),
             Shape::Float {
                 identity,
@@ -1697,17 +1755,13 @@ pub enum RawShape<'a, R: PatternForm = Draft> {
     },
     /// String — see [`AttrTypeKind::String { .. }`].
     String {
-        identity: Option<&'a TypeIdentity>,
-        pattern: Option<&'a PatternSpec>,
-        length: Option<(Option<u64>, Option<u64>)>,
-        validate: Option<&'a CustomValidator>,
-        to_dsl: Option<&'a DslTransform>,
+        identity_layer: StringIdentityParts<'a>,
+        member_layer: StringMemberParts<'a>,
     },
     /// Integer — see [`AttrTypeKind::Int { .. }`].
     Int {
-        identity: Option<&'a TypeIdentity>,
-        range: Option<(Option<i64>, Option<i64>)>,
-        validate: Option<&'a CustomValidator>,
+        identity_layer: IntIdentityParts<'a>,
+        member_layer: IntMemberParts,
     },
     /// Floating-point — see [`AttrTypeKind::Float { .. }`].
     Float {
@@ -1743,8 +1797,9 @@ pub enum RawShape<'a, R: PatternForm = Draft> {
     /// Named struct — see [`AttrTypeKind::Struct`].
     Struct {
         name: &'a str,
-        fields: &'a [PatternStructField<R>],
+        fields: &'a IndexedStructFields<R>,
         field_groups: &'a [FieldGroup],
+        input_rules: &'a [InputRule<R>],
     },
     /// Union of types — see [`AttrTypeKind::Union`].
     Union(&'a [PatternAttributeType<R>]),
@@ -1772,25 +1827,32 @@ impl<R: PatternForm> fmt::Debug for RawShape<'_, R> {
                 .field("length", length)
                 .finish(),
             RawShape::String {
-                identity,
-                pattern,
-                length,
-                validate: _,
-                to_dsl: _,
+                identity_layer:
+                    StringIdentityParts {
+                        identity,
+                        pattern,
+                        length,
+                        ..
+                    },
+                member_layer,
             } => f
                 .debug_struct("RawShape::String { .. }")
                 .field("identity", identity)
                 .field("pattern", pattern)
                 .field("length", length)
+                .field("member_layer", &member_layer)
                 .finish_non_exhaustive(),
             RawShape::Int {
-                identity,
-                range,
-                validate: _,
+                identity_layer:
+                    IntIdentityParts {
+                        identity, range, ..
+                    },
+                member_layer,
             } => f
                 .debug_struct("RawShape::Int { .. }")
                 .field("identity", identity)
                 .field("range", range)
+                .field("member_layer", &member_layer)
                 .finish_non_exhaustive(),
             RawShape::Float {
                 identity,
@@ -1841,11 +1903,13 @@ impl<R: PatternForm> fmt::Debug for RawShape<'_, R> {
                 name,
                 fields,
                 field_groups,
+                input_rules,
             } => f
                 .debug_struct("RawShape::Struct")
                 .field("name", name)
                 .field("fields", fields)
                 .field("field_groups", field_groups)
+                .field("input_rules", input_rules)
                 .finish(),
             RawShape::Union(members) => f.debug_tuple("RawShape::Union").field(members).finish(),
             RawShape::Ref(name) => f.debug_tuple("RawShape::Ref").field(name).finish(),
@@ -2290,15 +2354,20 @@ impl<R: PatternForm> fmt::Debug for PatternAttributeType<R> {
                 .field("length", length)
                 .finish(),
             AttrTypeKind::String {
-                binding,
-                pattern,
-                length,
-                to_dsl,
+                identity_layer:
+                    StringIdentityLayer {
+                        binding,
+                        pattern,
+                        length,
+                        to_dsl,
+                    },
+                member_layer,
             } => f
                 .debug_struct("String")
                 .field("identity", &binding.identity())
                 .field("pattern", pattern)
                 .field("length", length)
+                .field("member_layer", &member_layer)
                 .field("to_dsl", to_dsl)
                 .field("validate", &binding.callback().map(|_| "<closure>"))
                 .finish(),
@@ -2313,10 +2382,14 @@ impl<R: PatternForm> fmt::Debug for PatternAttributeType<R> {
             AttrTypeKind::StringLiteralSet { values } => {
                 f.debug_tuple("StringLiteralSet").field(values).finish()
             }
-            AttrTypeKind::Int { binding, range } => f
+            AttrTypeKind::Int {
+                identity_layer: IntIdentityLayer { binding, range },
+                member_layer,
+            } => f
                 .debug_struct("Int")
                 .field("identity", &binding.identity())
                 .field("range", range)
+                .field("member_layer", &member_layer)
                 .field("validate", &binding.callback().map(|_| "<closure>"))
                 .finish(),
             AttrTypeKind::Float { binding, range } => f
@@ -2367,11 +2440,13 @@ impl<R: PatternForm> fmt::Debug for PatternAttributeType<R> {
                 name,
                 fields,
                 field_groups,
+                input_rules,
             } => f
                 .debug_struct("Struct")
                 .field("name", name)
                 .field("fields", fields)
                 .field("field_groups", field_groups)
+                .field("input_rules", input_rules)
                 .finish(),
             AttrTypeKind::Union(types) => f.debug_tuple("Union").field(types).finish(),
             AttrTypeKind::Ref(name) => f.debug_tuple("Ref").field(name).finish(),
@@ -2386,13 +2461,52 @@ impl<R: PatternForm> fmt::Debug for PatternAttributeType<R> {
 pub enum FieldPathStep {
     Field(String),
     Index(usize),
+    Redacted(RedactedPathField),
+}
+
+/// A diagnostic marker is not an authored field with the marker's spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedactedPathField {
+    SecretValue,
+    MapKey,
+}
+
+impl fmt::Display for RedactedPathField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SecretValue => f.write_str(SECRET_VALUE_MASK),
+            Self::MapKey => f.write_str("<secret>"),
+        }
+    }
+}
+
+pub(crate) fn is_path_identifier(name: &str) -> bool {
+    name.as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Render a literal field, never interpreting its bytes as path separators.
+fn write_path_field(out: &mut impl fmt::Write, name: &str, has_parent: bool) -> fmt::Result {
+    if is_path_identifier(name) {
+        if has_parent {
+            out.write_char('.')?;
+        }
+        out.write_str(name)
+    } else {
+        write!(out, "[{name:?}]")
+    }
 }
 
 impl fmt::Display for FieldPathStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FieldPathStep::Field(name) => write!(f, "{}", name),
+            FieldPathStep::Field(name) => write_path_field(f, name, false),
             FieldPathStep::Index(i) => write!(f, "[{}]", i),
+            FieldPathStep::Redacted(marker) => marker.fmt(f),
         }
     }
 }
@@ -2401,97 +2515,293 @@ impl fmt::Display for FieldPathStep {
 /// a particular [`TypeError`]. Used by [`AttrTypeKind::validate_collect`]
 /// so the LSP can map errors back to source positions without
 /// re-running validation itself (#2214).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct FieldPath {
+    tail: Option<Arc<FieldPathNode>>,
+}
+
+struct FieldPathNode {
+    parent: Option<Arc<FieldPathNode>>,
+    step: FieldPathStep,
+    canonical: LeafPathSegment,
+    direction: FieldPathDirection,
+    len: usize,
+    materialized: OnceLock<FieldPathSegments>,
+}
+
+#[derive(Clone, Copy)]
+enum FieldPathDirection {
+    Before,
+    After,
+}
+
+struct FieldPathSegments {
     steps: Vec<FieldPathStep>,
     canonical: Vec<LeafPathSegment>,
 }
+
+/// Published diagnostic metadata has immutable storage, independent of the
+/// traversal prefix's lazy rendering cache.
+#[derive(Clone)]
+pub(crate) struct ConcreteFieldPath {
+    steps: Vec<FieldPathStep>,
+    canonical: Vec<LeafPathSegment>,
+}
+
+impl ConcreteFieldPath {
+    pub(crate) fn canonical(&self) -> &[LeafPathSegment] {
+        &self.canonical
+    }
+    pub(crate) fn as_field_path(&self) -> FieldPath {
+        self.steps
+            .iter()
+            .zip(&self.canonical)
+            .fold(FieldPath::new(), |path, (step, canonical)| {
+                path.pushed(step.clone(), canonical.clone(), FieldPathDirection::After)
+            })
+    }
+}
+
+impl PartialEq for ConcreteFieldPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical == other.canonical
+    }
+}
+impl Eq for ConcreteFieldPath {}
+
+impl fmt::Debug for ConcreteFieldPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FieldPath")
+            .field("steps", &self.steps)
+            .field("canonical", &self.canonical)
+            .finish()
+    }
+}
+
+impl Drop for FieldPath {
+    fn drop(&mut self) {
+        // Release a uniquely owned prefix iteratively, including very deep
+        // paths whose other owners have already gone away.
+        let mut tail = self.tail.take();
+        while let Some(node) = tail {
+            let Ok(mut node) = Arc::try_unwrap(node) else {
+                break;
+            };
+            tail = node.parent.take();
+        }
+    }
+}
+
+impl fmt::Debug for FieldPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let materialized = self.materialized();
+        f.debug_struct("FieldPath")
+            .field("steps", &materialized.steps)
+            .field("canonical", &materialized.canonical)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+thread_local! { static FIELD_PATH_WORK: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
+
+#[cfg(test)]
+fn record_field_path_work(segments: usize) {
+    FIELD_PATH_WORK.with(|work| {
+        if let Some(count) = work.get() {
+            work.set(Some(count + segments));
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn with_field_path_work<R>(operation: impl FnOnce() -> R) -> (R, usize) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FIELD_PATH_WORK.set(None);
+        }
+    }
+    FIELD_PATH_WORK.set(Some(0));
+    let _reset = Reset;
+    let result = operation();
+    (result, FIELD_PATH_WORK.get().unwrap())
+}
 impl PartialEq for FieldPath {
     fn eq(&self, other: &Self) -> bool {
-        self.steps == other.steps
+        self.steps() == other.steps()
     }
 }
 impl Eq for FieldPath {}
 
 impl FieldPath {
     pub fn new() -> Self {
-        Self {
-            steps: Vec::new(),
-            canonical: Vec::new(),
+        Self::default()
+    }
+
+    pub(crate) fn into_concrete(self) -> ConcreteFieldPath {
+        let parts = self.materialized();
+        #[cfg(test)]
+        record_field_path_work(parts.steps.len() + parts.canonical.len());
+        ConcreteFieldPath {
+            steps: parts.steps.clone(),
+            canonical: parts.canonical.clone(),
         }
     }
 
+    fn pushed(
+        &self,
+        step: FieldPathStep,
+        canonical: LeafPathSegment,
+        direction: FieldPathDirection,
+    ) -> Self {
+        #[cfg(test)]
+        record_field_path_work(2);
+        Self {
+            tail: Some(Arc::new(FieldPathNode {
+                parent: self.tail.clone(),
+                step,
+                canonical,
+                direction,
+                len: self.tail.as_ref().map_or(1, |node| node.len + 1),
+                materialized: OnceLock::new(),
+            })),
+        }
+    }
+
+    fn materialized(&self) -> &FieldPathSegments {
+        static EMPTY: FieldPathSegments = FieldPathSegments {
+            steps: Vec::new(),
+            canonical: Vec::new(),
+        };
+        let Some(tail) = &self.tail else {
+            return &EMPTY;
+        };
+        tail.materialized.get_or_init(|| {
+            let mut before = Vec::new();
+            let mut after = Vec::new();
+            let mut node = Some(tail.as_ref());
+            while let Some(current) = node {
+                match current.direction {
+                    FieldPathDirection::Before => before.push(current),
+                    FieldPathDirection::After => after.push(current),
+                }
+                node = current.parent.as_deref();
+            }
+            let mut steps = Vec::with_capacity(tail.len);
+            let mut canonical = Vec::with_capacity(tail.len);
+            for node in before.into_iter().chain(after.into_iter().rev()) {
+                steps.push(node.step.clone());
+                canonical.push(node.canonical.clone());
+            }
+            #[cfg(test)]
+            record_field_path_work(tail.len * 2);
+            FieldPathSegments { steps, canonical }
+        })
+    }
+
+    /// Build a path without copying any accumulated prefix.
+    pub(crate) fn from_canonical_segments(
+        segments: impl IntoIterator<Item = LeafPathSegment>,
+    ) -> Self {
+        let mut path = Self::new();
+        for canonical in segments {
+            let step = match &canonical {
+                LeafPathSegment::StructField(name) => FieldPathStep::Field(name.clone()),
+                LeafPathSegment::ListIndex(index) => FieldPathStep::Index(*index),
+                LeafPathSegment::MapKey(key) => match key.diagnostic_literal() {
+                    Some(key) => FieldPathStep::Field(key.to_owned()),
+                    None => FieldPathStep::Redacted(RedactedPathField::MapKey),
+                },
+            };
+            path = path.pushed(step, canonical, FieldPathDirection::After);
+        }
+        path
+    }
+
     pub fn steps(&self) -> &[FieldPathStep] {
-        &self.steps
+        &self.materialized().steps
     }
 
     pub fn is_empty(&self) -> bool {
-        self.steps.is_empty()
+        self.tail.is_none()
     }
 
-    /// Append a struct-field step and return a new path. Cheap clone
-    /// because validation paths are tiny (depth-of-struct, typically
-    /// < 5).
+    /// Append a literal struct field while sharing the existing prefix.
     pub fn push_field(&self, name: impl Into<String>) -> Self {
-        let mut next = self.clone();
         let name = name.into();
-        next.steps.push(FieldPathStep::Field(name.clone()));
-        next.canonical.push(LeafPathSegment::StructField(name));
-        next
+        self.pushed(
+            FieldPathStep::Field(name.clone()),
+            LeafPathSegment::StructField(name),
+            FieldPathDirection::After,
+        )
     }
 
-    /// Append a list-index step and return a new path.
     pub fn push_index(&self, index: usize) -> Self {
-        let mut next = self.clone();
-        next.steps.push(FieldPathStep::Index(index));
-        next.canonical.push(LeafPathSegment::ListIndex(index));
-        next
+        self.pushed(
+            FieldPathStep::Index(index),
+            LeafPathSegment::ListIndex(index),
+            FieldPathDirection::After,
+        )
     }
 
     pub fn canonical(&self) -> LeafPath {
-        LeafPath::from_segments(self.canonical.iter().cloned())
+        let canonical = &self.materialized().canonical;
+        #[cfg(test)]
+        record_field_path_work(canonical.len());
+        LeafPath::from_segments(canonical.iter().cloned())
     }
 
     pub(crate) fn push_map_key(&self, key: impl Into<String>) -> Self {
         let key = key.into();
-        let mut next = self.clone();
-        next.steps.push(FieldPathStep::Field(key.clone()));
-        next.canonical.push(LeafPathSegment::MapKey(key.into()));
-        next
+        self.pushed(
+            FieldPathStep::Field(key.clone()),
+            LeafPathSegment::MapKey(key.into()),
+            FieldPathDirection::After,
+        )
+    }
+
+    pub(crate) fn push_protected_map_key(&self) -> Self {
+        self.pushed(
+            FieldPathStep::Redacted(RedactedPathField::MapKey),
+            LeafPathSegment::MapKey("<secret>".into()),
+            FieldPathDirection::After,
+        )
     }
 
     fn prepend_field(&self, name: impl Into<String>) -> Self {
         let name = name.into();
-        let mut canonical = vec![LeafPathSegment::StructField(name.clone())];
-        canonical.extend(self.canonical.iter().cloned());
-        let mut steps = Vec::with_capacity(self.steps.len() + 1);
-        steps.push(FieldPathStep::Field(name));
-        steps.extend(self.steps.iter().cloned());
-        Self { steps, canonical }
+        self.pushed(
+            FieldPathStep::Field(name.clone()),
+            LeafPathSegment::StructField(name),
+            FieldPathDirection::Before,
+        )
     }
 
     fn prepend_index(&self, index: usize) -> Self {
-        let mut canonical = vec![LeafPathSegment::ListIndex(index)];
-        canonical.extend(self.canonical.iter().cloned());
-        let mut steps = Vec::with_capacity(self.steps.len() + 1);
-        steps.push(FieldPathStep::Index(index));
-        steps.extend(self.steps.iter().cloned());
-        Self { steps, canonical }
+        self.pushed(
+            FieldPathStep::Index(index),
+            LeafPathSegment::ListIndex(index),
+            FieldPathDirection::Before,
+        )
     }
 }
 
 impl fmt::Display for FieldPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut first = true;
-        for step in &self.steps {
+        for step in self.steps() {
             match step {
                 FieldPathStep::Field(name) => {
-                    if !first {
-                        write!(f, ".")?;
-                    }
-                    write!(f, "{}", name)?;
+                    write_path_field(f, name, !first)?;
                 }
                 FieldPathStep::Index(i) => write!(f, "[{}]", i)?,
+                FieldPathStep::Redacted(marker) => {
+                    if !first {
+                        f.write_str(".")?;
+                    }
+                    marker.fmt(f)?;
+                }
             }
             first = false;
         }
@@ -2711,30 +3021,33 @@ impl<R: PatternForm> PatternAttributeType<R> {
                 length: *length,
             },
             AttrTypeKind::String {
-                binding,
-                pattern,
-                length,
-                to_dsl,
+                identity_layer,
+                member_layer,
             } => Shape::String {
-                identity: binding.identity(),
-                pattern: pattern.as_ref().map(AsRef::as_ref),
-                length: *length,
-                validate: binding.callback(),
-                to_dsl: to_dsl.as_ref(),
+                identity_layer: identity_layer.parts(),
+                member_layer: member_layer.parts(),
             },
             AttrTypeKind::ResourceHandle { .. } | AttrTypeKind::StringLiteralSet { .. } => {
                 Shape::String {
-                    identity: None,
-                    pattern: None,
-                    length: None,
-                    validate: None,
-                    to_dsl: None,
+                    identity_layer: StringIdentityParts {
+                        identity: None,
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                    },
+                    member_layer: StringMemberParts {
+                        pattern: None,
+                        length: None,
+                    },
                 }
             }
-            AttrTypeKind::Int { binding, range } => Shape::Int {
-                identity: binding.identity(),
-                range: *range,
-                validate: binding.callback(),
+            AttrTypeKind::Int {
+                identity_layer,
+                member_layer,
+            } => Shape::Int {
+                identity_layer: identity_layer.parts(),
+                member_layer: member_layer.parts(),
             },
             AttrTypeKind::Float { binding, range } => Shape::Float {
                 identity: binding.identity(),
@@ -2817,30 +3130,33 @@ impl<R: PatternForm> PatternAttributeType<R> {
                 length: *length,
             },
             AttrTypeKind::String {
-                binding,
-                pattern,
-                length,
-                to_dsl,
+                identity_layer,
+                member_layer,
             } => RawShape::String {
-                identity: binding.identity(),
-                pattern: pattern.as_ref().map(AsRef::as_ref),
-                length: *length,
-                validate: binding.callback(),
-                to_dsl: to_dsl.as_ref(),
+                identity_layer: identity_layer.parts(),
+                member_layer: member_layer.parts(),
             },
             AttrTypeKind::ResourceHandle { .. } | AttrTypeKind::StringLiteralSet { .. } => {
                 RawShape::String {
-                    identity: None,
-                    pattern: None,
-                    length: None,
-                    validate: None,
-                    to_dsl: None,
+                    identity_layer: StringIdentityParts {
+                        identity: None,
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                    },
+                    member_layer: StringMemberParts {
+                        pattern: None,
+                        length: None,
+                    },
                 }
             }
-            AttrTypeKind::Int { binding, range } => RawShape::Int {
-                identity: binding.identity(),
-                range: *range,
-                validate: binding.callback(),
+            AttrTypeKind::Int {
+                identity_layer,
+                member_layer,
+            } => RawShape::Int {
+                identity_layer: identity_layer.parts(),
+                member_layer: member_layer.parts(),
             },
             AttrTypeKind::Float { binding, range } => RawShape::Float {
                 identity: binding.identity(),
@@ -2886,10 +3202,12 @@ impl<R: PatternForm> PatternAttributeType<R> {
                 name,
                 fields,
                 field_groups,
+                input_rules,
             } => RawShape::Struct {
                 name: name.as_str(),
-                fields: fields.as_slice(),
+                fields,
                 field_groups: field_groups.as_slice(),
+                input_rules: input_rules.as_slice(),
             },
             AttrTypeKind::Union(members) => RawShape::Union(members.as_raw_slice()),
             AttrTypeKind::Ref(name) => RawShape::Ref(name.as_str()),
@@ -2909,10 +3227,13 @@ impl<R: PatternForm> PatternAttributeType<R> {
     pub fn string() -> Self {
         PatternAttributeType {
             kind: AttrTypeKind::String {
-                binding: RefinementBinding::MetadataOnly(None),
-                pattern: None,
-                length: None,
-                to_dsl: None,
+                identity_layer: StringIdentityLayer {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    pattern: None,
+                    length: None,
+                    to_dsl: None,
+                },
+                member_layer: Default::default(),
             },
         }
     }
@@ -2963,14 +3284,10 @@ impl<R: PatternForm> PatternAttributeType<R> {
         length: Option<(Option<u64>, Option<u64>)>,
         to_dsl: Option<DslTransform>,
     ) -> Self {
-        PatternAttributeType {
-            kind: AttrTypeKind::String {
-                binding: RefinementBinding::MetadataOnly(identity),
-                pattern,
-                length,
-                to_dsl,
-            },
-        }
+        Self::string_member(
+            StringIdentityLayer::new(identity, pattern, length, to_dsl),
+            Default::default(),
+        )
     }
 
     /// Create a String type with refinement metadata and a custom validator.
@@ -2981,25 +3298,21 @@ impl<R: PatternForm> PatternAttributeType<R> {
         validate: CustomValidator,
         to_dsl: Option<DslTransform>,
     ) -> Self {
-        PatternAttributeType {
-            kind: AttrTypeKind::String {
-                binding: RefinementBinding::Validator {
-                    identity,
-                    callback: validate,
-                },
-                pattern,
-                length,
-                to_dsl,
-            },
-        }
+        Self::string_member(
+            StringIdentityLayer::with_validator(identity, pattern, length, validate, to_dsl),
+            Default::default(),
+        )
     }
 
     /// Create the primitive `Int` type.
     pub fn int() -> Self {
         PatternAttributeType {
             kind: AttrTypeKind::Int {
-                binding: RefinementBinding::MetadataOnly(None),
-                range: None,
+                identity_layer: IntIdentityLayer {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    range: None,
+                },
+                member_layer: Default::default(),
             },
         }
     }
@@ -3009,12 +3322,7 @@ impl<R: PatternForm> PatternAttributeType<R> {
         identity: Option<TypeIdentity>,
         range: Option<(Option<i64>, Option<i64>)>,
     ) -> Self {
-        PatternAttributeType {
-            kind: AttrTypeKind::Int {
-                binding: RefinementBinding::MetadataOnly(identity),
-                range,
-            },
-        }
+        Self::int_member(IntIdentityLayer::new(identity, range), Default::default())
     }
 
     /// Create an Int type with refinement metadata and a custom validator.
@@ -3023,15 +3331,10 @@ impl<R: PatternForm> PatternAttributeType<R> {
         range: Option<(Option<i64>, Option<i64>)>,
         validate: CustomValidator,
     ) -> Self {
-        PatternAttributeType {
-            kind: AttrTypeKind::Int {
-                binding: RefinementBinding::Validator {
-                    identity,
-                    callback: validate,
-                },
-                range,
-            },
-        }
+        Self::int_member(
+            IntIdentityLayer::with_validator(identity, range, validate),
+            Default::default(),
+        )
     }
 
     /// Create the primitive `Float` type.
@@ -3200,11 +3503,22 @@ impl<R: PatternForm> PatternAttributeType<R> {
         fields: Vec<PatternStructField<R>>,
         field_groups: Vec<FieldGroup>,
     ) -> Self {
+        Self::struct_with_rules(name, fields, field_groups, Vec::new())
+    }
+
+    /// Construct a Struct with sibling rules relative to each object instance.
+    pub fn struct_with_rules(
+        name: impl Into<String>,
+        fields: Vec<PatternStructField<R>>,
+        field_groups: Vec<FieldGroup>,
+        input_rules: Vec<InputRule<R>>,
+    ) -> Self {
         PatternAttributeType {
             kind: AttrTypeKind::Struct {
                 name: name.into(),
-                fields,
+                fields: fields.into(),
                 field_groups,
+                input_rules,
             },
         }
     }
@@ -3321,14 +3635,12 @@ impl<R: PatternForm> PatternAttributeType<R> {
             AttrTypeKind::Duration => "Duration".to_string(),
             AttrTypeKind::Enum { identity, .. } => identity.to_string(),
             AttrTypeKind::String {
-                binding,
-                pattern,
-                length,
-                ..
+                identity_layer,
+                member_layer,
             } => custom_display_name(
-                binding.identity(),
-                pattern.as_ref().map(AsRef::as_ref),
-                length.as_ref(),
+                identity_layer.binding.identity(),
+                identity_layer.pattern.is_some() || member_layer.pattern.is_some(),
+                intersect_bounds(identity_layer.length, member_layer.length),
             ),
             AttrTypeKind::ResourceHandle {
                 provider,
@@ -3340,7 +3652,10 @@ impl<R: PatternForm> PatternAttributeType<R> {
                 .map(|value| display_string_literal(value))
                 .collect::<Vec<_>>()
                 .join(" | "),
-            AttrTypeKind::Int { binding, .. } => binding
+            AttrTypeKind::Int {
+                identity_layer: IntIdentityLayer { binding, .. },
+                ..
+            } => binding
                 .identity()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "Int".to_string()),
@@ -3371,11 +3686,15 @@ impl<R: PatternForm> PatternAttributeType<R> {
             AttrTypeKind::UnloadedSchemaType(_) => false,
             AttrTypeKind::Reference { .. } => true,
             AttrTypeKind::String {
-                binding,
-                pattern,
-                length,
-                ..
-            } => binding.identity().is_some() || pattern.is_some() || length.is_some(),
+                identity_layer,
+                member_layer,
+            } => {
+                identity_layer.binding.identity().is_some()
+                    || identity_layer.pattern.is_some()
+                    || identity_layer.length.is_some()
+                    || member_layer.pattern.is_some()
+                    || member_layer.length.is_some()
+            }
             _ => false,
         }
     }
@@ -3517,37 +3836,31 @@ impl PatternAttributeType<Compiled> {
         &self,
         value: ConcreteValueRef<'_, P, B>,
     ) -> Result<(), TypeError> {
-        if self.has_empty_scalar_intersection() {
-            return Err(TypeError::ValidationFailed {
-                message: format!(
-                    "{} has an empty intersection of scalar constraints",
-                    self.type_name()
-                )
-                .into(),
-            });
-        }
-        match (&self.kind, value) {
+        let constraints = || match (&self.kind, value) {
             (AttrTypeKind::UnloadedSchemaType(_), _) => {
                 Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into())
             }
             (
                 AttrTypeKind::String {
-                    binding,
-                    pattern,
-                    length,
-                    ..
+                    identity_layer,
+                    member_layer,
                 },
                 ConcreteValueRef::String(s),
             ) => {
-                validate_string_refinement(binding.identity(), pattern.as_ref(), *length, s)?;
-                if let Some(owned) = binding.annotation() {
-                    for pattern in owned.patterns() {
-                        validate_string_refinement(binding.identity(), Some(pattern), None, s)?;
-                    }
-                }
-                binding
-                    .callback()
-                    .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
+                let StringIdentityLayer {
+                    binding,
+                    pattern,
+                    length,
+                    to_dsl: _to_dsl,
+                } = identity_layer;
+                validate_string_layers(
+                    binding,
+                    pattern.as_ref(),
+                    *length,
+                    member_layer.pattern.as_ref(),
+                    member_layer.length,
+                    s,
+                )
             }
             (
                 AttrTypeKind::Reference {
@@ -3562,23 +3875,21 @@ impl PatternAttributeType<Compiled> {
             {
                 Ok(())
             }
-            (AttrTypeKind::Int { binding, range }, ConcreteValueRef::Int(i)) => {
-                validate_int_range(*range, i)?;
-                binding
-                    .callback()
-                    .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
+            (
+                AttrTypeKind::Int {
+                    identity_layer,
+                    member_layer,
+                },
+                ConcreteValueRef::Int(i),
+            ) => {
+                validate_int_range(identity_layer.range, i)?;
+                validate_int_range(member_layer.parts().range, i)
             }
-            (AttrTypeKind::Float { binding, range }, ConcreteValueRef::Float(f)) => {
-                validate_float_range(*range, f)?;
-                binding
-                    .callback()
-                    .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
+            (AttrTypeKind::Float { range, .. }, ConcreteValueRef::Float(f)) => {
+                validate_float_range(*range, f)
             }
-            (AttrTypeKind::Float { binding, range }, ConcreteValueRef::Int(i)) => {
-                validate_int_in_float_range(*range, i)?;
-                binding
-                    .callback()
-                    .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
+            (AttrTypeKind::Float { range, .. }, ConcreteValueRef::Int(i)) => {
+                validate_int_in_float_range(*range, i)
             }
             (AttrTypeKind::Bool, ConcreteValueRef::Bool(_)) => Ok(()),
             (AttrTypeKind::Duration, ConcreteValueRef::Duration(_)) => Ok(()),
@@ -3586,6 +3897,20 @@ impl PatternAttributeType<Compiled> {
                 self.type_name(),
                 value.type_name().to_string(),
             )),
+        };
+        match &self.kind {
+            AttrTypeKind::String {
+                identity_layer: StringIdentityLayer { binding, .. },
+                member_layer: _,
+            }
+            | AttrTypeKind::Int {
+                identity_layer: IntIdentityLayer { binding, .. },
+                member_layer: _,
+            }
+            | AttrTypeKind::Float { binding, .. } => {
+                validate_scalar_refinement(binding, value, constraints)
+            }
+            _ => constraints(),
         }
     }
 
@@ -3761,9 +4086,9 @@ impl PatternAttributeType<Compiled> {
 
 impl<R: PatternForm> TypeInSchema<'_, R> {
     /// Check if a value of this source type can be assigned to `sink`.
-    /// Directional: narrowing source → wider sink is OK, but widening source →
-    /// narrower sink is NG. Each side resolves references against the
-    /// definition map carried by its own [`TypeInSchema`].
+    /// Identity widening is directional. Anonymous refinement evidence must
+    /// prove containment; nominal admission retains destination value checks.
+    /// Each side resolves references against its own [`TypeInSchema`] definitions.
     ///
     /// Rules (first match wins):
     /// 1. Peel top-level Ref chains on both sides. A missing definition,
@@ -3777,20 +4102,16 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     ///    assignable field types. Struct→Map is allowed when every field is
     ///    assignable to the map value type, preserving the DSL's structural
     ///    object-to-homogeneous-map coercion.
-    /// 7. Custom→Custom with both `identity: Some`: the source's identity
-    ///    must structurally subsume the sink's or follow an edge admitted by its authority and any length
-    ///    range must be contained by the sink's range. Enum→Enum additionally
-    ///    recurses on the two base types. This is the final verdict for
-    ///    identified custom types: pattern checks are subsumed by identity
-    ///    subsumption and are not consulted in this arm, while length
-    ///    containment remains a structural safety check. Directional
-    ///    per-axis subsumption — an
-    ///    empty axis on the **sink** widens (any source matches), but an empty
-    ///    axis on the **source** against a populated sink is rejected (no
-    ///    evidence). So `aws.iam.Role.Arn` flows into `aws.Arn` (sink is
-    ///    wider) but `aws.Arn` does not flow into `aws.iam.Role.Arn` (source
-    ///    has no Role-specific evidence). `aws.Region` and `gcp.Region` are
-    ///    rejected both ways (populated providers differ). Closes carina#3218.
+    /// 7. Identified String/Int/Float leaves admit the same identity or a
+    ///    widening allowed by structural axes or the sink authority's edges.
+    ///    Provably disjoint bounds reject; remaining destination constraints
+    ///    are checked on the resolved value at every sink, including annotations,
+    ///    exports, and function boundaries. Regex containment is not assumed.
+    ///    An empty sink axis widens; an empty source axis cannot satisfy a
+    ///    populated sink axis. Thus `aws.iam.Role.Arn` flows into `aws.Arn`,
+    ///    and the reverse direction rejects. Different populated providers
+    ///    also reject. Enum bases retain their declaration comparisons because
+    ///    they are not scalar member layers.
     /// 8. Custom→Custom where at least one side has `identity: None`: check
     ///    pattern (literal equality) and length containment (source ⊆ sink),
     ///    then recurse on base. Exception: an identity-bearing String, Int, or
@@ -3798,8 +4119,8 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     ///    primitive kind, and an identity-bearing Int source is also assignable
     ///    to an identity-less Float sink, regardless of the source's own
     ///    pattern/length/range. The sink's value constraints are checked when known
-    ///    at plan or before provider dispatch at apply (carina#3805). Rule 7
-    ///    and rule 8's identity-less refined-source comparisons are unchanged.
+    ///    at plan or before provider dispatch at apply (carina#3805).
+    ///    Identity-less refined-source comparisons still require containment.
     /// 9. Custom source → non-Custom sink: recurse on `source.base`.
     /// 10. A plain, unrefined primitive source → refined sink is split by
     ///     the sink's identity. An identified sink (including every Enum) is
@@ -3834,7 +4155,11 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     /// closed. Both exceptions above are limited to identity-less sinks and
     /// do not weaken those comparisons.
     pub fn is_assignable_to(self, sink: AssignmentSink<'_, R>) -> bool {
-        matches!(self.assignment_to(sink), TypeAssignability::Assignable)
+        match self.assignment_to(sink) {
+            TypeAssignability::Assignable => true,
+            TypeAssignability::Mismatch => false,
+            TypeAssignability::Unchecked(_) => false,
+        }
     }
 }
 
@@ -3938,13 +4263,28 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
     pub fn mismatch_type_names(&self, expected: TypeInSchema<'_, R>) -> (String, String) {
         let actual_name = self.resolved_type_name();
         let expected_name = expected.resolved_type_name();
-        let actual = self.resolved_type_name_on_path(&mut Vec::new(), true);
-        let expected = expected.resolved_type_name_on_path(&mut Vec::new(), true);
-        if (actual_name == expected_name && actual != expected)
-            || actual.contains("empty intersection")
-            || expected.contains("empty intersection")
+        let actual_constraints = self.resolved_type_name_on_path(&mut Vec::new(), true);
+        let expected_constraints = expected.resolved_type_name_on_path(&mut Vec::new(), true);
+        if (actual_name == expected_name && actual_constraints != expected_constraints)
+            || actual_constraints.contains("empty intersection")
+            || expected_constraints.contains("empty intersection")
         {
-            return (expected, actual);
+            return (expected_constraints, actual_constraints);
+        }
+        if actual_name == expected_name {
+            let kind = |ty: TypeInSchema<'_, R>| {
+                resolve_refs_on_path(ty.attr, ty.defs, &mut Vec::new())
+                    .ok()
+                    .and_then(|resolved| scalar_kind_for_schema_base(resolved.attr))
+            };
+            if let (Some(actual_kind), Some(expected_kind)) = (kind(*self), kind(expected))
+                && actual_kind != expected_kind
+            {
+                return (
+                    format!("{expected_name} ({expected_kind})"),
+                    format!("{actual_name} ({actual_kind})"),
+                );
+            }
         }
         (expected_name, actual_name)
     }
@@ -4032,10 +4372,8 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             // are checked on the materialized value before planning.
             (
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Reference {
                     identity: _,
@@ -4055,10 +4393,8 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     length: _,
                 },
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 },
             ) => true,
 
@@ -4077,19 +4413,19 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             (
                 StringLiteralSet { values: _ },
                 String {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer:
+                        StringIdentityLayer {
+                            binding: RefinementBinding::MetadataOnly(None),
+                            ..
+                        },
+                    member_layer: _,
                 },
             ) => true,
             (
                 StringLiteralSet { values: _ },
                 String {
-                    binding,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: StringIdentityLayer { binding, .. },
+                    member_layer: _,
                 },
             ) if binding.identity().is_some() => false,
             (StringLiteralSet { values: source }, StringLiteralSet { values: sink }) => {
@@ -4099,26 +4435,24 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             // behavior.
             (
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 },
                 StringLiteralSet { values: _ },
             ) => true,
             // Anonymous source → identified sink has no proof of identity.
             (
                 String {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer:
+                        StringIdentityLayer {
+                            binding: RefinementBinding::MetadataOnly(None),
+                            ..
+                        },
+                    member_layer: _,
                 },
                 String {
-                    binding,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: StringIdentityLayer { binding, .. },
+                    member_layer: _,
                 },
             ) if binding.identity().is_some() => false,
             // An identified String may flow into an identity-less String
@@ -4126,24 +4460,31 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             // before provider dispatch at apply (#3805, #4230).
             (
                 String {
-                    binding,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: StringIdentityLayer { binding, .. },
+                    member_layer: _,
                 },
                 String {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer:
+                        StringIdentityLayer {
+                            binding: RefinementBinding::MetadataOnly(None),
+                            ..
+                        },
+                    member_layer: _,
                 },
             ) if binding.identity().is_some() => true,
             (
                 Int {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    range: _,
+                    identity_layer:
+                        IntIdentityLayer {
+                            binding: RefinementBinding::MetadataOnly(None),
+                            ..
+                        },
+                    member_layer: _,
                 },
-                Int { binding, range: _ },
+                Int {
+                    identity_layer: IntIdentityLayer { binding, .. },
+                    member_layer: _,
+                },
             ) if binding.identity().is_some() => false,
             (
                 Float {
@@ -4155,10 +4496,17 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             // Identified numerics defer same-kind identity-less sink ranges
             // to the resolved value, like identified Strings (#3805, #4230).
             (
-                Int { binding, range: _ },
                 Int {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    range: _,
+                    identity_layer: IntIdentityLayer { binding, .. },
+                    member_layer: _,
+                },
+                Int {
+                    identity_layer:
+                        IntIdentityLayer {
+                            binding: RefinementBinding::MetadataOnly(None),
+                            ..
+                        },
+                    member_layer: _,
                 },
             )
             | (
@@ -4173,14 +4521,23 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             // sink identity and identity-less source range evidence.
             (
                 Int {
-                    binding: source_binding,
-                    range: source_range,
+                    identity_layer:
+                        IntIdentityLayer {
+                            binding: source_binding,
+                            range: source_range,
+                        },
+                    member_layer: source_member,
                 },
                 Float {
                     binding: sink_binding,
                     range: sink_range,
                 },
             ) => {
+                let source_range = if source_binding.identity().is_some() {
+                    *source_range
+                } else {
+                    intersect_bounds(*source_range, source_member.range)
+                };
                 if (source_binding.identity().is_some() || source_range.is_none())
                     && sink_binding.identity().is_none()
                 {
@@ -4194,26 +4551,44 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             // The identified-sink arm above must remain ahead of this one.
             (
                 String {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    pattern: None,
-                    length: None,
-                    to_dsl: _,
+                    identity_layer:
+                        StringIdentityLayer {
+                            binding: RefinementBinding::MetadataOnly(None),
+                            pattern: None,
+                            length: None,
+                            ..
+                        },
+                    member_layer:
+                        StringMemberConstraints {
+                            pattern: None,
+                            length: None,
+                        },
                 },
                 String {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer:
+                        StringIdentityLayer {
+                            binding: RefinementBinding::MetadataOnly(None),
+                            ..
+                        },
+                    member_layer: _,
                 },
             ) => true,
             (
                 Int {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    range: None,
+                    identity_layer:
+                        IntIdentityLayer {
+                            binding: RefinementBinding::MetadataOnly(None),
+                            range: None,
+                        },
+                    member_layer: IntMemberConstraints { range: None },
                 },
                 Int {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    range: _,
+                    identity_layer:
+                        IntIdentityLayer {
+                            binding: RefinementBinding::MetadataOnly(None),
+                            ..
+                        },
+                    member_layer: _,
                 },
             ) => true,
             (
@@ -4228,39 +4603,49 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             ) => true,
             (
                 String {
-                    pattern: s_pat,
-                    length: s_len,
-                    binding: _,
-                    to_dsl: _,
+                    identity_layer: source,
+                    member_layer: source_member,
                 },
                 String {
-                    pattern: k_pat,
-                    length: k_len,
-                    binding: _,
-                    to_dsl: _,
+                    identity_layer: target,
+                    member_layer: target_member,
                 },
             ) => {
-                if !pattern_compatible(
-                    s_pat.as_ref().map(AsRef::as_ref),
-                    k_pat.as_ref().map(AsRef::as_ref),
-                ) {
-                    return false;
-                }
-                if !length_contains(s_len.as_ref(), k_len.as_ref()) {
-                    return false;
-                }
-                true
+                let target_patterns = [
+                    target.pattern.as_ref().map(AsRef::as_ref),
+                    target_member.pattern.as_ref().map(AsRef::as_ref),
+                ];
+                let source_patterns = [
+                    source.pattern.as_ref().map(AsRef::as_ref),
+                    source_member.pattern.as_ref().map(AsRef::as_ref),
+                ];
+                let source_length = intersect_bounds(source.length, source_member.length);
+                target_patterns.into_iter().flatten().all(|target| {
+                    source_patterns
+                        .into_iter()
+                        .flatten()
+                        .any(|source| pattern_compatible(Some(source), Some(target)))
+                }) && length_contains(
+                    source_length.as_ref(),
+                    intersect_bounds(target.length, target_member.length).as_ref(),
+                )
             }
             (
                 Int {
-                    range: s_range,
-                    binding: _,
+                    identity_layer: source,
+                    member_layer: source_member,
                 },
                 Int {
-                    range: k_range,
-                    binding: _,
+                    identity_layer: target,
+                    member_layer: target_member,
                 },
-            ) => i64_range_contains(s_range.as_ref(), k_range.as_ref()),
+            ) => {
+                let source_range = intersect_bounds(source.range, source_member.range);
+                i64_range_contains(
+                    source_range.as_ref(),
+                    intersect_bounds(target.range, target_member.range).as_ref(),
+                )
+            }
             (
                 Float {
                     range: s_range,
@@ -4273,10 +4658,8 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             ) => f64_range_contains(s_range.as_ref(), k_range.as_ref()),
             (
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Reference {
                     identity: _,
@@ -4284,8 +4667,8 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     length: _,
                 },
                 Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -4313,6 +4696,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -4322,14 +4706,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             ) => self.attr.type_name() == sink.attr.type_name(),
             (
                 Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 },
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Enum {
                     identity: _,
@@ -4358,6 +4740,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -4371,14 +4754,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     range: _,
                 },
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Enum {
                     identity: _,
@@ -4407,6 +4788,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -4438,6 +4820,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -4445,14 +4828,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Union(_)
                 | Ref(_),
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -4485,6 +4866,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -4498,14 +4880,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     resource_type: _,
                 },
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -4539,6 +4919,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -4548,14 +4929,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             ) => false,
             (
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -4589,6 +4968,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -4602,8 +4982,8 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             ) => false,
             (
                 Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -4636,6 +5016,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -4687,13 +5068,87 @@ fn validation_error_message(err: TypeError) -> ProviderValidation {
     }
 }
 
+/// The ordinary scalar refinement gate, also used for schema input literals.
+/// Annotation intersections, all annotation patterns and native callbacks stay
+/// together even when a declaration has no inline range or pattern.
+fn validate_scalar_refinement<P: crate::resource::ValueKind, B: BindingAddress>(
+    binding: &RefinementBinding,
+    value: ConcreteValueRef<'_, P, B>,
+    constraints: impl FnOnce() -> Result<(), TypeError>,
+) -> Result<(), TypeError> {
+    if let Some(owned) = binding.annotation()
+        && owned.has_empty_intersection()
+    {
+        return Err(TypeError::ValidationFailed {
+            message: format!(
+                "{} has an empty intersection of scalar constraints",
+                owned.identity()
+            )
+            .into(),
+        });
+    }
+    constraints()?;
+    binding
+        .callback()
+        .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
+}
+
+/// Structural String checks shared by ordinary values and condition literals.
+/// All identity patterns precede identity length, then the slot's member layer.
+fn validate_string_layers(
+    binding: &RefinementBinding,
+    pattern: Option<&CompiledPattern>,
+    length: Option<(Option<u64>, Option<u64>)>,
+    member_pattern: Option<&CompiledPattern>,
+    member_length: Option<(Option<u64>, Option<u64>)>,
+    value: &ValueString,
+) -> Result<(), TypeError> {
+    validate_string_refinement(binding.identity(), pattern, None, value)?;
+    if let Some(annotation) = binding.annotation() {
+        for owner_pattern in annotation
+            .owner_patterns()
+            .filter(|owner_pattern| Some(*owner_pattern) != pattern)
+        {
+            validate_string_refinement(binding.identity(), Some(owner_pattern), None, value)?;
+        }
+    }
+    validate_string_refinement(binding.identity(), None, length, value)?;
+    validate_string_member_refinement(binding.identity(), member_pattern, member_length, value)
+}
+
 fn validate_string_refinement(
     identity: Option<&TypeIdentity>,
     pattern: Option<&CompiledPattern>,
     length: Option<(Option<u64>, Option<u64>)>,
     s: &ValueString,
 ) -> Result<(), TypeError> {
-    let type_name = identity.map(|id| id.kind.clone());
+    inspect_string_refinement(identity.map(|id| id.kind.clone()), pattern, length, s)
+}
+
+fn validate_string_member_refinement(
+    identity: Option<&TypeIdentity>,
+    pattern: Option<&CompiledPattern>,
+    length: Option<(Option<u64>, Option<u64>)>,
+    value: &ValueString,
+) -> Result<(), TypeError> {
+    if pattern.is_none() && length.is_none() {
+        return Ok(());
+    }
+    let identity = identity.map_or_else(|| "String".into(), ToString::to_string);
+    inspect_string_refinement(
+        Some(format!("{identity} (slot member constraint)")),
+        pattern,
+        length,
+        value,
+    )
+}
+
+fn inspect_string_refinement(
+    type_name: Option<String>,
+    pattern: Option<&CompiledPattern>,
+    length: Option<(Option<u64>, Option<u64>)>,
+    s: &ValueString,
+) -> Result<(), TypeError> {
     if let Some(pattern) = pattern
         && !pattern.is_match(s.expose_plaintext())
     {
@@ -4828,36 +5283,39 @@ impl Ord for FitExactness {
 /// The witness owns every nested Union choice and resolved enum value. A
 /// canonicalization caller can therefore walk the chosen tree without running
 /// validation or enum resolution a second time.
+#[derive(Clone)]
 pub(crate) struct Fit<'a> {
     exactness: FitExactness,
     pub(crate) attr: ResolvedAttrType<'a, Compiled>,
     pub(crate) kind: FitKind<'a>,
 }
 
+#[derive(Clone)]
 pub(crate) enum FitKind<'a> {
     PassThrough,
     Deferred(PendingFit),
     Failed,
     HistoricalOpaque,
-    Secret(Box<Fit<'a>>),
+    Secret(Arc<Fit<'a>>),
     Coalesce {
-        value: Box<Fit<'a>>,
-        default: Box<Fit<'a>>,
+        value: Arc<Fit<'a>>,
+        default: Arc<Fit<'a>>,
     },
     Enum {
         canonical: CanonicalEnumValue,
         rewrite: bool,
     },
-    List(Vec<Fit<'a>>),
-    StringList(Vec<Fit<'a>>),
-    Map(Vec<MapEntryFit<'a>>),
-    Struct(Vec<Fit<'a>>),
+    List(Arc<[Fit<'a>]>),
+    StringList(Arc<[Fit<'a>]>),
+    Map(Arc<[MapEntryFit<'a>]>),
+    Struct(Arc<[Fit<'a>]>),
     Union {
         member: &'a CompiledAttributeType,
-        fit: Box<Fit<'a>>,
+        fit: Arc<Fit<'a>>,
     },
 }
 
+#[derive(Clone)]
 pub(crate) struct MapEntryFit<'a> {
     pub(crate) canonical_key: Option<String>,
     pub(crate) value: Fit<'a>,
@@ -5018,6 +5476,26 @@ impl Fit<'_> {
     }
 }
 
+impl InsideSecret for Fit<'_> {
+    fn inside_secret(self) -> Self {
+        Self::with_kind(
+            self.exactness,
+            self.attr.as_attr(),
+            FitKind::Secret(Arc::new(self)),
+        )
+    }
+}
+
+impl InsideSecret for Option<Fit<'_>> {
+    fn inside_secret(self) -> Self {
+        self.map(InsideSecret::inside_secret)
+    }
+}
+
+/// Only the schema walk may open classified protection; its knowledge cursor
+/// requires a result that is protected before leaving the callback.
+pub(crate) struct SchemaEvidenceAuthority(());
+
 impl PartialEq for Fit<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.exactness == other.exactness
@@ -5140,30 +5618,17 @@ fn inspect_value_structure_on_path<
         | AT::Union(_)
         | AT::Ref(_) => {}
     }
-    if let Some(inner) = value.secret() {
-        let inner = inner
-            .try_project_plaintext(|value| {
-                let knowledge = value
-                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-                    .map(|proof| proof.into_classification())
-                    .map_err(|_| ())?;
-                inspect_value_structure_on_path(
-                    attr,
-                    (&knowledge).into(),
-                    defs,
-                    ancestry.inside_secret(),
-                    purpose,
-                    visited_refs,
-                )
-                .ok_or(())
-            })
-            .ok()?;
-        let exactness = inner.exactness;
-        return Some(Fit::with_kind(
-            exactness,
-            attr,
-            FitKind::Secret(Box::new(inner)),
-        ));
+    if let Some(inner) = value.protected_for_schema(&SchemaEvidenceAuthority(())) {
+        return inner.validate(|evidence| {
+            inspect_value_structure_on_path(
+                attr,
+                evidence,
+                defs,
+                ancestry.inside_secret(),
+                purpose,
+                visited_refs,
+            )
+        });
     }
 
     if let Some((value, default)) = value.coalesce() {
@@ -5189,8 +5654,8 @@ fn inspect_value_structure_on_path<
             exactness,
             attr,
             FitKind::Coalesce {
-                value: Box::new(value_fit),
-                default: Box::new(default_fit),
+                value: Arc::new(value_fit),
+                default: Arc::new(default_fit),
             },
         ));
     }
@@ -5224,7 +5689,7 @@ fn inspect_value_structure_on_path<
                         attr,
                         FitKind::Union {
                             member: selected.member,
-                            fit: Box::new(selected.fit),
+                            fit: Arc::new(selected.fit),
                         },
                     ))
                 }
@@ -5333,7 +5798,11 @@ fn inspect_value_structure_on_path<
                 exactness.combine(child.exactness);
                 item_fits.push(child);
             }
-            Some(Fit::with_kind(exactness, attr, FitKind::List(item_fits)))
+            Some(Fit::with_kind(
+                exactness,
+                attr,
+                FitKind::List(item_fits.into()),
+            ))
         }
         (
             AT::List {
@@ -5372,7 +5841,7 @@ fn inspect_value_structure_on_path<
             Some(Fit::with_kind(
                 exactness,
                 attr,
-                FitKind::StringList(item_fits),
+                FitKind::StringList(item_fits.into()),
             ))
         }
         (
@@ -5417,7 +5886,11 @@ fn inspect_value_structure_on_path<
                     value: value_fit,
                 });
             }
-            Some(Fit::with_kind(exactness, attr, FitKind::Map(entry_fits)))
+            Some(Fit::with_kind(
+                exactness,
+                attr,
+                FitKind::Map(entry_fits.into()),
+            ))
         }
         (
             AT::Struct {
@@ -5463,7 +5936,11 @@ fn inspect_value_structure_on_path<
                 exactness.combine(child.exactness);
                 field_fits.push(child);
             }
-            Some(Fit::with_kind(exactness, attr, FitKind::Struct(field_fits)))
+            Some(Fit::with_kind(
+                exactness,
+                attr,
+                FitKind::Struct(field_fits.into()),
+            ))
         }
         (AT::Union(members), _) => {
             let selected = inspect_union_structure_on_path(
@@ -5480,7 +5957,7 @@ fn inspect_value_structure_on_path<
                 attr,
                 FitKind::Union {
                     member: selected.member,
-                    fit: Box::new(selected.fit),
+                    fit: Arc::new(selected.fit),
                 },
             ))
         }
@@ -5617,7 +6094,7 @@ fn inspect_value_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAd
         return Some(Fit::with_kind(
             exactness,
             attr,
-            FitKind::Secret(Box::new(inner)),
+            FitKind::Secret(Arc::new(inner)),
         ));
     }
 
@@ -5644,8 +6121,8 @@ fn inspect_value_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAd
             exactness,
             attr,
             FitKind::Coalesce {
-                value: Box::new(value_fit),
-                default: Box::new(default_fit),
+                value: Arc::new(value_fit),
+                default: Arc::new(default_fit),
             },
         ));
     }
@@ -5678,7 +6155,7 @@ fn inspect_value_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAd
                     attr,
                     FitKind::Union {
                         member: selected.member,
-                        fit: Box::new(selected.fit),
+                        fit: Arc::new(selected.fit),
                     },
                 ))
             }
@@ -5781,7 +6258,11 @@ fn inspect_value_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAd
                 exactness.combine(child.exactness);
                 item_fits.push(child);
             }
-            Some(Fit::with_kind(exactness, attr, FitKind::List(item_fits)))
+            Some(Fit::with_kind(
+                exactness,
+                attr,
+                FitKind::List(item_fits.into()),
+            ))
         }
         (
             AT::List {
@@ -5820,7 +6301,7 @@ fn inspect_value_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAd
             Some(Fit::with_kind(
                 exactness,
                 attr,
-                FitKind::StringList(item_fits),
+                FitKind::StringList(item_fits.into()),
             ))
         }
         (
@@ -5861,7 +6342,11 @@ fn inspect_value_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAd
                     value: value_fit,
                 });
             }
-            Some(Fit::with_kind(exactness, attr, FitKind::Map(entry_fits)))
+            Some(Fit::with_kind(
+                exactness,
+                attr,
+                FitKind::Map(entry_fits.into()),
+            ))
         }
         (
             AT::Struct {
@@ -5906,7 +6391,11 @@ fn inspect_value_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAd
                 exactness.combine(child.exactness);
                 field_fits.push(child);
             }
-            Some(Fit::with_kind(exactness, attr, FitKind::Struct(field_fits)))
+            Some(Fit::with_kind(
+                exactness,
+                attr,
+                FitKind::Struct(field_fits.into()),
+            ))
         }
         (AT::Union(members), _) => {
             let selected = inspect_union_structure_on_path_snapshot(
@@ -5923,7 +6412,7 @@ fn inspect_value_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAd
                 attr,
                 FitKind::Union {
                     member: selected.member,
-                    fit: Box::new(selected.fit),
+                    fit: Arc::new(selected.fit),
                 },
             ))
         }
@@ -6016,7 +6505,7 @@ struct RecognizedStructFields(IndexSet<String>);
 
 impl RecognizedStructFields {
     fn new<P: PlaceholderKind, B: BindingAddress>(
-        fields: &[CompiledStructField],
+        fields: &IndexedStructFields<Compiled>,
         map: &IndexMap<String, Value<P, B>>,
         ancestry: FieldAncestry,
     ) -> Self {
@@ -6393,30 +6882,30 @@ pub(crate) fn closest_union_member_for_value_on_path<'a, P: PlaceholderKind, B: 
 /// Fit, validation, diagnostics, and canonicalization all call this helper so
 /// accepted-key semantics cannot drift (#2214, #3877).
 pub(crate) fn struct_field_for_key<'a>(
-    fields: &'a [CompiledStructField],
+    fields: &'a IndexedStructFields<Compiled>,
     key: &str,
     ancestry: FieldAncestry,
 ) -> Option<&'a CompiledStructField> {
-    fields
-        .iter()
-        .rev()
-        .find(|field| field.name == key || ancestry.block_name(field) == Some(key))
+    fields.authored_field(key, |field| ancestry.block_name(field) == Some(key))
 }
 
 fn struct_field_is_present<P: crate::resource::ValueKind, B: BindingAddress>(
-    fields: &[CompiledStructField],
+    fields: &IndexedStructFields<Compiled>,
     map: &IndexMap<String, Value<P, B>>,
     expected: &CompiledStructField,
     ancestry: FieldAncestry,
 ) -> bool {
-    map.keys().any(|key| {
-        struct_field_for_key(fields, key, ancestry)
-            .is_some_and(|found| std::ptr::eq(found, expected))
-    })
+    std::iter::once(expected.name.as_str())
+        .chain(ancestry.block_name(expected))
+        .any(|key| {
+            map.contains_key(key)
+                && struct_field_for_key(fields, key, ancestry)
+                    .is_some_and(|found| std::ptr::eq(found, expected))
+        })
 }
 
 fn violated_struct_field_groups<'a, P: crate::resource::ValueKind, B: BindingAddress>(
-    fields: &'a [CompiledStructField],
+    fields: &'a IndexedStructFields<Compiled>,
     field_groups: &'a [FieldGroup],
     map: &'a IndexMap<String, Value<P, B>>,
     ancestry: FieldAncestry,
@@ -6427,8 +6916,7 @@ fn violated_struct_field_groups<'a, P: crate::resource::ValueKind, B: BindingAdd
             .iter()
             .filter(|name| {
                 fields
-                    .iter()
-                    .find(|field| field.name == name.as_str())
+                    .field(name)
                     .is_some_and(|field| struct_field_is_present(fields, map, field, ancestry))
             })
             .count();
@@ -6528,14 +7016,13 @@ impl<R: PatternForm> fmt::Display for PatternAttributeType<R> {
 
 fn custom_display_name(
     identity: Option<&TypeIdentity>,
-    pattern: Option<&PatternSpec>,
-    length: Option<&(Option<u64>, Option<u64>)>,
+    has_pattern: bool,
+    length: Option<(Option<u64>, Option<u64>)>,
 ) -> String {
     if let Some(id) = identity {
         return id.to_string();
     }
     let mut s = String::from("String");
-    let has_pattern = pattern.is_some();
     let has_length = length.is_some();
     if has_pattern || has_length {
         s.push('(');
@@ -7870,7 +8357,7 @@ impl TypeError {
             | TypeError::BlockSyntaxNotAllowed { attribute: name } => Some(name),
             TypeError::FieldGroupViolation { path, .. } => match path.steps().first() {
                 Some(FieldPathStep::Field(name)) => Some(name),
-                Some(FieldPathStep::Index(_)) | None => None,
+                Some(FieldPathStep::Index(_) | FieldPathStep::Redacted(_)) | None => None,
             },
             TypeError::ListItemError { inner, .. }
             | TypeError::MapKeyError { inner, .. }
@@ -8721,9 +9208,9 @@ pub enum AttributePathTypeError {
 pub(crate) fn struct_fields_with_defs<'a, R: PatternForm>(
     attr_type: &'a PatternAttributeType<R>,
     defs: &'a std::collections::BTreeMap<String, PatternAttributeType<R>>,
-) -> Option<&'a [PatternStructField<R>]> {
+) -> Option<&'a IndexedStructFields<R>> {
     match attr_type.resolve_refs_with_defs(defs).as_attr().kind() {
-        AttrTypeKind::Struct { fields, .. } => Some(fields.as_slice()),
+        AttrTypeKind::Struct { fields, .. } => Some(fields),
         _ => None,
     }
 }
@@ -8964,13 +9451,66 @@ impl fmt::Display for SchemaValidationIssueLocation {
     }
 }
 
+/// An Enum base describes the enum definition, never a destination slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnumBaseMemberLayerError;
+
+impl EnumBaseMemberLayerError {
+    fn message(self) -> &'static str {
+        "enum base cannot contain slot-local member constraints"
+    }
+}
+
+impl fmt::Display for EnumBaseMemberLayerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message())
+    }
+}
+impl std::error::Error for EnumBaseMemberLayerError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SchemaDefinitionMessage {
+    Text(DiagnosticText),
+    EnumBaseMemberLayer(EnumBaseMemberLayerError),
+}
+
+impl SchemaDefinitionMessage {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Text(text) => text.as_str(),
+            Self::EnumBaseMemberLayer(error) => error.message(),
+        }
+    }
+    fn enum_base_member_error(&self) -> Option<&EnumBaseMemberLayerError> {
+        match self {
+            Self::EnumBaseMemberLayer(error) => Some(error),
+            Self::Text(_) => None,
+        }
+    }
+}
+impl From<String> for SchemaDefinitionMessage {
+    fn from(text: String) -> Self {
+        Self::Text(text.into())
+    }
+}
+impl From<DiagnosticText> for SchemaDefinitionMessage {
+    fn from(text: DiagnosticText) -> Self {
+        Self::Text(text)
+    }
+}
+impl fmt::Display for SchemaDefinitionMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SchemaDefinitionIssue {
     input_rule_error: Option<InputRuleError>,
     pattern_error: Option<PatternCompileError>,
     location: SchemaValidationIssueLocation,
     path: ProviderKey,
-    message: DiagnosticText,
+    message: SchemaDefinitionMessage,
 }
 
 impl fmt::Display for SchemaDefinitionIssue {
@@ -8997,6 +9537,17 @@ pub struct ResourceSchemaValidationError {
 }
 
 impl ResourceSchemaValidationError {
+    pub fn enum_base_member_errors(
+        &self,
+    ) -> impl Iterator<Item = (&SchemaValidationIssueLocation, &EnumBaseMemberLayerError)> {
+        self.issues.iter().filter_map(|issue| {
+            issue
+                .message
+                .enum_base_member_error()
+                .map(|error| (&issue.location, error))
+        })
+    }
+
     pub fn input_rule_errors(
         &self,
     ) -> impl Iterator<Item = (&SchemaValidationIssueLocation, &InputRuleError)> {
@@ -9052,6 +9603,17 @@ pub struct ConfigSchemaValidationError {
 }
 
 impl ConfigSchemaValidationError {
+    pub fn enum_base_member_errors(
+        &self,
+    ) -> impl Iterator<Item = (&SchemaValidationIssueLocation, &EnumBaseMemberLayerError)> {
+        self.issues.iter().filter_map(|issue| {
+            issue
+                .message
+                .enum_base_member_error()
+                .map(|error| (&issue.location, error))
+        })
+    }
+
     pub fn pattern_errors(
         &self,
     ) -> impl Iterator<Item = (&SchemaValidationIssueLocation, &PatternCompileError)> {
@@ -9461,9 +10023,7 @@ impl<'a> EffectiveType<'a> {
         name: &str,
         budget: &mut ShapeWalkBudget,
     ) -> Option<EffectiveField<'a>> {
-        self.field_candidates_with_budget(budget)
-            .into_iter()
-            .find(|field| field.name() == name || field.block_name() == Some(name))
+        self.find_indexed_field(name, true, budget)
     }
 
     fn find_field_by_canonical_name_with_budget(
@@ -9471,9 +10031,100 @@ impl<'a> EffectiveType<'a> {
         name: &str,
         budget: &mut ShapeWalkBudget,
     ) -> Option<EffectiveField<'a>> {
-        self.field_candidates_with_budget(budget)
-            .into_iter()
-            .find(|field| field.name() == name)
+        self.find_indexed_field(name, false, budget)
+    }
+
+    fn find_indexed_field(
+        &self,
+        name: &str,
+        authored: bool,
+        budget: &mut ShapeWalkBudget,
+    ) -> Option<EffectiveField<'a>> {
+        let mut found = None;
+        lookup_effective_field(
+            self.attr_type,
+            self.defs,
+            &self.path,
+            self.field_ancestry,
+            (name, authored),
+            budget,
+            &mut found,
+        );
+        found
+    }
+}
+
+fn lookup_effective_field<'a>(
+    attr_type: &'a CompiledAttributeType,
+    defs: &'a BTreeMap<String, CompiledAttributeType>,
+    parent_path: &[String],
+    ancestry: FieldAncestry,
+    query: (&str, bool),
+    budget: &mut ShapeWalkBudget,
+    found: &mut Option<EffectiveField<'a>>,
+) {
+    if !budget.take() {
+        return;
+    }
+    match attr_type.shape_with_defs(defs) {
+        Shape::Struct { .. } => {
+            let Some(fields) = struct_fields_with_defs(attr_type, defs) else {
+                return;
+            };
+            let field = if query.1 {
+                fields.first_authored_field(query.0, |field| {
+                    ancestry.block_name(field) == Some(query.0)
+                })
+            } else {
+                fields.field(query.0)
+            };
+            if found.is_none()
+                && let Some(field) = field
+            {
+                let mut path = parent_path.to_vec();
+                path.push(field.name.clone());
+                *found = Some(EffectiveField {
+                    field,
+                    defs,
+                    path,
+                    ancestry,
+                });
+            }
+        }
+        Shape::List { element_type, .. } => lookup_effective_field(
+            element_type,
+            defs,
+            parent_path,
+            ancestry,
+            query,
+            budget,
+            found,
+        ),
+        Shape::Union => {
+            if let Some(members) = union_members_with_defs(attr_type, defs) {
+                // Preserve the candidate walk's budget and declaration order.
+                for member in members.iter().flatten() {
+                    lookup_effective_field(
+                        member.as_attr(),
+                        defs,
+                        parent_path,
+                        ancestry,
+                        query,
+                        budget,
+                        found,
+                    );
+                }
+            }
+        }
+        Shape::UnloadedSchemaType(_)
+        | Shape::Reference { .. }
+        | Shape::String { .. }
+        | Shape::Int { .. }
+        | Shape::Float { .. }
+        | Shape::Bool
+        | Shape::Duration
+        | Shape::Enum { .. }
+        | Shape::Map { .. } => {}
     }
 }
 
@@ -9671,14 +10322,28 @@ impl<'a> EffectiveSchemaNode<'a> {
 }
 
 /// A resource schema that has passed every whole-schema rule.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ValidatedResourceSchema {
     pub(crate) admission_identity: crate::validation::admission::DeclarationId,
     schema: Arc<PatternResourceSchema<Compiled>>,
     identity_paths: Vec<IdentityPath>,
+    input_rule_declarations: Arc<crate::input_rules::InputRuleDeclarations>,
+}
+
+impl std::fmt::Debug for ValidatedResourceSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidatedResourceSchema")
+            .field("admission_identity", &self.admission_identity)
+            .field("schema", &self.schema)
+            .field("identity_paths", &self.identity_paths)
+            .finish()
+    }
 }
 
 impl ValidatedResourceSchema {
+    pub(crate) fn input_rule_declarations(&self) -> &crate::input_rules::InputRuleDeclarations {
+        &self.input_rule_declarations
+    }
     pub fn as_schema(&self) -> &PatternResourceSchema<Compiled> {
         &self.schema
     }
@@ -9828,14 +10493,13 @@ impl ValidatedResourceSchema {
                 Shape::Struct { name: struct_name } => {
                     let fields = struct_fields_with_defs(current.attr_type, current.defs)
                         .expect("Shape::Struct must expose struct fields internally");
-                    let field = fields
-                        .iter()
-                        .find(|field| field.name == *segment)
-                        .ok_or_else(|| AttributePathTypeError::UnknownStructField {
+                    let field = fields.field(segment).ok_or_else(|| {
+                        AttributePathTypeError::UnknownStructField {
                             parent_path: traversed.clone(),
                             field: segment.clone(),
                             struct_name: struct_name.to_string(),
-                        })?;
+                        }
+                    })?;
                     let mut field_path = current.path.clone();
                     field_path.push(field.name.clone());
                     EffectiveField {
@@ -10059,6 +10723,9 @@ pub enum ProviderSchemaValidationError {
     MissingScalarKind {
         identity: TypeIdentity,
     },
+    ConflictingIdentityDeclarations {
+        identity: TypeIdentity,
+    },
     ConflictingScalarKinds {
         identity: TypeIdentity,
         first_kind: RefinedScalarKind,
@@ -10107,6 +10774,11 @@ impl fmt::Display for ProviderSchemaValidationError {
             Self::BuiltinTypeCollision { identity } => write!(
                 formatter,
                 "custom type `{identity}` conflicts with the built-in declaration; use the core types constructor (including its scalar kind and validator) or choose a different identity",
+                identity = DiagnosticText::new(identity.to_string())
+            ),
+            Self::ConflictingIdentityDeclarations { identity } => write!(
+                formatter,
+                "custom type `{identity}` has conflicting identity-layer constraints",
                 identity = DiagnosticText::new(identity.to_string())
             ),
             Self::MissingScalarKind { identity } => {
@@ -10229,6 +10901,7 @@ impl ValidatedProviderSchemaWitness {
         assignability_edges: Vec<AssignabilityEdge>,
     ) -> Result<Self, ProviderSchemaValidationError> {
         let declarations = identified_declarations_from_witnesses(&resources, &config);
+        let mut identity_layers = BTreeMap::<TypeIdentity, ScalarIdentityParts<'_>>::new();
         let mut scalar_kinds = BTreeMap::<TypeIdentity, RefinedScalarKind>::new();
         let mut declaration_kinds =
             BTreeMap::<TypeIdentity, std::collections::BTreeSet<IdentifiedDeclarationKind>>::new();
@@ -10251,7 +10924,12 @@ impl ValidatedProviderSchemaWitness {
 
         for (identity, attribute_type) in &declarations {
             if let Some(builtin) = builtin_type_registry().get(identity)
-                && !same_builtin_declaration(attribute_type, builtin)
+                && !same_builtin_declaration(
+                    attribute_type.scalar_identity_parts(),
+                    builtin
+                        .scalar_identity_parts()
+                        .expect("built-in scalar definition"),
+                )
             {
                 return Err(ProviderSchemaValidationError::BuiltinTypeCollision {
                     identity: identity.clone(),
@@ -10287,6 +10965,21 @@ impl ValidatedProviderSchemaWitness {
                     first_kind: *first_kind,
                     second_kind: scalar_kind,
                 });
+            }
+            if let Some(identity_layer) = attribute_type.scalar_identity_parts() {
+                if identity_layers
+                    .get(identity)
+                    .is_some_and(|first| !first.agrees_with(identity_layer))
+                {
+                    return Err(
+                        ProviderSchemaValidationError::ConflictingIdentityDeclarations {
+                            identity: identity.clone(),
+                        },
+                    );
+                }
+                identity_layers
+                    .entry(identity.clone())
+                    .or_insert(identity_layer);
             }
             scalar_kinds.entry(identity.clone()).or_insert(scalar_kind);
             declaration_kinds
@@ -10377,16 +11070,24 @@ fn identified_declaration_kind(
             length: _length,
         } => Some(IdentifiedDeclarationKind::String),
         RawShape::String {
-            identity: Some(_identity),
-            pattern: _pattern,
-            length: _length,
-            validate: _validate,
-            to_dsl: _to_dsl,
+            identity_layer:
+                StringIdentityParts {
+                    identity: Some(_identity),
+                    pattern: _pattern,
+                    length: _length,
+                    validate: _validate,
+                    to_dsl: _to_dsl,
+                },
+            member_layer: _,
         } => Some(IdentifiedDeclarationKind::String),
         RawShape::Int {
-            identity: Some(_identity),
-            range: _range,
-            validate: _validate,
+            identity_layer:
+                IntIdentityParts {
+                    identity: Some(_identity),
+                    range: _range,
+                    validate: _validate,
+                },
+            member_layer: _,
         } => Some(IdentifiedDeclarationKind::Int),
         RawShape::Float {
             identity: Some(_identity),
@@ -10402,16 +11103,12 @@ fn identified_declaration_kind(
             to_dsl: _to_dsl,
         } => Some(IdentifiedDeclarationKind::Enum),
         RawShape::String {
-            identity: None,
-            pattern: _,
-            length: _,
-            validate: _,
-            to_dsl: _,
+            identity_layer: StringIdentityParts { identity: None, .. },
+            member_layer: _,
         }
         | RawShape::Int {
-            identity: None,
-            range: _,
-            validate: _,
+            identity_layer: IntIdentityParts { identity: None, .. },
+            member_layer: _,
         }
         | RawShape::Float {
             identity: None,
@@ -10433,6 +11130,7 @@ fn identified_declaration_kind(
             name: _name,
             fields: _fields,
             field_groups: _field_groups,
+            input_rules: _input_rules,
         } => None,
         RawShape::Union(_members) => None,
         RawShape::Ref(_name) => None,
@@ -10450,16 +11148,24 @@ fn identified_declaration_scalar_kind(
             length: _length,
         } => Some(RefinedScalarKind::String),
         RawShape::String {
-            identity: Some(_identity),
-            pattern: _pattern,
-            length: _length,
-            validate: _validate,
-            to_dsl: _to_dsl,
+            identity_layer:
+                StringIdentityParts {
+                    identity: Some(_identity),
+                    pattern: _pattern,
+                    length: _length,
+                    validate: _validate,
+                    to_dsl: _to_dsl,
+                },
+            member_layer: _,
         } => Some(RefinedScalarKind::String),
         RawShape::Int {
-            identity: Some(_identity),
-            range: _range,
-            validate: _validate,
+            identity_layer:
+                IntIdentityParts {
+                    identity: Some(_identity),
+                    range: _range,
+                    validate: _validate,
+                },
+            member_layer: _,
         } => Some(RefinedScalarKind::Int),
         RawShape::Float {
             identity: Some(_identity),
@@ -10475,16 +11181,12 @@ fn identified_declaration_scalar_kind(
             to_dsl: _to_dsl,
         } => scalar_kind_for_schema_base(base),
         RawShape::String {
-            identity: None,
-            pattern: _,
-            length: _,
-            validate: _,
-            to_dsl: _,
+            identity_layer: StringIdentityParts { identity: None, .. },
+            member_layer: _,
         }
         | RawShape::Int {
-            identity: None,
-            range: _,
-            validate: _,
+            identity_layer: IntIdentityParts { identity: None, .. },
+            member_layer: _,
         }
         | RawShape::Float {
             identity: None,
@@ -10506,6 +11208,7 @@ fn identified_declaration_scalar_kind(
             name: _name,
             fields: _fields,
             field_groups: _field_groups,
+            input_rules: _input_rules,
         } => None,
         RawShape::Union(_members) => None,
         RawShape::Ref(_name) => None,
@@ -10524,16 +11227,20 @@ fn visit_identified_declarations(
             length: _length,
         } => visitor(identity, attribute_type),
         RawShape::String {
-            identity: Some(identity),
-            pattern: _,
-            length: _,
-            validate: _,
-            to_dsl: _,
+            identity_layer:
+                StringIdentityParts {
+                    identity: Some(identity),
+                    ..
+                },
+            member_layer: _,
         }
         | RawShape::Int {
-            identity: Some(identity),
-            range: _,
-            validate: _,
+            identity_layer:
+                IntIdentityParts {
+                    identity: Some(identity),
+                    ..
+                },
+            member_layer: _,
         }
         | RawShape::Float {
             identity: Some(identity),
@@ -10574,16 +11281,12 @@ fn visit_identified_declarations(
             }
         }
         RawShape::String {
-            identity: None,
-            pattern: _,
-            length: _,
-            validate: _,
-            to_dsl: _,
+            identity_layer: StringIdentityParts { identity: None, .. },
+            member_layer: _,
         }
         | RawShape::Int {
-            identity: None,
-            range: _,
-            validate: _,
+            identity_layer: IntIdentityParts { identity: None, .. },
+            member_layer: _,
         }
         | RawShape::Float {
             identity: None,
@@ -10628,7 +11331,7 @@ fn normalize_issues(issues: &mut Vec<SchemaDefinitionIssue>) {
     issues.sort_by(|left, right| {
         left.path
             .cmp(&right.path)
-            .then_with(|| left.message.cmp(&right.message))
+            .then_with(|| left.message.as_str().cmp(right.message.as_str()))
     });
     issues.dedup();
 }
@@ -10643,14 +11346,21 @@ fn push_schema_issue(
         pattern_error: None,
         path: location.raw_path().into(),
         location: location.clone(),
-        message: DiagnosticText::new(message),
+        message: DiagnosticText::new(message).into(),
     });
 }
 
-fn validate_identified_scalar_kind_consistency(
-    attribute_type: &PatternAttributeType<Draft>,
+fn validate_identified_scalar_kind_consistency<'a>(
+    attribute_type: &'a PatternAttributeType<Draft>,
     location: SchemaValidationIssueLocation,
-    seen: &mut HashMap<TypeIdentity, (RefinedScalarKind, SchemaValidationIssueLocation)>,
+    seen: &mut HashMap<
+        TypeIdentity,
+        (
+            RefinedScalarKind,
+            Option<ScalarIdentityParts<'a>>,
+            SchemaValidationIssueLocation,
+        ),
+    >,
     issues: &mut Vec<SchemaDefinitionIssue>,
 ) {
     let identified = match attribute_type.raw_shape() {
@@ -10661,11 +11371,19 @@ fn validate_identified_scalar_kind_consistency(
             length: _length,
         } => Some((identity, RefinedScalarKind::String)),
         RawShape::String {
-            identity: Some(identity),
+            identity_layer:
+                StringIdentityParts {
+                    identity: Some(identity),
+                    ..
+                },
             ..
         } => Some((identity, RefinedScalarKind::String)),
         RawShape::Int {
-            identity: Some(identity),
+            identity_layer:
+                IntIdentityParts {
+                    identity: Some(identity),
+                    ..
+                },
             ..
         } => Some((identity, RefinedScalarKind::Int)),
         RawShape::Float {
@@ -10704,11 +11422,17 @@ fn validate_identified_scalar_kind_consistency(
                     if !matches!(
                         base.raw_shape(),
                         RawShape::String {
-                            identity: None,
-                            pattern: None,
-                            length: None,
-                            validate: None,
-                            to_dsl: None,
+                            identity_layer: StringIdentityParts {
+                                identity: None,
+                                pattern: None,
+                                length: None,
+                                validate: None,
+                                to_dsl: None,
+                            },
+                            member_layer: StringMemberParts {
+                                pattern: None,
+                                length: None
+                            }
                         }
                     ) {
                         push_schema_issue(
@@ -10747,8 +11471,14 @@ fn validate_identified_scalar_kind_consistency(
 
             kind.map(|kind| (identity, kind))
         }
-        RawShape::String { identity: None, .. }
-        | RawShape::Int { identity: None, .. }
+        RawShape::String {
+            identity_layer: StringIdentityParts { identity: None, .. },
+            ..
+        }
+        | RawShape::Int {
+            identity_layer: IntIdentityParts { identity: None, .. },
+            ..
+        }
         | RawShape::Float { identity: None, .. }
         | RawShape::Bool
         | RawShape::Duration
@@ -10759,7 +11489,8 @@ fn validate_identified_scalar_kind_consistency(
         | RawShape::Ref(_) => None,
     };
     if let Some((identity, kind)) = identified {
-        if let Some((first_kind, first_location)) = seen.get(identity) {
+        let identity_layer = attribute_type.scalar_identity_parts();
+        if let Some((first_kind, first_layer, first_location)) = seen.get(identity) {
             if *first_kind != kind {
                 push_schema_issue(
                     issues,
@@ -10768,9 +11499,20 @@ fn validate_identified_scalar_kind_consistency(
                         "custom type `{identity}` is bound to both {first_kind} at {first_location} and {kind}"
                     ),
                 );
+            } else if first_layer
+                .zip(identity_layer)
+                .is_some_and(|(first, second)| !first.agrees_with(second))
+            {
+                push_schema_issue(
+                    issues,
+                    &location,
+                    format!(
+                        "custom type `{identity}` has conflicting identity-layer constraints at {first_location} and {location}"
+                    ),
+                );
             }
         } else {
-            seen.insert(identity.clone(), (kind, location.clone()));
+            seen.insert(identity.clone(), (kind, identity_layer, location.clone()));
         }
     }
 
@@ -11095,6 +11837,40 @@ fn validate_field_group_admission(
     }
 }
 
+fn enum_base_has_member_layer<'a>(
+    base: &'a PatternAttributeType<Draft>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Draft>>,
+    refs: &mut Vec<&'a str>,
+) -> bool {
+    let Ok(resolved) = resolve_refs_on_path(base, defs, refs) else {
+        return false; // The existing definition checks report invalid refs.
+    };
+    let has_member_layer = match &resolved.attr.kind {
+        AttrTypeKind::String {
+            identity_layer: _,
+            member_layer,
+        } => {
+            let StringMemberConstraints { pattern, length } = member_layer;
+            pattern.is_some() || length.is_some()
+        }
+        AttrTypeKind::Int {
+            identity_layer: _,
+            member_layer: IntMemberConstraints { range },
+        } => range.is_some(),
+        AttrTypeKind::Enum {
+            identity: _,
+            base,
+            values: _,
+            dsl_aliases: _,
+            validate: _,
+            to_dsl: _,
+        } => enum_base_has_member_layer(base, defs, refs),
+        _ => false,
+    };
+    refs.truncate(resolved.restore_len);
+    has_member_layer
+}
+
 fn validate_type_definition(
     attr_type: &PatternAttributeType<Draft>,
     defs: &BTreeMap<String, PatternAttributeType<Draft>>,
@@ -11164,8 +11940,24 @@ fn validate_type_definition(
         AttrTypeKind::Struct {
             fields,
             field_groups,
+            input_rules,
             ..
         } => {
+            input_rules::validate_rule_collection(
+                input_rules,
+                |name| {
+                    fields.field(name).map(|field| {
+                        (
+                            &field.field_type,
+                            provider_populated_ancestor.unwrap_or(false)
+                                || field.declared_input_mode.is_provider_populated(),
+                        )
+                    })
+                },
+                defs,
+                |index| location.with_suffix(format_args!(".input_rules[{index}]")),
+                issues,
+            );
             let mut names = HashSet::new();
             for field in fields {
                 let field_location = location.with_suffix(format_args!(".{}", field.name));
@@ -11208,7 +12000,7 @@ fn validate_type_definition(
                 "field",
                 |group_index| location.with_suffix(format_args!(".field_groups[{group_index}]")),
                 |name| {
-                    fields.iter().find(|field| field.name == name).map(|field| {
+                    fields.field(name).map(|field| {
                         FieldGroupMemberAdmission {
                             input_mode: field.declared_input_mode,
                             // StructField has no default in the core or current
@@ -11233,6 +12025,25 @@ fn validate_type_definition(
                 );
             }
         }
+        AttrTypeKind::Enum {
+            identity: _,
+            base,
+            values: _,
+            dsl_aliases: _,
+            validate: _,
+            to_dsl: _,
+        } => {
+            if enum_base_has_member_layer(base, defs, &mut Vec::new()) {
+                let location = location.with_suffix(".<base>");
+                issues.push(SchemaDefinitionIssue {
+                    input_rule_error: None,
+                    pattern_error: None,
+                    path: location.raw_path().into(),
+                    location,
+                    message: SchemaDefinitionMessage::EnumBaseMemberLayer(EnumBaseMemberLayerError),
+                });
+            }
+        }
         AttrTypeKind::Reference { .. }
         | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
@@ -11240,8 +12051,7 @@ fn validate_type_definition(
         | AttrTypeKind::Int { .. }
         | AttrTypeKind::Float { .. }
         | AttrTypeKind::Bool
-        | AttrTypeKind::Duration
-        | AttrTypeKind::Enum { .. } => {}
+        | AttrTypeKind::Duration => {}
     }
 }
 
@@ -11727,7 +12537,7 @@ fn validate_keyed_partial_update(
         return;
     };
     let key_name = keyed.key_field.as_str();
-    let Some(field) = fields.iter().find(|field| field.name == key_name) else {
+    let Some(field) = fields.field(key_name) else {
         push_schema_issue(
             issues,
             location,
@@ -11955,7 +12765,7 @@ fn strip_write_only_leaves_from_value<'schema, P: crate::resource::ValueKind>(
                 entries
                     .iter()
                     .filter_map(|(key, entry)| {
-                        let field = fields.iter().find(|field| field.name == *key);
+                        let field = fields.field(key);
                         match field {
                             Some(field) if field.write_only => None,
                             Some(field) => Some((
@@ -12483,11 +13293,105 @@ impl fmt::Display for BlockNameConflict {
 }
 
 #[derive(Clone, Copy)]
-struct BlockFieldRef<'a> {
+pub(crate) struct BlockFieldRef<'a> {
     name: &'a str,
     block_name: Option<&'a str>,
     field_type: &'a CompiledAttributeType,
     child_ancestry: FieldAncestry,
+}
+
+pub(crate) struct BlockFields<'a> {
+    ordered: Vec<BlockFieldRef<'a>>,
+    canonical: HashMap<&'a str, usize>,
+    aliases: HashMap<&'a str, usize>,
+}
+
+impl<'a> FromIterator<BlockFieldRef<'a>> for BlockFields<'a> {
+    fn from_iter<T: IntoIterator<Item = BlockFieldRef<'a>>>(fields: T) -> Self {
+        let ordered = fields.into_iter().collect::<Vec<_>>();
+        let mut canonical = HashMap::with_capacity(ordered.len());
+        let mut aliases = HashMap::new();
+        for (index, field) in ordered.iter().enumerate() {
+            #[cfg(test)]
+            crate::input_rules::record_declaration_lookup_work(1);
+            canonical.entry(field.name).or_insert(index);
+            if let Some(alias) = field.block_name.filter(|alias| *alias != field.name) {
+                aliases.entry(alias).or_insert(index);
+            }
+        }
+        Self {
+            ordered,
+            canonical,
+            aliases,
+        }
+    }
+}
+impl<'a> BlockFields<'a> {
+    pub(crate) fn for_resource(schema: &'a CompiledResourceSchema) -> Self {
+        block_fields(schema)
+    }
+    pub(crate) fn for_struct(
+        fields: &'a IndexedStructFields<Compiled>,
+        ancestry: FieldAncestry,
+    ) -> Self {
+        fields
+            .iter()
+            .map(|field| BlockFieldRef {
+                name: &field.name,
+                block_name: ancestry.block_name(field),
+                field_type: &field.field_type,
+                child_ancestry: ancestry.descend(field),
+            })
+            .collect()
+    }
+    pub(crate) fn canonical_name(
+        &self,
+        key: &str,
+        is_list: bool,
+        defs: &BTreeMap<String, CompiledAttributeType>,
+    ) -> Option<&'a str> {
+        self.selected_field(key, is_list, defs)
+            .map(|field| field.name)
+    }
+    fn selected_field(
+        &self,
+        key: &str,
+        is_list: bool,
+        defs: &BTreeMap<String, CompiledAttributeType>,
+    ) -> Option<BlockFieldRef<'a>> {
+        let (canonical, alias) = self.candidates(key);
+        match (canonical, alias) {
+            // Parser blocks are lists. A concrete list selects the alias only
+            // when the real field with that name cannot itself accept a list.
+            (Some(canonical), Some(alias))
+                if is_list
+                    && !matches!(
+                        canonical.field_type.shape_with_defs(defs),
+                        Shape::List { .. }
+                    ) =>
+            {
+                Some(alias)
+            }
+            (Some(canonical), _) => Some(canonical),
+            (None, Some(alias)) => Some(alias),
+            (None, None) => None,
+        }
+    }
+    fn candidates(&self, key: &str) -> (Option<BlockFieldRef<'a>>, Option<BlockFieldRef<'a>>) {
+        #[cfg(test)]
+        crate::input_rules::record_declaration_lookup_work(2);
+        (
+            self.canonical.get(key).map(|index| self.ordered[*index]),
+            self.aliases.get(key).map(|index| self.ordered[*index]),
+        )
+    }
+}
+impl<'a, 'b> IntoIterator for &'a BlockFields<'b> {
+    type Item = &'a BlockFieldRef<'b>;
+    type IntoIter = std::slice::Iter<'a, BlockFieldRef<'b>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.ordered.iter()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -12496,7 +13400,35 @@ enum BlockFieldMatch<'a> {
     Alias(BlockFieldRef<'a>),
 }
 
+#[cfg(test)]
+thread_local! { static BLOCK_NAME_PATH_WORK: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
+
+#[cfg(test)]
+pub(crate) fn record_block_name_path_work(count: usize) {
+    BLOCK_NAME_PATH_WORK.with(|work| {
+        if let Some(current) = work.get() {
+            work.set(Some(current + count));
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn with_block_name_path_work<R>(operation: impl FnOnce() -> R) -> (R, usize) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BLOCK_NAME_PATH_WORK.set(None);
+        }
+    }
+    BLOCK_NAME_PATH_WORK.set(Some(0));
+    let _reset = Reset;
+    let result = operation();
+    (result, BLOCK_NAME_PATH_WORK.get().unwrap())
+}
+
 fn nested_path(parent: &str, name: &str) -> String {
+    #[cfg(test)]
+    record_block_name_path_work(parent.len() + name.len() + 1);
     if parent.is_empty() {
         name.to_string()
     } else {
@@ -12507,37 +13439,25 @@ fn nested_path(parent: &str, name: &str) -> String {
 fn match_block_field<'a, P: PlaceholderKind, B: BindingAddress>(
     key: &str,
     value: &Value<P, B>,
-    fields: &[BlockFieldRef<'a>],
+    fields: &BlockFields<'a>,
     defs: &BTreeMap<String, CompiledAttributeType>,
 ) -> Option<BlockFieldMatch<'a>> {
-    let canonical = fields.iter().copied().find(|field| field.name == key);
-    let alias = fields
-        .iter()
-        .copied()
-        .find(|field| field.block_name == Some(key) && field.name != key);
-
-    match (canonical, alias) {
-        // In the otherwise ambiguous case, a concrete list belongs to the
-        // aliased field when the real field cannot itself accept a list. This
-        // covers parser-produced block syntax as well as expressions already
-        // inlined to lists in the authored snapshot. Every other value shape,
-        // and a real list field, keeps the real-field meaning.
-        (Some(canonical), Some(alias))
-            if matches!(value, Value::Concrete(ConcreteValue::List(_)))
-                && !matches!(
-                    canonical.field_type.shape_with_defs(defs),
-                    Shape::List { .. }
-                ) =>
-        {
-            Some(BlockFieldMatch::Alias(alias))
-        }
-        (Some(_), _) => Some(BlockFieldMatch::Canonical),
-        (None, Some(alias)) => Some(BlockFieldMatch::Alias(alias)),
-        (None, None) => None,
-    }
+    fields
+        .selected_field(
+            key,
+            matches!(value, Value::Concrete(ConcreteValue::List(_))),
+            defs,
+        )
+        .map(|field| {
+            if field.name == key {
+                BlockFieldMatch::Canonical
+            } else {
+                BlockFieldMatch::Alias(field)
+            }
+        })
 }
 
-fn block_name_conflict(
+pub(crate) fn block_name_conflict(
     resource_id: &str,
     parent_path: &str,
     alias: &str,
@@ -12554,7 +13474,7 @@ fn block_name_conflict(
 fn value_for_field<'a, P: PlaceholderKind, B: BindingAddress>(
     map: &'a IndexMap<String, Value<P, B>>,
     field: BlockFieldRef<'_>,
-    fields: &[BlockFieldRef<'_>],
+    fields: &BlockFields<'_>,
     defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
 ) -> Option<&'a Value<P, B>> {
     if let Some(value) = map.get(field.name) {
@@ -12569,17 +13489,97 @@ fn value_for_field<'a, P: PlaceholderKind, B: BindingAddress>(
     .then_some(value)
 }
 
-fn resolve_block_names_in_map<P: PlaceholderKind, B: BindingAddress, AB: BindingAddress>(
+fn opened_block_fit<'f, 'schema>(mut fit: Option<&'f Fit<'schema>>) -> Option<&'f Fit<'schema>> {
+    while let Some(Fit {
+        kind: FitKind::Secret(inner),
+        ..
+    }) = fit
+    {
+        fit = Some(inner);
+    }
+    fit
+}
+
+fn block_authored_value<P: PlaceholderKind, B: BindingAddress>(
+    mut value: Option<&Value<P, B>>,
+) -> Option<&Value<P, B>> {
+    while let Some(Value::Deferred(DeferredValue::Secret(payload))) = value {
+        value = Some(payload.expose_plaintext());
+    }
+    value
+}
+
+fn block_union_fit<'schema, P: PlaceholderKind, B: BindingAddress>(
+    attr_type: &'schema CompiledAttributeType,
+    value: &Value<P, B>,
+    context: BlockNameResolutionContext<'schema>,
+) -> Option<value_validation::SelectedInputUnion<'schema>> {
+    let resolved = attr_type.resolve_refs_with_defs(context.defs).as_attr();
+    let RawShape::Union(members) = resolved.raw_shape() else {
+        return None;
+    };
+    let proof = value
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .ok()?
+        .into_classification();
+    if !matches!(proof, crate::resource::knowledge::Classification::Known(_)) {
+        return None;
+    }
+    match context.authority.admit(
+        members,
+        &proof,
+        context.defs,
+        context.owner,
+        &mut Vec::new(),
+    ) {
+        crate::input_rules::InputUnionAdmission::Selected(selected) => Some(selected),
+        crate::input_rules::InputUnionAdmission::Withheld
+        | crate::input_rules::InputUnionAdmission::Rejected => None,
+    }
+}
+
+fn block_struct_fits<'fit, 'schema, P: PlaceholderKind, B: BindingAddress>(
+    map: &IndexMap<String, Value<P, B>>,
+    fields: &BlockFields<'_>,
+    fit: Option<&'fit Fit<'schema>>,
+    defs: &BTreeMap<String, CompiledAttributeType>,
+) -> HashMap<String, &'fit Fit<'schema>> {
+    let Some(Fit {
+        kind: FitKind::Struct(fits),
+        ..
+    }) = opened_block_fit(fit)
+    else {
+        return HashMap::new();
+    };
+    map.iter()
+        .zip(fits.iter())
+        .filter_map(|((key, value), fit)| {
+            fields
+                .canonical_name(
+                    key,
+                    matches!(value, Value::Concrete(ConcreteValue::List(_))),
+                    defs,
+                )
+                .map(|canonical| (canonical.to_owned(), fit))
+        })
+        .collect()
+}
+
+fn resolve_block_names_in_map<
+    'schema,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    AB: BindingAddress,
+>(
     map: &mut IndexMap<String, Value<P, B>>,
     authored_map: Option<&IndexMap<String, Value<P, AB>>>,
-    fields: &[BlockFieldRef<'_>],
-    context: BlockNameResolutionContext<'_>,
-    parent_path: BlockNamePath<'_>,
-    conflicts: &mut Vec<BlockNameConflict>,
+    fields: &BlockFields<'schema>,
+    context: BlockNameResolutionContext<'schema>,
+    edits: &mut BlockNameEdits,
+    fit: Option<&Fit<'schema>>,
 ) {
-    // Preserve the source map's order, matching the pre-walker resolver: each
-    // renamed key is removed in authored order and appended under its canonical
-    // spelling in that same order.
+    let fits = block_struct_fits(map, fields, fit, context.defs);
+    // Keep the established authored rename order and canonical append order.
     let keys = map.keys().cloned().collect::<Vec<_>>();
     for key in keys {
         let Some(value) = map.get(&key) else {
@@ -12592,161 +13592,282 @@ fn resolve_block_names_in_map<P: PlaceholderKind, B: BindingAddress, AB: Binding
         let Some(BlockFieldMatch::Alias(field)) = field_match else {
             continue;
         };
-
         if map.contains_key(field.name) {
-            conflicts.push(block_name_conflict(
+            edits.conflicts.push(block_name_conflict(
                 context.resource_id,
-                parent_path.display,
+                &edits.path.display(),
                 &key,
                 field.name,
             ));
             continue;
         }
         if let Some(value) = map.shift_remove(&key) {
-            let mut path = parent_path.attributes.to_vec();
-            path.push(if path.is_empty() {
-                crate::parser::AttributePathSegment::Attribute(key.clone())
-            } else {
-                crate::parser::AttributePathSegment::StructField(key.clone())
-            });
-            context
+            edits.path.push_field(&key);
+            edits
                 .renames
-                .borrow_mut()
-                .push((path, field.name.to_string()));
-            map.insert(field.name.to_string(), value);
+                .push((edits.path.source_path(), field.name.to_owned()));
+            edits.path.pop();
+            map.insert(field.name.to_owned(), value);
         }
     }
-
     for field in fields {
-        let authored_value = authored_map
-            .and_then(|authored| value_for_field(authored, *field, fields, context.defs));
+        if !context.declarations.aliases_reachable(field.field_type) {
+            continue;
+        }
+        let authored =
+            authored_map.and_then(|map| value_for_field(map, *field, fields, context.defs));
         let Some(value) = map.get_mut(field.name) else {
             continue;
         };
-        let mut child_path = parent_path.attributes.to_vec();
-        child_path.push(if child_path.is_empty() {
-            crate::parser::AttributePathSegment::Attribute(field.name.to_string())
-        } else {
-            crate::parser::AttributePathSegment::StructField(field.name.to_string())
-        });
+        edits.path.push_field(field.name);
         resolve_block_names_in_value(
             value,
-            authored_value,
+            authored,
             field.field_type,
             field.child_ancestry,
             context,
-            BlockNamePath {
-                display: &nested_path(parent_path.display, field.name),
-                attributes: &child_path,
-            },
-            conflicts,
+            edits,
+            fits.get(field.name).copied(),
         );
+        edits.path.pop();
     }
 }
 
-fn resolve_block_names_in_value<P: PlaceholderKind, B: BindingAddress, AB: BindingAddress>(
+fn resolve_block_names_in_value<
+    'schema,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    AB: BindingAddress,
+>(
     value: &mut Value<P, B>,
     authored_value: Option<&Value<P, AB>>,
-    attr_type: &PatternAttributeType<Compiled>,
+    attr_type: &'schema CompiledAttributeType,
     ancestry: FieldAncestry,
-    context: BlockNameResolutionContext<'_>,
-    path: BlockNamePath<'_>,
-    conflicts: &mut Vec<BlockNameConflict>,
+    context: BlockNameResolutionContext<'schema>,
+    edits: &mut BlockNameEdits,
+    fit: Option<&Fit<'schema>>,
 ) {
+    let fit = opened_block_fit(fit);
+    let authored_value = block_authored_value(authored_value);
+    if let Value::Deferred(DeferredValue::Secret(payload)) = value {
+        let old_scope = edits.path.secret;
+        edits.path.secret = true;
+        payload.canonicalize_schema_aliases(|inner| {
+            resolve_block_names_in_value(
+                inner,
+                authored_value,
+                attr_type,
+                ancestry,
+                context,
+                edits,
+                fit,
+            )
+        });
+        edits.path.secret = old_scope;
+        return;
+    }
     match attr_type.shape_with_defs(context.defs) {
         Shape::Struct { .. } => {
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
                 return;
             };
-            let Some(struct_fields) = struct_fields_with_defs(attr_type, context.defs) else {
+            let Some(fields) = struct_fields_with_defs(attr_type, context.defs) else {
                 return;
             };
-            let fields = struct_fields
-                .iter()
-                .map(|field| BlockFieldRef {
-                    name: &field.name,
-                    block_name: ancestry.block_name(field),
-                    field_type: &field.field_type,
-                    child_ancestry: ancestry.descend(field),
-                })
-                .collect::<Vec<_>>();
-            let authored_map = match authored_value {
+            let fields = BlockFields::for_struct(fields, ancestry);
+            let authored = match authored_value {
                 Some(Value::Concrete(ConcreteValue::Map(map))) => Some(map),
                 _ => None,
             };
-            resolve_block_names_in_map(map, authored_map, &fields, context, path, conflicts);
+            resolve_block_names_in_map(map, authored, &fields, context, edits, fit);
         }
         Shape::List { element_type, .. } => {
-            if !matches!(
-                element_type.shape_with_defs(context.defs),
-                Shape::Struct { .. }
-            ) {
-                return;
-            }
             let Value::Concrete(ConcreteValue::List(items)) = value else {
                 return;
             };
-            let Some(struct_fields) = struct_fields_with_defs(element_type, context.defs) else {
-                return;
+            let authored = match authored_value {
+                Some(Value::Concrete(ConcreteValue::List(items))) => Some(items),
+                _ => None,
             };
-            let fields = struct_fields
-                .iter()
-                .map(|field| BlockFieldRef {
-                    name: &field.name,
-                    block_name: ancestry.block_name(field),
-                    field_type: &field.field_type,
-                    child_ancestry: ancestry.descend(field),
-                })
-                .collect::<Vec<_>>();
-            let authored_items = match authored_value {
-                Some(Value::Concrete(ConcreteValue::List(items))) => Some(items.as_slice()),
+            let fits = match fit {
+                Some(Fit {
+                    kind: FitKind::List(fits) | FitKind::StringList(fits),
+                    ..
+                }) => Some(fits),
                 _ => None,
             };
             for (index, item) in items.iter_mut().enumerate() {
-                let Value::Concrete(ConcreteValue::Map(map)) = item else {
-                    continue;
-                };
-                let authored_map = authored_items
-                    .and_then(|authored| authored.get(index))
-                    .and_then(|item| match item {
-                        Value::Concrete(ConcreteValue::Map(map)) => Some(map),
-                        _ => None,
-                    });
-                let mut item_path = path.attributes.to_vec();
-                item_path.push(crate::parser::AttributePathSegment::ListIndex(index));
-                resolve_block_names_in_map(
-                    map,
-                    authored_map,
-                    &fields,
+                edits.path.push_index(index);
+                resolve_block_names_in_value(
+                    item,
+                    authored.and_then(|items| items.get(index)),
+                    element_type,
+                    ancestry,
                     context,
-                    BlockNamePath {
-                        display: &format!("{}[{index}]", path.display),
-                        attributes: &item_path,
-                    },
-                    conflicts,
+                    edits,
+                    fits.and_then(|fits| fits.get(index)),
+                );
+                edits.path.pop();
+            }
+        }
+        Shape::Map {
+            value: value_type, ..
+        } => {
+            let Value::Concrete(ConcreteValue::Map(map)) = value else {
+                return;
+            };
+            let authored = match authored_value {
+                Some(Value::Concrete(ConcreteValue::Map(map))) => Some(map),
+                _ => None,
+            };
+            let fits = match fit {
+                Some(Fit {
+                    kind: FitKind::Map(fits),
+                    ..
+                }) => Some(fits),
+                _ => None,
+            };
+            for (index, (key, value)) in map.iter_mut().enumerate() {
+                edits.path.push_key(key);
+                resolve_block_names_in_value(
+                    value,
+                    authored.and_then(|map| map.get(key)),
+                    value_type,
+                    ancestry,
+                    context,
+                    edits,
+                    fits.and_then(|fits| fits.get(index)).map(|fit| &fit.value),
+                );
+                edits.path.pop();
+            }
+        }
+        Shape::Union => {
+            if let Some(Fit {
+                kind: FitKind::Union { member, fit },
+                ..
+            }) = fit
+            {
+                resolve_block_names_in_value(
+                    value,
+                    authored_value,
+                    member,
+                    ancestry,
+                    context,
+                    edits,
+                    Some(fit),
+                );
+            } else if let Some(selected) = block_union_fit(attr_type, value, context) {
+                resolve_block_names_in_value(
+                    value,
+                    authored_value,
+                    selected.member,
+                    ancestry,
+                    context,
+                    edits,
+                    Some(&selected.fit),
                 );
             }
         }
-        _ => {}
+        Shape::UnloadedSchemaType(_)
+        | Shape::Reference { .. }
+        | Shape::String { .. }
+        | Shape::Int { .. }
+        | Shape::Float { .. }
+        | Shape::Bool
+        | Shape::Duration
+        | Shape::Enum { .. } => {}
     }
 }
 
-#[derive(Clone, Copy)]
-struct BlockNamePath<'a> {
-    display: &'a str,
-    attributes: &'a [crate::parser::AttributePathSegment],
+#[derive(Default)]
+struct BlockNameEdits {
+    path: BlockNamePath,
+    renames: Vec<AttributePathRename>,
+    conflicts: Vec<BlockNameConflict>,
+}
+
+#[derive(Default)]
+struct BlockNamePath {
+    attributes: Vec<crate::parser::AttributePathSegment>,
+    protected: Vec<usize>,
+    secret: bool,
+}
+impl BlockNamePath {
+    fn push_field(&mut self, name: &str) {
+        #[cfg(test)]
+        record_block_name_path_work(name.len() + 1);
+        self.attributes.push(if self.attributes.is_empty() {
+            crate::parser::AttributePathSegment::Attribute(name.to_owned())
+        } else {
+            crate::parser::AttributePathSegment::StructField(name.to_owned())
+        });
+    }
+    fn push_index(&mut self, index: usize) {
+        #[cfg(test)]
+        record_block_name_path_work(1);
+        self.attributes
+            .push(crate::parser::AttributePathSegment::ListIndex(index));
+    }
+    fn push_key(&mut self, key: &str) {
+        #[cfg(test)]
+        record_block_name_path_work(key.len() + 1);
+        if self.secret {
+            self.protected.push(self.attributes.len());
+        }
+        self.attributes
+            .push(crate::parser::AttributePathSegment::Key(key.to_owned()));
+    }
+    fn pop(&mut self) {
+        if self.protected.last().copied() == self.attributes.len().checked_sub(1) {
+            self.protected.pop();
+        }
+        self.attributes.pop();
+    }
+    fn source_path(&self) -> Vec<crate::parser::AttributePathSegment> {
+        #[cfg(test)]
+        record_block_name_path_work(self.attributes.len());
+        self.attributes.clone()
+    }
+    fn display(&self) -> String {
+        use crate::parser::AttributePathSegment as Segment;
+        use std::fmt::Write;
+        let mut text = String::new();
+        let mut protected = self.protected.iter().copied().peekable();
+        for (index, segment) in self.attributes.iter().enumerate() {
+            #[cfg(test)]
+            record_block_name_path_work(1);
+            match segment {
+                Segment::Attribute(name) | Segment::StructField(name) => {
+                    let nested = !text.is_empty();
+                    write_path_field(&mut text, name, nested).expect("write String");
+                }
+                Segment::ListIndex(index) => write!(text, "[{index}]").expect("write String"),
+                Segment::Key(key) => {
+                    if protected.peek() == Some(&index) {
+                        protected.next();
+                        text.push_str("[\"<secret>\"]");
+                    } else {
+                        write!(text, "[{key:?}]").expect("write String");
+                    }
+                }
+            }
+        }
+        text
+    }
 }
 
 #[derive(Clone, Copy)]
 struct BlockNameResolutionContext<'a> {
     defs: &'a BTreeMap<String, CompiledAttributeType>,
+    declarations: &'a crate::input_rules::InputRuleDeclarations,
     resource_id: &'a str,
-    renames: &'a std::cell::RefCell<Vec<AttributePathRename>>,
+    owner: &'a str,
+    authority: &'a crate::input_rules::InputSelectionAuthority,
 }
 
 type AttributePathRename = (Vec<crate::parser::AttributePathSegment>, String);
 
-fn block_fields(schema: &CompiledResourceSchema) -> Vec<BlockFieldRef<'_>> {
+fn block_fields(schema: &CompiledResourceSchema) -> BlockFields<'_> {
     schema
         .attributes
         .values()
@@ -12764,7 +13885,7 @@ fn resolve_attribute_block_names<P: PlaceholderKind, B: BindingAddress>(
     attributes: &mut IndexMap<String, Value<P, B>>,
     declaration: &mut crate::parser::DeclarationProvenance,
     authored_attributes: Option<&IndexMap<String, Value<P, B>>>,
-    schema: &CompiledResourceSchema,
+    schema: &ValidatedResourceSchema,
 ) -> Vec<BlockNameConflict> {
     resolve_attribute_block_names_with_authored(
         resource_id,
@@ -12784,144 +13905,280 @@ fn resolve_attribute_block_names_with_authored<
     attributes: &mut IndexMap<String, Value<P, B>>,
     declaration: &mut crate::parser::DeclarationProvenance,
     authored_attributes: Option<&IndexMap<String, Value<P, AB>>>,
-    schema: &CompiledResourceSchema,
+    schema: &ValidatedResourceSchema,
 ) -> Vec<BlockNameConflict> {
-    let fields = block_fields(schema);
-    let mut conflicts = Vec::new();
-    let renames = std::cell::RefCell::new(Vec::new());
-    let resource_id = resource_id.to_string();
+    resolve_attribute_block_names_with_authority(
+        resource_id,
+        attributes,
+        declaration,
+        authored_attributes,
+        schema,
+        &crate::input_rules::InputSelectionAuthority::default(),
+    )
+}
+
+fn resolve_attribute_block_names_with_authority<
+    P: PlaceholderKind,
+    B: BindingAddress,
+    AB: BindingAddress,
+>(
+    resource_id: &ResourceId,
+    attributes: &mut IndexMap<String, Value<P, B>>,
+    declaration: &mut crate::parser::DeclarationProvenance,
+    authored_attributes: Option<&IndexMap<String, Value<P, AB>>>,
+    schema: &ValidatedResourceSchema,
+    authority: &crate::input_rules::InputSelectionAuthority,
+) -> Vec<BlockNameConflict> {
+    let fields = block_fields(schema.as_schema());
+    let mut edits = BlockNameEdits::default();
     resolve_block_names_in_map(
         attributes,
         authored_attributes,
         &fields,
         BlockNameResolutionContext {
-            defs: &schema.defs,
-            resource_id: &resource_id,
-            renames: &renames,
+            defs: schema.as_schema().defs(),
+            declarations: schema.input_rule_declarations(),
+            resource_id: &resource_id.to_string(),
+            owner: &resource_id.provider,
+            authority,
         },
-        BlockNamePath {
-            display: "",
-            attributes: &[],
-        },
-        &mut conflicts,
+        &mut edits,
+        None,
     );
-    for (path, name) in renames.into_inner() {
-        declaration.rename_attribute_path(&path, &name);
-    }
-    conflicts
+    declaration.rename_attribute_paths(edits.renames);
+    edits.conflicts
 }
 
-fn find_block_name_alias_in_map<P: PlaceholderKind, B: BindingAddress>(
+pub(crate) fn resolve_resource_block_names_in_session<
+    S,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    D,
+>(
+    resource: &mut Resource<S, P, B, D>,
+    schemas: &SchemaRegistry,
+    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+) -> Vec<BlockNameConflict> {
+    let Some(schema) = schemas.get_for(resource) else {
+        return Vec::new();
+    };
+    resolve_attribute_block_names_with_authority(
+        &resource.id,
+        &mut resource.attributes,
+        &mut resource.declaration,
+        None::<&IndexMap<String, Value<P, B>>>,
+        schema.schema(),
+        &crate::input_rules::InputSelectionAuthority::in_catalog(session.catalog()),
+    )
+}
+
+fn find_block_name_alias_in_map<'schema, P: PlaceholderKind, B: BindingAddress>(
     map: &IndexMap<String, Value<P, B>>,
-    fields: &[BlockFieldRef<'_>],
-    defs: &BTreeMap<String, CompiledAttributeType>,
-    resource_id: &str,
-    parent_path: &str,
+    fields: &BlockFields<'schema>,
+    context: BlockNameResolutionContext<'schema>,
+    path: &mut BlockNamePath,
+    fit: Option<&Fit<'schema>>,
 ) -> Option<BlockNameConflict> {
     for (key, value) in map {
-        if let Some(BlockFieldMatch::Alias(field)) = match_block_field(key, value, fields, defs) {
+        if let Some(BlockFieldMatch::Alias(field)) =
+            match_block_field(key, value, fields, context.defs)
+        {
             return Some(block_name_conflict(
-                resource_id,
-                parent_path,
+                context.resource_id,
+                &path.display(),
                 key,
                 field.name,
             ));
         }
     }
-
+    let fits = block_struct_fits(map, fields, fit, context.defs);
     for field in fields {
+        if !context.declarations.aliases_reachable(field.field_type) {
+            continue;
+        }
         let Some(value) = map.get(field.name) else {
             continue;
         };
-        if let Some(alias) = find_block_name_alias_in_value(
+        path.push_field(field.name);
+        let found = find_block_name_alias_in_value(
             value,
             field.field_type,
-            defs,
             field.child_ancestry,
-            resource_id,
-            &nested_path(parent_path, field.name),
-        ) {
-            return Some(alias);
+            context,
+            path,
+            fits.get(field.name).copied(),
+        );
+        path.pop();
+        if found.is_some() {
+            return found;
         }
     }
     None
 }
 
-fn find_block_name_alias_in_value<P: PlaceholderKind, B: BindingAddress>(
+fn find_block_name_alias_in_value<'schema, P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
-    attr_type: &PatternAttributeType<Compiled>,
-    defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
+    attr_type: &'schema CompiledAttributeType,
     ancestry: FieldAncestry,
-    resource_id: &str,
-    path: &str,
+    context: BlockNameResolutionContext<'schema>,
+    path: &mut BlockNamePath,
+    fit: Option<&Fit<'schema>>,
 ) -> Option<BlockNameConflict> {
-    match attr_type.shape_with_defs(defs) {
+    let fit = opened_block_fit(fit);
+    if let Value::Deferred(DeferredValue::Secret(payload)) = value {
+        let old_scope = path.secret;
+        path.secret = true;
+        let found = find_block_name_alias_in_value(
+            payload.expose_plaintext(),
+            attr_type,
+            ancestry,
+            context,
+            path,
+            fit,
+        );
+        path.secret = old_scope;
+        return found;
+    }
+    match attr_type.shape_with_defs(context.defs) {
         Shape::Struct { .. } => {
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
                 return None;
             };
-            let fields = struct_fields_with_defs(attr_type, defs)?
-                .iter()
-                .map(|field| BlockFieldRef {
-                    name: &field.name,
-                    block_name: ancestry.block_name(field),
-                    field_type: &field.field_type,
-                    child_ancestry: ancestry.descend(field),
-                })
-                .collect::<Vec<_>>();
-            find_block_name_alias_in_map(map, &fields, defs, resource_id, path)
+            let fields = BlockFields::for_struct(
+                struct_fields_with_defs(attr_type, context.defs)?,
+                ancestry,
+            );
+            find_block_name_alias_in_map(map, &fields, context, path, fit)
         }
-        Shape::List { element_type, .. }
-            if matches!(element_type.shape_with_defs(defs), Shape::Struct { .. }) =>
-        {
+        Shape::List { element_type, .. } => {
             let Value::Concrete(ConcreteValue::List(items)) = value else {
                 return None;
             };
-            let fields = struct_fields_with_defs(element_type, defs)?
-                .iter()
-                .map(|field| BlockFieldRef {
-                    name: &field.name,
-                    block_name: ancestry.block_name(field),
-                    field_type: &field.field_type,
-                    child_ancestry: ancestry.descend(field),
-                })
-                .collect::<Vec<_>>();
-            items.iter().enumerate().find_map(|(index, item)| {
-                let Value::Concrete(ConcreteValue::Map(map)) = item else {
-                    return None;
-                };
-                find_block_name_alias_in_map(
-                    map,
-                    &fields,
-                    defs,
-                    resource_id,
-                    &format!("{path}[{index}]"),
-                )
-            })
+            let fits = match fit {
+                Some(Fit {
+                    kind: FitKind::List(fits) | FitKind::StringList(fits),
+                    ..
+                }) => Some(fits),
+                _ => None,
+            };
+            for (index, value) in items.iter().enumerate() {
+                path.push_index(index);
+                let found = find_block_name_alias_in_value(
+                    value,
+                    element_type,
+                    ancestry,
+                    context,
+                    path,
+                    fits.and_then(|fits| fits.get(index)),
+                );
+                path.pop();
+                if found.is_some() {
+                    return found;
+                }
+            }
+            None
         }
-        _ => None,
+        Shape::Map {
+            value: value_type, ..
+        } => {
+            let Value::Concrete(ConcreteValue::Map(map)) = value else {
+                return None;
+            };
+            let fits = match fit {
+                Some(Fit {
+                    kind: FitKind::Map(fits),
+                    ..
+                }) => Some(fits),
+                _ => None,
+            };
+            for (index, (key, value)) in map.iter().enumerate() {
+                path.push_key(key);
+                let found = find_block_name_alias_in_value(
+                    value,
+                    value_type,
+                    ancestry,
+                    context,
+                    path,
+                    fits.and_then(|fits| fits.get(index)).map(|fit| &fit.value),
+                );
+                path.pop();
+                if found.is_some() {
+                    return found;
+                }
+            }
+            None
+        }
+        Shape::Union => {
+            if let Some(Fit {
+                kind: FitKind::Union { member, fit },
+                ..
+            }) = fit
+            {
+                find_block_name_alias_in_value(value, member, ancestry, context, path, Some(fit))
+            } else if let Some(selected) = block_union_fit(attr_type, value, context) {
+                find_block_name_alias_in_value(
+                    value,
+                    selected.member,
+                    ancestry,
+                    context,
+                    path,
+                    Some(&selected.fit),
+                )
+            } else {
+                None
+            }
+        }
+        Shape::UnloadedSchemaType(_)
+        | Shape::Reference { .. }
+        | Shape::String { .. }
+        | Shape::Int { .. }
+        | Shape::Float { .. }
+        | Shape::Bool
+        | Shape::Duration
+        | Shape::Enum { .. } => None,
     }
 }
 
-/// Find the first block alias without cloning or mutating the resource.
-///
-/// This uses the same field matcher as the rename pass, including the narrow
-/// ambiguous-name rule for parser-produced lists. Union values are left to
-/// normal schema validation.
+/// Find the first provable block alias with shared declaration/fit facts and
+/// protected, lazily rendered paths. Unavailable union authority never guesses.
+#[cfg(test)]
 pub(crate) fn find_resource_block_name_alias<S, P: PlaceholderKind, B: BindingAddress, D>(
     resource: &Resource<S, P, B, D>,
-    schema: &CompiledResourceSchema,
+    schema: &ValidatedResourceSchema,
 ) -> Option<BlockNameConflict> {
-    find_block_name_alias_in_map(
-        &resource.attributes,
-        &block_fields(schema),
-        &schema.defs,
-        &resource.id.to_string(),
-        "",
+    find_resource_block_name_alias_with_authority(
+        resource,
+        schema,
+        &crate::input_rules::InputSelectionAuthority::default(),
     )
 }
 
-fn resolve_block_names_detailed<S, P: PlaceholderKind, B: BindingAddress>(
+pub(crate) fn find_resource_block_name_alias_with_authority<
+    S,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    D,
+>(
+    resource: &Resource<S, P, B, D>,
+    schema: &ValidatedResourceSchema,
+    authority: &crate::input_rules::InputSelectionAuthority,
+) -> Option<BlockNameConflict> {
+    find_block_name_alias_in_map(
+        &resource.attributes,
+        &block_fields(schema.as_schema()),
+        BlockNameResolutionContext {
+            defs: schema.as_schema().defs(),
+            declarations: schema.input_rule_declarations(),
+            resource_id: &resource.id.to_string(),
+            owner: &resource.id.provider,
+            authority,
+        },
+        &mut BlockNamePath::default(),
+        None,
+    )
+}
+
+pub(crate) fn resolve_block_names_detailed<S, P: PlaceholderKind, B: BindingAddress>(
     resources: &mut [Resource<S, P, B>],
     registry: &SchemaRegistry,
 ) -> Vec<BlockNameConflict> {
@@ -12958,7 +14215,7 @@ fn resolve_managed_attribute_block_names<
         attributes,
         declaration,
         authored_attributes,
-        schema.as_schema(),
+        schema.schema(),
     )
 }
 
@@ -13046,7 +14303,7 @@ fn resolve_file_block_names<
                         &mut data_source.attributes,
                         &mut data_source.declaration,
                         None,
-                        schema.as_schema(),
+                        schema.schema(),
                     ));
                 }
             }
@@ -13160,7 +14417,7 @@ where
                         &mut data_source.attributes,
                         &mut data_source.declaration,
                         authored_attributes,
-                        schema.as_schema(),
+                        schema.schema(),
                     ));
                 }
             }
@@ -13674,44 +14931,87 @@ impl RefinedScalarKind {
     }
 }
 
+/// Shared inclusive interval spelling for schema diagnostics and hover metadata.
+pub fn format_refinement_bounds<T: fmt::Display>((min, max): (Option<T>, Option<T>)) -> String {
+    match (min, max) {
+        (Some(min), Some(max)) => format!("{min}..={max}"),
+        (Some(min), None) => format!("{min}..unbounded"),
+        (None, Some(max)) => format!("unbounded..={max}"),
+        (None, None) => "unbounded".into(),
+    }
+}
+
 impl<R: PatternForm> PatternAttributeType<R> {
-    fn scalar_diagnostic_name(&self) -> String {
-        fn bounds<T: fmt::Display>(bounds: Option<(Option<T>, Option<T>)>) -> String {
-            let (min, max) = bounds.unwrap_or((None, None));
-            match (min, max) {
-                (Some(min), Some(max)) => format!("{min}..={max}"),
-                (Some(min), None) => format!("{min}..unbounded"),
-                (None, Some(max)) => format!("unbounded..={max}"),
-                (None, None) => "unbounded".into(),
+    pub(crate) fn identity_patterns(&self) -> BTreeSet<&PatternSpec> {
+        match &self.kind {
+            AttrTypeKind::String {
+                identity_layer:
+                    StringIdentityLayer {
+                        binding,
+                        pattern,
+                        length: _,
+                        to_dsl: _,
+                    },
+                member_layer: _,
+            } => {
+                let mut patterns: BTreeSet<_> =
+                    pattern.as_ref().map(AsRef::as_ref).into_iter().collect();
+                if let Some(annotation) = binding.annotation() {
+                    patterns.extend(annotation.owner_patterns().map(AsRef::as_ref));
+                }
+                patterns
             }
+            AttrTypeKind::Reference {
+                identity: _,
+                pattern,
+                length: _,
+            } => pattern.as_ref().map(AsRef::as_ref).into_iter().collect(),
+            _ => BTreeSet::new(),
         }
+    }
+    fn scalar_diagnostic_name(&self) -> String {
         let mut constraints = Vec::new();
         match &self.kind {
             AttrTypeKind::String {
-                binding,
-                pattern,
-                length,
-                ..
+                identity_layer:
+                    StringIdentityLayer {
+                        binding: _,
+                        pattern: _,
+                        length,
+                        ..
+                    },
+                member_layer,
             } => {
-                constraints.push(format!("length {}", bounds(*length)));
-                if let Some(owned) = binding.annotation() {
-                    constraints.extend(owned.patterns().map(|pattern| {
-                        format!(
-                            "pattern {}",
-                            PatternSpecDisplay::new(pattern.as_ref()).quoted()
-                        )
-                    }));
-                } else if let Some(pattern) = pattern {
+                constraints.push(format!(
+                    "length {}",
+                    format_refinement_bounds(length.unwrap_or_default())
+                ));
+                for pattern in self.identity_patterns() {
                     constraints.push(format!(
                         "pattern {}",
+                        PatternSpecDisplay::new(pattern).quoted()
+                    ));
+                }
+                if let Some(pattern) = &member_layer.pattern {
+                    constraints.push(format!(
+                        "member pattern {}",
                         PatternSpecDisplay::new(pattern.as_ref()).quoted()
+                    ));
+                }
+                if member_layer.length.is_some() {
+                    constraints.push(format!(
+                        "member length {}",
+                        format_refinement_bounds(member_layer.length.unwrap_or_default())
                     ));
                 }
             }
             AttrTypeKind::Reference {
                 pattern, length, ..
             } => {
-                constraints.push(format!("length {}", bounds(*length)));
+                constraints.push(format!(
+                    "length {}",
+                    format_refinement_bounds(length.unwrap_or_default())
+                ));
                 if let Some(pattern) = pattern {
                     constraints.push(format!(
                         "pattern {}",
@@ -13719,14 +15019,48 @@ impl<R: PatternForm> PatternAttributeType<R> {
                     ));
                 }
             }
-            AttrTypeKind::Int { range, .. } => {
-                constraints.push(format!("range {}", bounds(*range)))
+            AttrTypeKind::Int {
+                identity_layer: IntIdentityLayer { binding: _, range },
+                member_layer:
+                    IntMemberConstraints {
+                        range: member_range,
+                    },
+            } => {
+                constraints.push(format!(
+                    "range {}",
+                    format_refinement_bounds(range.unwrap_or_default())
+                ));
+                if member_range.is_some() {
+                    constraints.push(format!(
+                        "member range {}",
+                        format_refinement_bounds(member_range.unwrap_or_default())
+                    ));
+                }
             }
-            AttrTypeKind::Float { range, .. } => {
-                constraints.push(format!("range {}", bounds(*range)))
-            }
-            AttrTypeKind::Enum { base, .. } => {
-                return format!("{} ({})", self.type_name(), base.scalar_diagnostic_name());
+            AttrTypeKind::Float { range, .. } => constraints.push(format!(
+                "range {}",
+                format_refinement_bounds(range.unwrap_or_default())
+            )),
+            AttrTypeKind::Enum { base, values, .. } => {
+                let values = values.as_ref().map_or_else(
+                    || "any".into(),
+                    |values| {
+                        format!(
+                            "[{}]",
+                            values
+                                .iter()
+                                .map(|value| display_string_literal(value))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    },
+                );
+                return format!(
+                    "{} ({}, values: {})",
+                    self.type_name(),
+                    base.scalar_diagnostic_name(),
+                    values
+                );
             }
             _ => return self.type_name(),
         }
@@ -13738,8 +15072,14 @@ impl<R: PatternForm> PatternAttributeType<R> {
 
     pub(crate) fn has_empty_scalar_intersection(&self) -> bool {
         match &self.kind {
-            AttrTypeKind::String { binding, .. }
-            | AttrTypeKind::Int { binding, .. }
+            AttrTypeKind::String {
+                identity_layer: StringIdentityLayer { binding, .. },
+                ..
+            }
+            | AttrTypeKind::Int {
+                identity_layer: IntIdentityLayer { binding, .. },
+                ..
+            }
             | AttrTypeKind::Float { binding, .. } => binding
                 .annotation()
                 .is_some_and(crate::parser::ResolvedSchemaType::has_empty_intersection),
@@ -13789,62 +15129,18 @@ pub fn builtin_type_registry() -> &'static HashMap<TypeIdentity, CompiledAttribu
 }
 
 fn same_builtin_declaration(
-    declaration: &CompiledAttributeType,
-    builtin: &CompiledAttributeType,
+    declaration: Option<ScalarIdentityParts<'_>>,
+    builtin: ScalarIdentityParts<'_>,
 ) -> bool {
-    let callbacks_match = |actual: Option<&CustomValidator>, expected: Option<&CustomValidator>| {
-        actual
-            .zip(expected)
-            .is_some_and(|(actual, expected)| Arc::ptr_eq(actual, expected))
+    let Some(declaration) = declaration else {
+        return false;
     };
-    match (declaration.raw_shape(), builtin.raw_shape()) {
-        (RawShape::UnloadedSchemaType(_), _) | (_, RawShape::UnloadedSchemaType(_)) => false,
-        (
-            RawShape::String {
-                pattern: a_pattern,
-                length: a_length,
-                validate: a_validate,
-                to_dsl: a_dsl,
-                ..
-            },
-            RawShape::String {
-                pattern: b_pattern,
-                length: b_length,
-                validate: b_validate,
-                to_dsl: b_dsl,
-                ..
-            },
-        ) => {
-            a_pattern == b_pattern
-                && a_length == b_length
-                && a_dsl == b_dsl
-                && callbacks_match(a_validate, b_validate)
-        }
-        (
-            RawShape::Int {
-                range: a_range,
-                validate: a_validate,
-                ..
-            },
-            RawShape::Int {
-                range: b_range,
-                validate: b_validate,
-                ..
-            },
-        ) => a_range == b_range && callbacks_match(a_validate, b_validate),
-        (
-            RawShape::Float {
-                range: a_range,
-                validate: a_validate,
-                ..
-            },
-            RawShape::Float {
-                range: b_range,
-                validate: b_validate,
-                ..
-            },
-        ) => a_range == b_range && callbacks_match(a_validate, b_validate),
-        _ => false,
+    if !declaration.same_definition(builtin) {
+        return false;
+    }
+    match (declaration.callback(), builtin.callback()) {
+        (Some(actual), Some(expected)) => Arc::ptr_eq(actual, expected),
+        (None, None) | (Some(_), None) | (None, Some(_)) => false,
     }
 }
 
@@ -13864,8 +15160,14 @@ pub fn builtin_validator_registry()
                 AttrTypeKind::UnloadedSchemaType(_) => {
                     unreachable!("built-ins carry scalar declarations")
                 }
-                AttrTypeKind::String { binding, .. } => (RefinedScalarKind::String, binding),
-                AttrTypeKind::Int { binding, .. } => (RefinedScalarKind::Int, binding),
+                AttrTypeKind::String {
+                    identity_layer: StringIdentityLayer { binding, .. },
+                    ..
+                } => (RefinedScalarKind::String, binding),
+                AttrTypeKind::Int {
+                    identity_layer: IntIdentityLayer { binding, .. },
+                    ..
+                } => (RefinedScalarKind::Int, binding),
                 AttrTypeKind::Float { binding, .. } => (RefinedScalarKind::Float, binding),
                 _ => continue,
             };
@@ -15132,10 +16434,14 @@ fn finish_resource_schema_validation(
     match schema {
         Some(mut schema) if issues.is_empty() => {
             schema.duplicate_attributes.clear();
+            let schema = Arc::new(schema);
+            let input_rule_declarations =
+                Arc::new(crate::input_rules::InputRuleDeclarations::new(&schema));
             Ok(ValidatedResourceSchema {
                 admission_identity: Default::default(),
-                schema: Arc::new(schema),
+                schema,
                 identity_paths,
+                input_rule_declarations,
             })
         }
         _ => Err(ResourceSchemaValidationError {
@@ -15201,7 +16507,7 @@ impl<R: PatternForm> PatternResourceSchema<R> {
         if !budget.take() {
             return None;
         }
-        struct_fields_with_defs(ty, &self.defs)
+        struct_fields_with_defs(ty, &self.defs).map(IndexedStructFields::as_slice)
     }
 
     pub fn union_members_with_budget<'a>(
@@ -15558,29 +16864,43 @@ pub(crate) fn assignment_catalog_without_edges_for_test()
 
 impl crate::resource::InsideSecret for LeafPath {
     fn inside_secret(self) -> Self {
-        Self::from_segments(self.0.into_iter().map(|segment| match segment {
-            LeafPathSegment::StructField(_) => {
-                LeafPathSegment::StructField(SECRET_VALUE_MASK.to_owned())
-            }
-            LeafPathSegment::MapKey(_) => LeafPathSegment::MapKey(SECRET_VALUE_MASK.into()),
-            LeafPathSegment::ListIndex(index) => LeafPathSegment::ListIndex(index),
-        }))
+        Self(
+            self.0
+                .into_iter()
+                .map(|segment| match segment {
+                    LeafPathSegment::StructField(_) => {
+                        LeafPathSegment::StructField(SECRET_VALUE_MASK.to_owned())
+                    }
+                    LeafPathSegment::MapKey(_) => LeafPathSegment::MapKey(SECRET_VALUE_MASK.into()),
+                    LeafPathSegment::ListIndex(index) => LeafPathSegment::ListIndex(index),
+                })
+                .collect(),
+            LeafPathRendering::Redacted,
+        )
     }
 }
 
 impl crate::resource::InsideSecret for FieldPath {
     fn inside_secret(self) -> Self {
-        Self {
-            canonical: LeafPath::from_segments(self.canonical).inside_secret().0,
-            steps: self
-                .steps
-                .into_iter()
-                .map(|step| match step {
-                    FieldPathStep::Field(_) => FieldPathStep::Field(SECRET_VALUE_MASK.to_string()),
-                    FieldPathStep::Index(index) => FieldPathStep::Index(index),
-                })
-                .collect(),
+        let segments = self.materialized();
+        let mut path = Self::new();
+        for (step, canonical) in segments.steps.iter().zip(&segments.canonical) {
+            let step = match step {
+                FieldPathStep::Field(_) | FieldPathStep::Redacted(_) => {
+                    FieldPathStep::Redacted(RedactedPathField::SecretValue)
+                }
+                FieldPathStep::Index(index) => FieldPathStep::Index(*index),
+            };
+            let canonical = match canonical {
+                LeafPathSegment::StructField(_) => {
+                    LeafPathSegment::StructField(SECRET_VALUE_MASK.to_string())
+                }
+                LeafPathSegment::MapKey(_) => LeafPathSegment::MapKey(SECRET_VALUE_MASK.into()),
+                LeafPathSegment::ListIndex(index) => LeafPathSegment::ListIndex(*index),
+            };
+            path = path.pushed(step, canonical, FieldPathDirection::After);
         }
+        path
     }
 }
 

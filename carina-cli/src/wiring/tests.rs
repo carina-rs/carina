@@ -15384,7 +15384,13 @@ fn settlement_loaded_validation_report_cannot_hide_pending_evidence() {
                 "attribute 'x'",
             ),
         );
-        Ok(Default::default())
+        let authored =
+            carina_core::parser::parse_file("", Path::new("/project/main.crn"), checks.catalog())
+                .unwrap();
+        crate::commands::ConfigurationValidation {
+            result: Ok(Default::default()),
+            authored_inputs: authored.authored_inputs().unwrap().clone(),
+        }
     });
     let schemas = SchemaRegistry::new();
     let report: ValidationReport = ValidationReport::settle(checks, &schemas);

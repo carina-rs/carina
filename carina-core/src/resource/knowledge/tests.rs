@@ -243,7 +243,7 @@ fn pending_coalesce_keeps_failed_alternative_without_making_it_required() {
     let Classification::Pending(pending) = resolved.knowledge() else {
         panic!("the alternative cannot become a value before selection")
     };
-    let kernel::PendingNode::Coalesce(coalesce) = &pending.node else {
+    let kernel::PendingNode::Coalesce(coalesce) = pending.node.as_ref() else {
         panic!("the failed alternative belongs to the pending coalesce")
     };
     assert!(matches!(
@@ -904,14 +904,14 @@ fn shared_lexical_body_keeps_each_invocations_operand_timing() {
     let Classification::ShapeKnown(shape) = &*knowledge else {
         panic!("partial list");
     };
-    let kernel::ShapeNode::List(items) = &shape.node else {
+    let kernel::ShapeNode::List(items) = shape.node.as_ref() else {
         panic!("list");
     };
     let analysis = |item: &Classification<'_, ParserPlaceholder, RelativeBindingName>| {
         let Classification::Pending(pending) = item else {
             panic!("call");
         };
-        let kernel::PendingNode::Ordinary(inputs) = &pending.node else {
+        let kernel::PendingNode::Ordinary(inputs) = pending.node.as_ref() else {
             panic!("ordinary call");
         };
         inputs

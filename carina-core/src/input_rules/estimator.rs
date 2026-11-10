@@ -45,6 +45,24 @@ impl Characters {
             Self::from_set(&CharSet::new(ranges).expect("valid scalar ranges"))
         }
     }
+    fn intersect(&self, other: &Self) -> Self {
+        let ranges = self
+            .0
+            .iter()
+            .flat_map(|(a, b)| {
+                other.0.iter().filter_map(move |(c, d)| {
+                    let start = (*a).max(*c);
+                    let end = (*b).min(*d);
+                    (start <= end).then_some((start, end))
+                })
+            })
+            .collect::<Vec<_>>();
+        if ranges.is_empty() {
+            Self::empty()
+        } else {
+            Self::from_set(&CharSet::new(ranges).expect("valid scalar ranges"))
+        }
+    }
     fn subset(&self, other: &Self) -> bool {
         self.0
             .iter()
@@ -452,8 +470,7 @@ fn path_may_be_absent<'a>(
                     return true;
                 };
                 if fields
-                    .iter()
-                    .find(|field| field.name == *name)
+                    .field(name)
                     .is_none_or(|field| field.parts().declared_input_mode == InputMode::Optional)
                 {
                     return true;
@@ -648,6 +665,35 @@ impl Estimator<'_> {
         }
     }
 
+    fn string_constraints<'a>(
+        &self,
+        bounds: impl IntoIterator<Item = Option<(Option<u64>, Option<u64>)>>,
+        patterns: impl IntoIterator<Item = Option<&'a crate::schema::CompiledPattern>>,
+    ) -> Summary {
+        let mut length = LengthInterval::from_bounds(None);
+        for bounds in bounds {
+            let Some(intersection) = length.intersect(LengthInterval::from_bounds(bounds.as_ref()))
+            else {
+                return Summary::unknown(&self.query);
+            };
+            length = intersection;
+        }
+        let mut alphabet = Characters::all();
+        for pattern in patterns.into_iter().flatten() {
+            if let Some((set, pattern_length)) = pattern.whole_string_class() {
+                let Some(intersection) = length.intersect(pattern_length) else {
+                    return Summary::unknown(&self.query);
+                };
+                length = intersection;
+                alphabet = alphabet.intersect(&Characters::from_set(&set));
+                if alphabet.0.is_empty() {
+                    return Summary::unknown(&self.query);
+                }
+            }
+        }
+        Summary::homogeneous(length, alphabet, &self.query)
+    }
+
     fn declared(
         &mut self,
         ty: &CompiledAttributeType,
@@ -704,25 +750,25 @@ impl Estimator<'_> {
             }
             _ if keys => Summary::unknown(&self.query),
             AttrTypeKind::String {
+                identity_layer:
+                    crate::schema::StringIdentityLayer {
+                        binding: _binding,
+                        pattern,
+                        length,
+                        to_dsl: _to_dsl,
+                    },
+                member_layer:
+                    crate::schema::StringMemberConstraints {
+                        pattern: member_pattern,
+                        length: member_length,
+                    },
+            } => self.string_constraints(
+                [*length, *member_length],
+                [pattern.as_ref(), member_pattern.as_ref()],
+            ),
+            AttrTypeKind::Reference {
                 pattern, length, ..
-            }
-            | AttrTypeKind::Reference {
-                pattern, length, ..
-            } => {
-                let mut length = LengthInterval::from_bounds(length.as_ref());
-                let mut alphabet = Characters::all();
-                if let Some((set, pattern_length)) = pattern
-                    .as_ref()
-                    .and_then(|pattern| pattern.whole_string_class())
-                {
-                    let Some(intersection) = length.intersect(pattern_length) else {
-                        return Summary::unknown(&self.query);
-                    };
-                    length = intersection;
-                    alphabet = Characters::from_set(&set);
-                }
-                Summary::homogeneous(length, alphabet, &self.query)
-            }
+            } => self.string_constraints([*length], [pattern.as_ref()]),
             AttrTypeKind::Enum {
                 values: Some(values),
                 ..
@@ -757,66 +803,32 @@ impl Estimator<'_> {
     }
 }
 
-/// Private entry point: no arbitrary value/type API can bypass a WriteSite.
+/// Every owner enters through its bound, admitted rule and concrete instance.
 pub(super) fn estimate(
-    site: &WriteSite<'_>,
-    rule: &InputRule<Compiled>,
-    path: &[String],
+    applicable: &BoundInputRule<'_, '_>,
+    input: rule_input::EstimatorInput<'_>,
 ) -> InputVerdict {
+    let (expression, keys) = input.into_parts();
+    let rule = applicable.rule;
     if matches!(
         rule.predicate(),
         InputPredicate::Matches(_) | InputPredicate::NotMatches(_)
     ) {
         return InputVerdict::Undecided;
     }
+    let defs = applicable.site.schema.as_schema().defs();
     let mut estimator = Estimator {
-        types: site.types,
-        literal_key_type: site
-            .schema
-            .effective_type_at_attribute_path(path)
-            .ok()
-            .and_then(|node| match node.shape() {
-                crate::schema::Shape::Map { key, .. } => Some((key, node.defs())),
+        types: Some(expression.declarations()),
+        literal_key_type: literal_type(applicable, rule.path()).and_then(|ty| {
+            match ty.shape_with_defs(defs) {
+                crate::schema::Shape::Map { key, .. } => Some((key, defs)),
                 _ => None,
-            }),
+            }
+        }),
         query: Query::new(rule.predicate()),
         steps: 0,
     };
-    match &site.authored {
-        Some(AuthoredAttributes::Resource(attributes)) => {
-            from_authored(attributes, path, site.schema, &mut estimator, rule)
-        }
-        Some(AuthoredAttributes::Template(attributes)) => {
-            from_authored(attributes, path, site.schema, &mut estimator, rule)
-        }
-        None => InputVerdict::Undecided,
-    }
-}
-
-fn from_authored<P: ValueKind>(
-    attributes: &IndexMap<String, Value<P>>,
-    path: &[String],
-    schema: &ValidatedResourceSchema,
-    estimator: &mut Estimator<'_>,
-    rule: &InputRule<Compiled>,
-) -> InputVerdict {
-    if omitted_optional(attributes, path, schema) {
-        return InputVerdict::Proven;
-    }
-    let Some(value) = attributes.get(rule.path().root()) else {
-        return InputVerdict::Undecided;
-    };
-    let tail = path[1..]
-        .iter()
-        .map(|name| PathSegment::Field { name: name.clone() })
-        .collect::<Vec<_>>();
-    let summary = estimator.at_path(
-        value,
-        &tail,
-        matches!(rule.target(), InputRuleTarget::MapKeys(_)),
-        0,
-    );
-    // A concrete map's exact keys obey existential failure.
+    let summary = estimator.at_path(expression.value(), &[], keys, 0);
     decide(summary, rule, &estimator.query)
 }
 
@@ -845,25 +857,6 @@ fn key_spelling_is_stable(
         }
         _ => false,
     }
-}
-
-pub(super) fn omitted_optional<P: ValueKind>(
-    mut fields: &IndexMap<String, Value<P>>,
-    path: &[String],
-    schema: &ValidatedResourceSchema,
-) -> bool {
-    for (index, name) in path.iter().enumerate() {
-        let Some(value) = fields.get(name) else {
-            return schema
-                .effective_node_at_path(&path[..=index])
-                .is_some_and(|node| node.effective_input_mode() == InputMode::Optional);
-        };
-        match peel_secret(value) {
-            Value::Concrete(ConcreteValue::Map(map)) => fields = map,
-            _ => return false,
-        }
-    }
-    false
 }
 
 fn decide(summary: Summary, rule: &InputRule<Compiled>, query: &Query<'_>) -> InputVerdict {
@@ -943,7 +936,7 @@ fn decide(summary: Summary, rule: &InputRule<Compiled>, query: &Query<'_>) -> In
                 .iter()
                 .any(|window| window_can_be_ipv4(window)))
             .then_some(true),
-            Matches(_) | NotMatches(_) => None,
+            Present | Absent | Equals(_) | Matches(_) | NotMatches(_) => None,
         }
     };
     match result {
@@ -1035,9 +1028,54 @@ fn window_can_be_ipv4(window: &[Characters]) -> bool {
 }
 
 fn violation(rule: &InputRule<Compiled>) -> InputViolation {
-    InputViolation {
-        path: rule.path().clone(),
-        code: rule.code().clone(),
-        reason: rule.predicate().violation_reason(),
+    rule_violation(rule)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{
+        AttributeType, PatternMatch, PatternSpec, StringIdentityLayer, StringMemberConstraints,
+        ValidatedConfigSchema,
+    };
+
+    #[test]
+    fn member_layer_narrows_declared_summary() {
+        let schema = ValidatedConfigSchema::validate(BTreeMap::from([(
+            "value".into(),
+            AttributeType::string_member(
+                StringIdentityLayer::new(
+                    None,
+                    Some(PatternSpec::new("[a-z]{1,12}", PatternMatch::Full)),
+                    Some((Some(1), Some(20))),
+                    None,
+                ),
+                StringMemberConstraints::new(
+                    Some(PatternSpec::new("[m-z]{2,8}", PatternMatch::Full)),
+                    Some((Some(3), Some(5))),
+                ),
+            ),
+        )]))
+        .unwrap();
+        let predicate = InputPredicate::Length {
+            min: Some(0),
+            max: Some(10),
+        };
+        let mut estimator = Estimator {
+            types: None,
+            literal_key_type: None,
+            query: Query::new(&predicate),
+            steps: 0,
+        };
+        let summary = estimator.declared(&schema.parts()["value"], &BTreeMap::new(), false, 0);
+        assert_eq!(
+            summary.length,
+            LengthInterval {
+                min: 3,
+                max: Some(5)
+            }
+        );
+        assert!(summary.alphabet.contains('m'));
+        assert!(!summary.alphabet.contains('a'));
     }
 }

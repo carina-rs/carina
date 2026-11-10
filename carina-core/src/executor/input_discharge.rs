@@ -4,17 +4,17 @@ use std::{
     sync::Arc,
 };
 
-use indexmap::IndexMap;
-
 use super::EffectFailureKind;
 use super::basic::PreparedBasicRequest;
 use super::provider_ready::{CheckInput, ProviderPreparationContext};
 use crate::{
     binding_index::SecretPreservingAttributes,
     effect::{DeletedInstanceKey, Effect, EffectGeneration},
-    input_rules::{InputVerdict, PendingInputObligation, executor_write_site},
-    provider::{AppliedIdentifier, CreateRequest, HostProvider, UpdateRequest},
-    resource::{Directives, ResourceId, Value},
+    input_rules::{PendingInputObligation, executor_write_site},
+    provider::{
+        AppliedIdentifier, CreateRequest, HostProvider, ProviderReadyResource, UpdateRequest,
+    },
+    resource::{Directives, ResourceId, SnapshotState},
     schema::SchemaRegistry,
 };
 
@@ -263,33 +263,22 @@ impl WriteCheck {
 
     fn discharge(
         &self,
-        id: &ResourceId,
-        attributes: &IndexMap<String, Value>,
+        input: Arc<crate::input_rules::RuleInput>,
         schemas: &SchemaRegistry,
     ) -> Result<(), EffectFailureKind> {
         let Some(admission) = &self.admission else {
             return Ok(());
         };
         let token = DischargeToken(());
-        let site = executor_write_site(&token, admission, id, attributes, schemas)
+        let site = executor_write_site(&token, admission, input, schemas)
             .map_err(EffectFailureKind::execution)?
             .ok_or_else(|| {
                 EffectFailureKind::message("input rule schema unavailable at dispatch")
             })?;
-        for applicable in site.applicable_rules() {
-            match applicable.evaluate() {
-                InputVerdict::Proven => {}
-                InputVerdict::Violation(violation) => {
-                    return Err(EffectFailureKind::InputRule { violation });
-                }
-                InputVerdict::Undecided => {
-                    return Err(EffectFailureKind::UnresolvedInputRule {
-                        path: applicable.path().clone(),
-                        code: applicable.code().clone(),
-                    });
-                }
-            }
+        if let Some(failure) = site.evaluate().into_dispatch_failure() {
+            return Err(failure);
         }
+
         Ok(())
     }
 
@@ -299,11 +288,13 @@ impl WriteCheck {
         writeback: SecretPreservingAttributes,
         schemas: &SchemaRegistry,
     ) -> Result<PreparedWrite<CreateRequest>, EffectFailureKind> {
-        self.discharge(
-            &request.resource().id,
-            &request.resource().attributes,
-            schemas,
-        )?;
+        if let Some(admission) = &self.admission {
+            let input = crate::input_rules::RuleInput::for_dispatch_create(
+                &request.resource().protected_desired_tree(),
+                &admission.schema,
+            );
+            self.discharge(input, schemas)?;
+        }
         let resource_id = request.resource().id.clone();
         let request = Arc::new(request);
         let retained_request = Arc::clone(&request);
@@ -322,16 +313,52 @@ impl WriteCheck {
 
     pub(super) fn prepare_update(
         self,
-        id: &ResourceId,
+        from: SnapshotState,
+        changed: &[String],
+        desired: ProviderReadyResource,
+        writeback: SecretPreservingAttributes,
+        schemas: &SchemaRegistry,
+    ) -> Result<PreparedWrite<UpdateRequest>, EffectFailureKind> {
+        let schema = super::provider_ready::managed_update_schema(schemas, desired.as_resource())
+            .map_err(EffectFailureKind::execution)?;
+        let request = UpdateRequest::checked(from, changed, &desired, schema)
+            .map_err(EffectFailureKind::execution)?;
+        if let Some(admission) = &self.admission {
+            let input = crate::input_rules::RuleInput::for_dispatch_update(
+                request.protected_input(),
+                &admission.schema,
+            );
+            self.discharge(input, schemas)?;
+        }
+        Ok(self.seal_update(request, writeback))
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(super) fn prepare_update_fixture(
+        self,
         request: UpdateRequest,
         writeback: SecretPreservingAttributes,
         schemas: &SchemaRegistry,
     ) -> Result<PreparedWrite<UpdateRequest>, EffectFailureKind> {
-        let attributes = request.patch().sent_projection();
-        self.discharge(id, &attributes, schemas)?;
-        Ok(PreparedWrite {
+        if let Some(admission) = &self.admission {
+            let input = crate::input_rules::RuleInput::for_dispatch_update(
+                request.protected_input(),
+                &admission.schema,
+            );
+            self.discharge(input, schemas)?;
+        }
+        Ok(self.seal_update(request, writeback))
+    }
+
+    fn seal_update(
+        self,
+        request: UpdateRequest,
+        writeback: SecretPreservingAttributes,
+    ) -> PreparedWrite<UpdateRequest> {
+        let resource_id = request.protected_input().id().clone();
+        PreparedWrite {
             request: Arc::new(request),
-            resource_id: id.clone(),
+            resource_id,
             writeback,
             receipt: Arc::new(PreparationReceipt {
                 slot: self.slot,
@@ -339,7 +366,7 @@ impl WriteCheck {
                 deletes: self.deletes,
                 _create_request: None,
             }),
-        })
+        }
     }
 
     pub(super) fn cohort_receipts<R>(
@@ -679,6 +706,296 @@ mod tests {
     use super::*;
     use crate::input_rules::FinalizedPlan;
     use crate::plan::Plan;
+    use crate::resource::Value;
+
+    #[test]
+    fn provider_selected_union_rules_are_enforced_at_create_and_update_dispatch() {
+        use crate::schema::{
+            AttributeSchema, AttributeType, InputCondition, InputLiteral, InputPath,
+            InputPredicate, InputRule, InputRuleCode, InputRuleScope, ResourceSchema, StructField,
+            TypeIdentity,
+        };
+        let arm = |name: &str, scalar: &str, rules| {
+            AttributeType::struct_with_rules(
+                name,
+                vec![
+                    StructField::required(
+                        "kind",
+                        AttributeType::refined_string(
+                            Some(TypeIdentity::bare(scalar)),
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                    .build(),
+                    StructField::optional("guard", AttributeType::bool()).build(),
+                    StructField::optional("target", AttributeType::bool()).build(),
+                ],
+                vec![],
+                rules,
+            )
+        };
+        let required = InputRule::value(
+            InputRuleScope::EveryWrite,
+            InputPath::new("target").unwrap(),
+            InputRuleCode::new("union.target").unwrap(),
+            InputPredicate::Present,
+        )
+        .with_condition(InputCondition::Equals {
+            path: InputPath::new("guard").unwrap(),
+            literal: InputLiteral::Bool(true),
+        });
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("UnionInput")
+                .attribute(
+                    AttributeSchema::optional(
+                        "node",
+                        AttributeType::union(vec![
+                            arm("A", "First", vec![]),
+                            arm("B", "Second", vec![required]),
+                        ]),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let mut catalog = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::clone(&callbacks);
+        catalog.custom_types = crate::parser::ProviderCustomTypes::loaded(
+            HashSet::new(),
+            Box::new(move |target, _| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let crate::parser::CustomTypeValidationTarget::Annotation(identity) = target else {
+                    panic!("provider annotation callback")
+                };
+                if identity.identity().kind == "First" {
+                    Err(crate::parser::CustomTypeValidationError::Rejected {
+                        owner: "mock".into(),
+                        identity: identity.identity().clone(),
+                        message: "first arm rejected".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            }),
+        );
+        let node = |guard| {
+            Value::Concrete(crate::resource::ConcreteValue::Map(
+                indexmap::IndexMap::from([
+                    (
+                        "kind".into(),
+                        Value::Concrete(crate::resource::ConcreteValue::String("b".into())),
+                    ),
+                    (
+                        "guard".into(),
+                        Value::Concrete(crate::resource::ConcreteValue::Bool(guard)),
+                    ),
+                ]),
+            ))
+        };
+        let bindings = crate::binding_index::ResolvedBindings::default();
+        let gate = super::super::ModuleConstraintGate::from_live_compositions(&[]);
+        crate::validation::deferred_types::with_session_for_test(&catalog, |type_checks| {
+            let context = ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &[],
+                &crate::provider::NoopNormalizer,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            for update in [false, true] {
+                let resource =
+                    crate::resource::Resource::with_provider("mock", "UnionInput", "example", None)
+                        .with_attribute("node", node(false));
+                let initial = futures::executor::block_on(super::super::prepare_create_request(
+                    resource.clone(),
+                    &context,
+                ))
+                .unwrap();
+                let from = SnapshotState::existing(
+                    resource.id.clone(),
+                    crate::test_support::snapshot_attributes(HashMap::from([(
+                        "node".into(),
+                        node(false),
+                    )])),
+                )
+                .with_identifier("existing");
+                let mut plan = Plan::<crate::resource::ProviderModuleSource>::default();
+                plan.add(if update {
+                    Effect::Update {
+                        from: Box::new(from.clone()),
+                        identifier: AppliedIdentifier::new("existing").unwrap(),
+                        to: initial.resource().as_inner().clone(),
+                        changed_attributes: vec!["node".into()],
+                    }
+                } else {
+                    Effect::Create(initial.resource().as_inner().clone())
+                });
+                let checked = FinalizedPlan::new(plan)
+                    .check_inputs(&schemas, &HashMap::new())
+                    .unwrap();
+                let check = ExecutionInputChecks::new(
+                    checked.execution_input_checks(),
+                    checked.effects(),
+                    &[0],
+                )
+                .unwrap()
+                .take_write(0)
+                .unwrap();
+                let request = futures::executor::block_on(super::super::prepare_create_request(
+                    resource.with_attribute("node", node(true)),
+                    &context,
+                ))
+                .unwrap();
+                let attributes = request.resource().as_resource().resolved_attributes();
+                let writeback =
+                    SecretPreservingAttributes::from_provider_values(&attributes, &attributes);
+                let result = if update {
+                    check
+                        .prepare_update(
+                            from,
+                            &["node".into()],
+                            request.resource().clone(),
+                            writeback,
+                            &schemas,
+                        )
+                        .map(|_| ())
+                } else {
+                    check
+                        .prepare_create(request, writeback, &schemas)
+                        .map(|_| ())
+                };
+                assert!(callbacks.load(std::sync::atomic::Ordering::SeqCst) > 0);
+                let error = result
+                    .expect_err("provider-selected B must enforce its local rule at dispatch");
+                assert!(
+                    error.to_string().contains("[union.target]"),
+                    "update={update}: {error}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn create_and_update_discharge_preserve_every_late_input_finding() {
+        use crate::schema::{
+            AttributeSchema, AttributeType, InputPath, InputPredicate, InputRule, InputRuleCode,
+            InputRuleScope, NonEmptyString, ResourceSchema,
+        };
+        let string =
+            |value: &str| Value::Concrete(crate::resource::ConcreteValue::String(value.into()));
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "",
+            ResourceSchema::new("test")
+                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+                .input_rule(InputRule::value(
+                    InputRuleScope::EveryWrite,
+                    InputPath::new("name").unwrap(),
+                    InputRuleCode::new("name.prefix").unwrap(),
+                    InputPredicate::NoPrefix(NonEmptyString::new("bad-").unwrap()),
+                ))
+                .input_rule(InputRule::value(
+                    InputRuleScope::EveryWrite,
+                    InputPath::new("name").unwrap(),
+                    InputRuleCode::new("name.suffix").unwrap(),
+                    InputPredicate::NoSuffix(NonEmptyString::new("-bad").unwrap()),
+                ))
+                .validate()
+                .unwrap(),
+        );
+        let bindings = crate::binding_index::ResolvedBindings::default();
+        let gate = super::super::ModuleConstraintGate::from_live_compositions(&[]);
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let context = ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &crate::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                for update in [false, true] {
+                    let resource = crate::resource::Resource::new("test", "example")
+                        .with_attribute("name", string("good"));
+                    let initial = futures::executor::block_on(
+                        super::super::prepare_create_request(resource.clone(), &context),
+                    )
+                    .unwrap();
+                    let from = SnapshotState::existing(
+                        resource.id.clone(),
+                        crate::test_support::snapshot_attributes(HashMap::from([(
+                            "name".into(),
+                            string("old-good"),
+                        )])),
+                    )
+                    .with_identifier("existing");
+                    let mut plan = Plan::<crate::resource::ProviderModuleSource>::default();
+                    plan.add(if update {
+                        Effect::Update {
+                            from: Box::new(from.clone()),
+                            identifier: AppliedIdentifier::new("existing").unwrap(),
+                            to: initial.resource().as_inner().clone(),
+                            changed_attributes: vec!["name".into()],
+                        }
+                    } else {
+                        Effect::Create(initial.resource().as_inner().clone())
+                    });
+                    let checked = FinalizedPlan::new(plan)
+                        .check_inputs(&schemas, &HashMap::new())
+                        .unwrap();
+                    let check = ExecutionInputChecks::new(
+                        checked.execution_input_checks(),
+                        checked.effects(),
+                        &[0],
+                    )
+                    .unwrap()
+                    .take_write(0)
+                    .unwrap();
+                    let late = resource.with_attribute("name", string("bad-name-bad"));
+                    let request = futures::executor::block_on(
+                        super::super::prepare_create_request(late, &context),
+                    )
+                    .unwrap();
+                    let attributes = request.resource().as_resource().resolved_attributes();
+                    let writeback =
+                        SecretPreservingAttributes::from_provider_values(&attributes, &attributes);
+                    let error = if update {
+                        match check.prepare_update(
+                            from,
+                            &["name".into()],
+                            request.resource().clone(),
+                            writeback,
+                            &schemas,
+                        ) {
+                            Err(error) => error,
+                            Ok(_) => panic!("late update must fail"),
+                        }
+                    } else {
+                        match check.prepare_create(request, writeback, &schemas) {
+                            Err(error) => error,
+                            Ok(_) => panic!("late create must fail"),
+                        }
+                    };
+                    let message = error.to_string();
+                    assert!(
+                        message.contains("[name.prefix]") && message.contains("[name.suffix]"),
+                        "update={update}: {message}"
+                    );
+                }
+            },
+        );
+    }
 
     #[test]
     fn input_discharge_invalid_plan_mapping_returns_error_without_panicking() {
@@ -853,32 +1170,49 @@ mod tests {
                             }
                         }
                         let from = crate::resource::SnapshotState::not_found(resource.id.clone());
-                        let update =
-                            futures::executor::block_on(super::super::prepare_update_request(
-                                resource,
-                                from,
-                                &["name".into()],
-                                &context,
-                            ))
-                            .unwrap();
-                        let id = update.from().id.clone();
-                        let mut desired = crate::resource::Resource::from_id(id.clone());
-                        desired.attributes = update.patch().sent_projection();
+                        let desired = futures::executor::block_on(
+                            super::super::provider_ready::prepare_provider_ready_resource(
+                                resource, &context,
+                            ),
+                        )
+                        .unwrap();
+                        let update = UpdateRequest::checked(
+                            from,
+                            &["name".into()],
+                            &desired,
+                            super::super::provider_ready::managed_update_schema(
+                                &schemas,
+                                desired.as_resource(),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        let planned = desired.as_resource().clone();
                         match admit(Effect::Update {
                             from: Box::new(update.from().clone()),
                             identifier: AppliedIdentifier::new("old-id").unwrap(),
-                            to: crate::resource::ResolvedResource::new(desired.into()),
+                            to: crate::resource::ResolvedResource::new(planned),
                             changed_attributes: vec!["name".into()],
                         }) {
                             Ok((ready, check)) => {
-                                let attributes =
-                                    update.patch().sent_projection().into_iter().collect();
+                                let attributes = desired
+                                    .as_resource()
+                                    .attributes
+                                    .clone()
+                                    .into_iter()
+                                    .collect();
                                 let writeback = SecretPreservingAttributes::from_provider_values(
                                     &attributes,
                                     &attributes,
                                 );
                                 let write = check
-                                    .prepare_update(&id, update, writeback, &schemas)
+                                    .prepare_update(
+                                        update.from().clone(),
+                                        &["name".into()],
+                                        desired,
+                                        writeback,
+                                        &schemas,
+                                    )
                                     .unwrap();
                                 let super::super::scheduler::ScheduledBasicEffect::Update {
                                     update,

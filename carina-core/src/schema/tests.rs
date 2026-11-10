@@ -3227,7 +3227,11 @@ fn provider_schema_rejects_conflicting_builtin_bare_declarations() {
             None,
             match types::email().raw_shape() {
                 RawShape::String {
-                    validate: Some(validate),
+                    identity_layer:
+                        crate::schema::StringIdentityParts {
+                            validate: Some(validate),
+                            ..
+                        },
                     ..
                 } => validate.clone(),
                 _ => unreachable!(),
@@ -3769,9 +3773,13 @@ fn https_url_builtin_rejects_non_string_values() {
 fn https_url_builtin_constructor_and_json_roundtrip_preserve_validation() {
     let url_type = admit_builtin_type(types::https_url());
     let AttrTypeKind::String {
-        binding,
-        pattern,
-        length,
+        identity_layer:
+            crate::schema::StringIdentityLayer {
+                binding,
+                pattern,
+                length,
+                ..
+            },
         ..
     } = url_type.kind()
     else {
@@ -10414,14 +10422,22 @@ fn contains_unrefined_primitive(attr: &AttributeType) -> bool {
     match &attr.kind {
         AttrTypeKind::UnloadedSchemaType(_) => false,
         AttrTypeKind::String {
-            binding: RefinementBinding::MetadataOnly(None),
-            pattern: None,
-            length: None,
+            identity_layer:
+                crate::schema::StringIdentityLayer {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    pattern: None,
+                    length: None,
+                    ..
+                },
             ..
         }
         | AttrTypeKind::Int {
-            binding: RefinementBinding::MetadataOnly(None),
-            range: None,
+            identity_layer:
+                crate::schema::IntIdentityLayer {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    range: None,
+                    ..
+                },
             ..
         }
         | AttrTypeKind::Float {
@@ -11134,24 +11150,35 @@ fn assignable_specific_arn_without_pattern_flows_into_generic_arn_with_pattern()
 }
 
 #[test]
-fn assignable_identified_custom_length_must_be_contained() {
+fn assignability_ignores_source_members_and_rejects_disjoint_identity_bounds() {
     let mk = |length: Option<(Option<u64>, Option<u64>)>| {
-        AttributeType::refined_string_with_validator(
-            TypeIdentity::bare("SizedString"),
-            None,
-            length,
-            crate::schema::legacy_validator(|_| Ok(())),
-            None,
+        AttributeType::string_member(
+            crate::schema::StringIdentityLayer::new(
+                Some(TypeIdentity::bare("SizedString")),
+                None,
+                None,
+                None,
+            ),
+            crate::schema::StringMemberConstraints::new(None, length),
         )
     };
 
     let narrow = mk(Some((Some(1), Some(32))));
     let wide = mk(Some((Some(1), Some(64))));
     assert!(assignable(&narrow, &wide));
-    assert!(!assignable(&wide, &narrow));
+    assert!(assignable(&wide, &narrow));
 
     let unproven = mk(None);
-    assert!(!assignable(&unproven, &wide));
+    assert!(assignable(&unproven, &wide));
+    let disjoint = mk(Some((Some(100), Some(128))));
+    assert!(assignable(&disjoint, &wide));
+    let identity_disjoint = AttributeType::refined_string(
+        Some(TypeIdentity::bare("SizedString")),
+        None,
+        Some((Some(100), Some(128))),
+        None,
+    );
+    assert!(!assignable(&identity_disjoint, &wide));
 }
 
 /// carina#3413: two callers that independently construct the SAME
@@ -11750,10 +11777,19 @@ fn typed_ref_anonymous_refined_string_preserves_named_identity_rules() {
     let wide = named(&[], Some((Some(1), Some(1024))));
     assert!(
         !assignable(&wide, &narrow),
-        "rule 7 still requires named length containment"
+        "matching identities still require identity-bound containment"
     );
     assert!(!assignable(&arn, &narrow));
     assert!(assignable(&narrow, &wide));
+    let slot = AttributeType::string_member(
+        StringIdentityLayer::new(Some(TypeIdentity::from_dotted("aws.Arn")), None, None, None),
+        StringMemberConstraints::new(None, Some((Some(10), Some(40)))),
+    );
+    assert!(assignable(&arn, &slot));
+    assert!(
+        assignable(&wide, &slot),
+        "member bounds retain the resolved-value obligation"
+    );
 }
 
 #[test]
@@ -12127,9 +12163,13 @@ fn custom_carries_semantic_name_pattern_length() {
     );
     match t.kind() {
         AttrTypeKind::String {
-            binding,
-            pattern,
-            length,
+            identity_layer:
+                crate::schema::StringIdentityLayer {
+                    binding,
+                    pattern,
+                    length,
+                    ..
+                },
             ..
         } => {
             assert_eq!(binding.identity().map(|id| id.kind.as_str()), Some("VpcId"));
@@ -12249,7 +12289,7 @@ fn schema_pattern_dialect_rejects_unicode_account_ids_and_preserves_transport() 
         let wire = crate::protocol_convert::resource_schema_to_protocol(&admitted).unwrap();
         assert!(matches!(
             &wire.attributes["account_id"].attr_type,
-            carina_provider_protocol::types::AttributeType::String { pattern: Some(pattern), .. } if pattern.as_str() == source && matches!(pattern.mode(), carina_provider_protocol::types::PatternMatch::Full)
+            carina_provider_protocol::types::AttributeType::String { identity_layer: carina_provider_protocol::types::StringIdentityLayer { pattern: Some(pattern), .. }, member_layer: _ } if pattern.as_str() == source && matches!(pattern.mode(), carina_provider_protocol::types::PatternMatch::Full)
         ));
         let decoded = crate::protocol_convert::protocol_to_resource_schema(&wire).unwrap();
         assert_eq!(
@@ -12832,7 +12872,10 @@ fn validate_email_type() {
 
     // Type identity: refined String with kind "Email"
     match t.kind() {
-        AttrTypeKind::String { binding, .. } => {
+        AttrTypeKind::String {
+            identity_layer: crate::schema::StringIdentityLayer { binding, .. },
+            ..
+        } => {
             assert_eq!(binding.identity().map(|id| id.kind.as_str()), Some("Email"));
         }
         other => panic!("Expected refined String, got: {:?}", other),
@@ -13034,7 +13077,10 @@ fn validate_http_response_status_code_type() {
 
     // Type identity: refined String with kind "HttpResponseStatusCode"
     match t.kind() {
-        AttrTypeKind::String { binding, .. } => {
+        AttrTypeKind::String {
+            identity_layer: crate::schema::StringIdentityLayer { binding, .. },
+            ..
+        } => {
             assert_eq!(
                 binding.identity().map(|id| id.kind.as_str()),
                 Some("HttpResponseStatusCode")
@@ -18264,20 +18310,10 @@ fn pattern_reason_controls_are_escaped_in_every_diagnostic() {
             None,
             None,
         );
-        let annotation = AttributeType {
-            kind: AttrTypeKind::String {
-                binding: RefinementBinding::Annotation(
-                    crate::parser::ResolvedSchemaType::from_schema_declaration(
-                        "test",
-                        &declaration,
-                    )
-                    .unwrap(),
-                ),
-                pattern: None,
-                length: None,
-                to_dsl: None,
-            },
-        };
+        let annotation =
+            crate::parser::ResolvedSchemaType::from_schema_declaration("test", &declaration)
+                .unwrap()
+                .materialize();
         let draft = super::AttributeType::refined_string(None, Some(spec.clone()), None, None);
         let mismatch = string
             .validate(&Value::Concrete(ConcreteValue::String("bad".into())))
@@ -18514,4 +18550,140 @@ fn secret_validation_keeps_opaque_causes_until_the_provider_boundary() {
         "validation-private",
     ]));
     assert_eq!(error.to_string(), "invalid reference: (secret)");
+}
+
+#[test]
+fn round11_builtin_matching_requires_a_shared_callback() {
+    let declaration = super::AttributeType::refined_string(
+        Some(TypeIdentity::bare("TestBuiltin")),
+        None,
+        None,
+        None,
+    );
+    assert!(
+        !same_builtin_declaration(
+            declaration.scalar_identity_parts(),
+            declaration.scalar_identity_parts().unwrap()
+        ),
+        "absence of both callbacks is not pointer identity"
+    );
+    for builtin in builtin_type_registry().values() {
+        let parts = builtin.scalar_identity_parts().unwrap();
+        assert!(
+            parts.callback().is_some(),
+            "all canonical builtins retain their semantic validator"
+        );
+        assert!(same_builtin_declaration(Some(parts), parts));
+    }
+}
+
+#[test]
+fn round12_anonymous_string_uses_both_layers_as_evidence() {
+    let pattern =
+        CompiledPattern::try_new(&PatternSpec::new("[a-z]+", PatternMatch::Full)).unwrap();
+    let source = AttributeType::string_member(
+        StringIdentityLayer::new(None, None, Some((Some(1), Some(100))), None),
+        StringMemberConstraints::new(Some(pattern.clone()), Some((Some(1), Some(8)))),
+    );
+    let sink = AttributeType::refined_string(None, Some(pattern), Some((Some(1), Some(16))), None);
+    assert!(
+        assignable(&source, &sink),
+        "anonymous member pattern and intersected bounds are structural evidence"
+    );
+    let source = AttributeType::string_member(
+        StringIdentityLayer::new(None, None, None, None),
+        StringMemberConstraints::new(
+            Some(
+                CompiledPattern::try_new(&PatternSpec::new("[a-z]+", PatternMatch::Full)).unwrap(),
+            ),
+            Some((Some(1), Some(8))),
+        ),
+    );
+    let incompatible = AttributeType::refined_string(
+        None,
+        Some(CompiledPattern::try_new(&PatternSpec::new("[0-9]+", PatternMatch::Full)).unwrap()),
+        Some((Some(1), Some(16))),
+        None,
+    );
+    assert!(
+        !assignable(&source, &incompatible),
+        "anonymous member-only patterns are still structural evidence"
+    );
+}
+
+#[test]
+fn round12_anonymous_int_uses_both_layers_as_evidence() {
+    let source = AttributeType::int_member(
+        IntIdentityLayer::new(None, Some((Some(1), Some(100)))),
+        IntMemberConstraints::new(Some((Some(1), Some(8)))),
+    );
+    let sink = AttributeType::refined_int(None, Some((Some(1), Some(16))));
+    assert!(assignable(&source, &sink));
+    let sink = AttributeType::refined_float(
+        None,
+        Some((Some(crate::finite(1.0)), Some(crate::finite(16.0)))),
+    );
+    assert!(assignable(&source, &sink));
+    let wide = AttributeType::int_member(
+        IntIdentityLayer::new(None, None),
+        IntMemberConstraints::new(Some((Some(1), Some(100)))),
+    );
+    assert!(!assignable(&wide, &sink));
+    assert!(!assignable(
+        &wide,
+        &AttributeType::refined_int(None, Some((Some(1), Some(16))))
+    ));
+}
+
+#[test]
+fn round13_schema_admission_rejects_members_inside_enum_bases() {
+    let member_bases = [
+        super::AttributeType::string_member(
+            StringIdentityLayer::new(None, None, None, None),
+            StringMemberConstraints::new(
+                Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                None,
+            ),
+        ),
+        super::AttributeType::string_member(
+            StringIdentityLayer::new(None, None, None, None),
+            StringMemberConstraints::new(None, Some((Some(1), Some(8)))),
+        ),
+        super::AttributeType::int_member(
+            IntIdentityLayer::new(None, None),
+            IntMemberConstraints::new(Some((Some(1), Some(8)))),
+        ),
+    ];
+    for base in member_bases {
+        let enumeration = super::AttributeType::enum_with_base(
+            TypeIdentity::from_dotted("test.Open"),
+            base,
+            None,
+            vec![],
+            None,
+            None,
+        );
+        let resource = super::ResourceSchema::new("Example")
+            .attribute(super::AttributeSchema::optional("choice", enumeration.clone()).build());
+        let error = resource
+            .validate()
+            .expect_err("an enum base cannot carry slot-local member constraints");
+        assert_eq!(error.enum_base_member_errors().count(), 1);
+        assert!(
+            error
+                .issues()
+                .any(|(_, message)| message.contains("member") && message.contains("enum")),
+            "{error}"
+        );
+        let error =
+            ValidatedConfigSchema::validate(BTreeMap::from([("choice".into(), enumeration)]))
+                .expect_err("config enums use the same admission rule");
+        assert_eq!(error.enum_base_member_errors().count(), 1);
+        assert!(
+            error
+                .issues()
+                .any(|(_, message)| message.contains("member") && message.contains("enum")),
+            "{error}"
+        );
+    }
 }

@@ -236,3 +236,121 @@ async fn saved_plan_unknown_role_arn_is_checked_before_schedule_dispatch() {
         );
     }
 }
+
+// Saved module constraints contain ValidateExpr values, not TypeExpr records.
+// Layer records are reloaded from the fingerprint-checked provider schemas.
+#[test]
+fn saved_plan_layered_scalars_reload_and_validate_both_layers() {
+    use carina_core::schema::{
+        IntIdentityLayer, IntMemberConstraints, PatternMatch, PatternSpec, StringIdentityLayer,
+        StringMemberConstraints, TypeIdentity,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let schema = ResourceSchema::new("Layered")
+        .attribute(
+            AttributeSchema::required(
+                "name",
+                AttributeType::string_member(
+                    StringIdentityLayer::new(
+                        Some(TypeIdentity::from_dotted("mock.Name")),
+                        Some(PatternSpec::new("[A-Z]+", PatternMatch::Full)),
+                        Some((Some(1), Some(32))),
+                        None,
+                    ),
+                    StringMemberConstraints::new(None, Some((Some(2), Some(4)))),
+                ),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::required(
+                "count",
+                AttributeType::int_member(
+                    IntIdentityLayer::new(
+                        Some(TypeIdentity::from_dotted("mock.Count")),
+                        Some((Some(0), Some(100))),
+                    ),
+                    IntMemberConstraints::new(Some((Some(1), Some(10)))),
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let schemas = mock_schema_registry([schema.clone()]);
+    for (name, count, valid_name, valid_count) in [
+        ("AB", 5, true, true),
+        ("ab", -1, false, false), // identity pattern and identity range
+        ("A", 11, false, false),  // member length and member range
+    ] {
+        let resource = Resource::with_provider("mock", "Layered", "value", None)
+            .with_attribute("name", string_value(name))
+            .with_attribute("count", Value::Concrete(ConcreteValue::Int(count)));
+        let contents = PlanFileContents {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: env!("CARGO_PKG_VERSION").into(),
+            timestamp: "2026-11-10T00:00:00Z".into(),
+            source_path: carina_core::paths::PersistedPath::new(tmp.path()).unwrap(),
+            source_identity: carina_core::paths::CanonicalPath::new(tmp.path()).unwrap(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs: deserialize_saved_provider_configs(vec![ProviderConfig {
+                name: "mock".into(),
+                attributes: IndexMap::new(),
+                default_tags: IndexMap::new(),
+                source: None,
+                version: None,
+                revision: None,
+                unresolved_attributes: IndexMap::new(),
+                binding: None,
+            }]),
+            backend_config: None,
+            plan: carina_core::plan::SnapshotPlan::default(),
+            sorted_resources: vec![resolved(resource).as_inner().to_snapshot()],
+            sorted_value_destroy_dependencies: vec![Default::default()],
+            sorted_explicit_destroy_dependencies: vec![Default::default()],
+            legacy_dependency_classification: None,
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            data_source_origins: Vec::new(),
+            data_source_values: Vec::new(),
+            current_states: Vec::new(),
+            upstream_snapshot: HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: Vec::new(),
+        };
+        let saved = record_with_test_schemas(contents, &schemas);
+        let path = tmp.path().join("layered.v44.plan.json");
+        std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let restored: PlanFile = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+        let decoded = PlanFile::decode_json(&bytes).unwrap();
+        let references = restored.referenced_schema_types();
+        let reloaded = decoded.reload_in_flight_from_locked_state(None).unwrap();
+        reloaded
+            .verify_schema_fingerprints(&references, &schemas)
+            .unwrap();
+        let live = reloaded
+            .resolve_with_schemas(&schemas)
+            .unwrap()
+            .into_live_without_secrets()
+            .unwrap();
+        let value = &live.sorted_resources()[0];
+        for (attribute, valid) in [("name", valid_name), ("count", valid_count)] {
+            let findings = schema
+                .effective_attribute(attribute)
+                .unwrap()
+                .validate_collect(value.get_attr(attribute).unwrap());
+            assert_eq!(
+                findings.len(),
+                usize::from(!valid),
+                "{name}/{count}: {findings:?}"
+            );
+        }
+    }
+}
