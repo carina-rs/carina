@@ -7764,7 +7764,8 @@ mod pattern_mode_roundtrip_tests {
             types.insert(
                 format!("{name}_reference"),
                 AttributeType::reference(
-                    TypeIdentity::new(Some("test"), ["Pattern"], "Reference"),
+                    // Each match mode has its own reusable identity definition.
+                    TypeIdentity::new(Some("test"), ["Pattern", name], "Reference"),
                     Some(spec),
                     None,
                 ),
