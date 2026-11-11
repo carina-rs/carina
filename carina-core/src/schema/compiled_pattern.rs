@@ -1052,6 +1052,23 @@ mod compile_error_spec_tests {
     use crate::schema::PatternReason;
 
     #[test]
+    fn review_4327_invalid_pattern_escapes_bidi_in_multiline_compiler_excerpt() {
+        let source = "a\u{202e}[";
+        let error =
+            CompiledPattern::try_new(&PatternSpec::new(source, PatternMatch::Full)).unwrap_err();
+        let rendered = error.to_string();
+        assert!(!rendered.contains('\u{202e}'), "{rendered:?}");
+        assert_eq!(rendered.matches(r"a\u{202e}[").count(), 2);
+        assert!(
+            rendered.contains('\n'),
+            "the compiler's layout must survive"
+        );
+        assert!(rendered.contains("unclosed character class"));
+        assert_eq!(error.as_ref().as_str(), source);
+        assert!(error.reason.to_string().contains(source));
+    }
+
+    #[test]
     fn compile_errors_preserve_mode_and_reason_in_identity_and_diagnostics() {
         let specs = [
             PatternSpec::new("[", PatternMatch::Full),

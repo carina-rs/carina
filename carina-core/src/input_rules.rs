@@ -970,7 +970,7 @@ impl<S> FinalizedPlan<S> {
                 PlanErrorKind::InputRule {
                     path: violation.path().as_str().into(),
                     code: violation.code().as_str().into(),
-                    reason: finding.message().to_string(),
+                    reason: finding.message().to_string().into(),
                     context,
                 },
             ));
@@ -1207,9 +1207,7 @@ fn condition_truth(applicable: &BoundInputRule<'_, '_>, condition: &InputConditi
 }
 
 fn failed_verdict(rule: &InputRule<Compiled>) -> InputVerdict {
-    let mut violation = rule_violation(rule);
-    violation.reason = Box::new(crate::schema::InputViolationReason::EvaluationFailed);
-    InputVerdict::Violation(violation)
+    InputVerdict::Violation(InputViolation::evaluation_failed(rule))
 }
 
 fn verdict(applicable: &BoundInputRule<'_, '_>) -> InputVerdict {
@@ -1346,12 +1344,7 @@ fn map_keys_verdict(applicable: &BoundInputRule<'_, '_>, evidence: &NodeRef<'_>)
 }
 
 fn rule_violation(rule: &InputRule<Compiled>) -> InputViolation {
-    InputViolation {
-        path: rule.path().clone().into(),
-        code: rule.code().clone(),
-        reason: Box::new(rule.predicate().violation_reason()),
-        condition: Box::new(rule.condition().clone()),
-    }
+    InputViolation::rejected(rule)
 }
 
 fn peel_secret<P: ValueKind>(mut value: &Value<P>) -> &Value<P> {
