@@ -8236,69 +8236,9 @@ pub fn identified_custom_type_identity(attribute_type: &AttributeType) -> Option
 pub fn identified_custom_type_scalar_kind(
     attribute_type: &AttributeType,
 ) -> Result<Option<RefinedScalarKind>, crate::parser::UnloadedSchemaType> {
-    Ok(match attribute_type.raw_shape() {
-        RawShape::UnloadedSchemaType(unloaded) => return Err(unloaded.clone()),
-        RawShape::Reference {
-            identity: _identity,
-            pattern: _pattern,
-            length: _length,
-        } => Some(RefinedScalarKind::String),
-        RawShape::String {
-            identity_layer:
-                crate::schema::StringIdentityParts {
-                    identity: Some(_), ..
-                },
-            ..
-        } => Some(RefinedScalarKind::String),
-        RawShape::Int {
-            identity_layer:
-                crate::schema::IntIdentityParts {
-                    identity: Some(_), ..
-                },
-            ..
-        } => Some(RefinedScalarKind::Int),
-        RawShape::Float {
-            identity: Some(_), ..
-        } => Some(RefinedScalarKind::Float),
-        RawShape::Enum { base, .. } => scalar_kind_from_base(base),
-        RawShape::String {
-            identity_layer: crate::schema::StringIdentityParts { identity: None, .. },
-            ..
-        }
-        | RawShape::Int {
-            identity_layer: crate::schema::IntIdentityParts { identity: None, .. },
-            ..
-        }
-        | RawShape::Float { identity: None, .. }
-        | RawShape::Bool
-        | RawShape::Duration
-        | RawShape::List { .. }
-        | RawShape::Map { .. }
-        | RawShape::Struct { .. }
-        | RawShape::Union(_)
-        | RawShape::Ref(_) => None,
-    })
-}
-
-fn scalar_kind_from_base(attribute_type: &AttributeType) -> Option<RefinedScalarKind> {
     match attribute_type.raw_shape() {
-        RawShape::UnloadedSchemaType(_) => None,
-        RawShape::Reference {
-            identity: _identity,
-            pattern: _pattern,
-            length: _length,
-        } => Some(RefinedScalarKind::String),
-        RawShape::String { .. } => Some(RefinedScalarKind::String),
-        RawShape::Int { .. } => Some(RefinedScalarKind::Int),
-        RawShape::Float { .. } => Some(RefinedScalarKind::Float),
-        RawShape::Enum { base, .. } => scalar_kind_from_base(base),
-        RawShape::Bool
-        | RawShape::Duration
-        | RawShape::List { .. }
-        | RawShape::Map { .. }
-        | RawShape::Struct { .. }
-        | RawShape::Union(_)
-        | RawShape::Ref(_) => None,
+        RawShape::UnloadedSchemaType(unloaded) => Err(unloaded.clone()),
+        shape => Ok(crate::schema::scalar_kind_for_identified_leaf(shape)),
     }
 }
 
@@ -9131,12 +9071,12 @@ impl CustomTypeDispatchTable {
     /// they are rejected before the witness can be constructed.
     pub fn from_provider_schema(witness: &ValidatedProviderSchemaWitness) -> Self {
         let mut bindings = HashMap::<TypeIdentity, CustomTypeDispatchBinding>::new();
-        for (identity, declaration) in witness.identified_declarations() {
-            let kind = identified_custom_type_scalar_kind(&declaration)
-                .expect("validated declarations have loaded scalar kinds")
+        for declaration in witness.identified_declarations() {
+            let kind = declaration
+                .scalar_kind()
                 .expect("validated provider schema guarantees a scalar bridge kind");
-            let callback = local_custom_validator(&declaration).cloned();
-            match bindings.entry(identity) {
+            let callback = local_custom_validator(declaration.attribute_type()).cloned();
+            match bindings.entry(declaration.identity().clone()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(CustomTypeDispatchBinding {
                         scalar_kind: kind,
@@ -9168,13 +9108,12 @@ impl CustomTypeDispatchTable {
         config: &ValidatedConfigSchema,
     ) -> Result<Self, CustomTypeDispatchTableError> {
         let mut bindings = HashMap::<TypeIdentity, CustomTypeDispatchBinding>::new();
-        for (identity, declaration) in
-            crate::schema::identified_declarations_from_witnesses(schemas, config)
-        {
-            let Ok(Some(kind)) = identified_custom_type_scalar_kind(&declaration) else {
+        for declaration in crate::schema::identified_declarations_from_witnesses(schemas, config) {
+            let identity = declaration.identity().clone();
+            let Some(kind) = declaration.scalar_kind() else {
                 return Err(CustomTypeDispatchTableError::MissingScalarKind { identity });
             };
-            let callback = local_custom_validator(&declaration).cloned();
+            let callback = local_custom_validator(declaration.attribute_type()).cloned();
             match bindings.entry(identity.clone()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(CustomTypeDispatchBinding {
@@ -9655,8 +9594,11 @@ fn build_owner_custom_type_index(
         .enumerate()
         .map(|(factory_index, factory)| {
             let mut declarations = BTreeMap::<TypeIdentity, Vec<AttributeType>>::new();
-            for (identity, declaration) in factory.witness.identified_declarations() {
-                declarations.entry(identity).or_default().push(declaration);
+            for declaration in factory.witness.identified_declarations() {
+                declarations
+                    .entry(declaration.identity().clone())
+                    .or_default()
+                    .push(declaration.attribute_type().clone());
             }
             // Aggregate witness admission already proved agreement within
             // this owner, once. Different owners are conjoined at resolution.
