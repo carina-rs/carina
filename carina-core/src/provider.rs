@@ -12462,6 +12462,102 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
+    async fn issue_4304_3a_dispatch_rejects_unresolved_default_tag_instead_of_dropping_it() {
+        use crate::executor::provider_ready::{
+            ModuleConstraintGate, ProviderPreparationContext, ProviderPreparationError,
+            prepare_create_request,
+        };
+
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            PatternResourceSchema::new("test.Tagged")
+                .attribute(
+                    PatternAttributeSchema::optional(
+                        "tags",
+                        PatternAttributeType::map(PatternAttributeType::string()),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        schemas.insert(
+            "mock",
+            PatternResourceSchema::new("test.Management")
+                .attribute(
+                    PatternAttributeSchema::provider_populated(
+                        "owner",
+                        PatternAttributeType::string(),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let path = crate::paths::ResolvedPath::new(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/issue_4304_3a/unresolved"),
+        )
+        .unwrap();
+        let provider_context =
+            crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::config_loader::parse_directory(&path, &provider_context)
+            .expect("provider defaults and resources must parse across directory files");
+        let file = crate::validation::deferred_types::with_session_for_test(
+            &provider_context,
+            |session| {
+                crate::module_resolver::resolve_modules_with_providerless_config(
+                    parsed, &path, session, &schemas,
+                )
+            },
+        )
+        .unwrap()
+        .into_expanded(&schemas, &provider_context)
+        .unwrap();
+        assert!(matches!(
+            file.providers[0].default_tags.get("Owner"),
+            Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
+        ));
+        let resource = file
+            .resources
+            .iter()
+            .find(|resource| resource.id.identity_str() == Some("target"))
+            .unwrap()
+            .clone();
+        let bindings = crate::binding_index::ResolvedBindings::default();
+        let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
+        crate::validation::deferred_types::with_session_for_test_async(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            async |session| {
+                let context = ProviderPreparationContext::new(
+                    &bindings, &module_gate, &file.providers, &NoopNormalizer,
+                    &[], &schemas, session,
+                );
+                let error = prepare_create_request(resource, &context).await.expect_err(
+                    "an unresolved applicable default tag must reject dispatch, never mint a request with the tag silently omitted",
+                );
+                assert!(matches!(error,
+                    ProviderPreparationError::Serialization(_)
+                        | ProviderPreparationError::Admission { .. }
+                        | ProviderPreparationError::ValueConstraint { .. }
+                        | ProviderPreparationError::Provider(_)
+                ), "expected a typed unresolved-default input error: {error:?}");
+                let mut rendered = error.to_string();
+                let mut cause = std::error::Error::source(&error);
+                while let Some(error) = cause {
+                    rendered.push_str(&format!("\n{error}"));
+                    cause = error.source();
+                }
+                for required in ["Owner", "mock", "default_tags"] {
+                    assert!(rendered.contains(required), "missing {required}: {rendered}");
+                }
+            },
+        ).await;
+    }
+
     #[test]
     fn merge_default_tags_remerge_is_idempotent_and_never_removes_existing_tags() {
         let mut config = ProviderConfig {

@@ -1,0 +1,5 @@
+let applicable = mock.test.Tagged {}
+
+let overridden = mock.test.Tagged {
+    tags = { Owner = "mine" }
+}

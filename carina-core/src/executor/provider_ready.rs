@@ -1892,6 +1892,448 @@ mod provider_config_tests {
         .await;
     }
 
+    mod final_input_admission_tests {
+        use super::*;
+        use crate::schema::{
+            PatternMatch, PatternSpec, PatternStructField, StringIdentityLayer,
+            StringMemberConstraints,
+        };
+
+        struct ReplacingNormalizer(Value);
+
+        impl ProviderNormalizer for ReplacingNormalizer {
+            fn normalize_desired<'a>(
+                &'a self,
+                resources: &'a mut [ProviderResource],
+            ) -> BoxFuture<'a, ProviderResult<()>> {
+                Box::pin(async move {
+                    for resource in resources {
+                        resource.set_attr("value", self.0.clone());
+                    }
+                    Ok(())
+                })
+            }
+
+            fn normalize_state<'a>(
+                &'a self,
+                _: &'a mut crate::provider::StateTransformMap,
+            ) -> BoxFuture<'a, ProviderResult<()>> {
+                crate::provider::ready_noop()
+            }
+
+            fn hydrate_read_state<'a>(
+                &'a self,
+                _: &'a mut crate::provider::StateTransformMap,
+                _: &'a crate::provider::SavedAttrs,
+            ) -> BoxFuture<'a, ProviderResult<()>> {
+                crate::provider::ready_noop()
+            }
+        }
+
+        fn text(value: &str) -> Value {
+            Value::Concrete(ConcreteValue::String(value.into()))
+        }
+
+        fn diagnostic(error: &dyn std::error::Error) -> String {
+            let mut rendered = error.to_string();
+            let mut cause = error.source();
+            while let Some(error) = cause {
+                rendered.push_str(&format!("\n{error}"));
+                cause = error.source();
+            }
+            rendered
+        }
+
+        async fn prepare_plan_input(
+            authored: Resource,
+            context: &ProviderPreparationContext<'_>,
+        ) -> Result<ProviderReadyResource, ProviderPreparationError> {
+            let attributes = authored.resolved_attributes();
+            let planned = crate::executor::normalized::apply_host_desired_normalization(
+                authored,
+                context.provider_configs,
+                context.normalizer,
+                context.schemas,
+            )
+            .await
+            .expect("fixture normalization must produce the candidate payload")
+            .into_resource();
+            prepare_provider_ready_resource_after_resolution(
+                ResolvedCheckInput::plan_normalized(planned, attributes, HashSet::new()),
+                context,
+            )
+            .await
+        }
+
+        async fn assert_plan_rejects_normalized_value(nested: bool) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let list = PatternAttributeType::list(PatternAttributeType::string_member(
+                StringIdentityLayer::new(Some(TypeIdentity::bare("VpcId")), None, None, None),
+                StringMemberConstraints::new(
+                    Some(PatternSpec::new("^vpc-[a-z]+$", PatternMatch::Full)),
+                    None,
+                ),
+            ));
+            let invalid = Value::Concrete(ConcreteValue::StringList(vec!["bad".into()]));
+            let (declaration, normalized, slot) = if nested {
+                (
+                    PatternAttributeType::struct_(
+                        "Options",
+                        vec![PatternStructField::required("ids", list).build()],
+                    ),
+                    Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                        "ids".into(),
+                        invalid,
+                    )]))),
+                    "value.ids",
+                )
+            } else {
+                (list, invalid, "value")
+            };
+            let factories: Arc<Vec<Box<dyn ProviderFactory>>> =
+                Arc::new(vec![Box::new(RoutingFactory {
+                    name: "owner",
+                    declaration,
+                    sibling_declaration: None,
+                    accepted: Some("vpc-good"),
+                    validate_calls: Arc::clone(&calls),
+                    seen_values: None,
+                })]);
+            let snapshot = crate::provider::loaded_provider_snapshot_from_factories(
+                Arc::clone(&factories),
+                SchemaRegistry::new(),
+                crate::EnvironmentSnapshot::empty(),
+            );
+            let bindings = ResolvedBindings::default();
+            let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
+            crate::validation::deferred_types::with_session_for_test_async(
+                snapshot.provider_context(),
+                async |session| {
+                    let normalizer = crate::provider::ConfiguredNormalizer::fixture(
+                        ReplacingNormalizer(normalized),
+                    );
+                    let context = ProviderPreparationContext::new(
+                        &bindings,
+                        &module_gate,
+                        &[],
+                        &normalizer,
+                        &factories,
+                        snapshot.schemas().schemas(),
+                        session,
+                    );
+                    let result = prepare_plan_input(
+                        Resource::with_provider("owner", "test.owner", "example", None),
+                        &context,
+                    )
+                    .await;
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        0,
+                        "local destination membership must reject before the provider validate callback"
+                    );
+                    let error = result.expect_err(
+                        "provider normalization introduced an invalid final input; plan preparation must reject it",
+                    );
+                    assert!(matches!(
+                        error,
+                        ProviderPreparationError::ValueConstraint { .. }
+                            | ProviderPreparationError::Admission { .. }
+                    ));
+                    let rendered = diagnostic(&error);
+                    assert!(rendered.contains(slot), "missing slot {slot}: {rendered}");
+                    assert!(
+                        rendered.contains("provider") && rendered.contains("normaliz"),
+                        "missing provider normalization origin: {rendered}"
+                    );
+                },
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
+        async fn issue_4304_3a_plan_rejects_provider_normalized_string_list() {
+            assert_plan_rejects_normalized_value(false).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
+        async fn issue_4304_3a_plan_rejects_provider_normalized_nested_struct_field() {
+            assert_plan_rejects_normalized_value(true).await;
+        }
+
+        #[derive(Clone, Copy)]
+        enum Entry {
+            Plan,
+            Dispatch,
+        }
+
+        fn tag_fixture(
+            name: &str,
+            tags: PatternAttributeType,
+        ) -> (crate::parser::ExpandedParsedFile, SchemaRegistry) {
+            let mut schemas = SchemaRegistry::new();
+            schemas.insert(
+                "mock",
+                PatternResourceSchema::new("test.Tagged")
+                    .attribute(PatternAttributeSchema::optional("tags", tags).build())
+                    .validate()
+                    .expect("valid destination tags declaration"),
+            );
+            let path = crate::paths::ResolvedPath::new(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/issue_4304_3a")
+                    .join(name),
+            )
+            .unwrap();
+            let provider_context =
+                crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+            let parsed = crate::config_loader::parse_directory(&path, &provider_context)
+                .expect("providers.crn and main.crn must parse together");
+            let expanded = crate::validation::deferred_types::with_session_for_test(
+                &provider_context,
+                |session| {
+                    crate::module_resolver::resolve_modules_with_providerless_config(
+                        parsed, &path, session, &schemas,
+                    )
+                },
+            )
+            .expect("directory fixture must resolve")
+            .into_expanded(&schemas, &provider_context)
+            .expect("fixture has no module placeholders");
+            assert_eq!(expanded.providers.len(), 1);
+            assert_eq!(
+                expanded.resources.len(),
+                if name == "key_pattern" { 1 } else { 2 }
+            );
+            (expanded, schemas)
+        }
+
+        async fn prepare_tags(
+            resource: Resource,
+            entry: Entry,
+            context: &ProviderPreparationContext<'_>,
+        ) -> Result<ProviderReadyResource, ProviderPreparationError> {
+            match entry {
+                Entry::Plan => prepare_plan_input(resource, context).await,
+                Entry::Dispatch => prepare_create_request(resource, context)
+                    .await
+                    .map(|request| request.resource().clone()),
+            }
+        }
+
+        async fn assert_tag_constraint(
+            fixture: &str,
+            tags: PatternAttributeType,
+            key: &str,
+            entry: Entry,
+        ) {
+            let (file, schemas) = tag_fixture(fixture, tags);
+            let bindings = ResolvedBindings::default();
+            let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
+            crate::validation::deferred_types::with_session_for_test_async(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                async |session| {
+                    let context = ProviderPreparationContext::new(
+                        &bindings,
+                        &module_gate,
+                        &file.providers,
+                        &crate::provider::NoopNormalizer,
+                        &[],
+                        &schemas,
+                        session,
+                    );
+                    // Check the valid sibling first. In particular, an invalid
+                    // default value hidden by an authored override is inapplicable.
+                    if fixture != "key_pattern" {
+                        let overridden = file.resources.iter().find(|resource| {
+                            resource.id.identity_str() == Some("overridden")
+                        }).unwrap().clone();
+                        let ready = prepare_tags(overridden, entry, &context)
+                            .await
+                            .expect("authored overrides must survive final-map admission");
+                        let tags = ready.as_resource().get_attr("tags").unwrap();
+                        let Value::Concrete(ConcreteValue::Map(tags)) = tags else {
+                            panic!("expected merged tag map: {tags:?}");
+                        };
+                        assert_eq!(tags.get("Owner"), Some(&text("mine")));
+                        assert!(!ready.as_resource().default_tag_keys.contains("Owner"));
+                        if fixture == "entry_count" {
+                            assert_eq!(tags.len(), 2, "overrides must not count as extra entries");
+                        }
+                    }
+
+                    let applicable = file.resources.iter().find(|resource| {
+                        resource.id.identity_str() == Some("applicable")
+                    }).unwrap().clone();
+                    let error = prepare_tags(applicable, entry, &context)
+                        .await
+                        .expect_err("the exact merged default_tags map must satisfy the destination tags declaration");
+                    assert!(matches!(
+                        error,
+                        ProviderPreparationError::ValueConstraint { .. }
+                            | ProviderPreparationError::Admission { .. }
+                    ));
+                    let rendered = diagnostic(&error);
+                    for required in ["tags", key, "mock", "default_tags"] {
+                        assert!(rendered.contains(required), "missing {required}: {rendered}");
+                    }
+                },
+            )
+            .await;
+        }
+
+        fn value_bounded_tags() -> PatternAttributeType {
+            PatternAttributeType::map(PatternAttributeType::string_member(
+                StringIdentityLayer::new(None, None, None, None),
+                StringMemberConstraints::new(None, Some((None, Some(4)))),
+            ))
+        }
+
+        fn key_bounded_tags() -> PatternAttributeType {
+            PatternAttributeType::map_with_key(
+                PatternAttributeType::string_member(
+                    StringIdentityLayer::new(None, None, None, None),
+                    StringMemberConstraints::new(
+                        Some(PatternSpec::new("^[A-Z][a-z]+$", PatternMatch::Full)),
+                        None,
+                    ),
+                ),
+                PatternAttributeType::string(),
+            )
+        }
+
+        fn count_bounded_tags() -> PatternAttributeType {
+            PatternAttributeType::refined_map(
+                PatternAttributeType::string(),
+                PatternAttributeType::string(),
+                Some((None, Some(2))),
+            )
+        }
+
+        #[tokio::test]
+        #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
+        async fn issue_4304_3a_plan_default_tag_value_length_preserves_authored_override() {
+            assert_tag_constraint("value_length", value_bounded_tags(), "Owner", Entry::Plan).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
+        async fn issue_4304_3a_dispatch_default_tag_value_length_preserves_authored_override() {
+            assert_tag_constraint(
+                "value_length",
+                value_bounded_tags(),
+                "Owner",
+                Entry::Dispatch,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
+        async fn issue_4304_3a_plan_default_tag_key_pattern() {
+            assert_tag_constraint(
+                "key_pattern",
+                key_bounded_tags(),
+                "invalid_key",
+                Entry::Plan,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
+        async fn issue_4304_3a_dispatch_default_tag_key_pattern() {
+            assert_tag_constraint(
+                "key_pattern",
+                key_bounded_tags(),
+                "invalid_key",
+                Entry::Dispatch,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
+        async fn issue_4304_3a_plan_merged_default_tags_entry_count() {
+            assert_tag_constraint("entry_count", count_bounded_tags(), "Team", Entry::Plan).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
+        async fn issue_4304_3a_dispatch_merged_default_tags_entry_count() {
+            assert_tag_constraint("entry_count", count_bounded_tags(), "Team", Entry::Dispatch)
+                .await;
+        }
+
+        #[tokio::test]
+        #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
+        async fn issue_4304_3a_admission_evidence_cannot_authorize_replacement_payload() {
+            let mut schemas = SchemaRegistry::new();
+            schemas.insert(
+                "mock",
+                PatternResourceSchema::new("test.Tagged")
+                    .attribute(
+                        PatternAttributeSchema::optional("tags", value_bounded_tags()).build(),
+                    )
+                    .validate()
+                    .unwrap(),
+            );
+            let bindings = ResolvedBindings::default();
+            let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
+            crate::validation::deferred_types::with_session_for_test_async(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                async |session| {
+                    let context = ProviderPreparationContext::new(
+                        &bindings,
+                        &module_gate,
+                        &[],
+                        &crate::provider::NoopNormalizer,
+                        &[],
+                        &schemas,
+                        session,
+                    );
+                    let original = Resource::with_provider("mock", "test.Tagged", "example", None)
+                        .with_attribute(
+                            "tags",
+                            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                                "Owner".into(),
+                                text("good"),
+                            )]))),
+                        );
+                    let admitted = prepare_provider_ready_resource(original, &context)
+                        .await
+                        .unwrap();
+                    let mut replacement = admitted.as_resource().clone();
+                    replacement.set_attr(
+                        "tags",
+                        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                            "Owner".into(),
+                            text("invalid-replacement"),
+                        )]))),
+                    );
+                    // Intended type guarantee: evidence owns P, so detaching it
+                    // and pairing it with P' must be unexpressible. This uses
+                    // today's actual API to expose the hole; replace it with a
+                    // compile_fail test when the user chooses the owning API.
+                    let replacement =
+                        ResolvedResource::resolve_with_schemas(replacement, &schemas).unwrap();
+                    let diagnostic_attributes = replacement.as_resource().attributes.clone();
+                    let result = ProviderReady::settled(
+                        session.pending((replacement, *admitted.directives())),
+                        diagnostic_attributes,
+                        admitted.admission,
+                    );
+                    assert!(
+                        result.is_err(),
+                        "admission evidence for P authorized a different payload P': {result:?}"
+                    );
+                },
+            )
+            .await;
+        }
+    }
+
     impl ProviderFactory for RoutingFactory {
         fn name(&self) -> &str {
             self.name

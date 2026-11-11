@@ -2,6 +2,149 @@
 
 use super::*;
 
+struct FinalInputNormalizer(Value);
+
+impl crate::provider::ProviderNormalizer for FinalInputNormalizer {
+    fn normalize_desired<'a>(
+        &'a self,
+        resources: &'a mut [crate::resource::ProviderResource],
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async move {
+            for resource in resources {
+                resource.set_attr("value", self.0.clone());
+            }
+            Ok(())
+        })
+    }
+
+    fn normalize_state<'a>(
+        &'a self,
+        _: &'a mut crate::provider::StateTransformMap,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        crate::provider::ready_noop()
+    }
+
+    fn hydrate_read_state<'a>(
+        &'a self,
+        _: &'a mut crate::provider::StateTransformMap,
+        _: &'a crate::provider::SavedAttrs,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        crate::provider::ready_noop()
+    }
+}
+
+async fn assert_dispatch_rejects_normalized_value(nested: bool) {
+    let callbacks = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&callbacks);
+    let list = PatternAttributeType::list(PatternAttributeType::string_member(
+        crate::schema::StringIdentityLayer::with_validator(
+            crate::schema::TypeIdentity::bare("VpcId"),
+            None,
+            None,
+            crate::schema::validator(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+            None,
+        ),
+        crate::schema::StringMemberConstraints::new(
+            Some(crate::schema::PatternSpec::new(
+                "^vpc-[a-z]+$",
+                crate::schema::PatternMatch::Full,
+            )),
+            None,
+        ),
+    ));
+    let invalid = Value::Concrete(ConcreteValue::StringList(vec!["bad".into()]));
+    let (declaration, normalized, slot) = if nested {
+        (
+            PatternAttributeType::struct_(
+                "Options",
+                vec![PatternStructField::required("ids", list).build()],
+            ),
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                "ids".into(),
+                invalid,
+            )]))),
+            "value.ids",
+        )
+    } else {
+        (list, invalid, "value")
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        PatternResourceSchema::new("test")
+            .attribute(PatternAttributeSchema::optional("value", declaration).build())
+            .validate()
+            .unwrap(),
+    );
+    let provider = MockProvider::new();
+    let resource = make_resource("example", &[]);
+    provider.push_create(Ok(ok_state(&resource.id)));
+    let plan = create_plan_from_fixture_resources(vec![resource]);
+    let checked = checked_fixture_plan(&plan);
+    let observer = MockObserver::new();
+    let normalizer =
+        crate::provider::ConfiguredNormalizer::fixture(FinalInputNormalizer(normalized));
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            ExecutionInput {
+                provider_context: crate::parser::ProviderContext::new(
+                    crate::EnvironmentSnapshot::empty(),
+                ),
+                plan: &checked,
+                provider_check_inputs: ProviderCheckInputs::Authored,
+                compositions: &[],
+                bindings: ResolvedBindings::default(),
+                managed_current: HashMap::new(),
+                data_source_values: ExecutableDataSourceValues::empty(),
+                normalizer: &normalizer,
+                provider_configs: &[],
+                factories: &[],
+                schemas: &schemas,
+                parallelism: crate::executor::TEST_UNCAPPED,
+                precompleted_success_count: 0,
+                checkpoint_sink: ExecutionCheckpointSink::noop(),
+            },
+            &observer,
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+    assert_eq!(
+        callbacks.load(Ordering::SeqCst),
+        0,
+        "local destination membership must reject before the validate callback"
+    );
+    assert!(
+        provider.calls().is_empty() && provider.captured_create_resources().is_empty(),
+        "invalid provider normalization output reached dispatch: {:?}",
+        provider.captured_create_resources()
+    );
+    assert_eq!(result.failure_count(), 1, "{:?}", observer.events());
+    assert_eq!(result.success_count, 0);
+    let rendered = format!("{:?}", observer.events());
+    assert!(rendered.contains(slot), "missing slot {slot}: {rendered}");
+    assert!(
+        rendered.contains("provider") && rendered.contains("normaliz"),
+        "missing provider normalization origin: {rendered}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "carina#4304 3a: pending user decision on final-input admission"]
+async fn issue_4304_3a_dispatch_rejects_provider_normalized_string_list() {
+    assert_dispatch_rejects_normalized_value(false).await;
+}
+
+#[tokio::test]
+#[ignore = "carina#4304 3a: pending user decision on final-input admission"]
+async fn issue_4304_3a_dispatch_rejects_provider_normalized_nested_struct_field() {
+    assert_dispatch_rejects_normalized_value(true).await;
+}
+
 fn text(value: &str) -> Value {
     Value::Concrete(ConcreteValue::String(value.into()))
 }
