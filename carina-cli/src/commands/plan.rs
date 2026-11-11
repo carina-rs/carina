@@ -2385,6 +2385,7 @@ impl PlanFile {
                 dependencies: _dependencies,
                 module_source: _module_source,
                 quoted_string_attrs: _quoted_string_attrs,
+                authored_slots: _authored_slots,
                 declaration: _declaration,
             } = data_source;
             attributes

@@ -21,16 +21,39 @@ pub(crate) fn substitute_module_arguments<B: BindingAddress>(
 ) -> Result<Value<ParserPlaceholder, B>, ArgumentSubstitutionError> {
     rewrite_parser_value(value, position, &mut ModuleArgumentRewrite { arguments })
 }
+pub(crate) fn substitute_module_slot<B: BindingAddress>(
+    slot: &mut crate::parser::retained::JudgedSlot<B>,
+    arguments: ArgumentSubstitutions<'_, B>,
+) {
+    slot.map_archived_projections(|value| {
+        substitute_module_arguments(value, arguments, RewritePosition::Value)
+    });
+}
+
+#[cfg(test)]
 pub(crate) fn select_expanded_module_ifs(
     value: &ModuleResolvedValue,
 ) -> Result<ModuleResolvedValue, ArgumentSubstitutionError> {
-    let mut selected = rewrite_parser_value(
-        value,
-        RewritePosition::Value,
-        &mut ExpandedModuleRewrite { config: None },
-    )?;
+    select_expanded_module_ifs_with_conditions(value).map(|(value, _)| value)
+}
+
+/// Preserve decisions from the existing selection pass without evaluating again.
+pub(crate) fn select_expanded_module_ifs_with_conditions(
+    value: &ModuleResolvedValue,
+) -> Result<
+    (
+        ModuleResolvedValue,
+        HashMap<crate::parser::retained::NodeId, bool>,
+    ),
+    ArgumentSubstitutionError,
+> {
+    let mut policy = ExpandedModuleRewrite {
+        config: None,
+        conditions: HashMap::new(),
+    };
+    let mut selected = rewrite_parser_value(value, RewritePosition::Value, &mut policy)?;
     selected.canonicalize_in_place();
-    Ok(selected)
+    Ok((selected, policy.conditions))
 }
 pub(crate) fn evaluate_expanded_module_functions(
     value: &ModuleResolvedValue,
@@ -41,6 +64,7 @@ pub(crate) fn evaluate_expanded_module_functions(
         RewritePosition::Value,
         &mut ExpandedModuleRewrite {
             config: Some(config),
+            conditions: HashMap::new(),
         },
     )
 }
@@ -54,6 +78,7 @@ pub(crate) fn select_authored_module_ifs(
 struct ExpandedModuleRewrite<'a> {
     // Evaluation and conditional selection are separate passes, as before.
     config: Option<&'a dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    conditions: HashMap<crate::parser::retained::NodeId, bool>,
 }
 
 impl ParserRewrite<AbsoluteBindingAddress> for ExpandedModuleRewrite<'_> {
@@ -149,6 +174,16 @@ impl ParserRewrite<AbsoluteBindingAddress> for ExpandedModuleRewrite<'_> {
                 message,
                 parse_error: None,
             })
+    }
+
+    fn selected_condition(
+        &mut self,
+        node_id: Option<crate::parser::retained::NodeId>,
+        selected: bool,
+    ) {
+        if let Some(node_id) = node_id {
+            self.conditions.insert(node_id, selected);
+        }
     }
 
     fn access(

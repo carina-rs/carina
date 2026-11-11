@@ -673,6 +673,7 @@ impl ReferenceLocations {
                 fields: locations.fields,
             },
             AccessLocations::Selection(occurrence) => self.with_occurrence(occurrence),
+            AccessLocations::Authored { locations, .. } => self.with_access(*locations),
         }
     }
 }
@@ -778,12 +779,43 @@ fn has_field_access(pair: &Pair<'_, Rule>) -> bool {
 pub(crate) enum AccessLocations {
     Reference(ReferenceLocations),
     Selection(DeclarationLocation),
+    Authored {
+        locations: Box<AccessLocations>,
+        node: super::retained::NodeId,
+    },
 }
 impl AccessLocations {
+    pub(in crate::parser) fn into_reference(self) -> Option<ReferenceLocations> {
+        match self {
+            Self::Reference(locations) => Some(locations),
+            Self::Selection(_) => None,
+            Self::Authored { locations, .. } => locations.into_reference(),
+        }
+    }
+    pub(in crate::parser) fn with_node(self, node: Option<super::retained::NodeId>) -> Self {
+        match node {
+            Some(node) => Self::Authored {
+                locations: Box::new(self),
+                node,
+            },
+            None => self,
+        }
+    }
+    pub(crate) fn node_id(
+        &self,
+    ) -> Result<super::retained::NodeId, super::retained::MissingEvidence> {
+        match self {
+            Self::Authored { node, .. } => Ok(*node),
+            Self::Selection(_) | Self::Reference(_) => Err(super::retained::MissingEvidence::new(
+                "computed access parser identity",
+            )),
+        }
+    }
     pub(crate) fn expression_location(&self) -> &DeclarationLocation {
         match self {
             Self::Reference(locations) => locations.occurrence(),
             Self::Selection(location) => location,
+            Self::Authored { locations, .. } => locations.expression_location(),
         }
     }
     pub(in crate::parser) fn from_pair(
@@ -803,6 +835,7 @@ impl AccessLocations {
             Self::Selection(occurrence) => path
                 .locations()
                 .map(|locations| locations.with_occurrence(occurrence.clone())),
+            Self::Authored { locations, .. } => locations.for_path(path),
         }
     }
 }

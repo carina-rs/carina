@@ -206,6 +206,8 @@ pub(crate) fn parse_if_expr(
     let condition_pair = next_pair(&mut inner, "condition", "if expression")?;
     let condition_line = condition_pair.line_col().0;
     let condition_source = ctx.diagnostic_source_text(condition_pair.clone());
+    let condition_node = ctx.authored_node_id(&condition_pair);
+    let condition_token = condition_pair.clone();
     let condition_value = parse_expression_eval(condition_pair, ctx)?;
 
     // Pass 1 of a directory fixed point knows that a sibling name exists but
@@ -231,6 +233,14 @@ pub(crate) fn parse_if_expr(
         );
     let decision = decide_if_condition(&condition_value, ctx.config)
         .map_err(|error| error.into_parse_error(condition_line))?;
+    if let Some(selected) = decision {
+        ctx.record_retained_eval(
+            &condition_token,
+            &EvalValue::from_value(Value::Concrete(crate::resource::ConcreteValue::Bool(
+                selected,
+            ))),
+        );
+    }
     let if_body = classify_if_body(next_pair(&mut inner, "if body", "if expression")?)?;
     let else_body = inner
         .next()
@@ -250,7 +260,8 @@ pub(crate) fn parse_if_expr(
             source_file.to_path_buf(),
             condition_line,
             condition_source,
-        );
+        )
+        .with_node_id(condition_node);
         return defer_if_body(condition, then_branch, else_branch, ctx, &target);
     }
 
@@ -482,6 +493,8 @@ pub(crate) fn parse_if_value_expr_with_mode(
     let condition_pair = next_pair(&mut inner, "condition", "if value expression")?;
     let condition_line = condition_pair.line_col().0;
     let condition_source = ctx.diagnostic_source_text(condition_pair.clone());
+    let condition_node = ctx.authored_node_id(&condition_pair);
+    let condition_token = condition_pair.clone();
     let condition_value = parse_expression_eval(condition_pair, ctx)?;
     if matches!(condition_value, EvalValue::ProvisionalReference { .. })
         && ctx.defer_provisional_static_conditions
@@ -503,6 +516,14 @@ pub(crate) fn parse_if_value_expr_with_mode(
         );
     let decision = decide_if_condition(&condition_value, ctx.config)
         .map_err(|error| error.into_parse_error(condition_line))?;
+    if let Some(selected) = decision {
+        ctx.record_retained_eval(
+            &condition_token,
+            &EvalValue::from_value(Value::Concrete(crate::resource::ConcreteValue::Bool(
+                selected,
+            ))),
+        );
+    }
 
     let if_body = classify_if_body(next_pair(&mut inner, "if body", "if value expression")?)?;
     let else_body = inner
@@ -532,7 +553,8 @@ pub(crate) fn parse_if_value_expr_with_mode(
                     ctx.source_file().to_path_buf(),
                     condition_line,
                     condition_source,
-                ),
+                )
+                .with_node_id(condition_node),
                 then_value,
                 else_value,
             ))),

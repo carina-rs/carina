@@ -497,48 +497,72 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
     let mut checked = match &context.proof {
         AdmissionProof::Validation(proof) => {
             let reference_context = ReferenceContext::from(context);
-            let check = |attr: &CompiledAttributeType, value: &Value<P, B>, path: &LeafPath| {
-                let path = join(&contract.path, path);
-                let mut findings = crate::schema::value_validation::AssignmentFindings::default();
-                match CandidateOrigin::of(value) {
-                    CandidateOrigin::Reference(reference) => reference.judge_at::<K>(
-                        contract,
-                        attr,
-                        &path,
-                        &reference_context,
-                        &mut findings,
-                    )?,
-                    CandidateOrigin::Expression => {
-                        if let Some(check) = context.assignment {
-                            return check(attr, value, &path);
-                        }
+            let check =
+                |attr: &CompiledAttributeType,
+                 checked: crate::schema::value_validation::CheckValue<'_, P, B>,
+                 path: &LeafPath,
+                 cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
+                    let path = join(&contract.path, path);
+                    // B1's authored policy belongs here, before lowered-origin
+                    // dispatch, and receives this exact declaration and cursor.
+                    // Selection parents are policy-only: main's ordinary local
+                    // and reference obligations belong to the selected child.
+                    if cursor.is_selection() {
+                        return Ok(Default::default());
                     }
-                }
-                Ok(findings)
-            };
-            crate::schema::value_validation::validate_value_for_admission(
+                    let mut findings = match context.assignment {
+                        Some(check) => check(attr, checked, &path, cursor)?,
+                        None => crate::schema::value_validation::AssignmentFindings::default(),
+                    };
+                    let crate::schema::value_validation::CheckValue::Current(value) = checked
+                    else {
+                        return Ok(findings);
+                    };
+                    match CandidateOrigin::of(value) {
+                        CandidateOrigin::Reference(reference) => reference.judge_at::<K>(
+                            contract,
+                            attr,
+                            &path,
+                            &reference_context,
+                            &mut findings,
+                        )?,
+                        CandidateOrigin::Expression => {}
+                    }
+                    Ok(findings)
+                };
+            crate::schema::value_validation::validate_authored_value_for_admission(
                 contract.attr(),
                 proof,
                 contract.defs(),
                 contract.ancestry,
                 &lookup,
-                Some(&check),
+                context.cursor.clone(),
+                &check,
+                &mut context.coverage.borrow_mut(),
             )
         }
-        AdmissionProof::Plan(proof) => crate::schema::value_validation::validate_value_with_lookup(
-            contract.attr(),
-            proof.knowledge(),
-            contract.defs(),
-            contract.ancestry,
-            &lookup,
-        ),
+        AdmissionProof::Plan(proof) => {
+            crate::schema::value_validation::validate_authored_value_for_admission(
+                contract.attr(),
+                proof.knowledge(),
+                contract.defs(),
+                contract.ancestry,
+                &lookup,
+                context.cursor.clone(),
+                &|_, _, _, _| Ok(Default::default()),
+                &mut context.coverage.borrow_mut(),
+            )
+        }
         AdmissionProof::Apply(proof) => {
-            crate::schema::value_validation::validate_value_with_lookup(
+            crate::schema::value_validation::validate_authored_value_for_admission(
                 contract.attr(),
                 &crate::resource::knowledge::Classification::<P, B>::Known(proof.clone()),
                 contract.defs(),
                 contract.ancestry,
                 &lookup,
+                context.cursor.clone(),
+                &|_, _, _, _| Ok(Default::default()),
+                &mut context.coverage.borrow_mut(),
             )
         }
     };

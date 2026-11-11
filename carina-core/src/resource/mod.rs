@@ -1020,6 +1020,7 @@ impl<S, P: ValueKind> From<ResourceWithDependenciesWire<S, P>> for SchemaUnresol
                 default_tag_keys,
                 loop_provenance,
                 quoted_string_attrs: HashSet::new(),
+                authored_slots: Default::default(),
                 declaration: Default::default(),
             },
             value_dependencies,
@@ -9227,6 +9228,9 @@ pub struct Resource<
     /// re-renders attributes — diagnostic messages, formatter output,
     /// plan display, snapshot tests — depends on this stability (#2222).
     pub attributes: IndexMap<String, Value<P, B>>,
+    /// Complete retained attribute inputs; never serialized into runtime state.
+    #[serde(skip)]
+    pub authored_slots: crate::parser::retained::AuthoredSlots<B>,
     /// `directives` meta-argument block: Carina-side instructions for
     /// how to handle this resource (force-delete, create-before-destroy,
     /// prevent-destroy).
@@ -9333,6 +9337,7 @@ impl<S, P: ValueKind> Resource<S, P, RelativeBindingName> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         } = self;
         Resource {
@@ -9350,6 +9355,7 @@ impl<S, P: ValueKind> Resource<S, P, RelativeBindingName> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            authored_slots: authored_slots.map_bindings(resolve),
             declaration,
         }
     }
@@ -9382,6 +9388,7 @@ impl<P: ValueKind> Resource<ModuleSource, P, AbsoluteBindingAddress> {
             default_tag_keys: _default_tag_keys,
             loop_provenance: _loop_provenance,
             quoted_string_attrs: _quoted_string_attrs,
+            authored_slots: _authored_slots,
             declaration: _declaration,
         } = self;
         for value in attributes.values_mut() {
@@ -9427,6 +9434,7 @@ impl<P: ValueKind, B: BindingAddress, D> From<Resource<ModuleSource, P, B, D>>
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         } = resource;
         Self {
@@ -9441,6 +9449,7 @@ impl<P: ValueKind, B: BindingAddress, D> From<Resource<ModuleSource, P, B, D>>
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         }
     }
@@ -9463,6 +9472,7 @@ impl<S, B: BindingAddress, D> Resource<S, ParserPlaceholder, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         } = self;
         let directives = directives.resolve(
@@ -9482,6 +9492,7 @@ impl<S, B: BindingAddress, D> Resource<S, ParserPlaceholder, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         })
     }
@@ -9505,6 +9516,7 @@ impl<S, B: BindingAddress, D> Resource<S, ParserPlaceholder, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         } = self;
         let directives = directives.into_loop_template(
@@ -9533,6 +9545,7 @@ impl<S, B: BindingAddress, D> Resource<S, ParserPlaceholder, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         })
     }
@@ -9552,6 +9565,7 @@ impl<P: ValueKind, B: BindingAddress> Resource<ModuleSource, P, B> {
             default_tag_keys: DefaultTagKeys::default(),
             loop_provenance: LoopProvenance::default(),
             quoted_string_attrs: HashSet::new(),
+            authored_slots: Default::default(),
             declaration: Default::default(),
         }
     }
@@ -9605,12 +9619,14 @@ impl<S: Clone, P: ValueKind, B: BindingAddress, D: Clone> Resource<S, P, B, D> {
     pub(crate) fn instantiate(&self) -> Self {
         let mut resource = self.clone();
         resource.id = self.id.instantiate_pending();
+        resource.authored_slots.reinstance();
         resource
     }
 
     pub(crate) fn instantiate_with_identity(&self, identity: ResourceIdentity) -> Self {
         let mut resource = self.clone();
         resource.id = self.id.instantiate_with_identity(identity);
+        resource.authored_slots.reinstance();
         resource
     }
 }
@@ -9633,6 +9649,7 @@ impl<S, D> Resource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
             default_tag_keys: _default_tag_keys,
             loop_provenance: _loop_provenance,
             quoted_string_attrs: _quoted_string_attrs,
+            authored_slots: _authored_slots,
             declaration: _declaration,
         } = self;
         attributes
@@ -9654,6 +9671,7 @@ impl<S, D> Resource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
             default_tag_keys,
             loop_provenance: _,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         } = self;
         ProviderResource {
@@ -9668,6 +9686,7 @@ impl<S, D> Resource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
             default_tag_keys,
             loop_provenance: LoopProvenance::default(),
             quoted_string_attrs,
+            authored_slots,
             declaration,
         }
     }
@@ -9689,6 +9708,7 @@ impl<S, D> Resource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
             default_tag_keys,
             loop_provenance: _,
             quoted_string_attrs,
+            authored_slots: _authored_slots,
             declaration: _declaration,
         } = provider;
         self.id = id;
@@ -9858,6 +9878,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> Resource<S, P, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         } = self;
         Resource {
@@ -9872,6 +9893,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> Resource<S, P, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         }
     }

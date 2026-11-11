@@ -484,7 +484,17 @@ fn needs_local_without_pending_sites_remains_pending() {
                     None,
                     session,
                 );
-                let local_check = |_: &CompiledAttributeType, _: &Value, path: &LeafPath| {
+                let local_check = |_: &CompiledAttributeType,
+                                   _: crate::schema::value_validation::CheckValue<
+                    '_,
+                    crate::resource::NoPlaceholder,
+                    AbsoluteBindingAddress,
+                >,
+                                   path: &LeafPath,
+                                   _: crate::parser::retained::AuthoredCursor<
+                    '_,
+                    AbsoluteBindingAddress,
+                >| {
                     Ok(crate::schema::value_validation::AssignmentFindings {
                         local: vec![assignment::LocalPath::for_recheck(
                             kind::ResourceAttribute,

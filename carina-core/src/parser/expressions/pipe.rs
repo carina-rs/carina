@@ -125,7 +125,12 @@ pub(crate) fn parse_coalesce_expr_with_mode(
     let line = pair.line_col().0;
     let mut values = pair
         .into_inner()
-        .map(|pair| parse_pipe_expr_with_mode(pair, ctx, mode))
+        .map(|pair| {
+            let syntax = pair.clone();
+            let value = parse_pipe_expr_with_mode(pair, ctx, mode)?;
+            ctx.record_retained_eval(&syntax, &value);
+            Ok::<_, ParseError>(value)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let mut result = values
         .pop()

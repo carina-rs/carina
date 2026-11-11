@@ -140,6 +140,7 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
     pub(super) binding_scope: BindingScopeId,
     binding_scope_source_file: std::path::PathBuf,
     diagnostic_source: Source,
+    authored_nodes: Arc<super::retained::CapturedNodes>,
     next_binding_scope: Rc<Cell<u64>>,
     /// The exact preprocessing map for the file whose pest pairs are being
     /// lowered. Shared ownership lets nested parser contexts preserve authored
@@ -194,6 +195,7 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
             self.diagnostic_source.clone(),
         );
         context.session = self.session;
+        context.authored_nodes = self.authored_nodes.clone();
         context
     }
 
@@ -216,6 +218,30 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         &self.diagnostic_source.path
     }
 
+    pub(super) fn authored_resource_slots(
+        &self,
+        pair: &pest::iterators::Pair<'_, Rule>,
+        sinks: &HashMap<String, super::retained::SinkExpression>,
+        values: &IndexMap<String, Value>,
+        kind: crate::schema::SchemaKind,
+    ) -> Result<super::retained::AuthoredSlots, ParseError> {
+        super::retained::resource_slots(pair, &self.authored_nodes, sinks, values, kind)
+    }
+
+    pub(super) fn record_retained_eval(
+        &self,
+        pair: &pest::iterators::Pair<'_, Rule>,
+        value: &crate::eval_value::EvalValue,
+    ) {
+        if let Ok(value) = value.clone().into_value() {
+            self.authored_nodes.record(pair, value);
+        }
+    }
+
+    pub(super) fn set_authored_nodes(&mut self, nodes: Arc<super::retained::CapturedNodes>) {
+        self.authored_nodes = nodes;
+    }
+
     pub(super) fn evaluate_retained_expression(
         &self,
         pair: pest::iterators::Pair<'_, Rule>,
@@ -225,6 +251,7 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
             pair,
             &self.diagnostic_source.file,
             &self.diagnostic_source.path,
+            &self.authored_nodes,
             reduce,
         )
     }
@@ -238,8 +265,16 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
             pair,
             &self.diagnostic_source.file,
             &self.diagnostic_source.path,
+            &self.authored_nodes,
             reduce,
         )
+    }
+
+    pub(super) fn authored_node_id(
+        &self,
+        pair: &pest::iterators::Pair<'_, Rule>,
+    ) -> Option<super::retained::NodeId> {
+        self.authored_nodes.node_id(pair)
     }
 
     pub(super) fn access_locations(
@@ -251,6 +286,7 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
             &self.diagnostic_source.file,
             &self.diagnostic_source.path,
         )
+        .with_node(self.authored_nodes.node_id(pair))
     }
 
     pub(super) fn reference_locations(
@@ -347,6 +383,7 @@ impl<'cfg, Source: Clone> ParseContext<'cfg, Source> {
             binding_scope: BindingScopeId::root(&source_file),
             binding_scope_source_file: source_file,
             diagnostic_source,
+            authored_nodes: Arc::default(),
             next_binding_scope: Rc::new(Cell::new(1)),
             source_position_map: None,
         }

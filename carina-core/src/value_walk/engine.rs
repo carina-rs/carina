@@ -820,6 +820,7 @@ impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Transform, P, B> {
                     source_file,
                     source_line,
                     source_expression,
+                    node_id,
                 } = condition;
                 let value = walked.value(value, at.operand(ExpressionEdge::Condition), algebra)?;
                 let then_value =
@@ -832,7 +833,8 @@ impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Transform, P, B> {
                         source_file,
                         source_line,
                         source_expression,
-                    ),
+                    )
+                    .with_node_id(node_id),
                     then_value,
                     else_value,
                 ))))

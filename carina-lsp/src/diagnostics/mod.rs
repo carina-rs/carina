@@ -340,6 +340,7 @@ type ExpandedConfiguration<'a> = carina_core::parser::retained::JudgedFile<
 struct ExpandedDiagnosticValidationInputs<'a> {
     configuration: &'a ExpandedConfiguration<'a>,
     resources: HashMap<&'a carina_core::resource::ResourceId, &'a ExpandedResource<'a>>,
+    coverage: Mutex<carina_core::validation::admission::WalkCoverage>,
     binding_index: carina_core::binding_index::BindingIndex<'a, AbsoluteBindingAddress>,
 }
 
@@ -349,7 +350,6 @@ impl ExpandedDiagnosticValidationInputs<'_> {
         resource_id: &carina_core::resource::ResourceId,
         session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Option<carina_core::schema::ResourceValueValidation> {
-        use carina_core::validation::admission::attributes::resource_attribute_admissions;
         let resource = *self.resources.get(resource_id)?;
         let schemas = self.configuration.schemas();
         let schema = resource.schema(schemas)?;
@@ -373,7 +373,7 @@ impl ExpandedDiagnosticValidationInputs<'_> {
             |_, _| {},
         ));
         let report = self.configuration.report().for_resource(resource_id).ok()?;
-        Some(resource_attribute_admissions(
+        Some(carina_core::validation::admission::attributes::resource_attribute_admissions_with_coverage(
             resource,
             self.configuration.file(),
             schema,
@@ -383,6 +383,7 @@ impl ExpandedDiagnosticValidationInputs<'_> {
             &self.binding_index,
             session,
             schemas,
+            &mut self.coverage.lock().expect("configuration admission coverage"),
         ))
     }
 }
@@ -1186,6 +1187,7 @@ impl DiagnosticRun<'_> {
                 Some(ExpandedDiagnosticValidationInputs {
                     configuration,
                     resources,
+                    coverage: Default::default(),
                     binding_index:
                         carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
                             graph, &self.schemas, Some(&expanded_upstream_exports), &module_signatures, self.provider_context,
@@ -1494,6 +1496,22 @@ impl DiagnosticRun<'_> {
                     }
                 }
             }
+            // Admission reads the sealed slots and projections owned by the
+            // judged directory. Source locations still anchor each diagnostic.
+            let authored_validation_tree = carina_core::parser::AnalysisTree::try_from_file(
+                pre_expansion_configuration.judged().file(),
+            )
+            .expect("judgement preserves the sealed directory analysis tree");
+            let mut authored_validation_resources = HashMap::new();
+            for resource in authored_validation_tree.project_resources() {
+                if let Some(address) = resource.authored_declaration_id() {
+                    // The source walk represents a loop template once, matching
+                    // main's first materialized view of that authored declaration.
+                    authored_validation_resources
+                        .entry(address)
+                        .or_insert(resource);
+                }
+            }
             // The document AST intentionally preserves function calls for
             // source-oriented checks. Build a parallel, same-order view with
             // locally resolvable calls evaluated so schema diagnostics see
@@ -1520,6 +1538,7 @@ impl DiagnosticRun<'_> {
                 .map(|resolved| resolved.iter_all_resources().collect::<Vec<_>>());
             // Every schema finding is anchored by the sealed parser view,
             // including the semantic per-file fallback after a buffer parse fails.
+            let mut authored_coverage = carina_core::validation::admission::WalkCoverage::default();
             for (resource_index, rref) in tree.project_resources().enumerate() {
                 let resource_id = rref.id();
                 let resource_attributes = rref.attributes();
@@ -1688,11 +1707,31 @@ impl DiagnosticRun<'_> {
                             })
                         })
                     });
+                    let admission_resource = if rref.kind()
+                        == carina_core::parser::AnalysisItemKind::Composition
+                    {
+                        Some(rref)
+                    } else {
+                        rref.authored_declaration_id()
+                            .and_then(|address| authored_validation_resources.get(address).copied())
+                    };
+                    let Some(admission_resource) = admission_resource else {
+                        let error = carina_core::parser::retained::MissingEvidence::for_resource(
+                            resource_id,
+                        );
+                        diagnostics.extend(render_merged(
+                            doc,
+                            &carina_core::parser::Located::new(rref.location().clone(), &error),
+                            DiagnosticSeverity::ERROR,
+                            error.to_string(),
+                        ));
+                        continue;
+                    };
                     let mut value_validation = expanded_validation_inputs.as_ref()
                         .filter(|_| uses_composition_output)
                         .and_then(|inputs| inputs.resource_admissions(resource_id, self.provider_context))
-                        .unwrap_or_else(|| carina_core::validation::admission::attributes::resource_attribute_admissions(
-                            rref, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, expression_report, &binding_index, self.provider_context, &self.schemas,
+                        .unwrap_or_else(|| carina_core::validation::admission::attributes::resource_attribute_admissions_with_coverage(
+                            admission_resource, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, expression_report, &binding_index, self.provider_context, &self.schemas, &mut authored_coverage,
                         ));
                     let mut reported_attribute_diagnostics = HashSet::new();
                     let retained_failures = resource_attributes

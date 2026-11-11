@@ -14,7 +14,7 @@ use crate::resource::{
 
 use super::ModuleCall;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct DeferredIfCondition<
     P: ValueKind = ParserPlaceholder,
     B: BindingAddress = RelativeBindingName,
@@ -23,6 +23,17 @@ pub struct DeferredIfCondition<
     pub(crate) source_file: PathBuf,
     pub(crate) source_line: usize,
     pub(crate) source_expression: DiagnosticExpressionText,
+    // Parser identity survives substitution; diagnostic locations never join it.
+    pub(crate) node_id: Option<super::retained::NodeId>,
+}
+
+impl<P: ValueKind, B: BindingAddress> PartialEq for DeferredIfCondition<P, B> {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+            && self.source_file == other.source_file
+            && self.source_line == other.source_line
+            && self.source_expression == other.source_expression
+    }
 }
 
 /// Diagnostic text can only be produced from a value whose intrinsic secret
@@ -81,7 +92,13 @@ impl<P: ValueKind, B: BindingAddress> DeferredIfCondition<P, B> {
             source_file,
             source_line,
             source_expression,
+            node_id: None,
         }
+    }
+
+    pub(crate) fn with_node_id(mut self, node_id: Option<super::retained::NodeId>) -> Self {
+        self.node_id = node_id;
+        self
     }
 
     pub fn value(&self) -> &Value<P, B> {
@@ -155,7 +172,8 @@ impl<P: ValueKind, B: BindingAddress> DeferredValueIf<P, B> {
                 self.condition.source_file.clone(),
                 self.condition.source_line,
                 self.condition.source_expression.clone(),
-            ),
+            )
+            .with_node_id(self.condition.node_id),
             map(&self.then_value)?,
             map(&self.else_value)?,
         ))
@@ -171,7 +189,8 @@ impl<P: ValueKind, B: BindingAddress> DeferredValueIf<P, B> {
                 self.condition.source_file,
                 self.condition.source_line,
                 self.condition.source_expression,
-            ),
+            )
+            .with_node_id(self.condition.node_id),
             map(self.then_value)?,
             map(self.else_value)?,
         ))
@@ -187,7 +206,8 @@ impl<P: ValueKind, B: BindingAddress> DeferredValueIf<P, B> {
                 self.condition.source_file,
                 self.condition.source_line,
                 self.condition.source_expression,
-            ),
+            )
+            .with_node_id(self.condition.node_id),
             self.then_value.map_bindings(map),
             self.else_value.map_bindings(map),
         )

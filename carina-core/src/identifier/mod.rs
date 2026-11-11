@@ -1452,6 +1452,9 @@ pub(crate) fn identity_required_bindings<
     required
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ResourcePrefixSource(());
+
 /// Resolve `<attr>_prefix` meta-attributes in resources.
 ///
 /// For each resource attribute ending in `_prefix`, checks if the base attribute
@@ -1530,6 +1533,10 @@ pub fn resolve_attr_prefixes<P: PlaceholderKind, B: BindingAddress>(
                     generate_random_suffix()
                 ),
                 [&prefix_value],
+            );
+            resource.authored_slots.record_synthetic(
+                base_attr.clone(),
+                crate::parser::retained::SyntheticSource::ResourcePrefix(ResourcePrefixSource(())),
             );
             resource.set_attr(
                 base_attr,

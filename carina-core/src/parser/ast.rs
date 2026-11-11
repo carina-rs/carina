@@ -1502,6 +1502,7 @@ mod deferred_template_resource_serde {
                     default_tag_keys,
                     loop_provenance,
                     quoted_string_attrs: HashSet::new(),
+                    authored_slots: Default::default(),
                     declaration: Default::default(),
                 },
                 legacy_null_name,
@@ -6274,6 +6275,10 @@ pub trait DeferredForPhaseTraversal<
         self.resource_refs()
     }
 
+    fn authored_slots_mut(
+        &mut self,
+    ) -> Box<dyn Iterator<Item = (&ResourceId, &mut super::retained::AuthoredSlots<B>)> + '_>;
+
     fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, P, T, B>> + '_>
     where
         Self: Sized;
@@ -6346,6 +6351,22 @@ impl<P: ValueKind, B: BindingAddress> DeferredForPhaseTraversal<P, P, B>
                         Some(ResourceRef::Deferred { resource, deferred })
                     }
                     DeferredForBody::Read(_) | DeferredForBody::ModuleCall(_) => None,
+                }),
+        )
+    }
+
+    fn authored_slots_mut(
+        &mut self,
+    ) -> Box<dyn Iterator<Item = (&ResourceId, &mut super::retained::AuthoredSlots<B>)> + '_> {
+        Box::new(
+            self.expressions
+                .iter_mut()
+                .filter_map(|deferred| match &mut deferred.body {
+                    DeferredForBody::Resource(resource) => {
+                        Some((&resource.resource.id, &mut resource.resource.authored_slots))
+                    }
+                    DeferredForBody::Read(source) => Some((&source.id, &mut source.authored_slots)),
+                    DeferredForBody::ModuleCall(_) => None,
                 }),
         )
     }
@@ -6447,6 +6468,17 @@ impl<P: ValueKind, T: ValueKind, B: BindingAddress> DeferredForPhaseTraversal<P,
                     deferred,
                 }),
         )
+    }
+
+    fn authored_slots_mut(
+        &mut self,
+    ) -> Box<dyn Iterator<Item = (&ResourceId, &mut super::retained::AuthoredSlots<B>)> + '_> {
+        Box::new(self.expressions.iter_mut().map(|deferred| {
+            (
+                &deferred.template_resource.resource.id,
+                &mut deferred.template_resource.resource.authored_slots,
+            )
+        }))
     }
 
     fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, P, T, B>> + '_> {
@@ -8253,6 +8285,7 @@ where
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         } = resource;
         let _resource_metadata = (
@@ -8265,6 +8298,7 @@ where
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         );
         for (attribute, value) in attributes {
@@ -8288,6 +8322,7 @@ where
             dependencies,
             module_source,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         } = data_source;
         let _data_source_metadata = (
@@ -8296,6 +8331,7 @@ where
             dependencies,
             module_source,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         );
         for (attribute, value) in attributes {
@@ -9038,6 +9074,7 @@ fn substitute_attrs<S, D>(
         default_tag_keys,
         loop_provenance,
         quoted_string_attrs,
+        authored_slots,
         declaration,
     } = resource;
     // Only the loop element supplies values here. Direct resource references
@@ -9068,6 +9105,11 @@ fn substitute_attrs<S, D>(
         attr.canonicalize_in_place();
         expanded_attributes.insert(name, attr);
     }
+    let mut authored_slots = authored_slots;
+    for (_, slot) in authored_slots.iter_mut() {
+        crate::value_walk::substitute_loop_slot(slot, index, key, value, miss_policy);
+    }
+    authored_slots.replace_expanded_projections(&expanded_attributes);
     Ok(crate::resource::Resource {
         id,
         attributes: expanded_attributes,
@@ -9080,6 +9122,7 @@ fn substitute_attrs<S, D>(
         default_tag_keys,
         loop_provenance,
         quoted_string_attrs,
+        authored_slots,
         declaration,
     })
 }

@@ -1377,6 +1377,44 @@ where
         }
     }
 
+    pub fn authored_declaration_id(&self) -> Option<&'a super::retained::SlotDeclarationId> {
+        match self.resource {
+            ResourceRef::Resource(resource) => resource.authored_slots.declaration_id(),
+            ResourceRef::DataSource(resource) => resource.authored_slots.declaration_id(),
+            ResourceRef::Deferred { resource, .. } => {
+                resource.as_resource().authored_slots.declaration_id()
+            }
+            ResourceRef::LiveComposition(_) => None,
+        }
+    }
+
+    pub(crate) fn projected_phase(&self, name: &str) -> Option<super::retained::ProjectedPhase> {
+        match self.resource {
+            ResourceRef::Resource(resource) => resource.authored_slots.projected_phase(name),
+            ResourceRef::DataSource(resource) => resource.authored_slots.projected_phase(name),
+            ResourceRef::Deferred { resource, .. } => {
+                resource.as_resource().authored_slots.projected_phase(name)
+            }
+            ResourceRef::LiveComposition(_) => None,
+        }
+    }
+
+    pub fn authored_slot(
+        &self,
+        name: &str,
+    ) -> Result<&'a super::retained::JudgedSlot<B>, super::retained::MissingEvidence> {
+        match self.resource {
+            ResourceRef::Resource(resource) => resource.authored_slots.get(name),
+            ResourceRef::DataSource(resource) => resource.authored_slots.get(name),
+            ResourceRef::Deferred { resource, .. } => {
+                resource.as_resource().authored_slots.get(name)
+            }
+            ResourceRef::LiveComposition(_) => Err(super::retained::MissingEvidence::new(
+                "composition attribute has no authored resource slot",
+            )),
+        }
+    }
+
     pub fn location(&self) -> &'a DeclarationLocation {
         self.location
     }
