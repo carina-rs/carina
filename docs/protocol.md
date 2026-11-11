@@ -4,8 +4,8 @@ The current protocol and minimum supported provider protocol are both **28**.
 
 Protocol 28 adds typed provider error retryability after protocol 27's
 refinement layers and protocol 26's conditional input rules. Carina v0.14.0 is
-the first release with protocol 28; protocols 25 through 27 were unreleased
-development snapshots. Carina
+the first release with protocol 28, and v0.14.1 keeps it; protocols 25 through
+27 were unreleased development snapshots. Carina
 v0.13.1 speaks protocol **24**, with minimum provider protocol **24**.
 
 | Protocol version | Minimum provider protocol | Change |
@@ -394,13 +394,13 @@ serialized. Saved plans are re-admitted under the apply lock, and dispatch
 discharges pending rules against resolved desired inputs and exact requests.
 
 Version 23 introduced the required `input_rules`, `scope` and `target` fields.
-For Carina v0.14.0, the version-28 requirements include explicit
+For Carina v0.14.0 and v0.14.1, the version-28 requirements include explicit
 pattern modes, conditions, Struct rule arrays, String/Int refinement layers,
 and typed error retryability. Older providers are rejected before schema
 decoding. The v12 migration adapter has been removed. The SDK's schema JSON
 export carries these input rules without adding WIT functions or CRUD request
 fields; the diagnostic imports are separate. AWS, AWSCC, and GitHub providers
-must rebuild against protocol 28 to load in Carina v0.14.0.
+must rebuild against protocol 28 to load in Carina v0.14.0 and v0.14.1.
 
 ## Version 22
 
