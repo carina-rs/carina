@@ -883,7 +883,7 @@ impl NonEmptyValidationErrors {
 }
 
 /// Publish a phase only after consuming the session that checked it.
-pub(crate) fn settle_type_checks<T, E: TypeCheckError>(
+pub(crate) fn settle_type_checks<T, E: std::fmt::Display>(
     checks: carina_core::validation::deferred_types::ProviderTypeCheckResult<Result<T, E>>,
     make_error: impl FnOnce(String) -> E,
 ) -> Result<T, E> {
@@ -892,35 +892,27 @@ pub(crate) fn settle_type_checks<T, E: TypeCheckError>(
     if sink.errors.is_empty() {
         return result;
     }
-    match result {
-        Err(error) => Err(error.with_type_check_diagnostics(sink.errors.join("\n"))),
-        Ok(_) => Err(make_error(sink.errors.join("\n"))),
+    if let Err(error) = result {
+        sink.errors.insert(0, error.to_string());
     }
+    Err(make_error(sink.errors.join("\n")))
 }
 
-/// Preserve typed primary errors when additional checks also failed.
-pub(crate) trait TypeCheckError: std::fmt::Display {
-    fn with_type_check_diagnostics(self, diagnostics: String) -> Self;
-}
-impl TypeCheckError for String {
-    fn with_type_check_diagnostics(self, diagnostics: String) -> Self {
-        format!("{self}\n{diagnostics}")
-    }
-}
-impl TypeCheckError for AppError {
-    fn with_type_check_diagnostics(self, diagnostics: String) -> Self {
-        AppError::TypeCheckDiagnostics(Box::new(crate::error::TypeCheckDiagnostics {
-            error: self,
-            diagnostics,
-        }))
-    }
-}
-impl TypeCheckError for PlanPreparationError {
-    fn with_type_check_diagnostics(self, diagnostics: String) -> Self {
-        PlanPreparationError::TypeCheckDiagnostics(Box::new(crate::error::TypeCheckDiagnostics {
-            error: self,
-            diagnostics,
-        }))
+/// Only persisted upstream admission introduces a typed primary error that must
+/// survive additional diagnostics. Existing settlement retains main's factory.
+pub(crate) fn settle_upstream_admission<T>(
+    checks: carina_core::validation::deferred_types::ProviderTypeCheckResult<
+        Result<T, carina_core::upstream_exports::UpstreamExportAdmissionError>,
+    >,
+) -> Result<T, crate::error::UpstreamLoadFailure> {
+    let mut sink = CliTypeCheckSink { errors: vec![] };
+    match checks.publish(&mut sink) {
+        Err(error) => Err(crate::error::UpstreamLoadFailure::Admission {
+            error: Box::new(error),
+            diagnostics: sink.errors,
+        }),
+        Ok(value) if sink.errors.is_empty() => Ok(value),
+        Ok(_) => Err(AppError::Validation(sink.errors.join("\n")).into()),
     }
 }
 
@@ -4311,8 +4303,6 @@ impl NonEmptyPlanErrors {
 #[derive(Debug, thiserror::Error)]
 pub enum PlanPreparationError {
     #[error(transparent)]
-    TypeCheckDiagnostics(Box<crate::error::TypeCheckDiagnostics<PlanPreparationError>>),
-    #[error(transparent)]
     ModuleConstraint(#[from] carina_core::executor::ModuleConstraintGateError),
     #[error("plan validation failed")]
     Plan(NonEmptyPlanErrors),
@@ -7136,7 +7126,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                         PlanPreparationError::ModuleConstraint(error) => {
                             return Err(AppError::ModuleConstraint(error));
                         }
-                        error @ (PlanPreparationError::Knowledge {..} | PlanPreparationError::TypeCheckDiagnostics(_)) => {
+                        error @ PlanPreparationError::Knowledge {..} => {
                             return Err(error.into());
                         }
                     };

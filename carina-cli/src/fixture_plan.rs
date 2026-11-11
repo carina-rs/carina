@@ -21,7 +21,6 @@ use carina_core::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, StructField,
     TypeIdentity, ValidatedResourceSchema,
 };
-use carina_core::upstream_exports::AdmittedUpstreamExports;
 use carina_state::{PublishedExports, StateFile, check_and_migrate};
 
 use crate::commands::plan::compute_export_diffs;
@@ -536,21 +535,24 @@ where
             &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
             |session| {
                 match exports {
-                    Some(exports) => AdmittedUpstreamExports::decode_and_admit(
+                    Some(exports) => {
+                        carina_core::upstream_exports::ResolvedUpstreamSource::for_test(
+                            us.binding.as_str(),
+                            None,
+                        )
+                        .decode_and_admit(
+                            exports
+                                .values()
+                                .iter()
+                                .map(|(key, value)| (key.clone(), value)),
+                            session,
+                        )
+                    }
+                    None => carina_core::upstream_exports::ResolvedUpstreamSource::for_test(
                         us.binding.as_str(),
-                        &carina_core::upstream_exports::SourceSurface::for_test(None),
-                        exports
-                            .values()
-                            .iter()
-                            .map(|(key, value)| (key.clone(), value)),
-                        session,
-                    ),
-                    None => AdmittedUpstreamExports::admit_snapshot(
-                        us.binding.as_str(),
-                        &carina_core::upstream_exports::SourceSurface::for_test(None),
-                        HashMap::new(),
-                        session,
-                    ),
+                        None,
+                    )
+                    .admit_snapshot(HashMap::new(), session),
                 }
                 .map_err(|error| AppError::UpstreamExportAdmission(Box::new(error)))
             },

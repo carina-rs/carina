@@ -67,32 +67,125 @@ pub struct UpstreamExportEntry {
 /// Exports for a single `upstream_state` binding: export name → entry.
 pub type UpstreamExportEntries = HashMap<String, UpstreamExportEntry>;
 
-/// Resolver evidence for admission: either a discovered surface (including an
-/// empty one), or a recorded reason discovery could not establish that surface.
-/// Callers cannot mint an unavailable surface to bypass admission.
+/// A binding and its pinned source directory, resolved together from one
+/// upstream declaration. Loading cannot substitute an unrelated directory.
 #[derive(Debug, Clone)]
-pub struct SourceSurface {
-    entries: Result<UpstreamExportEntries, String>,
+pub struct UpstreamSourceIdentity {
+    binding: String,
+    source: ResolvedPath,
 }
 
-impl SourceSurface {
+impl UpstreamSourceIdentity {
+    pub fn resolve<B: BindingAddress>(
+        upstream: &UpstreamState<B>,
+        base: &ResolvedPath,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            binding: upstream.binding.to_string(),
+            source: base.join_display(&base.persisted_path().display().join(&upstream.source))?,
+        })
+    }
+
+    pub fn binding(&self) -> &str {
+        &self.binding
+    }
+    pub fn source(&self) -> &ResolvedPath {
+        &self.source
+    }
+
+    pub fn load(
+        &self,
+        context: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+        schemas: &crate::schema::SchemaRegistry,
+    ) -> Result<ResolvedUpstreamSource, UpstreamSourceLoadError> {
+        let loaded = crate::config_loader::load_configuration_for_bootstrap(
+            &self.source,
+            context.catalog(),
+            &crate::schema::SchemaRegistry::new(),
+        )
+        .map_err(|message| UpstreamSourceLoadError::Configuration {
+            binding: self.binding.clone(),
+            message,
+        })?;
+        let surface = resolve_upstream_source_surface(&loaded, &self.source, context, schemas)?;
+        Ok(ResolvedUpstreamSource {
+            identity: self.clone(),
+            backend: loaded
+                .parsed
+                .backend
+                .clone()
+                .map(crate::parser::BackendConfig::into_expanded)
+                .transpose()?,
+            upstream_states: loaded.parsed.upstream_states.clone(),
+            surface,
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UpstreamSourceLoadError {
+    #[error("upstream_state '{binding}': {message}")]
+    Configuration { binding: String, message: String },
+    #[error(transparent)]
+    Invariant(#[from] crate::parser::AnalysisTreeError),
+    #[error(transparent)]
+    Expansion(#[from] crate::resource::LeftoverPlaceholder),
+}
+
+/// Identity, backend metadata, and admission surface from the same pinned source.
+/// Admission is a method on this object; neither the binding nor surface can be
+/// supplied independently at the value boundary.
+#[derive(Debug, Clone)]
+pub struct ResolvedUpstreamSource {
+    identity: UpstreamSourceIdentity,
+    backend: Option<crate::parser::BackendConfig>,
+    upstream_states: Vec<UpstreamState<RelativeBindingName>>,
+    surface: SourceSurface,
+}
+
+impl ResolvedUpstreamSource {
+    pub fn binding(&self) -> &str {
+        self.identity.binding()
+    }
+    pub fn source(&self) -> &ResolvedPath {
+        self.identity.source()
+    }
+    pub fn backend(&self) -> Option<&crate::parser::BackendConfig> {
+        self.backend.as_ref()
+    }
+    pub fn upstream_states(&self) -> &[UpstreamState<RelativeBindingName>] {
+        &self.upstream_states
+    }
     pub fn unavailable_reason(&self) -> Option<&str> {
-        self.entries.as_ref().err().map(String::as_str)
+        self.surface.entries.as_ref().err().map(String::as_str)
     }
 
     #[cfg(any(test, feature = "test-utils"))]
-    pub fn for_test(entries: Option<&UpstreamExportEntries>) -> Self {
+    pub fn for_test(binding: impl Into<String>, entries: Option<&UpstreamExportEntries>) -> Self {
         Self {
-            entries: entries
-                .cloned()
-                .ok_or_else(|| "test fixture has no source surface".into()),
+            identity: UpstreamSourceIdentity {
+                binding: binding.into(),
+                source: ResolvedPath::new(".").expect("fixture directory exists"),
+            },
+            backend: None,
+            upstream_states: vec![],
+            surface: SourceSurface {
+                entries: entries
+                    .cloned()
+                    .ok_or_else(|| "test fixture has no source surface".into()),
+            },
         }
     }
 }
 
+#[derive(Debug, Clone)]
+struct SourceSurface {
+    entries: Result<UpstreamExportEntries, String>,
+}
+
 /// Discover admission authority from an actual loader-owned source snapshot.
 /// Unavailable declarations preserve the unchecked policy without warnings.
-pub fn resolve_upstream_source_surface(
+fn resolve_upstream_source_surface(
     loaded: &crate::config_loader::LoadedConfig,
     source: &ResolvedPath,
     context: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,

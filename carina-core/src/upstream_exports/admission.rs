@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use super::{SourceSurface, UpstreamExportType};
+use super::{ResolvedUpstreamSource, SourceSurface, UpstreamExportType};
 use crate::resource::{Value, knowledge::KnowledgeContext};
 use crate::validation::deferred_types::ProviderTypeCheckContext;
 use crate::validation::typecheck::{TypeExprValueError, TypecheckProviderContext};
@@ -52,6 +52,17 @@ pub type AdmittedRemoteBindings = HashMap<String, AdmittedUpstreamExports>;
 ///     let _ = AdmittedUpstreamExports::decode_and_admit("orgs", None, std::iter::empty(), session);
 /// }
 /// ```
+/// A parsed directory cannot be relabelled as an unrelated upstream binding.
+///
+/// ```compile_fail
+/// use carina_core::{config_loader::LoadedConfig, paths::ResolvedPath};
+/// use carina_core::upstream_exports::{resolve_upstream_source_surface, AdmittedUpstreamExports};
+/// use carina_core::validation::deferred_types::ProviderTypeCheckContext;
+/// fn relabel(loaded_a: &LoadedConfig, source_b: &ResolvedPath, session: &dyn ProviderTypeCheckContext, schemas: &carina_core::schema::SchemaRegistry) {
+///     let surface_a = resolve_upstream_source_surface(loaded_a, source_b, session, schemas).unwrap();
+///     let _ = AdmittedUpstreamExports::admit_snapshot("binding_b", &surface_a, Default::default(), session);
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdmittedUpstreamExports {
     values: Arc<HashMap<String, Value>>,
@@ -95,35 +106,41 @@ impl std::error::Error for UpstreamExportAdmissionError {
     }
 }
 
-impl AdmittedUpstreamExports {
+impl ResolvedUpstreamSource {
     /// An unavailable source surface intentionally installs all supplied keys
     /// without source-type checking. Consumers still check the actual values.
     pub fn admit_snapshot(
-        binding: &str,
-        surface: &SourceSurface,
+        &self,
         values: HashMap<String, Value>,
         context: &dyn ProviderTypeCheckContext,
-    ) -> Result<Self, UpstreamExportAdmissionError> {
-        Self::admit_supplied(binding, surface, values, |value| Ok(Some(value)), context)
+    ) -> Result<AdmittedUpstreamExports, UpstreamExportAdmissionError> {
+        AdmittedUpstreamExports::admit_supplied(
+            self.binding(),
+            &self.surface,
+            values,
+            |value| Ok(Some(value)),
+            context,
+        )
     }
 
     /// Select source keys before decoding persisted values. Stale keys are never
     /// decoded; top-level null stays absent; installed nested nulls are errors.
     pub fn decode_and_admit<'a>(
-        binding: &str,
-        surface: &SourceSurface,
+        &self,
         values: impl IntoIterator<Item = (String, &'a PersistedExportValue)>,
         context: &dyn ProviderTypeCheckContext,
-    ) -> Result<Self, UpstreamExportAdmissionError> {
-        Self::admit_supplied(
-            binding,
-            surface,
+    ) -> Result<AdmittedUpstreamExports, UpstreamExportAdmissionError> {
+        AdmittedUpstreamExports::admit_supplied(
+            self.binding(),
+            &self.surface,
             values,
             PersistedExportValue::decode,
             context,
         )
     }
+}
 
+impl AdmittedUpstreamExports {
     fn admit_supplied<S>(
         binding: &str,
         surface: &SourceSurface,
@@ -203,12 +220,7 @@ pub fn remote_bindings_for_test(
         .map(|(name, values)| {
             let admitted =
                 crate::validation::deferred_types::with_session_for_test(&context, |session| {
-                    AdmittedUpstreamExports::admit_snapshot(
-                        &name,
-                        &SourceSurface::for_test(None),
-                        values,
-                        session,
-                    )
+                    ResolvedUpstreamSource::for_test(&name, None).admit_snapshot(values, session)
                 })
                 .expect("remote fixture values are fully resolved");
             (name, admitted)
@@ -238,9 +250,7 @@ mod tests {
         )]);
         let token = "tok_live_do_not_disclose_4a_987654";
         let error = crate::validation::deferred_types::with_session_for_test(&context, |session| {
-            AdmittedUpstreamExports::admit_snapshot(
-                "orgs",
-                &SourceSurface::for_test(Some(&declarations)),
+            ResolvedUpstreamSource::for_test("orgs", Some(&declarations)).admit_snapshot(
                 HashMap::from([(
                     "tokens".into(),
                     Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -302,9 +312,7 @@ mod tests {
         ] {
             let error =
                 crate::validation::deferred_types::with_session_for_test(&context, |session| {
-                    AdmittedUpstreamExports::admit_snapshot(
-                        "orgs",
-                        &SourceSurface::for_test(Some(&declarations)),
+                    ResolvedUpstreamSource::for_test("orgs", Some(&declarations)).admit_snapshot(
                         HashMap::from([(
                             "object".into(),
                             Value::Concrete(ConcreteValue::Map(fields)),
@@ -341,9 +349,7 @@ mod tests {
             },
         )]);
         let error = crate::validation::deferred_types::with_session_for_test(&context, |session| {
-            AdmittedUpstreamExports::admit_snapshot(
-                "up",
-                &SourceSurface::for_test(Some(&declarations)),
+            ResolvedUpstreamSource::for_test("up", Some(&declarations)).admit_snapshot(
                 HashMap::from([(
                     "broken".into(),
                     Value::root_resource_ref("waiting", "id", vec![]),
@@ -388,9 +394,7 @@ mod tests {
         )]);
         let checks =
             crate::validation::deferred_types::TypeCheckSession::run(&context, |session| {
-                AdmittedUpstreamExports::admit_snapshot(
-                    "orgs",
-                    &SourceSurface::for_test(Some(&declarations)),
+                ResolvedUpstreamSource::for_test("orgs", Some(&declarations)).admit_snapshot(
                     HashMap::from([("number".into(), Value::Concrete(ConcreteValue::Int(73)))]),
                     session,
                 )
@@ -500,9 +504,7 @@ mod tests {
         )]);
         let checks =
             crate::validation::deferred_types::TypeCheckSession::run(&context, |session| {
-                AdmittedUpstreamExports::admit_snapshot(
-                    "orgs",
-                    &SourceSurface::for_test(Some(&declarations)),
+                ResolvedUpstreamSource::for_test("orgs", Some(&declarations)).admit_snapshot(
                     HashMap::from([(
                         "id".into(),
                         Value::Concrete(ConcreteValue::String("id-123".into())),

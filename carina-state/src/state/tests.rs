@@ -9,9 +9,35 @@ use carina_core::resource::{
 use carina_core::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
-use carina_core::upstream_exports::AdmittedUpstreamExports;
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
+
+#[test]
+fn round2_3_full_state_and_export_display_keep_main_namespace_error_text() {
+    let mut state = serde_json::to_value(StateFile::new()).unwrap();
+    state["exports"] = serde_json::json!({"value": {"$enum": {}}});
+    let root_bytes = serde_json::to_vec(&state).unwrap();
+    let state_error = check_and_migrate_bytes(&root_bytes)
+        .unwrap_err()
+        .to_string();
+    let display_error = PublishedExports::from_state_bytes(&root_bytes)
+        .unwrap_err()
+        .to_string();
+    state["exports"] = serde_json::json!({"value": {"private_member": [{"$enum": {}}]}});
+    let nested_bytes = serde_json::to_vec(&state).unwrap();
+    assert_eq!(
+        check_and_migrate_bytes(&nested_bytes)
+            .unwrap_err()
+            .to_string(),
+        state_error
+    );
+    assert_eq!(
+        PublishedExports::from_state_bytes(&nested_bytes)
+            .unwrap_err()
+            .to_string(),
+        display_error
+    );
+}
 
 #[test]
 fn destroy_keeps_an_undeleted_identifierless_orphan_as_an_ordering_target() {
@@ -325,14 +351,13 @@ impl PublishedFixtureBindings for PublishedExports {
             carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         let admitted =
             carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
-                AdmittedUpstreamExports::decode_and_admit(
-                    "upstream",
-                    &carina_core::upstream_exports::SourceSurface::for_test(None),
-                    self.values()
-                        .iter()
-                        .map(|(key, value)| (key.clone(), value)),
-                    session,
-                )
+                carina_core::upstream_exports::ResolvedUpstreamSource::for_test("upstream", None)
+                    .decode_and_admit(
+                        self.values()
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value)),
+                        session,
+                    )
             })
             .expect("fixture published values pass admission");
         (*admitted).clone()
@@ -9417,15 +9442,14 @@ fn full_state_load_preserves_nested_null_exports_for_reapply() {
             carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         assert!(
             carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
-                AdmittedUpstreamExports::decode_and_admit(
-                    "upstream",
-                    &carina_core::upstream_exports::SourceSurface::for_test(None),
-                    published
-                        .values()
-                        .iter()
-                        .map(|(key, value)| (key.clone(), value)),
-                    session,
-                )
+                carina_core::upstream_exports::ResolvedUpstreamSource::for_test("upstream", None)
+                    .decode_and_admit(
+                        published
+                            .values()
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value)),
+                        session,
+                    )
             })
             .is_err(),
             "installed remote exports must reject nested nulls after legacy migration"
@@ -9471,9 +9495,11 @@ fn assert_published_export_null_rejected(value: serde_json::Value, error_path: &
         carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
     let result =
         carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
-            AdmittedUpstreamExports::decode_and_admit(
+            carina_core::upstream_exports::ResolvedUpstreamSource::for_test(
                 "upstream",
-                &carina_core::upstream_exports::SourceSurface::for_test(Some(&declarations)),
+                Some(&declarations),
+            )
+            .decode_and_admit(
                 published
                     .values()
                     .iter()

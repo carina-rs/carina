@@ -972,18 +972,33 @@ async fn verify_upstream_snapshot(
             None,
         )
         .await
-        .map_err(|error| match error {
-            error @ AppError::UpstreamExportAdmission(_) => AppError::UpstreamSnapshotChanged(
-                Box::new(crate::error::UpstreamSnapshotChangedError {
-                    message: upstream_snapshot_drift(source.binding.as_str(), apply_target),
-                    error,
-                }),
-            ),
-            other => other,
+        .map_err(|error| {
+            classify_upstream_snapshot_error(source.binding.as_str(), apply_target, error)
         })?;
         current.extend(loaded);
     }
     diff_upstream_snapshot(snapshot, &current, apply_target).map_err(AppError::Config)
+}
+
+pub(crate) fn classify_upstream_snapshot_error(
+    binding: &str,
+    apply_target: ApplyTarget<'_>,
+    error: crate::error::UpstreamLoadFailure,
+) -> AppError {
+    match error {
+        error @ crate::error::UpstreamLoadFailure::Admission { .. } => {
+            AppError::UpstreamSnapshotChanged(Box::new(
+                crate::error::UpstreamSnapshotChangedError {
+                    message: upstream_snapshot_drift(binding, apply_target),
+                    error: error.into(),
+                },
+            ))
+        }
+        crate::error::UpstreamLoadFailure::DroppedSavedKeys => {
+            AppError::Config(upstream_snapshot_drift(binding, apply_target))
+        }
+        crate::error::UpstreamLoadFailure::Other(error) => *error,
+    }
 }
 
 pub(crate) fn upstream_snapshot_drift(binding: &str, apply_target: ApplyTarget<'_>) -> String {
@@ -1038,6 +1053,54 @@ fn diff_upstream_snapshot(
 mod upstream_snapshot_tests {
     use super::*;
     use carina_core::upstream_exports::remote_bindings_for_test;
+
+    #[test]
+    fn round2_4_wrapped_admission_failure_remains_drift() {
+        let admission = carina_core::upstream_exports::UpstreamExportAdmissionError::Decode {
+            binding: "orgs".into(),
+            key: "count".into(),
+            error: carina_core::value::PersistedValueDecodeError::NestedExportNull,
+        };
+        let error = crate::error::UpstreamLoadFailure::Admission {
+            error: Box::new(admission),
+            diagnostics: vec!["diagnostic-marker".into()],
+        };
+        let error =
+            classify_upstream_snapshot_error("orgs", ApplyTarget::Project(Path::new(".")), error);
+        assert!(
+            matches!(error, AppError::UpstreamSnapshotChanged(_)),
+            "{error:?}"
+        );
+        let text = crate::error::format_error_with_source_chain(&error);
+        assert!(
+            text.contains("diagnostic-marker") && text.contains("orgs.count"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn round2_4_backend_failure_with_diagnostics_is_not_drift() {
+        let error = AppError::TypeCheckDiagnostics(Box::new(crate::error::TypeCheckDiagnostics {
+            error: AppError::Backend(carina_state::BackendError::Io("read-marker".into())),
+            diagnostics: "diagnostic-marker".into(),
+        }));
+        let error = classify_upstream_snapshot_error(
+            "orgs",
+            ApplyTarget::Project(Path::new(".")),
+            crate::error::UpstreamLoadFailure::Other(Box::new(error)),
+        );
+        assert!(
+            matches!(error, AppError::TypeCheckDiagnostics(_)),
+            "{error:?}"
+        );
+        let text = crate::error::format_error_with_source_chain(&error);
+        assert!(
+            !text.contains("drifted")
+                && text.contains("read-marker")
+                && text.contains("diagnostic-marker"),
+            "{text}"
+        );
+    }
 
     #[tokio::test]
     async fn round1_5_upstream_backend_read_failure_is_not_drift() {

@@ -1002,10 +1002,50 @@ impl std::error::Error for AwsCredentialStartupError {}
 /// Additional diagnostics retain the concrete primary error in the source chain.
 #[derive(Debug, thiserror::Error)]
 #[error("{diagnostics}")]
-pub struct TypeCheckDiagnostics<E: std::error::Error + 'static> {
+pub struct TypeCheckDiagnostics {
     #[source]
-    pub(crate) error: E,
+    pub(crate) error: AppError,
     pub(crate) diagnostics: String,
+}
+
+/// Keep admission failures distinct from read/configuration failures until the
+/// command chooses whether a saved snapshot makes that failure drift.
+#[derive(Debug)]
+pub(crate) enum UpstreamLoadFailure {
+    Admission {
+        error: Box<carina_core::upstream_exports::UpstreamExportAdmissionError>,
+        diagnostics: Vec<String>,
+    },
+    DroppedSavedKeys,
+    Other(Box<AppError>),
+}
+
+impl From<AppError> for UpstreamLoadFailure {
+    fn from(error: AppError) -> Self {
+        Self::Other(Box::new(error))
+    }
+}
+
+impl From<UpstreamLoadFailure> for AppError {
+    fn from(failure: UpstreamLoadFailure) -> Self {
+        match failure {
+            UpstreamLoadFailure::Admission { error, diagnostics } => {
+                let error = Self::UpstreamExportAdmission(error);
+                if diagnostics.is_empty() {
+                    error
+                } else {
+                    Self::TypeCheckDiagnostics(Box::new(TypeCheckDiagnostics {
+                        error,
+                        diagnostics: diagnostics.join("\n"),
+                    }))
+                }
+            }
+            UpstreamLoadFailure::DroppedSavedKeys => {
+                Self::Config("saved upstream export key is no longer declared".into())
+            }
+            UpstreamLoadFailure::Other(error) => *error,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1031,7 +1071,7 @@ pub enum AppError {
     },
 
     #[error(transparent)]
-    TypeCheckDiagnostics(Box<TypeCheckDiagnostics<AppError>>),
+    TypeCheckDiagnostics(Box<TypeCheckDiagnostics>),
 
     #[error(transparent)]
     UpstreamExportAdmission(Box<carina_core::upstream_exports::UpstreamExportAdmissionError>),
@@ -1703,9 +1743,24 @@ impl From<crate::wiring::PlanPreparationError> for AppError {
                 Self::ModuleConstraint(error)
             }
             error @ (crate::wiring::PlanPreparationError::Knowledge { .. }
-            | crate::wiring::PlanPreparationError::TypeCheckDiagnostics(_)
             | crate::wiring::PlanPreparationError::Plan(_)) => {
                 Self::PlanPreparation(Box::new(error))
+            }
+        }
+    }
+}
+
+impl From<carina_core::upstream_exports::UpstreamSourceLoadError> for AppError {
+    fn from(error: carina_core::upstream_exports::UpstreamSourceLoadError) -> Self {
+        match error {
+            error @ carina_core::upstream_exports::UpstreamSourceLoadError::Configuration {
+                ..
+            } => Self::Config(error.to_string()),
+            carina_core::upstream_exports::UpstreamSourceLoadError::Invariant(error) => {
+                error.into()
+            }
+            carina_core::upstream_exports::UpstreamSourceLoadError::Expansion(error) => {
+                error.into()
             }
         }
     }

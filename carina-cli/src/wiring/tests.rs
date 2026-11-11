@@ -1,6 +1,86 @@
 use super::*;
 
 #[test]
+fn round2_1_validate_load_error_precedes_unsettled_checks_with_main_variant() {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let wiring = WiringContext::new_for_test(&runtime, vec![], &[]);
+    let context = wiring.provider_context().as_provider_context();
+    let checks =
+        carina_core::validation::deferred_types::TypeCheckSession::run(context, |session| {
+            let missing = carina_core::parser::parse_type_expr_str(
+                "Missing",
+                &carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                ),
+            )
+            .unwrap();
+            session.record_type(&missing, "load declaration");
+            Err::<(), _>(AppError::Config("configuration load failed".into()))
+        });
+    let diagnostics = checks.diagnostics().iter().filter_map(|diagnostic| match diagnostic {
+        carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => Some(error.message.as_str()),
+        _ => None,
+    }).collect::<Vec<_>>().join("\n");
+    assert!(!diagnostics.is_empty());
+    let expected = format!("configuration load failed\n{}", diagnostics);
+    let error = settle_type_checks(checks, AppError::Validation).unwrap_err();
+    assert_eq!(
+        crate::error::format_error_with_source_chain(&error),
+        expected
+    );
+    assert!(matches!(error, AppError::Validation(_)), "{error:?}");
+}
+
+#[test]
+fn round2_1_plan_preparation_uses_main_factory_variant_and_order() {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let wiring = WiringContext::new_for_test(&runtime, vec![], &[]);
+    let context = wiring.provider_context().as_provider_context();
+    let plan_errors = vec![carina_core::plan::PlanError::new(
+        ResourceId::with_identity("mock.thing", "item"),
+        carina_core::plan::PlanErrorKind::MissingProviderIdentifier,
+    )]
+    .try_into()
+    .unwrap();
+    for primary in [
+        PlanPreparationError::Plan(plan_errors),
+        PlanPreparationError::Provider(HostError::api_error("primary provider failure")),
+    ] {
+        let primary_text = primary.to_string();
+        let checks =
+            carina_core::validation::deferred_types::TypeCheckSession::run(context, |session| {
+                let missing = carina_core::parser::parse_type_expr_str(
+                    "Missing",
+                    &carina_core::parser::ProviderContext::new(
+                        carina_core::EnvironmentSnapshot::empty(),
+                    ),
+                )
+                .unwrap();
+                session.record_type(&missing, "plan declaration");
+                Err::<(), _>(primary)
+            });
+        let diagnostics = checks.diagnostics().iter().filter_map(|diagnostic| match diagnostic {
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => Some(error.message.as_str()),
+            _ => None,
+        }).collect::<Vec<_>>().join("\n");
+        assert!(!diagnostics.is_empty());
+        let expected = format!("{primary_text}\n{}", diagnostics);
+        let error = settle_type_checks(checks, |text| {
+            PlanPreparationError::Provider(HostError::internal(text))
+        })
+        .unwrap_err();
+        assert_eq!(
+            crate::error::format_error_with_source_chain(&error),
+            expected
+        );
+        assert!(
+            matches!(error, PlanPreparationError::Provider(_)),
+            "{error:?}"
+        );
+    }
+}
+
+#[test]
 fn round1_4_chained_upstream_diagnostics_are_rendered_once() {
     let context =
         carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
@@ -20,9 +100,11 @@ fn round1_4_chained_upstream_diagnostics_are_rendered_once() {
     )]);
     let error =
         carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
-            carina_core::upstream_exports::AdmittedUpstreamExports::admit_snapshot(
+            carina_core::upstream_exports::ResolvedUpstreamSource::for_test(
                 "orgs",
-                &carina_core::upstream_exports::SourceSurface::for_test(Some(&declarations)),
+                Some(&declarations),
+            )
+            .admit_snapshot(
                 HashMap::from([(
                     "count".into(),
                     carina_core::resource::Value::Concrete(
@@ -36,8 +118,10 @@ fn round1_4_chained_upstream_diagnostics_are_rendered_once() {
     let error =
         AppError::UpstreamSnapshotChanged(Box::new(crate::error::UpstreamSnapshotChangedError {
             message: "snapshot-marker".into(),
-            error: AppError::UpstreamExportAdmission(Box::new(error))
-                .with_type_check_diagnostics("diagnostic-marker".into()),
+            error: AppError::TypeCheckDiagnostics(Box::new(crate::error::TypeCheckDiagnostics {
+                error: AppError::UpstreamExportAdmission(Box::new(error)),
+                diagnostics: "diagnostic-marker".into(),
+            })),
         }));
     assert!(std::error::Error::source(&error).unwrap().is::<AppError>());
     let message = crate::error::format_error_with_source_chain(&error);
@@ -52,42 +136,9 @@ fn round1_4_chained_upstream_diagnostics_are_rendered_once() {
 }
 
 #[test]
-fn round1_4_plan_preparation_diagnostics_preserve_user_error() {
-    let value: carina_core::resource::Value =
-        carina_core::resource::Value::Deferred(carina_core::resource::DeferredValue::BindingRef {
-            binding: carina_core::resource::absolute_binding_address_for_test("pending"),
-        });
-    let cause = value
-        .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
-        .and_then(|proof| proof.into_classification().into_known())
-        .unwrap_err();
-    let error = PlanPreparationError::Knowledge {
-        resource: Box::new(ResourceId::with_identity("mock.thing", "item")),
-        attribute: "name".into(),
-        error: cause,
-    }
-    .with_type_check_diagnostics("diagnostic-marker".into());
-    let mut cause: &(dyn std::error::Error + 'static) = &error;
-    loop {
-        if matches!(
-            cause.downcast_ref::<PlanPreparationError>(),
-            Some(PlanPreparationError::Knowledge { .. })
-        ) {
-            break;
-        }
-        cause = cause
-            .source()
-            .expect("the typed preparation failure must survive diagnostics");
-    }
-    assert!(!matches!(error, PlanPreparationError::Provider(_)));
-}
-
-#[test]
 fn review_6_settlement_keeps_typed_admission_error_with_diagnostics() {
     use carina_core::static_type::ExportStaticType;
-    use carina_core::upstream_exports::{
-        AdmittedUpstreamExports, UpstreamExportEntry, UpstreamExportType,
-    };
+    use carina_core::upstream_exports::{UpstreamExportEntry, UpstreamExportType};
     let runtime = crate::test_support::TestCommandRuntime::new();
     let wiring = WiringContext::new_for_test(&runtime, vec![], &[]);
     let context = wiring.provider_context().as_provider_context();
@@ -113,9 +164,11 @@ fn review_6_settlement_keeps_typed_admission_error_with_diagnostics() {
             )
             .unwrap();
             session.record_type(&unavailable, "another declaration");
-            AdmittedUpstreamExports::admit_snapshot(
+            carina_core::upstream_exports::ResolvedUpstreamSource::for_test(
                 "up",
-                &carina_core::upstream_exports::SourceSurface::for_test(Some(&declarations)),
+                Some(&declarations),
+            )
+            .admit_snapshot(
                 HashMap::from([(
                     "count".into(),
                     carina_core::resource::Value::Concrete(
@@ -124,10 +177,11 @@ fn review_6_settlement_keeps_typed_admission_error_with_diagnostics() {
                 )]),
                 session,
             )
-            .map_err(|error| AppError::UpstreamExportAdmission(Box::new(error)))
         });
     assert!(!checks.diagnostics().is_empty());
-    let error = settle_type_checks(checks, AppError::Validation).unwrap_err();
+    let error = settle_upstream_admission(checks)
+        .map_err(AppError::from)
+        .unwrap_err();
     let mut cause: &(dyn std::error::Error + 'static) = &error;
     loop {
         if cause
@@ -3527,9 +3581,6 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
     .expect_err("normalizer failure must abort plan preprocessing");
 
     match error {
-        error @ PlanPreparationError::TypeCheckDiagnostics(_) => {
-            panic!("unexpected type diagnostics: {error}")
-        }
         PlanPreparationError::Provider(error) => {
             assert_eq!(error.to_string(), "plan normalization failed");
         }
@@ -14787,9 +14838,6 @@ mod resolved_value_constraint_gate {
 
     fn into_plan_errors(error: PlanPreparationError) -> Vec<carina_core::plan::PlanError> {
         match error {
-            error @ PlanPreparationError::TypeCheckDiagnostics(_) => {
-                panic!("unexpected type diagnostics: {error}")
-            }
             PlanPreparationError::Plan(errors) => errors.into_vec(),
             error @ PlanPreparationError::Knowledge { .. } => {
                 panic!("unexpected knowledge error: {error}")

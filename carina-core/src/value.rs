@@ -609,7 +609,7 @@ impl PersistedExportValue {
 
     // Runtime export decoding is reachable only through source admission.
     pub(crate) fn decode(&self) -> Result<Option<Value>, PersistedValueDecodeError> {
-        persisted_json_to_dsl_value(&self.encoded, PersistedPurpose::Export).map(|value| {
+        persisted_json_to_dsl_value(&self.encoded, PersistedPurpose::ExportAdmission).map(|value| {
             value.map(|snapshot| {
                 snapshot
                     .to_value_at("export")
@@ -630,7 +630,7 @@ impl PersistedExportValue {
     }
 
     pub fn decoded_json(&self) -> serde_json::Value {
-        decode_persisted_json(&self.encoded, PersistedPurpose::ExportDisplay)
+        decode_persisted_json(&self.encoded, PersistedPurpose::Export)
             .expect("PersistedExportValue validates the reserved namespace at construction")
             .into_ordinary_json()
     }
@@ -642,7 +642,7 @@ impl PersistedExportValue {
     }
 
     fn from_serialized_json(encoded: serde_json::Value) -> Result<Self, PersistedValueDecodeError> {
-        decode_persisted_json(&encoded, PersistedPurpose::ExportDisplay)?;
+        decode_persisted_json(&encoded, PersistedPurpose::Export)?;
         Ok(Self { encoded })
     }
 }
@@ -1190,7 +1190,7 @@ fn json_to_dsl_value_inner(
 enum PersistedPurpose {
     State,
     Export,
-    ExportDisplay,
+    ExportAdmission,
 }
 
 enum DecodedPersistedJson {
@@ -1317,10 +1317,10 @@ fn decode_persisted_child(
     purpose: PersistedPurpose,
     path: String,
 ) -> Result<DecodedPersistedJson, PersistedValueDecodeError> {
-    if matches!(purpose, PersistedPurpose::State) {
+    if !matches!(purpose, PersistedPurpose::ExportAdmission) {
         return decode_persisted_json(json, purpose);
     }
-    let decoded = if json.is_null() && matches!(purpose, PersistedPurpose::Export) {
+    let decoded = if json.is_null() {
         Err(PersistedValueDecodeError::NestedExportNull)
     } else {
         decode_persisted_json(json, purpose)
@@ -1524,7 +1524,7 @@ pub fn render_export_json_value(value: &PersistedExportValue) -> RenderedValue {
 
 fn render_persisted_json(value: PersistedView<'_>) -> RenderedValue {
     let mut sink = SpanSink::default();
-    let value = decode_persisted_json(value.encoded, PersistedPurpose::ExportDisplay)
+    let value = decode_persisted_json(value.encoded, PersistedPurpose::Export)
         .expect("persisted value types validate the reserved namespace at construction");
     format_decoded_persisted_json_into(&value, &mut sink).expect("SpanSink writes are infallible");
     sink.finish()
@@ -7262,6 +7262,28 @@ pub(crate) fn redact_state_snapshot_value(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn round2_3_export_namespace_validation_keeps_main_error_without_child_paths() {
+        let malformed = serde_json::json!({"private_member": [{"$enum": {}}]});
+        let expected = "malformed $enum persisted enum payload";
+        assert_eq!(
+            PersistedValue::from_serialized_json(malformed.clone())
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+        assert_eq!(
+            PersistedExportValue::from_serialized_json(malformed.clone())
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+        let invalid_for_display = PersistedExportValue { encoded: malformed };
+        let error = decode_persisted_json(&invalid_for_display.encoded, PersistedPurpose::Export)
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), expected);
+    }
     use crate::schema::{
         PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
     };
@@ -8428,10 +8450,11 @@ mod tests {
 
     #[test]
     fn export_decode_retains_nested_malformed_payload_paths() {
-        let error = PersistedExportValue::from_serialized_json(serde_json::json!({
+        let raw = serde_json::json!({
             "outer": ["valid", {"$enum": {"api_value": "broken"}}]
-        }))
-        .unwrap_err();
+        });
+        let error =
+            persisted_json_to_dsl_value(&raw, PersistedPurpose::ExportAdmission).unwrap_err();
         let message = error.to_string();
         for fragment in ["outer", "[1]", "malformed $enum"] {
             assert!(message.contains(fragment), "{message}");

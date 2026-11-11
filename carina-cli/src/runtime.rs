@@ -4,6 +4,9 @@ use crate::error::{AppError, CommandInputError};
 use crate::output_style::ColorMode;
 use crate::wiring::TrustedLocalGrantInputs;
 use carina_core::paths::{CanonicalPath, ResolvedPath};
+use carina_core::upstream_exports::{
+    ResolvedUpstreamSource, UpstreamSourceIdentity, UpstreamTypeAuthority,
+};
 use carina_core::{EnvironmentSnapshot, UserDirs};
 use carina_provider_mock::ConfiguredBuiltinMock;
 use std::collections::{HashMap, HashSet};
@@ -15,13 +18,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 type ConfigureBuiltinMock =
     Box<dyn FnOnce() -> Result<ConfiguredBuiltinMock, Arc<CommandInputError>> + Send + Sync>;
 
-type UpstreamSourceCache = HashMap<
-    CanonicalPath,
-    Vec<(
-        carina_core::upstream_exports::UpstreamTypeAuthority,
-        Arc<crate::commands::plan::CachedUpstreamSource>,
-    )>,
->;
+type UpstreamSourceCache =
+    HashMap<(CanonicalPath, String), Vec<(UpstreamTypeAuthority, Arc<ResolvedUpstreamSource>)>>;
 
 /// Mock-only inputs become usable only after successful builtin selection.
 pub struct BuiltinMockInputs {
@@ -101,20 +99,28 @@ impl CommandRuntime {
     /// cached. Holding this lock only covers synchronous parse/expansion.
     pub(crate) fn upstream_source(
         &self,
-        path: &ResolvedPath,
-        authority: carina_core::upstream_exports::UpstreamTypeAuthority,
-        load: impl FnOnce() -> Result<crate::commands::plan::CachedUpstreamSource, AppError>,
-    ) -> Result<Arc<crate::commands::plan::CachedUpstreamSource>, AppError> {
+        identity: &UpstreamSourceIdentity,
+        context: &carina_core::parser::ProviderContext,
+        schemas: &carina_core::schema::SchemaRegistry,
+    ) -> Result<Arc<ResolvedUpstreamSource>, AppError> {
+        let authority = UpstreamTypeAuthority::capture(context, schemas);
         let mut sources = self
             .state
             .upstream_sources
             .lock()
             .expect("upstream source cache");
-        let sources = sources.entry(path.identity()).or_default();
+        let sources = sources
+            .entry((identity.source().identity(), identity.binding().into()))
+            .or_default();
         if let Some((_, source)) = sources.iter().find(|(existing, _)| existing == &authority) {
             return Ok(Arc::clone(source));
         }
-        let source = Arc::new(load()?);
+        let source = Arc::new(
+            carina_core::validation::deferred_types::TypeCheckSession::run(context, |session| {
+                identity.load(session, schemas)
+            })
+            .publish(&mut Vec::new())?,
+        );
         sources.push((authority, Arc::clone(&source)));
         Ok(source)
     }

@@ -8,9 +8,7 @@ use std::path::PathBuf;
 use crate::output_style::Colorize;
 use serde::{Deserialize, Serialize};
 
-use carina_core::config_loader::{
-    load_configuration_for_bootstrap, load_configuration_with_config,
-};
+use carina_core::config_loader::load_configuration_with_config;
 use carina_core::data_source_value::DataSourceValue;
 use carina_core::detail_rows::HistoricalDisplayAttributes;
 use carina_core::differ::rebind_current_for_move;
@@ -42,8 +40,10 @@ fn absolute_binding(name: &str) -> AbsoluteBindingAddress {
 fn root_resource_ref(binding: &str, attribute: &str) -> Value {
     Value::resource_ref(binding, attribute, Vec::new()).resolve_root_for_test()
 }
+#[cfg(test)]
+use carina_core::config_loader::load_configuration_for_bootstrap;
 use carina_core::schema::SchemaKind;
-use carina_core::upstream_exports::{AdmittedRemoteBindings, AdmittedUpstreamExports};
+use carina_core::upstream_exports::AdmittedRemoteBindings;
 #[cfg(test)]
 use carina_core::value::PersistedValue;
 use carina_core::value::{
@@ -6720,6 +6720,7 @@ async fn load_provider_referenced_upstream_states<E>(
             keys.as_ref(),
         )
         .await
+        .map_err(AppError::from)
         .map_err(|error| AppError::ProviderReferencedUpstream {
             provider: required_by.provider,
             attribute: required_by.attribute,
@@ -6911,54 +6912,6 @@ fn provider_referenced_upstream_states<E>(
         .collect()
 }
 
-/// One source parse and export expansion for the lifetime of a command.
-/// An unavailable surface is explicitly unchecked; it is not an empty surface.
-pub(crate) struct CachedUpstreamSource {
-    backend: Option<carina_core::parser::BackendConfig>,
-    upstream_states: Vec<UpstreamState<carina_core::resource::RelativeBindingName>>,
-    surface: carina_core::upstream_exports::SourceSurface,
-}
-
-fn resolve_upstream_source(
-    runtime: &crate::runtime::CommandRuntime,
-    binding: &str,
-    source: &ResolvedPath,
-    provider_context: &ProviderContext,
-    schemas: &carina_core::schema::SchemaRegistry,
-) -> Result<std::sync::Arc<CachedUpstreamSource>, AppError> {
-    runtime.upstream_source(
-        source,
-        carina_core::upstream_exports::UpstreamTypeAuthority::capture(provider_context, schemas),
-        || {
-            let loaded = load_configuration_for_bootstrap(
-                source,
-                provider_context,
-                &carina_core::schema::SchemaRegistry::new(),
-            )
-            .map_err(|error| AppError::Config(format!("upstream_state '{binding}': {error}")))?;
-            let surface = carina_core::validation::deferred_types::TypeCheckSession::run(
-                provider_context,
-                |session| {
-                    carina_core::upstream_exports::resolve_upstream_source_surface(
-                        &loaded, source, session, schemas,
-                    )
-                },
-            )
-            .publish(&mut Vec::new())?;
-            Ok(CachedUpstreamSource {
-                backend: loaded
-                    .parsed
-                    .backend
-                    .clone()
-                    .map(carina_core::parser::BackendConfig::into_expanded)
-                    .transpose()?,
-                upstream_states: loaded.parsed.upstream_states.clone(),
-                surface,
-            })
-        },
-    )
-}
-
 /// Resolve and read each upstream's published exports by parsing its source
 /// directory, deriving its backend, and pulling the state through that backend.
 ///
@@ -6983,16 +6936,15 @@ pub(crate) async fn load_selected_upstream_states<B: carina_core::resource::Bind
     schemas: &carina_core::schema::SchemaRegistry,
     policy: UpstreamMissingStatePolicy,
     selected_keys: Option<&HashSet<carina_core::resource::DependencyKey<String>>>,
-) -> Result<AdmittedRemoteBindings, AppError> {
+) -> Result<AdmittedRemoteBindings, crate::error::UpstreamLoadFailure> {
     let color_mode = runtime.color_mode();
     let mut result = HashMap::new();
 
     for us in upstream_states {
-        let source_abs = base_dir
-            .join_display(&base_dir.persisted_path().display().join(&us.source))
-            .and_then(|source| {
-                source.metadata()?;
-                Ok(source)
+        let identity = carina_core::upstream_exports::UpstreamSourceIdentity::resolve(us, base_dir)
+            .and_then(|identity| {
+                identity.source().metadata()?;
+                Ok(identity)
             })
             .map_err(|e| {
                 AppError::Config(format!(
@@ -7002,6 +6954,7 @@ pub(crate) async fn load_selected_upstream_states<B: carina_core::resource::Bind
                     e
                 ))
             })?;
+        let source_abs = identity.source();
 
         let source_identity = source_abs.identity();
         if !cycle_guard.insert(source_identity.clone()) {
@@ -7009,20 +6962,15 @@ pub(crate) async fn load_selected_upstream_states<B: carina_core::resource::Bind
                 "upstream_state '{}': cycle detected at {}",
                 us.binding,
                 source_abs.display()
-            )));
+            ))
+            .into());
         }
 
-        let backend_result = build_upstream_backend(
-            runtime,
-            us,
-            &source_abs,
-            provider_context,
-            cycle_guard,
-            schemas,
-        )
-        .await;
+        let backend_result =
+            build_upstream_backend(runtime, &identity, provider_context, cycle_guard, schemas)
+                .await;
         cycle_guard.remove(&source_identity);
-        let backend = backend_result?;
+        let (backend, metadata) = backend_result?;
 
         let published_exports = backend.read_published_exports().await.map_err(|error| {
             AppError::Backend(carina_state::BackendError::UpstreamExportRead(Box::new(
@@ -7034,20 +6982,11 @@ pub(crate) async fn load_selected_upstream_states<B: carina_core::resource::Bind
         })?;
         match (published_exports, policy) {
             (Some(exports), _) => {
-                let metadata = resolve_upstream_source(
-                    runtime,
-                    &us.binding.to_string(),
-                    &source_abs,
-                    provider_context,
-                    schemas,
-                )?;
-                let exports = crate::wiring::settle_type_checks(
+                let exports = crate::wiring::settle_upstream_admission(
                     carina_core::validation::deferred_types::TypeCheckSession::run(
                         provider_context,
                         |session| {
-                            AdmittedUpstreamExports::decode_and_admit(
-                                &us.binding.to_string(),
-                                &metadata.surface,
+                            metadata.decode_and_admit(
                                 exports
                                     .values()
                                     .iter()
@@ -7059,19 +6998,18 @@ pub(crate) async fn load_selected_upstream_states<B: carina_core::resource::Bind
                                     .map(|(key, value)| (key.clone(), value)),
                                 session,
                             )
-                            .map_err(|error| AppError::UpstreamExportAdmission(Box::new(error)))
                         },
                     ),
-                    AppError::Validation,
                 )?;
-                result.insert(us.binding.to_string(), exports);
+                result.insert(metadata.binding().to_owned(), exports);
             }
             (None, UpstreamMissingStatePolicy::Strict) => {
                 return Err(AppError::Config(format!(
                     "upstream_state '{}': no state found at {}",
                     us.binding,
                     source_abs.display()
-                )));
+                ))
+                .into());
             }
             (None, UpstreamMissingStatePolicy::Lenient) => {
                 let msg = format!(
@@ -7109,43 +7047,35 @@ pub(crate) fn admit_saved_upstream_snapshot(
         let Some(values) = values.get(&binding) else {
             continue;
         };
-        let drift = || crate::commands::apply::upstream_snapshot_drift(&binding, apply_target);
-        let path =
-            base_dir
-                .join(&source.source)
-                .map_err(|error| AppError::UpstreamSourceResolution {
-                    binding: binding.clone(),
-                    source_path: source.source.clone(),
-                    error,
-                })?;
-        let metadata =
-            resolve_upstream_source(runtime, &binding, &path, provider_context, schemas)?;
-        let exports = crate::wiring::settle_type_checks(
+        let identity = carina_core::upstream_exports::UpstreamSourceIdentity::resolve(
+            &carina_core::parser::ExpandedUpstreamState {
+                binding: source.binding.clone(),
+                source: source.source.clone(),
+            },
+            base_dir,
+        )
+        .map_err(|error| AppError::UpstreamSourceResolution {
+            binding: binding.clone(),
+            source_path: source.source.clone(),
+            error,
+        })?;
+        let metadata = runtime.upstream_source(&identity, provider_context, schemas)?;
+        let exports = crate::wiring::settle_upstream_admission(
             carina_core::validation::deferred_types::TypeCheckSession::run(
                 provider_context,
-                |session| {
-                    AdmittedUpstreamExports::admit_snapshot(
-                        &binding,
-                        &metadata.surface,
-                        values.clone(),
-                        session,
-                    )
-                    .map_err(|error| AppError::UpstreamExportAdmission(Box::new(error)))
-                },
+                |session| metadata.admit_snapshot(values.clone(), session),
             ),
-            AppError::Validation,
         )
+        .and_then(|exports| {
+            if exports.len() != values.len() {
+                Err(crate::error::UpstreamLoadFailure::DroppedSavedKeys)
+            } else {
+                Ok(exports)
+            }
+        })
         .map_err(|error| {
-            AppError::UpstreamSnapshotChanged(Box::new(
-                crate::error::UpstreamSnapshotChangedError {
-                    message: drift(),
-                    error,
-                },
-            ))
+            crate::commands::apply::classify_upstream_snapshot_error(&binding, apply_target, error)
         })?;
-        if exports.len() != values.len() {
-            return Err(AppError::Config(drift()));
-        }
         admitted.insert(binding, exports);
     }
     Ok(admitted)
@@ -7171,28 +7101,29 @@ pub(crate) async fn load_upstream_states<B: carina_core::resource::BindingAddres
         None,
     )
     .await
+    .map_err(AppError::from)
 }
 
 /// Resolve an upstream's backend: parse its `.crn`, walk its own upstream
 /// chain (cycle detection only — never state I/O — see
 /// carina-rs/carina#2608), then build the backend honoring local-path
 /// anchoring. Shared between strict and lenient upstream loaders.
-async fn build_upstream_backend<B: carina_core::resource::BindingAddress>(
+async fn build_upstream_backend(
     runtime: &crate::runtime::CommandRuntime,
-    us: &UpstreamState<B>,
-    source_abs: &ResolvedPath,
+    identity: &carina_core::upstream_exports::UpstreamSourceIdentity,
     provider_context: &ProviderContext,
     cycle_guard: &mut HashSet<CanonicalPath>,
     schemas: &carina_core::schema::SchemaRegistry,
-) -> Result<ResolvedReadBackend, AppError> {
+) -> Result<
+    (
+        ResolvedReadBackend,
+        std::sync::Arc<carina_core::upstream_exports::ResolvedUpstreamSource>,
+    ),
+    AppError,
+> {
     let color_mode = runtime.color_mode();
-    let loaded = resolve_upstream_source(
-        runtime,
-        &us.binding.to_string(),
-        source_abs,
-        provider_context,
-        schemas,
-    )?;
+    let loaded = runtime.upstream_source(identity, provider_context, schemas)?;
+    let source_abs = loaded.source();
 
     // Walk the upstream's own `upstream_state` chain so cycles longer
     // than one hop still surface — but do NOT fetch their state from
@@ -7202,7 +7133,7 @@ async fn build_upstream_backend<B: carina_core::resource::BindingAddress>(
     // internally, puncturing the encapsulation that `exports.crn` is
     // supposed to provide (carina-rs/carina#2608).
     Box::pin(walk_upstream_cycles_only(
-        &loaded.upstream_states,
+        loaded.upstream_states(),
         source_abs,
         provider_context,
         cycle_guard,
@@ -7212,11 +7143,11 @@ async fn build_upstream_backend<B: carina_core::resource::BindingAddress>(
     // Anchor local-backend state paths and the backend lock at the upstream's
     // source directory. A pending migration in the upstream must read the old
     // locked backend just like a top-level read command.
-    resolve_backend_for_read(
+    let backend = resolve_backend_for_read(
         color_mode,
         source_abs,
         &source_abs.source_label(),
-        loaded.backend.as_ref(),
+        loaded.backend(),
         BackendLockRequirement::AllowMissing,
         ReadBackendWarningPolicy::UpstreamSource {
             source_dir: source_abs,
@@ -7224,7 +7155,8 @@ async fn build_upstream_backend<B: carina_core::resource::BindingAddress>(
         },
     )
     .await
-    .map_err(|error| error.with_upstream_state_source(&source_abs.source_label()))
+    .map_err(|error| error.with_upstream_state_source(&source_abs.source_label()))?;
+    Ok((backend, loaded))
 }
 
 /// Walk an upstream's transitive `upstream_state` chain *without*
@@ -7398,6 +7330,7 @@ mod load_upstream_states_tests {
             None,
         )
         .await
+        .map_err(AppError::from)
         .unwrap();
         assert_eq!(
             first["orgs"]["count"],
@@ -7416,6 +7349,7 @@ mod load_upstream_states_tests {
             None,
         )
         .await
+        .map_err(AppError::from)
         .expect("one command must reuse its captured source metadata");
         assert_eq!(
             fresh_state["orgs"]["count"],
@@ -7433,6 +7367,7 @@ mod load_upstream_states_tests {
                 None,
             )
             .await
+            .map_err(AppError::from)
             .is_err(),
             "a new command must parse source again"
         );
@@ -7538,6 +7473,36 @@ mod load_upstream_states_tests {
     }
 
     #[tokio::test]
+    async fn round2_5_cached_source_keeps_each_binding_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        write_upstream_admission_source(dir.path(), "count: Int = seed");
+        write_state(dir.path(), &[("count", serde_json::json!(42))]);
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let upstreams = ["orgs", "again"].map(|name| UpstreamState {
+            binding: absolute_binding(name),
+            source: dir.path().to_path_buf(),
+        });
+        let loaded = load_upstream_states(
+            &runtime,
+            &upstreams,
+            &ResolvedPath::new(dir.path().parent().unwrap()).unwrap(),
+            &context,
+            &mut HashSet::new(),
+            UpstreamMissingStatePolicy::Strict,
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded.len(), 2);
+        for binding in ["orgs", "again"] {
+            assert_eq!(
+                loaded[binding]["count"],
+                Value::Concrete(ConcreteValue::Int(42))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn round1_7_empty_schema_load_cannot_poison_loaded_admission() {
         let dir = tempfile::tempdir().unwrap();
         write_upstream_admission_source(dir.path(), "claim = producer.count");
@@ -7580,6 +7545,7 @@ mod load_upstream_states_tests {
                 None,
             )
             .await
+            .map_err(AppError::from)
             .unwrap();
             let error = load_selected_upstream_states(
                 &runtime,
@@ -7592,6 +7558,7 @@ mod load_upstream_states_tests {
                 None,
             )
             .await
+            .map_err(AppError::from)
             .expect_err("unloaded metadata must not bypass a subsequent loaded source-type check");
             assert!(
                 matches!(error, AppError::UpstreamExportAdmission(_)),
@@ -7666,6 +7633,7 @@ mod load_upstream_states_tests {
             None,
         )
         .await
+        .map_err(AppError::from)
         .unwrap();
         assert!(valid["orgs"].contains_key("claim"));
         write_state(dir.path(), &[("claim", value("retired"))]);
@@ -7680,6 +7648,7 @@ mod load_upstream_states_tests {
             None,
         )
         .await
+        .map_err(AppError::from)
         .unwrap_err();
         assert!(error.to_string().contains("orgs.claim"), "{error}");
         assert!(

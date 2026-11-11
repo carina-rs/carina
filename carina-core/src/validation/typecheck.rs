@@ -500,15 +500,8 @@ impl TypeExprValueError {
     }
 }
 
-impl std::error::Error for TypeExprValueError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidAccess { error } => Some(error),
-            Self::CustomTypeValidation { error, .. } => Some(error.as_ref()),
-            _ => None,
-        }
-    }
-}
+// Display is the complete legacy diagnostic, including any nested cause.
+impl std::error::Error for TypeExprValueError {}
 
 fn write_path(f: &mut fmt::Formatter<'_>, path: &[TypeExprValuePathSegment]) -> fmt::Result {
     if path.is_empty() {
@@ -1373,6 +1366,47 @@ fn inferred_type_fits(expected: &TypeExpr, actual: &TypeExpr) -> bool {
 /// Directional compatibility for a declared source flowing into a declared sink.
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn round2_2_embedded_causes_do_not_repeat_in_source_chains() {
+        use super::*;
+        let value: crate::resource::Value = crate::resource::Value::Concrete(
+            crate::resource::ConcreteValue::String("fixture".into()),
+        );
+        let cause = crate::parser::CustomTypeValidationError::ProvidersNotLoaded;
+        let custom_cause = cause.to_string();
+        for (error, cause_text) in [
+            (
+                TypeExprValueError::InvalidAccess {
+                    error: crate::static_type::InferenceError::UnknownType {
+                        reason: "access-cause-marker".into(),
+                    },
+                },
+                "access-cause-marker".into(),
+            ),
+            (
+                TypeExprValueError::CustomTypeValidation {
+                    path: vec![],
+                    expected: Box::new(TypeExpr::String),
+                    actual: Box::new(crate::ValueDescription::of(&value)),
+                    error: Box::new(cause),
+                },
+                custom_cause,
+            ),
+        ] {
+            let display = error.to_string();
+            let mut rendered = display.clone();
+            let mut source = std::error::Error::source(&error);
+            while let Some(cause) = source {
+                rendered.push_str(&format!("\n{cause}"));
+                source = cause.source();
+            }
+            assert_eq!(rendered.matches(&cause_text).count(), 1, "{rendered}");
+            assert_eq!(
+                rendered, display,
+                "existing Display is the complete main diagnostic"
+            );
+        }
+    }
     use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
 
     use indexmap::IndexMap;

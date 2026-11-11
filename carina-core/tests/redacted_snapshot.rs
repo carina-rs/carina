@@ -110,12 +110,8 @@ fn validated_export_decode_returns_evaluable_values() {
         carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
     let admitted =
         carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
-            carina_core::upstream_exports::AdmittedUpstreamExports::decode_and_admit(
-                "upstream",
-                &carina_core::upstream_exports::SourceSurface::for_test(None),
-                [("export".into(), &persisted)],
-                session,
-            )
+            carina_core::upstream_exports::ResolvedUpstreamSource::for_test("upstream", None)
+                .decode_and_admit([("export".into(), &persisted)], session)
         })
         .unwrap();
     let decoded: Value = admitted["export"].clone();
