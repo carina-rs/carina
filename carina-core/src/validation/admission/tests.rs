@@ -2848,3 +2848,87 @@ fn round13_cross_owner_same_identity_defers_in_reference_and_declared_admission(
         }
     }
 }
+
+#[test]
+fn round2_plain_reference_skips_expression_callback() {
+    use crate::parser::ProviderContext;
+    use crate::resource::RelativeBindingName;
+    use crate::resource::knowledge::{KnowledgeContext, collect_classified_attributes};
+    use crate::validation::admission::{attributes, kind};
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut schemas = crate::schema::SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Source")
+            .attribute(AttributeSchema::optional("output", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(AttributeSchema::optional("input", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let parsed = crate::parser::parse_and_resolve(
+        "let source = mock.Source {}\nlet sink = mock.Sink { input = source.output }",
+    )
+    .unwrap();
+    let judged = crate::parser::retained::JudgedFile::new(parsed, &schemas, &config);
+    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let resource = tree
+        .project_resources()
+        .find(|resource| resource.id().resource_type == "Sink")
+        .unwrap();
+    let bindings =
+        crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &config);
+    let values = resource.attributes();
+    let classified = collect_classified_attributes(
+        values.iter().map(|(name, value)| (name.clone(), value)),
+        &KnowledgeContext::validation(),
+        |_, error| panic!("{error}"),
+    );
+    let actual: Vec<String> =
+        crate::validation::deferred_types::with_session_for_test(&config, |session| {
+            let check =
+                |_: &str,
+                 _: &crate::schema::CompiledAttributeType,
+                 _: &crate::resource::Value<
+                    crate::resource::ParserPlaceholder,
+                    RelativeBindingName,
+                >,
+                 _: &crate::schema::LeafPath,
+                 _: &crate::validation::admission::DestinationContract,
+                 _: &crate::validation::admission::assignment::ReferenceContext<
+                    '_,
+                    RelativeBindingName,
+                >,
+                 _cursor: crate::parser::retained::AuthoredCursor<'_>| {
+                    Err(crate::schema::TypeError::MissingRequired {
+                        name: "expression-only callback".into(),
+                    })
+                };
+            let result = attributes::admit_validation_attributes::<kind::ResourceAttribute, _, _>(
+                resource.schema(&schemas).unwrap(),
+                resource.id(),
+                &classified,
+                resource.quoted_string_attrs(),
+                Some(&bindings),
+                session,
+                Some(&check),
+                None,
+            );
+            result
+                .errors()
+                .chain(result.symbolic_errors().map(|(_, _, error)| error))
+                .map(ToString::to_string)
+                .collect()
+        });
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "../../parser/retained/judgement/round2_main.json"
+    ))
+    .unwrap();
+    let actual = serde_json::json!(actual);
+    assert_eq!(actual, expected["plain_reference"]);
+}

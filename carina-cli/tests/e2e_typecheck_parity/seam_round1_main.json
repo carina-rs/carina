@@ -1,0 +1,608 @@
+{
+  "block_alias": {
+    "cli": [
+      "test.Probe.<pending>: List item at index 0: Struct field 'count': Type mismatch: expected Int, got String"
+    ],
+    "lsp": [
+      {
+        "message": "Type mismatch: expected Int, got String for 'item[0].count'",
+        "range": {
+          "end": {
+            "character": 51,
+            "line": 0
+          },
+          "start": {
+            "character": 46,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      }
+    ]
+  },
+  "buffer_context": {
+    "cli": [],
+    "lsp": [
+      {
+        "message": "missing expression evidence: Root at DeclarationLocation { file: SourceFileId(\"test.crn\"), span: SourceSpan { start_byte: 23, end_byte: 52, start_line: 1, start_column: 24, end_line: 1, end_column: 53 } }",
+        "range": {
+          "end": {
+            "character": 52,
+            "line": 0
+          },
+          "start": {
+            "character": 23,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "source": "carina"
+      }
+    ]
+  },
+  "buffer_context_siblings": {
+    "cli": [
+      "test.Probe.<pending>: Type mismatch: expected Int, got String"
+    ],
+    "lsp": [
+      {
+        "message": "missing expression evidence: Root at DeclarationLocation { file: SourceFileId(\"test.crn\"), span: SourceSpan { start_byte: 23, end_byte: 28, start_line: 1, start_column: 24, end_line: 1, end_column: 29 } }",
+        "range": {
+          "end": {
+            "character": 28,
+            "line": 0
+          },
+          "start": {
+            "character": 23,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "source": "carina"
+      }
+    ]
+  },
+  "canonical_map_key": {
+    "cli": [],
+    "lsp": []
+  },
+  "directory_instances": {
+    "cli": [
+      "test.Probe.<pending>: Type mismatch: expected Int, got String"
+    ],
+    "lsp": [
+      {
+        "message": "Anonymous resource identity is derived from mutable attributes for multiple 'test.Probe' declarations using provider instance '<default>' in the root scope. Use `let` bindings to give them distinct stable identities.",
+        "range": {
+          "end": {
+            "character": 10,
+            "line": 1
+          },
+          "start": {
+            "character": 0,
+            "line": 1
+          }
+        },
+        "severity": 1,
+        "source": "carina"
+      },
+      {
+        "message": "Anonymous resources produced by the unbound `for` at main.crn:1 cannot be identified safely because multiple 'test.Probe' elements derive identity from mutable attributes.\nRewrite the loop with a binding and migrate its existing state addresses:\n\nlet probe = for item in values { test.Probe { payload = { needed = item first = 'a' } } }\n\nmoved {\n  from = test.Probe '_values[0]'\n  to = test.Probe 'probe[0]'\n}\n\nmoved {\n  from = test.Probe '_values[1]'\n  to = test.Probe 'probe[1]'\n}",
+        "range": {
+          "end": {
+            "character": 77,
+            "line": 0
+          },
+          "start": {
+            "character": 0,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "source": "carina"
+      },
+      {
+        "message": "Type mismatch: expected Int, got string 'bad'.",
+        "range": {
+          "end": {
+            "character": 20,
+            "line": 1
+          },
+          "start": {
+            "character": 13,
+            "line": 1
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      }
+    ]
+  },
+  "escaped_map": {
+    "cli": [],
+    "lsp": []
+  },
+  "escaped_resource": {
+    "cli": [],
+    "lsp": []
+  },
+  "escaped_resource_siblings": {
+    "cli": [
+      "test.Probe.<pending>: Map value for key 'key': Type mismatch: expected Int, got String",
+      "test.Probe.<pending>: Type mismatch: expected Int, got String"
+    ],
+    "lsp": [
+      {
+        "message": "Type mismatch: expected Int, got string 'bad'.",
+        "range": {
+          "end": {
+            "character": 38,
+            "line": 0
+          },
+          "start": {
+            "character": 31,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Map value for key 'key': Type mismatch: expected Int, got String",
+        "range": {
+          "end": {
+            "character": 54,
+            "line": 0
+          },
+          "start": {
+            "character": 47,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      }
+    ]
+  },
+  "escaped_unknown": {
+    "cli": [
+      "test.Probe.<pending>: Required attribute 'needed' is missing",
+      "test.Probe.<pending>: Type mismatch: expected Int, got String"
+    ],
+    "lsp": [
+      {
+        "message": "Required attribute 'needed' is missing",
+        "range": {
+          "end": {
+            "character": 20,
+            "line": 0
+          },
+          "start": {
+            "character": 13,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "payload: exactly one of [first, second] must be set",
+        "range": {
+          "end": {
+            "character": 20,
+            "line": 0
+          },
+          "start": {
+            "character": 13,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "source": "carina"
+      },
+      {
+        "message": "Unknown field 'unknown\\\\key' in Entry",
+        "range": {
+          "end": {
+            "character": 39,
+            "line": 0
+          },
+          "start": {
+            "character": 25,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Type mismatch: expected Int, got String",
+        "range": {
+          "end": {
+            "character": 49,
+            "line": 0
+          },
+          "start": {
+            "character": 44,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Validation failed: native finding",
+        "range": {
+          "end": {
+            "character": 64,
+            "line": 0
+          },
+          "start": {
+            "character": 58,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Type mismatch: expected Int, got string 'bad'.",
+        "range": {
+          "end": {
+            "character": 82,
+            "line": 0
+          },
+          "start": {
+            "character": 75,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Required attribute 'needed' is missing",
+        "range": {
+          "end": {
+            "character": 10,
+            "line": 0
+          },
+          "start": {
+            "character": 0,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "source": "carina"
+      }
+    ]
+  },
+  "list_siblings": {
+    "cli": [
+      "test.Probe.<pending>: List item at index 0: Required attribute 'needed' is missing",
+      "test.Probe.<pending>: Type mismatch: expected Int, got String"
+    ],
+    "lsp": [
+      {
+        "message": "Required attribute 'needed' is missing for 'items[0].needed'",
+        "range": {
+          "end": {
+            "character": 39,
+            "line": 0
+          },
+          "start": {
+            "character": 22,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "items[0]: exactly one of [first, second] must be set",
+        "range": {
+          "end": {
+            "character": 39,
+            "line": 0
+          },
+          "start": {
+            "character": 22,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "source": "carina"
+      },
+      {
+        "message": "Unknown field 'unknown' in Entry for 'items[0].unknown'",
+        "range": {
+          "end": {
+            "character": 33,
+            "line": 0
+          },
+          "start": {
+            "character": 24,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Type mismatch: expected Int, got String for 'items[1].count'",
+        "range": {
+          "end": {
+            "character": 74,
+            "line": 0
+          },
+          "start": {
+            "character": 69,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Type mismatch: expected Int, got string 'bad'.",
+        "range": {
+          "end": {
+            "character": 93,
+            "line": 0
+          },
+          "start": {
+            "character": 86,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Prefer block syntax for 'items'. Use `items { ... }` instead of `items = [{ ... }]`.",
+        "range": {
+          "end": {
+            "character": 18,
+            "line": 0
+          },
+          "start": {
+            "character": 13,
+            "line": 0
+          }
+        },
+        "severity": 4,
+        "source": "carina"
+      }
+    ]
+  },
+  "map_siblings": {
+    "cli": [
+      "test.Probe.<pending>: Map value for key 'first': Type mismatch: expected Int, got String",
+      "test.Probe.<pending>: Type mismatch: expected Int, got String"
+    ],
+    "lsp": [
+      {
+        "message": "Map value for key 'first': Type mismatch: expected Int, got String",
+        "range": {
+          "end": {
+            "character": 20,
+            "line": 0
+          },
+          "start": {
+            "character": 13,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Type mismatch: expected Int, got string 'bad'.",
+        "range": {
+          "end": {
+            "character": 67,
+            "line": 0
+          },
+          "start": {
+            "character": 60,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      }
+    ]
+  },
+  "module_access_if": {
+    "cli": [],
+    "lsp": []
+  },
+  "module_computed_if": {
+    "cli": [],
+    "lsp": []
+  },
+  "module_if": {
+    "cli": [],
+    "lsp": []
+  },
+  "quoted_resource": {
+    "cli": [],
+    "lsp": []
+  },
+  "quoted_resource_siblings": {
+    "cli": [
+      "test.Probe.<pending>: Map value for key 'key': Type mismatch: expected Int, got String",
+      "test.Probe.<pending>: Type mismatch: expected Int, got String"
+    ],
+    "lsp": [
+      {
+        "message": "Type mismatch: expected Int, got string 'bad'.",
+        "range": {
+          "end": {
+            "character": 62,
+            "line": 0
+          },
+          "start": {
+            "character": 55,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Map value for key 'key': Type mismatch: expected Int, got String",
+        "range": {
+          "end": {
+            "character": 78,
+            "line": 0
+          },
+          "start": {
+            "character": 71,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      }
+    ]
+  },
+  "quoted_struct": {
+    "cli": [],
+    "lsp": []
+  },
+  "struct_siblings": {
+    "cli": [
+      "test.Probe.<pending>: Required attribute 'needed' is missing",
+      "test.Probe.<pending>: Type mismatch: expected Int, got String"
+    ],
+    "lsp": [
+      {
+        "message": "Required attribute 'needed' is missing",
+        "range": {
+          "end": {
+            "character": 20,
+            "line": 0
+          },
+          "start": {
+            "character": 13,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "payload: exactly one of [first, second] must be set",
+        "range": {
+          "end": {
+            "character": 20,
+            "line": 0
+          },
+          "start": {
+            "character": 13,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "source": "carina"
+      },
+      {
+        "message": "Unknown field 'unknown' in Entry",
+        "range": {
+          "end": {
+            "character": 34,
+            "line": 0
+          },
+          "start": {
+            "character": 25,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Type mismatch: expected Int, got String",
+        "range": {
+          "end": {
+            "character": 44,
+            "line": 0
+          },
+          "start": {
+            "character": 39,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Validation failed: native finding",
+        "range": {
+          "end": {
+            "character": 59,
+            "line": 0
+          },
+          "start": {
+            "character": 53,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Type mismatch: expected Int, got string 'bad'.",
+        "range": {
+          "end": {
+            "character": 77,
+            "line": 0
+          },
+          "start": {
+            "character": 70,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Required attribute 'needed' is missing",
+        "range": {
+          "end": {
+            "character": 10,
+            "line": 0
+          },
+          "start": {
+            "character": 0,
+            "line": 0
+          }
+        },
+        "severity": 1,
+        "source": "carina"
+      }
+    ]
+  },
+  "unordered": {
+    "cli": [],
+    "lsp": [
+      {
+        "message": "Prefer block syntax for 'unordered'. Use `unordered { ... }` instead of `unordered = [{ ... }]`.",
+        "range": {
+          "end": {
+            "character": 22,
+            "line": 0
+          },
+          "start": {
+            "character": 13,
+            "line": 0
+          }
+        },
+        "severity": 4,
+        "source": "carina"
+      }
+    ]
+  }
+}

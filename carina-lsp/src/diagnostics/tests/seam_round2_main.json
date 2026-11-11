@@ -1,0 +1,43 @@
+{
+  "no_tree": [
+    {
+      "message": "Type mismatch: expected Int, got string 'bad'.",
+      "range": {
+        "end": {
+          "character": 17,
+          "line": 1
+        },
+        "start": {
+          "character": 12,
+          "line": 1
+        }
+      },
+      "severity": 2,
+      "source": "carina"
+    }
+  ],
+  "no_keys": [
+    {
+      "message": "Type mismatch: expected Int, got string 'bad'.",
+      "range": {
+        "end": {
+          "character": 17,
+          "line": 1
+        },
+        "start": {
+          "character": 12,
+          "line": 1
+        }
+      },
+      "severity": 2,
+      "source": "carina"
+    }
+  ],
+  "no_keys_valid": [],
+  "no_expanded_report": [
+    null,
+    null,
+    null,
+    null
+  ]
+}

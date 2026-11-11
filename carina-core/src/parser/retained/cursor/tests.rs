@@ -59,7 +59,7 @@ fn round1_seam_cursor_steps_do_not_allocate() {
         usage = usage.child(0, EdgeRole::ListItem).unwrap();
     }
     let allocations =
-        crate::schema::value_validation::cursor_step_allocations(AuthoredCursor::Authored(usage));
+        crate::schema::value_validation::cursor_step_allocations(AuthoredCursor::authored(usage));
     assert_eq!(allocations, 0, "main has no per-cursor heap allocation");
 }
 
@@ -131,7 +131,7 @@ fn round1_seam_expansion_records_a_decision_without_a_parse_projection() {
         schema.as_schema().defs(),
         crate::schema::FieldAncestry::WRITABLE,
         &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
-        AuthoredCursor::Authored(slot.cursor().unwrap()),
+        AuthoredCursor::authored(slot.cursor().unwrap()),
         &|_, _, _, _| Ok(Default::default()),
         &mut Default::default(),
     );
@@ -305,10 +305,10 @@ fn walk(source: &str, declaration: crate::schema::AttributeType) -> Vec<Visit> {
                  value: CheckValue<'_, _, _>,
                  _: &crate::schema::LeafPath,
                  cursor: AuthoredCursor<'_>| {
-        let (usage, covered) = match cursor {
-            AuthoredCursor::Authored(usage) => (usage, false),
-            AuthoredCursor::CoveredBy(usage) => (usage, true),
-            AuthoredCursor::Projected(_) => panic!("authored fixture became projected"),
+        let (usage, covered) = match cursor.kind {
+            CursorKind::Authored(usage) => (usage, false),
+            CursorKind::CoveredBy(usage) => (usage, true),
+            CursorKind::Projected(_) => panic!("authored fixture became projected"),
         };
         let kind = match usage.node().kind() {
             ExprKind::Scalar(_) => "scalar",
@@ -340,7 +340,7 @@ fn walk(source: &str, declaration: crate::schema::AttributeType) -> Vec<Visit> {
         schema.schema().as_schema().defs(),
         crate::schema::FieldAncestry::WRITABLE,
         &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
-        AuthoredCursor::Authored(slot.cursor().unwrap()),
+        AuthoredCursor::authored(slot.cursor().unwrap()),
         &check,
         &mut WalkCoverage::default(),
     );
@@ -587,7 +587,7 @@ fn slot_coverage(
             schema.schema().as_schema().defs(),
             crate::schema::FieldAncestry::WRITABLE,
             &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
-            AuthoredCursor::Authored(slot.cursor().unwrap()),
+            AuthoredCursor::authored(slot.cursor().unwrap()),
             &|_, _, _, _| Ok(Default::default()),
             &mut coverage,
         );
@@ -793,7 +793,7 @@ fn module_instances(condition: &str, rejudge: bool) {
                 schema.schema().as_schema().defs(),
                 crate::schema::FieldAncestry::WRITABLE,
                 &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
-                AuthoredCursor::Authored(slot.cursor().unwrap()),
+                AuthoredCursor::authored(slot.cursor().unwrap()),
                 &|_, _, _, _| Ok(Default::default()),
                 &mut coverage,
             );
@@ -859,8 +859,10 @@ fn seam_map_keys_are_covered_and_do_not_call_the_assignment_callback() {
     );
     assert_eq!(visits.len(), 2, "{visits:?}");
     let slot = slot("let input = { key = 'value' }");
-    let cursor = AuthoredCursor::Authored(slot.cursor().unwrap()).for_map_key();
-    let AuthoredCursor::CoveredBy(usage) = cursor else {
+    let mut key_use = slot.cursor().unwrap();
+    key_use.edge = EdgeRole::MapKey;
+    let cursor = AuthoredCursor::authored(key_use).covered();
+    let CursorKind::CoveredBy(usage) = cursor.kind else {
         panic!("map key is covered")
     };
     assert_eq!(usage.edge(), EdgeRole::MapKey);
@@ -936,12 +938,12 @@ fn seam_directory_replacement_keeps_reference_root_and_covers_descendants() {
                  _: crate::schema::value_validation::CheckValue<'_, _, _>,
                  _: &crate::schema::LeafPath,
                  cursor: AuthoredCursor<'_>| {
-        visits.borrow_mut().push(match cursor {
-            AuthoredCursor::Authored(usage) => {
+        visits.borrow_mut().push(match cursor.kind {
+            CursorKind::Authored(usage) => {
                 assert!(matches!(usage.node().kind(), ExprKind::Reference { .. }));
                 false
             }
-            AuthoredCursor::CoveredBy(usage) => {
+            CursorKind::CoveredBy(usage) => {
                 assert!(matches!(usage.node().kind(), ExprKind::Reference { .. }));
                 true
             }
@@ -956,7 +958,7 @@ fn seam_directory_replacement_keeps_reference_root_and_covers_descendants() {
         schema.schema().as_schema().defs(),
         crate::schema::FieldAncestry::WRITABLE,
         &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
-        AuthoredCursor::Authored(slot.cursor().unwrap()),
+        AuthoredCursor::authored(slot.cursor().unwrap()),
         &check,
         &mut Default::default(),
     );
@@ -1055,7 +1057,7 @@ fn seam_schema_block_aliases_keep_the_synthetic_authored_containers() {
         schema.schema().as_schema().defs(),
         crate::schema::FieldAncestry::WRITABLE,
         &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
-        AuthoredCursor::Authored(slot.cursor().unwrap()),
+        AuthoredCursor::authored(slot.cursor().unwrap()),
         &|_, _, _, _| Ok(Default::default()),
         &mut Default::default(),
     );
@@ -1320,7 +1322,7 @@ fn seam_completeness_tracks_the_materialized_slot_generation() {
         schema.schema().as_schema().defs(),
         crate::schema::FieldAncestry::WRITABLE,
         &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
-        AuthoredCursor::Authored(slot.cursor().unwrap()),
+        AuthoredCursor::authored(slot.cursor().unwrap()),
         &|_, _, _, _| Ok(Default::default()),
         &mut coverage,
     );
@@ -1590,7 +1592,7 @@ fn review_seam_false_if_without_else_preserves_absence() {
         schema.as_schema().defs(),
         crate::schema::FieldAncestry::WRITABLE,
         &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
-        AuthoredCursor::Authored(slot.cursor().unwrap()),
+        AuthoredCursor::authored(slot.cursor().unwrap()),
         &|_, _, _, _| Ok(Default::default()),
         &mut WalkCoverage::default(),
     );
@@ -1661,7 +1663,7 @@ fn review_seam_discarded_failure_does_not_cover_the_failed_walk() {
                  _: &crate::schema::LeafPath,
                  cursor: AuthoredCursor<'_>| {
         assert!(matches!(value, CheckValue::Discarded));
-        let AuthoredCursor::Authored(usage) = cursor else {
+        let CursorKind::Authored(usage) = cursor.kind else {
             panic!("discarded authored child")
         };
         if usage.form() == AuthoredForm::Literal {
@@ -1878,4 +1880,22 @@ fn review_seam_producer_materialization_keeps_a_real_projection_pairing() {
             source.generation()
         );
     });
+}
+
+#[test]
+fn round2_parens_roles_match_for_selected_and_discarded_children() {
+    let visits = walk(
+        "mock.Test { input = if true { ('selected') } else { ('discarded') } }",
+        crate::schema::AttributeType::string(),
+    );
+    let live = visits
+        .iter()
+        .find(|visit| visit.kind == "scalar" && !visit.discarded)
+        .unwrap();
+    let dead = visits
+        .iter()
+        .find(|visit| visit.kind == "scalar" && visit.discarded)
+        .unwrap();
+    assert_eq!(live.edge, EdgeRole::Parens);
+    assert_eq!(dead.edge, live.edge);
 }

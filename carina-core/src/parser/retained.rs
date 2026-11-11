@@ -52,7 +52,7 @@ pub use cursor::{
     JudgedNodeRef, JudgedSlot, NodeId, ProjectedPhase, ProjectionGeneration, SlotDeclarationId,
     UseId,
 };
-pub(crate) use cursor::{AuthoredForm, SyntheticSource};
+pub(crate) use cursor::{AuthoredForm, CursorKind, SyntheticSource};
 
 /// The expansion scope is part of expression identity, even when two module
 /// instances originate at the same authored source location.
@@ -2062,6 +2062,9 @@ pub(crate) fn value_dependent_judgement_for_test() -> JudgedExpr {
 // Constructors for judgement evidence are confined to this module. In
 // particular, the syntax compiler and provisional evaluators cannot mint it.
 mod judgement {
+    #[cfg(test)]
+    mod round2_tests;
+
     use super::*;
     use crate::static_type::{InferenceError, InferenceIssue, NotInferableReason};
     use crate::validation::inference::{self, InferenceBinding, InferenceBindings};

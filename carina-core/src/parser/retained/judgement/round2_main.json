@@ -1,0 +1,10 @@
+{
+  "missing_report": [
+    "missing expression evidence: resource mock.Test.<pending>"
+  ],
+  "unbound_alias": [],
+  "unknown_schema": [
+    "Unknown resource type: mock.Unknown"
+  ],
+  "plain_reference": []
+}

@@ -381,6 +381,10 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
         }))
     }
 
+    pub(crate) fn parens_operand(&self) -> Result<Self, MissingEvidence> {
+        self.child(0, EdgeRole::Parens)
+    }
+
     pub(crate) fn known_condition(&self) -> Result<bool, MissingEvidence> {
         let condition = self
             .node
@@ -496,14 +500,7 @@ enum ProjectedOrigin {
 /// by their producer modules; there is no raw-value or lookup-failure source.
 /// Schema defaults used only for display are not an attribute producer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(
-    dead_code,
-    reason = "normalization/replay source cursors are reserved for their later admission boundaries"
-)]
 pub(crate) enum SyntheticSource {
-    DefaultTagsMerge(crate::executor::normalized::DefaultTagsMergeSource),
-    ProviderNormalization(crate::executor::normalized::ProviderNormalizationSource),
-    SavedPlanReplay(crate::saved_replay::SavedPlanReplaySource),
     ResourcePrefix(crate::identifier::ResourcePrefixSource),
 }
 
@@ -528,77 +525,97 @@ impl ProjectedPhase {
         Self(ProjectedOrigin::Apply)
     }
 
-    #[allow(
-        dead_code,
-        reason = "normalization/replay currently enter through their Plan/Apply proofs"
-    )]
     pub(crate) fn synthetic(source: SyntheticSource) -> Self {
         Self(ProjectedOrigin::Synthetic(source))
     }
 }
 
-/// Mandatory source authority for an assignment check. There is no missing or
-/// default case, and projection authority cannot be made from a failed lookup.
 #[derive(Debug, Clone)]
-pub enum AuthoredCursor<'s, B: BindingAddress = RelativeBindingName> {
+pub(crate) enum CursorKind<'s, B: BindingAddress = RelativeBindingName> {
     Authored(AuthoredUse<'s, B>),
     CoveredBy(AuthoredUse<'s, B>),
     Projected(ProjectedPhase),
 }
 
+/// Downstream code cannot manufacture a cursor phase.
+/// ```compile_fail,E0599
+/// use carina_core::parser::retained::{AuthoredCursor, AuthoredUse};
+/// fn cover(usage: AuthoredUse<'_>) { let _ = AuthoredCursor::CoveredBy(usage); }
+/// ```
+/// ```compile_fail,E0599
+/// use carina_core::parser::retained::{AuthoredCursor, AuthoredUse};
+/// fn author(usage: AuthoredUse<'_>) { let _ = AuthoredCursor::Authored(usage); }
+/// ```
+/// ```compile_fail,E0599
+/// use carina_core::parser::retained::{AuthoredCursor, ProjectedPhase};
+/// fn project(phase: ProjectedPhase) { let _: AuthoredCursor<'_> = AuthoredCursor::Projected(phase); }
+/// ```
+/// Source authority carried through assignment checks. Construction is
+/// confined to core; report-based paths cannot manufacture authored authority.
+#[derive(Debug, Clone)]
+pub struct AuthoredCursor<'s, B: BindingAddress = RelativeBindingName> {
+    pub(crate) kind: CursorKind<'s, B>,
+}
+
 impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
+    pub(crate) fn authored(usage: AuthoredUse<'s, B>) -> Self {
+        Self {
+            kind: CursorKind::Authored(usage),
+        }
+    }
+    pub(crate) fn projected(phase: ProjectedPhase) -> Self {
+        Self {
+            kind: CursorKind::Projected(phase),
+        }
+    }
+    pub(crate) fn covered_by(usage: AuthoredUse<'s, B>) -> Self {
+        Self {
+            kind: CursorKind::CoveredBy(usage),
+        }
+    }
+
     pub(crate) fn selection(&self) -> Self {
         let mut cursor = self.clone();
-        match &mut cursor {
-            Self::Authored(usage) | Self::CoveredBy(usage) => {
+        match &mut cursor.kind {
+            CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => {
                 usage.visit = ProjectionVisit::Selection
             }
-            Self::Projected(_) => {}
+            CursorKind::Projected(_) => {}
         }
         cursor
     }
     pub(crate) fn is_selection(&self) -> bool {
-        match self {
-            Self::Authored(usage) | Self::CoveredBy(usage) => {
+        match &self.kind {
+            CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => {
                 usage.visit == ProjectionVisit::Selection
             }
-            Self::Projected(_) => false,
+            CursorKind::Projected(_) => false,
         }
     }
     pub(crate) fn identity(
         &self,
     ) -> Option<(NodeId, UseId, ExpansionInstanceId, ProjectionGeneration)> {
-        match self {
-            Self::Authored(usage) | Self::CoveredBy(usage) => Some((
+        match &self.kind {
+            CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => Some((
                 usage.node.node.id,
                 usage.occurrence,
                 usage.instance,
                 usage.node.generation,
             )),
-            Self::Projected(_) => None,
+            CursorKind::Projected(_) => None,
         }
     }
-    #[cfg(test)]
-    pub(crate) fn for_map_key(&self) -> Self {
-        match self {
-            Self::Authored(usage) | Self::CoveredBy(usage) => {
-                let mut usage = usage.clone();
-                usage.edge = EdgeRole::MapKey;
-                Self::CoveredBy(usage)
-            }
-            Self::Projected(phase) => Self::Projected(*phase),
-        }
-    }
-
     pub(crate) fn covered(&self) -> Self {
-        match self {
-            Self::Authored(usage) | Self::CoveredBy(usage) => Self::CoveredBy(usage.clone()),
-            Self::Projected(phase) => Self::Projected(*phase),
+        match &self.kind {
+            CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => {
+                Self::covered_by(usage.clone())
+            }
+            CursorKind::Projected(phase) => Self::projected(*phase),
         }
     }
     pub(crate) fn child(&self, index: usize, edge: EdgeRole) -> Result<Self, MissingEvidence> {
-        match self {
-            Self::Authored(usage) => match usage.form() {
+        match &self.kind {
+            CursorKind::Authored(usage) => match usage.form() {
                 // A substituted parameter/loop leaf retains its own authored
                 // source; its projected container has no authored child edges.
                 AuthoredForm::Reference | AuthoredForm::Binding | AuthoredForm::Literal => {
@@ -607,12 +624,12 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
                 AuthoredForm::List
                 | AuthoredForm::If
                 | AuthoredForm::Coalesce
-                | AuthoredForm::Secret => usage.child(index, edge).map(Self::Authored),
+                | AuthoredForm::Secret => usage.child(index, edge).map(Self::authored),
                 _ => Err(MissingEvidence::new(
                     "required authored child correspondence",
                 )),
             },
-            Self::CoveredBy(_) | Self::Projected(_) => Ok(self.clone()),
+            CursorKind::CoveredBy(_) | CursorKind::Projected(_) => Ok(self.clone()),
         }
     }
     pub(crate) fn field_child(
@@ -620,28 +637,28 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
         key: &str,
         alias: Option<&str>,
     ) -> Result<Self, MissingEvidence> {
-        let key = match self {
-            Self::Authored(usage)
+        let key = match &self.kind {
+            CursorKind::Authored(usage)
                 if usage.form() == AuthoredForm::Map
                     && !usage.map_keys().iter().any(|candidate| candidate == key) =>
             {
                 alias.unwrap_or(key)
             }
-            Self::Authored(_) | Self::CoveredBy(_) | Self::Projected(_) => key,
+            CursorKind::Authored(_) | CursorKind::CoveredBy(_) | CursorKind::Projected(_) => key,
         };
         self.map_child(key, EdgeRole::StructField)
     }
 
     pub(crate) fn map_child(&self, key: &str, edge: EdgeRole) -> Result<Self, MissingEvidence> {
-        match self {
-            Self::Authored(usage) => match usage.form() {
-                AuthoredForm::Map => usage.map_child(key, edge).map(Self::Authored),
+        match &self.kind {
+            CursorKind::Authored(usage) => match usage.form() {
+                AuthoredForm::Map => usage.map_child(key, edge).map(Self::authored),
                 AuthoredForm::Reference | AuthoredForm::Binding | AuthoredForm::Literal => {
                     Ok(self.covered())
                 }
                 _ => Err(MissingEvidence::new("required authored map correspondence")),
             },
-            Self::CoveredBy(_) | Self::Projected(_) => Ok(self.clone()),
+            CursorKind::CoveredBy(_) | CursorKind::Projected(_) => Ok(self.clone()),
         }
     }
 }
@@ -944,6 +961,13 @@ impl<B: BindingAddress> Default for AuthoredSlots<B> {
     }
 }
 impl<B: BindingAddress> AuthoredSlots<B> {
+    #[cfg(test)]
+    pub(crate) fn unbind_alias_for_test(&mut self, canonical: &str, authored: &str) {
+        let slot = self.slots.shift_remove(canonical).unwrap();
+        self.slots.insert(authored.to_owned(), slot);
+        self.aliases.clear();
+    }
+
     pub fn declaration_id(&self) -> Option<&SlotDeclarationId> {
         self.declaration.as_ref()
     }

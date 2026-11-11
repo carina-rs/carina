@@ -668,6 +668,7 @@ fn typed_resource_attribute_admissions<
     coverage: &std::cell::RefCell<crate::schema::value_validation::WalkCoverage>,
 ) -> crate::schema::ResourceValueValidation {
     use crate::resource::{DeferredValue, ParserPlaceholder};
+    let report = inputs.report(parsed.expression_report());
     let mut declaration_errors = std::collections::HashMap::new();
     let declarations = attributes
         .iter()
@@ -681,16 +682,15 @@ fn typed_resource_attribute_admissions<
                     .map_err(|error| (name, error))?
                     .node()
                     .judgement(),
-                AttributeInput::Composition => parsed
-                    .expression_report()
-                    .for_resource(resource.id())
-                    .and_then(|report| {
-                        report.expression(
-                            resource
-                                .attribute_value_location(name, &crate::schema::FieldPath::new()),
-                        )
-                    })
-                    .map_err(|error| (name, error))?,
+                AttributeInput::Reported => match report.expression(
+                    resource.attribute_value_location(name, &crate::schema::FieldPath::new()),
+                ) {
+                    Ok(expression) => expression,
+                    // Main's report path treats absent declaration recovery as
+                    // no lexical declaration. Ordinary expression checks below
+                    // still own their original lookup errors.
+                    Err(_) => return Ok(None),
+                },
                 AttributeInput::Projected { .. } => return Ok(None),
             };
             let value = expression.assignment_value(
@@ -748,22 +748,15 @@ fn typed_resource_attribute_admissions<
             Node(crate::parser::retained::JudgedNodeRef<'a, B>),
             Report(&'a crate::parser::retained::ExpressionReport<B>),
         }
-        let evidence = match &cursor {
-            crate::parser::retained::AuthoredCursor::Authored(usage)
-            | crate::parser::retained::AuthoredCursor::CoveredBy(usage) => {
+        let evidence = match &cursor.kind {
+            crate::parser::retained::CursorKind::Authored(usage)
+            | crate::parser::retained::CursorKind::CoveredBy(usage) => {
                 Evidence::Node(usage.node().clone())
             }
-            crate::parser::retained::AuthoredCursor::Projected(_)
-                if resource.kind() == crate::parser::AnalysisItemKind::Composition =>
-            {
-                Evidence::Report(
-                    parsed
-                        .expression_report()
-                        .for_resource(resource.id())
-                        .map_err(assignment_seam_error)?,
-                )
+            crate::parser::retained::CursorKind::Projected(_) if inputs.is_reported(name) => {
+                Evidence::Report(report)
             }
-            crate::parser::retained::AuthoredCursor::Projected(_) => return Ok(Default::default()),
+            crate::parser::retained::CursorKind::Projected(_) => return Ok(Default::default()),
         };
         let expression = match &evidence {
             Evidence::Node(node) => node.judgement(),
@@ -986,7 +979,7 @@ fn typed_resource_attribute_admissions<
                 session,
                 phase,
             )),
-            AttributeInput::Composition => Ok(Candidate::validation_classified(
+            AttributeInput::Reported => Ok(Candidate::validation_classified(
                 proof,
                 Some(bindings),
                 session,

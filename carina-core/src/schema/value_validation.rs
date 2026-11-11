@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::parser::retained::{
-    AuthoredCursor, AuthoredForm, AuthoredUse, EdgeRole, ExpansionInstanceId, NodeId,
+    AuthoredCursor, AuthoredForm, AuthoredUse, CursorKind, EdgeRole, ExpansionInstanceId, NodeId,
     ProjectionGeneration, UseId,
 };
 use crate::resource::ValueKind;
@@ -1027,7 +1027,7 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
     ) -> Result<(Self, AssignmentFindings), TypeError> {
         let mut findings = AssignmentFindings::default();
         let mut followed = std::collections::HashSet::new();
-        while let AuthoredCursor::Authored(usage) = &self.cursor {
+        while let CursorKind::Authored(usage) = &self.cursor.kind {
             self.coverage.borrow_mut().record(usage);
             if !followed.insert((usage.node().node_id(), usage.occurrence())) {
                 return Err(seam_error(crate::parser::retained::MissingEvidence::new(
@@ -1035,21 +1035,21 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
                 )));
             }
             self.cursor = match usage.form() {
-                AuthoredForm::Forward if usage.child_count() != 0 => AuthoredCursor::Authored(
+                AuthoredForm::Forward if usage.child_count() != 0 => AuthoredCursor::authored(
                     usage
                         .child(usage.child_count() - 1, usage.edge())
                         .map_err(seam_error)?,
                 ),
                 AuthoredForm::Parens => {
-                    AuthoredCursor::Authored(usage.child(0, EdgeRole::Parens).map_err(seam_error)?)
+                    AuthoredCursor::authored(usage.parens_operand().map_err(seam_error)?)
                 }
-                AuthoredForm::Definition => AuthoredCursor::Authored(
+                AuthoredForm::Definition => AuthoredCursor::authored(
                     usage
                         .child(0, EdgeRole::AliasDefinition)
                         .map_err(seam_error)?,
                 ),
                 AuthoredForm::Binding => match usage.definition().map_err(seam_error)? {
-                    Some(definition) => AuthoredCursor::Authored(definition),
+                    Some(definition) => AuthoredCursor::authored(definition),
                     None => break,
                 },
                 AuthoredForm::Computed => self.cursor.covered(),
@@ -1085,7 +1085,7 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
                         // empty projection, covered by the conditional itself.
                         self.cursor.covered()
                     } else {
-                        AuthoredCursor::Authored(
+                        AuthoredCursor::authored(
                             usage
                                 .child(selected, EdgeRole::IfBranch)
                                 .map_err(seam_error)?,
@@ -1111,7 +1111,7 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
                         self.check,
                         &mut coverage,
                     )?);
-                    AuthoredCursor::Authored(
+                    AuthoredCursor::authored(
                         usage
                             .child(0, EdgeRole::CoalesceOperand)
                             .map_err(seam_error)?,
@@ -1215,7 +1215,7 @@ pub(crate) fn visit_discarded<P: PlaceholderKind, B: BindingAddress>(
             attr,
             CheckValue::Discarded,
             &path.canonical(),
-            AuthoredCursor::Authored(cursor.clone()),
+            AuthoredCursor::authored(cursor.clone()),
         )?);
         let mut child =
             |attr: &CompiledAttributeType, child: AuthoredUse<'_, B>, path: FieldPath, ancestry| {
@@ -1234,7 +1234,7 @@ pub(crate) fn visit_discarded<P: PlaceholderKind, B: BindingAddress>(
             ),
             AuthoredForm::Parens => child(
                 attr,
-                cursor.child(0, EdgeRole::ListItem).map_err(seam_error)?,
+                cursor.parens_operand().map_err(seam_error)?,
                 path.clone(),
                 ancestry,
             ),
@@ -1432,7 +1432,7 @@ impl<'a> ValueValidator<'a, '_> {
                                 usage,
                                 instance,
                                 generation,
-                                matches!(&walk.cursor, AuthoredCursor::CoveredBy(_)),
+                                matches!(&walk.cursor.kind, CursorKind::CoveredBy(_)),
                             )
                         })
                 }),
@@ -1469,8 +1469,8 @@ impl<'a> ValueValidator<'a, '_> {
         if let Some(inner) = value.protected_for_schema(&SchemaEvidenceAuthority(())) {
             let assignment = match assignment {
                 Some(walk) => {
-                    let cursor = match &walk.cursor {
-                        AuthoredCursor::Authored(usage) if usage.form() == AuthoredForm::Secret => {
+                    let cursor = match &walk.cursor.kind {
+                        CursorKind::Authored(usage) if usage.form() == AuthoredForm::Secret => {
                             match walk.step(|cursor| cursor.child(0, EdgeRole::SecretArgument)) {
                                 Ok(child) => child,
                                 Err(error) => return CheckedValue::rejected(path, error),
@@ -1582,7 +1582,7 @@ impl<'a> ValueValidator<'a, '_> {
             let mut checked =
                 CheckedValue::accepted(attr, FitExactness::EXACT, FitKind::Deferred(pending.fit()));
             if let Some(walk) = &assignment
-                && matches!(&walk.cursor, AuthoredCursor::Authored(usage) if usage.form() == AuthoredForm::If)
+                && matches!(&walk.cursor.kind, CursorKind::Authored(usage) if usage.form() == AuthoredForm::If)
             {
                 match walk.check_selection(
                     attr,

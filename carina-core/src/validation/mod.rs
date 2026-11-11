@@ -5486,7 +5486,16 @@ fn resource_admission_report<
                         continue;
                     };
                     let attrs = resource.attributes();
-                    let inputs = admission::attributes::ResourceAttributeInputs::new(resource);
+                    let inputs = match admission::attributes::ResourceAttributeInputs::for_resource(
+                        resource,
+                        judged.report(),
+                    ) {
+                        Ok(inputs) => inputs,
+                        Err(error) => {
+                            all_errors.push(error.to_string());
+                            continue;
+                        }
+                    };
                     let classified = inputs.classify(
                         &crate::resource::knowledge::KnowledgeContext::validation(),
                         |_, _| {},

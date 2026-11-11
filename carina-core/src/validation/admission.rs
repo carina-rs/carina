@@ -416,7 +416,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
             AdmissionProof::Validation(proof),
             bindings,
             provider,
-            crate::parser::retained::AuthoredCursor::Projected(phase),
+            crate::parser::retained::AuthoredCursor::projected(phase),
         )
     }
 
@@ -432,7 +432,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
             AdmissionProof::Plan(proof),
             None,
             provider,
-            crate::parser::retained::AuthoredCursor::Projected(phase),
+            crate::parser::retained::AuthoredCursor::projected(phase),
         )
     }
 
@@ -447,7 +447,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
             AdmissionProof::Apply(proof),
             None,
             provider,
-            crate::parser::retained::AuthoredCursor::Projected(phase),
+            crate::parser::retained::AuthoredCursor::projected(phase),
         ))
     }
 
@@ -483,7 +483,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
             bindings: None,
             provider,
             assignment: None,
-            cursor: crate::parser::retained::AuthoredCursor::Projected(phase),
+            cursor: crate::parser::retained::AuthoredCursor::projected(phase),
             coverage: Default::default(),
             untyped: None,
             declaration: None,
@@ -559,7 +559,7 @@ impl<B: BindingAddress> Candidate<crate::resource::ParserPlaceholder, B> {
                 crate::parser::retained::MissingEvidence::new("slot/projection proof pairing"),
             ));
         }
-        let cursor = crate::parser::retained::AuthoredCursor::Authored(
+        let cursor = crate::parser::retained::AuthoredCursor::authored(
             slot.cursor().map_err(seam_constraint)?,
         );
         Ok(Self::paired(

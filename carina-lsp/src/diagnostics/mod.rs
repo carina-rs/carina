@@ -38,6 +38,10 @@ fn authored_validation_resources<'t, 'a>(
     carina_core::parser::AuthoredResourceInstanceKey<'a>,
     &'t carina_core::parser::AnalysisResourceRef<'a>,
 > {
+    #[cfg(test)]
+    if tests::seam_round2::fault() == tests::seam_round2::Fault::NoKeys {
+        return HashMap::new();
+    }
     tree.project_resources()
         .filter_map(|resource| resource.authored_instance_key().map(|key| (key, resource)))
         .collect()
@@ -363,7 +367,11 @@ impl ExpandedDiagnosticValidationInputs<'_> {
         let schemas = self.configuration.schemas();
         let schema = resource.schema(schemas)?;
         let inputs =
-            carina_core::validation::admission::attributes::ResourceAttributeInputs::new(resource);
+            carina_core::validation::admission::attributes::ResourceAttributeInputs::for_resource(
+                resource,
+                self.configuration.report(),
+            )
+            .ok()?;
         let mut classified = inputs.classify(
             &carina_core::resource::knowledge::KnowledgeContext::validation(),
             |_, _| {},
@@ -1511,39 +1519,20 @@ impl DiagnosticRun<'_> {
             }
             // Admission reads the sealed slots and projections owned by the
             // judged directory. Source locations still anchor each diagnostic.
-            let Some(authored_tree) = analysis_tree(
-                doc,
+            // Authored inventory is optional on main's buffer path. Its
+            // absence selects report-based admission, not a new diagnostic.
+            let authored_tree = carina_core::parser::AnalysisTree::try_from_file(
                 pre_expansion_configuration.judged().file(),
-                &mut diagnostics,
-            ) else {
-                return diagnostics;
+            )
+            .ok();
+            #[cfg(test)]
+            let authored_tree = if tests::seam_round2::fault() == tests::seam_round2::Fault::NoTree
+            {
+                None
+            } else {
+                authored_tree
             };
-            let authored_resources = authored_validation_resources(&authored_tree);
-            // A buffer may retain a deferred template or use a different file
-            // identity than the directory view. Judge its own inventory when
-            // a directory instance is absent. Loading clones this same parse,
-            // so its declaration/binding/loop key is preserved by construction.
-            let buffer_configuration = tree
-                .project_resources()
-                .any(|resource| {
-                    resource.kind() != carina_core::parser::AnalysisItemKind::Composition
-                        && resource
-                            .authored_instance_key()
-                            .is_none_or(|key| !authored_resources.contains_key(&key))
-                })
-                .then(|| {
-                    carina_core::config_loader::load_buffer_configuration(
-                        parsed,
-                        &self.schemas,
-                        self.provider_context.catalog(),
-                    )
-                });
-            let buffer_validation_tree = buffer_configuration.as_ref().and_then(|configuration| {
-                analysis_tree(doc, configuration.judged().file(), &mut diagnostics)
-            });
-            let buffer_validation_resources = buffer_validation_tree
-                .as_ref()
-                .map(authored_validation_resources);
+            let authored_resources = authored_tree.as_ref().map(authored_validation_resources);
             // The document AST intentionally preserves function calls for
             // source-oriented checks. Build a parallel, same-order view with
             // locally resolvable calls evaluated so schema diagnostics see
@@ -1669,33 +1658,20 @@ impl DiagnosticRun<'_> {
                     let schema = validated_schema.as_schema();
                     // Build block_name -> canonical_name map for this schema
                     let bn_map = schema.block_name_map();
-                    let admission_resource =
-                        if rref.kind() == carina_core::parser::AnalysisItemKind::Composition {
-                            Some(rref)
-                        } else {
-                            rref.authored_instance_key().and_then(|address| {
-                                authored_resources.get(&address).copied().or_else(|| {
-                                    buffer_validation_resources.as_ref()?.get(&address).copied()
-                                })
-                            })
-                        };
-                    let Some(admission_resource) = admission_resource else {
-                        let error = carina_core::parser::retained::MissingEvidence::for_resource(
-                            resource_id,
-                        );
-                        diagnostics.extend(render_merged(
-                            doc,
-                            &carina_core::parser::Located::new(rref.location().clone(), &error),
-                            DiagnosticSeverity::ERROR,
-                            error.to_string(),
-                        ));
-                        continue;
-                    };
                     let resolved_attrs = semantic_resource_attributes
                         .as_ref()
                         .map(carina_core::resource::attrs_to_hashmap)
                         .unwrap_or_else(|| rref.resolved_attributes());
-                    let inputs = carina_core::validation::admission::attributes::ResourceAttributeInputs::from_resolved(admission_resource, &resolved_attrs);
+                    let authored_resource = rref
+                        .authored_instance_key()
+                        .and_then(|key| authored_resources.as_ref()?.get(&key).copied());
+                    let (admission_resource, inputs) = match authored_resource.and_then(|resource| {
+                        carina_core::validation::admission::attributes::ResourceAttributeInputs::from_resolved(resource, &resolved_attrs, expression_report)
+                            .ok().map(|inputs| (resource, inputs))
+                    }) {
+                        Some(authored) => authored,
+                        None => (rref, carina_core::validation::admission::attributes::ResourceAttributeInputs::from_report(rref, &resolved_attrs, expression_report)),
+                    };
                     let knowledge_context =
                         carina_core::resource::knowledge::KnowledgeContext::validation();
                     let mut classification_error =

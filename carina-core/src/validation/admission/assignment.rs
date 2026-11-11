@@ -510,10 +510,8 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                     if cursor.is_selection() {
                         return Ok(Default::default());
                     }
-                    let mut findings = match context.assignment {
-                        Some(check) => check(attr, checked, &path, cursor)?,
-                        None => crate::schema::value_validation::AssignmentFindings::default(),
-                    };
+                    let mut findings =
+                        crate::schema::value_validation::AssignmentFindings::default();
                     let crate::schema::value_validation::CheckValue::Current(value) = checked
                     else {
                         return Ok(findings);
@@ -526,7 +524,11 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                             &reference_context,
                             &mut findings,
                         )?,
-                        CandidateOrigin::Expression => {}
+                        CandidateOrigin::Expression => {
+                            if let Some(check) = context.assignment {
+                                findings = check(attr, checked, &path, cursor)?;
+                            }
+                        }
                     }
                     Ok(findings)
                 };

@@ -16,13 +16,14 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct ResourceAttributeInputs<B: BindingAddress> {
     owner: ResourceId,
+    report: Option<Arc<crate::parser::retained::ExpressionReport<B>>>,
     inputs: IndexMap<String, StoredInput<B>>,
 }
 
 pub(super) enum AttributeInput<'a, B: BindingAddress> {
     Authored { slot: &'a JudgedSlot<B> },
     Projected { phase: ProjectedPhase },
-    Composition,
+    Reported,
 }
 
 #[derive(Clone)]
@@ -35,9 +36,9 @@ enum StoredInput<B: BindingAddress> {
         value: Arc<Value<ParserPlaceholder, B>>,
         phase: ProjectedPhase,
     },
-    // Composition outputs are outside the resource-slot inventory in 1b.
-    // They retain the report-based computed-expression checks from main.
-    Composition(Arc<Value<ParserPlaceholder, B>>),
+    // Inputs outside the slot inventory retain main's report-based checks.
+    // This mode never grants authored or covered authority.
+    Reported(Arc<Value<ParserPlaceholder, B>>),
     Unavailable {
         value: Arc<Value<ParserPlaceholder, B>>,
         error: MissingEvidence,
@@ -49,7 +50,7 @@ impl<B: BindingAddress> StoredInput<B> {
         match self {
             Self::Authored { slot, .. } => slot.projection().expect("prepared materialized slot"),
             Self::Projected { value, .. }
-            | Self::Composition(value)
+            | Self::Reported(value)
             | Self::Unavailable { value, .. } => value,
         }
     }
@@ -71,6 +72,66 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         Self::prepare(resource, resource.attributes().iter(), false)
     }
 
+    /// Require the resource report used by main's CLI/expanded admission path.
+    /// Callers retain main's distinct missing-report outcome (error or fallback).
+    pub fn for_resource<D>(
+        resource: &crate::parser::AnalysisResourceRef<
+            '_,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            B,
+        >,
+        report: &crate::parser::retained::ExpressionReport<B>,
+    ) -> Result<Self, MissingEvidence>
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        let report = report.for_resource(resource.id())?;
+        let mut inputs = Self::new(resource);
+        inputs.report = Some(Arc::new(report.clone()));
+        Ok(inputs)
+    }
+
+    /// Main's buffer path when an authored owner/tree is not available.
+    /// Values keep their classifications, and computed checks use this report.
+    pub fn from_report<D>(
+        resource: &crate::parser::AnalysisResourceRef<
+            '_,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            B,
+        >,
+        values: &HashMap<String, Value<ParserPlaceholder, B>>,
+        report: &crate::parser::retained::ExpressionReport<B>,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        Self {
+            owner: resource.id().clone(),
+            report: Some(Arc::new(report.clone())),
+            inputs: values
+                .iter()
+                .map(|(name, value)| (name.clone(), StoredInput::Reported(Arc::new(value.clone()))))
+                .collect(),
+        }
+    }
+
+    pub(super) fn report<'a>(
+        &'a self,
+        fallback: &'a crate::parser::retained::ExpressionReport<B>,
+    ) -> &'a crate::parser::retained::ExpressionReport<B> {
+        self.report
+            .as_deref()
+            .unwrap_or_else(|| fallback.for_resource(&self.owner).unwrap_or(fallback))
+    }
+
+    pub(super) fn is_reported(&self, name: &str) -> bool {
+        matches!(self.inputs.get(name), Some(StoredInput::Reported(_)))
+    }
+
     /// Produce inputs for exactly the resolved attribute key set. Evaluation
     /// owns this materialization; admission still borrows each slot's value.
     pub fn from_resolved<D>(
@@ -82,11 +143,15 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             B,
         >,
         values: &HashMap<String, Value<ParserPlaceholder, B>>,
-    ) -> Self
+        report: &crate::parser::retained::ExpressionReport<B>,
+    ) -> Result<Self, MissingEvidence>
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        Self::prepare(resource, values.iter(), true)
+        let report = report.for_resource(resource.id())?;
+        let mut inputs = Self::prepare(resource, values.iter(), true);
+        inputs.report = Some(Arc::new(report.clone()));
+        Ok(inputs)
     }
 
     fn prepare<'v, D>(
@@ -123,7 +188,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             .map(|(name, value)| {
                 let prepare = || {
                     if resource.kind() == crate::parser::AnalysisItemKind::Composition {
-                        return Ok(StoredInput::Composition(Arc::new(value.clone())));
+                        return Ok(StoredInput::Reported(Arc::new(value.clone())));
                     }
                     if let Some(phase) = resource.projected_phase(name) {
                         return Ok(StoredInput::Projected {
@@ -131,7 +196,13 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
                             phase,
                         });
                     }
-                    let slot = resource.authored_slot(name)?;
+                    let slot = match resource.authored_slot(name) {
+                        Ok(slot) => slot,
+                        // No authored declaration exists for this resolved
+                        // name. Main admitted it from the report; it is not a
+                        // failed live correspondence or synthetic authority.
+                        Err(_) => return Ok(StoredInput::Reported(Arc::new(value.clone()))),
+                    };
                     let source = match &sources {
                         Some(sources) => {
                             sources.get(&(slot.occurrence(), slot.instance())).copied()
@@ -162,6 +233,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             .collect();
         Self {
             owner: resource.id().clone(),
+            report: None,
             inputs,
         }
     }
@@ -199,16 +271,12 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         &'a Self,
         HashMap<String, Classification<'a, ParserPlaceholder, B>>,
     ) {
-        // Evaluation normally returns a subset of this owner's names. Retain
-        // a typed per-attribute outcome if that producer contract is broken;
-        // classifications and sibling admission must still run.
-        for (name, error) in self.unmatched_materializations(values) {
+        // Additional resolved names have no authored authority. Preserve
+        // main's classified/report path instead of inventing a seam finding.
+        for (name, _) in self.unmatched_materializations(values) {
             self.inputs.insert(
                 name.clone(),
-                StoredInput::Unavailable {
-                    value: Arc::new(values[&name].clone()),
-                    error,
-                },
+                StoredInput::Reported(Arc::new(values[&name].clone())),
             );
         }
         self.apply_materializations(values);
@@ -225,7 +293,8 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
 
     /// Called where evaluation produces new projections. Unchanged slots share
     /// their allocations, so existing classifications still name that value.
-    pub fn materialize(
+    #[cfg(test)]
+    pub(crate) fn materialize(
         &mut self,
         values: &HashMap<String, Value<ParserPlaceholder, B>>,
     ) -> Result<(), MissingEvidence> {
@@ -269,7 +338,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
                 StoredInput::Projected {
                     value: projection, ..
                 }
-                | StoredInput::Composition(projection)
+                | StoredInput::Reported(projection)
                 | StoredInput::Unavailable {
                     value: projection, ..
                 } => *projection = Arc::new(value.clone()),
@@ -312,7 +381,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             }
             StoredInput::Unavailable { error, .. } => Err(error.clone()),
             StoredInput::Projected { phase, .. } => Ok(AttributeInput::Projected { phase: *phase }),
-            StoredInput::Composition(_) => Ok(AttributeInput::Composition),
+            StoredInput::Reported(_) => Ok(AttributeInput::Reported),
         }
     }
 }
