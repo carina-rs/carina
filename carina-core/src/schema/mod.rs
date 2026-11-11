@@ -4086,8 +4086,8 @@ impl PatternAttributeType<Compiled> {
 
 impl<R: PatternForm> TypeInSchema<'_, R> {
     /// Check if a value of this source type can be assigned to `sink`.
-    /// Identity widening is directional. Anonymous refinement evidence must
-    /// prove containment; nominal admission retains destination value checks.
+    /// Identity widening is directional. Compatible scalar flows into identity-less
+    /// sinks use overlap-or-defer; admitted constraints remain destination checks.
     /// Each side resolves references against its own [`TypeInSchema`] definitions.
     ///
     /// Rules (first match wins):
@@ -4105,55 +4105,51 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     /// 7. Identified String/Int/Float leaves admit the same identity or a
     ///    widening allowed by structural axes or the sink authority's edges.
     ///    Provably disjoint bounds reject; remaining destination constraints
-    ///    are checked on the resolved value at every sink, including annotations,
-    ///    exports, and function boundaries. Regex containment is not assumed.
+    ///    are value checks. Regex containment is not assumed.
     ///    An empty sink axis widens; an empty source axis cannot satisfy a
     ///    populated sink axis. Thus `aws.iam.Role.Arn` flows into `aws.Arn`,
     ///    and the reverse direction rejects. Different populated providers
-    ///    also reject. Enum bases retain their declaration comparisons because
-    ///    they are not scalar member layers.
-    /// 8. Custom→Custom where at least one side has `identity: None`: check
-    ///    pattern (literal equality) and length containment (source ⊆ sink),
-    ///    then recurse on base. Exception: an identity-bearing String, Int, or
-    ///    Float source is assignable to an identity-less sink of the same
-    ///    primitive kind, and an identity-bearing Int source is also assignable
-    ///    to an identity-less Float sink, regardless of the source's own
-    ///    pattern/length/range. The sink's value constraints are checked when known
-    ///    at plan or before provider dispatch at apply (carina#3805).
-    ///    Identity-less refined-source comparisons still require containment.
+    ///    also reject. Enum identities are checked before base recursion;
+    ///    identity-less scalar bases follow rule 8a's overlap-or-defer rule,
+    ///    with enum values checked at the resolved destination.
+    /// 8. Compatible scalar pairs are String→String, Int→Int, Float→Float,
+    ///    and Int→Float:
+    ///    - 8a. Identity-less pairs use overlap-or-defer (carina#4362).
+    ///      String/Int bounds intersect both identity and member layers;
+    ///      Float uses its range. Provably disjoint source and sink bounds
+    ///      reject; otherwise type compatibility is admitted. Patterns and remaining
+    ///      bounds are checked against the resolved value at the provider slot.
+    ///    - 8b. Mixed pairs with an identified source and identity-less sink use
+    ///      the same rule, with identity-layer source bounds only (carina#3805,
+    ///      carina#4362). Sink bounds include both layers. An anonymous source
+    ///      cannot satisfy an identified sink because it has no identity evidence.
+    ///
+    ///    Reference admission records `NeedsLocal` for constrained identity-less
+    ///    sinks. Provider slots check resolved values against the full destination
+    ///    declaration before dispatch. Unconstrained sinks are assignable.
     /// 9. Custom source → non-Custom sink: recurse on `source.base`.
-    /// 10. A plain, unrefined primitive source → refined sink is split by
-    ///     the sink's identity. An identified sink (including every Enum) is
-    ///     NG because the source has no identity evidence. An identity-less
-    ///     sink is OK when the primitive bases are assignable; its
-    ///     pattern/length/range is a value constraint, enforced when the
-    ///     concrete value is known (carina#3805). Rules 4–6 make the same
+    /// 10. A plain, unrefined primitive source follows rule 8a for compatible
+    ///     identity-less scalar sinks, with no refinement evidence. An identified
+    ///     sink (including every Enum) is still NG because the source has no
+    ///     identity evidence. Rules 4–6 make the same
     ///     leaf decision recursively inside List/Map/Struct, and rules 2–3
     ///     preserve their normal all/any Union semantics.
     /// 11. Otherwise: same primitive type names.
     ///
-    /// # Conservative pattern/length policy
+    /// # Destination value checks and monotonicity
     ///
-    /// Rule 8 remains evidence-preserving for an identity-less refined
-    /// String source. A populated sink pattern requires literal
-    /// string equality; regex-language containment is not inferred. A sink
-    /// length range requires the source range to be a subset (`sink.min ≤
-    /// source.min` and `source.max ≤ sink.max`, with absent bounds treated
-    /// as unbounded). Thus a source whose own pattern differs, whose range is
-    /// wider, or whose other refinement evidence does not establish the
-    /// sink's constraint is rejected.
+    /// Anonymous String/Int/Float refinements occur only in provider schema slots;
+    /// annotations, module/export boundaries and function signatures use identified
+    /// refinements or unconstrained scalars. Resolved resource/data-source inputs
+    /// pass through `admit_apply_resource`/`admit_apply_data_source`; provider config
+    /// uses `validate_provider_config_attributes` on resolved values. These checks
+    /// validate the full destination declaration before dispatch, preserving
+    /// #2218's safety without static containment. Function parameters/returns also
+    /// have runtime constraint checks; backend schemas have no anonymous refinements.
     ///
-    /// A completely unrefined source is intentionally different: it makes
-    /// no refinement claim that can conflict with the sink. Rule 10 accepts
-    /// its assignable primitive base only into an identity-less sink, then
-    /// leaves the sink's pattern/length value check to carina#3805. It never
-    /// supplies evidence for an identified custom type or Enum.
-    ///
-    /// **Do not loosen rule 8's identity-less refined-source evidence
-    /// comparisons.** Accepting a wider or differently refined identity-less
-    /// source would re-introduce the silent-false-positive class that #2218
-    /// closed. Both exceptions above are limited to identity-less sinks and
-    /// do not weaken those comparisons.
+    /// Preserve the #4362 invariant: adding constraints to a source never reduces
+    /// assignability; only provably disjoint length/range bounds reject statically.
+    /// Regex patterns never prove disjointness and defer to the destination check.
     pub fn is_assignable_to(self, sink: AssignmentSink<'_, R>) -> bool {
         match self.assignment_to(sink) {
             TypeAssignability::Assignable => true,
@@ -4233,6 +4229,24 @@ impl std::fmt::Display for MismatchTypeNames {
             DiagnosticText::new(self.expected()),
             DiagnosticText::new(self.actual())
         )
+    }
+}
+
+/// A scalar kind comparison cannot discard the destination value obligation.
+#[derive(Debug, PartialEq, Eq)]
+enum KnownAssignment {
+    Assignable,
+    Mismatch,
+    DeferToSinkValue,
+}
+
+impl KnownAssignment {
+    fn from_bool(assignable: bool) -> Self {
+        if assignable {
+            Self::Assignable
+        } else {
+            Self::Mismatch
+        }
     }
 }
 
@@ -4364,9 +4378,57 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
 
     /// Scalar structural rules. Nominal and recursive decisions are made by
     /// `assignment_on_paths`, which always carries the sink's authority.
-    fn is_assignable_to_known(self, sink: AssignmentSink<'_, R>) -> bool {
+    fn is_assignable_to_known(self, sink: AssignmentSink<'_, R>) -> KnownAssignment {
         use AttrTypeKind::*;
         match (&self.attr.kind, &sink.attr.kind) {
+            // Scalar destinations without identity share one resolved-value
+            // obligation, regardless of whether the source has an identity.
+            (
+                String {
+                    identity_layer: _,
+                    member_layer: _,
+                },
+                String {
+                    identity_layer:
+                        StringIdentityLayer {
+                            binding: target, ..
+                        },
+                    member_layer: _,
+                },
+            )
+            | (
+                Int {
+                    identity_layer: _,
+                    member_layer: _,
+                },
+                Int {
+                    identity_layer:
+                        IntIdentityLayer {
+                            binding: target, ..
+                        },
+                    member_layer: _,
+                },
+            )
+            | (
+                Float {
+                    binding: _,
+                    range: _,
+                },
+                Float {
+                    binding: target,
+                    range: _,
+                },
+            )
+            | (
+                Int {
+                    identity_layer: _,
+                    member_layer: _,
+                },
+                Float {
+                    binding: target,
+                    range: _,
+                },
+            ) if target.identity().is_none() => KnownAssignment::DeferToSinkValue,
             // A resolver identity selects comparison behavior, not a different
             // wire scalar. Reference inputs accept string outputs; constraints
             // are checked on the materialized value before planning.
@@ -4385,7 +4447,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     pattern: _,
                     length: _,
                 },
-            ) => true,
+            ) => KnownAssignment::Assignable,
             (
                 Reference {
                     identity: _,
@@ -4396,7 +4458,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     identity_layer: _,
                     member_layer: _,
                 },
-            ) => true,
+            ) => KnownAssignment::Assignable,
 
             (
                 ResourceHandle {
@@ -4407,7 +4469,9 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     provider: sink_provider,
                     resource_type: sink_resource,
                 },
-            ) => source_provider == sink_provider && source_resource == sink_resource,
+            ) => KnownAssignment::from_bool(
+                source_provider == sink_provider && source_resource == sink_resource,
+            ),
             // Literal declarations carry string evidence but not the identity
             // evidence required by a provider custom type (#2648).
             (
@@ -4420,16 +4484,16 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                         },
                     member_layer: _,
                 },
-            ) => true,
+            ) => KnownAssignment::Assignable,
             (
                 StringLiteralSet { values: _ },
                 String {
                     identity_layer: StringIdentityLayer { binding, .. },
                     member_layer: _,
                 },
-            ) if binding.identity().is_some() => false,
+            ) if binding.identity().is_some() => KnownAssignment::Mismatch,
             (StringLiteralSet { values: source }, StringLiteralSet { values: sink }) => {
-                source.iter().all(|value| sink.contains(value))
+                KnownAssignment::from_bool(source.iter().all(|value| sink.contains(value)))
             }
             // Preserve the pre-existing declared String -> literal-union
             // behavior.
@@ -4439,7 +4503,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     member_layer: _,
                 },
                 StringLiteralSet { values: _ },
-            ) => true,
+            ) => KnownAssignment::Assignable,
             // Anonymous source → identified sink has no proof of identity.
             (
                 String {
@@ -4454,24 +4518,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     identity_layer: StringIdentityLayer { binding, .. },
                     member_layer: _,
                 },
-            ) if binding.identity().is_some() => false,
-            // An identified String may flow into an identity-less String
-            // sink. Check the sink's value constraints when known at plan or
-            // before provider dispatch at apply (#3805, #4230).
-            (
-                String {
-                    identity_layer: StringIdentityLayer { binding, .. },
-                    member_layer: _,
-                },
-                String {
-                    identity_layer:
-                        StringIdentityLayer {
-                            binding: RefinementBinding::MetadataOnly(None),
-                            ..
-                        },
-                    member_layer: _,
-                },
-            ) if binding.identity().is_some() => true,
+            ) if binding.identity().is_some() => KnownAssignment::Mismatch,
             (
                 Int {
                     identity_layer:
@@ -4485,177 +4532,57 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     identity_layer: IntIdentityLayer { binding, .. },
                     member_layer: _,
                 },
-            ) if binding.identity().is_some() => false,
+            ) if binding.identity().is_some() => KnownAssignment::Mismatch,
             (
                 Float {
                     binding: RefinementBinding::MetadataOnly(None),
                     range: _,
                 },
                 Float { binding, range: _ },
-            ) if binding.identity().is_some() => false,
-            // Identified numerics defer same-kind identity-less sink ranges
-            // to the resolved value, like identified Strings (#3805, #4230).
+            ) if binding.identity().is_some() => KnownAssignment::Mismatch,
+            // Identified scalar pairs are decided by assignment_on_paths'
+            // identity pre-block or dedicated Float arm; identity-less sinks
+            // already defer above.
             (
                 Int {
-                    identity_layer: IntIdentityLayer { binding, .. },
+                    identity_layer: _,
                     member_layer: _,
                 },
-                Int {
-                    identity_layer:
-                        IntIdentityLayer {
-                            binding: RefinementBinding::MetadataOnly(None),
-                            ..
-                        },
+                Float {
+                    binding: _,
+                    range: _,
+                },
+            )
+            | (
+                String {
+                    identity_layer: _,
+                    member_layer: _,
+                },
+                String {
+                    identity_layer: _,
                     member_layer: _,
                 },
             )
             | (
-                Float { binding, range: _ },
-                Float {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    range: _,
-                },
-            ) if binding.identity().is_some() => true,
-            // Numeric widening is directional: an Int source may flow into
-            // a Float sink, matching concrete-value validation. Preserve
-            // sink identity and identity-less source range evidence.
-            (
                 Int {
-                    identity_layer:
-                        IntIdentityLayer {
-                            binding: source_binding,
-                            range: source_range,
-                        },
-                    member_layer: source_member,
-                },
-                Float {
-                    binding: sink_binding,
-                    range: sink_range,
-                },
-            ) => {
-                let source_range = if source_binding.identity().is_some() {
-                    *source_range
-                } else {
-                    intersect_bounds(*source_range, source_member.range)
-                };
-                if (source_binding.identity().is_some() || source_range.is_none())
-                    && sink_binding.identity().is_none()
-                {
-                    return true;
-                }
-                i64_range_assignable_to_f64(source_range.as_ref(), sink_range.as_ref())
-            }
-            // A completely unrefined primitive source carries no competing
-            // refinement evidence. Identity-less sink metadata is a value
-            // constraint checked when the concrete value is known (#3805).
-            // The identified-sink arm above must remain ahead of this one.
-            (
-                String {
-                    identity_layer:
-                        StringIdentityLayer {
-                            binding: RefinementBinding::MetadataOnly(None),
-                            pattern: None,
-                            length: None,
-                            ..
-                        },
-                    member_layer:
-                        StringMemberConstraints {
-                            pattern: None,
-                            length: None,
-                        },
-                },
-                String {
-                    identity_layer:
-                        StringIdentityLayer {
-                            binding: RefinementBinding::MetadataOnly(None),
-                            ..
-                        },
+                    identity_layer: _,
                     member_layer: _,
                 },
-            ) => true,
-            (
                 Int {
-                    identity_layer:
-                        IntIdentityLayer {
-                            binding: RefinementBinding::MetadataOnly(None),
-                            range: None,
-                        },
-                    member_layer: IntMemberConstraints { range: None },
-                },
-                Int {
-                    identity_layer:
-                        IntIdentityLayer {
-                            binding: RefinementBinding::MetadataOnly(None),
-                            ..
-                        },
+                    identity_layer: _,
                     member_layer: _,
                 },
-            ) => true,
-            (
+            )
+            | (
                 Float {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    range: None,
-                },
-                Float {
-                    binding: RefinementBinding::MetadataOnly(None),
                     range: _,
-                },
-            ) => true,
-            (
-                String {
-                    identity_layer: source,
-                    member_layer: source_member,
-                },
-                String {
-                    identity_layer: target,
-                    member_layer: target_member,
-                },
-            ) => {
-                let target_patterns = [
-                    target.pattern.as_ref().map(AsRef::as_ref),
-                    target_member.pattern.as_ref().map(AsRef::as_ref),
-                ];
-                let source_patterns = [
-                    source.pattern.as_ref().map(AsRef::as_ref),
-                    source_member.pattern.as_ref().map(AsRef::as_ref),
-                ];
-                let source_length = intersect_bounds(source.length, source_member.length);
-                target_patterns.into_iter().flatten().all(|target| {
-                    source_patterns
-                        .into_iter()
-                        .flatten()
-                        .any(|source| pattern_compatible(Some(source), Some(target)))
-                }) && length_contains(
-                    source_length.as_ref(),
-                    intersect_bounds(target.length, target_member.length).as_ref(),
-                )
-            }
-            (
-                Int {
-                    identity_layer: source,
-                    member_layer: source_member,
-                },
-                Int {
-                    identity_layer: target,
-                    member_layer: target_member,
-                },
-            ) => {
-                let source_range = intersect_bounds(source.range, source_member.range);
-                i64_range_contains(
-                    source_range.as_ref(),
-                    intersect_bounds(target.range, target_member.range).as_ref(),
-                )
-            }
-            (
-                Float {
-                    range: s_range,
                     binding: _,
                 },
                 Float {
-                    range: k_range,
+                    range: _,
                     binding: _,
                 },
-            ) => f64_range_contains(s_range.as_ref(), k_range.as_ref()),
+            ) => KnownAssignment::Mismatch,
             (
                 String {
                     identity_layer: _,
@@ -4703,7 +4630,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Duration
                 | Union(_)
                 | Ref(_),
-            ) => self.attr.type_name() == sink.attr.type_name(),
+            ) => KnownAssignment::from_bool(self.attr.type_name() == sink.attr.type_name()),
             (
                 Int {
                     identity_layer: _,
@@ -4747,7 +4674,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Duration
                 | Union(_)
                 | Ref(_),
-            ) => self.attr.type_name() == sink.attr.type_name(),
+            ) => KnownAssignment::from_bool(self.attr.type_name() == sink.attr.type_name()),
             (
                 Float {
                     binding: _,
@@ -4795,7 +4722,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Duration
                 | Union(_)
                 | Ref(_),
-            ) => self.attr.type_name() == sink.attr.type_name(),
+            ) => KnownAssignment::from_bool(self.attr.type_name() == sink.attr.type_name()),
             (
                 Enum {
                     identity: _,
@@ -4873,7 +4800,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Duration
                 | Union(_)
                 | Ref(_),
-            ) => self.attr.type_name() == sink.attr.type_name(),
+            ) => KnownAssignment::from_bool(self.attr.type_name() == sink.attr.type_name()),
             (
                 ResourceHandle {
                     provider: _,
@@ -4926,7 +4853,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Duration
                 | Union(_)
                 | Ref(_),
-            ) => false,
+            ) => KnownAssignment::Mismatch,
             (
                 String {
                     identity_layer: _,
@@ -4979,7 +4906,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     provider: _,
                     resource_type: _,
                 },
-            ) => false,
+            ) => KnownAssignment::Mismatch,
             (
                 Int {
                     identity_layer: _,
@@ -5024,7 +4951,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Union(_)
                 | Ref(_),
                 StringLiteralSet { values: _ },
-            ) => false,
+            ) => KnownAssignment::Mismatch,
         }
     }
 }
@@ -6939,14 +6866,6 @@ fn validate_struct_field_assignment(
         .then(|| TypeError::ReadOnlyAttribute {
             name: input_name.to_string(),
         })
-}
-
-fn pattern_compatible(source: Option<&PatternSpec>, sink: Option<&PatternSpec>) -> bool {
-    match (source, sink) {
-        (_, None) => true,
-        (Some(source), Some(sink)) => source == sink,
-        (None, Some(_)) => false,
-    }
 }
 
 fn i64_range_contains(

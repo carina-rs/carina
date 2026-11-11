@@ -5264,9 +5264,8 @@ fn directional_relation_rejects_plain_string_for_identified_sink() {
     );
 }
 
-// Issue #3798's settled rule-10 exception: a plain source can cross an
-// identity-less refinement boundary. The concrete value is checked against
-// the pattern when known (carina#3805).
+// An unrefined source supplies no refinement evidence to overlap-or-defer (#4362).
+// The identity-less sink's pattern is checked on the resolved destination value.
 #[test]
 fn directional_relation_accepts_plain_string_for_identityless_pattern_sink() {
     let schema = AttributeType::refined_string(

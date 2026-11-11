@@ -555,6 +555,246 @@ fn resource_callers_admit_wider_same_identity_references() {
 }
 
 #[test]
+fn issue_4362_resource_reference_admission_uses_anonymous_overlap() {
+    let string = |min, max, member, pattern: &str| {
+        let pattern = Some(crate::schema::PatternSpec::new(
+            pattern,
+            crate::schema::PatternMatch::Full,
+        ));
+        if member {
+            AttributeType::string_member(
+                crate::schema::StringIdentityLayer::new(None, None, None, None),
+                crate::schema::StringMemberConstraints::new(pattern, Some((Some(min), Some(max)))),
+            )
+        } else {
+            AttributeType::refined_string(None, pattern, Some((Some(min), Some(max))), None)
+        }
+    };
+    for (min, max, admitted, member) in [
+        (1, 100, true, false),
+        (50, 60, false, false),
+        (1, 100, true, true),
+        (50, 60, false, true),
+    ] {
+        fixture(
+            string(min, max, member, "[a-z]+"),
+            string(1, 47, member, "a+"),
+            |catalog, schemas, _, _| {
+                let directory = tempfile::tempdir().unwrap();
+                std::fs::write(
+                    directory.path().join("main.crn"),
+                    "let producer = test.Source {}\n",
+                )
+                .unwrap();
+                std::fs::write(directory.path().join("consumer.crn"), "let forwarded = producer.output\nattributes { annotated: String = producer.output }\nlet direct = test.Sink { target = producer.output }\nlet via_binding = test.Sink { target = forwarded }\n").unwrap();
+                std::fs::write(
+                    directory.path().join("exports.crn"),
+                    "exports { output: String = producer.output }\n",
+                )
+                .unwrap();
+                let parsed_directory = crate::config_loader::parse_directory(
+                    &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+                    catalog,
+                )
+                .unwrap();
+                let parsed = crate::validation::inference::apply_inference(
+                    parsed_directory.into_parsed().resolve_root_for_test(),
+                    schemas,
+                    catalog,
+                );
+                let bindings = BindingIndex::from_parsed(&parsed, schemas, catalog);
+                let configuration =
+                    crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
+                crate::validation::validate_attribute_param_ref_types_with_bindings(
+                    &configuration.judged().file().attribute_params,
+                    &bindings,
+                )
+                .unwrap();
+                crate::validation::validate_export_param_ref_types_with_bindings(
+                    &configuration.judged().file().export_params,
+                    &bindings,
+                )
+                .unwrap();
+                let result = crate::validation::validate_resource_ref_types(
+                    configuration.judged(),
+                    &std::collections::HashSet::new(),
+                    &bindings,
+                    &mut Vec::new(),
+                );
+                assert_eq!(
+                    result.is_ok(),
+                    admitted,
+                    "String({min}..={max}) -> String(1..=47), member={member}: {result:?}"
+                );
+                if admitted {
+                    with_session_for_test(catalog, |session| {
+                        for name in ["direct", "via_binding"] {
+                            let resource = parsed
+                                .resources
+                                .iter()
+                                .find(|resource| {
+                                    resource
+                                        .binding
+                                        .as_ref()
+                                        .is_some_and(|binding| binding.as_str() == name)
+                                })
+                                .unwrap();
+                            let destination = schemas
+                                .resource_attribute_destination(&resource.id, "target", catalog)
+                                .unwrap();
+                            let value = resource.attributes["target"].to_expanded().expect(
+                                "forwarded resource references have no parser placeholders",
+                            );
+                            let pending = validate(&destination, &value, &bindings, session)
+                                .unwrap()
+                                .ready()
+                                .unwrap_err();
+                            assert!(pending.local_obligation().is_some());
+                            for (resolved_value, accepted, pattern_error) in [
+                                ("a".repeat(32), true, false),
+                                ("a".repeat(48), false, false),
+                                ("z".repeat(32), false, true),
+                            ] {
+                                let mut resolved = ResolvedBindings::default();
+                                resolved.set(
+                                    "producer",
+                                    HashMap::from([("output".into(), text(&resolved_value))]),
+                                    BindingValueSource::Local,
+                                );
+                                let result = pending.clone().discharge(&resolved, session);
+                                assert_eq!(
+                                    result.is_ok(),
+                                    accepted,
+                                    "{name}, value={resolved_value}, member={member}: {result:?}"
+                                );
+                                if let Err(error) = result {
+                                    let ResolutionError::AdmissionConstraints(findings) =
+                                        error.resolution_error()
+                                    else {
+                                        panic!("destination value check: {error:?}");
+                                    };
+                                    assert!(
+                                        findings.findings().iter().any(
+                                            |finding| if pattern_error {
+                                                matches!(
+                                                    finding.error,
+                                                    TypeError::PatternMismatch { .. }
+                                                )
+                                            } else {
+                                                matches!(
+                                                    finding.error,
+                                                    TypeError::LengthOutOfRange { .. }
+                                                )
+                                            }
+                                        ),
+                                        "{name}: {error:?}"
+                                    );
+                                }
+                            }
+                        }
+                    });
+                }
+                if let Err(error) = result {
+                    let message = error.to_string();
+                    // Original anonymous evidence is skipped by IdentifiedLeaves;
+                    // the forwarding declaration's Full check must still reject.
+                    for name in ["direct", "via_binding"] {
+                        assert!(
+                            message.contains(&format!("test.Sink.{name}: cannot assign")),
+                            "{message}"
+                        );
+                    }
+                }
+            },
+        );
+    }
+}
+
+#[test]
+fn issue_4362_sibling_destinations_retain_anonymous_value_checks() {
+    fn check<K: RechecksResolved + Clone + std::fmt::Debug>(
+        destination: &Destination<K>,
+        catalog: &ProviderContext,
+        bindings: &BindingIndex<'_, AbsoluteBindingAddress>,
+        admitted: bool,
+    ) {
+        with_session_for_test(catalog, |session| {
+            let result = validate(destination, &reference(), bindings, session);
+            if !admitted {
+                assert!(
+                    result.is_err(),
+                    "disjoint bounds must reject for {}",
+                    std::any::type_name::<K>()
+                );
+                return;
+            }
+            let pending = result
+                .expect("overlapping anonymous bounds defer")
+                .ready()
+                .unwrap_err();
+            assert!(pending.local_obligation().is_some());
+            for (length, accepted) in [(32, true), (48, false)] {
+                let mut resolved = ResolvedBindings::default();
+                resolved.set(
+                    "producer",
+                    HashMap::from([("output".into(), text(&"a".repeat(length)))]),
+                    BindingValueSource::Local,
+                );
+                let result = pending.clone().discharge(&resolved, session);
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "{} length={length}: {result:?}",
+                    std::any::type_name::<K>()
+                );
+            }
+        });
+    }
+    for (min, max, admitted) in [(1, 100, true), (50, 60, false)] {
+        fixture(
+            AttributeType::refined_string(None, None, Some((Some(min), Some(max))), None),
+            AttributeType::refined_string(None, None, Some((Some(1), Some(47))), None),
+            |catalog, _, bindings, destination| {
+                check(destination, catalog, bindings, admitted);
+                check(
+                    &Destination::<kind::AnnotatedAttribute> {
+                        identity: destination.identity.clone(),
+                        label: destination.label.clone(),
+                        contract: destination.contract.clone(),
+                        kind: PhantomData,
+                    },
+                    catalog,
+                    bindings,
+                    admitted,
+                );
+                check(
+                    &Destination::<kind::ModuleArgument> {
+                        identity: destination.identity.clone(),
+                        label: destination.label.clone(),
+                        contract: destination.contract.clone(),
+                        kind: PhantomData,
+                    },
+                    catalog,
+                    bindings,
+                    admitted,
+                );
+                check(
+                    &Destination::<kind::Export> {
+                        identity: destination.identity.clone(),
+                        label: destination.label.clone(),
+                        contract: destination.contract.clone(),
+                        kind: PhantomData,
+                    },
+                    catalog,
+                    bindings,
+                    admitted,
+                );
+            },
+        );
+    }
+}
+
+#[test]
 fn declared_reference_defers_same_identity_local_constraints_at_resource_sink() {
     let source = string_type("GroupId", Some(64));
     fixture(
