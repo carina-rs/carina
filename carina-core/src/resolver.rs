@@ -2623,7 +2623,9 @@ mod tests {
             compositions: &[],
             managed_current: &plan_input_states,
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings,
+            remote_bindings: &crate::upstream_exports::remote_bindings_for_test(
+                remote_bindings.clone(),
+            ),
             wait_aliases,
         });
         crate::validation::deferred_types::with_session_for_test(
@@ -2650,7 +2652,9 @@ mod tests {
             compositions: &[],
             managed_current: &plan_input_states,
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings,
+            remote_bindings: &crate::upstream_exports::remote_bindings_for_test(
+                remote_bindings.clone(),
+            ),
             wait_aliases,
         });
         let upstream_keys: std::collections::HashSet<&str> =

@@ -16,6 +16,27 @@ use crate::resource::{BindingAddress, ConcreteValue, DeferredValue, PlaceholderK
 pub struct ValueDescription(String);
 
 impl ValueDescription {
+    pub(crate) fn missing() -> Self {
+        Self("missing".into())
+    }
+
+    /// Retain only the kind when describing a value from another directory.
+    pub(crate) fn kind_only(&self) -> Self {
+        let kind = match self.0.split_whitespace().next() {
+            Some("string") => "string",
+            Some("int") => "int",
+            Some("float") => "float",
+            Some("bool") => "bool",
+            Some("duration") => "duration",
+            Some("list") => "list",
+            Some("map") => "map",
+            Some("enum" | "canonical") => "enum",
+            Some("secret") => "secret",
+            _ => "value",
+        };
+        Self(kind.into())
+    }
+
     /// Describe `value` for a type-mismatch diagnostic.
     pub fn of<P: PlaceholderKind, B: BindingAddress>(value: &Value<P, B>) -> Self {
         Self(match value {
