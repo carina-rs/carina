@@ -2802,14 +2802,18 @@ mod tests {
         delimiter: &str,
         write: impl Fn(&mut DiagnosticTextBuilder, &str),
     ) {
+        // Rust owns printable-Unicode escaping; Carina's forced escapes stay pinned.
+        let em_space = '\u{2003}'.escape_debug().collect::<String>();
+        let quoted_em_space = format!("token{em_space}tail");
+        let quoted_em_space_bidi = format!(r#"token\"{em_space}\u{{202e}}tail"#);
         for (raw, forms) in [
             (
                 "token\u{2003}tail",
                 [
                     "token\u{2003}tail",
                     "token\u{2003}tail",
-                    r"token\u{2003}tail",
-                    r"token\u{2003}tail",
+                    &quoted_em_space,
+                    &quoted_em_space,
                 ],
             ),
             ("token\u{200b}tail", [r"token\u{200b}tail"; 4]),
@@ -2864,8 +2868,8 @@ mod tests {
                 [
                     concat!("token\"", "\u{2003}", r"\u{202e}tail"),
                     concat!("token\"", "\u{2003}", r"\u{202e}tail"),
-                    r#"token\"\u{2003}\u{202e}tail"#,
-                    r#"token\"\u{2003}\u{202e}tail"#,
+                    &quoted_em_space_bidi,
+                    &quoted_em_space_bidi,
                 ],
             ),
         ] {
@@ -2905,9 +2909,10 @@ mod tests {
         let middle = "x".repeat(MAX_PROVIDER_TEXT_BYTES + 16);
         let raw = format!("token\u{2003}\"'{middle}\\\u{202e}tail");
         let secrets = provider_secrets(&[&raw]);
+        let em_space = '\u{2003}'.escape_debug().collect::<String>();
         for echo in [
-            format!(r#"token\u{{2003}}\"'{middle}\\\u{{202e}}tail"#),
-            format!(r#"token\u{{2003}}\"\'{middle}\\\u{{202e}}tail"#),
+            format!(r#"token{em_space}\"'{middle}\\\u{{202e}}tail"#),
+            format!(r#"token{em_space}\"\'{middle}\\\u{{202e}}tail"#),
         ] {
             assert!(echo.len() > MAX_PROVIDER_TEXT_BYTES);
             assert_eq!(
@@ -2915,10 +2920,8 @@ mod tests {
                 "(secret)"
             );
             let mut stderr = RedactingLineWriter::new(&secrets, Vec::new());
-            for chunk in echo.as_bytes().chunks(7) {
-                stderr
-                    .push_str(std::str::from_utf8(chunk).unwrap())
-                    .unwrap();
+            for ch in echo.chars() {
+                stderr.push_str(&ch.to_string()).unwrap();
             }
             stderr.finish().unwrap();
             assert_eq!(stderr.sink, b"(secret)\n");
@@ -2936,9 +2939,6 @@ mod tests {
         ] {
             let debug = format!("{raw:?}");
             let body = &debug[1..debug.len() - 1];
-            if raw == "token\u{115f}\u{200b}tail" {
-                assert_eq!(debug, concat!("\"token", "\u{115f}", r"\u{200b}tail", "\""));
-            }
             let secrets = provider_secrets(&[raw]);
             assert_eq!(
                 secrets

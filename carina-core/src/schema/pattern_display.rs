@@ -291,6 +291,12 @@ mod tests {
 
     #[test]
     fn review_4327_pattern_display_quotes_bidi_and_preserves_safe_sources() {
+        let em_space = '\u{2003}'.escape_debug().collect::<String>();
+        let em_space_display = if em_space == "\u{2003}" {
+            format!("/a{em_space}b/ (Full)")
+        } else {
+            format!("\"a{em_space}b\" (Full)")
+        };
         for source in [r"^[a-z]\d+$", r"a\u{202e}\b", r#"["'\\]+"#, "é"] {
             let spec = PatternSpec::new(source, PatternMatch::Full);
             assert_eq!(
@@ -302,7 +308,7 @@ mod tests {
             ("a\u{202e}\\b", r#""a\u{202e}\\b" (Full)"#),
             ("a\"b\\c\n", r#""a\"b\\c\n" (Full)"#),
             ("a\u{2028}b", r#""a\u{2028}b" (Full)"#),
-            ("a\u{2003}b", r#""a\u{2003}b" (Full)"#),
+            ("a\u{2003}b", em_space_display.as_str()),
             ("a\u{fe0f}b", r#""a\u{fe0f}b" (Full)"#),
         ] {
             let spec = PatternSpec::new(source, PatternMatch::Full);
