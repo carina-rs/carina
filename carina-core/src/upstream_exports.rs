@@ -15,6 +15,13 @@
 //! surface can share the same logic without duplicating traversal code.
 
 use crate::paths::ResolvedPath;
+mod admission;
+#[cfg(any(test, feature = "test-utils"))]
+pub use admission::remote_bindings_for_test;
+pub use admission::{
+    AdmittedRemoteBindings, AdmittedUpstreamExports, ExportSourceAdmission,
+    UpstreamExportAdmissionError,
+};
 use std::collections::HashMap;
 #[cfg(test)]
 use std::path::Path;
@@ -386,7 +393,7 @@ pub fn discover_upstream_exports<B: BindingAddress>(
     .unwrap_or_default()
 }
 
-fn resolve_upstream_exports_with_context<B: BindingAddress>(
+pub fn resolve_upstream_exports_with_context<B: BindingAddress>(
     base_dir: &ResolvedPath,
     upstream_states: &[UpstreamState<B>],
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,

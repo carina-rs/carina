@@ -77,7 +77,7 @@ pub use refresh::{
 // Re-export main types for convenience
 pub use backend::{
     BackendError, BackendResult, InvalidResourceIdentityError, LOCAL_BACKEND_TYPE, RawState,
-    S3_BACKEND_TYPE, StateBackend, read_published_exports,
+    S3_BACKEND_TYPE, StateBackend, read_encoded_published_exports, read_published_exports,
 };
 pub use backend_config::{
     BackendAttributeError, BackendConfig, BackendConfigError, BackendConfigErrors,
@@ -92,21 +92,22 @@ pub use backend_selection::{
 #[cfg(any(test, feature = "test-utils"))]
 pub use backends::local_backend_for_test;
 pub use backends::{
-    LocalBackend, LocalStateFile, StateUrl, anchored_local_path, load_local_state_file,
+    LocalBackend, LocalStateFile, StateUrl, anchored_local_path,
+    load_encoded_published_exports_from_url, load_local_state_file,
     load_published_exports_from_url, load_state_from_url,
 };
 pub use heartbeat::{HeartbeatGuard, LockHeartbeat, LockLost, LockedStateWriter};
 pub use lock::LockInfo;
 pub use state::{
     ApplyDecision, CurrentInstance, DeposedAttributes, DeposedInstance, DeposedKey,
-    ImportTargetDisposition, LegacyClassificationOutcome, LegacyDependencyClassification,
-    LegacyDependencyMigrationError, LegacyDependencyNames, LegacyDestroyOrderingWarning,
-    LegacyReadRequiredRow, LegacyReadRequiredRows, LoadedOrphans, LoadedState, MigratedStateFile,
-    MigrationInfo, NameOverride, NotOutcomeUnknown, NotOutcomeUnknownKind, OutcomeUnknownRow,
-    PreviousSecretHashAuthority, PublishedExports, ResourceState, ResourceStateEncodingError,
-    RowBasis, StateFile, UnreportedMigratedState, UnvalidatedLegacyMigration,
-    ValidatedLegacyMigration, check_and_migrate, check_and_migrate_bytes, log_state_migration_once,
-    should_apply_override,
+    EncodedPublishedExports, ImportTargetDisposition, LegacyClassificationOutcome,
+    LegacyDependencyClassification, LegacyDependencyMigrationError, LegacyDependencyNames,
+    LegacyDestroyOrderingWarning, LegacyReadRequiredRow, LegacyReadRequiredRows, LoadedOrphans,
+    LoadedState, MigratedStateFile, MigrationInfo, NameOverride, NotOutcomeUnknown,
+    NotOutcomeUnknownKind, OutcomeUnknownRow, PreviousSecretHashAuthority, PublishedExports,
+    ResourceState, ResourceStateEncodingError, RowBasis, StateFile, UnreportedMigratedState,
+    UnvalidatedLegacyMigration, ValidatedLegacyMigration, check_and_migrate,
+    check_and_migrate_bytes, log_state_migration_once, should_apply_override,
 };
 
 #[cfg(any(test, feature = "test-utils"))]

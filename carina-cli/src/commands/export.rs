@@ -6,7 +6,7 @@ use crate::output_style::Colorize;
 use carina_core::config_loader::load_configuration_for_bootstrap;
 use carina_core::parser::ProviderContext;
 use carina_core::value::{PersistedExportValue, render_export_json_value};
-use carina_state::{StateUrl, load_published_exports_from_url};
+use carina_state::{StateUrl, load_encoded_published_exports_from_url};
 
 use crate::display::colored_value;
 use crate::error::AppError;
@@ -35,7 +35,7 @@ pub async fn run_export(
 ) -> Result<(), AppError> {
     let exports = if let Some(raw_url) = state_url {
         let url = StateUrl::parse(raw_url).map_err(AppError::Backend)?;
-        load_published_exports_from_url(&url)
+        load_encoded_published_exports_from_url(&url)
             .await
             .map_err(AppError::Backend)?
     } else {
@@ -63,7 +63,7 @@ pub async fn run_export(
         )
         .await?;
         backend
-            .read_published_exports()
+            .read_encoded_published_exports()
             .await
             .map_err(AppError::Backend)?
             .ok_or_else(|| {

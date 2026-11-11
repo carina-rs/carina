@@ -106,7 +106,7 @@ fn snapshot_persisted_protocol_root_and_nested_hash_round_trip() {
 fn validated_export_decode_returns_evaluable_values() {
     let value = Value::Concrete(ConcreteValue::String("exported".into()));
     let persisted = carina_core::value::PersistedExportValue::encode(&value).unwrap();
-    let decoded: Value = persisted.decode().unwrap();
+    let decoded: Value = persisted.decode().unwrap().unwrap();
     assert_eq!(decoded, value);
 }
 

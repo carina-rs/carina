@@ -436,6 +436,13 @@ pub enum PersistedValueDecodeError {
     MalformedEnum,
     #[error("malformed {PERSISTED_SECRET_KEY} persisted secret payload")]
     MalformedSecret,
+    #[error("nested null is not allowed in an export value")]
+    NestedExportNull,
+    #[error("at {}: {error}", crate::provider_text::DiagnosticText::new(path))]
+    ExportPath {
+        path: String,
+        error: Box<PersistedValueDecodeError>,
+    },
 }
 
 /// A complete resource-state value tree in Carina's persisted JSON encoding.
@@ -600,14 +607,14 @@ impl PersistedExportValue {
             .map(|encoded| Self { encoded })
     }
 
-    pub fn decode(&self) -> Option<Value> {
-        persisted_json_to_dsl_value(&self.encoded, PersistedPurpose::Export)
-            .expect("PersistedExportValue validates the reserved namespace at construction")
-            .map(|snapshot| {
+    pub fn decode(&self) -> Result<Option<Value>, PersistedValueDecodeError> {
+        persisted_json_to_dsl_value(&self.encoded, PersistedPurpose::Export).map(|value| {
+            value.map(|snapshot| {
                 snapshot
                     .to_value_at("export")
                     .expect("PersistedExportValue rejects historical secret hashes at construction")
             })
+        })
     }
 
     #[cfg(not(any(test, feature = "test-utils")))]
@@ -622,7 +629,7 @@ impl PersistedExportValue {
     }
 
     pub fn decoded_json(&self) -> serde_json::Value {
-        decode_persisted_json(&self.encoded, PersistedPurpose::Export)
+        decode_persisted_json(&self.encoded, PersistedPurpose::ExportDisplay)
             .expect("PersistedExportValue validates the reserved namespace at construction")
             .into_ordinary_json()
     }
@@ -634,7 +641,7 @@ impl PersistedExportValue {
     }
 
     fn from_serialized_json(encoded: serde_json::Value) -> Result<Self, PersistedValueDecodeError> {
-        decode_persisted_json(&encoded, PersistedPurpose::Export)?;
+        decode_persisted_json(&encoded, PersistedPurpose::ExportDisplay)?;
         Ok(Self { encoded })
     }
 }
@@ -1182,6 +1189,7 @@ fn json_to_dsl_value_inner(
 enum PersistedPurpose {
     State,
     Export,
+    ExportDisplay,
 }
 
 enum DecodedPersistedJson {
@@ -1256,7 +1264,8 @@ fn decode_persisted_json(
         serde_json::Value::String(value) => Ok(DecodedPersistedJson::String(value.clone())),
         serde_json::Value::Array(values) => values
             .iter()
-            .map(|value| decode_persisted_json(value, purpose))
+            .enumerate()
+            .map(|(index, value)| decode_persisted_child(value, purpose, format!("[{index}]")))
             .collect::<Result<Vec<_>, _>>()
             .map(DecodedPersistedJson::Array),
         serde_json::Value::Object(values) => {
@@ -1267,7 +1276,7 @@ fn decode_persisted_json(
                 .collect();
             if !host_keys.is_empty() {
                 if values.len() == 1 && host_keys.as_slice() == [PERSISTED_SECRET_KEY] {
-                    if matches!(purpose, PersistedPurpose::Export) {
+                    if !matches!(purpose, PersistedPurpose::State) {
                         return Err(PersistedValueDecodeError::InvalidHostObject {
                             keys: values.keys().cloned().collect(),
                         });
@@ -1294,12 +1303,31 @@ fn decode_persisted_json(
                 .iter()
                 .map(|(key, value)| {
                     let key = key.strip_prefix('$').unwrap_or(key).to_string();
-                    decode_persisted_json(value, purpose).map(|value| (key, value))
+                    decode_persisted_child(value, purpose, key.clone()).map(|value| (key, value))
                 })
                 .collect::<Result<IndexMap<_, _>, _>>()
                 .map(DecodedPersistedJson::Object)
         }
     }
+}
+
+fn decode_persisted_child(
+    json: &serde_json::Value,
+    purpose: PersistedPurpose,
+    path: String,
+) -> Result<DecodedPersistedJson, PersistedValueDecodeError> {
+    if matches!(purpose, PersistedPurpose::State) {
+        return decode_persisted_json(json, purpose);
+    }
+    let decoded = if json.is_null() && matches!(purpose, PersistedPurpose::Export) {
+        Err(PersistedValueDecodeError::NestedExportNull)
+    } else {
+        decode_persisted_json(json, purpose)
+    };
+    decoded.map_err(|error| PersistedValueDecodeError::ExportPath {
+        path,
+        error: Box::new(error),
+    })
 }
 
 fn json_to_canonical_enum(
@@ -1495,7 +1523,7 @@ pub fn render_export_json_value(value: &PersistedExportValue) -> RenderedValue {
 
 fn render_persisted_json(value: PersistedView<'_>) -> RenderedValue {
     let mut sink = SpanSink::default();
-    let value = decode_persisted_json(value.encoded, PersistedPurpose::Export)
+    let value = decode_persisted_json(value.encoded, PersistedPurpose::ExportDisplay)
         .expect("persisted value types validate the reserved namespace at construction");
     format_decoded_persisted_json_into(&value, &mut sink).expect("SpanSink writes are infallible");
     sink.finish()
@@ -8387,7 +8415,7 @@ mod tests {
         let persisted = PersistedExportValue::encode(&plain).expect("plain export is persistable");
 
         assert_eq!(persisted.as_json(), &serde_json::json!(marker));
-        assert_eq!(persisted.decode(), Some(plain));
+        assert_eq!(persisted.decode().unwrap(), Some(plain));
         assert!(
             serde_json::from_value::<PersistedExportValue>(serde_json::json!({
                 "$secret": RedactedSecretHash::generate(b"forbidden-export").encoded_digest(),
@@ -8395,6 +8423,36 @@ mod tests {
             .is_err(),
             "exports must reject typed redacted-secret tags",
         );
+    }
+
+    #[test]
+    fn export_decode_retains_nested_malformed_payload_paths() {
+        let error = PersistedExportValue::from_serialized_json(serde_json::json!({
+            "outer": ["valid", {"$enum": {"api_value": "broken"}}]
+        }))
+        .unwrap_err();
+        let message = error.to_string();
+        for fragment in ["outer", "[1]", "malformed $enum"] {
+            assert!(message.contains(fragment), "{message}");
+        }
+    }
+
+    #[test]
+    fn export_null_rejection_preserves_resource_value_null_decoding() {
+        let raw = serde_json::json!({"items": ["before", null, "after"], "omitted": null});
+        let export = PersistedExportValue::from_serialized_json(raw.clone()).unwrap();
+        let error = export.decode().unwrap_err().to_string();
+        assert!(error.contains("items") && error.contains("[1]"), "{error}");
+
+        let resource = PersistedValue::from_serialized_json(raw).unwrap().decode();
+        let expected = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "items".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("before".into())),
+                Value::Concrete(ConcreteValue::String("after".into())),
+            ])),
+        )])));
+        assert_eq!(resource, Some(expected.to_snapshot()));
     }
 
     #[test]

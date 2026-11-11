@@ -1003,6 +1003,9 @@ impl std::error::Error for AwsCredentialStartupError {}
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error(transparent)]
+    UpstreamExportAdmission(Box<carina_core::upstream_exports::UpstreamExportAdmissionError>),
+
+    #[error(transparent)]
     PlanPreparation(Box<crate::wiring::PlanPreparationError>),
 
     #[error(transparent)]

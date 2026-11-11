@@ -442,7 +442,8 @@ async fn run_destroy_locked_owned(
     let provider_inputs = load_and_resolve_provider_configs(&runtime,
         parsed,
         base_dir,
-        provider_context,
+        &ctx.upstream_provider_context(provider_context),
+        ctx.schemas(),
         UpstreamMissingStatePolicy::Strict,
         ProviderUpstreamScope::ProviderReferences,
     )

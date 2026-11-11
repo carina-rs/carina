@@ -6774,11 +6774,14 @@ fn published_exports_ignore_future_state_version_and_resource_shape() {
     let exports = PublishedExports::from_state_bytes(json.to_string().as_bytes())
         .expect("supported exports must load independently of resource state");
     assert_eq!(
-        exports
-            .values()
-            .get("account_id")
-            .expect("fixture export exists")
-            .decoded_json(),
+        PersistedExportValue::encode(
+            exports
+                .values()
+                .get("account_id")
+                .expect("fixture export exists"),
+        )
+        .expect("decoded export is persistable")
+        .decoded_json(),
         serde_json::json!("123456789012")
     );
 
@@ -6881,11 +6884,14 @@ fn published_exports_load_v16_without_exports_version_through_legacy_migration()
     let exports = PublishedExports::from_state_bytes(json.to_string().as_bytes())
         .expect("v16 exports must use the legacy full-state migration path");
     assert_eq!(
-        exports
-            .values()
-            .get("user_map")
-            .expect("fixture export exists")
-            .decoded_json(),
+        PersistedExportValue::encode(
+            exports
+                .values()
+                .get("user_map")
+                .expect("fixture export exists"),
+        )
+        .expect("decoded export is persistable")
+        .decoded_json(),
         serde_json::json!({ "$user": true })
     );
 }
@@ -9361,6 +9367,71 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
     // Second item should be stored as a hash
     let secret_stored = structural_secret_digest(&values_arr[1]);
     assert!(secret_stored.starts_with("$argon2id$"));
+}
+
+#[test]
+fn full_state_load_preserves_nested_null_exports_for_reapply() {
+    let exports = serde_json::json!({
+        "list": ["before", null, "after"],
+        "object": {"id": null, "active": true},
+        "absent": null,
+    });
+    for version in [StateFile::CURRENT_VERSION, 16] {
+        let mut json = serde_json::to_value(StateFile::new()).unwrap();
+        json["exports"] = exports.clone();
+        json["version"] = serde_json::json!(version);
+        if version < StateFile::EXPORTS_VERSION_INTRODUCED {
+            json.as_object_mut().unwrap().remove("exports_version");
+        }
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let loaded = check_and_migrate_bytes(&bytes)
+            .expect("full-state loading must allow reapply to replace nested-null exports")
+            .into_state();
+        assert_eq!(serde_json::to_value(&loaded.exports).unwrap(), exports);
+
+        let displayed = EncodedPublishedExports::from_state_bytes(&bytes)
+            .expect("export display must preserve encoded nulls");
+        assert_eq!(serde_json::to_value(displayed.values()).unwrap(), exports);
+        assert!(
+            PublishedExports::from_state_bytes(&bytes).is_err(),
+            "remote bindings must still reject nested nulls after legacy migration",
+        );
+    }
+}
+
+#[test]
+fn published_exports_reject_nested_list_null_instead_of_compacting_it() {
+    assert_published_export_null_rejected(
+        serde_json::json!(["before", null, "after"]),
+        &["broken", "[1]"],
+    );
+}
+
+#[test]
+fn published_exports_reject_nested_object_null_instead_of_dropping_its_key() {
+    assert_published_export_null_rejected(
+        serde_json::json!({"id": null, "active": true}),
+        &["broken", "id"],
+    );
+}
+
+fn assert_published_export_null_rejected(value: serde_json::Value, error_path: &[&str]) {
+    let mut state = serde_json::to_value(StateFile::new()).unwrap();
+    state["exports"] = serde_json::json!({"valid": "keep", "broken": value});
+    let bytes = serde_json::to_vec(&state).unwrap();
+    let result = PublishedExports::from_state_bytes(&bytes);
+    assert!(
+        result.is_err(),
+        "present export {error_path:?} containing null must fail decoding, not silently drop data; decoded bindings: {:?}",
+        result.as_ref().map(PublishedExports::build_remote_bindings),
+    );
+    let message = result.unwrap_err().to_string();
+    for fragment in error_path {
+        assert!(
+            message.contains(fragment),
+            "decode error must retain export path {error_path:?}: {message}",
+        );
+    }
 }
 
 #[test]

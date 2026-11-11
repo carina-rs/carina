@@ -1570,7 +1570,10 @@ async fn run_state_bucket_delete(
         runtime,
         validated_config.resources(),
         base_dir,
-        provider_context,
+        &validated_config
+            .context()
+            .upstream_provider_context(provider_context),
+        validated_config.context().schemas(),
     )
     .await?;
     let bucket_provider = create_state_bucket_delete_provider(
@@ -1673,12 +1676,14 @@ async fn load_state_bucket_delete_provider_inputs<E>(
     parsed: &carina_core::parser::ExpandedFile<E>,
     base_dir: &carina_core::paths::ResolvedPath,
     provider_context: &ProviderContext,
+    schemas: &carina_core::schema::SchemaRegistry,
 ) -> Result<ResolvedProviderInputs, AppError> {
     load_and_resolve_provider_configs(
         runtime,
         parsed,
         base_dir,
         provider_context,
+        schemas,
         UpstreamMissingStatePolicy::Strict,
         ProviderUpstreamScope::ProviderReferences,
     )
@@ -1824,7 +1829,8 @@ pub(crate) async fn run_state_refresh_locked(
         validated_config.context().runtime(),
         parsed,
         base_dir,
-        provider_context,
+        &ctx.upstream_provider_context(provider_context),
+        ctx.schemas(),
         UpstreamMissingStatePolicy::Strict,
         ProviderUpstreamScope::ProviderReferences,
     )
@@ -3638,6 +3644,7 @@ mod tests {
             &parsed,
             &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &carina_core::schema::SchemaRegistry::new(),
         )
         .await
         .expect("state bucket delete provider inputs must resolve");
@@ -3904,6 +3911,7 @@ mod tests {
             &parsed,
             &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &carina_core::schema::SchemaRegistry::new(),
         )
         .await
         {
@@ -3934,6 +3942,7 @@ mod tests {
             &parsed,
             &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &carina_core::schema::SchemaRegistry::new(),
         )
         .await
         .expect("bucket delete must not load tag-only upstream state");
@@ -4000,6 +4009,7 @@ mod tests {
             &parsed,
             &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &carina_core::schema::SchemaRegistry::new(),
         )
         .await
         .expect("deferred default tags must not block bucket provider construction");

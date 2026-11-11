@@ -2981,8 +2981,8 @@ for account_id in orgs.accounts {
             message: "upstream iterable is not yet available".to_string(),
         });
 
-        let bindings =
-            crate::binding_index::IterableBindings::from_upstream_only(HashMap::from([(
+        let bindings = crate::binding_index::IterableBindings::from_upstream_only(
+            crate::upstream_exports::remote_bindings_for_test(HashMap::from([(
                 "orgs".to_string(),
                 HashMap::from([(
                     "accounts".to_string(),
@@ -2996,7 +2996,8 @@ for account_id in orgs.accounts {
                         ]),
                     ),
                 )]),
-            )]));
+            )])),
+        );
         let mut parsed = parsed
             .into_expanded(
                 &crate::schema::SchemaRegistry::new(),

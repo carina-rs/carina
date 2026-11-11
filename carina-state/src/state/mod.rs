@@ -419,12 +419,21 @@ enum DesiredAuthoringBasis<'a> {
     CarriedRead,
 }
 
-/// Published values read without decoding managed resource rows.
+/// Published values decoded for use as upstream remote bindings.
 ///
-/// Construction is restricted to [`Self::from_state_bytes`], so exports-only
-/// consumers cannot accidentally cross the full state-format version gate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Construction rejects nested nulls before any binding map can be built.
+/// Managed resource rows are not decoded or checked against the state version.
+#[derive(Debug, Clone, PartialEq)]
 pub struct PublishedExports {
+    values: HashMap<String, Value>,
+}
+
+/// Published JSON retained for export display, including nulls.
+///
+/// This validates the persisted namespace and structure without interpreting
+/// the values as remote bindings. It has no binding-installation API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedPublishedExports {
     values: HashMap<String, PersistedExportValue>,
 }
 
@@ -451,6 +460,39 @@ impl PublishedExports {
     /// written before the independent exports version existed are migrated
     /// through the legacy full-state path because their value encoding may
     /// require the v12-v14 migrations.
+    pub fn from_state_bytes(bytes: &[u8]) -> Result<Self, BackendError> {
+        Self::decode_state_bytes(bytes).map(|(exports, _)| exports)
+    }
+
+    pub(crate) fn decode_state_bytes(
+        bytes: &[u8],
+    ) -> Result<(Self, Option<MigrationInfo>), BackendError> {
+        let (encoded, migration) = EncodedPublishedExports::decode_state_bytes(bytes)?;
+        let mut values = HashMap::with_capacity(encoded.values.len());
+        for (name, encoded) in encoded.values {
+            let decoded = encoded.decode().map_err(|error| {
+                map_state_file_decode_error(persisted_export_decode_error(&name, error), None)
+            })?;
+            if let Some(value) = decoded {
+                values.insert(name, value);
+            }
+        }
+        Ok((Self { values }, migration))
+    }
+
+    pub fn values(&self) -> &HashMap<String, Value> {
+        &self.values
+    }
+
+    /// Copy the already-decoded export values consumed by `upstream_state`.
+    pub fn build_remote_bindings(&self) -> HashMap<String, Value> {
+        self.values.clone()
+    }
+}
+
+impl EncodedPublishedExports {
+    /// Read export JSON without the full state-format gate or resource rows.
+    /// Legacy encodings retain the same in-memory migration path as full state.
     pub fn from_state_bytes(bytes: &[u8]) -> Result<Self, BackendError> {
         Self::decode_state_bytes(bytes).map(|(exports, _)| exports)
     }
@@ -485,15 +527,6 @@ impl PublishedExports {
 
     pub fn values(&self) -> &HashMap<String, PersistedExportValue> {
         &self.values
-    }
-
-    /// Decode published values into the binding map consumed by
-    /// `upstream_state`.
-    pub fn build_remote_bindings(&self) -> HashMap<String, Value> {
-        self.values
-            .iter()
-            .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
-            .collect()
     }
 }
 
@@ -865,21 +898,27 @@ fn classify_exports_version(
     }
 }
 
+/// Validate persisted JSON without applying remote-binding value semantics.
 fn decode_persisted_exports(
     exports: HashMap<String, serde_json::Value>,
 ) -> Result<HashMap<String, PersistedExportValue>, StateFileDecodeError> {
     exports
         .into_iter()
         .map(|(name, value)| {
-            serde_json::from_value(value)
+            serde_json::from_value::<PersistedExportValue>(value)
                 .map(|value| (name.clone(), value))
-                .map_err(|error| {
-                    StateFileDecodeError::Validation(format!(
-                        "persisted export {name:?} is not valid persisted JSON: {error}"
-                    ))
-                })
+                .map_err(|error| persisted_export_decode_error(&name, error))
         })
         .collect()
+}
+
+fn persisted_export_decode_error(
+    name: &str,
+    error: impl std::fmt::Display,
+) -> StateFileDecodeError {
+    StateFileDecodeError::Validation(format!(
+        "persisted export {name:?} is not valid persisted JSON: {error}"
+    ))
 }
 
 fn map_state_file_decode_error(

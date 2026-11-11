@@ -28,6 +28,34 @@ fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress
 }
 
 #[test]
+fn upstream_metadata_retains_the_command_environment_and_decryptor() {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let ctx = WiringContext::new_for_test(&runtime, vec![], &[]);
+    let mut ambient = carina_core::parser::ProviderContext::new(
+        carina_core::EnvironmentSnapshot::new([("UPSTREAM_VALUE".into(), "captured-value".into())]),
+    );
+    ambient.decryptor = Some(Arc::new(|_, _| Ok("decrypted-value".into())));
+    let enriched = ctx.upstream_provider_context(&ambient);
+
+    assert_eq!(
+        enriched.environment.get("UPSTREAM_VALUE"),
+        ambient.environment.get("UPSTREAM_VALUE")
+    );
+    assert!(Arc::ptr_eq(
+        enriched.decryptor.as_ref().unwrap(),
+        ambient.decryptor.as_ref().unwrap()
+    ));
+    assert_eq!(
+        enriched.known_custom_types(),
+        ctx.provider_context().known_custom_types()
+    );
+    assert_eq!(
+        enriched.resource_types,
+        ctx.provider_context().resource_types
+    );
+}
+
+#[test]
 fn plan_boundary_collects_every_resource_and_attribute_failure() {
     let runtime = crate::test_support::TestCommandRuntime::new();
     let schema = PatternResourceSchema::new("example.consumer")
@@ -2564,11 +2592,15 @@ fn resolved_provider_configs_from_resolved<
     let remote = remote
         .iter()
         .map(|(binding, attributes)| {
-            carina_core::resource::into_expanded_value_map(attributes.clone(), None)
-                .map(|attributes| (binding.clone(), attributes))
+            carina_core::resource::into_expanded_value_map::<HashMap<_, _>, _>(
+                attributes.clone(),
+                None,
+            )
+            .map(|attributes| (binding.clone(), attributes))
         })
         .collect::<Result<HashMap<_, _>, _>>()
         .expect("test remote bindings contain no parser placeholders");
+    let remote = carina_core::upstream_exports::remote_bindings_for_test(remote);
     carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
@@ -3113,7 +3145,11 @@ where
     carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
-            carina_core::parser::resolve_provider_attributes_with_remote(&parsed, remote, session)
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                &parsed,
+                &carina_core::upstream_exports::remote_bindings_for_test(remote.clone()),
+                session,
+            )
         },
     )
     .expect("test provider configs must resolve")
@@ -3191,7 +3227,7 @@ where
         state_file,
         refresh,
         ProgressSink::Human,
-        remote_bindings,
+        &carina_core::upstream_exports::remote_bindings_for_test(remote_bindings.clone()),
         state_block_claims,
         resolved_state_block_targets,
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -8156,11 +8192,16 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     let expanded_remote_bindings = remote_bindings
         .iter()
         .map(|(binding, attributes)| {
-            carina_core::resource::into_expanded_value_map(attributes.clone(), None)
-                .map(|attributes| (binding.clone(), attributes))
+            carina_core::resource::into_expanded_value_map::<HashMap<_, _>, _>(
+                attributes.clone(),
+                None,
+            )
+            .map(|attributes| (binding.clone(), attributes))
         })
         .collect::<Result<HashMap<_, _>, _>>()
         .expect("test remote bindings contain no parser placeholders");
+    let expanded_remote_bindings =
+        carina_core::upstream_exports::remote_bindings_for_test(expanded_remote_bindings);
     let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
         &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(AssociationCreateOnlyFactory)],
@@ -12950,7 +12991,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &remote,
+            &carina_core::upstream_exports::remote_bindings_for_test(remote.clone()),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -14645,7 +14686,9 @@ mod resolved_value_constraint_gate {
                 compositions: &compositions,
                 managed_current: &current_states,
                 data_source_values: &DataSourceValues::empty(),
-                remote_bindings: &remote_bindings,
+                remote_bindings: &carina_core::upstream_exports::remote_bindings_for_test(
+                    remote_bindings.clone(),
+                ),
                 wait_aliases: &wait_aliases,
             },
         )
@@ -14778,7 +14821,9 @@ mod resolved_value_constraint_gate {
                 compositions,
                 managed_current: &current_states,
                 data_source_values: &DataSourceValues::empty(),
-                remote_bindings: &remote_bindings,
+                remote_bindings: &carina_core::upstream_exports::remote_bindings_for_test(
+                    remote_bindings.clone(),
+                ),
                 wait_aliases: &wait_aliases,
             },
         )

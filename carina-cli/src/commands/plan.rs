@@ -43,6 +43,7 @@ fn root_resource_ref(binding: &str, attribute: &str) -> Value {
     Value::resource_ref(binding, attribute, Vec::new()).resolve_root_for_test()
 }
 use carina_core::schema::SchemaKind;
+use carina_core::upstream_exports::{AdmittedRemoteBindings, AdmittedUpstreamExports};
 #[cfg(test)]
 use carina_core::value::PersistedValue;
 use carina_core::value::{
@@ -6355,7 +6356,10 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs(
         validated_config.context().runtime(),
         validated_config.resources().parsed(),
         base_dir,
-        provider_context,
+        &validated_config
+            .context()
+            .upstream_provider_context(provider_context),
+        validated_config.context().schemas(),
         upstream_policy,
         ProviderUpstreamScope::All,
     )
@@ -6591,7 +6595,7 @@ pub(crate) enum ProviderUpstreamScope {
 /// another.
 pub(crate) struct ResolvedProviderInputs {
     configs: ResolvedProviderConfigs,
-    remote_bindings: HashMap<String, HashMap<String, Value>>,
+    remote_bindings: AdmittedRemoteBindings,
 }
 
 impl ResolvedProviderInputs {
@@ -6599,7 +6603,7 @@ impl ResolvedProviderInputs {
         &self.configs
     }
 
-    pub(crate) fn remote_bindings(&self) -> &HashMap<String, HashMap<String, Value>> {
+    pub(crate) fn remote_bindings(&self) -> &AdmittedRemoteBindings {
         &self.remote_bindings
     }
 }
@@ -6609,11 +6613,13 @@ impl ResolvedProviderInputs {
 /// This is the sole CLI seam for project-based provider resolution. The
 /// command chooses both missing-state policy and load scope; provider
 /// construction then requires the returned typed configs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn load_and_resolve_provider_configs<E>(
     runtime: &crate::runtime::CommandRuntime,
     parsed: &carina_core::parser::ExpandedFile<E>,
     base_dir: &ResolvedPath,
     provider_context: &ProviderContext,
+    schemas: &carina_core::schema::SchemaRegistry,
     policy: UpstreamMissingStatePolicy,
     scope: ProviderUpstreamScope,
 ) -> Result<ResolvedProviderInputs, AppError> {
@@ -6624,12 +6630,13 @@ pub(crate) async fn load_and_resolve_provider_configs<E>(
                 let mut cycle_guard = seed_cycle_guard(base_dir);
                 let remote_bindings = match scope {
                     ProviderUpstreamScope::All => {
-                        load_upstream_states(
+                        load_upstream_states_with_schemas(
                             runtime,
                             &parsed.upstream_states,
                             base_dir,
                             provider_context,
                             &mut cycle_guard,
+                            schemas,
                             policy,
                         )
                         .await?
@@ -6641,6 +6648,7 @@ pub(crate) async fn load_and_resolve_provider_configs<E>(
                             base_dir,
                             provider_context,
                             &mut cycle_guard,
+                            schemas,
                             policy,
                         )
                         .await?
@@ -6689,20 +6697,22 @@ async fn load_provider_referenced_upstream_states<E>(
     base_dir: &ResolvedPath,
     provider_context: &ProviderContext,
     cycle_guard: &mut HashSet<CanonicalPath>,
+    schemas: &carina_core::schema::SchemaRegistry,
     policy: UpstreamMissingStatePolicy,
-) -> Result<HashMap<String, HashMap<String, Value>>, AppError> {
+) -> Result<AdmittedRemoteBindings, AppError> {
     let mut remote_bindings = HashMap::new();
     for referenced in provider_referenced_upstream_states(parsed) {
         let ProviderReferencedUpstream {
             upstream,
             required_by,
         } = referenced;
-        let loaded = load_upstream_states(
+        let loaded = load_upstream_states_with_schemas(
             runtime,
             std::slice::from_ref(&upstream),
             base_dir,
             provider_context,
             cycle_guard,
+            schemas,
             policy,
         )
         .await
@@ -6898,14 +6908,16 @@ fn provider_referenced_upstream_states<E>(
 /// resolution failures, upstream `.crn` parse errors, and backend I/O
 /// errors remain hard errors regardless — they indicate structural
 /// problems the user must fix before plan output can mean anything.
-pub(crate) async fn load_upstream_states<B: carina_core::resource::BindingAddress>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn load_upstream_states_with_schemas<B: carina_core::resource::BindingAddress>(
     runtime: &crate::runtime::CommandRuntime,
     upstream_states: &[UpstreamState<B>],
     base_dir: &ResolvedPath,
     provider_context: &ProviderContext,
     cycle_guard: &mut HashSet<CanonicalPath>,
+    schemas: &carina_core::schema::SchemaRegistry,
     policy: UpstreamMissingStatePolicy,
-) -> Result<HashMap<String, HashMap<String, Value>>, AppError> {
+) -> Result<AdmittedRemoteBindings, AppError> {
     let color_mode = runtime.color_mode();
     let mut result = HashMap::new();
 
@@ -6939,13 +6951,22 @@ pub(crate) async fn load_upstream_states<B: carina_core::resource::BindingAddres
         cycle_guard.remove(&source_identity);
         let backend = backend_result?;
 
-        let published_exports = backend
-            .read_published_exports()
-            .await
-            .map_err(AppError::Backend)?;
+        let published_exports = backend.read_published_exports().await.map_err(|error| {
+            AppError::Backend(carina_state::BackendError::UpstreamExportRead {
+                binding: us.binding.to_string(),
+                error: Box::new(error),
+            })
+        })?;
         match (published_exports, policy) {
             (Some(exports), _) => {
-                result.insert(us.binding.to_string(), exports.build_remote_bindings());
+                let admitted = admit_upstream_snapshot(
+                    std::slice::from_ref(us),
+                    base_dir,
+                    provider_context,
+                    schemas,
+                    HashMap::from([(us.binding.to_string(), exports.build_remote_bindings())]),
+                )?;
+                result.extend(admitted);
             }
             (None, UpstreamMissingStatePolicy::Strict) => {
                 return Err(AppError::Config(format!(
@@ -6971,6 +6992,72 @@ pub(crate) async fn load_upstream_states<B: carina_core::resource::BindingAddres
     }
 
     Ok(result)
+}
+
+pub(crate) fn admit_upstream_snapshot<B: carina_core::resource::BindingAddress>(
+    sources: &[UpstreamState<B>],
+    base_dir: &ResolvedPath,
+    provider_context: &ProviderContext,
+    schemas: &carina_core::schema::SchemaRegistry,
+    values: HashMap<String, HashMap<String, Value>>,
+) -> Result<AdmittedRemoteBindings, AppError> {
+    crate::wiring::settle_type_checks(
+        carina_core::validation::deferred_types::TypeCheckSession::run(
+            provider_context,
+            |session| {
+                let (declarations, errors) =
+                    carina_core::upstream_exports::resolve_upstream_exports_with_context(
+                        base_dir,
+                        sources,
+                        session,
+                        Some(schemas),
+                        &Default::default(),
+                    )?;
+                if let Some(error) = errors.into_iter().next() {
+                    return Err(AppError::Config(error.to_string()));
+                }
+                let mut admitted = HashMap::new();
+                for source in sources {
+                    let binding = source.binding.to_string();
+                    let Some(values) = values.get(&binding) else {
+                        continue;
+                    };
+                    let entries = declarations.get(&source.binding).ok_or_else(|| {
+                        AppError::Config(format!(
+                            "upstream_state '{binding}': export declarations are unavailable"
+                        ))
+                    })?;
+                    let exports =
+                        AdmittedUpstreamExports::admit(&binding, entries, values.clone(), session)
+                            .map_err(|error| AppError::UpstreamExportAdmission(Box::new(error)))?;
+                    admitted.insert(binding, exports);
+                }
+                Ok(admitted)
+            },
+        ),
+        AppError::Validation,
+    )
+}
+
+#[cfg(test)]
+pub(crate) async fn load_upstream_states<B: carina_core::resource::BindingAddress>(
+    runtime: &crate::runtime::CommandRuntime,
+    upstream_states: &[UpstreamState<B>],
+    base_dir: &ResolvedPath,
+    provider_context: &ProviderContext,
+    cycle_guard: &mut HashSet<CanonicalPath>,
+    policy: UpstreamMissingStatePolicy,
+) -> Result<AdmittedRemoteBindings, AppError> {
+    load_upstream_states_with_schemas(
+        runtime,
+        upstream_states,
+        base_dir,
+        provider_context,
+        cycle_guard,
+        &carina_core::schema::SchemaRegistry::new(),
+        policy,
+    )
+    .await
 }
 
 /// Resolve an upstream's backend: parse its `.crn`, walk its own upstream
@@ -7171,6 +7258,7 @@ mod load_upstream_states_tests {
             &ResolvedPath::new(dir.path()).unwrap(),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &mut HashSet::new(),
+            &carina_core::schema::SchemaRegistry::new(),
             UpstreamMissingStatePolicy::Strict,
         )
         .await
@@ -7220,6 +7308,7 @@ mod load_upstream_states_tests {
             &parsed,
             &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &carina_core::schema::SchemaRegistry::new(),
             UpstreamMissingStatePolicy::Strict,
             ProviderUpstreamScope::All,
         )
@@ -7268,6 +7357,7 @@ mod load_upstream_states_tests {
             &parsed,
             &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &carina_core::schema::SchemaRegistry::new(),
             UpstreamMissingStatePolicy::Strict,
             ProviderUpstreamScope::All,
         )
@@ -7328,6 +7418,7 @@ mod load_upstream_states_tests {
             &parsed,
             &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &carina_core::schema::SchemaRegistry::new(),
             UpstreamMissingStatePolicy::Strict,
             ProviderUpstreamScope::ProviderReferences,
         )
@@ -7380,6 +7471,7 @@ mod load_upstream_states_tests {
             &parsed,
             &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &carina_core::schema::SchemaRegistry::new(),
             UpstreamMissingStatePolicy::Strict,
             ProviderUpstreamScope::ProviderReferences,
         )
@@ -7427,6 +7519,11 @@ mod load_upstream_states_tests {
     async fn load_upstream_states_reads_exports_from_source_backend() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
+            dir.path().join("exports.crn"),
+            "exports { account_id: String = 'fixture' }\n",
+        )
+        .unwrap();
+        fs::write(
             dir.path().join("main.crn"),
             r#"backend local { path = "carina.state.json" }"#,
         )
@@ -7457,8 +7554,298 @@ mod load_upstream_states_tests {
     }
 
     #[tokio::test]
+    async fn upstream_export_violating_declared_int_type_is_rejected() {
+        assert_upstream_export_rejected(
+            "count: Int = seed",
+            "count",
+            serde_json::json!(7),
+            serde_json::json!("stale-string"),
+            &["count"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upstream_export_violating_declared_list_element_type_is_rejected() {
+        assert_upstream_export_rejected(
+            "labels: list(String) = ['alpha', 'omega']",
+            "labels",
+            serde_json::json!(["alpha", "omega"]),
+            serde_json::json!(["alpha", false]),
+            &["labels"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upstream_top_level_null_export_stays_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        write_upstream_admission_source(dir.path(), "count: Int = seed");
+        write_state(dir.path(), &[("count", serde_json::Value::Null)]);
+
+        for policy in [
+            UpstreamMissingStatePolicy::Strict,
+            UpstreamMissingStatePolicy::Lenient,
+        ] {
+            let bindings = load_upstream_admission_fixture(dir.path(), policy)
+                .await
+                .expect("a top-level null export means absence, not corruption");
+            let exports = bindings
+                .get("orgs")
+                .expect("an existing upstream snapshot must remain loaded");
+            assert!(
+                exports.is_empty(),
+                "a top-level null export must stay absent, got: {exports:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_stale_undeclared_export_key_is_omitted_without_error() {
+        // pending decision (iii): stale undeclared upstream export keys
+        let dir = tempfile::tempdir().unwrap();
+        write_upstream_admission_source(
+            dir.path(),
+            "count: Int = seed\nretired: String = 'once-declared'",
+        );
+        write_state(
+            dir.path(),
+            &[
+                ("count", serde_json::json!(42)),
+                ("retired", serde_json::json!("persisted-retired-value")),
+            ],
+        );
+        for policy in [
+            UpstreamMissingStatePolicy::Strict,
+            UpstreamMissingStatePolicy::Lenient,
+        ] {
+            let bindings = load_upstream_admission_fixture(dir.path(), policy)
+                .await
+                .expect("both declared exports must load before removing a declaration");
+            assert_eq!(bindings["orgs"].len(), 2);
+            assert_eq!(
+                bindings["orgs"]["retired"],
+                Value::Concrete(ConcreteValue::String("persisted-retired-value".into())),
+            );
+        }
+
+        // Leave the persisted snapshot intact while removing its source declaration.
+        fs::write(
+            dir.path().join("exports.crn"),
+            "exports { count: Int = seed }\n",
+        )
+        .unwrap();
+        let mut installed = Vec::new();
+        for (name, policy) in [
+            ("Strict", UpstreamMissingStatePolicy::Strict),
+            ("Lenient", UpstreamMissingStatePolicy::Lenient),
+        ] {
+            let bindings = load_upstream_admission_fixture(dir.path(), policy)
+                .await
+                .expect("a stale undeclared upstream export key must not be an error");
+            assert_eq!(
+                bindings["orgs"]["count"],
+                Value::Concrete(ConcreteValue::Int(42))
+            );
+            if bindings["orgs"].contains_key("retired") {
+                installed.push(format!("{name} installed {:?}", bindings["orgs"]));
+            }
+        }
+        assert!(
+            installed.is_empty(),
+            "stale undeclared upstream export 'orgs.retired' must be omitted without error; {}",
+            installed.join("; "),
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_export_with_nested_list_null_is_rejected_without_compacting() {
+        assert_upstream_export_rejected(
+            "labels: list(String) = ['alpha', 'omega']",
+            "labels",
+            serde_json::json!(["alpha", "omega"]),
+            serde_json::json!(["alpha", null, "omega"]),
+            &["labels", "[1]"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upstream_export_with_nested_map_null_is_rejected_without_dropping_key() {
+        assert_upstream_export_rejected(
+            "labels: map(String) = { primary = 'alpha' }",
+            "labels",
+            serde_json::json!({"primary": "alpha"}),
+            serde_json::json!({"primary": null}),
+            &["labels", "primary"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upstream_export_with_null_required_struct_member_is_rejected() {
+        assert_upstream_export_rejected(
+            "account: struct { id: String, active: Bool } = { id = 'account-id' active = true }",
+            "account",
+            serde_json::json!({"id": "account-id", "active": true}),
+            serde_json::json!({"id": null, "active": true}),
+            &["account", "id"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upstream_export_missing_required_struct_member_is_rejected() {
+        assert_upstream_export_rejected(
+            "account: struct { id: String, active: Bool } = { id = 'account-id' active = true }",
+            "account",
+            serde_json::json!({"id": "account-id", "active": true}),
+            serde_json::json!({"active": true}),
+            &["account", "id"],
+        )
+        .await;
+    }
+
+    fn write_upstream_admission_source(dir: &Path, declarations: &str) {
+        fs::write(dir.join("main.crn"), "let seed = 7\n").unwrap();
+        fs::write(
+            dir.join("exports.crn"),
+            format!("exports {{\n{declarations}\n}}\n"),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("backend.crn"),
+            "backend local { path = 'carina.state.json' }\n",
+        )
+        .unwrap();
+    }
+
+    async fn load_upstream_admission_fixture(
+        dir: &Path,
+        policy: UpstreamMissingStatePolicy,
+    ) -> Result<AdmittedRemoteBindings, AppError> {
+        load_upstream_states(
+            &crate::test_support::TestCommandRuntime::new(),
+            &[UpstreamState {
+                binding: absolute_binding("orgs"),
+                source: dir.to_path_buf(),
+            }],
+            &ResolvedPath::new(dir.parent().unwrap()).unwrap(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &mut HashSet::new(),
+            policy,
+        )
+        .await
+    }
+
+    async fn assert_upstream_export_rejected(
+        declarations: &str,
+        key: &str,
+        valid: serde_json::Value,
+        invalid: serde_json::Value,
+        error_path: &[&str],
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        write_upstream_admission_source(dir.path(), declarations);
+
+        // Prove the same declaration, backend and persisted envelope load
+        // successfully before replacing only the export value.
+        write_state(dir.path(), &[(key, valid.clone())]);
+        for policy in [
+            UpstreamMissingStatePolicy::Strict,
+            UpstreamMissingStatePolicy::Lenient,
+        ] {
+            let bindings = load_upstream_admission_fixture(dir.path(), policy)
+                .await
+                .expect("valid control must load before corrupting the export");
+            assert_eq!(bindings["orgs"].len(), 1);
+            assert_eq!(
+                PersistedExportValue::encode(&bindings["orgs"][key])
+                    .unwrap()
+                    .decoded_json(),
+                valid,
+            );
+        }
+
+        write_state(dir.path(), &[(key, invalid)]);
+        let mut accepted = Vec::new();
+        for (name, policy) in [
+            ("Strict", UpstreamMissingStatePolicy::Strict),
+            ("Lenient", UpstreamMissingStatePolicy::Lenient),
+        ] {
+            match load_upstream_admission_fixture(dir.path(), policy).await {
+                Ok(bindings) => accepted.push(format!("{name} installed {bindings:?}")),
+                Err(error) => {
+                    let message = error.to_string();
+                    for fragment in std::iter::once("orgs").chain(error_path.iter().copied()) {
+                        assert!(
+                            message.contains(fragment),
+                            "{name} must name the upstream binding and export path {error_path:?}: {message}",
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "present invalid upstream export 'orgs.{key}' must be a hard error before remote binding installation; {}",
+            accepted.join("; "),
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_exports_matching_builtin_declarations_load_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        write_upstream_admission_source(
+            dir.path(),
+            "count: Int = seed\n\
+             enabled: Bool = true\n\
+             labels: list(String) = ['authored']\n\
+             tags: map(String) = { authored = 'value' }\n\
+             account: struct { id: String, active: Bool } = { id = 'authored' active = true }",
+        );
+        // Persisted values deliberately differ from source expressions:
+        // admission must check membership, not recompute the exports.
+        let exports = [
+            ("count", serde_json::json!(42)),
+            ("enabled", serde_json::json!(false)),
+            ("labels", serde_json::json!(["persisted", "other"])),
+            ("tags", serde_json::json!({"persisted": "tag"})),
+            (
+                "account",
+                serde_json::json!({"id": "persisted", "active": false}),
+            ),
+        ];
+        write_state(dir.path(), &exports);
+        for policy in [
+            UpstreamMissingStatePolicy::Strict,
+            UpstreamMissingStatePolicy::Lenient,
+        ] {
+            let bindings = load_upstream_admission_fixture(dir.path(), policy)
+                .await
+                .expect("valid built-in export types must load");
+            assert_eq!(bindings.len(), 1);
+            assert_eq!(bindings["orgs"].len(), exports.len());
+            for (key, expected) in &exports {
+                assert_eq!(
+                    &PersistedExportValue::encode(&bindings["orgs"][*key])
+                        .unwrap()
+                        .decoded_json(),
+                    expected,
+                    "orgs.{key} must retain its persisted value",
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn load_upstream_states_preserves_finite_float_bits_under_both_policies() {
         let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("exports.crn"),
+            "exports { ratio: Float = 0.0 }\n",
+        )
+        .unwrap();
         fs::write(
             dir.path().join("main.crn"),
             r#"backend local { path = "carina.state.json" }"#,
@@ -7539,6 +7926,11 @@ mod load_upstream_states_tests {
     async fn load_upstream_states_uses_locked_backend_while_migration_is_pending() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
+            dir.path().join("exports.crn"),
+            "exports { account_id: String = 'fixture' }\n",
+        )
+        .unwrap();
+        fs::write(
             dir.path().join("main.crn"),
             r#"backend local { path = "new.state.json" }"#,
         )
@@ -7594,6 +7986,11 @@ mod load_upstream_states_tests {
     #[tokio::test]
     async fn load_upstream_states_reads_supported_exports_from_future_state() {
         let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("exports.crn"),
+            "exports { account_id: String = 'fixture' }\n",
+        )
+        .unwrap();
         fs::write(
             dir.path().join("backend.crn"),
             r#"backend local { path = "carina.state.json" }"#,
@@ -7870,6 +8267,11 @@ mod load_upstream_states_tests {
 let internal = upstream_state {{ source = '{}' }}"#,
                 c_dir.display()
             ),
+        )
+        .unwrap();
+        fs::write(
+            b_dir.join("exports.crn"),
+            "exports { oidc_provider_arn: String = 'fixture' }\n",
         )
         .unwrap();
         write_state(

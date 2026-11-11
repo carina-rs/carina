@@ -111,6 +111,12 @@ impl ResolvedReadBackend {
         crate::backend::read_published_exports(self.backend.as_ref()).await
     }
 
+    pub async fn read_encoded_published_exports(
+        &self,
+    ) -> BackendResult<Option<crate::EncodedPublishedExports>> {
+        crate::backend::read_encoded_published_exports(self.backend.as_ref()).await
+    }
+
     pub async fn bucket_exists(&self) -> BackendResult<bool> {
         self.backend.bucket_exists().await
     }
@@ -237,6 +243,13 @@ impl ExplicitUrlBackendSelection {
     ) -> BackendResult<Option<crate::PublishedExports>> {
         let backend = crate::backends::create_backend(&self.selection).await?;
         crate::backend::read_published_exports(backend.as_ref()).await
+    }
+
+    pub(crate) async fn read_encoded_published_exports(
+        &self,
+    ) -> BackendResult<Option<crate::EncodedPublishedExports>> {
+        let backend = crate::backends::create_backend(&self.selection).await?;
+        crate::backend::read_encoded_published_exports(backend.as_ref()).await
     }
 }
 

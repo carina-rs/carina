@@ -534,6 +534,7 @@ where
             .unwrap_or_default();
         remote_bindings.insert(us.binding.to_string(), bindings);
     }
+    let remote_bindings = carina_core::upstream_exports::remote_bindings_for_test(remote_bindings);
     let resolved_provider_configs = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
         |session| {

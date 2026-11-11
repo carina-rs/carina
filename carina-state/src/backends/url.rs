@@ -28,7 +28,7 @@ use carina_core::paths::ResolvedPath;
 
 use crate::backend::{BackendError, BackendResult, StateBackend};
 use crate::backend_selection::BackendSelection;
-use crate::state::{PublishedExports, StateFile};
+use crate::state::{EncodedPublishedExports, PublishedExports, StateFile};
 
 /// A local state file for offline commands. Remote URLs cannot inhabit this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +194,18 @@ pub async fn load_state_from_url(url: &StateUrl) -> BackendResult<StateFile> {
 pub async fn load_published_exports_from_url(url: &StateUrl) -> BackendResult<PublishedExports> {
     let loaded = BackendSelection::explicit_url(url)
         .read_published_exports()
+        .await?;
+
+    loaded
+        .ok_or_else(|| BackendError::InvalidState(format!("No state at {}", url.display_target())))
+}
+
+/// Load export JSON for display while preserving nulls and encoded values.
+pub async fn load_encoded_published_exports_from_url(
+    url: &StateUrl,
+) -> BackendResult<EncodedPublishedExports> {
+    let loaded = BackendSelection::explicit_url(url)
+        .read_encoded_published_exports()
         .await?;
 
     loaded

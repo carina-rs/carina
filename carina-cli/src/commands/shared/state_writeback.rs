@@ -8547,7 +8547,7 @@ mod stage4_unknown_err_tests {
         );
 
         let export_json = PersistedExportValue::encode(&value).expect("export writeback succeeds");
-        assert_eq!(export_json.decode(), Some(value));
+        assert_eq!(export_json.decode().unwrap(), Some(value));
     }
 
     #[test]

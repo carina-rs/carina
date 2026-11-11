@@ -946,9 +946,9 @@ async fn execute_rehydrated_saved_plan(
 /// succeed and silently mixing plan-time and apply-time values
 /// produces incorrect cascade re-resolution.
 async fn verify_upstream_snapshot(
-    runtime: &crate::runtime::CommandRuntime,
+    wiring: &crate::wiring::WiringContext,
     sources: &[crate::commands::plan::UpstreamSource],
-    snapshot: &HashMap<String, HashMap<String, Value>>,
+    snapshot: &carina_core::upstream_exports::AdmittedRemoteBindings,
     project_dir: &ResolvedPath,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
@@ -959,19 +959,28 @@ async fn verify_upstream_snapshot(
             source: s.source.clone(),
         })
         .collect();
-    let provider_context = ProviderContext::new(runtime.environment().clone());
+    let provider_context = wiring.provider_context().as_provider_context();
     let mut cycle_guard = super::plan::seed_cycle_guard(project_dir);
-    let current = super::plan::load_upstream_states(
-        runtime,
+    let current = super::plan::load_upstream_states_with_schemas(
+        wiring.runtime(),
         &upstream_states,
         project_dir,
-        &provider_context,
+        provider_context,
         &mut cycle_guard,
+        wiring.schemas(),
         super::plan::UpstreamMissingStatePolicy::Strict,
     )
     .await?;
 
-    diff_upstream_snapshot(snapshot, &current, apply_target).map_err(AppError::Config)
+    let snapshot = snapshot
+        .iter()
+        .map(|(binding, exports)| (binding.clone(), (**exports).clone()))
+        .collect();
+    let current = current
+        .iter()
+        .map(|(binding, exports)| (binding.clone(), (**exports).clone()))
+        .collect();
+    diff_upstream_snapshot(&snapshot, &current, apply_target).map_err(AppError::Config)
 }
 
 /// Pure comparison between a planned snapshot and a freshly-loaded
@@ -1908,7 +1917,10 @@ async fn run_apply_with_observer_factory(
                     runtime,
                     validated_config.resources().parsed(),
                     base_dir,
-                    provider_context,
+                    &validated_config
+                        .context()
+                        .upstream_provider_context(provider_context),
+                    validated_config.context().schemas(),
                 )
                 .await?;
                 let (bucket_provider, bucket_normalizer) = create_state_bucket_bootstrap_provider(
@@ -2140,12 +2152,14 @@ async fn load_apply_provider_inputs<E>(
     parsed: &carina_core::parser::ExpandedFile<E>,
     base_dir: &ResolvedPath,
     provider_context: &ProviderContext,
+    schemas: &carina_core::schema::SchemaRegistry,
 ) -> Result<ResolvedProviderInputs, AppError> {
     load_and_resolve_provider_configs(
         runtime,
         parsed,
         base_dir,
         provider_context,
+        schemas,
         UpstreamMissingStatePolicy::Strict,
         ProviderUpstreamScope::All,
     )
@@ -2309,7 +2323,10 @@ async fn run_apply_locked_owned(
                 validated_config.context().runtime(),
                 parsed,
                 project_dir,
-                provider_context,
+                &validated_config
+                    .context()
+                    .upstream_provider_context(provider_context),
+                validated_config.context().schemas(),
             )
             .await?;
             let provider_configs = provider_inputs.configs();
@@ -4174,6 +4191,15 @@ async fn run_apply_from_plan_locked_owned(
                 })?;
             let plan = checked_plan_file.plan();
 
+            // Admit upstream values before any migration write or binding installation.
+            let upstream_states = rehydrated_plan_file.upstream_sources().iter().map(|source| ExpandedUpstreamState {
+                binding: source.binding.clone(), source: source.source.clone(),
+            }).collect::<Vec<_>>();
+            let upstream_snapshot = super::plan::admit_upstream_snapshot(
+                &upstream_states, source, wiring.provider_context().as_provider_context(),
+                wiring.schemas(), rehydrated_plan_file.upstream_snapshot().clone(),
+            )?;
+
             // Persist migrations only after successful re-admission, using
             // the heartbeat's serialized lock owner.
             if (pending_migration.is_some() || removed_legacy_data_source_rows)
@@ -4190,7 +4216,6 @@ async fn run_apply_from_plan_locked_owned(
                 .map_err(|error| AppError::Config(error.to_string()))?;
             // Use the same saved binding view for the state-only fast path
             // and executor, including compositions, reads and wait aliases.
-            let upstream_snapshot = rehydrated_plan_file.upstream_snapshot().clone();
             let pre_apply_input_current = carina_core::resource::into_plan_input_current_map(
                 managed_current.clone(),
                 wiring.schemas(),
@@ -4334,7 +4359,7 @@ async fn run_apply_from_plan_locked_owned(
             // plan-time and apply-time values during cascade re-resolution.
             if !rehydrated_plan_file.upstream_sources().is_empty() {
                 verify_upstream_snapshot(
-                    wiring.runtime(),
+                    wiring,
                     rehydrated_plan_file.upstream_sources(),
                     &upstream_snapshot,
                     source,

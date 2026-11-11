@@ -2338,7 +2338,7 @@ pub(crate) struct LegacyConfigurationReadInputs<'a, 'backend, 'state> {
     pub provider: &'a ProviderRouter,
     pub state_file: &'a Option<StateFile>,
     pub refresh_phase: &'a RefreshPhase<'backend>,
-    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub remote_bindings: &'a carina_core::upstream_exports::AdmittedRemoteBindings,
     pub cancel: &'a ShutdownToken,
 }
 
@@ -2397,7 +2397,7 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
     pub(crate) async fn expand_deferred_for(
         self,
         prepared: &PreparedDeferredForExpansion,
-        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        remote_bindings: &carina_core::upstream_exports::AdmittedRemoteBindings,
         warning_policy: DeferredForWarningPolicy,
         provider: &ProviderRouter,
     ) -> Result<
@@ -2439,7 +2439,7 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
     pub(crate) fn expand_deferred_for_plan(
         self,
         prepared: PreparedDeferredForExpansion,
-        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        remote_bindings: &carina_core::upstream_exports::AdmittedRemoteBindings,
         warning_policy: DeferredForWarningPolicy,
         provider: &ProviderRouter,
     ) -> Result<ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>>, AppError> {
@@ -2755,6 +2755,19 @@ impl WiringContext {
 
     pub fn schemas(&self) -> &SchemaRegistry {
         self.loaded_providers.schema_registry()
+    }
+
+    /// Reuse downstream schema authority without replacing the command's
+    /// environment snapshot or decryptor while reading upstream configuration.
+    pub(crate) fn upstream_provider_context(
+        &self,
+        context: &carina_core::parser::ProviderContext,
+    ) -> carina_core::parser::ProviderContext {
+        carina_core::parser::ProviderContext {
+            custom_types: self.provider_context().custom_types.clone(),
+            resource_types: self.provider_context().resource_types.clone(),
+            ..context.clone()
+        }
     }
 
     pub(crate) fn loaded_provider_schemas(&self) -> &ProviderLoadedSchemaRegistry {
@@ -6129,7 +6142,7 @@ pub(crate) struct AddressedDataSourceReadInputs<'a, 'backend> {
     pub refresh_phase: Option<&'a RefreshPhase<'backend>>,
     pub compositions: &'a [LiveComposition],
     pub data_sources: &'a [DataSource],
-    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub remote_bindings: &'a carina_core::upstream_exports::AdmittedRemoteBindings,
     pub schemas: &'a SchemaRegistry,
     pub saved_dep_bindings:
         &'a HashMap<ResourceId, carina_core::resource::PersistedDestroyDependencies>,
@@ -6440,7 +6453,7 @@ pub struct ManagedBindingStabilityContext<'a> {
     pub schemas: &'a carina_core::schema::SchemaRegistry,
     pub saved_attrs: &'a LiftedSavedAttrs,
     pub prev_explicit: &'a HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
-    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub remote_bindings: &'a carina_core::upstream_exports::AdmittedRemoteBindings,
     pub wait_aliases: &'a [WaitAliasSpec],
     pub provider: &'a ProviderRouter,
     pub session: &'a ValidationProviderCatalog<'a>,
@@ -6745,7 +6758,7 @@ pub(crate) struct PostExpansionPlanEnvironment<'a> {
     pub provider: &'a ProviderRouter,
     pub normalizer: &'a dyn HostNormalizer,
     pub provider_configs: &'a [ExpandedProviderConfig],
-    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub remote_bindings: &'a carina_core::upstream_exports::AdmittedRemoteBindings,
     pub state_file: &'a Option<StateFile>,
     pub state_block_claims: &'a StateBlockClaims,
     pub resolved_state_block_targets: &'a ResolvedStateBlockTargets,
@@ -7529,7 +7542,7 @@ impl PreparedDeferredForExpansion {
         &self,
         mut resources: CanonicalResourcePair<E>,
         ctx: &WiringContext,
-        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        remote_bindings: &carina_core::upstream_exports::AdmittedRemoteBindings,
         warning_policy: DeferredForWarningPolicy,
         provider: &ProviderRouter,
     ) -> Result<(ExpandedCanonicalResources<E>, DeferredForExpansion), AppError> {
@@ -7573,7 +7586,7 @@ impl PreparedDeferredForExpansion {
         self,
         resources: CanonicalResourcePair<E>,
         ctx: &WiringContext,
-        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        remote_bindings: &carina_core::upstream_exports::AdmittedRemoteBindings,
         warning_policy: DeferredForWarningPolicy,
         provider: &ProviderRouter,
     ) -> Result<PostExpansionPlanView<E, ChildrenPending>, AppError> {
@@ -7626,7 +7639,7 @@ impl PreparedAddressPreservingDeferredForExpansion {
         &self,
         parsed: &mut ExpandedFile<E>,
         schemas: &SchemaRegistry,
-        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        remote_bindings: &carina_core::upstream_exports::AdmittedRemoteBindings,
         warning_policy: DeferredForWarningPolicy,
         provider: &ProviderRouter,
         identity_context: &WiringContext,
@@ -7803,7 +7816,7 @@ async fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTa
     schemas: &carina_core::schema::SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
-    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    remote_bindings: &carina_core::upstream_exports::AdmittedRemoteBindings,
     wait_aliases: &[WaitAliasSpec],
     moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
     already_refreshed: &HashSet<ResourceId>,
@@ -7988,7 +8001,7 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
     schemas: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
-    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    remote_bindings: &carina_core::upstream_exports::AdmittedRemoteBindings,
     wait_aliases: &[WaitAliasSpec],
     moved_targets: &HashSet<ResourceId>,
     already_refreshed: &HashSet<ResourceId>,
@@ -8093,7 +8106,7 @@ pub(crate) struct ExpandRefreshAndLiftInputs<'a, 'backend, P: HostProvider + Hos
     /// saved attributes, aliases, or exclusion sets.
     pub expansion: &'a mut E,
     pub warning_policy: DeferredForWarningPolicy,
-    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub remote_bindings: &'a carina_core::upstream_exports::AdmittedRemoteBindings,
     pub state_file: &'a Option<StateFile>,
     pub saved_dep_bindings:
         &'a HashMap<ResourceId, carina_core::resource::PersistedDestroyDependencies>,
@@ -8114,7 +8127,7 @@ pub(crate) struct ValidatedExpandRefreshAndLiftInputs<
     pub comparison_provider: &'a ProviderRouter,
     pub expansion: &'a mut E,
     pub warning_policy: DeferredForWarningPolicy,
-    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub remote_bindings: &'a carina_core::upstream_exports::AdmittedRemoteBindings,
     pub state_file: &'a Option<StateFile>,
     pub saved_dep_bindings:
         &'a HashMap<ResourceId, carina_core::resource::PersistedDestroyDependencies>,
@@ -8132,7 +8145,7 @@ pub(crate) struct ValidatedCanonicalExpandRefreshAndLiftInputs<
     pub comparison_provider: &'a ProviderRouter,
     pub expansion: PreparedDeferredForExpansion,
     pub warning_policy: DeferredForWarningPolicy,
-    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub remote_bindings: &'a carina_core::upstream_exports::AdmittedRemoteBindings,
     pub state_file: &'a Option<StateFile>,
     pub saved_dep_bindings:
         &'a HashMap<ResourceId, carina_core::resource::PersistedDestroyDependencies>,
@@ -8466,7 +8479,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     state_file: &Option<StateFile>,
     refresh: bool,
     progress_sink: ProgressSink,
-    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    remote_bindings: &carina_core::upstream_exports::AdmittedRemoteBindings,
     state_block_claims: &StateBlockClaims,
     resolved_state_block_targets: &ResolvedStateBlockTargets,
     row_request: RowRequest,
@@ -8514,7 +8527,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     state_file: &Option<StateFile>,
     refresh: bool,
     progress_sink: ProgressSink,
-    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    remote_bindings: &carina_core::upstream_exports::AdmittedRemoteBindings,
     state_block_claims: &StateBlockClaims,
     resolved_state_block_targets: &ResolvedStateBlockTargets,
     row_request: RowRequest,
@@ -8822,7 +8835,10 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
             managed_current,
             data_source_values,
             moved_origins,
-            upstream_snapshot: remote_bindings.clone(),
+            upstream_snapshot: remote_bindings
+                .iter()
+                .map(|(binding, exports)| (binding.clone(), (**exports).clone()))
+                .collect(),
             prev_explicit,
             residual_deferred_for,
             expansion_trace,
@@ -9827,7 +9843,7 @@ pub(crate) struct ReadDataSourcesInputs<'a, 'backend> {
     pub compositions: &'a [LiveComposition],
     pub data_sources: &'a [DataSource],
     managed_current: ManagedCurrentView<'a>,
-    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub remote_bindings: &'a carina_core::upstream_exports::AdmittedRemoteBindings,
     pub schemas: &'a SchemaRegistry,
     pub wait_aliases: &'a [WaitAliasSpec],
     pub saved_dep_bindings:
@@ -9915,7 +9931,7 @@ pub(crate) struct ExpandedDataSourceReadInputs<'a, 'backend> {
     pub data_sources: &'a [DataSource],
     pub managed_current: &'a HashMap<ResourceId, Current>,
     pub orphans: &'a Orphans,
-    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub remote_bindings: &'a carina_core::upstream_exports::AdmittedRemoteBindings,
     pub schemas: &'a SchemaRegistry,
     pub wait_aliases: &'a [WaitAliasSpec],
     pub saved_dep_bindings:
@@ -10326,7 +10342,7 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
 pub(crate) struct DataSourceRefreshContext<'a> {
     compositions: &'a [carina_core::resource::LiveComposition],
     managed_current: ManagedCurrentView<'a>,
-    remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    remote_bindings: &'a carina_core::upstream_exports::AdmittedRemoteBindings,
     schemas: &'a carina_core::schema::SchemaRegistry,
     wait_aliases: &'a [WaitAliasSpec],
     session: &'a ValidationProviderCatalog<'a>,
@@ -10404,7 +10420,7 @@ fn data_source_refresh_bindings_from_refs(
     compositions: &[carina_core::resource::LiveComposition],
     data_source_bindings: Phase2DataSourceBindings<'_>,
     managed_current: ManagedCurrentView<'_>,
-    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    remote_bindings: &carina_core::upstream_exports::AdmittedRemoteBindings,
     schemas: &carina_core::schema::SchemaRegistry,
     wait_aliases: &[WaitAliasSpec],
 ) -> ResolvedBindings {
