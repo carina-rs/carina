@@ -1088,12 +1088,20 @@ impl RedactionSet {
         for spelling in SecretSpelling::ALL {
             spellings.push(spelling.encode(plaintext));
         }
+        for encoding in DiagnosticEncoding::ALL {
+            spellings.push(
+                plaintext
+                    .chars()
+                    .flat_map(|ch| encoding.encode_char(ch))
+                    .collect(),
+            );
+        }
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 
-macro_rules! secret_spellings {
+macro_rules! enum_with_all {
     ($(#[$doc:meta])* enum $name:ident { $($variant:ident),+ $(,)? }) => {
         $(#[$doc])*
         #[derive(Clone, Copy)]
@@ -1101,20 +1109,21 @@ macro_rules! secret_spellings {
         impl $name { const ALL: &'static [Self] = &[$(Self::$variant),+]; }
     };
 }
-secret_spellings! {
-/// Covered: raw text; JSON string escaping without surrounding quotes; DSL
+enum_with_all! {
+/// Covered: raw text; JSON and Rust str Debug escaping without surrounding quotes; DSL
 /// double-quoted escaping; the DSL's selected string-literal escaping without
-/// surrounding quotes; terminal control-character escaping; RFC 3986 percent
-/// encoding of UTF-8 bytes with uppercase or lowercase hexadecimal digits.
+/// surrounding quotes; RFC 3986 percent encoding of UTF-8 bytes with uppercase
+/// or lowercase hexadecimal digits. Every DiagnosticEncoding is inventoried
+/// separately, using the same unbounded character encoding as the builder.
 /// Not covered: base64, hashes, encryption, compression, mixed-case percent
 /// encoding, partial or repeated encoding, or other transformations that do
 /// not contain a complete covered spelling as a substring.
 enum SecretSpelling {
     Raw,
     JsonEscaped,
+    RustDebug,
     DslDoubleQuoted,
     DslLiteral,
-    TerminalEscaped,
     PercentEncodedUpper,
     PercentEncodedLower,
 }
@@ -1127,20 +1136,15 @@ impl SecretSpelling {
                 let json = serde_json::to_string(plaintext).expect("strings encode as JSON");
                 json[1..json.len() - 1].to_owned()
             }
+            Self::RustDebug => {
+                let debug = format!("{plaintext:?}");
+                debug[1..debug.len() - 1].to_owned()
+            }
             Self::DslDoubleQuoted => crate::parser::display_double_quoted_literal_part(plaintext),
             Self::DslLiteral => {
                 let literal = crate::parser::display_string_literal(plaintext);
                 literal[1..literal.len() - 1].to_owned()
             }
-            Self::TerminalEscaped => plaintext
-                .chars()
-                .flat_map(|ch| match ch {
-                    '\0'..='\u{8}' | '\u{b}'..='\u{1f}' | '\u{7f}'..='\u{9f}' => {
-                        ch.escape_unicode().collect::<Vec<_>>()
-                    }
-                    ch => vec![ch],
-                })
-                .collect(),
             Self::PercentEncodedUpper => Self::percent_encode(plaintext, b"0123456789ABCDEF"),
             Self::PercentEncodedLower => Self::percent_encode(plaintext, b"0123456789abcdef"),
         }
@@ -1514,37 +1518,101 @@ pub struct DiagnosticTextBuilder {
     truncated: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum DiagnosticQuote {
+    Double,
+    Single,
+}
+
+impl DiagnosticQuote {
+    fn encoding(self) -> DiagnosticEncoding {
+        match self {
+            Self::Double => DiagnosticEncoding::DoubleQuoted,
+            Self::Single => DiagnosticEncoding::SingleQuoted,
+        }
+    }
+
+    pub(crate) fn escapes(self, ch: char) -> bool {
+        self.encoding().encode_char(ch).ne(std::iter::once(ch))
+    }
+}
+
+// The macro emits the closed enum and ALL together. A new variant is always
+// inventoried and cannot compile until encode_char's exhaustive match covers it.
+enum_with_all! {
+enum DiagnosticEncoding {
+    Multiline,
+    Inline,
+    DoubleQuoted,
+    SingleQuoted,
+}
+}
+
+impl DiagnosticEncoding {
+    // The only character escaper used by the builder and redaction inventory.
+    // Inventory construction applies it without the diagnostic byte budget.
+    fn encode_char(self, c: char) -> impl Iterator<Item = char> {
+        let (preserve_layout, quoted, preserve_apostrophe) = match self {
+            Self::Multiline => (true, false, false),
+            Self::Inline => (false, false, false),
+            Self::DoubleQuoted => (false, true, true),
+            Self::SingleQuoted => (false, true, false),
+        };
+        let (literal, unicode, debug) = match c {
+            '\n' | '\t' if preserve_layout => (Some(c), None, None),
+            '\'' if preserve_apostrophe => (Some(c), None, None),
+            c if is_default_ignorable(c) => (None, Some(c.escape_unicode()), None),
+            c if quoted
+                || matches!(c, '\u{2028}' | '\u{2029}')
+                || (!preserve_layout && c.is_control()) =>
+            {
+                (None, None, Some(c.escape_debug()))
+            }
+            c if c.is_control() => (None, Some(c.escape_unicode()), None),
+            c => (Some(c), None, None),
+        };
+        literal
+            .into_iter()
+            .chain(unicode.into_iter().flatten())
+            .chain(debug.into_iter().flatten())
+    }
+}
+
 impl DiagnosticTextBuilder {
     pub fn push_str(&mut self, text: &str) {
-        self.push_text(text, false);
+        self.push_text(text, DiagnosticEncoding::Multiline);
     }
 
     /// Append an inline diagnostic field without allowing embedded line breaks.
     pub(crate) fn push_inline_str(&mut self, text: &str) {
-        self.push_text(text, true);
+        self.push_text(text, DiagnosticEncoding::Inline);
     }
 
-    fn push_text(&mut self, text: &str, inline: bool) {
-        for c in text.chars() {
-            match c {
-                '\n' | '\t' if !inline => self.push_sanitized_char(c),
-                c if inline && is_default_ignorable(c) => {
-                    for escaped in c.escape_unicode() {
-                        self.push_sanitized_char(escaped);
-                    }
-                }
-                c if inline && (c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) => {
-                    for escaped in c.escape_debug() {
-                        self.push_sanitized_char(escaped);
-                    }
-                }
-                c if c.is_control() => {
-                    for escaped in c.escape_unicode() {
-                        self.push_sanitized_char(escaped);
-                    }
-                }
-                c => self.push_sanitized_char(c),
-            }
+    /// Quote a declaration token directly into its owner's budget. Escaping
+    /// uses the same closed encoding set as the redaction inventory.
+    pub(crate) fn push_quoted_str(&mut self, text: &str, quote: DiagnosticQuote) {
+        let delimiter = match quote {
+            DiagnosticQuote::Double => "\"",
+            DiagnosticQuote::Single => "'",
+        };
+        self.push_str(delimiter);
+        self.push_text(text, quote.encoding());
+        self.push_str(delimiter);
+    }
+
+    /// Canonical dotted paths stay bare; other declaration identities are one
+    /// quoted token, so their separators and inline controls are unambiguous.
+    pub(crate) fn push_declaration_path(&mut self, path: &str) {
+        if path.split('.').all(crate::schema::is_path_identifier) {
+            self.push_inline_str(path);
+        } else {
+            self.push_quoted_str(path, DiagnosticQuote::Double);
+        }
+    }
+
+    fn push_text(&mut self, text: &str, encoding: DiagnosticEncoding) {
+        for c in text.chars().flat_map(|c| encoding.encode_char(c)) {
+            self.push_sanitized_char(c);
         }
     }
 
@@ -2619,6 +2687,374 @@ mod tests {
     }
 
     #[test]
+    fn review_4327_redaction_masks_multiline_sanitized_secret_echoes() {
+        assert_sanitized_secret_echoes_are_masked(false);
+    }
+
+    #[test]
+    fn review_4327_redaction_masks_inline_sanitized_secret_echoes() {
+        assert_sanitized_secret_echoes_are_masked(true);
+    }
+
+    fn assert_sanitized_secret_echoes_are_masked(inline: bool) {
+        for (raw, multiline, inline_text) in [
+            (
+                "token\u{200b}tail",
+                r"token\u{200b}tail",
+                r"token\u{200b}tail",
+            ),
+            (
+                "token\u{202e}tail",
+                r"token\u{202e}tail",
+                r"token\u{202e}tail",
+            ),
+            (
+                "token\u{2028}tail",
+                r"token\u{2028}tail",
+                r"token\u{2028}tail",
+            ),
+            (
+                "token\u{2029}tail",
+                r"token\u{2029}tail",
+                r"token\u{2029}tail",
+            ),
+            ("token\0tail", r"token\u{0}tail", r"token\0tail"),
+            ("token\x1btail", r"token\u{1b}tail", r"token\u{1b}tail"),
+            ("token\ntail", "token\ntail", r"token\ntail"),
+            ("token\ttail", "token\ttail", r"token\ttail"),
+            ("token\rtail", r"token\u{d}tail", r"token\rtail"),
+            (
+                "token\u{200b}\u{202e}\u{2028}\n\t\0\r\x1btail",
+                "token\\u{200b}\\u{202e}\\u{2028}\n\t\\u{0}\\u{d}\\u{1b}tail",
+                r"token\u{200b}\u{202e}\u{2028}\n\t\0\r\u{1b}tail",
+            ),
+        ] {
+            let expected_spelling = if inline { inline_text } else { multiline };
+            let mut sanitized = DiagnosticTextBuilder::default();
+            if inline {
+                sanitized.push_inline_str(raw);
+            } else {
+                sanitized.push_str(raw);
+            }
+            let sanitized = sanitized.finish();
+            assert_eq!(sanitized.as_str(), expected_spelling);
+
+            let secrets = provider_secrets(&[raw]);
+            let echo = format!("public {sanitized} context");
+            assert_eq!(
+                ProviderText::new(&echo).redact(&secrets).as_str(),
+                "public (secret) context",
+                "inline={inline}, secret={raw:?}"
+            );
+            let mut stream = ProviderTextBuilder::new(secrets);
+            for ch in echo.chars() {
+                stream.push_str(&ch.to_string());
+            }
+            assert_eq!(stream.finish().as_str(), "public (secret) context");
+        }
+    }
+
+    #[test]
+    fn review_4327_redaction_keeps_full_sanitized_spellings_beyond_diagnostic_budget() {
+        let middle = "x".repeat(MAX_PROVIDER_TEXT_BYTES + 16);
+        let raw = format!("token\u{200b}{middle}\n\0tail");
+        let secrets = provider_secrets(&[&raw]);
+        for echo in [
+            format!("token\\u{{200b}}{middle}\n\\u{{0}}tail"),
+            format!("token\\u{{200b}}{middle}\\n\\0tail"),
+        ] {
+            assert!(echo.len() > MAX_PROVIDER_TEXT_BYTES);
+            assert_eq!(
+                ProviderText::new(echo).redact(&secrets).as_str(),
+                "(secret)"
+            );
+        }
+    }
+
+    #[test]
+    fn review_4327_encoding_redacts_multiline_builder_echoes() {
+        assert_builder_encoding_echoes_are_masked(0, "", |builder, raw| builder.push_str(raw));
+    }
+
+    #[test]
+    fn review_4327_encoding_redacts_inline_builder_echoes() {
+        assert_builder_encoding_echoes_are_masked(1, "", |builder, raw| {
+            builder.push_inline_str(raw)
+        });
+    }
+
+    #[test]
+    fn review_4327_encoding_redacts_double_quoted_builder_echoes() {
+        assert_builder_encoding_echoes_are_masked(2, "\"", |builder, raw| {
+            builder.push_quoted_str(raw, DiagnosticQuote::Double);
+        });
+    }
+
+    #[test]
+    fn review_4327_encoding_redacts_single_quoted_builder_echoes() {
+        assert_builder_encoding_echoes_are_masked(3, "'", |builder, raw| {
+            builder.push_quoted_str(raw, DiagnosticQuote::Single);
+        });
+    }
+
+    fn assert_builder_encoding_echoes_are_masked(
+        index: usize,
+        delimiter: &str,
+        write: impl Fn(&mut DiagnosticTextBuilder, &str),
+    ) {
+        // Rust owns printable-Unicode escaping; Carina's forced escapes stay pinned.
+        let em_space = '\u{2003}'.escape_debug().collect::<String>();
+        let quoted_em_space = format!("token{em_space}tail");
+        let quoted_em_space_bidi = format!(r#"token\"{em_space}\u{{202e}}tail"#);
+        for (raw, forms) in [
+            (
+                "token\u{2003}tail",
+                [
+                    "token\u{2003}tail",
+                    "token\u{2003}tail",
+                    &quoted_em_space,
+                    &quoted_em_space,
+                ],
+            ),
+            ("token\u{200b}tail", [r"token\u{200b}tail"; 4]),
+            ("token\u{202e}tail", [r"token\u{202e}tail"; 4]),
+            ("token\u{2028}tail", [r"token\u{2028}tail"; 4]),
+            (
+                "token\0tail",
+                [
+                    r"token\u{0}tail",
+                    r"token\0tail",
+                    r"token\0tail",
+                    r"token\0tail",
+                ],
+            ),
+            (
+                "token\ntail",
+                [
+                    "token\ntail",
+                    r"token\ntail",
+                    r"token\ntail",
+                    r"token\ntail",
+                ],
+            ),
+            (
+                "token\"tail",
+                [
+                    "token\"tail",
+                    "token\"tail",
+                    r#"token\"tail"#,
+                    r#"token\"tail"#,
+                ],
+            ),
+            (
+                r"token\tail",
+                [r"token\tail", r"token\tail", r"token\\tail", r"token\\tail"],
+            ),
+            (
+                "token'tail",
+                ["token'tail", "token'tail", "token'tail", r"token\'tail"],
+            ),
+            (
+                "token\"\\\u{202e}tail",
+                [
+                    r#"token"\\u{202e}tail"#,
+                    r#"token"\\u{202e}tail"#,
+                    r#"token\"\\\u{202e}tail"#,
+                    r#"token\"\\\u{202e}tail"#,
+                ],
+            ),
+            (
+                "token\"\u{2003}\u{202e}tail",
+                [
+                    concat!("token\"", "\u{2003}", r"\u{202e}tail"),
+                    concat!("token\"", "\u{2003}", r"\u{202e}tail"),
+                    &quoted_em_space_bidi,
+                    &quoted_em_space_bidi,
+                ],
+            ),
+        ] {
+            let mut builder = DiagnosticTextBuilder::default();
+            write(&mut builder, raw);
+            let rendered = builder.finish();
+            let body = forms[index];
+            assert_eq!(rendered.as_str(), format!("{delimiter}{body}{delimiter}"));
+            let secrets = provider_secrets(&[raw]);
+            for (echo, masked) in [
+                (rendered.as_str(), format!("{delimiter}(secret){delimiter}")),
+                (body, "(secret)".into()),
+            ] {
+                let message = format!("public {echo} context");
+                let expected = format!("public {masked} context");
+                assert_eq!(
+                    ProviderText::new(&message).redact(&secrets).as_str(),
+                    expected,
+                    "encoding={index}, secret={raw:?}"
+                );
+                let mut stderr = RedactingLineWriter::new(&secrets, Vec::new());
+                for ch in message.chars() {
+                    stderr.push_str(&ch.to_string()).unwrap();
+                }
+                stderr.finish().unwrap();
+                assert_eq!(
+                    String::from_utf8(stderr.sink).unwrap(),
+                    format!("{expected}\n"),
+                    "encoding={index}, secret={raw:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review_4327_encoding_keeps_unbounded_quoted_inventory_spellings() {
+        let middle = "x".repeat(MAX_PROVIDER_TEXT_BYTES + 16);
+        let raw = format!("token\u{2003}\"'{middle}\\\u{202e}tail");
+        let secrets = provider_secrets(&[&raw]);
+        let em_space = '\u{2003}'.escape_debug().collect::<String>();
+        for echo in [
+            format!(r#"token{em_space}\"'{middle}\\\u{{202e}}tail"#),
+            format!(r#"token{em_space}\"\'{middle}\\\u{{202e}}tail"#),
+        ] {
+            assert!(echo.len() > MAX_PROVIDER_TEXT_BYTES);
+            assert_eq!(
+                ProviderText::new(&echo).redact(&secrets).as_str(),
+                "(secret)"
+            );
+            let mut stderr = RedactingLineWriter::new(&secrets, Vec::new());
+            for ch in echo.chars() {
+                stderr.push_str(&ch.to_string()).unwrap();
+            }
+            stderr.finish().unwrap();
+            assert_eq!(stderr.sink, b"(secret)\n");
+        }
+    }
+
+    #[test]
+    fn review_4327_rust_debug_spelling_is_exact_and_deduplicated() {
+        for raw in [
+            "token\u{115f}\u{200b}tail",
+            "token\"\\\n\t\0\u{202e}tail",
+            "token\u{115f}\"\\\n\0\u{200b}\u{202e}\u{2028}tail",
+            "plain-token",
+            "token'tail",
+        ] {
+            let debug = format!("{raw:?}");
+            let body = &debug[1..debug.len() - 1];
+            let secrets = provider_secrets(&[raw]);
+            assert_eq!(
+                secrets
+                    .snapshot()
+                    .iter()
+                    .filter(|value| value.as_str() == body)
+                    .count(),
+                1,
+                "the exact str Debug body must occur once: {debug}"
+            );
+            for (echo, expected) in [
+                (debug.as_str(), "public \"(secret)\" context"),
+                (body, "public (secret) context"),
+            ] {
+                let message = format!("public {echo} context");
+                assert_eq!(
+                    ProviderText::new(&message).redact(&secrets).as_str(),
+                    expected
+                );
+                let mut stderr = RedactingLineWriter::new(&secrets, Vec::new());
+                for ch in message.chars() {
+                    stderr.push_str(&ch.to_string()).unwrap();
+                }
+                stderr.finish().unwrap();
+                assert_eq!(
+                    String::from_utf8(stderr.sink).unwrap(),
+                    format!("{expected}\n")
+                );
+            }
+        }
+    }
+
+    fn rust_debug_duplicate_key_cause(
+        secret: &str,
+    ) -> carina_provider_protocol::normalization::NormalizationError {
+        use carina_provider_protocol::normalization::{
+            NormalizationError, NormalizationErrorKind, NormalizationPathSegment,
+        };
+        NormalizationError::new(
+            carina_provider_protocol::types::ResourceId {
+                provider: "test".into(),
+                resource_type: "SecretEcho".into(),
+                identity: "example".into(),
+            },
+            "attributes",
+            NormalizationErrorKind::DuplicateKey { key: secret.into() },
+        )
+        .with_path(vec![NormalizationPathSegment::Key(secret.into())])
+    }
+
+    fn assert_rust_debug_duplicate_key_is_masked(rendered: &str) {
+        assert!(!rendered.contains("token"), "{rendered:?}");
+        assert!(rendered.contains("[\"(secret)\"]"), "{rendered:?}");
+        assert!(
+            rendered.contains("duplicate key \"(secret)\""),
+            "{rendered:?}"
+        );
+        assert_eq!(rendered.matches("(secret)").count(), 2, "{rendered:?}");
+    }
+
+    #[test]
+    fn review_4327_rust_debug_duplicate_key_provider_cause_is_masked() {
+        use carina_provider_protocol::normalization::NormalizationErrorKind;
+        let secret = "token\u{115f}\u{200b}tail";
+        let cause = rust_debug_duplicate_key_cause(secret);
+        assert_eq!(cause.to_string().matches(&format!("{secret:?}")).count(), 2);
+        assert!(
+            matches!(&cause.kind, NormalizationErrorKind::DuplicateKey { key } if key == secret)
+        );
+        let error =
+            crate::provider::ProviderError::from(cause).with_secrets(&provider_secrets(&[secret]));
+        assert_rust_debug_duplicate_key_is_masked(&error.to_string());
+        let view = error.detail().cause().unwrap().normalization().unwrap();
+        assert!(
+            matches!(&view.kind, NormalizationErrorKind::DuplicateKey { key } if key == "(secret)")
+        );
+    }
+
+    #[test]
+    fn review_4327_rust_debug_duplicate_key_stderr_is_masked() {
+        let secret = "token\u{115f}\u{200b}tail";
+        let cause = rust_debug_duplicate_key_cause(secret);
+        let message = format!("provider stderr: {cause}");
+        let secrets = provider_secrets(&[secret]);
+        let mut stderr = RedactingLineWriter::new(&secrets, Vec::new());
+        for ch in message.chars() {
+            stderr.push_str(&ch.to_string()).unwrap();
+        }
+        stderr.finish().unwrap();
+        assert_rust_debug_duplicate_key_is_masked(&String::from_utf8(stderr.sink).unwrap());
+    }
+
+    #[test]
+    fn review_4327_rust_debug_spelling_remains_unbounded() {
+        let raw = format!(
+            "token\u{115f}\u{200b}{}\"\\\n\u{202e}tail",
+            "x".repeat(MAX_PROVIDER_TEXT_BYTES + 16)
+        );
+        let debug = format!("{raw:?}");
+        let body = &debug[1..debug.len() - 1];
+        assert!(body.len() > MAX_PROVIDER_TEXT_BYTES);
+        let secrets = provider_secrets(&[&raw]);
+        assert!(secrets.snapshot().iter().any(|value| value == body));
+        assert_eq!(
+            ProviderText::new(body).redact(&secrets).as_str(),
+            "(secret)"
+        );
+        let mut stderr = RedactingLineWriter::new(&secrets, Vec::new());
+        for ch in body.chars() {
+            stderr.push_str(&ch.to_string()).unwrap();
+        }
+        stderr.finish().unwrap();
+        assert_eq!(stderr.sink, b"(secret)\n");
+    }
+
+    #[test]
     fn provider_text_masks_json_dsl_and_terminal_spellings() {
         let secret = "a\"b\\c\r\t\0${value}";
         let secrets = provider_secrets(&[secret]);
@@ -2949,6 +3385,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn review_4327_multiline_builder_escapes_format_controls_and_keeps_layout() {
+        let raw = "line\n\tindent\u{202e}\u{2028}\u{2029}\u{2066}\u{200b}\u{fe0f}";
+        let expected = "line\n\tindent\\u{202e}\\u{2028}\\u{2029}\\u{2066}\\u{200b}\\u{fe0f}";
+        let mut builder = DiagnosticTextBuilder::default();
+        builder.push_str(raw);
+        assert_eq!(builder.finish().as_str(), expected);
+        assert_eq!(DiagnosticText::new(raw).as_str(), expected);
+        let decoded: DiagnosticText =
+            serde_json::from_str(&serde_json::to_string(raw).unwrap()).unwrap();
+        assert_eq!(decoded.as_str(), expected);
+    }
+
+    #[test]
+    fn review_4327_multiline_builder_budgets_escaped_format_controls() {
+        let mut builder = DiagnosticTextBuilder::default();
+        builder.push_str(&"\u{202e}".repeat(MAX_PROVIDER_TEXT_BYTES));
+        let text = builder.finish();
+        assert!(!text.contains('\u{202e}'));
+        assert!(text.len() <= MAX_PROVIDER_TEXT_BYTES);
+        let (prefix, marker) = text.split_once("… (truncated, ").unwrap();
+        let omitted: usize = marker.strip_suffix(" bytes)").unwrap().parse().unwrap();
+        assert_eq!(
+            prefix.len() + omitted,
+            r"\u{202e}".len() * MAX_PROVIDER_TEXT_BYTES
+        );
     }
 
     #[test]

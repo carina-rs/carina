@@ -216,10 +216,12 @@ use crate::resource::knowledge::{
     Classification, ClassifiedRef, KnownValue, PendingFit, StructuralPending,
 };
 use length_interval::length_contains;
+mod input_rule_display;
 mod input_rules;
 pub use compiled_pattern::{
     Compiled, CompiledPattern, Draft, PatternCompileError, PatternCompileErrorSource, PatternForm,
 };
+pub use input_rule_display::InputRuleDisplay;
 pub(crate) use input_rules::MAX_INPUT_CONDITION_DEPTH;
 pub use input_rules::{
     CharSet, InputCondition, InputDiagnosticPath, InputLiteral, InputPath, InputPredicate,

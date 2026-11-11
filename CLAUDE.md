@@ -820,6 +820,34 @@ A struct type represents a nested object with typed fields.
   warnings with core-rendered rejected-if-created wording, while `EveryWrite`
   remains an error. The core finding derives severity from rule scope and write
   context once; CLI and LSP render that fact. Unknown guards remain pending.
+  `InputRuleDisplay` owns declaration wording for provider docs and diagnostics.
+  Its private requirement projection supplies predicate and condition text to
+  both displays, with the same diagnostic escaping and truncation budget.
+  Quoted declaration tokens share one inline quoting helper. Literals and
+  conditions stream into the requirement's budget. Shared pattern rendering
+  keeps ordinary regex sources verbatim between slashes, quotes sources needing
+  escaping or containing `/ (`. Reasons needing escapes or containing
+  parentheses or quotes use the same quoting helper. This distinguishes literal
+  controls, regex backslash escapes, and metadata delimiters. Plan errors budget
+  only their prefix
+  and embed the already-budgeted requirement verbatim. Its `DiagnosticText` field
+  sanitizes and bounds construction and deserialization. Multiline diagnostics
+  preserve newlines and tabs while escaping default-ignorables and Unicode
+  line/paragraph separators.
+  A closed `DiagnosticEncoding` enum owns the sole character escaper for
+  multiline, inline, double-quoted, and single-quoted builder output. Its variants
+  and complete inventory are generated together; quote classification and
+  redaction use that same encoding. Inventory spellings stay unbounded so
+  complete escaped secrets are matched before diagnostic truncation.
+  Independent Rust str `Debug` echoes are inventoried with the standard
+  formatter, stripping only the surrounding quotes. They must not pass through
+  diagnostic sanitization or truncation before matching.
+  Violations retain their declaration and a rejection/evaluation-failure kind;
+  `InputViolationReason` is classification data without `Display` or `Error`.
+  Render through the violation's `message()`, never invent a second predicate
+  formatter. Only provider-declared parameters may appear; rejected values and
+  protected instance keys must not enter the declaration display. Struct-local
+  declaration paths stay relative to their declaring object.
   Plans reject `CreateOnly` violations only at create-capable write sites.
   Semantic fingerprints encode conditions and nested rules in encoding v13. Adding
   a protocol field must break compilation until it is consciously carried

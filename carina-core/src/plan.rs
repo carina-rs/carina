@@ -112,7 +112,8 @@ pub enum PlanErrorKind {
     InputRule {
         path: String,
         code: String,
-        reason: String,
+        /// Sanitized, bounded requirement, including its original truncation marker.
+        reason: crate::provider_text::DiagnosticText,
         context: crate::input_rules::InputWriteContext,
     },
     PreventDestroy {
@@ -356,6 +357,11 @@ impl PlanErrorKind {
         f: &mut std::fmt::Formatter<'_>,
         project_dir: &Path,
     ) -> std::fmt::Result {
+        // Input-rule requirements already own their diagnostic budget. Budget
+        // only this plan's prefix so the shared requirement remains verbatim.
+        if matches!(self, Self::InputRule { .. }) {
+            return self.fmt_context(f, project_dir);
+        }
         struct Context<'a> {
             kind: &'a PlanErrorKind,
             project_dir: &'a Path,
@@ -389,7 +395,9 @@ impl PlanErrorKind {
                     | crate::input_rules::InputWriteContext::DeferredCreate
                     | crate::input_rules::InputWriteContext::DeferredReplacement => "create",
                 };
-                write!(f, "cannot {operation}: {path} [{code}]: {reason}")
+                let mut prefix = crate::provider_text::DiagnosticTextBuilder::default();
+                prefix.push_inline_str(&format!("cannot {operation}: {path} [{code}]"));
+                write!(f, "{}: {reason}", prefix.finish())
             }
             Self::PreventDestroy { action, source } => match source {
                 PreventDestroySource::ExplicitDirective => {
@@ -1889,6 +1897,83 @@ mod tests {
             .strip_prefix(&prefix)
             .expect("ordinary plan errors include their resource address")
             .to_string()
+    }
+
+    #[test]
+    fn review_4327_input_rule_plan_reason_sanitizes_construction() {
+        let kind = PlanErrorKind::InputRule {
+            path: "name".into(),
+            code: "test.rule".into(),
+            reason: "\x1b[2J".into(),
+            context: crate::input_rules::InputWriteContext::Create,
+        };
+        assert_eq!(
+            render_plan_error_kind(kind),
+            r"cannot create: name [test.rule]: \u{1b}[2J"
+        );
+    }
+
+    #[test]
+    fn review_4327_input_rule_plan_reason_sanitizes_deserialization() {
+        let kind: PlanErrorKind = serde_json::from_value(serde_json::json!({
+            "InputRule": {
+                "path": "name",
+                "code": "test.rule",
+                "reason": "\x1b[2J",
+                "context": "Create",
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&kind).unwrap()["InputRule"]["reason"],
+            r"\u{1b}[2J"
+        );
+        assert_eq!(
+            render_plan_error_kind(kind),
+            r"cannot create: name [test.rule]: \u{1b}[2J"
+        );
+    }
+
+    #[test]
+    fn review_4327_input_rule_plan_reason_bounds_construction_and_deserialization() {
+        use crate::provider_text::{DiagnosticText, MAX_PROVIDER_TEXT_BYTES};
+
+        let raw = format!("\x1b[2J{}", "é".repeat(MAX_PROVIDER_TEXT_BYTES));
+        let expected = DiagnosticText::new(&raw);
+        assert!(expected.contains("… (truncated, "));
+        let constructed = PlanErrorKind::InputRule {
+            path: "name".into(),
+            code: "test.rule".into(),
+            reason: raw.clone().into(),
+            context: crate::input_rules::InputWriteContext::Create,
+        };
+        let decoded: PlanErrorKind = serde_json::from_value(serde_json::json!({
+            "InputRule": {
+                "path": "name",
+                "code": "test.rule",
+                "reason": raw,
+                "context": "Create",
+            }
+        }))
+        .unwrap();
+        for kind in [constructed, decoded] {
+            let PlanErrorKind::InputRule { reason, .. } = &kind else {
+                panic!("expected an input-rule error");
+            };
+            assert!(reason.len() <= MAX_PROVIDER_TEXT_BYTES);
+            assert_eq!(reason.as_str(), expected.as_str());
+            let encoded = serde_json::to_value(&kind).unwrap();
+            assert_eq!(encoded["InputRule"]["reason"], expected.as_str());
+            let round_trip: PlanErrorKind = serde_json::from_value(encoded).unwrap();
+            assert_eq!(
+                round_trip, kind,
+                "the original truncation marker must survive"
+            );
+            assert_eq!(
+                render_plan_error_kind(kind),
+                format!("cannot create: name [test.rule]: {expected}")
+            );
+        }
     }
 
     #[test]

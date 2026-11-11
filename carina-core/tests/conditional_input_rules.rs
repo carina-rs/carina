@@ -912,7 +912,7 @@ fn s3_account_regional_suffix_is_create_only_and_imports_are_excluded() {
     assert_eq!(
         report.findings()[0].to_string(),
         format!(
-            "{}: target [s3.bucket.namespace_suffix]: has a forbidden suffix when not (guard equals mock.s3.Bucket.Namespace::\"account-regional\") (rejected if this resource is created)",
+            "{}: target [s3.bucket.namespace_suffix]: must not end with \"-an\" when not (guard equals mock.s3.Bucket.Namespace::\"account-regional\") (rejected if this resource is created)",
             file.resources[0].id
         )
     );
@@ -1305,7 +1305,7 @@ fn create_only_s3_namespace_preview_preserves_pending_create_obligations() {
             assert_eq!(
                 finding.to_string(),
                 format!(
-                    "{}: target [s3.bucket.namespace_suffix]: has a forbidden suffix when not (bucket_namespace equals mock.s3.Bucket.Namespace::\"account-regional\") (rejected if this resource is created)",
+                    "{}: target [s3.bucket.namespace_suffix]: must not end with \"-an\" when not (bucket_namespace equals mock.s3.Bucket.Namespace::\"account-regional\") (rejected if this resource is created)",
                     file.resources[0].id
                 )
             );
@@ -1319,7 +1319,7 @@ fn create_only_s3_namespace_preview_preserves_pending_create_obligations() {
                 assert_eq!(violations, 1);
                 assert_eq!(plan.errors().len(), 1);
                 assert!(
-                    matches!(&plan.errors()[0].kind, PlanErrorKind::InputRule { code, reason, .. } if code == "s3.bucket.namespace_suffix" && reason == "has a forbidden suffix when not (bucket_namespace equals mock.s3.Bucket.Namespace::\"account-regional\")")
+                    matches!(&plan.errors()[0].kind, PlanErrorKind::InputRule { code, reason, .. } if code == "s3.bucket.namespace_suffix" && reason == "must not end with \"-an\" when not (bucket_namespace equals mock.s3.Bucket.Namespace::\"account-regional\")")
                 );
             }
         }
