@@ -615,13 +615,22 @@ A struct type represents a nested object with typed fields.
   A member layer belongs to its destination slot. Enforce it on writes through
   identity admission and the deferred destination check; identified source bounds
   are identity-layer bounds only. Anonymous String/Int declarations retain both
-  layers as structural evidence (matching patterns and intersected bounds). Unannotated collections, conditionals and coalesce
+  layers as structural evidence (patterns and intersected bounds). String/Int/Float
+  sources with or without identity flowing to compatible identity-less scalar sinks,
+  including Int-to-Float, reject only provably disjoint bounds (#4362). Reference
+  admission records `NeedsLocal` for constrained identity-less sinks; provider slots
+  check resolved values against the full destination declaration before dispatch.
+  Anonymous scalar refinements occur only in provider schema slots; `TypeExpr`
+  boundaries use identified refinements or unconstrained scalars. Adding overlapping
+  source constraints never reduces assignability.
+  Unannotated collections, conditionals and coalesce
   require identical `TypeExpr`s, as on main. Reads of slots differing only in
   member constraints infer equal types. An explicit compatible annotation is
   the way to accept otherwise mixed declarations; inference never widens them.
   Enum definition and canonical-spelling disagreements remain typed errors.
   Enum bases describe definitions, never slots: schema admission rejects String/Int
-  member constraints inside a base with `EnumBaseMemberLayerError`.
+  member constraints inside a base with `EnumBaseMemberLayerError`; identity-less
+  enum base comparisons follow the same overlap-or-defer rule.
   Built-in and aggregate comparisons accept identity-only typed projections. Exact
   declarations and their fingerprints preserve both layers. Hover renders
   both layers through the core's read-only bounded refinement walk, which counts
@@ -639,24 +648,31 @@ A struct type represents a nested object with typed fields.
   replay reloads refinement layers from fingerprint-checked provider schemas.
   Every typed sink uses the same String/Int identity-admission rule for
   equal identities and allowed widenings (#4349), including annotations,
-  exports, module arguments, and function parameters/returns. All destination
-  kinds can retain the existing `NeedsLocal` resolved-value obligation. Same-identity
+  exports, module arguments, and function parameters/returns. Resource/data-source
+  reference admission retains the existing `NeedsLocal` obligation. Same-identity
   value admission, including a declared source, defers overlapping identity bounds
   to the local check; provably disjoint bounds reject statically. Different-identity
-  widening requires source identity bounds to be contained by destination identity
-  bounds. Strict declaration compatibility retains main's containment checks.
-  Declaration compatibility admits types; only value admission grants placement.
+  widening between identified scalars requires source identity bounds to be
+  contained by destination identity bounds. Strict declaration compatibility
+  retains containment checks only for pairs of identified scalars. Compatible
+  identity-less sinks use #4362's overlap-or-defer rule in both declaration and
+  reference checks, regardless of source identity. Original-evidence rechecks
+  inspect only identified leaves.
+  Declaration compatibility admits types, not resolved-value validity.
   `NeedsLocal` exists only in the admission-facing reference relation, requiring
   a `ReferenceCandidate`; it cannot convert back into general type compatibility.
-  Admission consumes it by registering the existing `LocalPath` on the destination
-  contract. `PendingAdmission::discharge` re-enters `admit_apply`, checking the
-  resolved value against that destination's complete declaration and both layers.
-  Known binding values also enter the destination's ordinary value validator after
-  declaration compatibility. Member String failures keep their structured pattern/
+  Resource/data-source attributes use `admit_apply_resource`/`admit_apply_data_source`
+  in `executor/provider_ready.rs`; provider config uses
+  `validate_provider_config_attributes` on resolved values. These validate the full
+  destination declaration before dispatch. Function parameters/returns additionally
+  use runtime `check_resolved_constraints_at`; backend schemas have no anonymous
+  refinements. Member String failures keep their structured pattern/
   length category and label the slot's member constraint; identity failures run first.
-  Int-to-Float widening uses identity-bound
-  containment too. Float retains main's strict range containment and same-identity
-  reference deferral; Enum/unloaded reference leaves retain that deferral too.
+  Int-to-Float widening between identified scalars uses identity-bound containment
+  too. Float pairs with identities on both sides retain strict declaration range
+  containment; same-identity Float reference admission retains resolved-value
+  deferral. Identity-less Float and Int-to-Float
+  pairs follow #4362 instead. Enum/unloaded reference leaves retain that deferral too.
   Unproven regex containment defers to the value check. At annotated sinks,
   declaration equality and display-name equality do not replace identity
   admission; mismatch names expose differing constraints or scalar kinds.

@@ -510,7 +510,10 @@ fn nominal_pattern_policy_is_preserved_and_diagnostics_show_each_pattern() {
         None,
         None,
     );
-    assert!(!assign(&source, &sink, &b, "p"));
+    assert!(
+        assign(&source, &sink, &b, "p"),
+        "anonymous patterns defer to destination values (#4362)"
+    );
     let (expected, actual) =
         TypeInSchema::schemaless(&source).mismatch_type_names(TypeInSchema::schemaless(&sink));
     assert!(

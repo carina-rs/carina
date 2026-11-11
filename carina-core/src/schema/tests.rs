@@ -9999,6 +9999,8 @@ fn finite_assignability_universe() -> Vec<NamedAssignableType> {
         NamedAssignableType::new("String(pattern=digits)", digits.clone()),
         NamedAssignableType::new("String(length=1..64)", len_1_64.clone()),
         NamedAssignableType::new("String(length=8..32)", len_8_32.clone()),
+        NamedAssignableType::new("String(length=1..100)", make_custom_anon_len(1, 100)),
+        NamedAssignableType::new("String(length=80..120)", make_custom_anon_len(80, 120)),
         NamedAssignableType::new("String(pattern=alpha,length=1..64)", alpha_len_1_64.clone()),
         NamedAssignableType::new("aws.ec2.Vpc.Id", vpc_id.clone()),
         NamedAssignableType::new("aws.ec2.SecurityGroup.Id", security_group_id),
@@ -10282,7 +10284,7 @@ fn assignability_rule_10_accepts_all_identityless_refinement_sinks() {
 }
 
 #[test]
-fn assignability_rule_8_rejects_unproven_refined_sources() {
+fn assignability_anonymous_overlapping_refinements_defer_to_values() {
     let pairs = vec![
         (
             NamedAssignableType::new(
@@ -10334,8 +10336,8 @@ fn assignability_rule_8_rejects_unproven_refined_sources() {
 
     for (source, sink) in pairs {
         assert!(
-            !assignable(&source.attr, &sink.attr),
-            "rule 8 must reject wider or differently refined evidence; offending pair: {} -> {}",
+            assignable(&source.attr, &sink.attr),
+            "overlapping bounds and differing patterns defer to destination values (#4362): {} -> {}",
             source.name,
             sink.name,
         );
@@ -10418,15 +10420,15 @@ fn lifted_type_expr_finite_universe_is_reflexive() {
     );
 }
 
-fn contains_unrefined_primitive(attr: &AttributeType) -> bool {
+fn contains_anonymous_scalar(attr: &AttributeType) -> bool {
     match &attr.kind {
         AttrTypeKind::UnloadedSchemaType(_) => false,
         AttrTypeKind::String {
             identity_layer:
                 crate::schema::StringIdentityLayer {
                     binding: RefinementBinding::MetadataOnly(None),
-                    pattern: None,
-                    length: None,
+                    pattern: _,
+                    length: _,
                     ..
                 },
             ..
@@ -10435,26 +10437,25 @@ fn contains_unrefined_primitive(attr: &AttributeType) -> bool {
             identity_layer:
                 crate::schema::IntIdentityLayer {
                     binding: RefinementBinding::MetadataOnly(None),
-                    range: None,
+                    range: _,
                     ..
                 },
             ..
         }
         | AttrTypeKind::Float {
             binding: RefinementBinding::MetadataOnly(None),
-            range: None,
+            range: _,
             ..
         } => true,
-        AttrTypeKind::List { element_type, .. } => contains_unrefined_primitive(element_type),
+        AttrTypeKind::List { element_type, .. } => contains_anonymous_scalar(element_type),
         AttrTypeKind::Map {
             key,
             value,
             constraints: _,
-        } => contains_unrefined_primitive(key) || contains_unrefined_primitive(value),
-        AttrTypeKind::Union(members) => members
-            .as_raw_slice()
-            .iter()
-            .any(contains_unrefined_primitive),
+        } => contains_anonymous_scalar(key) || contains_anonymous_scalar(value),
+        AttrTypeKind::Union(members) => {
+            members.as_raw_slice().iter().any(contains_anonymous_scalar)
+        }
         AttrTypeKind::Reference { .. }
         | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
@@ -10469,17 +10470,11 @@ fn contains_unrefined_primitive(attr: &AttributeType) -> bool {
     }
 }
 
-/// Assignability is transitive except when rule 10 uses a completely
-/// unrefined primitive as the intermediate evidence. For example,
-/// `pattern=alpha -> String -> pattern=digits` is accepted one edge at a time,
-/// while the direct refined comparison correctly fails under rule 8.
-///
-/// The settled #3798 decision keeps that value-validation escape in the
-/// relation and makes composition forwarding preserve both sides of the
-/// boundary instead. #3808 tracks an explicit user-authored escape hatch for
-/// intentionally discarding the original evidence.
+/// Overlap-or-defer admission is not transitive through anonymous scalars:
+/// lengths 8..=32 overlap 1..=100, which overlaps 80..=120, but the endpoints
+/// are disjoint. Composition forwarding must preserve the original evidence.
 #[test]
-fn assignability_finite_universe_is_transitive_except_through_unrefined_primitives() {
+fn assignability_finite_universe_is_transitive_except_through_anonymous_scalars() {
     let universe = finite_assignability_universe();
     let mut exceptions = 0;
 
@@ -10495,8 +10490,8 @@ fn assignability_finite_universe_is_transitive_except_through_unrefined_primitiv
                 if !assignable(&source.attr, &sink.attr) {
                     exceptions += 1;
                     assert!(
-                        contains_unrefined_primitive(&middle.attr),
-                        "non-transitivity is allowed only through an unrefined primitive intermediate; counterexample: {} -> {} and {} -> {}, but {} -> {} is rejected",
+                        contains_anonymous_scalar(&middle.attr),
+                        "non-transitivity is allowed only through an anonymous scalar intermediate; counterexample: {} -> {} and {} -> {}, but {} -> {} is rejected",
                         source.name,
                         middle.name,
                         middle.name,
@@ -10511,7 +10506,7 @@ fn assignability_finite_universe_is_transitive_except_through_unrefined_primitiv
 
     assert!(
         exceptions > 0,
-        "the finite universe must retain rule 10's documented non-transitive case",
+        "the finite universe must exercise non-transitive overlap admission",
     );
 }
 
@@ -10889,8 +10884,8 @@ fn assignable_single_union_side_semantics_are_unchanged() {
 fn assignable_empty_source_union_is_vacuously_assignable() {
     let bottom = AttributeType::union(vec![]);
 
-    // An empty union has no possible values, so it is the bottom type and is
-    // assignable to every sink under the source-subset rule.
+    // An empty union has no source members, so every member is assignable
+    // vacuously and the union is assignable to every sink.
     assert!(assignable(&bottom, &AttributeType::bool()));
 }
 
@@ -10905,13 +10900,15 @@ fn assignable_list_identified_string_flows_to_anonymous_string() {
 }
 
 #[test]
-fn assignable_list_int_range_rejects_wider_source() {
+fn assignable_list_int_range_defers_overlap_and_rejects_disjoint_source() {
     let source = AttributeType::list(AttributeType::refined_int(None, Some((Some(0), Some(100)))));
     let sink = AttributeType::list(AttributeType::refined_int(None, Some((Some(0), Some(10)))));
 
-    // Structural List comparison intentionally closes the old name-only
-    // false acceptance: the source element range is not contained by sink.
-    assert!(!assignable(&source, &sink));
+    // Lists use the same anonymous element overlap rule as scalar slots.
+    assert!(assignable(&source, &sink));
+    let disjoint =
+        AttributeType::list(AttributeType::refined_int(None, Some((Some(20), Some(30)))));
+    assert!(!assignable(&disjoint, &sink));
 }
 
 #[test]
@@ -11322,13 +11319,13 @@ fn assignable_identified_source_without_length_accepted_by_identityless_length_s
 }
 
 #[test]
-fn assignable_identityless_length_requires_source_containment() {
+fn assignable_identityless_length_defers_overlapping_source_bounds() {
     let at_most_1024 = make_custom_anon_pattern_and_len(None, Some((None, Some(1024))));
     let at_most_512 = make_custom_anon_len(1, 512);
     let at_most_2048 = make_custom_anon_len(1, 2048);
 
     assert!(assignable(&at_most_512, &at_most_1024));
-    assert!(!assignable(&at_most_2048, &at_most_1024));
+    assert!(assignable(&at_most_2048, &at_most_1024));
 }
 
 #[test]
@@ -11393,12 +11390,12 @@ fn assignable_exact_numeric_int_float_bounds() {
         (
             (None, Some(9_007_199_254_740_993)),
             (None, Some(crate::finite(9_007_199_254_740_992.0))),
-            false,
+            true,
         ),
         (
             (Some(-9_007_199_254_740_993), None),
             (Some(crate::finite(-9_007_199_254_740_992.0)), None),
-            false,
+            true,
         ),
         (
             (None, Some(i64::MAX)),
@@ -11410,8 +11407,20 @@ fn assignable_exact_numeric_int_float_bounds() {
             (Some(crate::finite(-9_223_372_036_854_775_808.0)), None),
             true,
         ),
-        ((Some(3), Some(4)), (Some(crate::finite(3.5)), None), false),
-        ((Some(3), Some(4)), (None, Some(crate::finite(3.5))), false),
+        ((Some(3), Some(4)), (Some(crate::finite(3.5)), None), true),
+        ((Some(3), Some(4)), (None, Some(crate::finite(3.5))), true),
+        ((Some(3), Some(3)), (Some(crate::finite(3.5)), None), false),
+        ((Some(4), Some(4)), (None, Some(crate::finite(3.5))), false),
+        (
+            (Some(9_007_199_254_740_993), None),
+            (None, Some(crate::finite(9_007_199_254_740_992.0))),
+            false,
+        ),
+        (
+            (None, Some(-9_007_199_254_740_993)),
+            (Some(crate::finite(-9_007_199_254_740_992.0)), None),
+            false,
+        ),
     ] {
         assert_eq!(
             assignable(
@@ -11433,9 +11442,11 @@ fn assignable_int_float_missing_bounds_use_i64_limits() {
             true,
         ),
         ((None, None), (None, Some(crate::finite(1e300))), true),
-        ((None, None), (None, Some(crate::finite(9.0e18))), false),
+        ((None, None), (None, Some(crate::finite(9.0e18))), true),
         ((None, None), (Some(crate::finite(-1e300)), None), true),
-        ((None, None), (Some(crate::finite(-9.0e18)), None), false),
+        ((None, None), (Some(crate::finite(-9.0e18)), None), true),
+        ((None, None), (Some(crate::finite(1e300)), None), false),
+        ((None, None), (None, Some(crate::finite(-1e300))), false),
     ] {
         assert_eq!(
             assignable(
@@ -11469,7 +11480,7 @@ fn assignable_identified_int_without_range_widens_to_ranged_float_sink() {
 }
 
 #[test]
-fn assignable_wider_float_range_rejects_narrower_identityless_range_sink() {
+fn assignable_float_range_defers_overlap_and_rejects_disjoint_source() {
     let source = AttributeType::refined_float(
         None,
         Some((Some(crate::finite(0.0)), Some(crate::finite(100.0)))),
@@ -11479,7 +11490,9 @@ fn assignable_wider_float_range_rejects_narrower_identityless_range_sink() {
         Some((Some(crate::finite(25.0)), Some(crate::finite(75.0)))),
     );
 
-    assert!(!assignable(&source, &sink));
+    assert!(assignable(&source, &sink));
+    let disjoint = AttributeType::refined_float(None, Some((Some(crate::finite(100.0)), None)));
+    assert!(!assignable(&disjoint, &sink));
 }
 
 #[test]
@@ -11514,9 +11527,9 @@ fn assignable_plain_string_rejects_enum_sink_through_composite_types() {
         None,
     );
 
-    // Enum identities and their membership sets are semantic evidence. A
-    // plain String carries neither, so Enum follows the identified-sink side
-    // of rule 10 rather than the identity-less value-constraint exception.
+    // An identified sink, including every Enum, requires identity evidence.
+    // A plain String carries none; overlap-or-defer only admits anonymous
+    // scalar pairs and cannot supply Enum identity or membership evidence.
     assert!(!assignable(&AttributeType::string(), &status));
     assert!(!assignable(
         &AttributeType::list(AttributeType::string()),
@@ -11583,11 +11596,14 @@ fn assignable_identityless_sink_rule_recurses_through_composite_types() {
         AttributeType::union(vec![AttributeType::string(), identified.clone()]);
     assert!(assignable(&identified_source_union, &constrained));
     assert!(!assignable(&identified_source_union, &identified));
-    let conflicting_source_union = AttributeType::union(vec![
+    let differently_patterned_source_union = AttributeType::union(vec![
         AttributeType::string(),
         make_custom_anon_pattern_and_len(Some(r"^[0-9]+$"), None),
     ]);
-    assert!(!assignable(&conflicting_source_union, &constrained));
+    assert!(assignable(
+        &differently_patterned_source_union,
+        &constrained
+    ));
 
     // The same recursive paths do not supply evidence for identified sinks.
     assert!(!assignable(
@@ -11648,29 +11664,16 @@ fn assignable_int_custom_rejects_string_custom() {
 
 // -- Custom-pattern and Custom-length assignability matrix (#2218) --
 //
-// Expected rules for primitive refinement assignability (#2218, #4230):
+// Expected rules for primitive refinement assignability (#2218, #4230, #4362):
 //
-// - An identity-bearing String, Int, or Float source may flow into an
-//   anonymous refined sink of the same primitive kind regardless of its own
-//   pattern/length/range evidence. The sink's constraints are checked on the
-//   value when known at plan or before provider dispatch at apply (#3805).
-//   This exception is limited to identity-less sinks. Rule 7's identity and
-//   constraint comparisons and rule 8's identity-less refined-source evidence
-//   comparisons are unchanged, as are Enum and Int-to-Float widening rules.
-// - Between anonymous refined Strings, the conservative rules below remain:
-//
-// - pattern: differing literal strings are conservatively *incompatible*
-//   (we cannot prove a regex is a refinement of another by string compare,
-//   so we err on the side of rejecting). `None` on the sink means "no
-//   pattern constraint" and admits any source pattern (or none). A source
-//   that carries some other refinement but no pattern is rejected against a
-//   `Some` sink because its own evidence does not prove that pattern.
-// - length: source ⊆ sink (sink.min ≤ source.min AND source.max ≤ sink.max,
-//   missing bounds treated as unbounded on that side). `None` on the sink
-//   admits any source length. A source that carries some other refinement but
-//   no length is rejected against a bounded sink. A completely unrefined
-//   source is the rule-10 exception tested below; its concrete value is
-//   validated separately under carina#3805.
+// - String/Int/Float sources use overlap-or-defer for compatible identity-less
+//   scalar sinks, including Int -> Float. Identified source bounds come only
+//   from the identity layer; anonymous source bounds intersect both layers.
+//   Provably disjoint bounds reject; overlapping bounds and all regex patterns
+//   defer to the destination value check (#3805, #4362).
+// - Identified destinations still require compatible identities and their
+//   existing identity bounds. Adding overlapping source refinements cannot
+//   reduce admission into an identity-less sink.
 
 #[test]
 fn typed_ref_anonymous_refined_string_assignability_matrix() {
@@ -11793,25 +11796,29 @@ fn typed_ref_anonymous_refined_string_preserves_named_identity_rules() {
 }
 
 #[test]
-fn typed_ref_anonymous_refined_string_preserves_anonymous_refinement_rules() {
+fn typed_ref_anonymous_refined_string_defers_patterns_and_overlapping_bounds() {
     let alpha = make_custom_anon_pattern_and_len(Some(r"^[a-z]+$"), None);
     let digits = make_custom_anon_pattern_and_len(Some(r"^[0-9]+$"), None);
     assert!(
-        !assignable(&alpha, &digits),
-        "rule 8 requires equal anonymous patterns"
+        assignable(&alpha, &digits),
+        "regex patterns are deferred to the destination value check"
     );
-    assert!(!assignable(&digits, &alpha));
+    assert!(assignable(&digits, &alpha));
     assert!(
-        !assignable(
+        assignable(
             &make_custom_anon_len(1, 1024),
             &make_custom_anon_len(10, 40)
         ),
-        "rule 8 still requires anonymous length containment"
+        "overlapping anonymous lengths defer to the destination value check"
     );
+    assert!(!assignable(
+        &make_custom_anon_len(50, 60),
+        &make_custom_anon_len(10, 40)
+    ));
 }
 
 #[test]
-fn declared_string_outputs_preserve_incompatible_anonymous_refined_evidence() {
+fn declared_string_outputs_defer_overlapping_and_reject_disjoint_anonymous_evidence() {
     use crate::binding_index::{BindingIndex, RefType, RefTypeAssignabilityError};
     use crate::parser::{ProviderContext, TypeExpr, parse};
     use crate::resource::{
@@ -11822,8 +11829,10 @@ fn declared_string_outputs_preserve_incompatible_anonymous_refined_evidence() {
 
     let evidence = make_custom_anon_len(1, 1024);
     let sink = make_custom_anon_len(10, 40);
+    let disjoint = make_custom_anon_len(2048, 4096);
     assert!(assignable(&AttributeType::string(), &sink));
-    assert!(!assignable(&evidence, &sink));
+    assert!(assignable(&evidence, &sink));
+    assert!(!assignable(&evidence, &disjoint));
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -11904,14 +11913,26 @@ fn declared_string_outputs_preserve_incompatible_anonymous_refined_evidence() {
                 )
                 .is_ok()
         );
+        assert!(
+            resolved
+                .is_assignable_to_sink(
+                    (TypeInSchema::schemaless(&sink)).with_authority(
+                        crate::schema::assignment_catalog_without_edges_for_test(),
+                        crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+                    ),
+                    &bindings,
+                )
+                .is_ok(),
+            "overlapping original evidence survives each declared String boundary"
+        );
         let Err(RefTypeAssignabilityError::Mismatch(mismatch)) = resolved.is_assignable_to_sink(
-            (TypeInSchema::schemaless(&sink)).with_authority(
+            (TypeInSchema::schemaless(&disjoint)).with_authority(
                 crate::schema::assignment_catalog_without_edges_for_test(),
                 crate::schema::SinkAuthority::Owner(&TEST_OWNER),
             ),
             &bindings,
         ) else {
-            panic!("rule 8 must reject the forwarded evidence after each String boundary");
+            panic!("disjoint original evidence must reject after each String boundary");
         };
         assert_eq!(mismatch.actual_type_name(), "String(len: 1..=1024)");
         assert_eq!(mismatch.declared_type_name(), Some("String"));
@@ -11939,30 +11960,39 @@ fn typed_ref_anonymous_refined_string_rejects_enum_sink() {
 }
 
 #[test]
-fn typed_ref_anonymous_refined_int_defers_range_constraints() {
-    for range in [
-        None,
-        Some((Some(30), Some(60))),
-        Some((Some(0), Some(100))),
-        Some((Some(100), Some(200))),
+fn typed_ref_identified_int_defers_overlapping_anonymous_ranges() {
+    for (range, expected) in [
+        (None, true),
+        (Some((Some(30), Some(60))), true),
+        (Some((Some(0), Some(100))), true),
+        (Some((Some(100), Some(200))), false),
     ] {
         let source = AttributeType::refined_int(Some(TypeIdentity::bare("Count")), range);
         let sink = AttributeType::refined_int(None, Some((Some(25), Some(75))));
         let actual = assignable(&source, &sink);
-        assert!(
-            actual,
-            "identified Int with range {range:?} must defer the sink's range check; assignability was {actual}"
+        assert_eq!(
+            actual, expected,
+            "identified Int range {range:?} into 25..=75 uses overlap-or-defer"
         );
     }
 }
 
 #[test]
-fn typed_ref_anonymous_refined_float_defers_range_constraints() {
-    for range in [
-        None,
-        Some((Some(crate::finite(30.0)), Some(crate::finite(60.0)))),
-        Some((Some(crate::finite(0.0)), Some(crate::finite(100.0)))),
-        Some((Some(crate::finite(100.0)), Some(crate::finite(200.0)))),
+fn typed_ref_identified_float_defers_overlapping_anonymous_ranges() {
+    for (range, expected) in [
+        (None, true),
+        (
+            Some((Some(crate::finite(30.0)), Some(crate::finite(60.0)))),
+            true,
+        ),
+        (
+            Some((Some(crate::finite(0.0)), Some(crate::finite(100.0)))),
+            true,
+        ),
+        (
+            Some((Some(crate::finite(100.0)), Some(crate::finite(200.0)))),
+            false,
+        ),
     ] {
         let source = AttributeType::refined_float(Some(TypeIdentity::bare("Ratio")), range);
         let sink = AttributeType::refined_float(
@@ -11970,9 +12000,9 @@ fn typed_ref_anonymous_refined_float_defers_range_constraints() {
             Some((Some(crate::finite(25.0)), Some(crate::finite(75.0)))),
         );
         let actual = assignable(&source, &sink);
-        assert!(
-            actual,
-            "identified Float with range {range:?} must defer the sink's range check; assignability was {actual}"
+        assert_eq!(
+            actual, expected,
+            "identified Float range {range:?} into 25..=75 uses overlap-or-defer"
         );
     }
 }
@@ -11989,8 +12019,8 @@ fn typed_ref_anonymous_refined_numeric_preserves_identity_range_and_primitive_ru
     let wide_int = AttributeType::refined_int(None, Some((Some(0), Some(100))));
     let narrow_int = AttributeType::refined_int(None, Some((Some(25), Some(75))));
     assert!(
-        !assignable(&wide_int, &narrow_int),
-        "rule 8 still requires identity-less source range containment"
+        assignable(&wide_int, &narrow_int),
+        "overlapping anonymous Int ranges defer to the destination value check"
     );
 
     let named_float = AttributeType::refined_float(Some(TypeIdentity::bare("Ratio")), None);
@@ -12010,8 +12040,8 @@ fn typed_ref_anonymous_refined_numeric_preserves_identity_range_and_primitive_ru
         Some((Some(crate::finite(25.0)), Some(crate::finite(75.0)))),
     );
     assert!(
-        !assignable(&wide_int, &narrow_float),
-        "Int to Float widening still requires identity-less source range containment"
+        assignable(&wide_int, &narrow_float),
+        "anonymous Int to Float widening defers overlapping ranges"
     );
     assert!(assignable(&named_int, &narrow_float));
     assert!(
@@ -12052,14 +12082,13 @@ fn assignable_anon_pattern_equal_strings_compatible() {
 }
 
 #[test]
-fn assignable_anon_pattern_differing_strings_incompatible() {
-    // Even if both regexes might describe overlapping languages, the
-    // implementation does not prove containment — differing pattern
-    // strings are conservatively rejected.
+fn assignable_anon_pattern_differing_strings_defer() {
+    // Regex compatibility is checked on the destination value, never proven
+    // or disproven by comparing pattern strings.
     let a = make_custom_anon_pattern_and_len(Some("^a+$"), None);
     let b = make_custom_anon_pattern_and_len(Some("^a*$"), None);
-    assert!(!assignable(&a, &b));
-    assert!(!assignable(&b, &a));
+    assert!(assignable(&a, &b));
+    assert!(assignable(&b, &a));
 }
 
 #[test]
@@ -12067,9 +12096,8 @@ fn assignable_unrefined_source_accepts_identityless_pattern_sink() {
     let source = make_custom_anon_pattern_and_len(None, None);
     let sink = make_custom_anon_pattern_and_len(Some("^x+$"), None);
 
-    // Issue #3798's settled rule-10 decision: with no identity, pattern, or
-    // length evidence of its own, the source is the plain base type. The
-    // identity-less sink's value constraint is enforced under carina#3805.
+    // An unrefined source supplies no refinement evidence to overlap-or-defer (#4362).
+    // The identity-less sink's pattern remains a destination value check.
     assert!(assignable(&source, &sink));
 }
 
@@ -12083,42 +12111,43 @@ fn assignable_anon_pattern_source_some_sink_none_compatible() {
 
 #[test]
 fn assignable_anon_length_source_narrower_compatible() {
-    // Source length range ⊂ sink range → compatible.
+    // These length ranges overlap, so static admission defers to the
+    // destination value check.
     let source = make_custom_anon_pattern_and_len(None, Some((Some(20), Some(30))));
     let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
     assert!(assignable(&source, &sink));
 }
 
 #[test]
-fn assignable_anon_length_source_wider_min_rejected() {
-    // Source min < sink min → values shorter than sink allows could leak through.
+fn assignable_anon_length_source_wider_min_defers() {
+    // The ranges overlap; the concrete destination value must satisfy its minimum.
     let source = make_custom_anon_pattern_and_len(None, Some((Some(5), Some(40))));
     let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
-    assert!(!assignable(&source, &sink));
+    assert!(assignable(&source, &sink));
 }
 
 #[test]
-fn assignable_anon_length_source_wider_max_rejected() {
-    // Source max > sink max → values longer than sink allows could leak through.
+fn assignable_anon_length_source_wider_max_defers() {
+    // The ranges overlap; the concrete destination value must satisfy its maximum.
     let source = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(50))));
     let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
-    assert!(!assignable(&source, &sink));
+    assert!(assignable(&source, &sink));
 }
 
 #[test]
-fn assignable_anon_length_source_unbounded_max_against_bounded_sink_rejected() {
-    // Source has no upper bound; sink does → source could exceed sink max.
+fn assignable_anon_length_source_unbounded_max_against_bounded_sink_defers() {
+    // An unbounded maximum does not prove disjointness.
     let source = make_custom_anon_pattern_and_len(None, Some((Some(10), None)));
     let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
-    assert!(!assignable(&source, &sink));
+    assert!(assignable(&source, &sink));
 }
 
 #[test]
-fn assignable_anon_length_source_unbounded_min_against_bounded_sink_rejected() {
-    // Source has no lower bound; sink does → source could fall below sink min.
+fn assignable_anon_length_source_unbounded_min_against_bounded_sink_defers() {
+    // An unbounded minimum does not prove disjointness.
     let source = make_custom_anon_pattern_and_len(None, Some((None, Some(40))));
     let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
-    assert!(!assignable(&source, &sink));
+    assert!(assignable(&source, &sink));
 }
 
 #[test]
@@ -12126,8 +12155,7 @@ fn assignable_unrefined_source_accepts_identityless_length_sink() {
     let source = make_custom_anon_pattern_and_len(None, None);
     let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
 
-    // Issue #3798's settled rule-10 decision; unlike a wider refined source,
-    // this source carries no refinement evidence that could conflict.
+    // Unrefined and overlapping refined sources share the same value check.
     assert!(assignable(&source, &sink));
 }
 
@@ -18210,7 +18238,7 @@ fn unbounded_integer_range_is_assignable_to_unbounded_float_range() {
 }
 
 #[test]
-fn pattern_modes_and_reasons_affect_equality_assignability_and_fingerprints() {
+fn pattern_modes_and_reasons_affect_equality_and_fingerprints_but_defer_assignment() {
     use std::collections::{BTreeSet, HashSet};
     let specs = [
         PatternSpec::new("abc", PatternMatch::Full),
@@ -18240,7 +18268,10 @@ fn pattern_modes_and_reasons_affect_equality_assignability_and_fingerprints() {
     for (i, source) in types.iter().enumerate() {
         for (j, sink) in types.iter().enumerate() {
             assert_eq!(compiled[i] == compiled[j], i == j);
-            assert_eq!(assignable(source, sink), i == j, "{i} -> {j}");
+            assert!(
+                assignable(source, sink),
+                "{i} -> {j}: pattern constraints defer"
+            );
         }
     }
     let fingerprints: HashSet<_> = specs
@@ -18590,6 +18621,14 @@ fn round12_anonymous_string_uses_both_layers_as_evidence() {
         assignable(&source, &sink),
         "anonymous member pattern and intersected bounds are structural evidence"
     );
+    let disjoint = AttributeType::string_member(
+        StringIdentityLayer::new(None, None, Some((Some(1), Some(100))), None),
+        StringMemberConstraints::new(None, Some((Some(50), Some(60)))),
+    );
+    assert!(
+        !assignable(&disjoint, &sink),
+        "the member intersection, not the wider identity bounds, proves disjointness"
+    );
     let source = AttributeType::string_member(
         StringIdentityLayer::new(None, None, None, None),
         StringMemberConstraints::new(
@@ -18599,15 +18638,15 @@ fn round12_anonymous_string_uses_both_layers_as_evidence() {
             Some((Some(1), Some(8))),
         ),
     );
-    let incompatible = AttributeType::refined_string(
+    let different_pattern = AttributeType::refined_string(
         None,
         Some(CompiledPattern::try_new(&PatternSpec::new("[0-9]+", PatternMatch::Full)).unwrap()),
         Some((Some(1), Some(16))),
         None,
     );
     assert!(
-        !assignable(&source, &incompatible),
-        "anonymous member-only patterns are still structural evidence"
+        assignable(&source, &different_pattern),
+        "anonymous member-only patterns defer to the destination value check"
     );
 }
 
@@ -18619,17 +18658,26 @@ fn round12_anonymous_int_uses_both_layers_as_evidence() {
     );
     let sink = AttributeType::refined_int(None, Some((Some(1), Some(16))));
     assert!(assignable(&source, &sink));
+    let disjoint = AttributeType::int_member(
+        IntIdentityLayer::new(None, Some((Some(1), Some(100)))),
+        IntMemberConstraints::new(Some((Some(50), Some(60)))),
+    );
+    assert!(!assignable(&disjoint, &sink));
     let sink = AttributeType::refined_float(
         None,
         Some((Some(crate::finite(1.0)), Some(crate::finite(16.0)))),
     );
     assert!(assignable(&source, &sink));
+    assert!(
+        !assignable(&disjoint, &sink),
+        "Int-to-Float also uses the member intersection"
+    );
     let wide = AttributeType::int_member(
         IntIdentityLayer::new(None, None),
         IntMemberConstraints::new(Some((Some(1), Some(100)))),
     );
-    assert!(!assignable(&wide, &sink));
-    assert!(!assignable(
+    assert!(assignable(&wide, &sink));
+    assert!(assignable(
         &wide,
         &AttributeType::refined_int(None, Some((Some(1), Some(16))))
     ));
