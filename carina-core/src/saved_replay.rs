@@ -4,6 +4,7 @@
 use crate::input_rules::{
     FinalizedPlan, InputAdmissionFailure, InputCheckedPlan, InputTypeContext,
 };
+use crate::parser::retained::{ProjectedPhase, SyntheticSource};
 use crate::plan::{AdmittedPlan, Plan, UnresolvedSavedPlan};
 use crate::resource::{
     Current, DataSource, NoPlaceholder, PlanValueKind, Resource, ResourceId, SavedModuleSource,
@@ -19,6 +20,20 @@ use std::ops::Deref;
 pub struct SavedPlanReplay<V: PlanValueKind = NoPlaceholder> {
     plan: Plan<SavedModuleSource, V>,
 }
+
+/// Replay provenance is sealed here from core's resolved, rehydrated replay
+/// owner. Decoded raw values cannot construct this source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SavedPlanReplaySource(());
+
+#[allow(
+    dead_code,
+    reason = "saved replay source transport is connected in Stage 2"
+)]
+pub(crate) fn projected_saved_plan_replay(_proof: &SavedPlanReplay) -> ProjectedPhase {
+    ProjectedPhase::synthetic(SyntheticSource::SavedPlanReplay(SavedPlanReplaySource(())))
+}
+
 impl<V: PlanValueKind> Deref for SavedPlanReplay<V> {
     type Target = Plan<SavedModuleSource, V>;
     fn deref(&self) -> &Self::Target {

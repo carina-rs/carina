@@ -18,6 +18,18 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 #[cfg(test)]
 mod tests;
 
+// Stage 1 publishes the sealed seam without connecting runtime traversal yet.
+#[allow(
+    dead_code,
+    reason = "authored cursor construction is connected in Stage 2"
+)]
+mod cursor;
+pub(crate) use cursor::SyntheticSource;
+pub use cursor::{
+    AuthoredCursor, AuthoredUse, CompletenessReport, ExpansionInstanceId, JudgedNodeRef,
+    JudgedSlot, NodeId, ProjectedPhase, ProjectionGeneration, UseId,
+};
+
 /// The expansion scope is part of expression identity, even when two module
 /// instances originate at the same authored source location.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -91,11 +103,22 @@ enum Projection<P: ValueKind, B: BindingAddress> {
     Value(Value<P, B>),
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 struct AuthoredExpr<P: ValueKind, B: BindingAddress> {
+    id: NodeId,
     location: ExpressionLocation,
     kind: ExprKind<B>,
     children: Vec<ExprValue<P, B>>,
+}
+
+// Syntax equality predates identity. Keep its existing semantics for callers
+// comparing parser output; admission uses NodeId explicitly.
+impl<P: ValueKind, B: BindingAddress> PartialEq for AuthoredExpr<P, B> {
+    fn eq(&self, other: &Self) -> bool {
+        self.location == other.location
+            && self.kind == other.kind
+            && self.children == other.children
+    }
 }
 
 impl<P: ValueKind, B: BindingAddress> std::fmt::Debug for AuthoredExpr<P, B> {
@@ -174,6 +197,10 @@ struct FunctionSignature {
 }
 
 impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
+    pub fn node_id(&self) -> NodeId {
+        self.authored.id
+    }
+
     pub fn projection(&self) -> Option<&Value<P, B>> {
         match &self.payload {
             Projection::Value(value) => Some(value),
@@ -252,6 +279,7 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
             ExprKind::Unsupported(rule) => ExprKind::Unsupported(rule),
         };
         let authored = Arc::new(AuthoredExpr {
+            id: authored.id,
             location: authored.location,
             kind,
             children: authored
@@ -563,6 +591,7 @@ fn node(
 ) -> ExprValue {
     ExprValue {
         authored: Arc::new(AuthoredExpr {
+            id: NodeId::fresh(),
             location: ExpressionLocation::new(
                 ExpressionInstance::Root,
                 &DeclarationLocation::expression_node(pair, file, source),
@@ -593,6 +622,7 @@ fn lower_blocks(children: Vec<ExprValue>) -> Vec<ExprValue> {
         .map(|(name, records)| {
             let value = ExprValue {
                 authored: Arc::new(AuthoredExpr {
+                    id: NodeId::fresh(),
                     location: ExpressionLocation::new(ExpressionInstance::Root, &headers[&name]),
                     kind: ExprKind::List,
                     children: records,
@@ -608,6 +638,7 @@ fn lower_blocks(children: Vec<ExprValue>) -> Vec<ExprValue> {
             if let ExprKind::NestedBlock { name, header } = &child.authored.kind {
                 ExprValue {
                     authored: Arc::new(AuthoredExpr {
+                        id: NodeId::fresh(),
                         location: ExpressionLocation::new(ExpressionInstance::Root, header),
                         kind: ExprKind::Sink(name.clone()),
                         children: vec![groups[name].clone()],

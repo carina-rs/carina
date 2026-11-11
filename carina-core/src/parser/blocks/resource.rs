@@ -264,9 +264,11 @@ fn parse_block_contents_with_quoted(
                             next_pair(&mut attr_inner, "attribute value", "block content")?;
                         record_quoted_if_literal(quoted_out, &key, &value_pair);
                         let value_mode = mode.at_named_child(key.clone());
-                        match parse_expression_in_sink(value_pair, &local_ctx, &value_mode)?
-                            .projection()
-                        {
+                        // Retain the complete sink here for Stage 2's
+                        // JudgedSlot::from_sink construction.
+                        let expression =
+                            parse_expression_in_sink(value_pair, &local_ctx, &value_mode)?;
+                        match expression.projection() {
                             ParsedSinkValue::Ready(value) => {
                                 attributes.insert(key, value.clone());
                             }
@@ -327,7 +329,9 @@ fn parse_block_contents_with_quoted(
                 let value_pair = next_pair(&mut attr_inner, "attribute value", "block content")?;
                 record_quoted_if_literal(quoted_out, &key, &value_pair);
                 let value_mode = mode.at_named_child(key.clone());
-                match parse_expression_in_sink(value_pair, &local_ctx, &value_mode)?.projection() {
+                // The same complete sink is the slot input for this branch.
+                let expression = parse_expression_in_sink(value_pair, &local_ctx, &value_mode)?;
+                match expression.projection() {
                     ParsedSinkValue::Ready(value) => {
                         attributes.insert(key, value.clone());
                     }

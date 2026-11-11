@@ -1,7 +1,54 @@
 //! Local checks and provider dispatch share a value traversal and Union choice.
 
 use super::*;
+use crate::parser::retained::{AuthoredCursor, AuthoredUse, NodeId, UseId};
+use crate::resource::ValueKind;
 use crate::resource::knowledge::{KnownView, ShapeView};
+
+/// Assignment checks distinguish a current projection from authored syntax
+/// discarded by selection. Discarded syntax never supplies a fabricated Value.
+#[derive(Debug, Clone, Copy)]
+#[allow(
+    dead_code,
+    reason = "the authored assignment seam is connected in Stage 2"
+)]
+pub(crate) enum CheckValue<'v, P: ValueKind, B: BindingAddress> {
+    Current(&'v Value<P, B>),
+    Discarded,
+}
+
+/// Visits belong to use edges, even when several uses share a syntax node.
+#[derive(Debug, Default)]
+#[allow(
+    dead_code,
+    reason = "the authored assignment seam is connected in Stage 2"
+)]
+pub(crate) struct WalkCoverage {
+    visits: std::collections::HashSet<(NodeId, UseId)>,
+}
+
+#[allow(
+    dead_code,
+    reason = "the authored assignment seam is connected in Stage 2"
+)]
+impl WalkCoverage {
+    pub(crate) fn record<B: BindingAddress>(&mut self, authored: &AuthoredUse<'_, B>) {
+        self.visits
+            .insert((authored.node().node_id(), authored.occurrence()));
+    }
+
+    pub(crate) fn contains(&self, node: NodeId, occurrence: UseId) -> bool {
+        self.visits.contains(&(node, occurrence))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.visits.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.visits.is_empty()
+    }
+}
 
 /// Proof that this exact declaration accepted the value, including its canonical
 /// scalar spelling. Only the value validator can construct this proof.
@@ -786,13 +833,73 @@ impl InsideSecret for AssignmentFindings {
         }
     }
 }
-pub(crate) type AssignmentCheck<'a, P, B> = Option<
+/// The destination, value path and definitions still belong to the existing
+/// schema walk. Authored authority is mandatory and moves into each check.
+#[allow(
+    dead_code,
+    reason = "the authored assignment seam is connected in Stage 2"
+)]
+pub(crate) type AssignmentCheck<'a, P, B> = &'a dyn Fn(
+    &CompiledAttributeType,
+    CheckValue<'_, P, B>,
+    &LeafPath,
+    AuthoredCursor<'_, B>,
+) -> Result<AssignmentFindings, TypeError>;
+
+// Keep the running validator and schema fixtures unchanged during Stage 1.
+// Stage 2 removes this transitional callback when cursor transport is wired.
+pub(crate) type LegacyAssignmentCheck<'a, P, B> = Option<
     &'a dyn Fn(
         &CompiledAttributeType,
         &Value<P, B>,
         &LeafPath,
     ) -> Result<AssignmentFindings, TypeError>,
 >;
+
+/// Stage 2 threads the supplied cursor through ValueValidator's existing Ref,
+/// Union and value traversal. This entry has no live callers in Stage 1.
+#[allow(
+    dead_code,
+    reason = "the authored assignment seam is connected in Stage 2"
+)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_authored_value_for_admission<
+    's,
+    'v,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    T: StructuralPending<'v, P, B>,
+>(
+    _attr: &CompiledAttributeType,
+    _value: &Classification<'v, P, B, T>,
+    _defs: &BTreeMap<String, CompiledAttributeType>,
+    _ancestry: FieldAncestry,
+    _lookup: CustomTypeLookup<'_>,
+    _cursor: AuthoredCursor<'s, B>,
+    _assignment: AssignmentCheck<'_, P, B>,
+    _coverage: &mut WalkCoverage,
+) -> ValueValidationFindings {
+    todo!("Stage 2: transport the authored cursor through ValueValidator")
+}
+
+/// Authored-only counterpart for discarded known branches. Its input cannot
+/// be Projected or CoveredBy. Stage 2 descends selected declarations along
+/// authored child edges and invokes AssignmentCheck with CheckValue::Discarded.
+#[allow(
+    dead_code,
+    reason = "discarded authored traversal is connected in Stage 2"
+)]
+pub(crate) fn visit_discarded<P: PlaceholderKind, B: BindingAddress>(
+    _attr: &CompiledAttributeType,
+    _defs: &BTreeMap<String, CompiledAttributeType>,
+    _path: &LeafPath,
+    _ancestry: FieldAncestry,
+    _cursor: AuthoredUse<'_, B>,
+    _assignment: AssignmentCheck<'_, P, B>,
+    _coverage: &mut WalkCoverage,
+) -> ValueValidationFindings {
+    todo!("Stage 2: visit discarded syntax without evaluating its projection")
+}
 
 /// The declaration selected by the resource schema walk, including its slot.
 pub(crate) struct SchemaAttribute<'s> {
@@ -827,7 +934,7 @@ pub(crate) fn validate_value_for_admission<
     defs: &BTreeMap<String, CompiledAttributeType>,
     ancestry: FieldAncestry,
     lookup: CustomTypeLookup<'_>,
-    assignment: AssignmentCheck<'_, P, B>,
+    assignment: LegacyAssignmentCheck<'_, P, B>,
 ) -> ValueValidationFindings {
     let mut checked = ValueValidator::new(defs, Some(lookup))
         .walk_with_assignment(
@@ -867,7 +974,7 @@ impl<'a> ValueValidator<'a, '_> {
         path: &FieldPath,
         ancestry: FieldAncestry,
         visited: &mut Vec<&'a str>,
-        assignment: AssignmentCheck<'_, P, B>,
+        assignment: LegacyAssignmentCheck<'_, P, B>,
     ) -> CheckedValue<'a> {
         let node = match value {
             ClassifiedRef::Known(value) => Some(CheckedNode {
@@ -899,7 +1006,7 @@ impl<'a> ValueValidator<'a, '_> {
         path: &FieldPath,
         ancestry: FieldAncestry,
         visited: &mut Vec<&'a str>,
-        assignment: AssignmentCheck<'_, P, B>,
+        assignment: LegacyAssignmentCheck<'_, P, B>,
     ) -> CheckedValue<'a> {
         if let Some(inner) = value.protected_for_schema(&SchemaEvidenceAuthority(())) {
             return inner.validate(|evidence| {
@@ -1038,7 +1145,7 @@ impl<'a> ValueValidator<'a, '_> {
         path: &FieldPath,
         ancestry: FieldAncestry,
         visited: &mut Vec<&'a str>,
-        assignment: AssignmentCheck<'_, P, B>,
+        assignment: LegacyAssignmentCheck<'_, P, B>,
     ) -> CheckedValue<'a> {
         let findings = match assignment {
             Some(check) => match check(attr, value.diagnostic_value(), &path.canonical()) {
@@ -1095,7 +1202,7 @@ impl<'a> ValueValidator<'a, '_> {
         path: &FieldPath,
         ancestry: FieldAncestry,
         visited: &mut Vec<&'a str>,
-        assignment: AssignmentCheck<'_, P, B>,
+        assignment: LegacyAssignmentCheck<'_, P, B>,
     ) -> CheckedValue<'a> {
         if let AttrTypeKind::UnloadedSchemaType(_) = &attr.kind {
             return CheckedValue::rejected(
@@ -1510,7 +1617,7 @@ impl<'a> ValueValidator<'a, '_> {
         string_list: bool,
         path: &FieldPath,
         ancestry: FieldAncestry,
-        assignment: AssignmentCheck<'_, P, B>,
+        assignment: LegacyAssignmentCheck<'_, P, B>,
     ) -> CheckedValue<'a> {
         let mut children = Vec::new();
         let mut child_fits = Vec::new();
@@ -1611,7 +1718,7 @@ impl<'a> ValueValidator<'a, '_> {
         path: &FieldPath,
         ancestry: FieldAncestry,
         visited: &mut Vec<&'a str>,
-        assignment: AssignmentCheck<'_, P, B>,
+        assignment: LegacyAssignmentCheck<'_, P, B>,
     ) -> Result<AdmittedUnion<'a>, Box<UnionFailure<'a>>> {
         let mut best_accepted: Option<AdmittedUnion<'a>> = None;
         let mut failure: Option<BestUnionMemberFailures> = None;

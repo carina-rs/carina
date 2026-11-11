@@ -384,7 +384,7 @@ pub struct AdmissionContext<
     proof: AdmissionProof<'a, P, B>,
     bindings: Option<&'a BindingIndex<'a, B>>,
     provider: &'a dyn ProviderTypeCheckContext,
-    assignment: crate::schema::value_validation::AssignmentCheck<'a, P, B>,
+    assignment: crate::schema::value_validation::LegacyAssignmentCheck<'a, P, B>,
     untyped: Option<&'a dyn Fn() -> Vec<TypeError>>,
     declaration: Option<(&'a str, &'a crate::binding_index::DeclaredValueSource)>,
 }
