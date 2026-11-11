@@ -3,6 +3,256 @@ use crate::parser::retained::{ExprValue, judge_expressions};
 use crate::parser::{ProviderContext, TypeExpr};
 use crate::schema::SchemaRegistry;
 
+#[test]
+fn round5_resource_and_data_source_references_do_not_enter_definition_blocks() {
+    for read in [false, true] {
+        let source = format!(
+            "let source = {}mock.Source {{ output = 'unrelated' }}\nmock.Sink {{ input = source.output }}",
+            if read { "read " } else { "" }
+        );
+        let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let mut schemas = SchemaRegistry::new();
+        let source_schema = crate::schema::ResourceSchema::new("Source").attribute(
+            crate::schema::AttributeSchema::optional(
+                "output",
+                crate::schema::AttributeType::string(),
+            )
+            .build(),
+        );
+        schemas.insert(
+            "mock",
+            if read {
+                source_schema.as_data_source()
+            } else {
+                source_schema
+            }
+            .validate()
+            .unwrap(),
+        );
+        schemas.insert(
+            "mock",
+            crate::schema::ResourceSchema::new("Sink")
+                .attribute(
+                    crate::schema::AttributeSchema::optional(
+                        "input",
+                        crate::schema::AttributeType::string(),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let parsed =
+            crate::parser::parse_file(&source, std::path::Path::new("boundary.crn"), &catalog)
+                .unwrap();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let judged = configuration.judged();
+        let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let resource = tree
+            .resources()
+            .find(|resource| resource.id().resource_type == "Sink")
+            .unwrap();
+        let slot = resource.authored_slot("input").unwrap();
+        let schema = resource.schema(&schemas).unwrap();
+        let proof = slot
+            .projection()
+            .unwrap()
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .unwrap()
+            .into_classification();
+        let visits = std::cell::Cell::new(0);
+        let hook = |_: &crate::schema::CompiledAttributeType,
+                    _: crate::schema::value_validation::CheckValue<
+            '_,
+            ParserPlaceholder,
+            RelativeBindingName,
+        >,
+                    _: &crate::schema::LeafPath,
+                    cursor: AuthoredCursor<'_>| {
+            let CursorKind::Authored(usage) = cursor.kind else {
+                panic!("plain resource reference must be authored");
+            };
+            assert!(
+                matches!(usage.node().kind(), ExprKind::Reference { .. }),
+                "{:?}",
+                usage.node().kind()
+            );
+            assert_eq!(usage.edge(), EdgeRole::SlotRoot);
+            visits.set(visits.get() + 1);
+            Ok(Default::default())
+        };
+        let result = crate::schema::value_validation::validate_authored_value_for_admission(
+            &schema.schema().as_schema().attributes()["input"].attr_type,
+            &proof,
+            schema.schema().as_schema().defs(),
+            crate::schema::FieldAncestry::WRITABLE,
+            &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
+            AuthoredCursor::authored(slot.cursor().unwrap()),
+            crate::schema::value_validation::AssignmentCallbacks {
+                ordinary: &|_, _, _, _| Ok(Default::default()),
+                authored: Some(&hook),
+            },
+            &mut Default::default(),
+        );
+        assert!(result.local_error().is_none(), "{result:?}");
+        assert_eq!(visits.get(), 1, "definition blocks are separate admissions");
+    }
+}
+
+#[test]
+fn round5_reference_slot_syntax_inventory() {
+    let source = "let source = mock.Source {}\nmock.Sink { input = source.output }";
+    let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut schemas = SchemaRegistry::new();
+    for (kind, attribute) in [("Source", "output"), ("Sink", "input")] {
+        schemas.insert(
+            "mock",
+            crate::schema::ResourceSchema::new(kind)
+                .attribute(
+                    crate::schema::AttributeSchema::optional(
+                        attribute,
+                        crate::schema::AttributeType::string(),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+    }
+    let parsed =
+        crate::parser::parse_file(source, std::path::Path::new("reference.crn"), &catalog).unwrap();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let judged = configuration.judged();
+    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let resource = tree
+        .resources()
+        .find(|resource| resource.id().resource_type == "Sink")
+        .unwrap();
+    let slot = resource.authored_slot("input").unwrap();
+    let proof = slot
+        .projection()
+        .unwrap()
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .unwrap()
+        .into_classification();
+    let schema = resource.schema(&schemas).unwrap();
+    let visits = std::cell::RefCell::new(Vec::new());
+    let hook = |_: &crate::schema::CompiledAttributeType,
+                _: crate::schema::value_validation::CheckValue<
+        '_,
+        ParserPlaceholder,
+        RelativeBindingName,
+    >,
+                _: &crate::schema::LeafPath,
+                cursor: AuthoredCursor<'_>| {
+        let usage = match cursor.kind {
+            CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => usage,
+            CursorKind::Projected(_) => panic!("projected"),
+        };
+        visits
+            .borrow_mut()
+            .push(format!("{:?}", usage.node().kind()));
+        Ok(Default::default())
+    };
+    let findings = crate::schema::value_validation::validate_authored_value_for_admission(
+        &schema.schema().as_schema().attributes()["input"].attr_type,
+        &proof,
+        schema.schema().as_schema().defs(),
+        crate::schema::FieldAncestry::WRITABLE,
+        &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
+        AuthoredCursor::authored(slot.cursor().unwrap()),
+        crate::schema::value_validation::AssignmentCallbacks {
+            ordinary: &|_, _, _, _| Ok(Default::default()),
+            authored: Some(&hook),
+        },
+        &mut Default::default(),
+    );
+    assert!(findings.local_error().is_none());
+    // source.output is one reference expression; the other grammar levels
+    // introduce no authored syntax and must not become hook positions.
+    assert_eq!(visits.borrow().len(), 1, "{:?}", visits.borrow());
+}
+
+#[test]
+fn round5_union_best_failing_hook_is_retained_once_live_and_discarded() {
+    use crate::schema::value_validation::{
+        AssignmentCallbacks, AssignmentFindings, CheckValue, WalkCoverage,
+        validate_authored_value_for_admission, visit_discarded,
+    };
+    let slot = slot("let input = 'value'");
+    let schema = crate::schema::ResourceSchema::new("Sink")
+        .attribute(
+            crate::schema::AttributeSchema::optional(
+                "input",
+                crate::schema::AttributeType::union(vec![
+                    crate::schema::AttributeType::int(),
+                    crate::schema::AttributeType::string(),
+                ]),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let attr = &schema.as_schema().attributes()["input"].attr_type;
+    let proof = slot
+        .projection()
+        .unwrap()
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .unwrap()
+        .into_classification();
+    let hook = |attr: &crate::schema::CompiledAttributeType,
+                _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                path: &crate::schema::LeafPath,
+                _: AuthoredCursor<'_>| {
+        Ok(AssignmentFindings {
+            errors: vec![(
+                path.clone(),
+                crate::schema::TypeError::MissingRequired {
+                    name: format!("hook: {}", attr.type_name()),
+                },
+            )],
+            ..Default::default()
+        })
+    };
+    let callbacks = AssignmentCallbacks {
+        ordinary: &|_, _, _, _| Ok(Default::default()),
+        authored: Some(&hook),
+    };
+    let mut current = validate_authored_value_for_admission(
+        attr,
+        &proof,
+        schema.as_schema().defs(),
+        crate::schema::FieldAncestry::WRITABLE,
+        &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
+        AuthoredCursor::authored(slot.cursor().unwrap()),
+        callbacks,
+        &mut WalkCoverage::default(),
+    );
+    let current = current.take_assignment();
+    let discarded = visit_discarded(
+        attr,
+        schema.as_schema().defs(),
+        &crate::schema::FieldPath::new(),
+        crate::schema::FieldAncestry::WRITABLE,
+        slot.cursor().unwrap(),
+        callbacks,
+        &mut WalkCoverage::default(),
+    )
+    .unwrap()
+    .authored;
+    for findings in [current, discarded] {
+        assert_eq!(findings.errors.len(), 1, "{findings:?}");
+        assert_eq!(
+            findings.errors[0].1,
+            crate::schema::TypeError::MissingRequired {
+                name: "hook: String".into()
+            }
+        );
+    }
+}
+
 fn slot(source: &str) -> JudgedSlot {
     let parsed = crate::parser::parse_and_resolve(source).unwrap();
     let expressions = parsed.parser_binding_metadata.syntax().expressions();
@@ -66,7 +316,15 @@ fn round1_seam_cursor_steps_do_not_allocate() {
 #[test]
 fn round1_seam_children_are_fallible_instead_of_panicking() {
     let mut slot = slot("let input = 1 + 2");
-    let child = slot.root.children[0].node_id();
+    let child = slot
+        .cursor()
+        .unwrap()
+        .node()
+        .children()
+        .next()
+        .unwrap()
+        .unwrap()
+        .node_id();
     let instance = slot.snapshot.instance.clone();
     Arc::make_mut(&mut Arc::make_mut(&mut slot.snapshot).nodes).remove(&(instance, child));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -132,7 +390,10 @@ fn round1_seam_expansion_records_a_decision_without_a_parse_projection() {
         crate::schema::FieldAncestry::WRITABLE,
         &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
         AuthoredCursor::authored(slot.cursor().unwrap()),
-        &|_, _, _, _| Ok(Default::default()),
+        crate::schema::value_validation::AssignmentCallbacks {
+            ordinary: &|_, _, _, _| Ok(Default::default()),
+            authored: None,
+        },
         &mut Default::default(),
     );
     assert!(findings.local_error().is_none(), "{findings:?}");
@@ -341,7 +602,10 @@ fn walk(source: &str, declaration: crate::schema::AttributeType) -> Vec<Visit> {
         crate::schema::FieldAncestry::WRITABLE,
         &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
         AuthoredCursor::authored(slot.cursor().unwrap()),
-        &check,
+        crate::schema::value_validation::AssignmentCallbacks {
+            ordinary: &check,
+            authored: None,
+        },
         &mut WalkCoverage::default(),
     );
     assert!(findings.local_error().is_none(), "{findings:?}");
@@ -455,7 +719,7 @@ fn seam_walk_computed_results_are_covered_without_visiting_operands() {
 #[test]
 fn seam_computed_operand_evidence_is_paired_by_parser_identity() {
     let mut parsed = crate::parser::parse_and_resolve(
-        "arguments { input: Int }\nmock.Test { value = input + 1 }",
+        "arguments { input: Int }\nmock.Test { value = (input + 1) }",
     )
     .unwrap();
     crate::parser::retained::judge_configuration(
@@ -588,7 +852,10 @@ fn slot_coverage(
             crate::schema::FieldAncestry::WRITABLE,
             &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
             AuthoredCursor::authored(slot.cursor().unwrap()),
-            &|_, _, _, _| Ok(Default::default()),
+            crate::schema::value_validation::AssignmentCallbacks {
+                ordinary: &|_, _, _, _| Ok(Default::default()),
+                authored: None,
+            },
             &mut coverage,
         );
         assert!(findings.local_error().is_none(), "{findings:?}");
@@ -794,7 +1061,10 @@ fn module_instances(condition: &str, rejudge: bool) {
                 crate::schema::FieldAncestry::WRITABLE,
                 &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
                 AuthoredCursor::authored(slot.cursor().unwrap()),
-                &|_, _, _, _| Ok(Default::default()),
+                crate::schema::value_validation::AssignmentCallbacks {
+                    ordinary: &|_, _, _, _| Ok(Default::default()),
+                    authored: None,
+                },
                 &mut coverage,
             );
             assert!(findings.local_error().is_none(), "{findings:?}");
@@ -959,7 +1229,10 @@ fn seam_directory_replacement_keeps_reference_root_and_covers_descendants() {
         crate::schema::FieldAncestry::WRITABLE,
         &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
         AuthoredCursor::authored(slot.cursor().unwrap()),
-        &check,
+        crate::schema::value_validation::AssignmentCallbacks {
+            ordinary: &check,
+            authored: None,
+        },
         &mut Default::default(),
     );
     assert!(result.local_error().is_none(), "{result:?}");
@@ -1058,7 +1331,10 @@ fn seam_schema_block_aliases_keep_the_synthetic_authored_containers() {
         crate::schema::FieldAncestry::WRITABLE,
         &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
         AuthoredCursor::authored(slot.cursor().unwrap()),
-        &|_, _, _, _| Ok(Default::default()),
+        crate::schema::value_validation::AssignmentCallbacks {
+            ordinary: &|_, _, _, _| Ok(Default::default()),
+            authored: None,
+        },
         &mut Default::default(),
     );
     assert!(findings.local_error().is_none(), "{findings:?}");
@@ -1323,7 +1599,10 @@ fn seam_completeness_tracks_the_materialized_slot_generation() {
         crate::schema::FieldAncestry::WRITABLE,
         &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
         AuthoredCursor::authored(slot.cursor().unwrap()),
-        &|_, _, _, _| Ok(Default::default()),
+        crate::schema::value_validation::AssignmentCallbacks {
+            ordinary: &|_, _, _, _| Ok(Default::default()),
+            authored: None,
+        },
         &mut coverage,
     );
     assert!(findings.local_error().is_none(), "{findings:?}");
@@ -1593,7 +1872,10 @@ fn review_seam_false_if_without_else_preserves_absence() {
         crate::schema::FieldAncestry::WRITABLE,
         &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
         AuthoredCursor::authored(slot.cursor().unwrap()),
-        &|_, _, _, _| Ok(Default::default()),
+        crate::schema::value_validation::AssignmentCallbacks {
+            ordinary: &|_, _, _, _| Ok(Default::default()),
+            authored: None,
+        },
         &mut WalkCoverage::default(),
     );
     assert!(findings.local_error().is_none(), "{findings:?}");
@@ -1681,7 +1963,10 @@ fn review_seam_discarded_failure_does_not_cover_the_failed_walk() {
         &crate::schema::FieldPath::new(),
         crate::schema::FieldAncestry::WRITABLE,
         discarded,
-        &check,
+        crate::schema::value_validation::AssignmentCallbacks {
+            ordinary: &check,
+            authored: None,
+        },
         &mut coverage,
     );
     assert!(

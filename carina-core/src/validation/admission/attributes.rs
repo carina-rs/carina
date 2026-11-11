@@ -430,7 +430,9 @@ type ValidationCandidateFactory<'a, P, B> =
 /// source must supply its cursor factory; association failure is never projected.
 enum ValidationInput<'a, P: PlaceholderKind, B: BindingAddress> {
     Classified,
-    Authored {
+    // Producer-owned inputs preserve pairing even on the report-only path.
+    // AttributeInput, not analysis kind, selects the cursor authority.
+    Resource {
         candidate: ValidationCandidateFactory<'a, P, B>,
         coverage: &'a std::cell::RefCell<crate::schema::value_validation::WalkCoverage>,
     },
@@ -466,7 +468,7 @@ fn admit_validation_attributes_with_input<
             ValidationInput::Classified => {
                 Candidate::validation_classified(proof.clone(), bindings, session)
             }
-            ValidationInput::Authored { candidate, .. } => match candidate(name, proof.clone()) {
+            ValidationInput::Resource { candidate, .. } => match candidate(name, proof.clone()) {
                 Ok(input) => input,
                 Err(error) => return admission_findings(&mut Err::<Admission<K, P, B>, _>(error)),
             },
@@ -539,7 +541,7 @@ fn admit_validation_attributes_with_input<
             &untyped,
         );
         let findings = admission_findings(&mut admit(destination, candidate, &boundary));
-        if let ValidationInput::Authored { coverage, .. } = &input {
+        if let ValidationInput::Resource { coverage, .. } = &input {
             coverage.borrow_mut().extend(boundary.coverage.take());
         }
         if proof.failure().is_some() {
@@ -616,6 +618,9 @@ pub fn resource_attribute_admissions<
     schemas: &SchemaRegistry,
     coverage: &mut WalkCoverage,
 ) -> crate::schema::ResourceValueValidation {
+    if let Err(missing) = inputs.authored_evidence() {
+        coverage.no_authored_evidence(missing);
+    }
     let visits = std::cell::RefCell::new(std::mem::take(coverage));
     let findings = if uses_resource_attribute_admission(resource.kind()) {
         typed_resource_attribute_admissions::<kind::ResourceAttribute, _, _, _>(
@@ -989,13 +994,9 @@ fn typed_resource_attribute_admissions<
             )),
         }
     };
-    let input = if resource.kind() == crate::parser::AnalysisItemKind::Composition {
-        ValidationInput::Classified
-    } else {
-        ValidationInput::Authored {
-            candidate: &candidate,
-            coverage,
-        }
+    let input = ValidationInput::Resource {
+        candidate: &candidate,
+        coverage,
     };
     admit_validation_attributes_with_input::<K, _, _>(
         schema,

@@ -497,18 +497,23 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
     let mut checked = match &context.proof {
         AdmissionProof::Validation(proof) => {
             let reference_context = ReferenceContext::from(context);
+            let authored =
+                |attr: &CompiledAttributeType,
+                 checked: crate::schema::value_validation::CheckValue<'_, P, B>,
+                 path: &LeafPath,
+                 cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
+                    match context.assignment.authored {
+                        Some(hook) => hook(attr, checked, &join(&contract.path, path), cursor),
+                        None => Ok(Default::default()),
+                    }
+                };
             let check =
                 |attr: &CompiledAttributeType,
                  checked: crate::schema::value_validation::CheckValue<'_, P, B>,
                  path: &LeafPath,
                  cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
                     let path = join(&contract.path, path);
-                    // Authored policy sees every position before main's
-                    // ordinary selection, value and origin dispatch.
-                    let mut findings = match context.assignment.authored {
-                        Some(hook) => hook(attr, checked, &path, cursor.clone())?,
-                        None => Default::default(),
-                    };
+                    let mut findings = Default::default();
                     // Selection parents are policy-only: main's ordinary local
                     // and reference obligations belong to the selected child.
                     if cursor.is_selection() {
@@ -541,7 +546,10 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 contract.ancestry,
                 &lookup,
                 context.cursor.clone(),
-                &check,
+                crate::schema::value_validation::AssignmentCallbacks {
+                    ordinary: &check,
+                    authored: context.assignment.authored.map(|_| &authored as _),
+                },
                 &mut context.coverage.borrow_mut(),
             )
         }
@@ -553,7 +561,10 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 contract.ancestry,
                 &lookup,
                 context.cursor.clone(),
-                &|_, _, _, _| Ok(Default::default()),
+                crate::schema::value_validation::AssignmentCallbacks {
+                    ordinary: &|_, _, _, _| Ok(Default::default()),
+                    authored: None,
+                },
                 &mut context.coverage.borrow_mut(),
             )
         }
@@ -565,7 +576,10 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 contract.ancestry,
                 &lookup,
                 context.cursor.clone(),
-                &|_, _, _, _| Ok(Default::default()),
+                crate::schema::value_validation::AssignmentCallbacks {
+                    ordinary: &|_, _, _, _| Ok(Default::default()),
+                    authored: None,
+                },
                 &mut context.coverage.borrow_mut(),
             )
         }

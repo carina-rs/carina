@@ -18,6 +18,13 @@ pub struct ResourceAttributeInputs<B: BindingAddress> {
     owner: ResourceId,
     report: Option<Arc<crate::parser::retained::ExpressionReport<B>>>,
     inputs: IndexMap<String, StoredInput<B>>,
+    evidence: ResourceEvidence,
+}
+
+#[derive(Clone)]
+enum ResourceEvidence {
+    Slots,
+    NoAuthoredEvidence(Arc<crate::parser::retained::NoAuthoredEvidence>),
 }
 
 pub(super) enum AttributeInput<'a, B: BindingAddress> {
@@ -111,6 +118,12 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     {
         Self {
             owner: resource.id().clone(),
+            evidence: ResourceEvidence::NoAuthoredEvidence(Arc::new(
+                crate::parser::retained::NoAuthoredEvidence::for_resource(
+                    resource.id(),
+                    resource.authored_slots(),
+                ),
+            )),
             report: Some(Arc::new(report.clone())),
             inputs: values
                 .iter()
@@ -187,9 +200,6 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         let inputs = values
             .map(|(name, value)| {
                 let prepare = || {
-                    if resource.kind() == crate::parser::AnalysisItemKind::Composition {
-                        return Ok(StoredInput::Reported(Arc::new(value.clone())));
-                    }
                     if let Some(phase) = resource.projected_phase(name) {
                         return Ok(StoredInput::Projected {
                             value: Arc::new(value.clone()),
@@ -235,6 +245,25 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             owner: resource.id().clone(),
             report: None,
             inputs,
+            evidence: if resource.authored_declaration_id().is_some() {
+                ResourceEvidence::Slots
+            } else {
+                ResourceEvidence::NoAuthoredEvidence(Arc::new(
+                    crate::parser::retained::NoAuthoredEvidence::for_resource(
+                        resource.id(),
+                        resource.authored_slots(),
+                    ),
+                ))
+            },
+        }
+    }
+
+    /// Input provenance, distinct from candidate sealing or successful admission.
+    /// Report-only inputs never confer authored authority on their source slots.
+    pub fn authored_evidence(&self) -> Result<(), &crate::parser::retained::NoAuthoredEvidence> {
+        match &self.evidence {
+            ResourceEvidence::Slots => Ok(()),
+            ResourceEvidence::NoAuthoredEvidence(missing) => Err(missing),
         }
     }
 

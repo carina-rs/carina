@@ -36,6 +36,12 @@ fn check_report_selection(with_empty_map: bool) {
         judged.report(),
     );
     assert!(std::ptr::eq(selected, resource));
+    let missing = inputs
+        .authored_evidence()
+        .expect_err("report fallback is not authored admission");
+    assert_eq!(missing.resource_id(), resource.id());
+    assert_eq!(missing.slots().len(), 1);
+    assert_eq!(missing.slots()[0].attribute(), "input");
     let bindings =
         carina_core::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &config);
     let admit = |inputs: &ResourceAttributeInputs<_>| {
@@ -74,6 +80,12 @@ fn check_report_selection(with_empty_map: bool) {
     assert_eq!(errors, expected);
     assert_eq!(errors.len(), 1);
     assert!(coverage.is_empty(), "fallback must use report evidence");
+    let completeness = judged.report().completeness_report(&coverage);
+    assert!(
+        completeness
+            .unreached_slots()
+            .any(|slot| slot.resource_id() == resource.id() && slot.attribute() == "input")
+    );
 }
 
 #[test]
@@ -84,6 +96,94 @@ fn round3_lsp_absent_authored_map_selects_report_inputs() {
 #[test]
 fn round3_lsp_empty_authored_map_selects_report_inputs() {
     check_report_selection(true);
+}
+
+#[test]
+fn round5_source_resource_missing_from_report_is_explicitly_unreached() {
+    use carina_core::resource::knowledge::KnowledgeContext;
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let mut schemas = SchemaRegistry::new();
+    for kind in ["Test", "Previous"] {
+        schemas.insert(
+            "mock",
+            ResourceSchema::new(kind)
+                .attribute(AttributeSchema::optional("input", AttributeType::int()).build())
+                .validate()
+                .unwrap(),
+        );
+    }
+    let previous = carina_core::parser::parse_file(
+        "mock.Previous { input = 1 }",
+        std::path::Path::new("buffer.crn"),
+        &config,
+    )
+    .unwrap();
+    let sealed =
+        carina_core::config_loader::load_buffer_configuration(&previous, &schemas, &config);
+    // A newer source resource is being checked against a different sealed
+    // analysis. Its syntax exists, but that report cannot authorize its slots.
+    let current = carina_core::parser::parse_file(
+        "mock.Test { input = 'bad' }",
+        std::path::Path::new("buffer.crn"),
+        &config,
+    )
+    .unwrap();
+    let tree = carina_core::parser::AnalysisTree::try_from_file(&current).unwrap();
+    let resource = tree.resources().next().unwrap();
+    assert!(
+        sealed
+            .judged()
+            .report()
+            .for_resource(resource.id())
+            .is_err()
+    );
+    let map = authored_validation_resources(&tree);
+    let values = resource.resolved_attributes();
+    let (selected, inputs) =
+        select_admission_inputs(resource, Some(&map), &values, sealed.judged().report());
+    let missing = inputs
+        .authored_evidence()
+        .expect_err("source syntax without a matching report is explicitly unavailable");
+    assert_eq!(missing.slots().len(), 1);
+    let classified = inputs.classify(&KnowledgeContext::validation(), |_, error| {
+        panic!("{error}")
+    });
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed(
+        sealed.judged().file(),
+        &schemas,
+        &config,
+    );
+    let mut coverage = Default::default();
+    carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
+        let report = carina_core::validation::admission::attributes::resource_attribute_admissions(
+            selected,
+            sealed.judged().file(),
+            selected.schema(&schemas).unwrap(),
+            &classified,
+            selected.quoted_string_attrs(),
+            &inputs,
+            &bindings,
+            session,
+            &schemas,
+            &mut coverage,
+        );
+        assert_eq!(
+            report.errors().count() + report.symbolic_errors().count(),
+            1,
+            "main's existing type error only: {report:?}"
+        );
+    });
+    let completeness = sealed.judged().report().completeness_report(&coverage);
+    assert!(
+        completeness
+            .unreached_slots()
+            .any(|slot| slot.resource_id() == resource.id() && slot.attribute() == "input")
+    );
+    assert!(
+        coverage.is_empty(),
+        "report-only checks confer no authored coverage"
+    );
 }
 
 #[test]

@@ -67,6 +67,9 @@ fn select_admission_inputs<'r, 'a>(
             .map(|inputs| (resource, inputs))
     }) {
         Some(authored) => authored,
+        // A missing tree/key/report is not evidence that source syntax is
+        // absent. This constructor preserves main's checks and carries typed
+        // NoAuthoredEvidence; admission records its slots as unreached.
         None => (
             resource,
             ResourceAttributeInputs::from_report(resource, values, report),

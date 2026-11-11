@@ -1387,7 +1387,7 @@ where
         }
     }
 
-    fn authored_slots(&self) -> Option<&'a super::retained::AuthoredSlots<B>> {
+    pub(crate) fn authored_slots(&self) -> Option<&'a super::retained::AuthoredSlots<B>> {
         match self.resource {
             ResourceRef::Resource(resource) => Some(&resource.authored_slots),
             ResourceRef::DataSource(source) => Some(&source.authored_slots),

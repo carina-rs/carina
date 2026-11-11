@@ -6,6 +6,9 @@ use crate::schema::{
 use crate::validation::deferred_types::with_session_for_test;
 use std::collections::HashMap;
 
+#[path = "tests/seam_round4.rs"]
+mod seam_round4;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct AdmissionWork {
     candidates: usize,

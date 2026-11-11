@@ -2,8 +2,8 @@
 
 use super::*;
 use crate::parser::retained::{
-    AuthoredCursor, AuthoredForm, AuthoredUse, CursorKind, EdgeRole, ExpansionInstanceId, NodeId,
-    ProjectionGeneration, UseId,
+    AuthoredCursor, AuthoredForm, AuthoredNavigation, AuthoredUse, CursorKind, EdgeRole,
+    ExpansionInstanceId, NodeId, ProjectionGeneration, UseId,
 };
 use crate::resource::ValueKind;
 use crate::resource::knowledge::{KnownView, ShapeView};
@@ -59,8 +59,11 @@ pub(crate) fn cursor_step_allocations(cursor: AuthoredCursor<'_>) -> usize {
     let coverage = Default::default();
     let walk = AssignmentWalk {
         cursor,
-        check: &|_, _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>, _, _| {
-            Ok(Default::default())
+        callbacks: AssignmentCallbacks {
+            ordinary: &|_, _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>, _, _| {
+                Ok(Default::default())
+            },
+            authored: None,
         },
         coverage: &coverage,
     };
@@ -85,6 +88,9 @@ pub(crate) fn cursor_step_allocations(cursor: AuthoredCursor<'_>) -> usize {
 #[derive(Debug)]
 pub(crate) enum CheckValue<'v, P: ValueKind, B: BindingAddress> {
     Current(&'v Value<P, B>),
+    /// Live authored syntax whose lowering belongs to its enclosing expression.
+    /// No operand value is fabricated and ordinary assignment is disabled.
+    Covered,
     Discarded,
 }
 
@@ -102,6 +108,7 @@ pub struct WalkCoverage {
     work: usize,
     generations: std::collections::HashMap<(UseId, ExpansionInstanceId), ProjectionGeneration>,
     nodes: std::collections::HashSet<(NodeId, crate::parser::retained::ExpressionEnvironmentId)>,
+    unavailable: std::collections::HashSet<crate::parser::retained::UnreachedSlot>,
 }
 
 impl WalkCoverage {
@@ -115,10 +122,36 @@ impl WalkCoverage {
     pub(crate) fn extend(&mut self, other: Self) {
         self.visits.extend(other.visits);
         self.nodes.extend(other.nodes);
+        self.unavailable.extend(other.unavailable);
         self.work += other.work;
         for (identity, generation) in other.generations {
             self.bump(identity, generation);
         }
+    }
+
+    pub(crate) fn no_authored_evidence(
+        &mut self,
+        missing: &crate::parser::retained::NoAuthoredEvidence,
+    ) {
+        self.unavailable.extend(missing.slots().iter().cloned());
+    }
+
+    pub(crate) fn unreached_slots(
+        &self,
+    ) -> impl Iterator<Item = &crate::parser::retained::UnreachedSlot> {
+        self.unavailable.iter().filter(|slot| {
+            let generation = self
+                .current_generation(slot.occurrence(), slot.instance())
+                .map_or(slot.generation(), |current| {
+                    current.latest(slot.generation())
+                });
+            !self.visits.contains(&(
+                slot.node_id(),
+                slot.occurrence(),
+                slot.instance(),
+                generation,
+            ))
+        })
     }
 
     pub(crate) fn record<B: BindingAddress>(&mut self, authored: &AuthoredUse<'_, B>) {
@@ -541,6 +574,8 @@ struct CheckedFindings {
     local: Vec<(FieldPath, TypeError)>,
     pub(super) located: Vec<(FieldPath, TypeError)>,
     assignment: AssignmentFindings,
+    // Kept on the probe, separately from main's ordinary assignment work.
+    authored: AssignmentFindings,
     // Other undecided branches have independent primary local errors. Ordinary
     // containers still retain their established first-error CLI precedence.
     additional_local_errors: Vec<TypeError>,
@@ -564,6 +599,7 @@ impl InsideSecret for CheckedFindings {
                 .map(|(path, error)| (path.inside_secret(), error.inside_secret()))
                 .collect(),
             assignment: self.assignment.inside_secret(),
+            authored: self.authored.inside_secret(),
             additional_local_errors: self.additional_local_errors.inside_secret(),
             provider: self.provider.inside_secret(),
         }
@@ -574,6 +610,7 @@ impl InsideSecret for CheckedFindings {
 struct CheckedValue<'a> {
     local: LocalOutcome<Fit<'a>>,
     findings: CheckedFindings,
+    selected: Option<&'a CompiledAttributeType>,
 }
 
 impl InsideSecret for CheckedValue<'_> {
@@ -586,6 +623,7 @@ impl InsideSecret for CheckedValue<'_> {
                 },
             },
             findings: self.findings.inside_secret(),
+            selected: self.selected,
         }
     }
 }
@@ -593,11 +631,13 @@ impl InsideSecret for CheckedValue<'_> {
 struct UnionFailure<'a> {
     local: LocalOutcome<UnionFit<'a>>,
     findings: CheckedFindings,
+    selected: Option<&'a CompiledAttributeType>,
 }
 
 struct UnionProviderFailure<'a> {
     local_fit: UnionFit<'a>,
     provider: Vec<(FieldPath, TypeError)>,
+    authored: AssignmentFindings,
 }
 
 impl<'a> CheckedValue<'a> {
@@ -609,6 +649,7 @@ impl<'a> CheckedValue<'a> {
         Self {
             local: LocalOutcome::Accepted(Fit::with_kind(exactness, attr, kind)),
             findings: Default::default(),
+            selected: Some(attr),
         }
     }
 
@@ -623,6 +664,7 @@ impl<'a> CheckedValue<'a> {
                 local: vec![primary],
                 ..Default::default()
             },
+            selected: None,
         }
     }
 
@@ -682,6 +724,7 @@ impl<'a> CheckedValue<'a> {
 
     fn into_findings(mut self) -> ValueValidationFindings {
         self.retain_primary_finding();
+        self.findings.assignment.extend(self.findings.authored);
         ValueValidationFindings {
             structure: ValueStructure::Scalar,
             local_error: match self.local {
@@ -976,13 +1019,38 @@ pub(crate) type AssignmentCheck<'a, P, B> = &'a dyn Fn(
     AuthoredCursor<'_, B>,
 ) -> Result<AssignmentFindings, TypeError>;
 
+pub(crate) struct AssignmentCallbacks<'a, P: ValueKind, B: BindingAddress> {
+    pub(crate) ordinary: AssignmentCheck<'a, P, B>,
+    pub(crate) authored: Option<AssignmentCheck<'a, P, B>>,
+}
+
+impl<P: ValueKind, B: BindingAddress> Copy for AssignmentCallbacks<'_, P, B> {}
+impl<P: ValueKind, B: BindingAddress> Clone for AssignmentCallbacks<'_, P, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AssignmentProbe {
+    pub(crate) ordinary: AssignmentFindings,
+    pub(crate) authored: AssignmentFindings,
+}
+
+impl AssignmentProbe {
+    fn extend(&mut self, other: Self) {
+        self.ordinary.extend(other.ordinary);
+        self.authored.extend(other.authored);
+    }
+}
+
 /// Cursor and callback travel together, including through union probes. A
 /// structural schema-only walk has no assignment work; live admission always
 /// constructs this complete input.
 #[derive(Clone)]
 struct AssignmentWalk<'a, 's, P: PlaceholderKind, B: BindingAddress> {
     cursor: AuthoredCursor<'s, B>,
-    check: AssignmentCheck<'a, P, B>,
+    callbacks: AssignmentCallbacks<'a, P, B>,
     coverage: &'a std::cell::RefCell<WalkCoverage>,
 }
 
@@ -1005,7 +1073,7 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
         value: CheckValue<'_, P, B>,
         path: &FieldPath,
     ) -> Result<AssignmentFindings, TypeError> {
-        (self.check)(attr, value, &path.canonical(), self.cursor.clone())
+        (self.callbacks.ordinary)(attr, value, &path.canonical(), self.cursor.clone())
     }
 
     fn check_selection(
@@ -1014,7 +1082,57 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
         value: CheckValue<'_, P, B>,
         path: &FieldPath,
     ) -> Result<AssignmentFindings, TypeError> {
-        (self.check)(attr, value, &path.canonical(), self.cursor.selection())
+        (self.callbacks.ordinary)(attr, value, &path.canonical(), self.cursor.selection())
+    }
+
+    fn authored(
+        &self,
+        attr: &CompiledAttributeType,
+        value: CheckValue<'_, P, B>,
+        path: &FieldPath,
+    ) -> Result<AssignmentFindings, TypeError> {
+        if self.cursor.is_projection_only() {
+            return Ok(Default::default());
+        }
+        match self.callbacks.authored {
+            Some(hook) => hook(attr, value, &path.canonical(), self.cursor.clone()),
+            None => Ok(Default::default()),
+        }
+    }
+
+    fn authored_parts(
+        &self,
+        attr: &CompiledAttributeType,
+        defs: &BTreeMap<String, CompiledAttributeType>,
+        path: &FieldPath,
+        ancestry: FieldAncestry,
+    ) -> AssignmentFindings {
+        let mut authored = AssignmentFindings::default();
+        if self.callbacks.authored.is_some()
+            && !self.cursor.is_projection_only()
+            && let CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) = &self.cursor.kind
+            && matches!(usage.navigation(), Ok(AuthoredNavigation::Parts))
+        {
+            for index in 0..usage.child_count() {
+                let result = usage.part(index).map_err(seam_error).and_then(|child| {
+                    visit_syntax(
+                        attr,
+                        defs,
+                        path,
+                        ancestry,
+                        child,
+                        self.callbacks,
+                        &mut self.coverage.borrow_mut(),
+                        SyntaxVisit::Covered,
+                    )
+                });
+                match result {
+                    Ok(probe) => authored.extend(probe.authored),
+                    Err(error) => authored.errors.push((path.canonical(), error)),
+                }
+            }
+        }
+        authored
     }
 
     fn prepare<'v, T: StructuralPending<'v, P, B>>(
@@ -1024,8 +1142,9 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
         value: ClassifiedRef<'_, 'v, P, B, T>,
         path: &FieldPath,
         ancestry: FieldAncestry,
-    ) -> Result<(Self, AssignmentFindings), TypeError> {
-        let mut findings = AssignmentFindings::default();
+    ) -> Result<(Self, AssignmentProbe, Vec<AuthoredCursor<'s, B>>), TypeError> {
+        let mut findings = AssignmentProbe::default();
+        let mut wrappers = Vec::new();
         let mut followed = std::collections::HashSet::new();
         while let CursorKind::Authored(usage) = &self.cursor.kind {
             self.coverage.borrow_mut().record(usage);
@@ -1034,100 +1153,75 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
                     "cyclic authored use",
                 )));
             }
-            self.cursor = match usage.form() {
-                AuthoredForm::Forward if usage.child_count() != 0 => AuthoredCursor::authored(
-                    usage
-                        .child(usage.child_count() - 1, usage.edge())
-                        .map_err(seam_error)?,
-                ),
-                AuthoredForm::Parens => {
-                    AuthoredCursor::authored(usage.parens_operand().map_err(seam_error)?)
+            self.cursor = match usage.navigation().map_err(seam_error)? {
+                AuthoredNavigation::Forward { child, authored } => {
+                    if authored && self.callbacks.authored.is_some() {
+                        wrappers.push(self.cursor.clone());
+                    }
+                    AuthoredCursor::authored(child)
                 }
-                AuthoredForm::Definition => AuthoredCursor::authored(
-                    usage
-                        .child(0, EdgeRole::AliasDefinition)
-                        .map_err(seam_error)?,
-                ),
-                AuthoredForm::Binding => match usage.definition().map_err(seam_error)? {
-                    Some(definition) => AuthoredCursor::authored(definition),
-                    None => break,
-                },
-                AuthoredForm::Computed => self.cursor.covered(),
-                AuthoredForm::If if value.branches().is_none() => {
-                    findings.extend(self.check_selection(
+                AuthoredNavigation::Covered | AuthoredNavigation::Parts => self.cursor.covered(),
+                AuthoredNavigation::Alternatives { first, .. }
+                    if usage.form() == AuthoredForm::If && value.branches().is_none() =>
+                {
+                    findings.ordinary.extend(self.check_selection(
                         attr,
                         CheckValue::Current(value.diagnostic_value()),
                         path,
                     )?);
-                    let selected = if usage.known_condition().map_err(seam_error)? {
-                        1
-                    } else {
-                        2
-                    };
-                    let discarded = if selected == 1 { 2 } else { 1 };
-                    if discarded < usage.child_count() {
-                        let discarded = usage
-                            .child(discarded, EdgeRole::IfBranch)
-                            .map_err(seam_error)?;
-                        let mut coverage = self.coverage.borrow_mut();
+                    if self.callbacks.authored.is_some() {
+                        wrappers.push(self.cursor.selection());
+                    }
+                    let selected = usize::from(!usage.known_condition().map_err(seam_error)?);
+                    let discarded = 1 - selected;
+                    if first + discarded < usage.child_count() {
                         findings.extend(visit_discarded(
                             attr,
                             defs,
                             path,
                             ancestry,
-                            discarded,
-                            self.check,
-                            &mut coverage,
+                            usage.alternative(discarded).map_err(seam_error)?,
+                            self.callbacks,
+                            &mut self.coverage.borrow_mut(),
                         )?);
                     }
-                    if selected == 2 && usage.child_count() == 2 {
-                        // A false structural conditional without else has an
-                        // empty projection, covered by the conditional itself.
-                        self.cursor.covered()
+                    if first + selected == usage.child_count() {
+                        // Main's empty projection for a false if without else.
+                        self.cursor.covered_projection()
                     } else {
-                        AuthoredCursor::authored(
-                            usage
-                                .child(selected, EdgeRole::IfBranch)
-                                .map_err(seam_error)?,
-                        )
+                        AuthoredCursor::authored(usage.alternative(selected).map_err(seam_error)?)
                     }
                 }
-                AuthoredForm::Coalesce if value.coalesce().is_none() => {
-                    findings.extend(self.check_selection(
+                AuthoredNavigation::Alternatives { .. }
+                    if usage.form() == AuthoredForm::Coalesce && value.coalesce().is_none() =>
+                {
+                    findings.ordinary.extend(self.check_selection(
                         attr,
                         CheckValue::Current(value.diagnostic_value()),
                         path,
                     )?);
-                    let discarded = usage
-                        .child(1, EdgeRole::CoalesceOperand)
-                        .map_err(seam_error)?;
-                    let mut coverage = self.coverage.borrow_mut();
+                    if self.callbacks.authored.is_some() {
+                        wrappers.push(self.cursor.selection());
+                    }
                     findings.extend(visit_discarded(
                         attr,
                         defs,
                         path,
                         ancestry,
-                        discarded,
-                        self.check,
-                        &mut coverage,
+                        usage.alternative(1).map_err(seam_error)?,
+                        self.callbacks,
+                        &mut self.coverage.borrow_mut(),
                     )?);
-                    AuthoredCursor::authored(
-                        usage
-                            .child(0, EdgeRole::CoalesceOperand)
-                            .map_err(seam_error)?,
-                    )
+                    AuthoredCursor::authored(usage.alternative(0).map_err(seam_error)?)
                 }
-                AuthoredForm::Forward
-                | AuthoredForm::Literal
-                | AuthoredForm::List
-                | AuthoredForm::Map
-                | AuthoredForm::Secret
-                | AuthoredForm::If
-                | AuthoredForm::Coalesce
-                | AuthoredForm::Reference => break,
+                AuthoredNavigation::Secret(_)
+                | AuthoredNavigation::Alternatives { .. }
+                | AuthoredNavigation::List
+                | AuthoredNavigation::Map
+                | AuthoredNavigation::Leaf => break,
             };
         }
-        Ok((self, findings))
+        Ok((self, findings, wrappers))
     }
 }
 
@@ -1145,7 +1239,7 @@ pub(crate) fn validate_authored_value_for_admission<
     ancestry: FieldAncestry,
     lookup: CustomTypeLookup<'_>,
     cursor: AuthoredCursor<'s, B>,
-    assignment: AssignmentCheck<'_, P, B>,
+    callbacks: AssignmentCallbacks<'_, P, B>,
     coverage: &mut WalkCoverage,
 ) -> ValueValidationFindings {
     let visits = std::cell::RefCell::new(std::mem::take(coverage));
@@ -1158,7 +1252,7 @@ pub(crate) fn validate_authored_value_for_admission<
             &mut Vec::new(),
             Some(AssignmentWalk {
                 cursor,
-                check: assignment,
+                callbacks,
                 coverage: &visits,
             }),
         )
@@ -1180,8 +1274,40 @@ fn step_assignment<'a, 's, P: PlaceholderKind, B: BindingAddress>(
     walk.step(advance).map(Some)
 }
 
+/// One container edge owns its role, correspondence and diagnostic path in
+/// both walks. A map key can never acquire a struct-field path by accident.
+#[derive(Clone, Copy)]
+enum ChildRoute<'k> {
+    ListItem(usize),
+    MapValue(&'k str),
+    StructField {
+        key: &'k str,
+        alias: Option<&'k str>,
+    },
+}
+impl ChildRoute<'_> {
+    fn path(self, parent: &FieldPath) -> FieldPath {
+        match self {
+            Self::ListItem(index) => parent.push_index(index),
+            Self::MapValue(key) => parent.push_map_key(key.to_owned()),
+            Self::StructField { key, .. } => parent.push_field(key.to_owned()),
+        }
+    }
+    fn step<'s, B: BindingAddress>(
+        self,
+        cursor: &AuthoredCursor<'s, B>,
+    ) -> Result<AuthoredCursor<'s, B>, crate::parser::retained::MissingEvidence> {
+        match self {
+            Self::ListItem(index) => cursor.child(index, EdgeRole::ListItem),
+            Self::MapValue(key) => cursor.map_child(key, EdgeRole::MapValue),
+            Self::StructField { key, alias } => cursor.field_child(key, alias),
+        }
+    }
+}
+
 /// Discarded alternatives consume syntax and declarations only. No value is
-/// evaluated, classified, normalized or sent to a provider here.
+/// evaluated, classified, normalized or sent to a provider here. Union probes
+/// own their findings and coverage; only a chosen authored probe survives.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn visit_discarded<P: PlaceholderKind, B: BindingAddress>(
     attr: &CompiledAttributeType,
@@ -1189,141 +1315,263 @@ pub(crate) fn visit_discarded<P: PlaceholderKind, B: BindingAddress>(
     path: &FieldPath,
     ancestry: FieldAncestry,
     cursor: AuthoredUse<'_, B>,
-    assignment: AssignmentCheck<'_, P, B>,
+    callbacks: AssignmentCallbacks<'_, P, B>,
     coverage: &mut WalkCoverage,
-) -> Result<AssignmentFindings, TypeError> {
+) -> Result<AssignmentProbe, TypeError> {
+    visit_syntax(
+        attr,
+        defs,
+        path,
+        ancestry,
+        cursor,
+        callbacks,
+        coverage,
+        SyntaxVisit::Discarded,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum SyntaxVisit {
+    Discarded,
+    DiscardedCovered,
+    Covered,
+}
+impl SyntaxVisit {
+    fn value<'v, P: PlaceholderKind, B: BindingAddress>(self) -> CheckValue<'v, P, B> {
+        match self {
+            Self::Discarded | Self::DiscardedCovered => CheckValue::Discarded,
+            Self::Covered => CheckValue::Covered,
+        }
+    }
+    fn covered(self) -> Self {
+        match self {
+            Self::Discarded => Self::DiscardedCovered,
+            other => other,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_syntax<P: PlaceholderKind, B: BindingAddress>(
+    attr: &CompiledAttributeType,
+    defs: &BTreeMap<String, CompiledAttributeType>,
+    path: &FieldPath,
+    ancestry: FieldAncestry,
+    cursor: AuthoredUse<'_, B>,
+    callbacks: AssignmentCallbacks<'_, P, B>,
+    coverage: &mut WalkCoverage,
+    visit: SyntaxVisit,
+) -> Result<AssignmentProbe, TypeError> {
     fn descend<P: PlaceholderKind, B: BindingAddress>(
         attr: &CompiledAttributeType,
         defs: &BTreeMap<String, CompiledAttributeType>,
         path: &FieldPath,
         ancestry: FieldAncestry,
         cursor: AuthoredUse<'_, B>,
-        assignment: AssignmentCheck<'_, P, B>,
+        callbacks: AssignmentCallbacks<'_, P, B>,
+        visit: SyntaxVisit,
         coverage: &mut WalkCoverage,
-        findings: &mut AssignmentFindings,
+        findings: &mut AssignmentProbe,
         visited: &mut std::collections::HashSet<(NodeId, UseId)>,
     ) -> Result<(), TypeError> {
-        if !visited.insert((cursor.node().node_id(), cursor.occurrence())) {
-            return Ok(());
-        }
-        coverage.record(&cursor);
         let mut references = Vec::new();
         let resolved = resolve_refs_on_path(attr, defs, &mut references)
             .map_err(|error| error.into_validation_error())?;
         let attr = resolved.attr;
-        findings.extend(assignment(
-            attr,
-            CheckValue::Discarded,
-            &path.canonical(),
-            AuthoredCursor::authored(cursor.clone()),
-        )?);
+        let navigation = cursor.navigation().map_err(seam_error)?;
+        if let AuthoredNavigation::Forward {
+            child,
+            authored: false,
+        } = navigation
+        {
+            return descend(
+                attr, defs, path, ancestry, child, callbacks, visit, coverage, findings, visited,
+            );
+        }
+        if let AttrTypeKind::Union(members) = &attr.kind {
+            // Syntax, never a fabricated Value, determines which container
+            // declarations can supply child contracts to this authored probe.
+            let mut shape = cursor.clone();
+            let shape = loop {
+                match shape.navigation().map_err(seam_error)? {
+                    AuthoredNavigation::Forward { child: next, .. }
+                    | AuthoredNavigation::Secret(next) => shape = next,
+                    navigation => break navigation,
+                }
+            };
+            let mut best = None;
+            for member in members.as_raw_slice() {
+                let resolved = resolve_refs_on_path(member, defs, &mut Vec::new())
+                    .map_err(|error| error.into_validation_error())?;
+                let compatible = match &shape {
+                    AuthoredNavigation::List => matches!(
+                        resolved.attr.kind,
+                        AttrTypeKind::List { .. } | AttrTypeKind::Union(_)
+                    ),
+                    AuthoredNavigation::Map => matches!(
+                        resolved.attr.kind,
+                        AttrTypeKind::Map { .. }
+                            | AttrTypeKind::Struct { .. }
+                            | AttrTypeKind::Union(_)
+                    ),
+                    _ => true,
+                };
+                if !compatible {
+                    continue;
+                }
+                let mut probe = AssignmentProbe::default();
+                let mut reached = WalkCoverage::default();
+                descend(
+                    member,
+                    defs,
+                    path,
+                    ancestry,
+                    cursor.clone(),
+                    callbacks,
+                    visit,
+                    &mut reached,
+                    &mut probe,
+                    &mut Default::default(),
+                )?;
+                let rank = (
+                    std::cmp::Reverse(authored_shape_matches(resolved.attr, &cursor)),
+                    probe.ordinary.errors.len() + probe.authored.errors.len(),
+                    std::cmp::Reverse(reached.len()),
+                );
+                if best.as_ref().is_none_or(|(current, _, _)| rank < *current) {
+                    best = Some((rank, probe, reached));
+                }
+            }
+            if let Some((_, probe, reached)) = best {
+                findings.extend(probe);
+                coverage.extend(reached);
+                return Ok(());
+            }
+        }
+        if !visited.insert((cursor.node().node_id(), cursor.occurrence())) {
+            return Ok(());
+        }
+        let visit = if matches!(
+            navigation,
+            AuthoredNavigation::Covered | AuthoredNavigation::Parts
+        ) {
+            visit.covered()
+        } else {
+            visit
+        };
+        let authored = match visit {
+            SyntaxVisit::Discarded => AuthoredCursor::authored(cursor.clone()),
+            SyntaxVisit::DiscardedCovered | SyntaxVisit::Covered => {
+                AuthoredCursor::covered_by(cursor.clone())
+            }
+        };
+        if !matches!(visit, SyntaxVisit::Covered) {
+            findings.ordinary.extend((callbacks.ordinary)(
+                attr,
+                visit.value(),
+                &path.canonical(),
+                authored.clone(),
+            )?);
+        }
+        if let Some(hook) = callbacks.authored {
+            findings
+                .authored
+                .extend(hook(attr, visit.value(), &path.canonical(), authored)?);
+        }
+        coverage.record(&cursor);
         let mut child =
             |attr: &CompiledAttributeType, child: AuthoredUse<'_, B>, path: FieldPath, ancestry| {
                 descend(
-                    attr, defs, &path, ancestry, child, assignment, coverage, findings, visited,
+                    attr, defs, &path, ancestry, child, callbacks, visit, coverage, findings,
+                    visited,
                 )
             };
-        match cursor.form() {
-            AuthoredForm::Forward if cursor.child_count() > 0 => child(
-                attr,
-                cursor
-                    .child(cursor.child_count() - 1, cursor.edge())
-                    .map_err(seam_error)?,
-                path.clone(),
-                ancestry,
-            ),
-            AuthoredForm::Parens => child(
-                attr,
-                cursor.parens_operand().map_err(seam_error)?,
-                path.clone(),
-                ancestry,
-            ),
-            AuthoredForm::Secret => child(
-                attr,
-                cursor
-                    .child(0, EdgeRole::SecretArgument)
-                    .map_err(seam_error)?,
-                path.clone(),
-                ancestry.inside_secret(),
-            ),
-            AuthoredForm::Definition => child(
-                attr,
-                cursor
-                    .child(0, EdgeRole::AliasDefinition)
-                    .map_err(seam_error)?,
-                path.clone(),
-                ancestry,
-            ),
-            AuthoredForm::Binding => match cursor.definition().map_err(seam_error)? {
-                Some(definition) => child(attr, definition, path.clone(), ancestry),
-                None => Ok(()),
-            },
-            AuthoredForm::If | AuthoredForm::Coalesce => {
-                let (start, edge) = if cursor.form() == AuthoredForm::If {
-                    (1, EdgeRole::IfBranch)
-                } else {
-                    (0, EdgeRole::CoalesceOperand)
-                };
-                for index in start..cursor.child_count() {
+        match navigation {
+            AuthoredNavigation::Forward { child: next, .. } => {
+                child(attr, next, path.clone(), ancestry)
+            }
+            AuthoredNavigation::Secret(next) => {
+                child(attr, next, path.clone(), ancestry.inside_secret())
+            }
+            AuthoredNavigation::Alternatives { first, .. } => {
+                for index in 0..cursor.child_count() - first {
                     child(
                         attr,
-                        cursor.child(index, edge).map_err(seam_error)?,
+                        cursor.alternative(index).map_err(seam_error)?,
                         path.clone(),
                         ancestry,
                     )?;
                 }
                 Ok(())
             }
-            AuthoredForm::List => {
-                if let AttrTypeKind::List { element_type, .. } = &attr.kind {
-                    for index in 0..cursor.child_count() {
-                        child(
-                            element_type,
-                            cursor
-                                .child(index, EdgeRole::ListItem)
-                                .map_err(seam_error)?,
-                            path.push_index(index),
-                            ancestry,
-                        )?;
-                    }
+            AuthoredNavigation::List => {
+                let element = match &attr.kind {
+                    AttrTypeKind::List { element_type, .. } => element_type.as_ref(),
+                    _ => attr,
+                };
+                for index in 0..cursor.child_count() {
+                    let route = ChildRoute::ListItem(index);
+                    let CursorKind::Authored(next) = route
+                        .step(&AuthoredCursor::authored(cursor.clone()))
+                        .map_err(seam_error)?
+                        .kind
+                    else {
+                        unreachable!("authored list child")
+                    };
+                    child(element, next, route.path(path), ancestry)?;
                 }
                 Ok(())
             }
-            AuthoredForm::Map => {
+            AuthoredNavigation::Map => {
                 for key in cursor.map_keys() {
-                    let destination = match &attr.kind {
+                    let (declaration, route, ancestry) = match &attr.kind {
                         AttrTypeKind::Map { value, .. } => {
-                            Some((value.as_ref(), EdgeRole::MapValue, ancestry))
+                            (value.as_ref(), ChildRoute::MapValue(key), ancestry)
                         }
                         AttrTypeKind::Struct { fields, .. } => {
-                            struct_field_for_key(fields, key, ancestry).map(|field| {
-                                (
-                                    &field.field_type,
-                                    EdgeRole::StructField,
-                                    ancestry.descend(field),
-                                )
-                            })
+                            let Some(field) = struct_field_for_key(fields, key, ancestry) else {
+                                continue;
+                            };
+                            if validate_struct_field_assignment(field, key, ancestry).is_some() {
+                                continue;
+                            }
+                            (
+                                &field.field_type,
+                                ChildRoute::StructField {
+                                    key,
+                                    alias: ancestry.block_name(field),
+                                },
+                                ancestry.descend(field),
+                            )
                         }
-                        _ => None,
+                        _ => (attr, ChildRoute::MapValue(key), ancestry),
                     };
-                    if let Some((attr, edge, ancestry)) = destination {
-                        child(
-                            attr,
-                            cursor.map_child(key, edge).map_err(seam_error)?,
-                            path.push_field(key),
-                            ancestry,
-                        )?;
-                    }
+                    let CursorKind::Authored(next) = route
+                        .step(&AuthoredCursor::authored(cursor.clone()))
+                        .map_err(seam_error)?
+                        .kind
+                    else {
+                        unreachable!("authored map child")
+                    };
+                    child(declaration, next, route.path(path), ancestry)?;
                 }
                 Ok(())
             }
-            AuthoredForm::Forward
-            | AuthoredForm::Literal
-            | AuthoredForm::Reference
-            | AuthoredForm::Computed => Ok(()),
+            AuthoredNavigation::Parts => {
+                for index in 0..cursor.child_count() {
+                    child(
+                        attr,
+                        cursor.part(index).map_err(seam_error)?,
+                        path.clone(),
+                        ancestry,
+                    )?;
+                }
+                Ok(())
+            }
+            AuthoredNavigation::Leaf | AuthoredNavigation::Covered => Ok(()),
         }
     }
-    let mut findings = AssignmentFindings::default();
+    let mut findings = AssignmentProbe::default();
     let mut completed = WalkCoverage::default();
     descend(
         attr,
@@ -1331,13 +1579,43 @@ pub(crate) fn visit_discarded<P: PlaceholderKind, B: BindingAddress>(
         path,
         ancestry,
         cursor,
-        assignment,
+        callbacks,
+        visit,
         &mut completed,
         &mut findings,
         &mut Default::default(),
     )?;
     coverage.extend(completed);
     Ok(findings)
+}
+
+/// Shape evidence is already judged syntax, not a manufactured discarded
+/// value. It ranks compatible probes without evaluating scalar constraints.
+fn authored_shape_matches<B: BindingAddress>(
+    attr: &CompiledAttributeType,
+    cursor: &AuthoredUse<'_, B>,
+) -> bool {
+    use crate::parser::TypeExpr;
+    let kind = match &attr.kind {
+        AttrTypeKind::Enum { base, .. } => &base.kind,
+        kind => kind,
+    };
+    matches!(
+        (kind, cursor.node().judgement().static_type()),
+        (
+            AttrTypeKind::String { .. }
+                | AttrTypeKind::Reference { .. }
+                | AttrTypeKind::StringLiteralSet { .. },
+            Ok(TypeExpr::String)
+        ) | (AttrTypeKind::Int { .. }, Ok(TypeExpr::Int))
+            | (AttrTypeKind::Float { .. }, Ok(TypeExpr::Float))
+            | (AttrTypeKind::Bool, Ok(TypeExpr::Bool))
+            | (AttrTypeKind::List { .. }, Ok(TypeExpr::List(_)))
+            | (
+                AttrTypeKind::Map { .. } | AttrTypeKind::Struct { .. },
+                Ok(TypeExpr::Map(_))
+            )
+    )
 }
 
 /// The declaration selected by the resource schema walk, including its slot.
@@ -1360,6 +1638,7 @@ pub(crate) struct AttributeAdmission<'a, 'v, P: PlaceholderKind, B: BindingAddre
 struct AdmittedUnion<'a> {
     selected: UnionFit<'a>,
     assignment: AssignmentFindings,
+    authored: AssignmentFindings,
 }
 
 /// Compatibility for the schema's structural-only fixtures. Infallible makes
@@ -1410,12 +1689,12 @@ impl<'a> ValueValidator<'a, '_> {
         visited: &mut Vec<&'a str>,
         assignment: Option<AssignmentWalk<'_, '_, P, B>>,
     ) -> CheckedValue<'a> {
-        let (assignment, extra) = match assignment {
+        let (assignment, extra, wrappers) = match assignment {
             Some(assignment) => match assignment.prepare(attr, self.defs, value, path, ancestry) {
-                Ok((assignment, findings)) => (Some(assignment), findings),
+                Ok((assignment, findings, wrappers)) => (Some(assignment), findings, wrappers),
                 Err(error) => return CheckedValue::rejected(path, error),
             },
-            None => (None, AssignmentFindings::default()),
+            None => (None, AssignmentProbe::default(), Vec::new()),
         };
         let node = match value {
             ClassifiedRef::Known(value) => Some(CheckedNode {
@@ -1445,14 +1724,322 @@ impl<'a> ValueValidator<'a, '_> {
         {
             return checked;
         }
-        let mut checked = self.walk_value(attr, value, path, ancestry, visited, assignment);
-        for (_, error) in &extra.errors {
-            checked.reject(path, error.clone());
-        }
-        checked.findings.assignment.extend(extra);
+        let mut checked = self.walk_value(attr, value, path, ancestry, visited, assignment.clone());
+        self.complete_authored_walk(&mut checked, attr, value, path, assignment, extra, wrappers);
         checked.retain_primary_finding();
         if let Some(node) = node {
             self.checked.borrow_mut().insert(node, checked.clone());
+        }
+        checked
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_authored_walk<
+        'v,
+        P: PlaceholderKind,
+        B: BindingAddress,
+        T: StructuralPending<'v, P, B>,
+    >(
+        &self,
+        checked: &mut CheckedValue<'a>,
+        attr: &'a CompiledAttributeType,
+        value: ClassifiedRef<'_, 'v, P, B, T>,
+        path: &FieldPath,
+        assignment: Option<AssignmentWalk<'_, '_, P, B>>,
+        extra: AssignmentProbe,
+        wrappers: Vec<AuthoredCursor<'_, B>>,
+    ) {
+        let mut authored = AssignmentFindings::default();
+        if let Some(walk) = assignment {
+            for cursor in wrappers {
+                let wrapper = AssignmentWalk {
+                    cursor,
+                    ..walk.clone()
+                };
+                match wrapper.authored(
+                    checked.selected.unwrap_or(attr),
+                    CheckValue::Current(value.diagnostic_value()),
+                    path,
+                ) {
+                    Ok(findings) => authored.extend(findings),
+                    Err(error) => authored.errors.push((path.canonical(), error)),
+                }
+            }
+        }
+        authored.extend(extra.authored);
+        for (_, error) in extra.ordinary.errors.iter().chain(&authored.errors) {
+            checked.reject(path, error.clone());
+        }
+        authored.extend(std::mem::take(&mut checked.findings.authored));
+        checked.findings.authored = authored;
+        checked.findings.assignment.extend(extra.ordinary);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_secret<'v, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'v, P, B>>(
+        &self,
+        attr: &'a CompiledAttributeType,
+        evidence: ClassifiedRef<'_, 'v, P, B, T>,
+        original: &Value<P, B>,
+        path: &FieldPath,
+        ancestry: FieldAncestry,
+        visited: &mut Vec<&'a str>,
+        assignment: Option<AssignmentWalk<'_, '_, P, B>>,
+    ) -> CheckedValue<'a> {
+        let (assignment, wrapper) = match assignment {
+            Some(walk) => match &walk.cursor.kind {
+                CursorKind::Authored(usage) => match usage.navigation().map_err(seam_error) {
+                    Ok(AuthoredNavigation::Secret(next)) => (
+                        Some(AssignmentWalk {
+                            cursor: AuthoredCursor::authored(next),
+                            ..walk.clone()
+                        }),
+                        Some(walk),
+                    ),
+                    Ok(_) => (Some(walk), None),
+                    Err(error) => return CheckedValue::rejected(path, error),
+                },
+                _ => (Some(walk), None),
+            },
+            None => (None, None),
+        };
+        let mut checked = self.walk_with_assignment(
+            attr,
+            evidence,
+            path,
+            ancestry.inside_secret(),
+            visited,
+            assignment,
+        );
+        if let Some(wrapper) = wrapper {
+            let mut authored = match wrapper.authored(
+                checked.selected.unwrap_or(attr),
+                CheckValue::Current(original),
+                path,
+            ) {
+                Ok(findings) => findings,
+                Err(error) => AssignmentFindings {
+                    errors: vec![(path.canonical(), error)],
+                    ..Default::default()
+                },
+            };
+            for (_, error) in &authored.errors {
+                checked.reject(path, error.clone());
+            }
+            authored.extend(std::mem::take(&mut checked.findings.authored));
+            checked.findings.authored = authored;
+        }
+        checked
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_coalesce<
+        'c,
+        'v,
+        P: PlaceholderKind,
+        B: BindingAddress,
+        T: StructuralPending<'v, P, B>,
+    >(
+        &self,
+        attr: &'a CompiledAttributeType,
+        value: ClassifiedRef<'c, 'v, P, B, T>,
+        left_value: ClassifiedRef<'c, 'v, P, B, T>,
+        default: ClassifiedRef<'c, 'v, P, B, T>,
+        path: &FieldPath,
+        ancestry: FieldAncestry,
+        assignment: Option<AssignmentWalk<'_, '_, P, B>>,
+    ) -> CheckedValue<'a> {
+        // A coalesce has an authored assignment of its own. Retain that
+        // judgement while the existing walk checks both classified
+        // alternatives, including their provider callbacks.
+        let parent_authored = match &assignment {
+            Some(walk) => walk.authored(attr, CheckValue::Current(value.diagnostic_value()), path),
+            None => Ok(AssignmentFindings::default()),
+        };
+        let parent_assignment = match &assignment {
+            Some(walk) => walk.check(attr, CheckValue::Current(value.diagnostic_value()), path),
+            None => Ok(AssignmentFindings::default()),
+        };
+        let left_assignment =
+            match step_assignment(assignment.as_ref(), |cursor| cursor.alternative(0)) {
+                Ok(walk) => walk,
+                Err(error) => return CheckedValue::rejected(path, error),
+            };
+        let right_assignment =
+            match step_assignment(assignment.as_ref(), |cursor| cursor.alternative(1)) {
+                Ok(walk) => walk,
+                Err(error) => return CheckedValue::rejected(path, error),
+            };
+        let mut left = self.walk_with_assignment(
+            attr,
+            left_value,
+            path,
+            ancestry,
+            &mut Vec::new(),
+            left_assignment,
+        );
+        let right = self.walk_with_assignment(
+            attr,
+            default,
+            path,
+            ancestry,
+            &mut Vec::new(),
+            right_assignment,
+        );
+        // Deferred coalesces have one authored parent location. Keep the
+        // established primary local diagnostic there, while retaining every
+        // provider finding from the independently known branches.
+        left.findings.local = left
+            .local
+            .error()
+            .or_else(|| right.local.error())
+            .map(|error| vec![(path.clone(), error.clone())])
+            .unwrap_or_default();
+        left.findings.assignment.extend(right.findings.assignment);
+        left.findings.authored.extend(right.findings.authored);
+        left.findings.located.extend(right.findings.located);
+        left.findings.provider.extend(right.findings.provider);
+        left.findings
+            .additional_local_errors
+            .extend(right.findings.additional_local_errors);
+        left.local = match (left.local, right.local) {
+            (LocalOutcome::Accepted(value), LocalOutcome::Accepted(default)) => {
+                let mut exactness = value.exactness;
+                exactness.combine(default.exactness);
+                LocalOutcome::Accepted(Fit::with_kind(
+                    exactness,
+                    attr,
+                    FitKind::Coalesce {
+                        value: Arc::new(value),
+                        default: Arc::new(default),
+                    },
+                ))
+            }
+            (LocalOutcome::Rejected { primary }, _) | (_, LocalOutcome::Rejected { primary }) => {
+                LocalOutcome::Rejected { primary }
+            }
+        };
+        match parent_assignment {
+            Ok(findings) => left.findings.assignment.extend(findings),
+            // A branch's local error is the established primary diagnostic
+            // at this authored coalesce. Do not add its inferred echo.
+            Err(_) if left.local.error().is_some() => {}
+            Err(error) => {
+                left.reject(path, error.clone());
+                left.findings
+                    .assignment
+                    .errors
+                    .push((path.canonical(), error));
+            }
+        }
+        match parent_authored {
+            Ok(mut findings) => {
+                if let Some(walk) = &assignment {
+                    findings.extend(walk.authored_parts(attr, self.defs, path, ancestry));
+                }
+                for (_, error) in &findings.errors {
+                    left.reject(path, error.clone());
+                }
+                findings.extend(std::mem::take(&mut left.findings.authored));
+                left.findings.authored = findings;
+            }
+            Err(error) => {
+                left.reject(path, error.clone());
+                left.findings
+                    .authored
+                    .errors
+                    .push((path.canonical(), error));
+            }
+        }
+        left.selected = Some(attr);
+        left
+    }
+
+    fn walk_branches<
+        'c,
+        'v,
+        P: PlaceholderKind,
+        B: BindingAddress,
+        T: StructuralPending<'v, P, B>,
+    >(
+        &self,
+        attr: &'a CompiledAttributeType,
+        value: ClassifiedRef<'c, 'v, P, B, T>,
+        branches: Vec<ClassifiedRef<'c, 'v, P, B, T>>,
+        path: &FieldPath,
+        ancestry: FieldAncestry,
+        assignment: Option<AssignmentWalk<'_, '_, P, B>>,
+    ) -> CheckedValue<'a> {
+        let ClassifiedRef::Pending(pending) = value else {
+            unreachable!("only an undecided conditional has branches")
+        };
+        let mut checked =
+            CheckedValue::accepted(attr, FitExactness::EXACT, FitKind::Deferred(pending.fit()));
+        if let Some(walk) = &assignment
+            && matches!(&walk.cursor.kind, CursorKind::Authored(usage) if usage.form() == AuthoredForm::If)
+        {
+            let selection = AssignmentWalk {
+                cursor: walk.cursor.selection(),
+                ..walk.clone()
+            };
+            match selection.authored(attr, CheckValue::Current(value.diagnostic_value()), path) {
+                Ok(findings) => checked.findings.authored.extend(findings),
+                Err(error) => return CheckedValue::rejected(path, error),
+            }
+            match walk.check_selection(attr, CheckValue::Current(value.diagnostic_value()), path) {
+                Ok(findings) => checked.findings.assignment.extend(findings),
+                Err(error) => return CheckedValue::rejected(path, error),
+            }
+        }
+        if let Some(walk) = &assignment
+            && !matches!(&walk.cursor.kind, CursorKind::Authored(usage) if usage.form() == AuthoredForm::If)
+        {
+            match walk.authored(attr, CheckValue::Current(value.diagnostic_value()), path) {
+                Ok(findings) => checked.findings.authored.extend(findings),
+                Err(error) => return CheckedValue::rejected(path, error),
+            }
+        }
+        for (index, branch) in branches.into_iter().enumerate() {
+            let branch_assignment =
+                match step_assignment(assignment.as_ref(), |cursor| cursor.alternative(index)) {
+                    Ok(walk) => walk,
+                    Err(error) => return CheckedValue::rejected(path, error),
+                };
+            let branch = self.walk_with_assignment(
+                attr,
+                branch,
+                path,
+                ancestry,
+                &mut Vec::new(),
+                branch_assignment,
+            );
+            // Expansion removes decided ModuleIf values. Every branch
+            // still present here is independently checked in both stages.
+            if let Some(error) = branch.local.error() {
+                if checked.local.error().is_some() {
+                    checked.findings.additional_local_errors.push(error.clone());
+                } else {
+                    checked.reject(path, error.clone());
+                }
+            }
+            checked
+                .findings
+                .assignment
+                .extend(branch.findings.assignment);
+            checked.findings.authored.extend(branch.findings.authored);
+            checked.findings.located.extend(branch.findings.located);
+            checked.findings.local.extend(branch.findings.local);
+            checked
+                .findings
+                .additional_local_errors
+                .extend(branch.findings.additional_local_errors);
+            checked.findings.provider.extend(branch.findings.provider);
+        }
+        if let Some(walk) = &assignment {
+            checked
+                .findings
+                .authored
+                .extend(walk.authored_parts(attr, self.defs, path, ancestry));
         }
         checked
     }
@@ -1467,169 +2054,23 @@ impl<'a> ValueValidator<'a, '_> {
         assignment: Option<AssignmentWalk<'_, '_, P, B>>,
     ) -> CheckedValue<'a> {
         if let Some(inner) = value.protected_for_schema(&SchemaEvidenceAuthority(())) {
-            let assignment = match assignment {
-                Some(walk) => {
-                    let cursor = match &walk.cursor.kind {
-                        CursorKind::Authored(usage) if usage.form() == AuthoredForm::Secret => {
-                            match walk.step(|cursor| cursor.child(0, EdgeRole::SecretArgument)) {
-                                Ok(child) => child,
-                                Err(error) => return CheckedValue::rejected(path, error),
-                            }
-                        }
-                        _ => walk,
-                    };
-                    Some(cursor)
-                }
-                None => None,
-            };
             return inner.validate(|evidence| {
-                self.walk_with_assignment(
+                self.walk_secret(
                     attr,
                     evidence,
+                    value.diagnostic_value(),
                     path,
-                    ancestry.inside_secret(),
+                    ancestry,
                     visited,
                     assignment,
                 )
             });
         }
-        if let Some((left_value, default)) = value.coalesce() {
-            // A coalesce has an authored assignment of its own. Retain that
-            // judgement while the existing walk checks both classified
-            // alternatives, including their provider callbacks.
-            let parent_assignment = match &assignment {
-                Some(walk) => walk.check(attr, CheckValue::Current(value.diagnostic_value()), path),
-                None => Ok(AssignmentFindings::default()),
-            };
-            let left_assignment = match step_assignment(assignment.as_ref(), |cursor| {
-                cursor.child(0, EdgeRole::CoalesceOperand)
-            }) {
-                Ok(walk) => walk,
-                Err(error) => return CheckedValue::rejected(path, error),
-            };
-            let right_assignment = match step_assignment(assignment.as_ref(), |cursor| {
-                cursor.child(1, EdgeRole::CoalesceOperand)
-            }) {
-                Ok(walk) => walk,
-                Err(error) => return CheckedValue::rejected(path, error),
-            };
-            let mut left = self.walk_with_assignment(
-                attr,
-                left_value,
-                path,
-                ancestry,
-                &mut Vec::new(),
-                left_assignment,
-            );
-            let right = self.walk_with_assignment(
-                attr,
-                default,
-                path,
-                ancestry,
-                &mut Vec::new(),
-                right_assignment,
-            );
-            // Deferred coalesces have one authored parent location. Keep the
-            // established primary local diagnostic there, while retaining every
-            // provider finding from the independently known branches.
-            left.findings.local = left
-                .local
-                .error()
-                .or_else(|| right.local.error())
-                .map(|error| vec![(path.clone(), error.clone())])
-                .unwrap_or_default();
-            left.findings.assignment.extend(right.findings.assignment);
-            left.findings.located.extend(right.findings.located);
-            left.findings.provider.extend(right.findings.provider);
-            left.findings
-                .additional_local_errors
-                .extend(right.findings.additional_local_errors);
-            left.local = match (left.local, right.local) {
-                (LocalOutcome::Accepted(value), LocalOutcome::Accepted(default)) => {
-                    let mut exactness = value.exactness;
-                    exactness.combine(default.exactness);
-                    LocalOutcome::Accepted(Fit::with_kind(
-                        exactness,
-                        attr,
-                        FitKind::Coalesce {
-                            value: Arc::new(value),
-                            default: Arc::new(default),
-                        },
-                    ))
-                }
-                (LocalOutcome::Rejected { primary }, _)
-                | (_, LocalOutcome::Rejected { primary }) => LocalOutcome::Rejected { primary },
-            };
-            match parent_assignment {
-                Ok(findings) => left.findings.assignment.extend(findings),
-                // A branch's local error is the established primary diagnostic
-                // at this authored coalesce. Do not add its inferred echo.
-                Err(_) if left.local.error().is_some() => {}
-                Err(error) => {
-                    left.reject(path, error.clone());
-                    left.findings
-                        .assignment
-                        .errors
-                        .push((path.canonical(), error));
-                }
-            }
-            return left;
+        if let Some((left, right)) = value.coalesce() {
+            return self.walk_coalesce(attr, value, left, right, path, ancestry, assignment);
         }
         if let Some(branches) = value.branches() {
-            let ClassifiedRef::Pending(pending) = value else {
-                unreachable!("only an undecided conditional has branches")
-            };
-            let mut checked =
-                CheckedValue::accepted(attr, FitExactness::EXACT, FitKind::Deferred(pending.fit()));
-            if let Some(walk) = &assignment
-                && matches!(&walk.cursor.kind, CursorKind::Authored(usage) if usage.form() == AuthoredForm::If)
-            {
-                match walk.check_selection(
-                    attr,
-                    CheckValue::Current(value.diagnostic_value()),
-                    path,
-                ) {
-                    Ok(findings) => checked.findings.assignment.extend(findings),
-                    Err(error) => return CheckedValue::rejected(path, error),
-                }
-            }
-            for (index, branch) in branches.into_iter().enumerate() {
-                let branch_assignment = match step_assignment(assignment.as_ref(), |cursor| {
-                    cursor.child(index + 1, EdgeRole::IfBranch)
-                }) {
-                    Ok(walk) => walk,
-                    Err(error) => return CheckedValue::rejected(path, error),
-                };
-                let branch = self.walk_with_assignment(
-                    attr,
-                    branch,
-                    path,
-                    ancestry,
-                    &mut Vec::new(),
-                    branch_assignment,
-                );
-                // Expansion removes decided ModuleIf values. Every branch
-                // still present here is independently checked in both stages.
-                if let Some(error) = branch.local.error() {
-                    if checked.local.error().is_some() {
-                        checked.findings.additional_local_errors.push(error.clone());
-                    } else {
-                        checked.reject(path, error.clone());
-                    }
-                }
-                checked
-                    .findings
-                    .assignment
-                    .extend(branch.findings.assignment);
-                checked.findings.located.extend(branch.findings.located);
-                checked.findings.local.extend(branch.findings.local);
-                checked
-                    .findings
-                    .additional_local_errors
-                    .extend(branch.findings.additional_local_errors);
-                checked.findings.provider.extend(branch.findings.provider);
-            }
-            return checked;
+            return self.walk_branches(attr, value, branches, path, ancestry, assignment);
         }
         let resolution = match resolve_refs_on_path(attr, self.defs, visited) {
             Ok(resolution) => resolution,
@@ -1650,6 +2091,52 @@ impl<'a> ValueValidator<'a, '_> {
         visited: &mut Vec<&'a str>,
         assignment: Option<AssignmentWalk<'_, '_, P, B>>,
     ) -> CheckedValue<'a> {
+        // Main's union-level ordinary check remains before member trials.
+        // The authored hook belongs to the chosen member's probe instead.
+        let probes = matches!(attr.kind, AttrTypeKind::Union(_))
+            && !matches!(value, ClassifiedRef::Failed(_))
+            && !matches!(value, ClassifiedRef::Pending(pending) if !pending.arithmetic());
+        let authored = match assignment.as_ref().filter(|_| !probes) {
+            Some(walk) => {
+                match walk.authored(attr, CheckValue::Current(value.diagnostic_value()), path) {
+                    Ok(findings) if !findings.errors.is_empty() => {
+                        let mut checked =
+                            CheckedValue::rejected(path, findings.errors[0].1.clone());
+                        checked.selected = Some(attr);
+                        checked.findings.additional_local_errors.extend(
+                            findings
+                                .errors
+                                .iter()
+                                .skip(1)
+                                .map(|(_, error)| error.clone()),
+                        );
+                        checked.findings.located.extend(findings.errors.iter().map(
+                            |(path, error)| {
+                                (
+                                    FieldPath::from_canonical_segments(
+                                        path.segments().iter().cloned(),
+                                    ),
+                                    error.clone(),
+                                )
+                            },
+                        ));
+                        checked.findings.authored = findings;
+                        return checked;
+                    }
+                    Ok(findings) => findings,
+                    Err(error) => {
+                        let mut checked = CheckedValue::rejected(path, error.clone());
+                        checked
+                            .findings
+                            .authored
+                            .errors
+                            .push((path.canonical(), error));
+                        return checked;
+                    }
+                }
+            }
+            None => Default::default(),
+        };
         let findings = match &assignment {
             Some(walk) => {
                 match walk.check(attr, CheckValue::Current(value.diagnostic_value()), path) {
@@ -1674,6 +2161,8 @@ impl<'a> ValueValidator<'a, '_> {
                             },
                         ));
                         checked.findings.assignment = findings;
+                        checked.findings.authored = authored;
+                        checked.selected = Some(attr);
                         return checked;
                     }
                     Ok(findings) => findings,
@@ -1684,6 +2173,8 @@ impl<'a> ValueValidator<'a, '_> {
                             .assignment
                             .errors
                             .push((path.canonical(), error));
+                        checked.findings.authored = authored;
+                        checked.selected = Some(attr);
                         return checked;
                     }
                 }
@@ -1693,6 +2184,17 @@ impl<'a> ValueValidator<'a, '_> {
         let mut checked =
             self.walk_resolved_value(attr, value, path, ancestry, visited, assignment.clone());
         checked.findings.assignment.extend(findings);
+        let mut authored = authored;
+        if !probes && let Some(walk) = &assignment {
+            authored.extend(walk.authored_parts(attr, self.defs, path, ancestry));
+        }
+        for (_, error) in &authored.errors {
+            checked.reject(path, error.clone());
+        }
+
+        authored.extend(std::mem::take(&mut checked.findings.authored));
+        checked.findings.authored = authored;
+        checked.selected.get_or_insert(attr);
         checked
     }
 
@@ -1753,6 +2255,8 @@ impl<'a> ValueValidator<'a, '_> {
                         },
                     );
                     checked.findings.assignment = admitted.assignment;
+                    checked.findings.authored = admitted.authored;
+                    checked.selected = Some(admitted.selected.member);
                     checked
                 }
                 Err(failure) => CheckedValue {
@@ -1767,6 +2271,7 @@ impl<'a> ValueValidator<'a, '_> {
                         )
                     }),
                     findings: failure.findings,
+                    selected: failure.selected,
                 },
             };
         }
@@ -1784,6 +2289,7 @@ impl<'a> ValueValidator<'a, '_> {
                 Some(fit) => CheckedValue {
                     local: LocalOutcome::Accepted(fit),
                     findings: Default::default(),
+                    selected: Some(attr),
                 },
                 None => CheckedValue::rejected(
                     path,
@@ -1939,13 +2445,18 @@ impl<'a> ValueValidator<'a, '_> {
         let cached = value.map().expect("classified map membership");
         for (key, _value) in map {
             let value = cached[key.as_str()];
-            let child_path = path.push_field(key.clone());
+            let route = ChildRoute::StructField { key, alias: None };
+            let child_path = route.path(path);
             let field = struct_field_for_key(fields, key, ancestry);
             let child = match field {
                 Some(field) => match validate_struct_field_assignment(field, key, ancestry) {
                     Some(error) => CheckedValue::rejected(&child_path, error),
                     None => match step_assignment(assignment.as_ref(), |cursor| {
-                        cursor.field_child(key, ancestry.block_name(field))
+                        ChildRoute::StructField {
+                            key,
+                            alias: ancestry.block_name(field),
+                        }
+                        .step(cursor)
                     }) {
                         Err(error) => CheckedValue::rejected(&child_path, error),
                         Ok(child_assignment) => self.walk_with_assignment(
@@ -1982,6 +2493,7 @@ impl<'a> ValueValidator<'a, '_> {
                 .findings
                 .assignment
                 .extend(child.findings.assignment);
+            checked.findings.authored.extend(child.findings.authored);
             checked.findings.located.extend(child.findings.located);
             checked.findings.local.extend(child.findings.local);
             checked
@@ -2043,7 +2555,8 @@ impl<'a> ValueValidator<'a, '_> {
         let cached = value.map().expect("classified map membership");
         for (map_key, _map_value) in map {
             let map_value = cached[map_key.as_str()];
-            let next_path = path.push_map_key(map_key.clone());
+            let route = ChildRoute::MapValue(map_key);
+            let next_path = route.path(path);
             let key_value: Value<P, B> = lift_map_key(key, map_key, self.defs);
             let key_proof = match key_value
                 .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
@@ -2070,9 +2583,7 @@ impl<'a> ValueValidator<'a, '_> {
                 checked.reject(path, error.clone());
                 checked.findings.push_local(next_path.clone(), error);
             }
-            let child = match step_assignment(assignment.as_ref(), |cursor| {
-                cursor.map_child(map_key, EdgeRole::MapValue)
-            }) {
+            let child = match step_assignment(assignment.as_ref(), |cursor| route.step(cursor)) {
                 Err(error) => CheckedValue::rejected(&next_path, error),
                 Ok(child_assignment) => self.walk_with_assignment(
                     value_type,
@@ -2116,6 +2627,7 @@ impl<'a> ValueValidator<'a, '_> {
                 .findings
                 .assignment
                 .extend(child.findings.assignment);
+            checked.findings.authored.extend(child.findings.authored);
             checked.findings.located.extend(child.findings.located);
             checked.findings.local.extend(
                 child
@@ -2235,6 +2747,7 @@ impl<'a> ValueValidator<'a, '_> {
         }
         for (_, findings) in children {
             checked.findings.assignment.extend(findings.assignment);
+            checked.findings.authored.extend(findings.authored);
             checked.findings.located.extend(findings.located);
             checked.findings.local.extend(findings.local);
             checked
@@ -2277,6 +2790,9 @@ impl<'a> ValueValidator<'a, '_> {
         let mut sibling_provider_errors = Vec::new();
         let mut sibling_local_errors = Vec::new();
         let mut sibling_assignment = AssignmentFindings::default();
+        let mut sibling_authored = AssignmentFindings::default();
+        let mut selected_failure = None;
+        let mut unmatched = None;
         for member in members {
             let checked = self.walk_with_assignment(
                 member,
@@ -2293,6 +2809,7 @@ impl<'a> ValueValidator<'a, '_> {
                         return Ok(AdmittedUnion {
                             selected: UnionFit { member, fit },
                             assignment: checked.findings.assignment,
+                            authored: checked.findings.authored,
                         });
                     }
                     if best_accepted
@@ -2302,6 +2819,7 @@ impl<'a> ValueValidator<'a, '_> {
                         best_accepted = Some(AdmittedUnion {
                             selected: UnionFit { member, fit },
                             assignment: checked.findings.assignment,
+                            authored: checked.findings.authored,
                         });
                     }
                 }
@@ -2315,6 +2833,7 @@ impl<'a> ValueValidator<'a, '_> {
                         Some(best) => {
                             if fit > best.local_fit.fit {
                                 best.local_fit = UnionFit { member, fit };
+                                best.authored = checked.findings.authored;
                             }
                             // Provider-only failures use count and declaration
                             // order, independently of structural/local fit.
@@ -2326,6 +2845,7 @@ impl<'a> ValueValidator<'a, '_> {
                             provider_failure = Some(UnionProviderFailure {
                                 local_fit: UnionFit { member, fit },
                                 provider: checked.findings.provider,
+                                authored: checked.findings.authored,
                             })
                         }
                     }
@@ -2342,6 +2862,7 @@ impl<'a> ValueValidator<'a, '_> {
                 })
                 .unwrap_or_else(UnionMemberJudgement::no_match);
             if !judgement.failure_rank.is_match() {
+                unmatched.get_or_insert((member, checked.findings.authored));
                 continue;
             }
             let candidate = UnionMemberFailure {
@@ -2354,6 +2875,8 @@ impl<'a> ValueValidator<'a, '_> {
                     sibling_provider_errors = checked.findings.provider;
                     sibling_local_errors = checked.findings.additional_local_errors;
                     sibling_assignment = checked.findings.assignment;
+                    sibling_authored = checked.findings.authored;
+                    selected_failure = Some(member);
                 }
                 Some(current) if judgement.failure_rank == current.failure_rank => {
                     current.tied.push(candidate);
@@ -2369,6 +2892,8 @@ impl<'a> ValueValidator<'a, '_> {
                     sibling_provider_errors = checked.findings.provider;
                     sibling_local_errors = checked.findings.additional_local_errors;
                     sibling_assignment = checked.findings.assignment;
+                    sibling_authored = checked.findings.authored;
+                    selected_failure = Some(member);
                 }
             }
         }
@@ -2379,9 +2904,11 @@ impl<'a> ValueValidator<'a, '_> {
         // provider findings of a locally accepted arm, including at a tie.
         if let Some(failure) = provider_failure {
             return Err(Box::new(UnionFailure {
+                selected: Some(failure.local_fit.member),
                 local: LocalOutcome::Accepted(failure.local_fit),
                 findings: CheckedFindings {
                     provider: failure.provider,
+                    authored: failure.authored,
                     ..Default::default()
                 },
             }));
@@ -2401,7 +2928,14 @@ impl<'a> ValueValidator<'a, '_> {
                 value.type_name(),
             ),
         };
+        if selected_failure.is_none()
+            && let Some((member, authored)) = unmatched
+        {
+            selected_failure = Some(member);
+            sibling_authored = authored;
+        }
         Err(Box::new(UnionFailure {
+            selected: selected_failure,
             local: LocalOutcome::Rejected {
                 primary: (path.clone(), error),
             },
@@ -2409,6 +2943,7 @@ impl<'a> ValueValidator<'a, '_> {
                 additional_local_errors: sibling_local_errors,
                 provider: sibling_provider_errors,
                 assignment: sibling_assignment,
+                authored: sibling_authored,
                 ..Default::default()
             },
         }))
@@ -2461,6 +2996,7 @@ impl<'a> ValueValidator<'a, '_> {
         let mut checked = CheckedValue {
             local: LocalOutcome::Accepted(fit),
             findings: Default::default(),
+            selected: Some(attr),
         };
         if let Some(lookup) = self.lookup
             && !has_native_validator(attr)

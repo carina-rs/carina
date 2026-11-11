@@ -49,10 +49,10 @@ fn record_projection_copy(value: &Value<ParserPlaceholder, RelativeBindingName>)
 mod cursor;
 pub use cursor::{
     AuthoredCursor, AuthoredSlots, AuthoredUse, CompletenessReport, EdgeRole, ExpansionInstanceId,
-    JudgedNodeRef, JudgedSlot, NodeId, ProjectedPhase, ProjectionGeneration, SlotDeclarationId,
-    UseId,
+    JudgedNodeRef, JudgedSlot, NoAuthoredEvidence, NodeId, ProjectedPhase, ProjectionGeneration,
+    SlotDeclarationId, UnreachedSlot, UseId,
 };
-pub(crate) use cursor::{AuthoredForm, CursorKind, SyntheticSource};
+pub(crate) use cursor::{AuthoredForm, AuthoredNavigation, CursorKind, SyntheticSource};
 
 /// The expansion scope is part of expression identity, even when two module
 /// instances originate at the same authored source location.
