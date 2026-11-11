@@ -7247,14 +7247,20 @@ async fn test_wasm_invalid_satisfier_hint_is_not_silently_dropped() {
 #[tokio::test(flavor = "multi_thread")]
 async fn wasm_reference_batches_preserve_order_and_all_typed_outcomes() {
     use carina_core::references::{ReferenceError, ReferenceOutcome, ReferenceRequest};
+    use carina_core::test_utils::provider_text::NativeWireFixture;
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
-    let error = serde_json::json!({"kind":"api_error","message":"mock lookup diagnostic","code":"MockDenied","request_id":"request-123"});
+    let error = serde_json::json!({"kind":"api_error","retryability":"unclassified","message":"mock lookup diagnostic","code":"MockDenied","request_id":"request-123"});
+    let retry_error = carina_core::provider::ProviderError::api_error("mock lookup diagnostic")
+        .with_retryability(carina_core::provider_text::Retryability::Transient)
+        .with_code("MockRetry")
+        .with_request_id("request-123")
+        .to_wire();
     let table = serde_json::json!({
         "alias/live":{"Ok":{"Resolved":"key/a"}},
         "gone":{"Ok":{"NotFound":error.clone()}},
         "denied":{"Err":{"AccessDenied":error.clone()}},
-        "retry":{"Err":{"Transient":error.clone()}},
+        "retry":{"Err":{"InvalidReference":retry_error}},
         "invalid":{"Err":{"InvalidReference":error}},
         "empty":{"Ok":{"Resolved":""}}
     });
@@ -7294,11 +7300,11 @@ async fn wasm_reference_batches_preserve_order_and_all_typed_outcomes() {
     ));
     assert!(matches!(
         results.next().unwrap(),
-        Err(ReferenceError::Transient(_))
+        Err(ReferenceError::InvalidReference(error)) if error.is_transient()
     ));
     assert!(matches!(
         results.next().unwrap(),
-        Err(ReferenceError::InvalidReference(_))
+        Err(ReferenceError::InvalidReference(error)) if !error.is_transient()
     ));
     assert!(matches!(
         results.next().unwrap(),
@@ -7436,11 +7442,15 @@ async fn wasm_pattern_modes_preserve_matching_and_reason() {
         for (name, accepts_containing) in [("full", false), ("substring", true)] {
             let ty = schema.parts().attributes[name].attr_type();
             let RawShape::String {
-                identity: _identity,
-                pattern: Some(spec),
-                length: _length,
-                validate: _validate,
-                to_dsl: _to_dsl,
+                identity_layer:
+                    carina_core::schema::StringIdentityParts {
+                        identity: _identity,
+                        pattern: Some(spec),
+                        length: _length,
+                        validate: _validate,
+                        to_dsl: _to_dsl,
+                    },
+                member_layer: _,
             } = ty.raw_shape()
             else {
                 panic!("pattern fixture string");

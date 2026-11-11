@@ -2857,7 +2857,11 @@ fn schema_type_serde_preserves_every_scalar_kind_without_registry() {
         );
         match lifted.raw_shape() {
             crate::schema::RawShape::String {
-                length, pattern, ..
+                identity_layer:
+                    crate::schema::StringIdentityParts {
+                        length, pattern, ..
+                    },
+                ..
             } => {
                 assert_eq!(length, Some((Some(1), Some(64))));
                 assert_eq!(
@@ -2868,7 +2872,10 @@ fn schema_type_serde_preserves_every_scalar_kind_without_registry() {
                     ))
                 );
             }
-            crate::schema::RawShape::Int { range, .. } => {
+            crate::schema::RawShape::Int {
+                identity_layer: crate::schema::IntIdentityParts { range, .. },
+                ..
+            } => {
                 assert_eq!(range, Some((Some(2), Some(42))));
             }
             crate::schema::RawShape::Float { range, .. } => {
@@ -2902,7 +2909,7 @@ fn schema_type_serde_requires_explicit_constraint_record_and_bounds() {
         "missing constraint evidence must never become an unbounded declaration"
     );
     let mut wire = serde_json::to_value(&original).unwrap();
-    wire["SchemaType"]["owned"]["constraints"]["scalar"]["Int"]["range"]
+    wire["SchemaType"]["owned"]["constraints"]["scalar"]["Int"]["identity_range"]
         .as_object_mut()
         .unwrap()
         .remove("min");
@@ -2956,10 +2963,10 @@ fn schema_type_serde_bounded_declaration_validates_constraint_evidence() {
         "/SchemaType/owned/constraints",
         "/SchemaType/owned/constraints/scalar",
         "/SchemaType/owned/constraints/empty_intersection",
-        "/SchemaType/owned/constraints/scalar/String/length",
-        "/SchemaType/owned/constraints/scalar/String/length/min",
-        "/SchemaType/owned/constraints/scalar/String/length/max",
-        "/SchemaType/owned/constraints/scalar/String/patterns",
+        "/SchemaType/owned/constraints/scalar/String/identity_layer/length",
+        "/SchemaType/owned/constraints/scalar/String/identity_layer/length/min",
+        "/SchemaType/owned/constraints/scalar/String/identity_layer/length/max",
+        "/SchemaType/owned/constraints/scalar/String/identity_layer/patterns",
     ] {
         let mut invalid = wire.clone();
         let (parent, field) = pointer.rsplit_once('/').unwrap();
@@ -2976,15 +2983,15 @@ fn schema_type_serde_bounded_declaration_validates_constraint_evidence() {
     }
     for (pointer, value) in [
         (
-            "/SchemaType/owned/constraints/scalar/String/length/min",
+            "/SchemaType/owned/constraints/scalar/String/identity_layer/length/min",
             serde_json::json!({"Inclusive": 65}),
         ),
         (
-            "/SchemaType/owned/constraints/scalar/String/length/min",
+            "/SchemaType/owned/constraints/scalar/String/identity_layer/length/min",
             serde_json::json!({"Inclusive": -1}),
         ),
         (
-            "/SchemaType/owned/constraints/scalar/String/patterns",
+            "/SchemaType/owned/constraints/scalar/String/identity_layer/patterns",
             serde_json::json!(["["]),
         ),
         (

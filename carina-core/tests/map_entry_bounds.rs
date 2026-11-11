@@ -39,7 +39,7 @@ fn map_length_builder_preserves_bounds_and_typed_keys_through_protocol() {
     let json = serde_json::to_value(&wire).unwrap();
     assert_eq!(json["length"], serde_json::json!([0, 10]));
     assert_eq!(
-        json["key"]["pattern"],
+        json["key"]["identity_layer"]["pattern"],
         serde_json::json!({"regex":"^key_[0-9]+$", "mode":{"kind":"full"}})
     );
     let decoded_wire = serde_json::from_value(json).unwrap();

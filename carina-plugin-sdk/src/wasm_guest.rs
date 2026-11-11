@@ -7,8 +7,27 @@
 use carina_provider_protocol::PERSISTED_SECRET_KEY;
 use carina_provider_protocol::types as proto;
 
-/// Flattened transport projections. These records retain text and metadata,
-/// while native typed causes and retry policy remain in the authored values.
+#[cfg(target_arch = "wasm32")]
+use carina_plugin_bindings_diagnostics::carina::provider::types as wit_types;
+
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+pub fn proto_to_wit_retryability(
+    retryability: proto::ProviderErrorRetryability,
+) -> wit_types::ErrorRetryability {
+    match retryability {
+        proto::ProviderErrorRetryability::Unclassified => {
+            wit_types::ErrorRetryability::Unclassified
+        }
+        proto::ProviderErrorRetryability::Transient => wit_types::ErrorRetryability::Transient,
+        proto::ProviderErrorRetryability::DependencyBlocked => {
+            wit_types::ErrorRetryability::DependencyBlocked
+        }
+    }
+}
+
+/// Flattened transport projections. Error records preserve typed retry policy;
+/// native typed causes remain in the authored values.
 pub type EncodedProviderError = proto::ProviderError;
 pub type EncodedPartial = proto::PartialReadDiagnostic;
 pub type EncodedUpdateOutcome = proto::UpdateOutcome;
@@ -1768,6 +1787,7 @@ macro_rules! export_provider {
                     .collect::<std::collections::BTreeSet<_>>();
                 if !sent.is_valid_for(&request_attributes) {
                     return Err(wit_types::ProviderError::Internal(wit_types::ErrorDetail {
+                        retryability: wit_types::ErrorRetryability::Unclassified,
                         message: "WASM boundary rejected pending create with sent attributes outside the request".to_string(),
                         resource_id: None,
                         cause: None,
@@ -1900,6 +1920,7 @@ macro_rules! export_provider {
             }
             fn wire_to_wit_provider_error(err: proto::ProviderError) -> wit_types::ProviderError {
                 let detail = wit_types::ErrorDetail {
+                    retryability: $crate::wasm_guest::proto_to_wit_retryability(err.retryability),
                     message: err.message,
                     resource_id: err.resource_id.as_ref().map(proto_to_wit_resource_id),
                     cause: err.cause,
@@ -1932,6 +1953,7 @@ macro_rules! export_provider {
                 msg: String,
             ) -> wit_types::ProviderError {
                 wit_types::ProviderError::InvalidInput(wit_types::ErrorDetail {
+                    retryability: wit_types::ErrorRetryability::Unclassified,
                     message: msg,
                     resource_id: None,
                     cause: None,
@@ -1954,6 +1976,7 @@ macro_rules! export_provider {
                     |part| format!("{operation} {part}"),
                 );
                 wit_types::ProviderError::Internal(wit_types::ErrorDetail {
+                    retryability: wit_types::ErrorRetryability::Unclassified,
                     message: format!("WASM boundary decode error in {location}: {error}"),
                     resource_id: None,
                     cause: None,
@@ -1980,6 +2003,7 @@ macro_rules! export_provider {
                 error: proto::EmptyAppliedIdentifier,
             ) -> wit_types::ProviderError {
                 wit_types::ProviderError::InvalidInput(wit_types::ErrorDetail {
+                    retryability: wit_types::ErrorRetryability::Unclassified,
                     message: format!(
                         "WASM boundary decode error in {operation} identifier: {error}"
                     ),
@@ -1998,6 +2022,7 @@ macro_rules! export_provider {
                 error: serde_json::Error,
             ) -> wit_types::ProviderError {
                 wit_types::ProviderError::Internal(wit_types::ErrorDetail {
+                    retryability: wit_types::ErrorRetryability::Unclassified,
                     message: format!("WASM boundary decode error in {operation} pending token"),
                     resource_id: None,
                     cause: Some(format!(
@@ -2019,6 +2044,7 @@ macro_rules! export_provider {
                 error: serde_json::Error,
             ) -> wit_types::ProviderError {
                 wit_types::ProviderError::Internal(wit_types::ErrorDetail {
+                    retryability: wit_types::ErrorRetryability::Unclassified,
                     message: format!("WASM boundary encode error in {operation} pending token"),
                     resource_id: None,
                     cause: Some(format!(
@@ -2580,7 +2606,6 @@ macro_rules! export_provider {
                         Ok($crate::types::ReferenceOutcome::Resolved(value)) => Ok(wit_types::ReferenceOutcome::Resolved(value)),
                         Ok($crate::types::ReferenceOutcome::NotFound(error)) => Ok(wit_types::ReferenceOutcome::NotFound(proto_to_wit_provider_error(*error))),
                         Err($crate::types::ReferenceError::AccessDenied(error)) => Err(wit_types::ReferenceError::AccessDenied(proto_to_wit_provider_error(*error))),
-                        Err($crate::types::ReferenceError::Transient(error)) => Err(wit_types::ReferenceError::Transient(proto_to_wit_provider_error(*error))),
                         Err($crate::types::ReferenceError::InvalidReference(error)) => Err(wit_types::ReferenceError::InvalidReference(proto_to_wit_provider_error(*error))),
                     }).collect())
                 }

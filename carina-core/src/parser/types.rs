@@ -333,7 +333,7 @@ fn merge_custom_type_candidates(
                 second_kind: owned.scalar_kind(),
             });
         }
-        declaration = declaration.with_merged_owners(declaration.owners().union(owned.owners()));
+        declaration = declaration.conjoin(owned);
     }
     Ok(Some(declaration))
 }

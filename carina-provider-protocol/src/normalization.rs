@@ -195,6 +195,7 @@ impl From<NormalizationError> for crate::types::ProviderError {
         let cause = (!cause.is_empty()).then_some(cause);
         Self {
             kind: crate::types::ProviderErrorKind::Internal,
+            retryability: crate::types::ProviderErrorRetryability::Unclassified,
             message,
             resource_id: Some(*error.resource_id),
             cause,

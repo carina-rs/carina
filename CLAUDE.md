@@ -579,6 +579,87 @@ A struct type represents a nested object with typed fields.
   `NativeDesiredNormalization`. Keep `ProviderWireError`
   terminal: render its typed conversion reason once, without input values,
   and access the typed reason through `conversion_error()`.
+- **Refinement layers** (carina#4348): protocol 27 and later require
+  separate `identity_layer` and `member_layer` records for String and Int.
+  `StringIdentityLayer`/`IntIdentityLayer` own reusable definitions;
+  `StringMemberConstraints`/`IntMemberConstraints` add declaration-local bounds.
+  `string_member` and `int_member` take these distinct types once and preserve
+  the complete identity. Each String layer has one optional `PatternSpec` and
+  one optional length interval; each Int layer has one optional range. Float
+  is unchanged. Validate the identity pattern then bounds, member pattern then
+  bounds, and finally the semantic callback; retain first-failure diagnostics.
+  Never repeat structural checks in callbacks. Within one provider, every
+  occurrence of a String/Int/Float identity must have the same identity-layer
+  definition (including Float ranges);
+  aggregate admission rejects `ConflictingIdentityDeclarations`. Provider
+  migrations must move resource-specific bounds into the member layer rather
+  than redeclaring an identity with different constraints. Across different
+  owners (for example AWS and AWSCC), annotation constraints are conjoined:
+  values must satisfy every owner's identity layer. Annotation-origin evidence
+  uses an identity-only payload with no member slots. Read-value projections
+  are identity-only too: their typed declarations preserve enum values,
+  reference kind and semantic callbacks but cannot store member constraints.
+  Projection fingerprints cover identity/value metadata, never slot members.
+  Decoding either value-evidence origin with member fields must fail.
+  Native single-owner and multi-owner annotations are distinct
+  forms: a single holds one `SchemaTypeOwner`, and a multi holds a checked map
+  keyed by at least two `SchemaTypeOwner`s. Wire single-owner annotations omit
+  `owner_layers`; multi-owner annotations retain exactly one identity layer per
+  owner. Decoding verifies the exact conjunction of owner layers, including
+  empty bounds from same-owner repeats, and recomputes the empty-intersection
+  marker after Float normalization. Owner sets derive from layer keys. Annotation
+  pattern conjunctions are sorted, deduplicated sets, including same-owner repeats.
+  Structural scalar reads use the same canonical evidence as identity annotations,
+  so equal identity-level types compare and serialize equally. Callbacks,
+  transforms, enums and references retain exact projection provenance.
+  A member layer belongs to its destination slot. Enforce it on writes through
+  identity admission and the deferred destination check; identified source bounds
+  are identity-layer bounds only. Anonymous String/Int declarations retain both
+  layers as structural evidence (matching patterns and intersected bounds). Unannotated collections, conditionals and coalesce
+  require identical `TypeExpr`s, as on main. Reads of slots differing only in
+  member constraints infer equal types. An explicit compatible annotation is
+  the way to accept otherwise mixed declarations; inference never widens them.
+  Enum definition and canonical-spelling disagreements remain typed errors.
+  Enum bases describe definitions, never slots: schema admission rejects String/Int
+  member constraints inside a base with `EnumBaseMemberLayerError`.
+  Built-in and aggregate comparisons accept identity-only typed projections. Exact
+  declarations and their fingerprints preserve both layers. Hover renders
+  both layers through the core's read-only bounded refinement walk, which counts
+  refined String/Int/Reference leaves and structural nodes, including Refs and
+  nested unions. Every emitted position, including an identity-only String/Int,
+  consumes budget. Plain scalar leaves and bare References emit nothing and cost
+  no budget; only actual omissions mark truncation. Anonymous refinements use
+  structural labels with intersected bounds and every pattern rather than
+  identity/member labels; identified leaves show every identity-conjunction
+  pattern. Shared provider docgen
+  must render both layers too. This change needs no WIT change.
+  Schema fingerprints use v13 and saved plans use format 44; format 43 plans
+  must fail the version gate before decoding the payload. Saved module
+  `pending_constraints` contain `ValidateExpr` values, not retained types;
+  replay reloads refinement layers from fingerprint-checked provider schemas.
+  Every typed sink uses the same String/Int identity-admission rule for
+  equal identities and allowed widenings (#4349), including annotations,
+  exports, module arguments, and function parameters/returns. All destination
+  kinds can retain the existing `NeedsLocal` resolved-value obligation. Same-identity
+  value admission, including a declared source, defers overlapping identity bounds
+  to the local check; provably disjoint bounds reject statically. Different-identity
+  widening requires source identity bounds to be contained by destination identity
+  bounds. Strict declaration compatibility retains main's containment checks.
+  Declaration compatibility admits types; only value admission grants placement.
+  `NeedsLocal` exists only in the admission-facing reference relation, requiring
+  a `ReferenceCandidate`; it cannot convert back into general type compatibility.
+  Admission consumes it by registering the existing `LocalPath` on the destination
+  contract. `PendingAdmission::discharge` re-enters `admit_apply`, checking the
+  resolved value against that destination's complete declaration and both layers.
+  Known binding values also enter the destination's ordinary value validator after
+  declaration compatibility. Member String failures keep their structured pattern/
+  length category and label the slot's member constraint; identity failures run first.
+  Int-to-Float widening uses identity-bound
+  containment too. Float retains main's strict range containment and same-identity
+  reference deferral; Enum/unloaded reference leaves retain that deferral too.
+  Unproven regex containment defers to the value check. At annotated sinks,
+  declaration equality and display-name equality do not replace identity
+  admission; mismatch names expose differing constraints or scalar kinds.
 - **Schema field transport**: `StructField` and `AttributeSchema` cross the
   WASM boundary as JSON via the `schemas: func() -> string` WIT export. The
   sole typed core/protocol boundary is `carina_core::protocol_convert`: the SDK
@@ -601,8 +682,8 @@ A struct type represents a nested object with typed fields.
   declarations share the identity's callback set, and separately allocated
   callbacks from repeated type-constructor calls are valid. This is the honest
   current-protocol (`PROTOCOL_VERSION`) behavior: the wire names an identity,
-  not a schema declaration, so the identity is the guest-side type and its
-  constraints are per provider. The current WIT keeps
+  not a schema declaration, for semantic callback dispatch. Structural identity
+  and member constraints are transported separately and checked by the host. The current WIT keeps
   `validate-custom-type(TypeIdentity, string)`: the guest parses canonical text
   with the binding's stored kind, and aggregate schema admission rejects an
   identity reused with another scalar kind. Resource/config schema walks pass
@@ -635,10 +716,12 @@ A struct type represents a nested object with typed fields.
   `Custom` decoder preserves the first outer record's name as the only
   identity, including an empty name; nested `Custom.name` and primitive-base
   identities never fill it in. Enclosing String/int refinements take
-  precedence over nested/base metadata, falling back to the inner metadata
-  only when the enclosing record omits it. Anonymous legacy `Custom` records
-  with a List base remain ordinary refined lists. A named List base is the one
-  intentional legacy-Custom tightening: core cannot retain that enclosing
+  precedence over nested/base identity-layer metadata, falling back to the inner
+  identity metadata only when the enclosing record omits it. Legacy `Custom`
+  has no member layer: a terminal String/Int base with non-empty member metadata
+  is incompatible and returns a typed decode error, regardless of outer fields.
+  Anonymous legacy `Custom` records with a List base remain ordinary refined
+  lists. A named List base is also rejected: core cannot retain that enclosing
   identity, so decode returns a typed error instead of silently dropping it.
   Metadata incompatible with the terminal shape remains a typed error. The
   `ResourceSchema`, `AttributeSchema`, and `StructField` conversions destructure
@@ -755,11 +838,11 @@ A struct type represents a nested object with typed fields.
   across or explicitly bound and documented as unavailable on the destination
   side. Never use a catch-all `_` or `..` at this seam; a silently dropped field
   is invisible in production and cost carina#3034 its effect (carina#3772).
-- **Provider diagnostics** (carina#4334): protocol 25 and WIT package 0.2.0
+- **Provider diagnostics** (carina#4334): protocol 28 and WIT package 0.3.0
   require `diagnostics` and `protected-material` imports in every provider
   world. Component type scanning rejects a legacy package before linking or
   executing any start/info code, naming the found package and the required
-  `carina:provider@0.2.0` and the current host protocol. `ProviderDiagnostics::emit` accepts only typed events borrowing
+  `carina:provider@0.3.0` and the current host protocol. `ProviderDiagnostics::emit` accepts only typed events borrowing
   provider errors/diagnostics or carrying structured value candidates. The
   host binds them through the same private text kernel as returned errors.
   Only that kernel mints `BoundProviderEvent`; its presenter consumes Bound
@@ -840,6 +923,13 @@ A struct type represents a nested object with typed fields.
   schemas. Native OS output
   remains outside this channel. Diagnostics are not persisted and do
   not change the state format.
+- **Provider error retryability** (carina#4350): Provider errors carry a required
+  exclusive retryability class: Unclassified, Transient (including throttling),
+  or DependencyBlocked. Message, cause and code never infer this class; the wire
+  preserves the provider's typed verdict. Reference errors expose only
+  AccessDenied and InvalidReference. Temporary resolution failures use
+  InvalidReference with an inner Transient class; reference variants never
+  encode retryability.
 - **Desired normalization is per leaf** (carina#4194). The normalization opacity policy,
   `carina_core::resource::is_deferred_desired_leaf`, marks every
   `Value::Deferred` leaf (references, unknowns, secrets, other unresolved

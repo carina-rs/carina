@@ -2556,12 +2556,17 @@ mod judgement {
 
     fn assignment_error(expression: &JudgedExpr, sink: &TypeExpr) -> InferenceError {
         InferenceError::UnknownType {
-            reason: format!(
-                "expected {sink}, got {}",
-                expression
-                    .static_type()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|_| "collection".into())
+            reason: expression.static_type().map_or_else(
+                |_| format!("expected {sink}, got collection"),
+                |actual| {
+                    // Expression diagnostics keep authored collection spelling;
+                    // equal nominal names still expand their differing bounds.
+                    if sink.to_string() == actual.to_string() {
+                        crate::schema::MismatchTypeNames::for_type_exprs(sink, actual).to_string()
+                    } else {
+                        format!("expected {sink}, got {actual}")
+                    }
+                },
             ),
         }
     }

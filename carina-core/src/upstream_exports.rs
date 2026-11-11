@@ -5082,7 +5082,10 @@ mod tests {
             "main.crn",
             "arguments { value: test.types.Identifier }\n\
              let item = test.Item {}\n\
-             exports { out = [value, item.identifier] }\n",
+             exports {\n\
+               out = [value, item.identifier]\n\
+               reversed = [item.identifier, value]\n\
+             }\n",
         );
 
         let identity = crate::schema::TypeIdentity::from_schema_type("test", "types", "Identifier");
@@ -5099,24 +5102,22 @@ mod tests {
             ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         });
         let mut schemas = crate::schema::SchemaRegistry::new();
-        schemas.insert(
-            "test",
-            PatternResourceSchema::new("Item")
-                .attribute(
-                    PatternAttributeSchema::optional(
-                        "identifier",
-                        PatternAttributeType::refined_string(
-                            Some(owned.identity().clone()),
-                            None,
-                            None,
-                            None,
-                        ),
-                    )
-                    .build(),
+        let schema = PatternResourceSchema::new("Item")
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "identifier",
+                    PatternAttributeType::refined_string(
+                        Some(owned.identity().clone()),
+                        None,
+                        None,
+                        None,
+                    ),
                 )
-                .validate()
-                .expect("schema fixture must be valid"),
-        );
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid");
+        schemas.insert("test", schema);
 
         let (exports, errors) =
             crate::validation::deferred_types::with_session_for_test(&config, |session| {
@@ -5130,14 +5131,17 @@ mod tests {
             });
 
         assert!(errors.is_empty(), "unexpected resolve errors: {errors:?}");
-        assert_eq!(
-            exports["ups"]["out"].static_type,
-            UpstreamExportType::Static(ExportStaticType::Inferred(consumer_inferred_type(
-                TypeExpr::List(Box::new(TypeExpr::SchemaType {
-                    owned: owned.unbounded_witness_for_test()
-                })),
-            )))
-        );
+        for name in ["out", "reversed"] {
+            assert_eq!(
+                exports["ups"][name].static_type,
+                UpstreamExportType::Static(ExportStaticType::Inferred(consumer_inferred_type(
+                    TypeExpr::List(Box::new(TypeExpr::SchemaType {
+                        owned: owned.clone().unbounded_witness_for_test(),
+                    })),
+                ))),
+                "annotation and attribute reads share one identity-level value type"
+            );
+        }
     }
 
     #[test]

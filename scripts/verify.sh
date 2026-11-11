@@ -158,6 +158,7 @@ run_kind() {
         plan-fixtures) bash scripts/check-plan-fixtures.sh ;;
         rust-cache)
             bash scripts/check-rust-cache-via-local-action.sh
+            bash scripts/test-release-tag-channel.sh
             bash scripts/test-classify-ci-diff.sh
             bash scripts/test-rust-cache-key.sh
             bash scripts/test-verify-sh.sh

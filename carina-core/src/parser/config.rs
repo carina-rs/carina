@@ -22,6 +22,14 @@ pub enum SchemaTypeOwner {
     Provider(String),
 }
 
+impl SchemaTypeOwner {
+    pub fn provider_name(&self) -> &str {
+        match self {
+            Self::Provider(name) => name,
+        }
+    }
+}
+
 /// A set of schema owners that is non-empty by construction and decoding.
 ///
 /// Authored type names describe a semantic [`TypeIdentity`], not a factory.
@@ -47,6 +55,14 @@ impl NonEmptySchemaTypeOwners {
 
     pub fn is_singleton(&self) -> bool {
         self.0.len() == 1
+    }
+
+    pub(crate) fn single_owner(&self) -> Option<&SchemaTypeOwner> {
+        if self.is_singleton() {
+            self.0.first()
+        } else {
+            None
+        }
     }
 
     pub fn contains(&self, owner: &SchemaTypeOwner) -> bool {
@@ -208,9 +224,12 @@ impl OwnedTypeIdentity {
         }
     }
 
-    pub(crate) fn with_merged_owners(&self, owners: NonEmptySchemaTypeOwners) -> Self {
+    /// Merge catalog routing keys, which carry no constraint evidence. The
+    /// catalog groups these keys by identity and kind. Constraint-bearing
+    /// ResolvedSchemaType values merge only through their own conjoin method.
+    pub(crate) fn conjoin(&self, other: &Self) -> Self {
         Self {
-            owners,
+            owners: self.owners.union(other.owners()),
             declaration: self.declaration.clone(),
         }
     }
@@ -244,13 +263,16 @@ impl OwnedTypeIdentity {
     #[cfg(test)]
     pub(crate) fn unbounded_witness_for_test(self) -> ResolvedSchemaType {
         let declared = self.scalar_kind().identified_type(self.identity().clone());
-        ResolvedSchemaType(std::sync::Arc::new(ResolvedScalarDeclaration {
-            constraints: super::scalar_constraints::ScalarConstraints::from_declaration(&declared)
-                .unwrap(),
-            owned: self,
-            projection: None,
-            projection_fingerprint: None,
-        }))
+        let mut result: Option<ResolvedSchemaType> = None;
+        for owner in self.provider_names() {
+            let declaration =
+                ResolvedSchemaType::from_annotation_declaration(owner, &declared).unwrap();
+            result = Some(match result {
+                Some(existing) => existing.conjoin(&declaration),
+                None => declaration,
+            });
+        }
+        result.expect("nonempty owners")
     }
 
     pub fn owners(&self) -> &NonEmptySchemaTypeOwners {
@@ -258,9 +280,7 @@ impl OwnedTypeIdentity {
     }
 
     pub fn provider_names(&self) -> impl Iterator<Item = &str> {
-        self.owners.iter().map(|owner| match owner {
-            SchemaTypeOwner::Provider(owner) => owner.as_str(),
-        })
+        self.owners.iter().map(SchemaTypeOwner::provider_name)
     }
 
     pub fn identity(&self) -> &TypeIdentity {
@@ -295,9 +315,10 @@ impl OwnedTypeIdentity {
 }
 
 /// Opaque resolved scalar-declaration evidence for an annotation or an exact
-/// schema projection. Catalog annotations conjoin every declaration of every
-/// owner; exact projections retain only their own declaration. Shared storage
-/// keeps compiled patterns out of catalog keys and makes nested lifting cheap.
+/// value projection. Catalog annotations conjoin every declaration of every
+/// owner; value projections retain identity-layer metadata and semantic
+/// provenance. Shared storage keeps compiled patterns out of catalog keys and
+/// makes nested lifting cheap.
 ///
 /// ```compile_fail
 /// use carina_core::parser::{OwnedTypeIdentity, ResolvedSchemaType};
@@ -309,8 +330,8 @@ pub struct ResolvedSchemaType(std::sync::Arc<ResolvedScalarDeclaration>);
 #[derive(Debug, Clone)]
 struct ResolvedScalarDeclaration {
     owned: OwnedTypeIdentity,
-    constraints: super::scalar_constraints::ScalarConstraints,
-    projection: Option<AttributeType>,
+    evidence: ResolvedConstraintEvidence,
+    projection: Option<super::value_type::ValueTypeDeclaration>,
     // Portable declaration provenance. Decoding retains this key until the
     // catalog can rebind the exact host declaration, including its callback.
     projection_fingerprint: Option<String>,
@@ -320,23 +341,109 @@ struct ResolvedScalarDeclaration {
 // retains callback dispatch provenance without making closures part of equality.
 impl PartialEq for ResolvedScalarDeclaration {
     fn eq(&self, other: &Self) -> bool {
-        self.owned == other.owned && self.constraints == other.constraints
+        self.owned == other.owned
+            && self.evidence == other.evidence
+            && self.projection_fingerprint == other.projection_fingerprint
     }
 }
 impl Eq for ResolvedScalarDeclaration {}
 
+/// Origins carry distinct typed payloads. A projection owns one schema owner;
+/// annotation constraints own either a single owner or a checked owner map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedConstraintEvidence {
+    Annotation(super::scalar_constraints::IdentityConstraints),
+    Projection {
+        owner: SchemaTypeOwner,
+        constraints: super::scalar_constraints::ValueConstraints,
+    },
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
-enum ResolvedDeclarationOrigin {
-    Annotation,
-    Projection,
+#[serde(tag = "origin", content = "constraints")]
+enum ResolvedConstraintEvidenceWire {
+    Annotation(super::scalar_constraints::IdentityConstraintsWire),
+    Projection(super::scalar_constraints::ValueConstraints),
+}
+
+impl ResolvedConstraintEvidenceWire {
+    fn bind(
+        self,
+        owners: &NonEmptySchemaTypeOwners,
+    ) -> Result<ResolvedConstraintEvidence, &'static str> {
+        match self {
+            Self::Annotation(wire) => wire
+                .bind(owners)
+                .map(ResolvedConstraintEvidence::Annotation),
+            Self::Projection(mut constraints) => {
+                constraints.validate_record()?;
+                let owner = owners
+                    .single_owner()
+                    .ok_or("an exact schema projection must have one owner")?
+                    .clone();
+                Ok(ResolvedConstraintEvidence::Projection { owner, constraints })
+            }
+        }
+    }
+}
+
+impl ResolvedConstraintEvidence {
+    fn kind(&self) -> RefinedScalarKind {
+        match self {
+            Self::Annotation(c) => c.kind(),
+            Self::Projection {
+                owner: _,
+                constraints,
+            } => constraints.kind(),
+        }
+    }
+
+    fn to_wire(&self) -> ResolvedConstraintEvidenceWire {
+        match self {
+            Self::Annotation(c) => ResolvedConstraintEvidenceWire::Annotation(c.to_wire()),
+            Self::Projection {
+                owner: _,
+                constraints,
+            } => ResolvedConstraintEvidenceWire::Projection(constraints.clone()),
+        }
+    }
+
+    fn identity_constraints(&self) -> super::scalar_constraints::IdentityConstraints {
+        match self {
+            Self::Annotation(c) => c.clone(),
+            Self::Projection { owner, constraints } => {
+                constraints.identity_constraints(owner.clone())
+            }
+        }
+    }
+
+    fn materialize(&self, owned: &ResolvedSchemaType) -> AttributeType {
+        match self {
+            Self::Annotation(c) => c.materialize(owned),
+            Self::Projection {
+                owner: _,
+                constraints,
+            } => constraints.materialize(owned),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Annotation(c) => c.is_empty(),
+            Self::Projection {
+                owner: _,
+                constraints,
+            } => constraints.is_empty(),
+        }
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ResolvedSchemaTypeWire {
     #[serde(flatten)]
     owned: OwnedTypeIdentity,
-    constraints: super::scalar_constraints::ScalarConstraints,
-    origin: ResolvedDeclarationOrigin,
+    #[serde(flatten)]
+    evidence: ResolvedConstraintEvidenceWire,
     projection_fingerprint: Option<String>,
 }
 
@@ -344,12 +451,7 @@ impl serde::Serialize for ResolvedSchemaType {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         ResolvedSchemaTypeWire {
             owned: self.0.owned.clone(),
-            constraints: self.0.constraints.clone(),
-            origin: if self.0.projection_fingerprint.is_some() {
-                ResolvedDeclarationOrigin::Projection
-            } else {
-                ResolvedDeclarationOrigin::Annotation
-            },
+            evidence: self.0.evidence.to_wire(),
             projection_fingerprint: self.0.projection_fingerprint.clone(),
         }
         .serialize(serializer)
@@ -358,29 +460,28 @@ impl serde::Serialize for ResolvedSchemaType {
 
 impl<'de> serde::Deserialize<'de> for ResolvedSchemaType {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut wire = ResolvedSchemaTypeWire::deserialize(deserializer)?;
-        if wire.owned.scalar_kind() != wire.constraints.kind() {
+        let wire = ResolvedSchemaTypeWire::deserialize(deserializer)?;
+        let evidence = wire
+            .evidence
+            .bind(wire.owned.owners())
+            .map_err(serde::de::Error::custom)?;
+        if wire.owned.scalar_kind() != evidence.kind() {
             return Err(serde::de::Error::custom(
                 "schema type scalar kind must match its constraints",
             ));
         }
-        wire.constraints
-            .validate_record()
-            .map_err(serde::de::Error::custom)?;
-        match wire.origin {
-            ResolvedDeclarationOrigin::Annotation => {
+        match &evidence {
+            ResolvedConstraintEvidence::Annotation(_) => {
                 if wire.projection_fingerprint.is_some() {
                     return Err(serde::de::Error::custom(
                         "an annotation cannot carry exact projection provenance",
                     ));
                 }
             }
-            ResolvedDeclarationOrigin::Projection => {
-                if !wire.owned.owners().is_singleton() {
-                    return Err(serde::de::Error::custom(
-                        "an exact schema projection must have one owner",
-                    ));
-                }
+            ResolvedConstraintEvidence::Projection {
+                owner: _,
+                constraints: _,
+            } => {
                 if !wire
                     .projection_fingerprint
                     .as_ref()
@@ -397,7 +498,7 @@ impl<'de> serde::Deserialize<'de> for ResolvedSchemaType {
         }
         Ok(Self(std::sync::Arc::new(ResolvedScalarDeclaration {
             owned: wire.owned,
-            constraints: wire.constraints,
+            evidence,
             projection: None,
             projection_fingerprint: wire.projection_fingerprint,
         })))
@@ -416,13 +517,40 @@ impl ResolvedSchemaType {
         owner: impl Into<String>,
         declaration: &AttributeType,
     ) -> Option<Self> {
+        let owner = owner.into();
+        let projection = super::value_type::ValueTypeDeclaration::from_declaration(declaration)?;
+        if !projection.requires_exact_provenance() {
+            return Self::from_annotation_declaration(owner, declaration);
+        }
+        let fingerprint = projection.fingerprint();
         Some(Self(std::sync::Arc::new(ResolvedScalarDeclaration {
-            owned: OwnedTypeIdentity::from_schema_declaration(owner, declaration)?,
-            constraints: super::scalar_constraints::ScalarConstraints::from_declaration(
-                declaration,
-            )?,
-            projection: Some(declaration.clone()),
-            projection_fingerprint: Some(declaration.declaration_fingerprint()),
+            owned: OwnedTypeIdentity::from_schema_declaration(owner.clone(), declaration)?,
+            evidence: ResolvedConstraintEvidence::Projection {
+                owner: SchemaTypeOwner::Provider(owner),
+                constraints: super::scalar_constraints::ValueConstraints::from_declaration(
+                    declaration,
+                )?,
+            },
+            projection: Some(projection),
+            projection_fingerprint: Some(fingerprint),
+        })))
+    }
+
+    pub(crate) fn from_annotation_declaration(
+        owner: impl Into<String>,
+        declaration: &AttributeType,
+    ) -> Option<Self> {
+        let owner = owner.into();
+        Some(Self(std::sync::Arc::new(ResolvedScalarDeclaration {
+            owned: OwnedTypeIdentity::from_schema_declaration(owner.clone(), declaration)?,
+            evidence: ResolvedConstraintEvidence::Annotation(
+                super::scalar_constraints::IdentityConstraints::from_declaration(
+                    SchemaTypeOwner::Provider(owner),
+                    declaration,
+                )?,
+            ),
+            projection: None,
+            projection_fingerprint: None,
         })))
     }
 
@@ -437,22 +565,36 @@ impl ResolvedSchemaType {
     pub(crate) fn conjoin(&self, other: &Self) -> Self {
         assert_eq!(self.identity(), other.identity());
         assert_eq!(self.scalar_kind(), other.scalar_kind());
-        let mut constraints = self.0.constraints.clone();
-        constraints.intersect(&other.0.constraints);
+        let constraints = self
+            .0
+            .evidence
+            .identity_constraints()
+            .conjoin(&other.0.evidence.identity_constraints());
         Self(std::sync::Arc::new(ResolvedScalarDeclaration {
-            owned: self
-                .0
-                .owned
-                .with_merged_owners(self.owners().union(other.owners())),
-            constraints,
+            owned: OwnedTypeIdentity {
+                owners: constraints.owners(),
+                declaration: self.0.owned.declaration.clone(),
+            },
+            evidence: ResolvedConstraintEvidence::Annotation(constraints),
             projection: None,
             projection_fingerprint: None,
         }))
     }
 
     pub(crate) fn into_annotation(mut self) -> Self {
-        std::sync::Arc::make_mut(&mut self.0).projection = None;
-        std::sync::Arc::make_mut(&mut self.0).projection_fingerprint = None;
+        if matches!(
+            self.0.evidence,
+            ResolvedConstraintEvidence::Projection {
+                owner: _,
+                constraints: _
+            }
+        ) {
+            let declaration = std::sync::Arc::make_mut(&mut self.0);
+            declaration.evidence =
+                ResolvedConstraintEvidence::Annotation(declaration.evidence.identity_constraints());
+            declaration.projection = None;
+            declaration.projection_fingerprint = None;
+        }
         self
     }
 
@@ -461,32 +603,67 @@ impl ResolvedSchemaType {
         config: &ProviderContext,
     ) -> Result<Option<AttributeType>, CustomTypeValidationError> {
         match (&self.0.projection, &self.0.projection_fingerprint) {
-            (Some(declaration), _) => Ok(Some(declaration.clone())),
-            (None, Some(_)) => config.custom_types.projection_declaration(self).map(Some),
+            (Some(declaration), _) => Ok(Some(declaration.materialize())),
+            (None, Some(_)) => {
+                let declaration = config.custom_types.projection_declaration(self)?;
+                let value = super::value_type::ValueTypeDeclaration::from_declaration(&declaration)
+                    .ok_or_else(|| CustomTypeValidationError::MissingDeclaration {
+                        owner: self
+                            .provider_names()
+                            .next()
+                            .expect("nonempty owners")
+                            .into(),
+                        identity: self.identity().clone(),
+                    })?;
+                Ok(Some(value.materialize()))
+            }
             (None, None) => Ok(None),
         }
     }
 
     pub(crate) fn matches_projection_declaration(&self, declaration: &AttributeType) -> bool {
+        let ResolvedConstraintEvidence::Projection {
+            owner: _,
+            constraints,
+        } = &self.0.evidence
+        else {
+            return false;
+        };
         self.0
             .projection_fingerprint
             .as_ref()
             .is_some_and(|fingerprint| {
-                *fingerprint == declaration.declaration_fingerprint()
-                    && super::scalar_constraints::ScalarConstraints::from_declaration(declaration)
+                super::value_type::ValueTypeDeclaration::from_declaration(declaration)
+                    .is_some_and(|value| *fingerprint == value.fingerprint())
+                    && super::scalar_constraints::ValueConstraints::from_declaration(declaration)
                         .as_ref()
-                        == Some(&self.0.constraints)
+                        == Some(constraints)
             })
     }
 
     pub(crate) fn materialize(&self) -> AttributeType {
-        self.0.constraints.materialize(self)
+        self.0.evidence.materialize(self)
     }
+    pub(crate) fn owner_patterns(&self) -> impl Iterator<Item = &crate::schema::CompiledPattern> {
+        let (annotation, projection) = match &self.0.evidence {
+            ResolvedConstraintEvidence::Annotation(constraints) => (Some(constraints), None),
+            ResolvedConstraintEvidence::Projection {
+                owner: _,
+                constraints,
+            } => (None, Some(constraints)),
+        };
+        annotation
+            .into_iter()
+            .flat_map(super::scalar_constraints::IdentityConstraints::owner_patterns)
+            .chain(
+                projection
+                    .into_iter()
+                    .flat_map(super::scalar_constraints::ValueConstraints::patterns),
+            )
+    }
+
     pub(crate) fn has_empty_intersection(&self) -> bool {
-        self.0.constraints.is_empty()
-    }
-    pub(crate) fn patterns(&self) -> impl Iterator<Item = &crate::schema::CompiledPattern> {
-        self.0.constraints.patterns()
+        self.0.evidence.is_empty()
     }
 }
 
@@ -802,6 +979,9 @@ impl PartialEq for CustomTypeValidationError {
         }
     }
 }
+
+// All variants compare reflexive, immutable diagnostic metadata.
+impl Eq for CustomTypeValidationError {}
 
 impl CustomTypeValidationError {
     pub(crate) fn diagnostic_shape(&self) -> crate::schema::ValidationDiagnostic<'_> {

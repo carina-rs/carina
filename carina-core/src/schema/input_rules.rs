@@ -903,14 +903,24 @@ fn admit_literal<R: PatternForm>(
     let ty = peel_refs(ty, defs).ok_or(InputRuleError::UnknownPath)?;
     let matches = match (&ty.kind, literal) {
         (AttrTypeKind::Bool, InputLiteral::Bool(_)) => true,
-        (AttrTypeKind::Int { binding, range }, InputLiteral::Int(value)) => {
-            super::validate_scalar_refinement(
-                binding,
-                crate::resource::ConcreteValueRef::<crate::resource::NoPlaceholder>::Int(*value),
-                || super::validate_int_range(*range, *value),
-            )
-            .is_ok()
-        }
+        (
+            AttrTypeKind::Int {
+                identity_layer: crate::schema::IntIdentityLayer { binding, range },
+                member_layer:
+                    crate::schema::IntMemberConstraints {
+                        range: member_range,
+                    },
+            },
+            InputLiteral::Int(value),
+        ) => super::validate_scalar_refinement(
+            binding,
+            crate::resource::ConcreteValueRef::<crate::resource::NoPlaceholder>::Int(*value),
+            || {
+                super::validate_int_range(*range, *value)?;
+                super::validate_int_range(*member_range, *value)
+            },
+        )
+        .is_ok(),
         (AttrTypeKind::Float { binding, range }, InputLiteral::Float(value)) => {
             super::validate_scalar_refinement(
                 binding,
@@ -921,14 +931,27 @@ fn admit_literal<R: PatternForm>(
         }
         (
             AttrTypeKind::String {
-                binding,
-                pattern,
-                length,
-                ..
+                identity_layer:
+                    crate::schema::StringIdentityLayer {
+                        binding,
+                        pattern,
+                        length,
+                        to_dsl: _,
+                    },
+                member_layer:
+                    crate::schema::StringMemberConstraints {
+                        pattern: member_pattern,
+                        length: member_length,
+                    },
             },
             InputLiteral::String(value),
         ) => {
             let pattern = pattern
+                .as_ref()
+                .map(|pattern| CompiledPattern::try_new(pattern.as_ref()))
+                .transpose()
+                .map_err(|_| InputRuleError::LiteralTypeMismatch)?;
+            let member_pattern = member_pattern
                 .as_ref()
                 .map(|pattern| CompiledPattern::try_new(pattern.as_ref()))
                 .transpose()
@@ -938,10 +961,12 @@ fn admit_literal<R: PatternForm>(
                 binding,
                 crate::resource::ConcreteValueRef::<crate::resource::NoPlaceholder>::String(&value),
                 || {
-                    super::validate_string_refinement(
-                        binding.identity(),
+                    super::validate_string_layers(
+                        binding,
                         pattern.as_ref(),
                         *length,
+                        member_pattern.as_ref(),
+                        *member_length,
                         &value,
                     )
                 },
@@ -1103,10 +1128,13 @@ mod scalar_literal_tests {
         let annotation = first.conjoin(&second).into_annotation();
         let annotated = AttributeType {
             kind: AttrTypeKind::String {
-                binding: RefinementBinding::Annotation(annotation),
-                pattern: None,
-                length: None,
-                to_dsl: None,
+                identity_layer: crate::schema::StringIdentityLayer {
+                    binding: RefinementBinding::Annotation(annotation),
+                    pattern: None,
+                    length: None,
+                    to_dsl: None,
+                },
+                member_layer: Default::default(),
             },
         };
         for (text, valid) in [("ab", false), ("bz", false), ("az", true)] {
@@ -1148,8 +1176,11 @@ mod scalar_literal_tests {
         assert!(annotation.has_empty_intersection());
         let annotated = AttributeType {
             kind: AttrTypeKind::Int {
-                binding: RefinementBinding::Annotation(annotation),
-                range: None,
+                identity_layer: crate::schema::IntIdentityLayer {
+                    binding: RefinementBinding::Annotation(annotation),
+                    range: None,
+                },
+                member_layer: Default::default(),
             },
         };
         assert_eq!(
@@ -1164,5 +1195,103 @@ mod scalar_literal_tests {
             .unwrap();
         let value: Value = Value::Concrete(ConcreteValue::Int(2));
         assert!(compiled.validate(&value).is_err());
+    }
+
+    #[test]
+    fn condition_literals_enforce_both_refinement_layers() {
+        use crate::schema::{
+            IntIdentityLayer, IntMemberConstraints, StringIdentityLayer, StringMemberConstraints,
+        };
+        let string = AttributeType::string_member(
+            StringIdentityLayer::new(
+                Some(TypeIdentity::bare("Name")),
+                Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                Some((Some(2), Some(100))),
+                None,
+            ),
+            StringMemberConstraints::new(
+                Some(PatternSpec::new("a.*", PatternMatch::Full)),
+                Some((Some(2), Some(4))),
+            ),
+        );
+        for (text, valid) in [
+            ("az", true),
+            ("zz", false),
+            ("a", false),
+            ("abbbb", false),
+            ("AB", false),
+        ] {
+            assert_eq!(
+                admit_literal(
+                    &string,
+                    &InputLiteral::String(text.into()),
+                    &Default::default()
+                )
+                .is_ok(),
+                valid,
+                "{text}"
+            );
+        }
+        let integer = AttributeType::int_member(
+            IntIdentityLayer::new(
+                Some(TypeIdentity::bare("Count")),
+                Some((Some(1), Some(100))),
+            ),
+            IntMemberConstraints::new(Some((Some(10), Some(20)))),
+        );
+        for (value, valid) in [(5, false), (15, true), (25, false), (101, false)] {
+            assert_eq!(
+                admit_literal(&integer, &InputLiteral::Int(value), &Default::default()).is_ok(),
+                valid,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn condition_literals_and_values_run_the_callback_once_after_the_member_layer() {
+        use crate::schema::{StringIdentityLayer, StringMemberConstraints};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let ty = AttributeType::string_member(
+            StringIdentityLayer::with_validator(
+                TypeIdentity::bare("Name"),
+                None,
+                Some((Some(1), Some(100))),
+                Arc::new(move |_| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+                None,
+            ),
+            StringMemberConstraints::new(None, Some((Some(1), Some(10)))),
+        );
+        let compiled = ty
+            .clone()
+            .compile_patterns(
+                SchemaValidationIssueLocation::Attribute("name".into()),
+                &mut vec![],
+            )
+            .unwrap();
+        for (text, valid) in [("short".to_string(), true), ("a".repeat(50), false)] {
+            calls.store(0, Ordering::SeqCst);
+            assert_eq!(
+                admit_literal(
+                    &ty,
+                    &InputLiteral::String(text.clone()),
+                    &Default::default()
+                )
+                .is_ok(),
+                valid
+            );
+            assert_eq!(calls.swap(0, Ordering::SeqCst), usize::from(valid));
+            let value: Value = Value::Concrete(ConcreteValue::String(text.into()));
+            assert_eq!(compiled.validate(&value).is_ok(), valid);
+            assert_eq!(calls.swap(0, Ordering::SeqCst), usize::from(valid));
+        }
     }
 }

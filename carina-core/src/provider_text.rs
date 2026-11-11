@@ -145,7 +145,7 @@ use std::borrow::Borrow;
 use std::fmt;
 use std::ops::Deref;
 
-use carina_provider_protocol::is_default_ignorable;
+use carina_provider_protocol::{is_default_ignorable, types as protocol_types};
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Maximum stored diagnostic size, including a truncation marker.
@@ -287,7 +287,30 @@ impl From<ProviderText> for ProviderContext {
 pub enum Retryability {
     #[default]
     Unclassified,
+    /// A temporary failure, including throttling, that may be retried.
     Transient,
+    /// Deletion must wait for a dependent resource to go away.
+    DependencyBlocked,
+}
+
+impl From<protocol_types::ProviderErrorRetryability> for Retryability {
+    fn from(retryability: protocol_types::ProviderErrorRetryability) -> Self {
+        match retryability {
+            protocol_types::ProviderErrorRetryability::Unclassified => Self::Unclassified,
+            protocol_types::ProviderErrorRetryability::Transient => Self::Transient,
+            protocol_types::ProviderErrorRetryability::DependencyBlocked => Self::DependencyBlocked,
+        }
+    }
+}
+
+impl From<Retryability> for protocol_types::ProviderErrorRetryability {
+    fn from(retryability: Retryability) -> Self {
+        match retryability {
+            Retryability::Unclassified => Self::Unclassified,
+            Retryability::Transient => Self::Transient,
+            Retryability::DependencyBlocked => Self::DependencyBlocked,
+        }
+    }
 }
 
 impl ProviderText {
@@ -336,20 +359,6 @@ impl ProviderText {
         }
         stream.flush(&mut |chunk| text.push_str(chunk));
         RedactedProviderText(text)
-    }
-    pub(crate) fn has_throttling_marker(&self) -> bool {
-        self.0.iter().any(|part| match part {
-            OpaquePart::Text(text) => crate::provider::has_throttling_marker(text),
-            OpaquePart::Protected { text, .. } => text.has_throttling_marker(),
-            OpaquePart::Status(_) => false,
-        })
-    }
-    pub(crate) fn has_delete_dependency_marker(&self) -> bool {
-        self.0.iter().any(|part| match part {
-            OpaquePart::Text(text) => crate::provider::has_delete_dependency_marker(text),
-            OpaquePart::Protected { text, .. } => text.has_delete_dependency_marker(),
-            OpaquePart::Status(_) => false,
-        })
     }
     pub fn with_context(&self, context: impl Into<ProviderContext>) -> Self {
         let mut text = context.into().0;
@@ -1761,6 +1770,20 @@ fn validation_frame(shape: crate::schema::ValidationDiagnostic<'_>) -> Option<Op
         | ValidationDiagnostic::HiddenChild { .. }) => Some(OpaqueFrame::ValidationCategory(shape)),
     }
 }
+
+fn cause_retryability(error: &(dyn std::error::Error + 'static)) -> Retryability {
+    let mut node = Some(ProviderCause::new(error, RedactionContext::default()));
+    while let Some(cause) = node {
+        if let Some(frame) = opaque_frame(cause.error) {
+            // Verdict-bearing Carina frames decide, including Unclassified;
+            // pass-through frames delegate to their child in retryability().
+            return frame.retryability();
+        }
+        node = cause.source();
+    }
+    Retryability::Unclassified
+}
+
 impl<'a> OpaqueFrame<'a> {
     fn text<S: TextState>(&self) -> ErrorText<S> {
         match self {
@@ -1797,15 +1820,27 @@ impl<'a> OpaqueFrame<'a> {
             Self::Validation(error) => error.retryability(),
             Self::ValidationCategory(shape) => match shape {
                 crate::schema::ValidationDiagnostic::Reason { reason, .. } => reason.retryability(),
-                crate::schema::ValidationDiagnostic::Child { .. }
-                | crate::schema::ValidationDiagnostic::Alternatives(_)
-                | crate::schema::ValidationDiagnostic::HiddenChild { .. }
-                | crate::schema::ValidationDiagnostic::Plain(_) => Retryability::Unclassified,
+                crate::schema::ValidationDiagnostic::Child { child, .. }
+                | crate::schema::ValidationDiagnostic::HiddenChild { child, .. } => {
+                    cause_retryability(*child)
+                }
+                crate::schema::ValidationDiagnostic::Alternatives(arms) => {
+                    Self::Alternatives(arms).retryability()
+                }
+                crate::schema::ValidationDiagnostic::Plain(_) => Retryability::Unclassified,
             },
-            Self::Alternatives(_) => Retryability::Unclassified,
+            Self::Alternatives(arms) => {
+                let mut classes = arms.iter().map(|arm| cause_retryability(arm));
+                let first = classes.next().unwrap_or(Retryability::Unclassified);
+                if classes.all(|class| class == first) {
+                    first
+                } else {
+                    Retryability::Unclassified
+                }
+            }
             Self::Dispatch(error) => match error {
                 crate::provider::CustomTypeDispatchError::Validation(category) => {
-                    ProviderDiagnostic::new(category.as_ref().clone()).retryability()
+                    cause_retryability(category.as_ref())
                 }
                 crate::provider::CustomTypeDispatchError::Undeclared(_)
                 | crate::provider::CustomTypeDispatchError::Decode(_) => Retryability::Unclassified,
@@ -1941,20 +1976,7 @@ impl<S: TextState> Diagnostic<S> {
     pub(crate) fn capture_host_or_provider(
         error: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
-        let mut node = Some(ProviderCause::new(&error, RedactionContext::default()));
-        let mut retryability = Retryability::Unclassified;
-        while let Some(cause) = node {
-            if let Some(frame) = opaque_frame(cause.error) {
-                match frame.retryability() {
-                    Retryability::Unclassified => {}
-                    Retryability::Transient => {
-                        retryability = Retryability::Transient;
-                        break;
-                    }
-                }
-            }
-            node = cause.source();
-        }
+        let retryability = cause_retryability(&error);
         let text = Self::capture(&error);
         Self::captured(error, text, retryability)
     }
@@ -2010,13 +2032,6 @@ impl<S: TextState> Diagnostic<S> {
     pub(crate) fn known_secrets(&self) -> Option<RedactionSet> {
         self.text.known_secrets()
     }
-    pub(crate) fn has_throttling_marker(&self) -> bool {
-        self.text.opaque().has_throttling_marker()
-    }
-    pub(crate) fn has_delete_dependency_marker(&self) -> bool {
-        self.text.opaque().has_delete_dependency_marker()
-    }
-
     /// Type-only inspection cannot reveal a provider cause's contents.
     pub fn is<T: std::error::Error + 'static>(&self) -> bool {
         self.error.is::<T>()
@@ -3084,6 +3099,7 @@ mod tests {
         )
         .with_operation("private-password")
         .with_code("DependencyViolation")
+        .with_retryability(Retryability::DependencyBlocked)
         .with_request_id("private-password")
         .for_resource(crate::resource::ResourceId::with_identity(
             "test",
@@ -3111,9 +3127,15 @@ mod tests {
         assert!(encoded.contains("(secret)"));
         let coded = ProviderError::api_error("public")
             .with_code("DependencyViolation")
+            .with_retryability(Retryability::DependencyBlocked)
             .with_secrets(&secrets);
         assert!(coded.is_delete_dependency());
-        assert!(!coded.with_code("other").is_delete_dependency());
+        assert!(coded.clone().with_code("other").is_delete_dependency());
+        assert!(
+            !coded
+                .with_retryability(Retryability::Unclassified)
+                .is_delete_dependency()
+        );
     }
 
     #[test]
@@ -3171,6 +3193,7 @@ mod tests {
             std::io::Error::other(cause.clone()),
         )
         .with_code(message.clone())
+        .with_retryability(Retryability::DependencyBlocked)
         .with_secrets(&RedactionSet::for_test(&[]));
         let wire = error.to_wire();
         assert_eq!(wire.code.as_deref(), Some(message.as_str()));

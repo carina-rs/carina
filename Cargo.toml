@@ -23,7 +23,7 @@ exclude = ["vendor"]
 resolver = "2"
 
 [workspace.package]
-version = "0.13.1"
+version = "0.14.0"
 repository = "https://github.com/carina-rs/carina"
 homepage = "https://github.com/carina-rs/carina"
 publish = false

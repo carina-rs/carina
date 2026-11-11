@@ -2793,19 +2793,19 @@ mod explicit_pattern_mode_tests {
             serde_json::from_str(&provider_schema_to_json(&witness).unwrap()).unwrap();
         let attrs = &json["resources"][0]["attributes"];
         assert_eq!(
-            attrs["full"]["attr_type"]["pattern"],
+            attrs["full"]["attr_type"]["identity_layer"]["pattern"],
             serde_json::json!({"regex":"abc", "mode":{"kind":"full"}})
         );
         assert_eq!(
-            attrs["substring"]["attr_type"]["pattern"],
+            attrs["substring"]["attr_type"]["identity_layer"]["pattern"],
             serde_json::json!({"regex":"abc", "mode":{"kind":"substring", "reason":"The upstream contract permits surrounding text"}})
         );
         let config_json: serde_json::Value =
             serde_json::from_str(&provider_config_schema_to_json(&config).unwrap()).unwrap();
         for name in ["full", "substring"] {
             assert_eq!(
-                config_json[name]["pattern"],
-                attrs[name]["attr_type"]["pattern"]
+                config_json[name]["identity_layer"]["pattern"],
+                attrs[name]["attr_type"]["identity_layer"]["pattern"]
             );
         }
     }
@@ -2921,36 +2921,48 @@ mod error_composition_tests {
 
     #[test]
     fn sdk_error_authoring_retains_cause_until_encoding() {
-        let error = types::ProviderError::api_error_caused_by(
-            "outer",
-            carina_core::provider::ProviderError::timeout_caused_by(
-                "inner",
-                std::io::Error::other("typed leaf"),
-            )
-            .with_retryability(Retryability::Transient),
-        );
-        assert!(error.is_transient());
-        assert!(
-            error
-                .detail()
-                .cause()
-                .unwrap()
-                .source_is::<std::io::Error>()
-        );
         use carina_core::test_utils::provider_text::NativeWireFixture;
-        let decoded = error.round_trip();
-        let wire = wasm_guest::encode_provider_error(error);
-        assert_eq!(wire.message, "outer");
-        assert_eq!(wire.cause.as_deref(), Some("inner: typed leaf"));
-        assert_eq!(decoded.retryability(), Retryability::Unclassified);
-        assert!(
-            !decoded
-                .detail()
-                .cause()
-                .unwrap()
-                .as_cause()
-                .matches_for_test::<std::io::Error>(|_| true)
-        );
+        for (retryability, wire_retryability) in [
+            (
+                Retryability::Transient,
+                carina_provider_protocol::types::ProviderErrorRetryability::Transient,
+            ),
+            (
+                Retryability::DependencyBlocked,
+                carina_provider_protocol::types::ProviderErrorRetryability::DependencyBlocked,
+            ),
+        ] {
+            let error = types::ProviderError::api_error_caused_by(
+                "outer",
+                carina_core::provider::ProviderError::timeout_caused_by(
+                    "inner",
+                    std::io::Error::other("typed leaf"),
+                )
+                .with_retryability(retryability),
+            );
+            assert_eq!(error.retryability(), retryability);
+            assert!(
+                error
+                    .detail()
+                    .cause()
+                    .unwrap()
+                    .source_is::<std::io::Error>()
+            );
+            let decoded = error.round_trip();
+            let wire = wasm_guest::encode_provider_error(error);
+            assert_eq!(wire.retryability, wire_retryability);
+            assert_eq!(wire.message, "outer");
+            assert_eq!(wire.cause.as_deref(), Some("inner: typed leaf"));
+            assert_eq!(decoded.retryability(), retryability);
+            assert!(
+                !decoded
+                    .detail()
+                    .cause()
+                    .unwrap()
+                    .as_cause()
+                    .matches_for_test::<std::io::Error>(|_| true)
+            );
+        }
     }
 }
 

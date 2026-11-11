@@ -56,6 +56,147 @@ fn find_use_import_path(
     None
 }
 
+fn refinement_hover(walk: carina_core::schema::RefinementPositions<'_>) -> String {
+    use carina_core::schema::{
+        PatternSpecDisplay, RefinementPathSegment, Shape, format_refinement_bounds,
+    };
+    let mut content = String::new();
+    for position in walk.positions() {
+        let mut refinements = String::new();
+        let shape = position.value_type().shape();
+        let identity = match &shape {
+            Shape::Reference {
+                identity,
+                pattern: _,
+                length: _,
+            } => Some(*identity),
+            Shape::String {
+                identity_layer,
+                member_layer: _,
+            } => identity_layer.identity,
+            Shape::Int {
+                identity_layer,
+                member_layer: _,
+            } => identity_layer.identity,
+            _ => None,
+        };
+        if let Some(identity) = identity {
+            refinements.push_str(&format!("\n- **Identity**: `{identity}`"));
+        }
+        match shape {
+            Shape::Reference {
+                identity: _,
+                pattern,
+                length,
+            } => {
+                if let Some(spec) = pattern {
+                    refinements.push_str(&format!(
+                        "\n- **Identity pattern**: {}",
+                        PatternSpecDisplay::new(spec)
+                    ));
+                }
+                if let Some(bounds) = length.map(format_refinement_bounds) {
+                    refinements.push_str(&format!("\n- **Identity length**: {bounds}"));
+                }
+            }
+            Shape::String {
+                identity_layer,
+                member_layer,
+            } => {
+                let mut patterns = position.value_type().identity_patterns();
+                if identity.is_some() {
+                    for spec in patterns {
+                        refinements.push_str(&format!(
+                            "\n- **Identity pattern**: {}",
+                            PatternSpecDisplay::new(spec)
+                        ));
+                    }
+                    if let Some(spec) = member_layer.pattern {
+                        refinements.push_str(&format!(
+                            "\n- **Member pattern**: {}",
+                            PatternSpecDisplay::new(spec)
+                        ));
+                    }
+                    for (label, length) in [
+                        ("Identity length", identity_layer.length),
+                        ("Member length", member_layer.length),
+                    ] {
+                        if let Some(bounds) = length.map(format_refinement_bounds) {
+                            refinements.push_str(&format!("\n- **{label}**: {bounds}"));
+                        }
+                    }
+                } else {
+                    patterns.extend(member_layer.pattern);
+                    if !patterns.is_empty() {
+                        let conjunction = patterns
+                            .into_iter()
+                            .map(|spec| PatternSpecDisplay::new(spec).to_string())
+                            .collect::<Vec<_>>()
+                            .join(" AND ");
+                        refinements.push_str(&format!("\n- **Pattern**: {conjunction}"));
+                    }
+                    if let Some(bounds) = carina_core::schema::intersect_bounds(
+                        identity_layer.length,
+                        member_layer.length,
+                    )
+                    .map(format_refinement_bounds)
+                    {
+                        refinements.push_str(&format!("\n- **Length**: {bounds}"));
+                    }
+                }
+            }
+            Shape::Int {
+                identity_layer,
+                member_layer,
+            } => {
+                if identity.is_some() {
+                    for (label, range) in [
+                        ("Identity range", identity_layer.range),
+                        ("Member range", member_layer.range),
+                    ] {
+                        if let Some(bounds) = range.map(format_refinement_bounds) {
+                            refinements.push_str(&format!("\n- **{label}**: {bounds}"));
+                        }
+                    }
+                } else if let Some(bounds) =
+                    carina_core::schema::intersect_bounds(identity_layer.range, member_layer.range)
+                        .map(format_refinement_bounds)
+                {
+                    refinements.push_str(&format!("\n- **Range**: {bounds}"));
+                }
+            }
+            _ => {}
+        }
+        if refinements.is_empty() {
+            continue;
+        }
+        if !position.path().is_empty() {
+            let label = position
+                .path()
+                .iter()
+                .map(|segment| match segment {
+                    RefinementPathSegment::Field(name) => format!("Field `{name}`"),
+                    RefinementPathSegment::ListElement => "List element".into(),
+                    RefinementPathSegment::MapKey => "Map key".into(),
+                    RefinementPathSegment::MapValue => "Map value".into(),
+                    RefinementPathSegment::UnionMember(index) => format!("Union member {index}"),
+                    RefinementPathSegment::EnumBase => "Enum base".into(),
+                })
+                .collect::<Vec<_>>()
+                .join(" → ");
+            content.push_str(&format!(
+                "\n\n**{label}** (`{}`):",
+                position.value_type().as_type()
+            ));
+        }
+        content.push_str(&refinements);
+    }
+    if walk.is_truncated() {
+        content.push_str("\n\n… further nested constraints omitted");
+    }
+    content
+}
+
 /// Format a Value for hover display
 fn format_value_for_hover(value: &Value) -> String {
     match value {
@@ -546,13 +687,17 @@ impl HoverProvider {
         };
         let type_name = format!("{}", attr.field_type());
 
-        let content = format!(
+        let mut content = format!(
             "## {}\n\n{}\n\n- **Type**: {}\n- **Required**: {}",
             attr.name(),
             description,
             type_name,
             required
         );
+
+        content.push_str(&refinement_hover(
+            attr.value_type().refinement_positions(64),
+        ));
 
         Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -2726,6 +2871,751 @@ EOT
         assert!(
             hover.is_some(),
             "hover should survive an unrelated sibling parse error"
+        );
+    }
+    #[test]
+    fn hover_preserves_nested_refinement_layers() {
+        use carina_core::schema::{
+            PatternMatch, PatternSpec, StringIdentityLayer, StringMemberConstraints, StructField,
+            TypeIdentity,
+        };
+        let name = || {
+            AttributeType::string_member(
+                StringIdentityLayer::new(
+                    Some(TypeIdentity::bare("Name")),
+                    Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                    Some((Some(1), Some(32))),
+                    None,
+                ),
+                StringMemberConstraints::new(
+                    Some(PatternSpec::new("a.*", PatternMatch::Full)),
+                    Some((Some(2), Some(16))),
+                ),
+            )
+        };
+        let nested = AttributeType::struct_(
+            "Details",
+            vec![StructField::optional("name", name()).build()],
+        );
+        let schema = ResourceSchema::new("contact")
+            .attribute(AttributeSchema::optional("names", AttributeType::list(name())).build())
+            .attribute(AttributeSchema::optional("by_key", AttributeType::map(name())).build())
+            .attribute(AttributeSchema::optional("details", nested).build())
+            .validate()
+            .unwrap();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("test", schema);
+        let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+        let text =
+            "test.contact {\n names = []\n by_key = {}\n details = {\n  name = 'abc'\n }\n}\n";
+        let doc = Document::new(
+            text.into(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        for line in [1, 2, 3, 4] {
+            let hover = provider.hover(&doc, Position::new(line, 3)).unwrap();
+            let HoverContents::Markup(content) = hover.contents else {
+                panic!("Markdown hover")
+            };
+            for fragment in [
+                "Identity pattern",
+                "[a-z]+",
+                "Member pattern",
+                "a.*",
+                "Identity length",
+                "1..=32",
+                "Member length",
+                "2..=16",
+            ] {
+                assert!(
+                    content.value.contains(fragment),
+                    "line {line}: missing {fragment}: {}",
+                    content.value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hover_preserves_union_and_enum_base_refinement_layers() {
+        use carina_core::schema::{
+            IntIdentityLayer, IntMemberConstraints, PatternMatch, PatternSpec, StringIdentityLayer,
+            StringMemberConstraints, TypeIdentity,
+        };
+        let name = AttributeType::string_member(
+            StringIdentityLayer::new(
+                Some(TypeIdentity::bare("Name")),
+                Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                None,
+                None,
+            ),
+            StringMemberConstraints::new(None, Some((Some(2), Some(8)))),
+        );
+        let count = AttributeType::int_member(
+            IntIdentityLayer::new(
+                Some(TypeIdentity::bare("Count")),
+                Some((Some(0), Some(100))),
+            ),
+            IntMemberConstraints::new(Some((Some(1), Some(10)))),
+        );
+        let schema = ResourceSchema::new("contact")
+            .attribute(
+                AttributeSchema::optional(
+                    "choice",
+                    AttributeType::union(vec![name.clone(), count]),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "mode",
+                    AttributeType::enum_with_base(
+                        TypeIdentity::from_dotted("test.Mode"),
+                        AttributeType::refined_string(
+                            None,
+                            Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                            Some((Some(2), Some(8))),
+                            None,
+                        ),
+                        None,
+                        vec![],
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("test", schema);
+        let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+        let doc = Document::new(
+            "test.contact {\n choice = 'abc'\n mode = 'ab'\n}\n".into(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        for line in [1, 2] {
+            let hover = provider.hover(&doc, Position::new(line, 3)).unwrap();
+            let HoverContents::Markup(content) = hover.contents else {
+                panic!("Markdown hover")
+            };
+            let fragments = if line == 1 {
+                ["Identity pattern", "[a-z]+", "Member length", "2..=8"]
+            } else {
+                ["Pattern", "[a-z]+", "Length", "2..=8"]
+            };
+            for fragment in fragments {
+                assert!(
+                    content.value.contains(fragment),
+                    "line {line}: missing {fragment}: {}",
+                    content.value
+                );
+            }
+            if line == 1 {
+                for fragment in ["Identity range", "0..=100", "Member range", "1..=10"] {
+                    assert!(
+                        content.value.contains(fragment),
+                        "missing {fragment}: {}",
+                        content.value
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hover_marks_truncated_nested_constraints() {
+        use carina_core::schema::{StringIdentityLayer, StringMemberConstraints, TypeIdentity};
+        let name = AttributeType::string_member(
+            StringIdentityLayer::new(Some(TypeIdentity::bare("Name")), None, None, None),
+            StringMemberConstraints::new(None, Some((Some(1), Some(8)))),
+        );
+        let schema = ResourceSchema::new("contact")
+            .attribute(
+                AttributeSchema::optional(
+                    "details",
+                    AttributeType::struct_(
+                        "Details",
+                        (0..100)
+                            .map(|index| {
+                                StructField::optional(format!("name{index}"), name.clone()).build()
+                            })
+                            .collect(),
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("test", schema);
+        let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+        let doc = Document::new(
+            "test.contact {\n details = {}\n}\n".into(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        let hover = provider.hover(&doc, Position::new(1, 3)).unwrap();
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("Markdown hover")
+        };
+        assert_eq!(
+            content
+                .value
+                .matches("… further nested constraints omitted")
+                .count(),
+            1,
+            "{}",
+            content.value
+        );
+        assert!(content.value.contains("Member length"), "{}", content.value);
+        assert!(
+            !content.value.contains("Field `name99`"),
+            "{}",
+            content.value
+        );
+    }
+
+    #[test]
+    fn hover_exactly_fitting_and_empty_struct_walks_are_not_truncated() {
+        use carina_core::schema::{StringIdentityLayer, StringMemberConstraints, TypeIdentity};
+        let name = AttributeType::string_member(
+            StringIdentityLayer::new(Some(TypeIdentity::bare("Name")), None, None, None),
+            StringMemberConstraints::new(None, Some((Some(1), Some(8)))),
+        );
+        for fields in [
+            Vec::new(),
+            (0..63)
+                .map(|index| StructField::optional(format!("name{index}"), name.clone()).build())
+                .collect(),
+        ] {
+            let has_fields = !fields.is_empty();
+            let schema = ResourceSchema::new("contact")
+                .attribute(
+                    AttributeSchema::optional("details", AttributeType::struct_("Details", fields))
+                        .build(),
+                )
+                .validate()
+                .unwrap();
+            let mut schemas = SchemaRegistry::new();
+            schemas.insert("test", schema);
+            let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+            let doc = Document::new(
+                "test.contact {\n details = {}\n}\n".into(),
+                Arc::new(ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                )),
+            );
+            let hover = provider.hover(&doc, Position::new(1, 3)).unwrap();
+            let HoverContents::Markup(content) = hover.contents else {
+                panic!("Markdown hover")
+            };
+            assert!(
+                !content.value.contains("further nested constraints omitted"),
+                "{}",
+                content.value
+            );
+            if has_fields {
+                assert!(
+                    content.value.contains("Field `name62`"),
+                    "{}",
+                    content.value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hover_nested_ref_union_walk_is_bounded() {
+        use carina_core::schema::{StringIdentityLayer, StringMemberConstraints, TypeIdentity};
+        let name = AttributeType::string_member(
+            StringIdentityLayer::new(Some(TypeIdentity::bare("Name")), None, None, None),
+            StringMemberConstraints::new(None, Some((Some(1), Some(8)))),
+        );
+        let mut draft = ResourceSchema::new("contact")
+            .with_def("last", AttributeType::union(vec![name]))
+            .attribute(
+                AttributeSchema::optional(
+                    "choice",
+                    AttributeType::union(vec![
+                        AttributeType::ref_("alias0"),
+                        AttributeType::ref_("alias0"),
+                    ]),
+                )
+                .build(),
+            );
+        for index in 0..40 {
+            let next = if index == 39 {
+                "last".to_owned()
+            } else {
+                format!("alias{}", index + 1)
+            };
+            draft = draft.with_def(format!("alias{index}"), AttributeType::ref_(next));
+        }
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("test", draft.validate().unwrap());
+        let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+        let doc = Document::new(
+            "test.contact {\n choice = 'abc'\n}\n".into(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        let hover = provider.hover(&doc, Position::new(1, 3)).unwrap();
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("Markdown hover")
+        };
+        assert_eq!(
+            content
+                .value
+                .matches("… further nested constraints omitted")
+                .count(),
+            1,
+            "{}",
+            content.value
+        );
+        assert_eq!(
+            content.value.matches("Member length").count(),
+            1,
+            "{}",
+            content.value
+        );
+    }
+
+    fn hover_for_refinement_fields(fields: Vec<carina_core::schema::StructField>) -> String {
+        let schema = ResourceSchema::new("contact")
+            .attribute(
+                AttributeSchema::optional("details", AttributeType::struct_("Details", fields))
+                    .build(),
+            )
+            .validate()
+            .unwrap();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("test", schema);
+        let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+        let doc = Document::new(
+            "test.contact {\n details = {}\n}\n".into(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        let hover = provider.hover(&doc, Position::new(1, 3)).unwrap();
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("Markdown hover")
+        };
+        content.value
+    }
+
+    #[test]
+    fn round13_anonymous_refinements_have_structural_labels() {
+        use carina_core::schema::{
+            IntIdentityLayer, IntMemberConstraints, PatternMatch, PatternSpec, StringIdentityLayer,
+            StringMemberConstraints,
+        };
+        for (declaration, labels) in [
+            (
+                AttributeType::string_member(
+                    StringIdentityLayer::new(
+                        None,
+                        Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                        Some((Some(1), Some(100))),
+                        None,
+                    ),
+                    StringMemberConstraints::new(
+                        Some(PatternSpec::new("a.*", PatternMatch::Full)),
+                        Some((Some(1), Some(8))),
+                    ),
+                ),
+                vec!["**Pattern**", "**Length**"],
+            ),
+            (
+                AttributeType::int_member(
+                    IntIdentityLayer::new(None, Some((Some(1), Some(100)))),
+                    IntMemberConstraints::new(Some((Some(1), Some(8)))),
+                ),
+                vec!["**Range**"],
+            ),
+        ] {
+            let content = hover_for_refinement_fields(vec![
+                StructField::optional("anonymous", declaration).build(),
+            ]);
+            for label in labels {
+                assert!(content.contains(label), "{content}");
+            }
+            assert!(!content.contains("**Identity"), "{content}");
+            assert!(!content.contains("**Member"), "{content}");
+        }
+    }
+
+    #[test]
+    fn round11_hover_nested_and_unbounded_leaves_name_their_identity() {
+        use carina_core::schema::{PatternMatch, PatternSpec, TypeIdentity};
+        for leaf in [
+            AttributeType::refined_string(
+                Some(TypeIdentity::from_dotted("test.X")),
+                Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                None,
+                None,
+            ),
+            AttributeType::refined_string(
+                Some(TypeIdentity::from_dotted("test.X")),
+                None,
+                None,
+                None,
+            ),
+            AttributeType::refined_int(Some(TypeIdentity::from_dotted("test.X")), None),
+            AttributeType::reference(
+                TypeIdentity::from_dotted("test.X"),
+                Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                None,
+            ),
+        ] {
+            for nested in [
+                leaf.clone(),
+                AttributeType::list(leaf.clone()),
+                AttributeType::union(vec![leaf.clone(), AttributeType::bool()]),
+            ] {
+                let content = hover_for_refinement_fields(vec![
+                    StructField::optional("nested", nested).build(),
+                ]);
+                assert!(content.contains("**Identity**: `test.X`"), "{content}");
+                assert!(
+                    !content.contains("further nested constraints omitted"),
+                    "{content}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round11_hover_bounds_use_the_core_diagnostic_spelling() {
+        use carina_core::schema::TypeIdentity;
+        for (length, expected) in [
+            ((Some(1), None), "1..unbounded"),
+            ((None, Some(8)), "unbounded..=8"),
+            ((None, None), "unbounded"),
+        ] {
+            let content = hover_for_refinement_fields(vec![
+                StructField::optional(
+                    "x",
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::from_dotted("test.X")),
+                        None,
+                        Some(length),
+                        None,
+                    ),
+                )
+                .build(),
+            ]);
+            assert!(
+                content.contains(&format!("**Identity length**: {expected}")),
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn hover_top_level_refined_leaves_name_their_identity() {
+        use carina_core::schema::{
+            IntIdentityLayer, IntMemberConstraints, PatternMatch, PatternSpec, StringIdentityLayer,
+            StringMemberConstraints, TypeIdentity,
+        };
+        for declaration in [
+            AttributeType::reference(
+                TypeIdentity::from_dotted("test.ReadName"),
+                Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                Some((Some(1), Some(8))),
+            ),
+            AttributeType::string_member(
+                StringIdentityLayer::new(
+                    Some(TypeIdentity::from_dotted("test.ReadName")),
+                    None,
+                    Some((Some(1), Some(32))),
+                    None,
+                ),
+                StringMemberConstraints::new(None, Some((Some(1), Some(8)))),
+            ),
+            AttributeType::int_member(
+                IntIdentityLayer::new(
+                    Some(TypeIdentity::from_dotted("test.ReadName")),
+                    Some((Some(0), Some(32))),
+                ),
+                IntMemberConstraints::new(Some((Some(1), Some(8)))),
+            ),
+        ] {
+            let schema = ResourceSchema::new("contact")
+                .attribute(AttributeSchema::optional("value", declaration).build())
+                .validate()
+                .unwrap();
+            let mut schemas = SchemaRegistry::new();
+            schemas.insert("test", schema);
+            let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+            let doc = Document::new(
+                "test.contact {\n value = 'abc'\n}\n".into(),
+                Arc::new(ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                )),
+            );
+            let hover = provider.hover(&doc, Position::new(1, 3)).unwrap();
+            let HoverContents::Markup(content) = hover.contents else {
+                panic!("Markdown hover")
+            };
+            assert!(
+                content.value.contains("**Identity**: `test.ReadName`"),
+                "{}",
+                content.value
+            );
+        }
+    }
+
+    #[test]
+    fn hover_reference_leaf_shows_identity_pattern_and_length() {
+        let content = hover_for_refinement_fields(vec![
+            StructField::optional(
+                "reference",
+                AttributeType::reference(
+                    carina_core::schema::TypeIdentity::from_dotted("test.WidgetName"),
+                    Some(carina_core::schema::PatternSpec::new(
+                        "[a-z]+",
+                        carina_core::schema::PatternMatch::Full,
+                    )),
+                    Some((Some(1), Some(8))),
+                ),
+            )
+            .build(),
+        ]);
+        for expected in [
+            "Field `reference`",
+            "test.WidgetName",
+            "**Identity pattern**",
+            "[a-z]+",
+            "**Identity length**: 1..=8",
+        ] {
+            assert!(content.contains(expected), "missing {expected}: {content}");
+        }
+        assert!(
+            !content.contains("further nested constraints omitted"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn hover_plain_fields_leave_budget_for_refined_fields() {
+        let mut fields: Vec<_> = (0..70)
+            .map(|index| {
+                StructField::optional(format!("plain{index}"), AttributeType::string()).build()
+            })
+            .collect();
+        fields.push(
+            StructField::optional(
+                "constrained",
+                AttributeType::string_member(
+                    carina_core::schema::StringIdentityLayer::new(None, None, None, None),
+                    carina_core::schema::StringMemberConstraints::new(
+                        None,
+                        Some((Some(1), Some(8))),
+                    ),
+                ),
+            )
+            .build(),
+        );
+        let content = hover_for_refinement_fields(fields);
+        assert!(
+            content.contains("Field `constrained`") && content.contains("**Length**"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("further nested constraints omitted"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn hover_plain_bools_do_not_show_a_truncation_marker() {
+        let fields = (0..70)
+            .map(|index| {
+                StructField::optional(format!("plain{index}"), AttributeType::bool()).build()
+            })
+            .collect();
+        let content = hover_for_refinement_fields(fields);
+        assert!(
+            !content.contains("further nested constraints omitted"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn hover_preserves_identity_and_member_constraints() {
+        use carina_core::schema::{
+            IntIdentityLayer, IntMemberConstraints, PatternMatch, PatternSpec, StringIdentityLayer,
+            StringMemberConstraints, TypeIdentity,
+        };
+        let schema = ResourceSchema::new("contact")
+            .attribute(
+                AttributeSchema::optional(
+                    "name",
+                    AttributeType::string_member(
+                        StringIdentityLayer::new(
+                            Some(TypeIdentity::bare("Name")),
+                            Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                            Some((Some(1), Some(32))),
+                            None,
+                        ),
+                        StringMemberConstraints::new(
+                            Some(PatternSpec::new("a.*", PatternMatch::Full)),
+                            Some((Some(2), Some(16))),
+                        ),
+                    ),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "count",
+                    AttributeType::int_member(
+                        IntIdentityLayer::new(
+                            Some(TypeIdentity::bare("Count")),
+                            Some((Some(1), Some(100))),
+                        ),
+                        IntMemberConstraints::new(Some((Some(10), Some(20)))),
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("test", schema);
+        let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+        let doc = Document::new(
+            "test.contact {\n name\n count\n}\n".into(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        for (line, fragments) in [
+            (
+                1,
+                vec![
+                    "Identity pattern",
+                    "[a-z]+",
+                    "Member pattern",
+                    "a.*",
+                    "Identity length",
+                    "Member length",
+                ],
+            ),
+            (
+                2,
+                vec!["Identity range", "1..=100", "Member range", "10..=20"],
+            ),
+        ] {
+            let hover = provider.hover(&doc, Position::new(line, 2)).unwrap();
+            let HoverContents::Markup(content) = hover.contents else {
+                panic!("Markdown hover")
+            };
+            for fragment in fragments {
+                assert!(
+                    content.value.contains(fragment),
+                    "missing {fragment}: {}",
+                    content.value
+                );
+            }
+        }
+    }
+    #[test]
+    fn round14_anonymous_hover_intersects_bounds_and_keeps_all_patterns() {
+        use carina_core::schema::{
+            IntIdentityLayer, IntMemberConstraints, PatternMatch, PatternSpec, StringIdentityLayer,
+            StringMemberConstraints,
+        };
+        for (declaration, label, effective) in [
+            (
+                AttributeType::string_member(
+                    StringIdentityLayer::new(
+                        None,
+                        Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                        Some((Some(1), Some(100))),
+                        None,
+                    ),
+                    StringMemberConstraints::new(
+                        Some(PatternSpec::new("a.*", PatternMatch::Full)),
+                        Some((Some(2), Some(8))),
+                    ),
+                ),
+                "Length",
+                "2..=8",
+            ),
+            (
+                AttributeType::int_member(
+                    IntIdentityLayer::new(None, Some((Some(1), Some(100)))),
+                    IntMemberConstraints::new(Some((Some(2), Some(8)))),
+                ),
+                "Range",
+                "2..=8",
+            ),
+        ] {
+            let content = hover_for_refinement_fields(vec![
+                StructField::optional("value", declaration).build(),
+            ]);
+            assert_eq!(
+                content.matches(&format!("**{label}**:")).count(),
+                1,
+                "{content}"
+            );
+            assert!(
+                content.contains(&format!("**{label}**: {effective}")),
+                "{content}"
+            );
+            if label == "Length" {
+                assert_eq!(content.matches("**Pattern**:").count(), 1, "{content}");
+                for pattern in ["[a-z]+", "a.*"] {
+                    assert!(content.contains(pattern), "{content}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round14_hover_renders_the_entire_identity_pattern_conjunction() {
+        use carina_core::schema::{
+            PatternMatch, PatternSpec, RefinedScalarKind, TypeIdentity, TypeInSchema,
+        };
+        let identity = TypeIdentity::from_dotted("test.Name");
+        let mut wire = serde_json::json!({
+            "owners": [{ "Provider": "test" }],
+            "identity": identity,
+            "scalar_kind": RefinedScalarKind::String,
+            "declaration": { "String": identity }
+        });
+        wire["origin"] = serde_json::json!("Annotation");
+        wire["projection_fingerprint"] = serde_json::Value::Null;
+        wire["constraints"] = serde_json::json!({
+            "scalar": { "String": { "identity_layer": {
+                "length": { "min": "Unbounded", "max": "Unbounded" },
+                "patterns": [PatternSpec::new("^.*z$", PatternMatch::Full), PatternSpec::new("^a.*$", PatternMatch::Full)]
+            }}},
+            "empty_intersection": false
+        });
+        let owned = serde_json::from_value(wire).unwrap();
+        let ty =
+            carina_core::validation::lift_type_expr(&carina_core::parser::TypeExpr::SchemaType {
+                owned,
+            })
+            .unwrap();
+        let content = refinement_hover(TypeInSchema::schemaless(&ty).refinement_positions(64));
+        for pattern in ["^.*z$", "^a.*$"] {
+            assert!(content.contains(pattern), "missing {pattern}: {content}");
+        }
+        assert_eq!(
+            content.matches("**Identity pattern**").count(),
+            2,
+            "{content}"
         );
     }
 }

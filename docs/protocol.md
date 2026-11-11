@@ -1,12 +1,17 @@
 # Provider protocol versions
 
-The current protocol and minimum supported provider protocol are both **26**.
+The current protocol and minimum supported provider protocol are both **28**.
 
-Protocol 26 is the next unreleased protocol after the protocol-25 development
-snapshot. Released Carina v0.13.1 speaks protocol **24**, with minimum provider protocol **24**.
+Protocol 28 adds typed provider error retryability after protocol 27's
+refinement layers and protocol 26's conditional input rules. Carina v0.14.0 is
+the first release with protocol 28; protocols 25 through 27 were unreleased
+development snapshots. Carina
+v0.13.1 speaks protocol **24**, with minimum provider protocol **24**.
 
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
+| 28 | 28 | WIT 0.3.0 required exclusive provider error retryability; removed the redundant reference-error variant. |
+| 27 | 27 | Required separate String/Int identity and member records, strict layer decoding and reusable within-provider identities. |
 | 26 | 26 | Required typed input-rule conditions, Struct-local rules, and CreateOnly authoring previews; fingerprint encoding v13. |
 | 25 | 25 | WIT 0.2.0 typed diagnostics and credential registration; guest stdout/stderr discarded. |
 | 24 | 24 | Required typed pattern specifications with explicit Full or justified Substring matching. |
@@ -20,6 +25,142 @@ snapshot. Released Carina v0.13.1 speaks protocol **24**, with minimum provider 
 | 16 | 16 | Required identity mode field; declared identity hashing and nested create-only diffing. |
 | 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
+
+## Version 28
+
+WIT package `carina:provider@0.3.0` adds required `error-detail.retryability`.
+Every protocol `ProviderError` record also requires a `retryability` field with
+one of `unclassified`, `transient`, or `dependency_blocked` (WIT:
+`dependency-blocked`). Missing and unknown classes fail decoding. `Transient`
+includes throttling; `DependencyBlocked` means deletion must wait for a dependent
+resource to go away. Message, cause and code remain diagnostic metadata and do
+not change the class. Context errors inherit their typed cause's retryability;
+providers may explicitly replace it with `with_retryability`, including
+`Unclassified`. The nearest Carina error that authors a verdict in the cause
+chain decides the class; an explicit `Unclassified` is final. Foreign frames
+and Carina pass-through wrappers are skipped. Structural validation wrappers
+inherit from their child; validation alternatives keep a class only when every
+arm agrees, otherwise they are `Unclassified`.
+
+Reference errors now have only `AccessDenied` and `InvalidReference` variants
+(WIT: `access-denied` and `invalid-reference`). The `Transient` reference-error
+variant is removed; its JSON tag is rejected. Temporary resolution failures use
+`InvalidReference` with the inner error's `retryability` set to `transient`
+(`with_retryability(Retryability::Transient)` in provider code). Both variants
+abort a plan-time comparison on either side. The host renders
+`reference resolution temporarily failed` when an `InvalidReference` error's
+typed class is `Transient`, preserving the former variant's message.
+
+The current and minimum supported protocol are both 28. Providers built for
+protocol 27 or earlier must rebuild against the current SDK. WIT 0.1.0 and 0.2.0
+components are rejected before linking or executing guest code.
+
+## Version 27
+
+Refined `String` and `Int` declarations carry two required records:
+`identity_layer` and `member_layer`. The new String/Int layer records use `deny_unknown_fields`, so unknown keys
+are rejected. Empty layers are explicit `{}` records;
+missing records are rejected. A String identity owns its nominal identity,
+optional pattern and character-length interval, semantic validator binding and
+DSL transform. Its member record adds an optional pattern and length interval.
+An Int identity owns its nominal identity and range; its member adds a range. Enum bases
+are definitions rather than destination slots: schema admission rejects any
+String/Int member constraints inside an Enum base with a typed
+`EnumBaseMemberLayerError`.
+Float and typed Reference schemas retain their existing shapes.
+
+A legacy `Custom` wrapper has no member layer. A non-empty String/Int member
+layer on its base is incompatible metadata and fails with a typed decode error;
+it is neither discarded nor conjoined. Outer-over-inner precedence applies only
+to identity-layer metadata. Named List bases remain rejected as before.
+
+Validation keeps first-failure semantics: identity pattern, identity length or
+range, member pattern, member length or range, then the semantic callback.
+Structural constraints remain schema metadata and are never delegated to a
+callback. Every pattern retains its authored regex, explicit match mode and
+substring reason. Identity consistency and built-in admission compare only a
+typed identity projection; full declaration fingerprints include both layers.
+A core Email identity with a member length is valid, while changing Email's
+identity definition remains a built-in collision.
+
+Provider migration requirement: within one provider's aggregate resource and
+configuration schemas, a String/Int/Float identity has one reusable identity-layer
+definition, including its Float range.
+Different definitions fail with `ConflictingIdentityDeclarations`; move
+resource-specific restrictions into the member layer. Across different schema
+owners, such as AWS and AWSCC, annotations conjoin the owners' identity
+constraints, so a value must satisfy every owner. Different identity constraints
+across owners are allowed. Enum definition and canonical-spelling disagreement
+remain typed errors. Authored annotations name an identity: their retained
+constraint payload has no member layer. The static type of a value read from an
+attribute or field is identity-only too. Typed value projections retain enum
+values, reference kind, semantic callbacks and an identity-only fingerprint,
+and have no member pattern, length or range fields. Either value-evidence origin
+rejects member fields during decoding, including empty member records.
+Native annotations have
+distinct single-owner and checked multi-owner forms; the latter maps at least
+two `SchemaTypeOwner`s to their identity constraints. Single-owner retained
+annotations omit `owner_layers`. Multi-owner records key exactly one identity
+layer by each schema owner's provider name; missing, extra, or duplicate owners
+are invalid. Owner sets derive from layer keys. Retained records accept empty
+same-owner bounds as well as empty cross-owner intersections: after normalizing
+Float bounds, decoding verifies the exact conjunction of the owner layers and
+recomputes the `empty_intersection` marker. Exact projection records reject
+unknown constraint fields. Annotation pattern conjunctions retain a sorted,
+deduplicated set of every pattern, including same-owner repeats. Structural
+scalar reads use the same canonical evidence as identity annotations: equal
+identity-level types compare and serialize equally. Callbacks, transforms, enums
+and references retain exact projection provenance, excluding slot members.
+
+Member constraints belong to the destination slot, and are enforced when writing
+resource/config attributes, nested fields and annotated sinks through identity
+admission and the existing deferred destination obligation. Different-identity widening requires source identity
+bounds to be contained by destination identity bounds. Member constraints defer
+unless source identity bounds are provably disjoint from effective destination
+bounds. Anonymous String/Int declarations retain both layers as structural
+evidence, using both patterns and intersecting bounds.
+
+Unannotated collections, conditionals and coalesce retain main's equality-only
+rule: all alternatives must infer identical `TypeExpr`s. Slot reads differing
+only in member layers therefore compare equal. An explicit compatible annotation
+accepts otherwise mixed declarations; inference does not widen their types.
+
+Schema fingerprint encoding is v13. Saved-plan format 44 supersedes 43 because
+the schema fingerprint encoding changed. Saved module `pending_constraints`
+contain value expressions (`ValidateExpr`), not retained type records. Saved-plan
+replay reloads identity/member constraints from fingerprint-checked provider
+schemas. Format-43 plans must be regenerated; their version gate fails
+before payload decoding or fingerprint verification.
+
+Every typed destination uses one String/Int identity rule: same identity
+or an allowed structural/provider widening. This includes binding/export
+annotations, map/list element annotations, module arguments, and user-function
+parameters and returns. Destination member constraints remain resolved-value
+obligations; every destination kind supports the existing `NeedsLocal` path.
+Same-identity value admission, including admission with a declared source,
+defers overlapping identity bounds through `NeedsLocal`; provably disjoint bounds
+reject statically. Different-identity widening retains String length / Int range
+containment checks. Strict declaration compatibility retains main's containment
+checks. General declaration compatibility is distinct from value admission.
+Only the admission-facing reference relation produces `NeedsLocal`; callers need
+reference evidence, and the result cannot convert to a general type-compatibility
+result. Admission registers its existing `LocalPath` under the actual destination
+contract. On resolution, `PendingAdmission::discharge` re-enters `admit_apply` and
+validates against the complete destination declaration, including both layers.
+Known binding values use that destination's ordinary value check too. String
+pattern/length errors retain their structured category and identify member failures
+as the slot's member constraint; identity failures still run first.
+Unproven pattern containment defers (#4349). Int-to-Float widening uses identity
+bound containment too. Float retains main's strict range containment and
+same-identity reference deferral, also retained for Enum/unloaded leaves. Annotated
+sink mismatches render the differing constraints or scalar kinds when the nominal
+names alone would be identical.
+
+At version 27, both `PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION`
+were 27. Protocol-26 providers had to rebuild against the protocol-27 SDK before
+they could load, including on schema-only migration paths. Version 27 kept WIT
+`carina:provider@0.2.0`: schemas already cross the boundary as JSON, and
+`validate-custom-type` continues to identify semantic checks by type identity. This is the next unreleased protocol after the conditional input rules in version 26.
 
 ## Version 26
 
@@ -100,7 +241,7 @@ replanning. Checked plans and pending input obligations are not serialized.
 
 ## Version 25
 
-WIT package `carina:provider@0.2.0` requires the `diagnostics` and
+WIT package 0.2.0 of `carina:provider` introduced the `diagnostics` and
 `protected-material` imports in every provider world. The host discards guest
 stdout and stderr from metadata loading through teardown. Provider errors,
 warnings, panic payloads, value diagnostics and HTTP traces use typed events
@@ -175,7 +316,7 @@ schema-fingerprint verification.
 
 Every resource schema requires an `input_rules` array, including `[]` when
 no rules are declared. Each rule requires a `scope`, a typed `target`, a stable
-lowercase dotted diagnostic `code`, and a tagged `predicate`. Current protocol-26
+lowercase dotted diagnostic `code`, and a tagged `predicate`. Current protocol-28
 examples also include the required `condition`:
 
 ```json
@@ -253,12 +394,13 @@ serialized. Saved plans are re-admitted under the apply lock, and dispatch
 discharges pending rules against resolved desired inputs and exact requests.
 
 Version 23 introduced the required `input_rules`, `scope` and `target` fields.
-For this development host, the version-26 requirements include explicit
-pattern modes, conditions and Struct rule arrays. Older providers are rejected
-before schema decoding. The v12 migration adapter has
-been removed. The SDK's schema JSON export carries these input rules without
-adding WIT functions or CRUD request fields; the diagnostic imports are separate. AWS, AWSCC, and GitHub providers must rebuild
-against protocol 26 to target this unreleased host.
+For Carina v0.14.0, the version-28 requirements include explicit
+pattern modes, conditions, Struct rule arrays, String/Int refinement layers,
+and typed error retryability. Older providers are rejected before schema
+decoding. The v12 migration adapter has been removed. The SDK's schema JSON
+export carries these input rules without adding WIT functions or CRUD request
+fields; the diagnostic imports are separate. AWS, AWSCC, and GitHub providers
+must rebuild against protocol 28 to load in Carina v0.14.0.
 
 ## Version 22
 
@@ -416,7 +558,8 @@ typed source chains; secret payloads are never included in diagnostics.
 Protocol v18 adds string-valued reference schema leaves and the initialized
 provider's `resolve-references` export. Requests carry a structured type
 identity and raw string; positional outcomes are a resolved canonical string,
-NotFound, or a typed AccessDenied, Transient, or InvalidReference failure.
+NotFound, or a typed reference-resolution failure. The current failure variants
+and their retryability classes are described in [Version 28](#version-28).
 Core rejects batch length mismatches and empty resolved values for every
 provider, native or WASM. Guests
 validate their canonical value shapes. Reference validation remains offline;

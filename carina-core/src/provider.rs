@@ -123,8 +123,7 @@ pub struct UnknownMissingAttribute;
 #[derive(Clone)]
 pub struct OperationErrorDetail<S: TextState = Unbound> {
     body: FailureBody<S>,
-    /// Retry policy captured before diagnostic text is escaped or truncated.
-    throttling: ThrottlingClassification,
+    /// Provider-authored retry policy, preserved independently of diagnostic text.
     retryability: Retryability,
     /// Resource the error pertains to, if known.
     pub resource_id: Option<Box<ErrorResourceId<S>>>,
@@ -242,49 +241,6 @@ impl<S: TextState> fmt::Debug for OperationErrorDetail<S> {
             .field("request_id", &self.request_id)
             .finish()
     }
-}
-
-#[derive(Debug, Default, Clone)]
-struct ThrottlingClassification {
-    message_or_cause: bool,
-    code: bool,
-    delete_dependency: bool,
-    dependency_code: bool,
-}
-
-impl ThrottlingClassification {
-    #[cfg(any(test, all(feature = "test-utils", not(target_arch = "wasm32"))))]
-    fn from_raw(message: &str, code: Option<&str>, cause: Option<&str>) -> Self {
-        Self {
-            message_or_cause: has_throttling_marker(message)
-                || cause.is_some_and(has_throttling_marker),
-            code: code.is_some_and(has_throttling_marker),
-            delete_dependency: has_delete_dependency_marker(message)
-                || cause.is_some_and(has_delete_dependency_marker),
-            dependency_code: code.is_some_and(has_delete_dependency_marker),
-        }
-    }
-
-    fn is_throttled(&self) -> bool {
-        self.message_or_cause || self.code
-    }
-}
-
-pub(crate) fn has_throttling_marker(text: &str) -> bool {
-    text.contains("ThrottlingException") || text.contains("Rate exceeded")
-}
-
-pub(crate) fn has_delete_dependency_marker(text: &str) -> bool {
-    [
-        "DependencyViolation",
-        "has dependent object",
-        "has a dependent object",
-        "resource has dependencies",
-        "mapped public address",
-        "Failed to detach",
-    ]
-    .iter()
-    .any(|pattern| text.contains(pattern))
 }
 
 /// Original resource identity with a sanitized diagnostic header.
@@ -665,15 +621,9 @@ impl<S: TextState> ProviderFailure<S> {
         self.retryability() == Retryability::Transient
     }
 
-    /// Whether the original message, code or cause identifies throttling.
-    /// Diagnostic escaping, truncation and redaction do not affect retry policy.
-    pub fn is_throttled(&self) -> bool {
-        self.detail().throttling.is_throttled()
-    }
-
-    /// Delete dependency policy is captured before diagnostic redaction.
+    /// Whether deletion must wait for a dependent resource to go away.
     pub fn is_delete_dependency(&self) -> bool {
-        self.detail().throttling.delete_dependency || self.detail().throttling.dependency_code
+        self.retryability() == Retryability::DependencyBlocked
     }
 
     /// User-supplied input is invalid.
@@ -769,6 +719,7 @@ impl<S: TextState> ProviderFailure<S> {
         };
         let mut wire = WireProviderError {
             kind,
+            retryability: self.retryability().into(),
             message: String::new(),
             resource_id: detail
                 .resource_id
@@ -845,12 +796,8 @@ impl<S: TextState> ProviderFailure<S> {
     /// Attach the application-level error code from the cloud API
     /// (e.g. `"AccessDenied"`, `"NoSuchBucket"`).
     pub fn with_code(mut self, code: impl Into<String>) -> Self {
-        let code = code.into();
-        let text = self.new_host_field(code.clone());
-        let detail = self.detail_mut();
-        detail.throttling.code = has_throttling_marker(&code);
-        detail.throttling.dependency_code = has_delete_dependency_marker(&code);
-        detail.code = Some(text);
+        let text = self.new_host_field(code.into());
+        self.detail_mut().code = Some(text);
 
         self
     }
@@ -932,15 +879,9 @@ impl<S: TextState> OperationErrorDetail<S> {
         detail
     }
     fn captured(cause: Diagnostic<S>) -> Self {
-        let throttling = ThrottlingClassification {
-            message_or_cause: cause.has_throttling_marker(),
-            delete_dependency: cause.has_delete_dependency_marker(),
-            ..ThrottlingClassification::default()
-        };
         Self {
             retryability: cause.retryability(),
             body: FailureBody::Captured(cause),
-            throttling,
             resource_id: None,
             host_cause: None,
             provider_name: None,
@@ -958,8 +899,6 @@ impl<S: TextState> OperationErrorDetail<S> {
     }
     fn contextual(context: ErrorText<S>, cause: Diagnostic<S>) -> Self {
         let mut detail = Self::captured(cause.clone());
-        detail.throttling.message_or_cause |= context.opaque().has_throttling_marker();
-        detail.throttling.delete_dependency |= context.opaque().has_delete_dependency_marker();
         detail.body = FailureBody::Context { context, cause };
         detail
     }
@@ -1000,8 +939,8 @@ impl OperationErrorDetail<Bound> {
         self.body.message().as_diagnostic()
     }
 
-    /// Sanitized application-level code for diagnostics. Set it with
-    /// [`ProviderError::with_code`] so raw-text retry classification stays valid.
+    /// Sanitized application-level code for diagnostics, attached through
+    /// [`ProviderError::with_code`] independently of retry policy.
     pub fn code(&self) -> Option<crate::provider_text::DiagnosticText> {
         self.code.as_ref().map(ErrorText::as_diagnostic)
     }
@@ -5747,6 +5686,7 @@ impl ProviderFailure<Unbound> {
     pub(crate) fn from_wire(error: WireProviderError) -> Self {
         let WireProviderError {
             kind,
+            retryability,
             message,
             resource_id,
             cause,
@@ -5758,8 +5698,6 @@ impl ProviderFailure<Unbound> {
         } = error;
         let resource_id = resource_id
             .map(|id| Box::new(crate::protocol_convert::protocol_to_resource_id(&id).into()));
-        let throttling =
-            ThrottlingClassification::from_raw(&message, code.as_deref(), cause.as_deref());
         let detail = Box::new(OperationErrorDetail {
             body: match cause {
                 Some(cause) => FailureBody::Context {
@@ -5768,8 +5706,7 @@ impl ProviderFailure<Unbound> {
                 },
                 None => FailureBody::Message(message.into()),
             },
-            throttling,
-            retryability: Retryability::Unclassified,
+            retryability: retryability.into(),
             resource_id,
             // Host lifecycle markers are intentionally not part of the wire
             // record and untrusted guest errors cannot acquire one on decode.
@@ -5803,7 +5740,6 @@ impl ProviderFailure<Unbound> {
         };
         let detail = Box::new(OperationErrorDetail {
             body: detail.body.bind(secrets, &context),
-            throttling: detail.throttling,
             retryability: detail.retryability,
             resource_id: detail.resource_id.map(|id| {
                 Box::new(ErrorResourceId {
@@ -5844,7 +5780,6 @@ impl ProviderFailure<Bound> {
         };
         let detail = Box::new(OperationErrorDetail {
             body: detail.body.host_for_state(),
-            throttling: detail.throttling,
             retryability: detail.retryability,
             resource_id: detail.resource_id.map(|id| {
                 Box::new(ErrorResourceId {
@@ -5877,8 +5812,8 @@ impl ProviderFailure<Unbound> {
     pub fn to_wire(&self) -> WireProviderError {
         self.to_wire_inner()
     }
-    /// Flatten this error for transport. Typed causes and retry policy do not
-    /// survive this projection; retain the error for further composition.
+    /// Flatten typed causes for transport while preserving the typed retry policy.
+    /// Retain the error for further composition with its native causes.
     /// Wire decoding is private to the host, not a provider authoring route.
     #[cfg(target_arch = "wasm32")]
     pub fn to_wire(&self) -> WireProviderError {
@@ -8275,8 +8210,14 @@ pub fn identified_custom_type_identity(attribute_type: &AttributeType) -> Option
     match attribute_type.raw_shape() {
         RawShape::UnloadedSchemaType(unloaded) => Some(unloaded.identity()),
         RawShape::Reference { .. } => None,
-        RawShape::String { identity, .. }
-        | RawShape::Int { identity, .. }
+        RawShape::String {
+            identity_layer: crate::schema::StringIdentityParts { identity, .. },
+            ..
+        }
+        | RawShape::Int {
+            identity_layer: crate::schema::IntIdentityParts { identity, .. },
+            ..
+        }
         | RawShape::Float { identity, .. } => identity,
         RawShape::Enum { identity, .. } => Some(identity),
         RawShape::Bool
@@ -8303,17 +8244,31 @@ pub fn identified_custom_type_scalar_kind(
             length: _length,
         } => Some(RefinedScalarKind::String),
         RawShape::String {
-            identity: Some(_), ..
+            identity_layer:
+                crate::schema::StringIdentityParts {
+                    identity: Some(_), ..
+                },
+            ..
         } => Some(RefinedScalarKind::String),
         RawShape::Int {
-            identity: Some(_), ..
+            identity_layer:
+                crate::schema::IntIdentityParts {
+                    identity: Some(_), ..
+                },
+            ..
         } => Some(RefinedScalarKind::Int),
         RawShape::Float {
             identity: Some(_), ..
         } => Some(RefinedScalarKind::Float),
         RawShape::Enum { base, .. } => scalar_kind_from_base(base),
-        RawShape::String { identity: None, .. }
-        | RawShape::Int { identity: None, .. }
+        RawShape::String {
+            identity_layer: crate::schema::StringIdentityParts { identity: None, .. },
+            ..
+        }
+        | RawShape::Int {
+            identity_layer: crate::schema::IntIdentityParts { identity: None, .. },
+            ..
+        }
         | RawShape::Float { identity: None, .. }
         | RawShape::Bool
         | RawShape::Duration
@@ -8391,29 +8346,41 @@ pub(crate) fn canonicalize_custom_type_value(
         }
         (
             RawShape::String {
-                identity: _,
-                pattern: _,
-                length: _,
-                validate: _,
-                to_dsl: _,
+                identity_layer:
+                    crate::schema::StringIdentityParts {
+                        identity: _,
+                        pattern: _,
+                        length: _,
+                        validate: _,
+                        to_dsl: _,
+                    },
+                member_layer: _,
             },
             Value::Concrete(ConcreteValue::String(value)),
         ) => Ok(Some(CanonicalCustomTypeValue::from_literal_string(value))),
         (
             RawShape::String {
-                identity: _,
-                pattern: _,
-                length: _,
-                validate: _,
-                to_dsl: _,
+                identity_layer:
+                    crate::schema::StringIdentityParts {
+                        identity: _,
+                        pattern: _,
+                        length: _,
+                        validate: _,
+                        to_dsl: _,
+                    },
+                member_layer: _,
             },
             Value::Concrete(ConcreteValue::EnumIdentifier(raw)),
         ) => Ok(Some(CanonicalCustomTypeValue(raw.as_str().to_string()))),
         (
             RawShape::Int {
-                identity: _,
-                range: _,
-                validate: _,
+                identity_layer:
+                    crate::schema::IntIdentityParts {
+                        identity: _,
+                        range: _,
+                        validate: _,
+                    },
+                member_layer: _,
             },
             Value::Concrete(ConcreteValue::Int(value)),
         ) => Ok(Some(CanonicalCustomTypeValue(value.to_string()))),
@@ -8879,10 +8846,18 @@ fn collect_type_names_from_type(
             names.insert(identity.clone());
         }
         RawShape::String {
-            identity: Some(id), ..
+            identity_layer:
+                crate::schema::StringIdentityParts {
+                    identity: Some(id), ..
+                },
+            ..
         }
         | RawShape::Int {
-            identity: Some(id), ..
+            identity_layer:
+                crate::schema::IntIdentityParts {
+                    identity: Some(id), ..
+                },
+            ..
         }
         | RawShape::Float {
             identity: Some(id), ..
@@ -8897,8 +8872,14 @@ fn collect_type_names_from_type(
         } => {
             names.insert(id.clone());
         }
-        RawShape::String { identity: None, .. }
-        | RawShape::Int { identity: None, .. }
+        RawShape::String {
+            identity_layer: crate::schema::StringIdentityParts { identity: None, .. },
+            ..
+        }
+        | RawShape::Int {
+            identity_layer: crate::schema::IntIdentityParts { identity: None, .. },
+            ..
+        }
         | RawShape::Float { identity: None, .. } => {}
         RawShape::List {
             element_type: inner,
@@ -8941,8 +8922,14 @@ fn local_custom_validator(
             pattern: _pattern,
             length: _length,
         } => None,
-        RawShape::String { validate, .. }
-        | RawShape::Int { validate, .. }
+        RawShape::String {
+            identity_layer: crate::schema::StringIdentityParts { validate, .. },
+            ..
+        }
+        | RawShape::Int {
+            identity_layer: crate::schema::IntIdentityParts { validate, .. },
+            ..
+        }
         | RawShape::Float { validate, .. }
         | RawShape::Enum { validate, .. } => validate,
         RawShape::Bool
@@ -9354,6 +9341,10 @@ fn enum_definition_signature(attribute_type: &AttributeType) -> Option<EnumDefin
 struct OwnerCustomTypeIndex {
     factory_index: usize,
     declarations: BTreeMap<TypeIdentity, Vec<AttributeType>>,
+    identity_declarations: BTreeMap<
+        TypeIdentity,
+        Result<crate::parser::ResolvedSchemaType, crate::parser::CustomTypeValidationError>,
+    >,
 }
 
 struct ProviderFactorySchemaSnapshot {
@@ -9459,8 +9450,7 @@ where
                 declarations_by_identity
                     .entry((identity.clone(), owned.scalar_kind()))
                     .and_modify(|existing| {
-                        *existing =
-                            existing.with_merged_owners(existing.owners().union(owned.owners()));
+                        *existing = existing.conjoin(&owned);
                     })
                     .or_insert(owned);
             }
@@ -9513,21 +9503,20 @@ where
                 owner: owner.clone(),
                 identity: owned.identity().clone(),
             };
-            let declarations = self
+            let declaration = self
                 .index
                 .get(owner)
-                .and_then(|index| index.declarations.get(owned.identity()))
-                .filter(|declarations| !declarations.is_empty())
-                .ok_or_else(missing)?;
-            for declaration in declarations {
-                let declaration = ResolvedSchemaType::from_schema_declaration(owner, declaration)
-                    .filter(|declaration| declaration.scalar_kind() == owned.scalar_kind())
-                    .ok_or_else(missing)?;
-                resolved = Some(match resolved {
-                    Some(existing) => existing.conjoin(&declaration),
-                    None => declaration,
-                });
+                .and_then(|index| index.identity_declarations.get(owned.identity()))
+                .ok_or_else(missing)?
+                .as_ref()
+                .map_err(Clone::clone)?;
+            if declaration.scalar_kind() != owned.scalar_kind() {
+                return Err(missing());
             }
+            resolved = Some(match resolved {
+                Some(existing) => existing.conjoin(declaration),
+                None => declaration.clone(),
+            });
         }
         Ok(resolved
             .expect("nonempty owners and declarations")
@@ -9553,7 +9542,13 @@ where
                             identity: owned.identity().clone(),
                         }
                     })?;
-                Ok((owner.to_string(), declarations.clone()))
+                Ok((
+                    owner.to_string(),
+                    declarations
+                        .iter()
+                        .map(AttributeType::identity_only_declaration)
+                        .collect(),
+                ))
             })
             .collect()
     }
@@ -9663,11 +9658,43 @@ fn build_owner_custom_type_index(
             for (identity, declaration) in factory.witness.identified_declarations() {
                 declarations.entry(identity).or_default().push(declaration);
             }
+            // Aggregate witness admission already proved agreement within
+            // this owner, once. Different owners are conjoined at resolution.
+            let identity_declarations = declarations
+                .iter()
+                .map(|(identity, declarations)| {
+                    let mut layers = declarations.iter().map(|declaration| {
+                        crate::parser::ResolvedSchemaType::from_annotation_declaration(
+                            &factory.name,
+                            declaration,
+                        )
+                        .ok_or_else(|| {
+                            crate::parser::CustomTypeValidationError::MissingDeclaration {
+                                owner: factory.name.clone(),
+                                identity: identity.clone(),
+                            }
+                        })
+                    });
+                    // Every grouped identity has a declaration. Enum/Reference
+                    // bases contribute constraints too; unsupported bases keep
+                    // a typed failure in the index instead of dropping its key.
+                    let resolved = layers
+                        .next()
+                        .expect("nonempty identity declaration group")
+                        .and_then(|first| {
+                            layers.try_fold(first, |resolved, layer| {
+                                layer.map(|layer| resolved.conjoin(&layer))
+                            })
+                        });
+                    (identity.clone(), resolved)
+                })
+                .collect();
             (
                 factory.name.clone(),
                 OwnerCustomTypeIndex {
                     factory_index,
                     declarations,
+                    identity_declarations,
                 },
             )
         })
@@ -10205,6 +10232,47 @@ mod tests {
         }
 
         #[test]
+        fn round11_owner_index_is_total_for_scalar_and_enum_declarations() {
+            use crate::provider::{ProviderFactorySchemaSnapshot, build_owner_custom_type_index};
+            use crate::schema::PatternAttributeType;
+            use std::collections::BTreeMap;
+            let id = TypeIdentity::from_dotted("test.X");
+            let scalar = PatternAttributeType::refined_string(Some(id.clone()), None, None, None);
+            let enumeration = PatternAttributeType::enum_with_base(
+                id.clone(),
+                PatternAttributeType::string(),
+                Some(vec!["yes".into()]),
+                Vec::new(),
+                None,
+                None,
+            );
+            let witness = ValidatedProviderSchemaWitness::new(
+                Vec::new(),
+                ValidatedConfigSchema::validate(BTreeMap::from([
+                    ("scalar".into(), scalar),
+                    ("enum".into(), enumeration),
+                ]))
+                .unwrap(),
+                Default::default(),
+                Vec::new(),
+            )
+            .unwrap();
+            let snapshots = [ProviderFactorySchemaSnapshot {
+                name: "test".into(),
+                witness,
+            }];
+            let index = build_owner_custom_type_index(&snapshots);
+            assert!(
+                index["test"]
+                    .identity_declarations
+                    .get(&id)
+                    .is_some_and(Result::is_ok),
+                "an enum base must not drop the identity's scalar index"
+            );
+            assert_eq!(index["test"].declarations[&id].len(), 2);
+        }
+
+        #[test]
         fn registry_witness_edges_reach_loaded_catalog_without_a_factory() {
             let mut registry = SchemaRegistry::new();
             registry
@@ -10501,6 +10569,36 @@ mod tests {
 
     fn initialized(provider: impl Provider + 'static) -> InitializedProvider {
         InitializedProvider::for_test(Box::new(provider), ReferenceScope::Unavailable)
+    }
+
+    #[test]
+    fn round13_annotation_resolution_requires_the_total_identity_index() {
+        use crate::parser::{CustomTypeResolver, CustomTypeValidationError, OwnedTypeIdentity};
+        let identity = TypeIdentity::from_dotted("test.Indexed");
+        let declaration = AttributeType::refined_string(Some(identity.clone()), None, None, None);
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(ConfigOnlyCustomTypeFactory)];
+        let index = BTreeMap::from([(
+            "config-owner".into(),
+            OwnerCustomTypeIndex {
+                factory_index: 0,
+                declarations: BTreeMap::from([(identity.clone(), vec![declaration])]),
+                identity_declarations: BTreeMap::new(),
+            },
+        )]);
+        let resolver = FactoryCustomTypeResolver::with_index(
+            factories.as_slice(),
+            index,
+            &SchemaRegistry::new(),
+        );
+        let owned =
+            OwnedTypeIdentity::provider("config-owner", identity, RefinedScalarKind::String);
+        assert!(
+            matches!(
+                resolver.annotation_declaration(&owned),
+                Err(CustomTypeValidationError::MissingDeclaration { .. })
+            ),
+            "raw declarations cannot replace missing indexed evidence"
+        );
     }
 
     #[test]
@@ -11176,6 +11274,7 @@ mod tests {
             "config-owner".into(),
             OwnerCustomTypeIndex {
                 factory_index: 0,
+                identity_declarations: BTreeMap::new(),
                 declarations: BTreeMap::from([(identity.clone(), vec![declaration])]),
             },
         )]);
@@ -11224,6 +11323,7 @@ mod tests {
             "config-owner".into(),
             OwnerCustomTypeIndex {
                 factory_index: 0,
+                identity_declarations: BTreeMap::new(),
                 declarations: BTreeMap::from([(identity.clone(), vec![AttributeType::string()])]),
             },
         )]);
@@ -13876,35 +13976,118 @@ mod tests {
     }
 
     #[test]
-    fn provider_error_throttling_classifies_raw_wire_message_code_and_cause() {
-        for marker in ["ThrottlingException", "Rate exceeded"] {
-            for prefix in ["x".repeat(9 * 1024), "\x1b".repeat(1500)] {
-                let raw = format!("{prefix} {marker}");
-                for (message, code, cause) in [
-                    (raw.clone(), None, None),
-                    ("request failed".into(), Some(raw.clone()), None),
-                    ("request failed".into(), None, Some(raw.clone())),
-                ] {
-                    let error = ProviderError::from_wire(WireProviderError {
-                        kind: WireProviderErrorKind::ApiError,
-                        message,
-                        resource_id: None,
-                        cause,
-                        provider_name: None,
-                        operation: None,
-                        status: None,
-                        code,
-                        request_id: None,
-                    });
-                    assert!(!error.to_string().contains(marker));
-                    assert!(error.is_throttled(), "missing raw marker {marker}");
+    fn provider_error_unclassified_marker_text_does_not_change_retryability() {
+        for marker in [
+            "Rate exceeded",
+            "ThrottlingException",
+            "DependencyViolation",
+        ] {
+            let errors = [
+                ProviderError::api_error(marker),
+                ProviderError::api_error_caused_by("batch failed", std::io::Error::other(marker)),
+                ProviderError::api_error("partially applied").with_code(marker),
+            ];
+            for error in errors {
+                assert_eq!(error.retryability(), Retryability::Unclassified);
+                assert!(!error.is_transient());
+                assert!(
+                    !error.is_delete_dependency(),
+                    "text changed policy: {marker}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_error_explicit_unclassified_overrides_transient_cause() {
+        #[derive(Debug)]
+        struct ForeignError(HostError);
+        impl std::fmt::Display for ForeignError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("foreign error")
+            }
+        }
+        impl std::error::Error for ForeignError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let cause = ProviderError::api_error("Rate exceeded DependencyViolation")
+            .with_retryability(Retryability::Transient);
+        let error = ProviderError::api_error_caused_by("CreateFlowLogs partially applied", cause)
+            .with_retryability(Retryability::Unclassified);
+        let host_error = error.clone().with_secrets(&RedactionSet::for_test(&[]));
+        for error in [
+            error.clone(),
+            ProviderError::internal_caused_by("create failed", error.clone()),
+            ProviderError::api_error_caused_by("create failed", error),
+            ProviderError::internal_caused_by("create failed", host_error.clone()),
+            ProviderError::api_error_caused_by("create failed", host_error.clone()),
+            ProviderError::internal_caused_by("create failed", ForeignError(host_error)),
+            ProviderError::api_error_caused_by(
+                "create failed",
+                std::io::Error::other("Rate exceeded DependencyViolation"),
+            ),
+        ] {
+            assert_eq!(error.retryability(), Retryability::Unclassified);
+            assert!(!error.is_transient());
+            assert!(!error.is_delete_dependency());
+        }
+
+        let cause = ProviderError::api_error("temporary failure")
+            .with_retryability(Retryability::Transient)
+            .with_secrets(&RedactionSet::for_test(&[]));
+        let error = ProviderError::api_error_caused_by("create failed", ForeignError(cause));
+        assert_eq!(error.retryability(), Retryability::Transient);
+    }
+
+    #[test]
+    fn provider_error_retryability_survives_raw_wire_message_code_and_cause() {
+        for (retryability, wire_retryability) in [
+            (
+                Retryability::Transient,
+                protocol_types::ProviderErrorRetryability::Transient,
+            ),
+            (
+                Retryability::DependencyBlocked,
+                protocol_types::ProviderErrorRetryability::DependencyBlocked,
+            ),
+        ] {
+            for marker in [
+                "ThrottlingException",
+                "Rate exceeded",
+                "DependencyViolation",
+            ] {
+                for prefix in ["x".repeat(9 * 1024), "\x1b".repeat(1500)] {
+                    let raw = format!("{prefix} {marker}");
+                    for (message, code, cause) in [
+                        (raw.clone(), None, None),
+                        ("request failed".into(), Some(raw.clone()), None),
+                        ("request failed".into(), None, Some(raw.clone())),
+                    ] {
+                        let error = ProviderError::from_wire(WireProviderError {
+                            kind: WireProviderErrorKind::ApiError,
+                            retryability: wire_retryability,
+                            message,
+                            resource_id: None,
+                            cause,
+                            provider_name: None,
+                            operation: None,
+                            status: None,
+                            code,
+                            request_id: None,
+                        });
+                        assert!(!error.to_string().contains(marker));
+                        assert_eq!(error.retryability(), retryability);
+                    }
                 }
             }
         }
     }
 
     #[test]
-    fn provider_error_throttling_classifies_every_native_constructor() {
+    fn provider_error_retryability_is_explicit_for_every_native_constructor() {
         let message_constructors: [fn(String) -> ProviderError; 5] = [
             ProviderError::invalid_input,
             ProviderError::api_error,
@@ -13919,48 +14102,71 @@ mod tests {
             ProviderError::timeout_caused_by,
             ProviderError::internal_caused_by,
         ];
-        for marker in ["ThrottlingException", "Rate exceeded"] {
-            let raw = format!("{} {marker}", "x".repeat(9 * 1024));
+        for marker in [
+            "ThrottlingException",
+            "Rate exceeded",
+            "DependencyViolation",
+        ] {
+            let assert_explicit_policy = |error: ProviderError| {
+                assert_eq!(error.retryability(), Retryability::Unclassified, "{marker}");
+                for retryability in [
+                    Retryability::Unclassified,
+                    Retryability::Transient,
+                    Retryability::DependencyBlocked,
+                ] {
+                    assert_eq!(
+                        error.clone().with_retryability(retryability).retryability(),
+                        retryability,
+                        "{marker}",
+                    );
+                }
+            };
             for construct in message_constructors {
-                let error = construct(raw.clone());
-                assert!(!error.to_string().contains(marker));
-                assert!(error.is_throttled());
+                assert_explicit_policy(construct(marker.into()));
+                assert_explicit_policy(construct("request failed".into()).with_code(marker));
             }
             for construct in cause_constructors {
-                let error = construct("request failed", std::io::Error::other(raw.clone()));
-                assert!(!error.to_string().contains(marker));
-                assert!(error.is_throttled());
+                assert_explicit_policy(construct(marker, std::io::Error::other("foreign cause")));
+                assert_explicit_policy(construct("request failed", std::io::Error::other(marker)));
+                assert_explicit_policy(
+                    construct("request failed", std::io::Error::other("foreign cause"))
+                        .with_code(marker),
+                );
             }
         }
     }
 
     #[test]
-    fn provider_error_throttling_uses_raw_code_and_preserves_classification_on_redaction() {
-        let raw = format!("{} ThrottlingException", "x".repeat(9 * 1024));
-        let error = ProviderError::api_error("request failed")
-            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]))
-            .with_code(raw.clone());
-        assert!(!error.to_string().contains("ThrottlingException"));
-        assert!(error.is_throttled());
-        assert!(!error.with_code("AccessDenied").is_throttled());
+    fn provider_error_retryability_survives_code_changes_and_redaction() {
+        for retryability in [Retryability::Transient, Retryability::DependencyBlocked] {
+            let raw = format!(
+                "{} ThrottlingException DependencyViolation",
+                "x".repeat(9 * 1024)
+            );
+            let error = ProviderError::api_error("request failed")
+                .with_retryability(retryability)
+                .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]))
+                .with_code(raw.clone());
+            assert!(!error.to_string().contains("ThrottlingException"));
+            assert_eq!(error.retryability(), retryability);
+            assert_eq!(error.with_code("AccessDenied").retryability(), retryability);
 
-        let error = ProviderError::api_error(raw)
-            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]))
-            .with_redacted_message("redacted")
-            .with_code("AccessDenied");
-        assert_eq!(error.detail().context(), "redacted");
-        assert!(error.is_throttled());
+            let error = ProviderError::api_error(raw)
+                .with_retryability(retryability)
+                .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]))
+                .with_redacted_message("redacted")
+                .with_code("AccessDenied");
+            assert_eq!(error.detail().context(), "redacted");
+            assert_eq!(error.retryability(), retryability);
+        }
     }
 
     #[test]
-    fn provider_error_throttling_keeps_existing_case_sensitive_marker_semantics() {
+    fn provider_error_metadata_does_not_infer_retryability() {
         for message in [
             "prefix ThrottlingException suffix",
             "prefix Rate exceeded suffix",
-        ] {
-            assert!(ProviderError::api_error(message).is_throttled());
-        }
-        for message in [
+            "DependencyViolation",
             "throttlingexception",
             "rate exceeded",
             "Throttling",
@@ -13968,58 +14174,111 @@ mod tests {
             "RequestLimitExceeded",
             "SlowDown",
         ] {
-            assert!(!ProviderError::api_error(message).is_throttled());
-            assert!(
-                !ProviderError::api_error("request failed")
-                    .with_code(message)
-                    .is_throttled()
-            );
+            for error in [
+                ProviderError::api_error(message),
+                ProviderError::api_error("request failed").with_code(message),
+            ] {
+                assert_eq!(error.retryability(), Retryability::Unclassified);
+                assert!(!error.is_transient());
+                assert!(!error.is_delete_dependency());
+            }
         }
-        assert!(
-            !ProviderError::api_error("request failed")
+        assert_eq!(
+            ProviderError::api_error("request failed")
                 .with_status(429)
-                .is_throttled()
+                .retryability(),
+            Retryability::Unclassified,
         );
     }
 
     #[test]
-    fn provider_error_throttling_classifies_nested_typed_causes() {
+    fn provider_error_retryability_inherits_nested_typed_causes() {
         #[derive(Debug)]
-        struct ServiceError(std::io::Error);
-
+        struct ServiceError(HostError);
         impl std::fmt::Display for ServiceError {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("service error")
             }
         }
-
         impl std::error::Error for ServiceError {
             fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
                 Some(&self.0)
             }
         }
-
-        let raw = format!("{} Rate exceeded", "x".repeat(9 * 1024));
-        let error = ProviderError::api_error_caused_by(
-            "request failed",
-            ServiceError(std::io::Error::other(raw.clone())),
-        );
-        assert!(!error.to_string().contains("Rate exceeded"));
-        assert!(error.is_throttled());
-
-        let nested =
-            ProviderError::internal_caused_by("operation failed", ProviderError::api_error(raw));
-        assert!(!nested.to_string().contains("Rate exceeded"));
-        assert!(nested.is_throttled());
+        for retryability in [Retryability::Transient, Retryability::DependencyBlocked] {
+            let cause = ProviderError::api_error(format!("{} Rate exceeded", "x".repeat(9 * 1024)))
+                .with_retryability(retryability);
+            let error = ProviderError::api_error_caused_by(
+                "request failed",
+                ServiceError(cause.clone().with_secrets(&RedactionSet::for_test(&[]))),
+            );
+            assert!(!error.to_string().contains("Rate exceeded"));
+            assert_eq!(error.retryability(), retryability);
+            let nested = ProviderError::internal_caused_by("operation failed", cause);
+            assert!(!nested.to_string().contains("Rate exceeded"));
+            assert_eq!(nested.retryability(), retryability);
+            assert_eq!(
+                nested.is_delete_dependency(),
+                retryability == Retryability::DependencyBlocked
+            );
+        }
     }
 
     #[test]
-    fn provider_error_throttling_inspects_original_diagnostic_cause() {
-        let raw = format!("{} ThrottlingException", "x".repeat(9 * 1024));
-        let diagnostic = ProviderDiagnostic::new(std::io::Error::other(raw));
-        assert!(!diagnostic.to_string().contains("ThrottlingException"));
-        let error = ProviderError::api_error_caused_by("request failed", diagnostic);
-        assert!(error.is_throttled());
+    fn provider_error_retryability_retains_original_diagnostic_cause() {
+        for retryability in [Retryability::Transient, Retryability::DependencyBlocked] {
+            let raw = format!("{} ThrottlingException", "x".repeat(9 * 1024));
+            let diagnostic = ProviderDiagnostic::new(
+                ProviderError::api_error_caused_by("typed failure", std::io::Error::other(raw))
+                    .with_retryability(retryability),
+            );
+            assert!(!diagnostic.to_string().contains("ThrottlingException"));
+            let error = ProviderError::api_error_caused_by("request failed", diagnostic);
+            assert_eq!(error.retryability(), retryability);
+        }
+    }
+
+    #[test]
+    fn provider_error_dependency_blocked_context_inherits_and_can_be_cleared() {
+        let cause = ProviderError::api_error("dependent resource exists")
+            .with_retryability(Retryability::DependencyBlocked);
+        let error = ProviderError::api_error_caused_by("delete waits", cause);
+        assert!(error.is_delete_dependency());
+        assert!(!error.is_transient());
+        let permanent = error.with_retryability(Retryability::Unclassified);
+        assert_eq!(permanent.retryability(), Retryability::Unclassified);
+        assert!(!permanent.is_delete_dependency());
+        assert!(!permanent.is_transient());
+    }
+
+    #[test]
+    fn provider_error_retryability_uses_nearest_carina_frame() {
+        for (nearest, deeper, expected) in [
+            (
+                Retryability::DependencyBlocked,
+                Retryability::Transient,
+                Retryability::DependencyBlocked,
+            ),
+            (
+                Retryability::Transient,
+                Retryability::DependencyBlocked,
+                Retryability::Transient,
+            ),
+            (
+                Retryability::Unclassified,
+                Retryability::DependencyBlocked,
+                Retryability::Unclassified,
+            ),
+        ] {
+            let leaf = ProviderError::api_error("leaf").with_retryability(deeper);
+            let frame =
+                ProviderError::internal_caused_by("nearest", leaf).with_retryability(nearest);
+            let diagnostic =
+                ProviderDiagnostic::new(frame.with_secrets(&RedactionSet::for_test(&[])));
+            assert_eq!(diagnostic.retryability(), expected);
+            let error = ProviderError::api_error_caused_by("outer", diagnostic);
+            assert_eq!(error.retryability(), expected);
+        }
     }
 
     #[test]

@@ -35,6 +35,7 @@ mod let_binding;
 mod resolve;
 pub mod retained;
 mod scalar_constraints;
+mod value_type;
 pub(crate) use resolve::resolve_resource_refs_in_session_unsealed;
 pub use resolve::{
     AnalysisResolutionError, finalize_provider_configs_for_analysis,

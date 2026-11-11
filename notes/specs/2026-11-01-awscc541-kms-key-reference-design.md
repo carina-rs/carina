@@ -149,19 +149,22 @@ side decides what each case means:
 enum ReferenceOutcome { Resolved(CanonicalReference), NotFound(ProviderError) }
 enum ReferenceError {
     AccessDenied(ProviderError),   // AccessDeniedException, key policy denial
-    Transient(ProviderError),      // throttling after retries, transport, 5xx, credentials
-    InvalidReference(ProviderError), // malformed value, unreachable partition, non-ARN success
+    InvalidReference(ProviderError), // malformed value or other resolution failure
 }
 ```
 
 Core holds a provider-agnostic `CanonicalReference`; the guest validates `KmsKeyArn`.
 Cached states are `Resolved`, `NotFound` and `Failed`.
+Temporary resolution failures (throttling, transport, 5xx, credentials) use
+`InvalidReference` with the inner error classified using
+`with_retryability(Retryability::Transient)`. Protocol 28 / WIT 0.3.0 encodes
+retryability only in that typed class.
 
 | Case | Desired side | Current (read/state) side |
 |---|---|---|
 | `Resolved` | compare ARNs | compare ARNs |
 | `NotFound` (alias or key deleted) | plan error: apply would send a reference KMS rejects | `CurrentSide::Dangling`: unequal to every resolved desired ARN, so it is a diff |
-| `AccessDenied` / `Transient` / `InvalidReference` | plan error | plan error |
+| `AccessDenied` / `InvalidReference` (any retryability class) | plan error | plan error |
 
 `NotFound` on the current side means the resource points at nothing; an
 error there would block the very update that repairs it, so it becomes a
@@ -209,12 +212,13 @@ record reference-request {
 variant reference-outcome { resolved(string), not-found(provider-error) }
 variant reference-error {
     access-denied(provider-error),
-    transient(provider-error),
     invalid-reference(provider-error),
 }
 resolve-references: func(requests: list<reference-request>)
     -> result<list<result<reference-outcome, reference-error>>, provider-error>;
 ```
+
+Protocol 28 removed `transient(provider-error)`; the inner error's retryability class carries transience.
 
 Results are positional; the host retains resource/path fan-out and never
 sends unknown/deferred leaves. Core rejects length mismatches and empty

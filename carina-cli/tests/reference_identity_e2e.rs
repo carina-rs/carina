@@ -124,7 +124,7 @@ fn saved_reference_update_renders_and_applies_without_a_resolution_witness() {
     assert!(planned.status.success(), "{}", output(&planned));
     let mut denied = table("key-b");
     denied["alias/live"] = json!({"Err":{"AccessDenied":{
-        "kind":"api_error", "message":"saved-plan display must not resolve references",
+        "kind":"api_error","retryability":"unclassified", "message":"saved-plan display must not resolve references",
         "provider_name":"mock", "operation":"ResolveKey", "code":"AccessDenied"
     }}});
     // Echo the authored input during CRUD so only an accidental planning or
@@ -176,7 +176,7 @@ fn reference_directory_denial_exits_one_and_produces_no_executable_saved_plan() 
     project.apply(&table("key-a"), false);
     let mut table = table("key-a");
     table["alias/live"] = json!({"Err":{"AccessDenied":{
-        "kind":"api_error", "message":"Describe denied", "provider_name":"mock",
+        "kind":"api_error","retryability":"unclassified", "message":"Describe denied", "provider_name":"mock",
         "operation":"ResolveKey", "code":"AccessDenied", "request_id":"request-123"
     }}});
     let result = project.run(&["plan", "--out", "denied.plan.json"], &table, false);

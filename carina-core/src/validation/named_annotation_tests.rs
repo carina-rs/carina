@@ -90,6 +90,95 @@ fn string(min: u64, max: u64, pattern: Option<crate::schema::PatternSpec>) -> Dr
     )
 }
 
+fn member(min: u64, max: u64, pattern: Option<crate::schema::PatternSpec>) -> DraftType {
+    DraftType::string_member(
+        crate::schema::StringIdentityLayer::new(Some(identity()), None, None, None),
+        crate::schema::StringMemberConstraints::new(pattern, Some((Some(min), Some(max)))),
+    )
+}
+
+#[test]
+fn read_value_evidence_cannot_retain_string_or_int_member_constraints() {
+    for declarations in [
+        vec![member(1, 8, None), member(16, 32, None)],
+        vec![
+            DraftType::int_member(
+                crate::schema::IntIdentityLayer::new(Some(identity()), None),
+                crate::schema::IntMemberConstraints::new(Some((Some(1), Some(8)))),
+            ),
+            DraftType::int_member(
+                crate::schema::IntIdentityLayer::new(Some(identity()), None),
+                crate::schema::IntMemberConstraints::new(Some((Some(16), Some(32)))),
+            ),
+        ],
+    ] {
+        let loaded = snapshot(vec![("p", declarations)]);
+        let left = inference::attribute_type_to_type_expr(declaration(&loaded, "p", 0), "p");
+        let right = inference::attribute_type_to_type_expr(declaration(&loaded, "p", 1), "p");
+        assert_eq!(
+            left, right,
+            "a destination member layer is not value type evidence"
+        );
+        let wire = serde_json::to_string(&left).unwrap();
+        assert!(
+            !wire.contains("member_layer") && !wire.contains("member_range"),
+            "{wire}"
+        );
+        let restored: TypeExpr = serde_json::from_str(&wire).unwrap();
+        assert_eq!(left, restored);
+        let value = match &left {
+            TypeExpr::SchemaType { owned }
+                if owned.scalar_kind() == crate::schema::RefinedScalarKind::Int =>
+            {
+                integer(100)
+            }
+            _ => text("value outside either slot's length bounds"),
+        };
+        typecheck::check_type_expr_value(
+            &restored,
+            &value,
+            loaded.provider_context(),
+            &crate::parser::retained::value_dependent_judgement_for_test(),
+        )
+        .require_provider_schemas()
+        .expect("reads retain identity constraints and semantic checks only");
+    }
+}
+
+fn local(declaration: DraftType) -> DraftType {
+    let RawShape::String {
+        identity_layer,
+        member_layer,
+    } = declaration.raw_shape()
+    else {
+        return declaration;
+    };
+    let crate::schema::StringIdentityParts {
+        identity,
+        pattern,
+        length,
+        validate,
+        to_dsl,
+    } = identity_layer;
+    assert!(member_layer.pattern.is_none() && member_layer.length.is_none());
+    let base = match validate {
+        Some(validate) => crate::schema::StringIdentityLayer::with_validator(
+            identity.unwrap().clone(),
+            None,
+            None,
+            validate.clone(),
+            to_dsl.cloned(),
+        ),
+        None => {
+            crate::schema::StringIdentityLayer::new(identity.cloned(), None, None, to_dsl.cloned())
+        }
+    };
+    DraftType::string_member(
+        base,
+        crate::schema::StringMemberConstraints::new(pattern.cloned(), length),
+    )
+}
+
 fn snapshot(owners: Vec<(&'static str, Vec<DraftType>)>) -> LoadedProviderSnapshot {
     snapshot_with_config(owners, BTreeMap::new())
 }
@@ -175,7 +264,10 @@ fn lifting_preserves_all_string_obligations_in_nested_annotations() {
     assert!(matches!(
         lifted.raw_shape(),
         RawShape::String {
-            length: Some((Some(1), Some(64))),
+            identity_layer: crate::schema::StringIdentityParts {
+                length: Some((Some(1), Some(64))),
+                ..
+            },
             ..
         }
     ));
@@ -194,84 +286,62 @@ fn lifting_preserves_all_string_obligations_in_nested_annotations() {
 }
 
 #[test]
-fn every_owner_and_every_declaration_contribute_order_independently() {
-    let first = vec![
-        string(
-            1,
-            64,
-            Some(crate::schema::PatternSpec::new(
-                "^A",
-                crate::schema::PatternMatch::Substring {
-                    reason: crate::schema::PatternReason::new(
-                        "Owner contributes a prefix or suffix constraint to the conjunction",
-                    )
-                    .unwrap(),
-                },
-            )),
-        ),
-        string(
-            8,
-            128,
-            Some(crate::schema::PatternSpec::new(
-                "Z$",
-                crate::schema::PatternMatch::Substring {
-                    reason: crate::schema::PatternReason::new(
-                        "Owner contributes a prefix or suffix constraint to the conjunction",
-                    )
-                    .unwrap(),
-                },
-            )),
-        ),
-    ];
-    let second = vec![string(
-        4,
-        80,
-        Some(crate::schema::PatternSpec::new(
-            "^[A-Z]+$",
-            crate::schema::PatternMatch::Full,
-        )),
-    )];
+fn identity_annotations_ignore_member_order_and_keep_every_owner() {
+    use crate::schema::{
+        PatternMatch, PatternReason, PatternSpec, StringIdentityLayer, StringMemberConstraints,
+    };
+    let base = StringIdentityLayer::new(
+        Some(identity()),
+        Some(PatternSpec::new("[A-Z]+", PatternMatch::Full)),
+        Some((Some(8), Some(64))),
+        None,
+    );
+    let site = |regex: &str, min, max| {
+        DraftType::string_member(
+            base.clone(),
+            StringMemberConstraints::new(
+                Some(PatternSpec::new(
+                    regex,
+                    PatternMatch::Substring {
+                        reason: PatternReason::new("A member-specific prefix or suffix").unwrap(),
+                    },
+                )),
+                Some((Some(min), Some(max))),
+            ),
+        )
+    };
+    let first = vec![site("^A", 1, 64), site("Z$", 8, 128)];
+    let second = vec![site("[A-Z]+", 4, 80)];
     let a = snapshot(vec![("p", first.clone()), ("q", second.clone())]);
     let b = snapshot(vec![
         ("q", second),
         ("p", first.into_iter().rev().collect()),
     ]);
     assert_eq!(annotation(&a), annotation(&b));
-    let lifted = lift_type_expr(&annotation(&a)).unwrap();
+    let first = inference::attribute_type_to_type_expr(declaration(&a, "p", 0), "p");
+    let second = inference::attribute_type_to_type_expr(declaration(&a, "p", 1), "p");
     assert_eq!(
-        inference::attribute_type_to_type_expr(&lifted, "p"),
-        annotation(&a)
+        first, second,
+        "member differences disappear at the read seam"
     );
-    assert!(matches!(
-        lifted.raw_shape(),
-        RawShape::String {
-            length: Some((Some(8), Some(64))),
-            ..
-        }
-    ));
+    let lifted = lift_type_expr(&annotation(&a)).unwrap();
+    for value in ["AAAAAAAZ", "BAAAAAAZ", "AAAAAAAA"] {
+        assert!(lifted.validate(&text(value)).is_ok());
+    }
+    for value in ["AaaaaaaZ", "AZ"] {
+        assert!(lifted.validate(&text(value)).is_err());
+    }
     for (owner, index) in [("p", 0), ("p", 1), ("q", 0)] {
         assert!(assign(&lifted, declaration(&a, owner, index), &a, owner));
     }
-    assert!(lifted.validate(&text("AAAAAAAZ")).is_ok());
-    for rejected in ["BAAAAAAZ", "AAAAAAAA", "AaaaaaaZ", "AZ"] {
-        assert!(lifted.validate(&text(rejected)).is_err(), "{rejected}");
-    }
-    let narrower = snapshot(vec![("p", vec![string(10, 32, None)])]);
-    assert!(!assign(
-        &lifted,
-        declaration(&narrower, "p", 0),
-        &narrower,
-        "p"
-    ));
-    let wire = serde_json::to_value(annotation(&a)).unwrap();
-    assert_eq!(wire["SchemaType"]["owned"]["origin"], "Annotation");
-    let restored: TypeExpr = serde_json::from_value(wire).unwrap();
+    let restored: TypeExpr =
+        serde_json::from_value(serde_json::to_value(annotation(&a)).unwrap()).unwrap();
     assert_eq!(restored, annotation(&a));
     assert!(
         lift_type_expr(&restored)
             .unwrap()
             .validate(&text("BAAAAAAZ"))
-            .is_err()
+            .is_ok()
     );
 }
 
@@ -280,8 +350,20 @@ fn numeric_annotation_intersections_preserve_effective_ranges() {
     for (declarations, expected) in [
         (
             vec![
-                DraftType::refined_int(Some(identity()), Some((Some(-2), Some(64)))),
-                DraftType::refined_int(Some(identity()), Some((Some(8), Some(128)))),
+                DraftType::int_member(
+                    crate::schema::IntIdentityLayer::new(
+                        Some(identity()),
+                        Some((Some(8), Some(64))),
+                    ),
+                    crate::schema::IntMemberConstraints::new(Some((Some(-2), Some(64)))),
+                ),
+                DraftType::int_member(
+                    crate::schema::IntIdentityLayer::new(
+                        Some(identity()),
+                        Some((Some(8), Some(64))),
+                    ),
+                    crate::schema::IntMemberConstraints::new(Some((Some(8), Some(128)))),
+                ),
             ],
             "range 8..=64",
         ),
@@ -299,18 +381,54 @@ fn numeric_annotation_intersections_preserve_effective_ranges() {
             "range 8.5..=64.5",
         ),
     ] {
-        let a = snapshot(vec![("p", declarations.clone())]);
-        let b = snapshot(vec![("p", declarations.into_iter().rev().collect())]);
+        // Float has no member layer: differing reusable definitions belong
+        // to different owners, whose annotation constraints still conjoin.
+        let is_float = matches!(
+            declarations[0].raw_shape(),
+            crate::schema::RawShape::Float { .. }
+        );
+        let (a, b, second_owner, second_index) = if is_float {
+            (
+                snapshot(vec![
+                    ("p", vec![declarations[0].clone()]),
+                    ("q", vec![declarations[1].clone()]),
+                ]),
+                snapshot(vec![
+                    ("q", vec![declarations[1].clone()]),
+                    ("p", vec![declarations[0].clone()]),
+                ]),
+                "q",
+                0,
+            )
+        } else {
+            (
+                snapshot(vec![("p", declarations.clone())]),
+                snapshot(vec![("p", declarations.into_iter().rev().collect())]),
+                "p",
+                1,
+            )
+        };
         assert_eq!(annotation(&a), annotation(&b));
         let lifted = lift_type_expr(&annotation(&a)).unwrap();
         assert!(assign(&lifted, declaration(&a, "p", 0), &a, "p"));
-        assert!(assign(&lifted, declaration(&a, "p", 1), &a, "p"));
+        assert!(assign(
+            &lifted,
+            declaration(&a, second_owner, second_index),
+            &a,
+            second_owner
+        ));
         assert!(lifted.validate(&integer(16)).is_ok());
         assert!(lifted.validate(&integer(7)).is_err());
         assert!(lifted.validate(&integer(65)).is_err());
-        let (_, actual) = TypeInSchema::schemaless(&lifted)
+        let (expected_name, actual) = TypeInSchema::schemaless(&lifted)
             .mismatch_type_names(TypeInSchema::schemaless(declaration(&a, "p", 0)));
         assert!(actual.contains(expected), "{actual}");
+        if matches!(lifted.raw_shape(), RawShape::Int { .. }) {
+            assert!(
+                expected_name.contains("member range -2..=64"),
+                "{expected_name}"
+            );
+        }
     }
 }
 
@@ -407,13 +525,13 @@ fn nominal_pattern_policy_is_preserved_and_diagnostics_show_each_pattern() {
 
 #[test]
 fn empty_intersections_are_explicit_and_reject_values_and_assignments() {
-    for declarations in [
-        vec![string(1, 4, None), string(8, 12, None)],
-        vec![
+    for (first, second) in [
+        (string(1, 4, None), string(8, 12, None)),
+        (
             DraftType::refined_int(Some(identity()), Some((Some(1), Some(4)))),
             DraftType::refined_int(Some(identity()), Some((Some(8), Some(12)))),
-        ],
-        vec![
+        ),
+        (
             DraftType::refined_float(
                 Some(identity()),
                 Some((Some(crate::finite(1.0)), Some(crate::finite(4.0)))),
@@ -422,9 +540,9 @@ fn empty_intersections_are_explicit_and_reject_values_and_assignments() {
                 Some(identity()),
                 Some((Some(crate::finite(8.0)), Some(crate::finite(12.0)))),
             ),
-        ],
+        ),
     ] {
-        let snapshot = snapshot(vec![("p", declarations)]);
+        let snapshot = snapshot(vec![("p", vec![first]), ("q", vec![second])]);
         let ty = annotation(&snapshot);
         let lifted = lift_type_expr(&ty).unwrap();
         assert!(!assign(
@@ -444,13 +562,7 @@ fn empty_intersections_are_explicit_and_reject_values_and_assignments() {
             RawShape::String { .. } => text("ABC"),
             _ => integer(3),
         };
-        assert!(
-            lifted
-                .validate(&value)
-                .unwrap_err()
-                .to_string()
-                .contains("empty intersection")
-        );
+        assert!(lifted.validate(&value).is_err());
         let wire = serde_json::to_value(&ty).unwrap();
         assert_eq!(
             wire["SchemaType"]["owned"]["constraints"]["empty_intersection"],
@@ -467,20 +579,20 @@ fn empty_intersections_are_explicit_and_reject_values_and_assignments() {
 }
 
 #[test]
-fn exact_schema_projections_keep_their_declaration_instead_of_sibling_constraints() {
-    let snapshot = snapshot(vec![("p", vec![string(1, 128, None), string(8, 64, None)])]);
+fn read_projections_keep_identity_constraints_without_slot_members() {
+    let snapshot = snapshot(vec![("p", vec![member(1, 128, None), member(8, 64, None)])]);
     let source = declaration(&snapshot, "p", 0);
     let exact = inference::attribute_type_to_type_expr(source, "p");
     let lifted = lift_type_expr(&exact).unwrap();
     assert!(matches!(
         lifted.raw_shape(),
         RawShape::String {
-            length: Some((Some(1), Some(128))),
+            member_layer: crate::schema::StringMemberParts { length: None, .. },
             ..
         }
     ));
-    assert_ne!(exact, annotation(&snapshot));
-    assert!(!assign(
+    assert_eq!(exact, annotation(&snapshot));
+    assert!(assign(
         &lifted,
         declaration(&snapshot, "p", 1),
         &snapshot,
@@ -496,10 +608,13 @@ fn exact_schema_projections_keep_their_declaration_instead_of_sibling_constraint
     .expect("an exact source value must not inherit its narrower sibling's bound");
     let (expected, actual) = TypeInSchema::schemaless(&lifted)
         .mismatch_type_names(TypeInSchema::schemaless(declaration(&snapshot, "p", 1)));
-    assert_eq!(expected, "aws.iam.Role.Name (length 8..=64)");
-    assert_eq!(actual, "aws.iam.Role.Name (length 1..=128)");
+    assert_eq!(
+        expected,
+        "aws.iam.Role.Name (length unbounded, member length 8..=64)"
+    );
+    assert_eq!(actual, "aws.iam.Role.Name (length unbounded)");
     let wire = serde_json::to_value(&exact).unwrap();
-    assert_eq!(wire["SchemaType"]["owned"]["origin"], "Projection");
+    assert_eq!(wire["SchemaType"]["owned"]["origin"], "Annotation");
     let restored: TypeExpr = serde_json::from_value(wire).unwrap();
     assert_eq!(restored, exact);
     typecheck::check_type_expr_value(
@@ -537,7 +652,7 @@ fn exact_projection_value_validation_keeps_its_callback_without_sibling_callback
         }),
         None,
     );
-    let snapshot = snapshot(vec![("p", vec![wide, narrow])]);
+    let snapshot = snapshot(vec![("p", vec![local(wide), local(narrow)])]);
     let exact = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 0), "p");
     let value = text("A".repeat(16));
     typecheck::check_type_expr_value(
@@ -567,14 +682,17 @@ fn exact_projection_value_validation_keeps_its_callback_without_sibling_callback
 #[test]
 fn config_only_declarations_join_resource_declarations_and_truly_unbounded_types_lift() {
     let snapshot = snapshot_with_config(
-        vec![("p", vec![string(1, 128, None)])],
+        vec![("p", vec![string(8, 64, None)])],
         BTreeMap::from([("config_name".into(), string(8, 64, None))]),
     );
     let lifted = lift_type_expr(&annotation(&snapshot)).unwrap();
     assert!(matches!(
         lifted.raw_shape(),
         RawShape::String {
-            length: Some((Some(8), Some(64))),
+            identity_layer: crate::schema::StringIdentityParts {
+                length: Some((Some(8), Some(64))),
+                ..
+            },
             ..
         }
     ));
@@ -587,7 +705,10 @@ fn config_only_declarations_join_resource_declarations_and_truly_unbounded_types
             .unwrap()
             .raw_shape(),
         RawShape::String {
-            length: Some((Some(2), Some(16))),
+            identity_layer: crate::schema::StringIdentityParts {
+                length: Some((Some(2), Some(16))),
+                ..
+            },
             ..
         }
     ));
@@ -603,7 +724,8 @@ fn config_only_declarations_join_resource_declarations_and_truly_unbounded_types
     let ty = annotation(&unbounded);
     let wire = serde_json::to_value(&ty).unwrap();
     assert_eq!(
-        wire["SchemaType"]["owned"]["constraints"]["scalar"]["String"]["length"]["min"],
+        wire["SchemaType"]["owned"]["constraints"]["scalar"]["String"]["identity_layer"]["length"]
+            ["min"],
         "Unbounded"
     );
     let restored: TypeExpr = serde_json::from_value(wire).unwrap();
@@ -635,8 +757,8 @@ fn review_projection_serde_rebinds_exact_callbacks_and_enum_semantics() {
         })),
         None,
     );
-    for draft in [callback, enumeration, dynamic_enum] {
-        let snapshot = snapshot(vec![("p", vec![draft, string(8, 64, None)])]);
+    for draft in [local(callback), enumeration, dynamic_enum] {
+        let snapshot = snapshot(vec![("p", vec![draft, member(8, 64, None)])]);
         let exact = TypeExpr::SchemaType {
             owned: crate::parser::ResolvedSchemaType::from_schema_declaration(
                 "p",
@@ -659,7 +781,7 @@ fn review_projection_serde_rebinds_exact_callbacks_and_enum_semantics() {
                 "exact validation must survive serde: {ty:?}"
             );
         }
-        let missing = self::snapshot(vec![("p", vec![string(1, 128, None)])]);
+        let missing = self::snapshot(vec![("p", vec![member(1, 128, None)])]);
         assert!(
             typecheck::check_type_expr_value(
                 &restored,
@@ -892,7 +1014,7 @@ fn review_enum_witness_pattern_error_masks_env_value() {
 #[test]
 fn review_unloaded_resolution_waits_for_provider_config_declarations() {
     let snapshot = snapshot_with_config(
-        vec![("p", vec![string(1, 128, None)])],
+        vec![("p", vec![string(8, 64, None)])],
         BTreeMap::from([("config_name".into(), string(8, 64, None))]),
     );
     let unloaded = ProviderContext::new(crate::EnvironmentSnapshot::empty());
@@ -1015,22 +1137,11 @@ fn module_call_boundaries_check_schema_sources_and_forwarded_caller_arguments() 
             "arguments { x: aws.iam.Role.Name }\nlet child = use { source = './child' }\nlet instance = child { x = x }\n",
         ] {
             let findings = call_findings(source, &caller, annotation(&callee));
-            if width <= 64 {
-                assert!(findings.is_empty(), "width {width}: {findings:#?}");
-            } else {
-                assert!(
-                    !findings.is_empty(),
-                    "wider same-identity source must fail: {source}"
-                );
-                assert!(
-                    findings.iter().any(|finding| {
-                        let message = finding.message().to_string();
-                        message.contains("expected aws.iam.Role.Name (length 1..=64)")
-                            && message.contains("got aws.iam.Role.Name (length 1..=128)")
-                    }),
-                    "{findings:#?}"
-                );
-            }
+            assert_eq!(
+                findings.is_empty(),
+                width <= 64,
+                "identity admission at width {width}: {findings:#?}"
+            );
         }
     }
 }
@@ -1062,11 +1173,14 @@ fn review_bare_enum_module_argument_rejects_empty_witness() {
         None,
         None,
     );
-    let caller = snapshot(vec![("p", vec![enumeration.clone()])]);
-    let callee = snapshot(vec![(
-        "p",
-        vec![enumeration, string(1, 4, None), string(8, 12, None)],
-    )]);
+    let caller = snapshot(vec![
+        ("p", vec![enumeration.clone()]),
+        ("q", vec![string(1, 128, None)]),
+    ]);
+    let callee = snapshot(vec![
+        ("p", vec![enumeration, string(1, 4, None)]),
+        ("q", vec![string(8, 12, None)]),
+    ]);
     for (argument, sink) in [
         ("choice", annotation(&callee)),
         ("[choice]", TypeExpr::List(Box::new(annotation(&callee)))),
@@ -1140,39 +1254,62 @@ fn unbounded_annotation_constraints_admit_explicitly_unbounded_schema_declaratio
     for declarations in [
         vec![
             DraftType::refined_string(Some(identity()), None, None, None),
-            DraftType::refined_string(Some(identity()), None, Some((None, None)), None),
+            DraftType::string_member(
+                crate::schema::StringIdentityLayer::new(Some(identity()), None, None, None),
+                crate::schema::StringMemberConstraints::new(None, Some((None, None))),
+            ),
         ],
         vec![
             DraftType::refined_int(Some(identity()), None),
-            DraftType::refined_int(Some(identity()), Some((None, None))),
+            DraftType::int_member(
+                crate::schema::IntIdentityLayer::new(Some(identity()), None),
+                crate::schema::IntMemberConstraints::new(Some((None, None))),
+            ),
         ],
         vec![
             DraftType::refined_float(Some(identity()), None),
             DraftType::refined_float(Some(identity()), Some((None, None))),
         ],
     ] {
-        let snapshot = snapshot(vec![("p", declarations)]);
+        let is_float = matches!(
+            declarations[0].raw_shape(),
+            crate::schema::RawShape::Float { .. }
+        );
+        let (snapshot, locations) = if is_float {
+            (
+                snapshot(vec![
+                    ("p", vec![declarations[0].clone()]),
+                    ("q", vec![declarations[1].clone()]),
+                ]),
+                [("p", 0), ("q", 0)],
+            )
+        } else {
+            (snapshot(vec![("p", declarations)]), [("p", 0), ("p", 1)])
+        };
         let lifted = lift_type_expr(&annotation(&snapshot)).unwrap();
-        for index in [0, 1] {
+        for (owner, index) in locations {
             assert!(assign(
                 &lifted,
-                declaration(&snapshot, "p", index),
+                declaration(&snapshot, owner, index),
                 &snapshot,
-                "p"
+                owner
             ));
             assert!(assign(
-                declaration(&snapshot, "p", index),
+                declaration(&snapshot, owner, index),
                 &lifted,
                 &snapshot,
-                "p"
+                owner
             ));
         }
     }
 }
 
 #[test]
-fn computed_access_mismatch_keeps_inferred_constraints_and_nested_path() {
-    let snapshot = snapshot(vec![("p", vec![string(1, 128, None), string(1, 64, None)])]);
+fn computed_access_keeps_only_identity_constraints() {
+    let snapshot = snapshot(vec![(
+        "p",
+        vec![member(100, 128, None), member(1, 64, None)],
+    )]);
     let parsed = crate::parser::parse(
         "let source = p.Values {}\nlet result = [([source.value0] ?? [source.value0])[0]]",
         snapshot.provider_context().as_provider_context(),
@@ -1203,7 +1340,7 @@ fn computed_access_mismatch_keeps_inferred_constraints_and_nested_path() {
         Value::Deferred(crate::resource::DeferredValue::Access(_))
     ));
     let expected = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 1), "p");
-    let error = typecheck::check_type_expr_value(
+    typecheck::check_type_expr_value(
         &TypeExpr::List(Box::new(expected)),
         &list(vec![access]),
         snapshot.provider_context(),
@@ -1212,11 +1349,7 @@ fn computed_access_mismatch_keeps_inferred_constraints_and_nested_path() {
             .unwrap(),
     )
     .require_provider_schemas()
-    .unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "at list element 0: expected aws.iam.Role.Name (length 1..=64), got aws.iam.Role.Name (length 1..=128)"
-    );
+    .expect("a read's former member bounds are not value constraints");
 }
 
 #[test]
@@ -1224,19 +1357,14 @@ fn computed_access_rejects_heterogeneous_collection_in_validation() {
     let snapshot = snapshot(vec![(
         "p",
         vec![
-            string(1, 64, None),
-            string(1, 128, None),
-            DraftType::list(string(1, 64, None)),
+            member(1, 64, None),
+            member(1, 128, None),
+            DraftType::list(member(1, 64, None)),
         ],
     )]);
     let context = snapshot.provider_context().as_provider_context();
     for (fallback, expected_error) in [
-        (
-            "[source.value0, source.value1]",
-            Some(
-                "collection element types disagree: `aws.iam.Role.Name (length 1..=64)` vs `aws.iam.Role.Name (length 1..=128)`",
-            ),
-        ),
+        ("[source.value0, source.value1]", None),
         (
             "['ValidName', 1]",
             Some("collection element types disagree: `String` vs `Int`"),
@@ -1274,7 +1402,7 @@ fn computed_access_rejects_heterogeneous_collection_in_validation() {
 
 #[test]
 fn computed_access_rejects_heterogeneous_collection_in_typecheck() {
-    let snapshot = snapshot(vec![("p", vec![string(1, 64, None), string(1, 128, None)])]);
+    let snapshot = snapshot(vec![("p", vec![member(1, 64, None), member(1, 128, None)])]);
     let expected = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 0), "p");
     let narrow = typed_function_result(expected.clone());
     let wide = typed_function_result(inference::attribute_type_to_type_expr(
@@ -1282,25 +1410,30 @@ fn computed_access_rejects_heterogeneous_collection_in_typecheck() {
         "p",
     ));
     for (index, (elements, expected_error)) in [
-        (
-            vec![narrow.clone(), wide],
-            Some(
-                "collection element types disagree: `aws.iam.Role.Name (length 1..=64)` vs `aws.iam.Role.Name (length 1..=128)`",
-            ),
-        ),
+        (vec![narrow.clone(), wide], None),
         (
             vec![text("ValidName"), integer(1)],
             Some("collection element types disagree: `String` vs `Int`"),
         ),
         (vec![narrow.clone(), narrow.clone()], None),
-    ].into_iter().enumerate() {
-        let fallback = ["[source.value0, source.value1]", "['ValidName', 1]", "[source.value0, source.value0]"][index];
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fallback = [
+            "[source.value0, source.value1]",
+            "['ValidName', 1]",
+            "[source.value0, source.value0]",
+        ][index];
         let parsed = crate::parser::parse(
             &format!("let source = p.Values {{}}\nlet result = ([source.value0, source.value0] ?? {fallback})[1]"),
             snapshot.provider_context().as_provider_context(),
         ).unwrap();
         let report = crate::parser::retained::judge_expressions(
-            &parsed, snapshot.schema_registry(), snapshot.provider_context().as_provider_context());
+            &parsed,
+            snapshot.schema_registry(),
+            snapshot.provider_context().as_provider_context(),
+        );
         let access = crate::resource::apply_value_path_segment(
             Value::Deferred(crate::resource::DeferredValue::Coalesce {
                 value: Box::new(list(vec![narrow.clone(), narrow.clone()])),
@@ -1316,7 +1449,9 @@ fn computed_access_rejects_heterogeneous_collection_in_typecheck() {
         .into_value()
         .unwrap();
         {
-            let inference = report.binding(&crate::resource::RelativeBindingName::new("result")).unwrap();
+            let inference = report
+                .binding(&crate::resource::RelativeBindingName::new("result"))
+                .unwrap();
             let result = typecheck::check_type_expr_value(
                 &expected,
                 &access,
@@ -1343,8 +1478,8 @@ fn computed_access_rejects_heterogeneous_collection_in_typecheck() {
 }
 
 #[test]
-fn coalesce_and_collection_inference_mismatches_distinguish_named_constraints() {
-    let snapshot = snapshot(vec![("p", vec![string(1, 64, None), string(1, 128, None)])]);
+fn coalesce_and_collection_inference_share_the_identity_layer() {
+    let snapshot = snapshot(vec![("p", vec![member(1, 64, None), member(1, 128, None)])]);
     let bindings = inference::InferenceBindings::from([(
         "source".into(),
         inference::InferenceBinding::Resource {
@@ -1354,31 +1489,32 @@ fn coalesce_and_collection_inference_mismatches_distinguish_named_constraints() 
     )]);
     let first = Value::resource_ref("source", "value0", Vec::new());
     let second = Value::resource_ref("source", "value1", Vec::new());
+    let canonical = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 0), "p");
     for (value, expected) in [
         (
             Value::Deferred(crate::resource::DeferredValue::Coalesce {
                 value: Box::new(first.clone()),
                 default: Box::new(second.clone()),
             }),
-            "coalesce default type `aws.iam.Role.Name (length 1..=128)` does not match left type `aws.iam.Role.Name (length 1..=64)`",
+            canonical.clone(),
         ),
         (
             list(vec![first.clone(), second.clone()]),
-            "collection element types disagree: `aws.iam.Role.Name (length 1..=64)` vs `aws.iam.Role.Name (length 1..=128)`",
+            TypeExpr::List(Box::new(canonical.clone())),
         ),
         (
             map(IndexMap::from([("a".into(), first), ("b".into(), second)])),
-            "collection element types disagree: `aws.iam.Role.Name (length 1..=64)` vs `aws.iam.Role.Name (length 1..=128)`",
+            TypeExpr::Map(Box::new(canonical)),
         ),
     ] {
-        let error = inference::infer_projected_type(
+        let inferred = inference::infer_projected_type(
             &value,
             &bindings,
             snapshot.schema_registry(),
             snapshot.provider_context().as_provider_context(),
         )
-        .unwrap_err();
-        assert_eq!(error.to_string(), expected);
+        .unwrap();
+        assert_eq!(inferred, expected);
     }
 }
 
@@ -1483,8 +1619,8 @@ fn enum_resource_binding_mismatch_keeps_the_exact_enum_name() {
 }
 
 #[test]
-fn production_inference_retains_constraints_for_coalesce_collections_and_branches() {
-    let snapshot = snapshot(vec![("p", vec![string(1, 64, None), string(1, 128, None)])]);
+fn production_inference_compares_identity_only_value_types() {
+    let snapshot = snapshot(vec![("p", vec![member(1, 64, None), member(1, 128, None)])]);
     let first = typed_function_result(inference::attribute_type_to_type_expr(
         declaration(&snapshot, "p", 0),
         "p",
@@ -1521,28 +1657,30 @@ fn production_inference_retains_constraints_for_coalesce_collections_and_branche
         ))),
     ];
     for value in values {
-        let error = inference::infer_projected_type(
+        let inferred = inference::infer_projected_type(
             &value,
             &inference::InferenceBindings::new(),
             snapshot.schema_registry(),
             snapshot.provider_context().as_provider_context(),
         )
-        .unwrap_err();
-        let message = error.to_string();
-        assert!(
-            message.contains("aws.iam.Role.Name (length 1..=64)"),
-            "{message}"
-        );
-        assert!(
-            message.contains("aws.iam.Role.Name (length 1..=128)"),
-            "{message}"
-        );
+        .unwrap();
+        let canonical = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 0), "p");
+        let expected = match &value {
+            Value::Concrete(crate::resource::ConcreteValue::List(_)) => {
+                TypeExpr::List(Box::new(canonical))
+            }
+            Value::Concrete(crate::resource::ConcreteValue::Map(_)) => {
+                TypeExpr::Map(Box::new(canonical))
+            }
+            _ => canonical,
+        };
+        assert_eq!(inferred, expected);
     }
 }
 
 #[test]
-fn resource_reference_is_pending_while_strict_boundaries_retain_both_names() {
-    let snapshot = snapshot(vec![("p", vec![string(1, 128, None), string(1, 64, None)])]);
+fn every_boundary_admits_same_identity_member_restrictions() {
+    let snapshot = snapshot(vec![("p", vec![member(1, 128, None), member(1, 64, None)])]);
     let context = snapshot.provider_context().as_provider_context();
     let mut parsed = crate::parser::parse(
         "let source = p.Values {}\nlet target = p.Values { value1 = source.value0 }\nattributes { name: aws.iam.Role.Name = source.value0 }\nexports { name: aws.iam.Role.Name = source.value0 }\nfn result(): aws.iam.Role.Name { source.value0 }\n",
@@ -1552,6 +1690,10 @@ fn resource_reference_is_pending_while_strict_boundaries_retain_both_names() {
         resolve_file_type_exprs_report(&mut parsed, session, None)
     })
     .unwrap();
+    let narrow = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 1), "p");
+    parsed.attribute_params[0].static_type = Some(narrow.clone());
+    parsed.export_params[0].static_type = Some(narrow.clone());
+    parsed.user_functions.get_mut("result").unwrap().return_type = Some(narrow);
     let parsed = inference::apply_inference(parsed, snapshot.schema_registry(), context);
     let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
     validate_resource_ref_types(
@@ -1566,25 +1708,9 @@ fn resource_reference_is_pending_while_strict_boundaries_retain_both_names() {
         &mut Vec::new(),
     )
     .expect("same-identity resource reference defers its local constraints");
-    let messages = [
-        validate_attribute_param_ref_types_with_bindings(&parsed.attribute_params, &bindings)
-            .unwrap_err(),
-        validate_export_param_ref_types_with_bindings(&parsed.export_params, &bindings)
-            .unwrap_err()
-            .into_iter()
-            .map(|error| error.to_string())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        validate_user_function_ref_types_with_bindings(&parsed, &bindings).unwrap_err(),
-    ];
-    for message in messages {
-        assert!(
-            message.contains(
-                "expected aws.iam.Role.Name (length 1..=64), got aws.iam.Role.Name (length 1..=128)"
-            ),
-            "{message}"
-        );
-    }
+    validate_attribute_param_ref_types_with_bindings(&parsed.attribute_params, &bindings).unwrap();
+    validate_export_param_ref_types_with_bindings(&parsed.export_params, &bindings).unwrap();
+    validate_user_function_ref_types_with_bindings(&parsed, &bindings).unwrap();
 }
 
 #[test]
@@ -1592,7 +1718,10 @@ fn wider_name_resource_reference_discharge_matches_the_destination_literal_error
     use crate::binding_index::{BindingValueSource, ResolvedBindings};
     use crate::resource::knowledge::KnowledgeContext;
     use crate::validation::admission::{Candidate, admit};
-    let snapshot = snapshot(vec![("p", vec![string(1, 128, None), string(1, 64, None)])]);
+    let snapshot = snapshot(vec![(
+        "p",
+        vec![member(100, 128, None), member(1, 64, None)],
+    )]);
     let context = snapshot.provider_context().as_provider_context();
     let parsed = crate::parser::parse_file(
         "let source = p.Values {}\nlet target = p.Values { value1 = source.value0 }\n",
@@ -1621,7 +1750,7 @@ fn wider_name_resource_reference_discharge_matches_the_destination_literal_error
             .ready()
             .unwrap_err();
         let literal = crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
-            "A".repeat(65).into(),
+            "A".repeat(100).into(),
         ));
         let (candidate, boundary) = Candidate::validation_classified(
             literal
@@ -1652,8 +1781,11 @@ fn wider_name_resource_reference_discharge_matches_the_destination_literal_error
 }
 
 #[test]
-fn declared_function_result_and_deferred_coalesce_keep_the_formatted_pair() {
-    let snapshot = snapshot(vec![("p", vec![string(1, 128, None), string(1, 64, None)])]);
+fn function_reads_ignore_slot_members_and_coalesce_keeps_destination_checks() {
+    let snapshot = snapshot(vec![(
+        "p",
+        vec![member(100, 128, None), member(1, 64, None)],
+    )]);
     let context = snapshot.provider_context().as_provider_context();
     let mut parsed = crate::parser::parse(
         "attributes { name: aws.iam.Role.Name = 'VALID' }\n",
@@ -1666,12 +1798,13 @@ fn declared_function_result_and_deferred_coalesce_keep_the_formatted_pair() {
     .unwrap();
     let wide = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 0), "p");
     let narrow = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 1), "p");
+    parsed.attribute_params[0].static_type = Some(narrow.clone());
     parsed.attribute_params[0].value = Some(crate::parser::BoundaryExpression::Value(
         typed_function_result(wide.clone()),
     ));
     let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
-    let error = validate_user_function_ref_types_with_bindings(&parsed, &bindings).unwrap_err();
-    assert!(error.contains("expected aws.iam.Role.Name (length 1..=64), got aws.iam.Role.Name (length 1..=128) (from function 'result' return type)"), "{error}");
+    validate_user_function_ref_types_with_bindings(&parsed, &bindings)
+        .expect("function value types contain identity bounds only");
 
     let value = Value::Deferred(crate::resource::DeferredValue::Coalesce {
         value: Box::new(typed_function_result(narrow)),
@@ -1684,7 +1817,7 @@ fn declared_function_result_and_deferred_coalesce_keep_the_formatted_pair() {
     .unwrap();
     let report =
         crate::parser::retained::judge_expressions(&evidence, snapshot.schema_registry(), context);
-    let error = check_deferred_access_type(
+    check_deferred_access_type(
         &value,
         declaration(&snapshot, "p", 1)
             .in_schema(crate::schema::empty_defs_for_schema_walks())
@@ -1700,16 +1833,12 @@ fn declared_function_result_and_deferred_coalesce_keep_the_formatted_pair() {
         snapshot.schema_registry(),
         &bindings,
     )
-    .unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "Type mismatch: expected aws.iam.Role.Name (length 1..=64), got aws.iam.Role.Name (length 1..=128) (from coalesce default)"
-    );
+    .expect("the coalesce can select the fitting branch; the selected value remains checked at its destination");
 }
 
 #[test]
 fn mismatch_formatter_preserves_refs_nested_types_and_map_key_constraints() {
-    let snapshot = snapshot(vec![("p", vec![string(1, 64, None), string(1, 128, None)])]);
+    let snapshot = snapshot(vec![("p", vec![member(1, 64, None), member(1, 128, None)])]);
     let reference = AttributeType::ref_("Name");
     let expected_defs = BTreeMap::from([("Name".into(), declaration(&snapshot, "p", 0).clone())]);
     let actual_defs = BTreeMap::from([("Name".into(), declaration(&snapshot, "p", 1).clone())]);
@@ -1731,11 +1860,11 @@ fn mismatch_formatter_preserves_refs_nested_types_and_map_key_constraints() {
         };
         let message = error.to_string();
         assert!(
-            message.contains("aws.iam.Role.Name (length 1..=64)"),
+            message.contains("aws.iam.Role.Name (length unbounded, member length 1..=64)"),
             "{message}"
         );
         assert!(
-            message.contains("aws.iam.Role.Name (length 1..=128)"),
+            message.contains("aws.iam.Role.Name (length unbounded, member length 1..=128)"),
             "{message}"
         );
     }
@@ -2131,4 +2260,795 @@ fn issue_4282_review_split_coalesce_checks_literal_alternative() {
         error.to_string(),
         "at list element 0: expected aws.iam.Role.Name, got string 'UPPER': p rejected `aws.iam.Role.Name`: Invalid Name value 'UPPER': does not match required pattern /^[a-z]+$/ (Full)"
     );
+}
+
+#[test]
+fn member_constraints_do_not_enter_multi_owner_identity_annotations() {
+    use crate::schema::{PatternMatch, PatternSpec, StringIdentityLayer, StringMemberConstraints};
+    let identity_layer = || {
+        StringIdentityLayer::new(
+            Some(identity()),
+            Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+            Some((Some(1), Some(32))),
+            None,
+        )
+    };
+    let a = DraftType::string_member(
+        identity_layer(),
+        StringMemberConstraints::new(
+            Some(PatternSpec::new("a.*", PatternMatch::Full)),
+            Some((Some(5), Some(16))),
+        ),
+    );
+    let b = DraftType::string_member(
+        identity_layer(),
+        StringMemberConstraints::new(
+            Some(PatternSpec::new("b.*", PatternMatch::Full)),
+            Some((Some(3), Some(20))),
+        ),
+    );
+    let loaded = snapshot(vec![("a", vec![a]), ("b", vec![b])]);
+    let ty = annotation(&loaded);
+    let TypeExpr::SchemaType { owned } = &ty else {
+        panic!("owned annotation")
+    };
+    assert_eq!(owned.owners().iter().len(), 2);
+    let wire = serde_json::to_value(&ty).unwrap();
+    let scalar = &wire["SchemaType"]["owned"]["constraints"]["scalar"]["String"];
+    assert!(scalar.get("member_layer").is_none(), "{scalar}");
+    let restored: TypeExpr = serde_json::from_value(wire).unwrap();
+    assert_eq!(restored, ty);
+    let lifted = lift_type_expr(&restored).unwrap();
+    assert!(lifted.validate(&text("ccc")).is_ok());
+    assert!(declaration(&loaded, "a", 0).validate(&text("ccc")).is_err());
+    assert!(declaration(&loaded, "b", 0).validate(&text("ccc")).is_err());
+}
+
+#[test]
+fn owners_conjoin_differing_identity_layers_without_member_constraints() {
+    use crate::schema::{PatternMatch, PatternSpec};
+    let loaded = snapshot(vec![
+        (
+            "a",
+            vec![string(
+                1,
+                16,
+                Some(PatternSpec::new("a.*", PatternMatch::Full)),
+            )],
+        ),
+        (
+            "b",
+            vec![string(
+                3,
+                32,
+                Some(PatternSpec::new(".*z", PatternMatch::Full)),
+            )],
+        ),
+    ]);
+    let ty = annotation(&loaded);
+    let lifted = lift_type_expr(&ty).unwrap();
+    for (value, valid) in [("abz", true), ("az", false), ("xbz", false), ("abc", false)] {
+        assert_eq!(lifted.validate(&text(value)).is_ok(), valid, "{value}");
+    }
+    let restored: TypeExpr = serde_json::from_value(serde_json::to_value(&ty).unwrap()).unwrap();
+    assert_eq!(restored, ty);
+    let restored = lift_type_expr(&restored).unwrap();
+    assert!(restored.validate(&text("abz")).is_ok());
+    assert!(restored.validate(&text("abc")).is_err());
+    let mut tampered = serde_json::to_value(&ty).unwrap();
+    tampered["SchemaType"]["owned"]["constraints"]["scalar"]["String"]["identity_layer"]["length"]
+        ["min"] = serde_json::json!({"Inclusive": 0});
+    assert!(
+        serde_json::from_value::<TypeExpr>(tampered).is_err(),
+        "owner bounds cannot disappear from retained evidence"
+    );
+
+    let integers = snapshot(vec![
+        (
+            "a",
+            vec![DraftType::refined_int(
+                Some(identity()),
+                Some((Some(1), Some(20))),
+            )],
+        ),
+        (
+            "b",
+            vec![DraftType::refined_int(
+                Some(identity()),
+                Some((Some(5), Some(30))),
+            )],
+        ),
+    ]);
+    let integers = lift_type_expr(&annotation(&integers)).unwrap();
+    for (value, valid) in [(3, false), (5, true), (20, true), (21, false)] {
+        assert_eq!(integers.validate(&integer(value)).is_ok(), valid, "{value}");
+    }
+
+    let disjoint = snapshot(vec![
+        ("a", vec![string(1, 2, None)]),
+        ("b", vec![string(4, 6, None)]),
+    ]);
+    let disjoint = lift_type_expr(&annotation(&disjoint)).unwrap();
+    let error = disjoint.validate(&text("abc")).unwrap_err().to_string();
+    assert!(
+        error.contains("empty intersection of scalar constraints"),
+        "{error}"
+    );
+}
+
+#[test]
+fn every_annotation_sink_admits_identity_before_member_containment() {
+    let snapshot = snapshot(vec![("p", vec![member(1, 128, None), member(1, 64, None)])]);
+    let context = snapshot.provider_context().as_provider_context();
+    let mut parsed = crate::parser::parse(
+        "let source = p.Values {}\nattributes { name: aws.iam.Role.Name = source.value0 }\nexports { name: aws.iam.Role.Name = source.value0 }\nfn result(): aws.iam.Role.Name { source.value0 }\nfn take(x: aws.iam.Role.Name) { x }\nlet accepted = take(source.value0)\n", context,
+    ).unwrap();
+    deferred_types::with_session_for_test(snapshot.provider_context(), |session| {
+        resolve_file_type_exprs_report(&mut parsed, session, None)
+    })
+    .unwrap();
+    let parsed = inference::apply_inference(parsed, snapshot.schema_registry(), context);
+    let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
+    validate_attribute_param_ref_types_with_bindings(&parsed.attribute_params, &bindings)
+        .expect("attribute member must defer");
+    validate_export_param_ref_types_with_bindings(&parsed.export_params, &bindings)
+        .expect("export member must defer");
+    validate_user_function_ref_types_with_bindings(&parsed, &bindings)
+        .expect("function members must defer");
+    let bounded = super::named_annotation_tests::snapshot(vec![("p", vec![string(1, 64, None)])]);
+    let narrow = annotation(&bounded);
+    let mut functions = crate::parser::parse(
+        &format!(
+            "fn take(x: aws.iam.Role.Name) {{ x }}\nfn result(): aws.iam.Role.Name {{ '{}' }}\n",
+            "A".repeat(80)
+        ),
+        context,
+    )
+    .unwrap()
+    .user_functions;
+    functions.get_mut("take").unwrap().params[0].param_type = Some(narrow.clone());
+    functions.get_mut("result").unwrap().return_type = Some(narrow);
+    deferred_types::with_session_for_test(bounded.provider_context(), |session| {
+        let call = |name: &str,
+                    args: Vec<
+            crate::resource::FunctionArgument<ParserPlaceholder, RelativeBindingName>,
+        >| {
+            Value::Deferred(crate::resource::DeferredValue::ResolvedFunctionCall {
+                function: Arc::new(functions[name].clone()),
+                functions: Arc::new(functions.clone()),
+                args,
+                source_line: 1.into(),
+            })
+        };
+        let resolved = crate::binding_index::ResolvedBindings::default();
+        for (length, valid) in [(20, true), (80, false)] {
+            let value = call(
+                "take",
+                vec![crate::resource::FunctionArgument::from_value(text(
+                    "A".repeat(length),
+                ))],
+            );
+            let result = crate::resolver::resolve_ref_value(&value, &resolved, session);
+            assert_eq!(result.is_ok(), valid, "{result:?}");
+            if let Err(error) = result {
+                assert_eq!(
+                    error.to_string().matches("outside allowed range").count(),
+                    1,
+                    "{error}"
+                );
+            }
+        }
+        let error = crate::resolver::resolve_ref_value(&call("result", vec![]), &resolved, session)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string().matches("outside allowed range").count(),
+            1,
+            "{error}"
+        );
+    });
+}
+
+#[test]
+fn retained_read_types_do_not_claim_slot_member_bounds() {
+    let snapshot = snapshot(vec![(
+        "p",
+        vec![member(100, 128, None), member(1, 64, None)],
+    )]);
+    let context = snapshot.provider_context().as_provider_context();
+    let parsed = crate::parser::parse(
+        "let source = p.Values {}\nlet value = source.value0\n",
+        context,
+    )
+    .unwrap();
+    let configuration = crate::config_loader::load_buffer_configuration(
+        &parsed,
+        snapshot.schema_registry(),
+        context,
+    );
+    let expression = configuration
+        .judged()
+        .report()
+        .binding(&crate::resource::RelativeBindingName::new("value"))
+        .unwrap();
+    let sink = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 1), "p");
+    crate::parser::retained::admit_with_context(
+        expression,
+        &sink,
+        crate::parser::retained::AdmissionContext::Assignment,
+        context,
+    )
+    .expect("only an actual destination slot owns member bounds");
+}
+
+#[test]
+fn owner_conjunction_wire_contains_only_identity_records() {
+    let loaded = snapshot(vec![
+        ("p", vec![string(1, 16, None)]),
+        ("q", vec![string(3, 32, None)]),
+    ]);
+    let ty = annotation(&loaded);
+    let wire = serde_json::to_value(&ty).unwrap();
+    let owners = wire["SchemaType"]["owned"]["constraints"]["owner_layers"]
+        .as_object()
+        .unwrap();
+    assert_eq!(
+        owners.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["p", "q"]
+    );
+    for layer in owners.values() {
+        let owner = &layer["String"]["identity_layer"];
+        assert!(owner.get("member_layer").is_none(), "{owner}");
+        assert!(
+            owner.get("patterns").is_some() && owner.get("length").is_some(),
+            "{owner}"
+        );
+    }
+    let restored: TypeExpr = serde_json::from_value(wire).unwrap();
+    assert_eq!(restored, ty);
+}
+
+#[test]
+fn layered_scalar_evidence_fixture_round_trips_and_rebinds() {
+    use crate::schema::{
+        IntIdentityLayer, IntMemberConstraints, PatternMatch, PatternSpec, StringIdentityLayer,
+        StringMemberConstraints,
+    };
+    let declarations = snapshot(vec![(
+        "p",
+        vec![
+            DraftType::string_member(
+                StringIdentityLayer::new(
+                    Some(identity()),
+                    Some(PatternSpec::new("[A-Z]+", PatternMatch::Full)),
+                    Some((Some(1), Some(32))),
+                    None,
+                ),
+                StringMemberConstraints::new(None, Some((Some(2), Some(4)))),
+            ),
+            DraftType::int_member(
+                IntIdentityLayer::new(
+                    Some(TypeIdentity::from_dotted("aws.Count")),
+                    Some((Some(0), Some(100))),
+                ),
+                IntMemberConstraints::new(Some((Some(1), Some(10)))),
+            ),
+        ],
+    )]);
+    let owners = snapshot(vec![
+        (
+            "p",
+            vec![string(
+                1,
+                16,
+                Some(PatternSpec::new("[A-Z]+", PatternMatch::Full)),
+            )],
+        ),
+        (
+            "q",
+            vec![string(
+                3,
+                32,
+                Some(PatternSpec::new("A.*", PatternMatch::Full)),
+            )],
+        ),
+    ]);
+    let fixture = BTreeMap::from([
+        (
+            "string".to_owned(),
+            inference::attribute_type_to_type_expr(declaration(&declarations, "p", 0), "p"),
+        ),
+        (
+            "int".to_owned(),
+            inference::attribute_type_to_type_expr(declaration(&declarations, "p", 1), "p"),
+        ),
+        ("owners".to_owned(), annotation(&owners)),
+    ]);
+    let json = include_str!("fixtures/layered_scalar_evidence.json");
+    assert_eq!(crate::utils::pretty_with_newline(&fixture).unwrap(), json);
+    let restored: BTreeMap<String, TypeExpr> = serde_json::from_str(json).unwrap();
+    assert_eq!(fixture, restored);
+    for (key, snapshot, values) in [
+        (
+            "string",
+            &declarations,
+            vec![(text("AB"), true), (text("ab"), false), (text("A"), true)],
+        ),
+        (
+            "int",
+            &declarations,
+            vec![
+                (integer(5), true),
+                (integer(-1), false),
+                (integer(11), true),
+            ],
+        ),
+        (
+            "owners",
+            &owners,
+            vec![
+                (text("ABC"), true),
+                (text("ZZZ"), false),
+                (text("Abc"), false),
+            ],
+        ),
+    ] {
+        for (value, valid) in values {
+            let result = typecheck::check_type_expr_value(
+                &restored[key],
+                &value,
+                snapshot.provider_context(),
+                &crate::parser::retained::value_dependent_judgement_for_test(),
+            )
+            .require_provider_schemas();
+            assert_eq!(result.is_ok(), valid, "{key}: {result:?}");
+        }
+    }
+}
+
+#[test]
+fn value_type_records_reject_member_constraints_in_both_origins() {
+    let fixture: BTreeMap<String, serde_json::Value> =
+        serde_json::from_str(include_str!("fixtures/layered_scalar_evidence.json")).unwrap();
+    for key in ["string", "int"] {
+        for origin in ["Projection", "Annotation"] {
+            let mut tampered = fixture[key].clone();
+            let owned = &mut tampered["SchemaType"]["owned"];
+            owned["origin"] = serde_json::json!(origin);
+            owned["projection_fingerprint"] = if origin == "Annotation" {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!("0".repeat(64))
+            };
+            assert!(
+                serde_json::from_value::<TypeExpr>(tampered.clone()).is_ok(),
+                "valid {origin} evidence before tampering"
+            );
+            let owned = &mut tampered["SchemaType"]["owned"];
+            if key == "string" {
+                owned["constraints"]["scalar"]["String"]["member_layer"] = serde_json::json!({"pattern":null,"length":{"min":"Unbounded","max":"Unbounded"}});
+            } else {
+                owned["constraints"]["scalar"]["Int"]["member_range"] =
+                    serde_json::json!({"min":"Unbounded","max":"Unbounded"});
+            }
+            assert!(
+                serde_json::from_value::<TypeExpr>(tampered).is_err(),
+                "{origin} retained {key} members"
+            );
+        }
+    }
+}
+
+#[test]
+fn annotation_projection_equality_matches_wire_equality() {
+    let loaded = snapshot(vec![("p", vec![string(1, 32, None)])]);
+    let annotation = annotation(&loaded);
+    let projection = inference::attribute_type_to_type_expr(declaration(&loaded, "p", 0), "p");
+    assert_eq!(annotation, projection);
+    assert_eq!(
+        annotation == projection,
+        serde_json::to_value(&annotation).unwrap() == serde_json::to_value(&projection).unwrap()
+    );
+    let references = snapshot(vec![(
+        "p",
+        vec![DraftType::reference(identity(), None, None)],
+    )]);
+    let projection = inference::attribute_type_to_type_expr(declaration(&references, "p", 0), "p");
+    let mut changed = serde_json::to_value(&projection).unwrap();
+    changed["SchemaType"]["owned"]["projection_fingerprint"] = serde_json::json!("0".repeat(64));
+    let changed: TypeExpr = serde_json::from_value(changed).unwrap();
+    assert_ne!(
+        projection, changed,
+        "fingerprints are portable equality evidence"
+    );
+}
+
+#[test]
+fn annotation_owner_layers_must_match_the_owner_set() {
+    let loaded = snapshot(vec![
+        ("a", vec![string(1, 32, None)]),
+        ("b", vec![string(3, 64, None)]),
+    ]);
+    let wire = serde_json::to_value(annotation(&loaded)).unwrap();
+    for owners in [
+        serde_json::json!([{"Provider":"a"}]),
+        serde_json::json!([{"Provider":"a"},{"Provider":"b"},{"Provider":"extra"}]),
+    ] {
+        let mut tampered = wire.clone();
+        tampered["SchemaType"]["owned"]["owners"] = owners;
+        assert!(
+            serde_json::from_value::<TypeExpr>(tampered).is_err(),
+            "owner layers cannot be extra or missing"
+        );
+    }
+    let layer =
+        serde_json::to_string(&wire["SchemaType"]["owned"]["constraints"]["owner_layers"]["a"])
+            .unwrap();
+    let duplicate = serde_json::to_string(&wire).unwrap().replace(
+        "\"owner_layers\":{",
+        &format!("\"owner_layers\":{{\"a\":{layer},"),
+    );
+    assert!(
+        serde_json::from_str::<TypeExpr>(&duplicate).is_err(),
+        "duplicate owner entries are invalid"
+    );
+}
+
+#[test]
+fn single_owner_annotations_have_one_canonical_layer_form() {
+    let loaded = snapshot(vec![("a", vec![string(1, 32, None)])]);
+    let annotation = annotation(&loaded);
+    let wire = serde_json::to_value(&annotation).unwrap();
+    let identity =
+        wire["SchemaType"]["owned"]["constraints"]["scalar"]["String"]["identity_layer"].clone();
+    for layers in [
+        serde_json::json!([identity.clone()]),
+        serde_json::json!({"a":{"String":{"identity_layer": identity}}}),
+    ] {
+        let mut tampered = wire.clone();
+        tampered["SchemaType"]["owned"]["constraints"]["owner_layers"] = layers;
+        assert!(
+            serde_json::from_value::<TypeExpr>(tampered).is_err(),
+            "single-owner annotations omit owner_layers"
+        );
+    }
+    let restored: TypeExpr = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(restored, annotation);
+    assert_eq!(serde_json::to_value(restored).unwrap(), wire);
+}
+
+#[test]
+fn projection_constraint_records_reject_unknown_fields() {
+    let fixture: BTreeMap<String, serde_json::Value> =
+        serde_json::from_str(include_str!("fixtures/layered_scalar_evidence.json")).unwrap();
+    for key in ["string", "int"] {
+        for extra in ["owner_layers", "future_constraint"] {
+            let mut tampered = fixture[key].clone();
+            tampered["SchemaType"]["owned"]["origin"] = serde_json::json!("Projection");
+            tampered["SchemaType"]["owned"]["projection_fingerprint"] =
+                serde_json::json!("0".repeat(64));
+            assert!(serde_json::from_value::<TypeExpr>(tampered.clone()).is_ok());
+            tampered["SchemaType"]["owned"]["constraints"][extra] = serde_json::json!([]);
+            assert!(
+                serde_json::from_value::<TypeExpr>(tampered).is_err(),
+                "projection accepted {extra}"
+            );
+        }
+    }
+}
+
+#[test]
+fn enum_identity_annotations_reject_nonmembers_matching_the_base() {
+    let loaded = snapshot(vec![(
+        "p",
+        vec![DraftType::enum_(
+            identity(),
+            Some(vec!["GOOD".into()]),
+            vec![],
+            None,
+            None,
+        )],
+    )]);
+    let annotation = annotation(&loaded);
+    let restored: TypeExpr =
+        serde_json::from_value(serde_json::to_value(&annotation).unwrap()).unwrap();
+    for ty in [&annotation, &restored] {
+        // Main's materialized scalar view is the enum base; contextual
+        // annotation validation also checks the enum declaration's values.
+        assert!(lift_type_expr(ty).unwrap().validate(&text("OTHER")).is_ok());
+        for (value, valid) in [
+            (
+                Value::Concrete(crate::resource::ConcreteValue::CanonicalEnum(
+                    crate::resource::CanonicalEnumValue::new_for_test(identity(), "GOOD"),
+                )),
+                true,
+            ),
+            (text("OTHER"), false),
+            (
+                Value::Concrete(crate::resource::ConcreteValue::EnumIdentifier(
+                    crate::resource::RawEnumIdentifier::parse(format!("{}.OTHER", identity())),
+                )),
+                false,
+            ),
+        ] {
+            let result = typecheck::check_type_expr_value(
+                ty,
+                &value,
+                loaded.provider_context(),
+                &crate::parser::retained::value_dependent_judgement_for_test(),
+            )
+            .require_provider_schemas();
+            assert_eq!(result.is_ok(), valid, "{value:?}: {result:?}");
+        }
+    }
+}
+
+#[test]
+fn annotation_records_accept_empty_bounds_with_consistent_evidence() {
+    for (first, second, kind, bounds) in [
+        (string(1, 4, None), string(8, 12, None), "String", "length"),
+        (
+            DraftType::refined_int(Some(identity()), Some((Some(1), Some(4)))),
+            DraftType::refined_int(Some(identity()), Some((Some(8), Some(12)))),
+            "Int",
+            "identity_range",
+        ),
+        (
+            DraftType::refined_float(
+                Some(identity()),
+                Some((Some(crate::finite(1.0)), Some(crate::finite(4.0)))),
+            ),
+            DraftType::refined_float(
+                Some(identity()),
+                Some((Some(crate::finite(8.0)), Some(crate::finite(12.0)))),
+            ),
+            "Float",
+            "range",
+        ),
+    ] {
+        let single = snapshot(vec![("a", vec![first.clone()])]);
+        let mut wire = serde_json::to_value(annotation(&single)).unwrap();
+        let scalar = &mut wire["SchemaType"]["owned"]["constraints"]["scalar"][kind];
+        let scalar = if kind == "String" {
+            &mut scalar["identity_layer"]
+        } else {
+            scalar
+        };
+        scalar[bounds]["min"] = serde_json::json!({"Inclusive":5});
+        wire["SchemaType"]["owned"]["constraints"]["empty_intersection"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<TypeExpr>(wire.clone()).is_ok(),
+            "{kind}: a same-owner conjunction may be empty"
+        );
+        wire["SchemaType"]["owned"]["constraints"]["empty_intersection"] = serde_json::json!(false);
+        assert!(serde_json::from_value::<TypeExpr>(wire).is_err());
+
+        let loaded = snapshot(vec![("a", vec![first]), ("b", vec![second])]);
+        let annotation = annotation(&loaded);
+        let mut wire = serde_json::to_value(&annotation).unwrap();
+        assert!(
+            serde_json::from_value::<TypeExpr>(wire.clone()).is_ok(),
+            "nonempty owners may have an empty aggregate"
+        );
+        let scalar = &mut wire["SchemaType"]["owned"]["constraints"]["owner_layers"]["a"][kind];
+        let scalar = if kind == "String" {
+            &mut scalar["identity_layer"]
+        } else {
+            scalar
+        };
+        scalar[bounds]["min"] = serde_json::json!({"Inclusive":5});
+        assert!(
+            serde_json::from_value::<TypeExpr>(wire.clone()).is_ok(),
+            "{kind}: an empty owner layer agrees with this aggregate"
+        );
+        wire["SchemaType"]["owned"]["constraints"]["empty_intersection"] = serde_json::json!(false);
+        assert!(serde_json::from_value::<TypeExpr>(wire).is_err());
+    }
+}
+
+#[test]
+fn within_owner_disjoint_float_annotation_round_trips() {
+    // Exercise the conjunction record directly, including repeated same-owner
+    // evidence. Such conflicting definitions are no longer provider-admissible.
+    let declaration = |min, max| {
+        AttributeType::refined_float(
+            Some(identity()),
+            Some((Some(crate::finite(min)), Some(crate::finite(max)))),
+        )
+    };
+    let first =
+        crate::parser::ResolvedSchemaType::from_annotation_declaration("p", &declaration(1.0, 4.0))
+            .unwrap();
+    let second = crate::parser::ResolvedSchemaType::from_annotation_declaration(
+        "p",
+        &declaration(8.0, 12.0),
+    )
+    .unwrap();
+    let original = TypeExpr::SchemaType {
+        owned: first.conjoin(&second),
+    };
+    let TypeExpr::SchemaType { owned } = &original else {
+        panic!("annotation")
+    };
+    assert!(owned.has_empty_intersection());
+    let decoded: TypeExpr =
+        serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
+    assert_eq!(decoded, original);
+}
+
+#[test]
+fn decoded_annotation_checks_current_owner_declarations() {
+    let old = snapshot(vec![("p", vec![string(1, 128, None)])]);
+    let current = snapshot(vec![(
+        "p",
+        vec![string(
+            1,
+            32,
+            Some(crate::schema::PatternSpec::new(
+                "[a-z]+",
+                crate::schema::PatternMatch::Full,
+            )),
+        )],
+    )]);
+    let decoded: TypeExpr =
+        serde_json::from_value(serde_json::to_value(annotation(&old)).unwrap()).unwrap();
+    for (value, valid) in [("valid", true), ("UPPER", false)] {
+        let checked = typecheck::check_type_expr_value(
+            &decoded,
+            &text(value),
+            current.provider_context(),
+            &crate::parser::retained::value_dependent_judgement_for_test(),
+        )
+        .require_provider_schemas();
+        assert_eq!(checked.is_ok(), valid, "{value}: {checked:?}");
+    }
+}
+
+#[test]
+fn owner_constraint_conjoin_promotes_and_preserves_typed_owner_maps() {
+    let a = snapshot(vec![("a", vec![string(1, 32, None)])]);
+    let b = snapshot(vec![("b", vec![string(3, 64, None)])]);
+    let c = snapshot(vec![("c", vec![string(5, 128, None)])]);
+    let annotation_owned = |loaded: &LoadedProviderSnapshot| match annotation(loaded) {
+        TypeExpr::SchemaType { owned } => owned,
+        _ => panic!("annotation"),
+    };
+    let a = annotation_owned(&a);
+    let b = annotation_owned(&b);
+    let c = annotation_owned(&c);
+    let ab = a.conjoin(&b);
+    let abc = ab.conjoin(&c);
+    for joined in [&ab, &abc, &c.conjoin(&ab), &ab.conjoin(&b.conjoin(&c))] {
+        let wire = serde_json::to_value(joined).unwrap();
+        let restored: crate::parser::ResolvedSchemaType =
+            serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(&restored, joined);
+        assert_eq!(serde_json::to_value(restored).unwrap(), wire);
+        assert_eq!(
+            joined.owners().iter().count(),
+            wire["constraints"]["owner_layers"]
+                .as_object()
+                .unwrap()
+                .len()
+        );
+    }
+    assert_eq!(abc, c.conjoin(&ab));
+    assert_eq!(abc, ab.conjoin(&b.conjoin(&c)));
+}
+
+#[test]
+fn round12_cross_owner_enum_assignment_keeps_main_value_set_policy() {
+    for source_values in [None, Some(vec!["A".into(), "B".into()])] {
+        let loaded = snapshot(vec![
+            (
+                "a",
+                vec![DraftType::enum_(
+                    identity(),
+                    source_values,
+                    vec![],
+                    None,
+                    None,
+                )],
+            ),
+            (
+                "b",
+                vec![DraftType::enum_(
+                    identity(),
+                    Some(vec!["A".into()]),
+                    vec![],
+                    None,
+                    None,
+                )],
+            ),
+        ]);
+        assert!(
+            assign(
+                declaration(&loaded, "a", 0),
+                declaration(&loaded, "b", 0),
+                &loaded,
+                "b"
+            ),
+            "main compares enum identity and base, not value-set containment"
+        );
+    }
+}
+
+#[test]
+fn round12_unknown_function_return_rechecks_destination_member_at_resolution() {
+    use crate::binding_index::{BindingValueSource, ResolvedBindings};
+    use crate::resource::knowledge::KnowledgeContext;
+    use crate::validation::admission::{Candidate, admit};
+    let slot = |member_length| {
+        DraftType::string_member(
+            crate::schema::StringIdentityLayer::new(
+                Some(identity()),
+                None,
+                Some((Some(1), Some(64))),
+                None,
+            ),
+            crate::schema::StringMemberConstraints::new(None, member_length),
+        )
+    };
+    let loaded = snapshot(vec![(
+        "p",
+        vec![slot(None), slot(Some((Some(1), Some(8))))],
+    )]);
+    let context = loaded.provider_context().as_provider_context();
+    let mut authored = crate::parser::parse("let source = p.Values {}\nlet target = p.Values {}\nfn forward(value: aws.iam.Role.Name): aws.iam.Role.Name { value }\n", context).unwrap();
+    deferred_types::with_session_for_test(loaded.provider_context(), |session| {
+        resolve_file_type_exprs_report(&mut authored, session, None)
+    })
+    .unwrap();
+    let parsed = authored.resolve_root_for_test();
+    let bindings = BindingIndex::from_parsed(&parsed, loaded.schema_registry(), context);
+    let destination = loaded
+        .schema_registry()
+        .resource_attribute_destination(&parsed.resources[1].id, "value1", context)
+        .unwrap();
+    for (length, accepted) in [(7, true), (20, false)] {
+        let value = crate::resource::Value::Deferred(
+            crate::resource::DeferredValue::ResolvedFunctionCall {
+                function: Arc::new(parsed.user_functions["forward"].clone()),
+                functions: Arc::new(parsed.user_functions.clone()),
+                args: vec![crate::resource::FunctionArgument::from_value(
+                    crate::resource::Value::root_resource_ref("source", "value0", vec![]),
+                )],
+                source_line: 1.into(),
+            },
+        );
+        deferred_types::with_session_for_test(loaded.provider_context(), |session| {
+            let (candidate, boundary) = Candidate::validation_classified(
+                value
+                    .knowledge(&KnowledgeContext::validation())
+                    .unwrap()
+                    .into_classification(),
+                Some(&bindings),
+                session,
+            );
+            let pending = admit(&destination, candidate, &boundary)
+                .unwrap()
+                .ready()
+                .unwrap_err();
+            let mut resolved = ResolvedBindings::default();
+            resolved.set(
+                "source",
+                HashMap::from([(
+                    "value0".into(),
+                    crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                        "A".repeat(length).into(),
+                    )),
+                )]),
+                BindingValueSource::Local,
+            );
+            let result = pending.discharge(&resolved, session);
+            assert_eq!(result.is_ok(), accepted, "{result:?}");
+            if let Err(error) = result {
+                let message = error.resolution_error().to_string();
+                assert!(
+                    message.contains("outside allowed range") || message.contains("length"),
+                    "{message}"
+                );
+                assert_eq!(message.matches("value1:").count(), 1, "{message}");
+            }
+        });
+    }
 }

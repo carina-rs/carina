@@ -55,18 +55,21 @@ impl ProviderFactory for NamedAnnotationCompletionFactory {
 }
 
 fn named_completion_string(max: u64) -> AttributeType {
-    AttributeType::refined_string(
-        Some(carina_core::schema::TypeIdentity::from_schema_type(
-            "aws", "iam.Role", "Name",
-        )),
-        None,
-        Some((Some(1), Some(max))),
-        None,
+    AttributeType::string_member(
+        carina_core::schema::StringIdentityLayer::new(
+            Some(carina_core::schema::TypeIdentity::from_schema_type(
+                "aws", "iam.Role", "Name",
+            )),
+            None,
+            None,
+            None,
+        ),
+        carina_core::schema::StringMemberConstraints::new(None, Some((Some(1), Some(max)))),
     )
 }
 
 #[test]
-fn named_annotation_completion_retains_bounds_at_schema_and_module_sinks() {
+fn named_identity_completion_defers_members_at_schema_and_module_sinks() {
     let mut supplemental = SchemaRegistry::new();
     supplemental.insert(
         "aws",
@@ -104,9 +107,12 @@ fn named_annotation_completion_retains_bounds_at_schema_and_module_sinks() {
         "arguments {\n  x: aws.iam.Role.Name\n}\n",
     )
     .unwrap();
-    for target in [
-        "aws.iam.Role {\n  role_name = ",
-        "let child = use { source = './child' }\nlet instance = child {\n  x = ",
+    for (target, accepts_wider) in [
+        ("aws.iam.Role {\n  role_name = ", true),
+        (
+            "let child = use { source = './child' }\nlet instance = child {\n  x = ",
+            true,
+        ),
     ] {
         let source = format!(
             "arguments {{\n  local: aws.iam.Role.Name\n}}\nlet source = aws.NameSource {{}}\n{target}\n}}\n"
@@ -129,15 +135,17 @@ fn named_annotation_completion_retains_bounds_at_schema_and_module_sinks() {
             .iter()
             .map(|item| item.label.as_str())
             .collect::<Vec<_>>();
-        assert!(
+        assert_eq!(
             labels.contains(&"local"),
-            "named argument should satisfy its sink: {labels:?}"
+            accepts_wider,
+            "matching identities retain a destination value check: {labels:?}"
         );
         assert!(labels.contains(&"source.matching"), "{labels:?}");
         assert!(labels.contains(&"source.narrower"), "{labels:?}");
-        assert!(
-            !labels.contains(&"source.wider"),
-            "an exact wider source must be excluded: {labels:?}"
+        assert_eq!(
+            labels.contains(&"source.wider"),
+            accepts_wider,
+            "member restrictions are checked when the value is resolved: {labels:?}"
         );
     }
 }
