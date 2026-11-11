@@ -313,10 +313,12 @@ aws-vault exec <profile> -- cargo run -- plan
 
 ## Verify Protocol
 
-`scripts/verify.sh` requires Bash 4.4 or newer and needs cargo-nextest,
-cargo-hack, and the `wasm32-wasip2` target (`rustup target add wasm32-wasip2`)
-for its full check set. When selecting kinds, only their required tools are
-checked before execution.
+`scripts/verify.sh` requires Bash 4.4 or newer, cargo-nextest and cargo-hack
+for its full check set. Rustup automatically reads `rust-toolchain.toml` to
+select the pinned toolchain, `clippy`, `rustfmt` and `wasm32-wasip2` target.
+Run `rustup toolchain install` (rustup 1.28.0 or newer) to install them.
+Upgrade the toolchain by editing that one file in an explicit PR.
+When selecting kinds, only their required tools are checked before execution.
 
 `--local` has a known limit: a `-p` scope resolves dependency features only for
 the selected packages, so feature unification can differ from CI's `--workspace`
@@ -615,13 +617,22 @@ A struct type represents a nested object with typed fields.
   A member layer belongs to its destination slot. Enforce it on writes through
   identity admission and the deferred destination check; identified source bounds
   are identity-layer bounds only. Anonymous String/Int declarations retain both
-  layers as structural evidence (matching patterns and intersected bounds). Unannotated collections, conditionals and coalesce
+  layers as structural evidence (patterns and intersected bounds). String/Int/Float
+  sources with or without identity flowing to compatible identity-less scalar sinks,
+  including Int-to-Float, reject only provably disjoint bounds (#4362). Reference
+  admission records `NeedsLocal` for constrained identity-less sinks; provider slots
+  check resolved values against the full destination declaration before dispatch.
+  Anonymous scalar refinements occur only in provider schema slots; `TypeExpr`
+  boundaries use identified refinements or unconstrained scalars. Adding overlapping
+  source constraints never reduces assignability.
+  Unannotated collections, conditionals and coalesce
   require identical `TypeExpr`s, as on main. Reads of slots differing only in
   member constraints infer equal types. An explicit compatible annotation is
   the way to accept otherwise mixed declarations; inference never widens them.
   Enum definition and canonical-spelling disagreements remain typed errors.
   Enum bases describe definitions, never slots: schema admission rejects String/Int
-  member constraints inside a base with `EnumBaseMemberLayerError`.
+  member constraints inside a base with `EnumBaseMemberLayerError`; identity-less
+  enum base comparisons follow the same overlap-or-defer rule.
   Built-in and aggregate comparisons accept identity-only typed projections. Exact
   declarations and their fingerprints preserve both layers. Hover renders
   both layers through the core's read-only bounded refinement walk, which counts
@@ -639,24 +650,31 @@ A struct type represents a nested object with typed fields.
   replay reloads refinement layers from fingerprint-checked provider schemas.
   Every typed sink uses the same String/Int identity-admission rule for
   equal identities and allowed widenings (#4349), including annotations,
-  exports, module arguments, and function parameters/returns. All destination
-  kinds can retain the existing `NeedsLocal` resolved-value obligation. Same-identity
+  exports, module arguments, and function parameters/returns. Resource/data-source
+  reference admission retains the existing `NeedsLocal` obligation. Same-identity
   value admission, including a declared source, defers overlapping identity bounds
   to the local check; provably disjoint bounds reject statically. Different-identity
-  widening requires source identity bounds to be contained by destination identity
-  bounds. Strict declaration compatibility retains main's containment checks.
-  Declaration compatibility admits types; only value admission grants placement.
+  widening between identified scalars requires source identity bounds to be
+  contained by destination identity bounds. Strict declaration compatibility
+  retains containment checks only for pairs of identified scalars. Compatible
+  identity-less sinks use #4362's overlap-or-defer rule in both declaration and
+  reference checks, regardless of source identity. Original-evidence rechecks
+  inspect only identified leaves.
+  Declaration compatibility admits types, not resolved-value validity.
   `NeedsLocal` exists only in the admission-facing reference relation, requiring
   a `ReferenceCandidate`; it cannot convert back into general type compatibility.
-  Admission consumes it by registering the existing `LocalPath` on the destination
-  contract. `PendingAdmission::discharge` re-enters `admit_apply`, checking the
-  resolved value against that destination's complete declaration and both layers.
-  Known binding values also enter the destination's ordinary value validator after
-  declaration compatibility. Member String failures keep their structured pattern/
+  Resource/data-source attributes use `admit_apply_resource`/`admit_apply_data_source`
+  in `executor/provider_ready.rs`; provider config uses
+  `validate_provider_config_attributes` on resolved values. These validate the full
+  destination declaration before dispatch. Function parameters/returns additionally
+  use runtime `check_resolved_constraints_at`; backend schemas have no anonymous
+  refinements. Member String failures keep their structured pattern/
   length category and label the slot's member constraint; identity failures run first.
-  Int-to-Float widening uses identity-bound
-  containment too. Float retains main's strict range containment and same-identity
-  reference deferral; Enum/unloaded reference leaves retain that deferral too.
+  Int-to-Float widening between identified scalars uses identity-bound containment
+  too. Float pairs with identities on both sides retain strict declaration range
+  containment; same-identity Float reference admission retains resolved-value
+  deferral. Identity-less Float and Int-to-Float
+  pairs follow #4362 instead. Enum/unloaded reference leaves retain that deferral too.
   Unproven regex containment defers to the value check. At annotated sinks,
   declaration equality and display-name equality do not replace identity
   admission; mismatch names expose differing constraints or scalar kinds.
@@ -804,6 +822,34 @@ A struct type represents a nested object with typed fields.
   warnings with core-rendered rejected-if-created wording, while `EveryWrite`
   remains an error. The core finding derives severity from rule scope and write
   context once; CLI and LSP render that fact. Unknown guards remain pending.
+  `InputRuleDisplay` owns declaration wording for provider docs and diagnostics.
+  Its private requirement projection supplies predicate and condition text to
+  both displays, with the same diagnostic escaping and truncation budget.
+  Quoted declaration tokens share one inline quoting helper. Literals and
+  conditions stream into the requirement's budget. Shared pattern rendering
+  keeps ordinary regex sources verbatim between slashes, quotes sources needing
+  escaping or containing `/ (`. Reasons needing escapes or containing
+  parentheses or quotes use the same quoting helper. This distinguishes literal
+  controls, regex backslash escapes, and metadata delimiters. Plan errors budget
+  only their prefix
+  and embed the already-budgeted requirement verbatim. Its `DiagnosticText` field
+  sanitizes and bounds construction and deserialization. Multiline diagnostics
+  preserve newlines and tabs while escaping default-ignorables and Unicode
+  line/paragraph separators.
+  A closed `DiagnosticEncoding` enum owns the sole character escaper for
+  multiline, inline, double-quoted, and single-quoted builder output. Its variants
+  and complete inventory are generated together; quote classification and
+  redaction use that same encoding. Inventory spellings stay unbounded so
+  complete escaped secrets are matched before diagnostic truncation.
+  Independent Rust str `Debug` echoes are inventoried with the standard
+  formatter, stripping only the surrounding quotes. They must not pass through
+  diagnostic sanitization or truncation before matching.
+  Violations retain their declaration and a rejection/evaluation-failure kind;
+  `InputViolationReason` is classification data without `Display` or `Error`.
+  Render through the violation's `message()`, never invent a second predicate
+  formatter. Only provider-declared parameters may appear; rejected values and
+  protected instance keys must not enter the declaration display. Struct-local
+  declaration paths stay relative to their declaring object.
   Plans reject `CreateOnly` violations only at create-capable write sites.
   Semantic fingerprints encode conditions and nested rules in encoding v13. Adding
   a protocol field must break compilation until it is consciously carried

@@ -3,6 +3,8 @@
 
 use std::{collections::HashSet, fmt};
 
+use crate::provider_text::{DiagnosticQuote, DiagnosticTextBuilder};
+
 use super::{
     AttrTypeKind, Compiled, CompiledPattern, Draft, PatternAttributeType, PatternForm,
     PatternResourceSchema, SchemaDefinitionIssue, SchemaValidationIssueLocation, TypeIdentity,
@@ -192,7 +194,9 @@ impl InputPath {
 
 impl fmt::Display for InputPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        let mut text = DiagnosticTextBuilder::default();
+        text.push_declaration_path(self.as_str());
+        fmt::Display::fmt(&text.finish(), f)
     }
 }
 
@@ -234,35 +238,60 @@ impl InputCondition {
     }
 }
 
-impl fmt::Display for InputLiteral {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use crate::provider_text::DiagnosticText;
+impl InputLiteral {
+    pub(super) fn push_to(&self, text: &mut DiagnosticTextBuilder) {
         match self {
-            Self::Bool(value) => write!(f, "{value}"),
-            Self::Int(value) => write!(f, "{value}"),
-            Self::Float(value) => write!(f, "{value}"),
-            Self::String(value) => write!(f, "\"{}\"", DiagnosticText::new(value)),
+            Self::Bool(value) => text.push_str(&value.to_string()),
+            Self::Int(value) => text.push_str(&value.to_string()),
+            Self::Float(value) => text.push_str(&value.to_string()),
+            Self::String(value) => text.push_quoted_str(value, DiagnosticQuote::Double),
             Self::Enum {
                 identity,
                 api_value,
-            } => write!(
-                f,
-                "{}::\"{}\"",
-                DiagnosticText::new(identity.to_string()),
-                DiagnosticText::new(api_value)
-            ),
+            } => {
+                text.push_declaration_path(&identity.to_string());
+                text.push_str("::");
+                text.push_quoted_str(api_value, DiagnosticQuote::Double);
+            }
+        }
+    }
+}
+
+impl fmt::Display for InputLiteral {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut text = DiagnosticTextBuilder::default();
+        self.push_to(&mut text);
+        fmt::Display::fmt(&text.finish(), f)
+    }
+}
+
+impl InputCondition {
+    pub(super) fn push_to(&self, text: &mut DiagnosticTextBuilder) {
+        match self {
+            Self::Always => text.push_str("always"),
+            Self::Present(path) => {
+                text.push_declaration_path(path.as_str());
+                text.push_str(" is present");
+            }
+            Self::Equals { path, literal } => {
+                text.push_declaration_path(path.as_str());
+                text.push_str(" equals ");
+                literal.push_to(text);
+            }
+            Self::Not(inner) => {
+                text.push_str("not (");
+                inner.push_to(text);
+                text.push_str(")");
+            }
         }
     }
 }
 
 impl fmt::Display for InputCondition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Always => f.write_str("always"),
-            Self::Present(path) => write!(f, "{path} is present"),
-            Self::Equals { path, literal } => write!(f, "{path} equals {literal}"),
-            Self::Not(inner) => write!(f, "not ({inner})"),
-        }
+        let mut text = DiagnosticTextBuilder::default();
+        self.push_to(&mut text);
+        fmt::Display::fmt(&text.finish(), f)
     }
 }
 
@@ -600,60 +629,75 @@ impl<R: PatternForm> InputRule<R> {
 }
 
 /// A safe reason that never retains the rejected input string.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+///
+/// Reasons classify failures; only a violation can render its declaration.
+///
+/// ```compile_fail,E0277
+/// use carina_core::schema::InputViolationReason;
+/// let _ = format!("{}", InputViolationReason::NoSuffix);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputViolationReason {
-    #[error("must be present")]
     Present,
-    #[error("must be absent")]
     Absent,
-    #[error("must equal {0}")]
     Equals(InputLiteral),
-    #[error("input evaluation failed")]
     EvaluationFailed,
-    #[error("length is outside the permitted character-count bounds")]
     Length,
-    #[error("contains a character outside the permitted set")]
     AllowedChars,
-    #[error("first character is outside the permitted set or the string is empty")]
     FirstChar,
-    #[error("last character is outside the permitted set or the string is empty")]
     LastChar,
-    #[error("contains a forbidden substring")]
     NoSubstring,
-    #[error("has a forbidden prefix")]
     NoPrefix,
-    #[error("has a forbidden prefix")]
     ForbiddenPrefix,
-    #[error("has a forbidden suffix")]
     NoSuffix,
-    #[error("contains a forbidden adjacent character pair")]
     NoAdjacent,
-    #[error("has IPv4 dotted-quad form")]
     NotIpv4,
-    #[error("does not match the required pattern")]
     Matches,
-    #[error("matches a forbidden pattern")]
     NotMatches,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputViolationKind {
+    PredicateRejected,
+    EvaluationFailed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{path} [{code}]: {message}", message = self.message())]
+#[error("{path} [{code}]: {message}", code = self.code(), message = self.message())]
 pub struct InputViolation {
     pub(crate) path: InputDiagnosticPath,
-    pub(crate) code: InputRuleCode,
-    pub(crate) reason: Box<InputViolationReason>,
-    pub(crate) condition: Box<InputCondition>,
+    rule: Box<InputRule<Compiled>>,
+    kind: InputViolationKind,
 }
 
 impl InputViolation {
+    pub(crate) fn rejected(rule: &InputRule<Compiled>) -> Self {
+        Self::new(rule, InputViolationKind::PredicateRejected)
+    }
+
+    pub(crate) fn evaluation_failed(rule: &InputRule<Compiled>) -> Self {
+        Self::new(rule, InputViolationKind::EvaluationFailed)
+    }
+
+    fn new(rule: &InputRule<Compiled>, kind: InputViolationKind) -> Self {
+        Self {
+            path: rule.path().clone().into(),
+            rule: Box::new(rule.clone()),
+            kind,
+        }
+    }
+
     pub fn path(&self) -> &InputDiagnosticPath {
         &self.path
     }
     pub fn code(&self) -> &InputRuleCode {
-        &self.code
+        self.rule.code()
     }
     pub fn reason(&self) -> InputViolationReason {
-        self.reason.as_ref().clone()
+        match self.kind {
+            InputViolationKind::PredicateRejected => self.rule.predicate().violation_reason(),
+            InputViolationKind::EvaluationFailed => InputViolationReason::EvaluationFailed,
+        }
     }
     pub fn message(&self) -> InputViolationMessage<'_> {
         InputViolationMessage(self)
@@ -662,15 +706,13 @@ impl InputViolation {
 pub struct InputViolationMessage<'a>(&'a InputViolation);
 impl fmt::Display for InputViolationMessage<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0.reason)?;
-        match self.0.condition.as_ref() {
-            InputCondition::Always => Ok(()),
-            condition @ (InputCondition::Present(_)
-            | InputCondition::Equals {
-                path: _,
-                literal: _,
+        match self.0.kind {
+            InputViolationKind::PredicateRejected => super::InputRuleDisplay::new(&self.0.rule)
+                .requirement()
+                .fmt(f),
+            InputViolationKind::EvaluationFailed => {
+                super::input_rule_display::evaluation_failure(self.0.rule.condition()).fmt(f)
             }
-            | InputCondition::Not(_)) => write!(f, " when {condition}"),
         }
     }
 }

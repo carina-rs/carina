@@ -51,7 +51,7 @@ fn create_only_verdict_yields_authored_warning_and_create_error() {
     assert_eq!(warning.severity(), InputFindingSeverity::Warning);
     assert_eq!(
         warning.to_string(),
-        "mock.test.Conditional.example: target [test.create_suffix]: has a forbidden suffix (rejected if this resource is created)"
+        "mock.test.Conditional.example: target [test.create_suffix]: must not end with \"-an\" (rejected if this resource is created)"
     );
     let mut plan = Plan::new();
     plan.add(Effect::Create(
@@ -79,12 +79,12 @@ fn create_only_verdict_yields_authored_warning_and_create_error() {
     assert_eq!(error.severity(), InputFindingSeverity::Error);
     assert_eq!(
         error.to_string(),
-        "mock.test.Conditional.example: target [test.create_suffix]: has a forbidden suffix"
+        "mock.test.Conditional.example: target [test.create_suffix]: must not end with \"-an\""
     );
     let rejected = finalized.check_inputs(&schemas, &current).unwrap_err();
     assert_eq!(rejected.errors().len(), 1);
     assert!(
-        matches!(&rejected.errors()[0].kind, PlanErrorKind::InputRule { reason, context: InputWriteContext::Create, .. } if reason == "has a forbidden suffix")
+        matches!(&rejected.errors()[0].kind, PlanErrorKind::InputRule { reason, context: InputWriteContext::Create, .. } if reason == "must not end with \"-an\"")
     );
 }
 
@@ -189,7 +189,7 @@ fn create_only_plan_exempts_import_update_and_rejects_replacement_creates() {
             .unwrap_err();
         assert_eq!(rejected.errors().len(), 1);
         assert!(
-            matches!(&rejected.errors()[0].kind, PlanErrorKind::InputRule { context: InputWriteContext::Replacement { create_before_destroy: actual }, reason, .. } if *actual == create_before_destroy && reason == "has a forbidden suffix")
+            matches!(&rejected.errors()[0].kind, PlanErrorKind::InputRule { context: InputWriteContext::Replacement { create_before_destroy: actual }, reason, .. } if *actual == create_before_destroy && reason == "must not end with \"-an\"")
         );
     }
 }
@@ -358,4 +358,49 @@ fn update_guard_cannot_use_an_ignored_leaf_copied_from_observation() {
         site.applicable_rules().next().unwrap().verdict_for_test(),
         InputVerdict::Undecided
     );
+}
+
+#[test]
+fn input_rule_display_evaluation_failure_keeps_the_condition_without_claiming_rejection() {
+    for (condition, suffix) in [
+        (InputCondition::Always, ""),
+        (
+            InputCondition::Not(Box::new(InputCondition::Equals {
+                path: InputPath::new("guard").unwrap(),
+                literal: InputLiteral::Bool(false),
+            })),
+            " when not (guard equals false)",
+        ),
+    ] {
+        let schema = ResourceSchema::new("test.Display")
+            .attribute(AttributeSchema::optional("guard", AttributeType::bool()).build())
+            .attribute(AttributeSchema::optional("target", AttributeType::string()).build())
+            .input_rule(
+                InputRule::value(
+                    InputRuleScope::EveryWrite,
+                    InputPath::new("target").unwrap(),
+                    InputRuleCode::new("test.display").unwrap(),
+                    InputPredicate::NoSuffix(crate::schema::NonEmptyString::new("-an").unwrap()),
+                )
+                .with_condition(condition),
+            )
+            .validate()
+            .unwrap();
+        let rule = &schema.as_schema().input_rules()[0];
+        let InputVerdict::Violation(violation) = failed_verdict(rule) else {
+            panic!("failed evaluation must retain a failure");
+        };
+        assert_eq!(
+            violation.reason(),
+            crate::schema::InputViolationReason::EvaluationFailed
+        );
+        assert_eq!(
+            violation.message().to_string(),
+            format!("input evaluation failed{suffix}")
+        );
+        assert_eq!(
+            crate::schema::InputRuleDisplay::new(rule).to_string(),
+            format!("value at target: must not end with \"-an\"{suffix} (on every write)")
+        );
+    }
 }

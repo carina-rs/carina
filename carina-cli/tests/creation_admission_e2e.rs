@@ -241,7 +241,7 @@ fn validate_warns_but_succeeds_for_legacy_create_only_name() {
     let output = fixture.run(&["validate", "."]);
     assert!(output.status.success(), "{}", text(&output));
     assert!(text(&output).contains(
-        "mock.test.creation_constrained.legacy: name [mock.name.not_ipv4]: has IPv4 dotted-quad form (rejected if this resource is created)"
+        "mock.test.creation_constrained.legacy: name [mock.name.not_ipv4]: must not have IPv4 dotted-quad form (rejected if this resource is created)"
     ), "{}", text(&output));
 }
 
@@ -256,7 +256,7 @@ fn validate_json_includes_create_only_warning_and_succeeds() {
     let finding = warnings.iter().find(|w| w["type"] == "input_rule").unwrap();
     assert_eq!(
         finding["message"],
-        "mock.test.creation_constrained.legacy: name [mock.name.not_ipv4]: has IPv4 dotted-quad form (rejected if this resource is created)"
+        "mock.test.creation_constrained.legacy: name [mock.name.not_ipv4]: must not have IPv4 dotted-quad form (rejected if this resource is created)"
     );
 }
 
@@ -747,7 +747,7 @@ fn input_validate_reports_every_write_error_and_create_only_warning_in_multi_fil
         text(&output)
     );
     assert!(text(&output).contains(
-        "mock.test.input_constrained.tagged: name [mock.name.not_ipv4]: has IPv4 dotted-quad form (rejected if this resource is created)"
+        "mock.test.input_constrained.tagged: name [mock.name.not_ipv4]: must not have IPv4 dotted-quad form (rejected if this resource is created)"
     ), "{}", text(&output));
     assert!(!text(&output).contains("aWs:private-key"));
     assert!(!text(&output).contains("secret-tag-value"));

@@ -1,0 +1,24 @@
+name: Rust toolchain
+description: Install the pinned toolchain, components and targets from rust-toolchain.toml
+
+inputs:
+  targets:
+    description: Additional targets to install (space or comma separated)
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install pinned Rust toolchain
+      shell: bash
+      env:
+        EXTRA_TARGETS: ${{ inputs.targets }}
+      run: |
+        rustup toolchain install
+        target_list=${EXTRA_TARGETS//,/ }
+        read -r -a targets <<< "${target_list//$'\n'/ }"
+        if (( ${#targets[@]} )); then
+          rustup target add -- "${targets[@]}"
+        fi
+        rustc --version

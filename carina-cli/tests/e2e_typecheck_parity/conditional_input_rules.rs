@@ -6,6 +6,208 @@ use carina_core::schema::{
     InputRuleScope,
 };
 
+#[test]
+fn review_4327_long_requirement_is_identical_in_declaration_clients_and_plan() {
+    use carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES;
+    use carina_core::schema::{InputRuleDisplay, NonEmptyString};
+
+    let suffix = "é".repeat(MAX_PROVIDER_TEXT_BYTES);
+    let value = format!("DO-NOT-PRINT{suffix}");
+    for (scope, scope_text, preview) in [
+        (
+            InputRuleScope::CreateOnly,
+            "on create",
+            " (rejected if this resource is created)",
+        ),
+        (InputRuleScope::EveryWrite, "on every write", ""),
+    ] {
+        let declaration = InputRule::value(
+            scope,
+            InputPath::new("name").unwrap(),
+            InputRuleCode::new("test.long_suffix").unwrap(),
+            InputPredicate::NoSuffix(NonEmptyString::new(&suffix).unwrap()),
+        );
+        let rendered = InputRuleDisplay::new(&declaration).to_string();
+        let requirement = rendered
+            .strip_prefix("value at name: ")
+            .unwrap()
+            .strip_suffix(&format!(" ({scope_text})"))
+            .unwrap();
+        assert!(requirement.contains("… (truncated, "));
+        let schema = ResourceSchema::new("test.LongDisplay")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .input_rule(declaration);
+        let schemas = single_schema_map(schema);
+        let values = format!("let long_name = '{value}'\n");
+        let fixture = write_fixture(&[
+            ("providers.crn", "provider test {}\n"),
+            ("values.crn", &values),
+            (
+                "main.crn",
+                "let example = test.test.LongDisplay { name = long_name }\n",
+            ),
+        ]);
+        let cli = carina_cli::commands::validate::validate_diagnostics_with_factories(
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            carina_cli::wiring::LoadedProviderFactory::for_test(factories_for(&schemas)),
+            Default::default(),
+        );
+        let cli_message = match scope {
+            InputRuleScope::CreateOnly => {
+                assert!(cli.errors.is_empty(), "{:?}", cli.errors);
+                assert_eq!(cli.input_warnings.len(), 1);
+                assert_eq!(
+                    cli.input_warnings[0].violation().message().to_string(),
+                    requirement
+                );
+                cli.input_warnings[0].to_string()
+            }
+            InputRuleScope::EveryWrite => {
+                assert!(cli.input_warnings.is_empty());
+                let messages = cli
+                    .errors
+                    .iter()
+                    .flat_map(|error| {
+                        error
+                            .to_string()
+                            .lines()
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|message| message.contains("[test.long_suffix]"))
+                    .collect::<Vec<_>>();
+                assert_eq!(messages.len(), 1, "{:?}", cli.errors);
+                messages[0].clone()
+            }
+        };
+        let expected = format!(
+            "test.test.LongDisplay.example: name [test.long_suffix]: {requirement}{preview}"
+        );
+        assert_eq!(cli_message, expected);
+        let lsp = lsp_diagnostics(&engine_with_schemas(schemas.clone()), &fixture, "main.crn");
+        let diagnostics = lsp
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("[test.long_suffix]"))
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1, "{lsp:#?}");
+        assert_eq!(diagnostics[0].message.as_bytes(), cli_message.as_bytes());
+        assert!(!cli_message.contains("DO-NOT-PRINT"));
+
+        let resource = carina_core::resource::Resource::with_provider(
+            "test",
+            "test.LongDisplay",
+            "example",
+            None,
+        )
+        .with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String(value.clone().into())),
+        );
+        let resource =
+            carina_core::resource::ResolvedResource::resolve_raw_fixture(resource, &schemas)
+                .unwrap();
+        let mut plan = carina_core::plan::Plan::new();
+        plan.add(carina_core::effect::Effect::Create(resource));
+        let plan = carina_core::input_rules::finalize_plan_for_test(plan);
+        let failure = plan.check_inputs(&schemas, &HashMap::new()).unwrap_err();
+        assert_eq!(failure.errors().len(), 1);
+        let error = &failure.errors()[0];
+        assert!(
+            matches!(&error.kind, carina_core::plan::PlanErrorKind::InputRule { reason, .. } if reason == requirement)
+        );
+        assert_eq!(
+            error.display_with_project_dir(fixture.path()).to_string(),
+            format!(
+                "test.test.LongDisplay.example: cannot create: name [test.long_suffix]: {requirement}"
+            )
+        );
+    }
+}
+
+#[test]
+fn input_rule_display_cli_lsp_messages_are_byte_identical_for_both_scopes() {
+    let schema = ResourceSchema::new("test.Display")
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("label", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("guard", AttributeType::bool()).build())
+        .input_rule(
+            InputRule::value(
+                InputRuleScope::CreateOnly,
+                InputPath::new("name").unwrap(),
+                InputRuleCode::new("test.display_create").unwrap(),
+                InputPredicate::NoSuffix(carina_core::schema::NonEmptyString::new("-an").unwrap()),
+            )
+            .with_condition(InputCondition::Not(Box::new(InputCondition::Equals {
+                path: InputPath::new("guard").unwrap(),
+                literal: InputLiteral::Bool(false),
+            }))),
+        )
+        .input_rule(InputRule::value(
+            InputRuleScope::EveryWrite,
+            InputPath::new("label").unwrap(),
+            InputRuleCode::new("test.display_write").unwrap(),
+            InputPredicate::NoPrefix(carina_core::schema::NonEmptyString::new("xn--").unwrap()),
+        ));
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider test {}\n"),
+        (
+            "values.crn",
+            "let bucket_name = 'DO-NOT-PRINT-an'\nlet label = 'xn--DO-NOT-PRINT'\nlet trigger = true\n",
+        ),
+        (
+            "main.crn",
+            "let example = test.test.Display { name = bucket_name label = label guard = trigger }\n",
+        ),
+    ]);
+    let schemas = single_schema_map(schema);
+    let cli = carina_cli::commands::validate::validate_diagnostics_with_factories(
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        carina_cli::wiring::LoadedProviderFactory::for_test(factories_for(&schemas)),
+        Default::default(),
+    );
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    assert_eq!(cli.input_warnings.len(), 1, "{:?}", cli.input_warnings);
+    let warning = cli.input_warnings[0].to_string();
+    let expected_warning = "test.test.Display.example: name [test.display_create]: must not end with \"-an\" when not (guard equals false) (rejected if this resource is created)";
+    assert_eq!(warning, expected_warning);
+    let expected_error =
+        "test.test.Display.example: label [test.display_write]: must not start with \"xn--\"";
+    let cli_errors = cli
+        .errors
+        .iter()
+        .flat_map(|error| {
+            error
+                .to_string()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|message| message.contains("[test.display_write]"))
+        .collect::<Vec<_>>();
+    assert_eq!(cli_errors, vec![expected_error]);
+    for (code, message, severity) in [
+        (
+            "[test.display_create]",
+            warning.as_str(),
+            DiagnosticSeverity::WARNING,
+        ),
+        (
+            "[test.display_write]",
+            cli_errors[0].as_str(),
+            DiagnosticSeverity::ERROR,
+        ),
+    ] {
+        let diagnostics = lsp
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains(code))
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1, "{lsp:#?}");
+        assert_eq!(diagnostics[0].message.as_bytes(), message.as_bytes());
+        assert_eq!(diagnostics[0].severity, Some(severity));
+        assert!(!message.contains("DO-NOT-PRINT"));
+    }
+}
+
 fn provider_selected_rule_factories() -> Vec<Box<dyn ProviderFactory>> {
     provider_selected_rule_factories_for(InputCondition::Equals {
         path: InputPath::new("guard").unwrap(),
@@ -736,7 +938,7 @@ fn create_only_s3_rules_have_multifile_cli_lsp_warning_and_pending_parity() {
             assert_eq!(warning.to_string(), diagnostic.message);
             assert_eq!(
                 diagnostic.message,
-                "test.s3.Bucket.bucket: name [s3.bucket.namespace_suffix]: has a forbidden suffix when not (bucket_namespace equals test.s3.Bucket.Namespace::\"account-regional\") (rejected if this resource is created)"
+                "test.s3.Bucket.bucket: name [s3.bucket.namespace_suffix]: must not end with \"-an\" when not (bucket_namespace equals test.s3.Bucket.Namespace::\"account-regional\") (rejected if this resource is created)"
             );
         }
     }

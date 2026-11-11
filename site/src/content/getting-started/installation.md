@@ -28,13 +28,10 @@ Stable tags (`vX.Y.Z`) publish the latest release and update Homebrew. Release c
 
 ## Build from source
 
-Prerequisites:
-- **Rust toolchain** (stable) -- install via [rustup](https://rustup.rs/)
-- **wasm32-wasip2 target** -- required for building provider plugins
-
-```bash
-rustup target add wasm32-wasip2
-```
+Install [rustup](https://rustup.rs/) (1.28.0 or newer). Rustup automatically reads
+`rust-toolchain.toml` to select the pinned Rust toolchain, `clippy`, `rustfmt` and
+`wasm32-wasip2` target. Toolchain upgrades are explicit pull requests that edit
+that one file.
 
 Clone the repository (with the WIT definitions submodule) and build in release mode:
 
@@ -42,6 +39,7 @@ Clone the repository (with the WIT definitions submodule) and build in release m
 git clone https://github.com/carina-rs/carina.git
 cd carina
 git submodule update --init --recursive
+rustup toolchain install
 cargo build --release
 ```
 

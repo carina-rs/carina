@@ -404,7 +404,7 @@ fn create_only_input_rules_produce_lsp_warnings() {
     assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
     assert_eq!(
         diagnostics[0].message,
-        "test.test.Widget.bucket: name [test.not_ipv4]: has IPv4 dotted-quad form (rejected if this resource is created)"
+        "test.test.Widget.bucket: name [test.not_ipv4]: must not have IPv4 dotted-quad form (rejected if this resource is created)"
     );
 }
 
@@ -476,10 +476,14 @@ fn input_every_write_matches_validate_for_multifile_desired_values_and_defaults(
                 assert_eq!(
                     finding.message,
                     format!(
-                        "test.test.Widget.bucket: tags [tags.reserved_prefix]: has a forbidden prefix{suffix}"
+                        "test.test.Widget.bucket: tags [tags.reserved_prefix]: must not start with \"aws:\" (ignoring ASCII case){suffix}"
                     )
                 );
-                assert!(finding.message.contains("has a forbidden prefix"));
+                assert!(
+                    finding
+                        .message
+                        .contains("must not start with \"aws:\" (ignoring ASCII case)")
+                );
                 assert!(!finding.message.contains("private-key"));
                 assert!(!finding.message.contains("secret-value"));
             }
