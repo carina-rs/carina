@@ -2376,7 +2376,7 @@ where
 /// [`ResolvedProviderConfigs`].
 pub fn resolve_provider_attributes_with_remote<E, D>(
     parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>,
-    remote_bindings: &HashMap<String, HashMap<String, RuntimeValue>>,
+    remote_bindings: &crate::upstream_exports::AdmittedRemoteBindings,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<ResolvedProviderConfigs, ProviderConfigResolutionError> {
     let mut bindings =
@@ -2399,7 +2399,7 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
                     .collect(),
             };
             parser_bindings.insert(binding_name.to_string(), attributes.clone());
-            bindings.set_with_completeness(
+            bindings.set_values_with_completeness(
                 binding_name,
                 attributes,
                 crate::binding_index::BindingValueSource::Local,
@@ -2407,14 +2407,9 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
             );
         }
     }
+    bindings.install_upstream(remote_bindings);
     for (binding, attrs) in remote_bindings {
-        parser_bindings.insert(binding.clone(), attrs.clone());
-        bindings.set_with_completeness(
-            binding,
-            attrs.clone(),
-            crate::binding_index::BindingValueSource::Upstream,
-            crate::binding_index::BindingCompleteness::Complete,
-        );
+        parser_bindings.insert(binding.clone(), (**attrs).clone());
     }
 
     let mut providers = Vec::with_capacity(parsed.providers.len());

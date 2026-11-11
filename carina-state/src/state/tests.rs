@@ -13,6 +13,33 @@ use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[test]
+fn round2_3_full_state_and_export_display_keep_main_namespace_error_text() {
+    let mut state = serde_json::to_value(StateFile::new()).unwrap();
+    state["exports"] = serde_json::json!({"value": {"$enum": {}}});
+    let root_bytes = serde_json::to_vec(&state).unwrap();
+    let state_error = check_and_migrate_bytes(&root_bytes)
+        .unwrap_err()
+        .to_string();
+    let display_error = PublishedExports::from_state_bytes(&root_bytes)
+        .unwrap_err()
+        .to_string();
+    state["exports"] = serde_json::json!({"value": {"private_member": [{"$enum": {}}]}});
+    let nested_bytes = serde_json::to_vec(&state).unwrap();
+    assert_eq!(
+        check_and_migrate_bytes(&nested_bytes)
+            .unwrap_err()
+            .to_string(),
+        state_error
+    );
+    assert_eq!(
+        PublishedExports::from_state_bytes(&nested_bytes)
+            .unwrap_err()
+            .to_string(),
+        display_error
+    );
+}
+
+#[test]
 fn destroy_keeps_an_undeleted_identifierless_orphan_as_an_ordering_target() {
     use carina_core::{executor::DeleteScheduler, planning_state::DestroyPlan};
     let kept_id = ResolvedResourceId::with_provider_identity("mock", "test.Bucket", "kept", None);
@@ -311,6 +338,30 @@ fn published_exports_from_state(state: &StateFile) -> PublishedExports {
     let bytes = carina_core::utils::pretty_with_newline_bytes(state)
         .expect("test state must serialize with the state writer encoding");
     PublishedExports::from_state_bytes(&bytes).expect("serialized test exports must decode")
+}
+
+// Preserve the original decoder-fixture assertions while exercising admission
+// before exposing their decoded maps to resolver fixtures.
+trait PublishedFixtureBindings {
+    fn build_remote_bindings(&self) -> HashMap<String, Value>;
+}
+impl PublishedFixtureBindings for PublishedExports {
+    fn build_remote_bindings(&self) -> HashMap<String, Value> {
+        let context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let admitted =
+            carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+                carina_core::upstream_exports::ResolvedUpstreamSource::for_test("upstream", None)
+                    .decode_and_admit(
+                        self.values()
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value)),
+                        session,
+                    )
+            })
+            .expect("fixture published values pass admission");
+        (*admitted).clone()
+    }
 }
 
 fn persisted_prevent_destroy_json(directives: &PersistedDirectives) -> serde_json::Value {
@@ -9361,6 +9412,120 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
     // Second item should be stored as a hash
     let secret_stored = structural_secret_digest(&values_arr[1]);
     assert!(secret_stored.starts_with("$argon2id$"));
+}
+
+#[test]
+fn full_state_load_preserves_nested_null_exports_for_reapply() {
+    let exports = serde_json::json!({
+        "list": ["before", null, "after"],
+        "object": {"id": null, "active": true},
+        "absent": null,
+    });
+    for version in [StateFile::CURRENT_VERSION, 16] {
+        let mut json = serde_json::to_value(StateFile::new()).unwrap();
+        json["exports"] = exports.clone();
+        json["version"] = serde_json::json!(version);
+        if version < StateFile::EXPORTS_VERSION_INTRODUCED {
+            json.as_object_mut().unwrap().remove("exports_version");
+        }
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let loaded = check_and_migrate_bytes(&bytes)
+            .expect("full-state loading must allow reapply to replace nested-null exports")
+            .into_state();
+        assert_eq!(serde_json::to_value(&loaded.exports).unwrap(), exports);
+
+        let displayed = PublishedExports::from_state_bytes(&bytes)
+            .expect("export display must preserve encoded nulls");
+        assert_eq!(serde_json::to_value(displayed.values()).unwrap(), exports);
+        let published = PublishedExports::from_state_bytes(&bytes).unwrap();
+        let context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        assert!(
+            carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+                carina_core::upstream_exports::ResolvedUpstreamSource::for_test("upstream", None)
+                    .decode_and_admit(
+                        published
+                            .values()
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value)),
+                        session,
+                    )
+            })
+            .is_err(),
+            "installed remote exports must reject nested nulls after legacy migration"
+        );
+    }
+}
+
+#[test]
+fn published_exports_reject_nested_list_null_instead_of_compacting_it() {
+    assert_published_export_null_rejected(
+        serde_json::json!(["before", null, "after"]),
+        &["broken", "[1]"],
+    );
+}
+
+#[test]
+fn published_exports_reject_nested_object_null_instead_of_dropping_its_key() {
+    assert_published_export_null_rejected(
+        serde_json::json!({"id": null, "active": true}),
+        &["broken", "id"],
+    );
+}
+
+fn assert_published_export_null_rejected(value: serde_json::Value, error_path: &[&str]) {
+    let mut state = serde_json::to_value(StateFile::new()).unwrap();
+    state["exports"] = serde_json::json!({"valid": "keep", "broken": value});
+    let bytes = serde_json::to_vec(&state).unwrap();
+    let published = PublishedExports::from_state_bytes(&bytes).unwrap();
+    let declarations = published
+        .values()
+        .keys()
+        .map(|key| {
+            (
+                key.clone(),
+                carina_core::upstream_exports::UpstreamExportEntry {
+                    static_type: carina_core::upstream_exports::UpstreamExportType::InferenceNotRun,
+                    value: None,
+                },
+            )
+        })
+        .collect();
+    let context =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let result =
+        carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+            carina_core::upstream_exports::ResolvedUpstreamSource::for_test(
+                "upstream",
+                Some(&declarations),
+            )
+            .decode_and_admit(
+                published
+                    .values()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value)),
+                session,
+            )
+        });
+    assert!(
+        result.is_err(),
+        "a present installed export containing null must fail admission instead of silently dropping data"
+    );
+    let error = result.unwrap_err();
+    let mut messages = vec![error.to_string()];
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        messages.push(cause.to_string());
+        source = cause.source();
+    }
+    let message = messages.join("\n");
+    assert!(message.contains("upstream.broken"), "{message}");
+    for fragment in error_path {
+        assert!(
+            message.contains(fragment),
+            "decode error must retain export path {error_path:?}: {message}",
+        );
+    }
 }
 
 #[test]

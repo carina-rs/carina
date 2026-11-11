@@ -419,10 +419,11 @@ enum DesiredAuthoringBasis<'a> {
     CarriedRead,
 }
 
-/// Published values read without decoding managed resource rows.
+/// Published values retained until source-key selection and admission.
 ///
-/// Construction is restricted to [`Self::from_state_bytes`], so exports-only
-/// consumers cannot accidentally cross the full state-format version gate.
+/// Construction validates the persisted namespace and structure. Only admission
+/// decodes installed keys, so corrupt stale values cannot block downstreams.
+/// Managed resource rows are not decoded or checked against the state version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedExports {
     values: HashMap<String, PersistedExportValue>,
@@ -485,15 +486,6 @@ impl PublishedExports {
 
     pub fn values(&self) -> &HashMap<String, PersistedExportValue> {
         &self.values
-    }
-
-    /// Decode published values into the binding map consumed by
-    /// `upstream_state`.
-    pub fn build_remote_bindings(&self) -> HashMap<String, Value> {
-        self.values
-            .iter()
-            .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
-            .collect()
     }
 }
 
@@ -865,6 +857,7 @@ fn classify_exports_version(
     }
 }
 
+/// Validate persisted JSON without applying remote-binding value semantics.
 fn decode_persisted_exports(
     exports: HashMap<String, serde_json::Value>,
 ) -> Result<HashMap<String, PersistedExportValue>, StateFileDecodeError> {

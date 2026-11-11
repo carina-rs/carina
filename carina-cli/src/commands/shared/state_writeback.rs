@@ -8547,7 +8547,15 @@ mod stage4_unknown_err_tests {
         );
 
         let export_json = PersistedExportValue::encode(&value).expect("export writeback succeeds");
-        assert_eq!(export_json.decode(), Some(value));
+        let context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let admitted =
+            carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+                carina_core::upstream_exports::ResolvedUpstreamSource::for_test("upstream", None)
+                    .decode_and_admit([("payload".into(), &export_json)], session)
+            })
+            .unwrap();
+        assert_eq!(admitted.get("payload").cloned(), Some(value));
     }
 
     #[test]
