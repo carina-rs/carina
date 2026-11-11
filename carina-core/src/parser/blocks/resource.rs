@@ -104,6 +104,12 @@ pub(crate) fn parse_resource_for_target(
         ReservedAttributeNamePolicy::Reject,
     )?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
+    let authored_slots = ctx.authored_resource_slots(
+        &syntax,
+        &parsed_contents.sinks,
+        &parsed_contents.attributes,
+        crate::schema::SchemaKind::Resource,
+    )?;
     let attributes = parsed_contents.attributes;
     let ParsedDirectives {
         directives,
@@ -153,6 +159,7 @@ pub(crate) fn parse_resource_for_target(
     Ok(Resource {
         id,
         attributes: attributes.into_iter().collect(),
+        authored_slots,
         directives,
         resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
@@ -188,6 +195,7 @@ struct ParsedBlockContents {
     attributes: IndexMap<String, Value>,
     directives: Option<ParsedDirectives>,
     pending: bool,
+    sinks: HashMap<String, crate::parser::retained::SinkExpression>,
 }
 
 #[derive(Default)]
@@ -222,6 +230,7 @@ fn parse_block_contents_with_quoted(
     let mut nested_blocks: IndexMap<String, Vec<Value>> = IndexMap::new();
     let mut authored_nested_blocks: HashMap<String, usize> = HashMap::new();
     let mut directives = None;
+    let mut sinks = HashMap::new();
 
     // Local scope extends the parent context with block-scoped let bindings
     let mut local_ctx = ctx.child_scope();
@@ -264,9 +273,12 @@ fn parse_block_contents_with_quoted(
                             next_pair(&mut attr_inner, "attribute value", "block content")?;
                         record_quoted_if_literal(quoted_out, &key, &value_pair);
                         let value_mode = mode.at_named_child(key.clone());
-                        match parse_expression_in_sink(value_pair, &local_ctx, &value_mode)?
-                            .projection()
-                        {
+                        // Storage consumes the complete sink and shares its
+                        // authored handles with the syntax inventory.
+                        let expression =
+                            parse_expression_in_sink(value_pair, &local_ctx, &value_mode)?;
+                        sinks.insert(key.clone(), expression.clone());
+                        match expression.projection() {
                             ParsedSinkValue::Ready(value) => {
                                 attributes.insert(key, value.clone());
                             }
@@ -327,7 +339,10 @@ fn parse_block_contents_with_quoted(
                 let value_pair = next_pair(&mut attr_inner, "attribute value", "block content")?;
                 record_quoted_if_literal(quoted_out, &key, &value_pair);
                 let value_mode = mode.at_named_child(key.clone());
-                match parse_expression_in_sink(value_pair, &local_ctx, &value_mode)?.projection() {
+                // This grammar branch stores the same complete sink bundle.
+                let expression = parse_expression_in_sink(value_pair, &local_ctx, &value_mode)?;
+                sinks.insert(key.clone(), expression.clone());
+                match expression.projection() {
                     ParsedSinkValue::Ready(value) => {
                         attributes.insert(key, value.clone());
                     }
@@ -353,6 +368,7 @@ fn parse_block_contents_with_quoted(
         attributes,
         directives,
         pending,
+        sinks,
     })
 }
 
@@ -418,6 +434,7 @@ pub(crate) fn parse_read_resource_expr(
 ) -> Result<DataSource, ParseError> {
     let declaration =
         crate::parser::DeclarationProvenance::from_pair(&pair, preprocessed_file, source_file);
+    let syntax = pair.clone();
     let mut inner = pair.into_inner();
 
     let namespaced_type = next_pair(&mut inner, "resource type", "read resource expression")?
@@ -450,6 +467,12 @@ pub(crate) fn parse_read_resource_expr(
         ReservedAttributeNamePolicy::Reject,
     )?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
+    let authored_slots = ctx.authored_resource_slots(
+        &syntax,
+        &parsed_contents.sinks,
+        &parsed_contents.attributes,
+        crate::schema::SchemaKind::DataSource,
+    )?;
     let attributes = parsed_contents.attributes;
     let ParsedDirectives {
         directives,
@@ -470,6 +493,7 @@ pub(crate) fn parse_read_resource_expr(
     Ok(DataSource {
         id,
         attributes: attributes.into_iter().collect(),
+        authored_slots,
         directives,
         binding: Some(RelativeBindingName::new(binding_name)),
         dependencies: Default::default(),

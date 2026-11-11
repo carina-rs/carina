@@ -74,6 +74,7 @@ pub(crate) fn parse_integer_operator(
     ctx: &ParseContext,
 ) -> Result<(IntegerOp, IntegerOperatorSpan), ParseError> {
     let location = ctx.declaration_location(&pair);
+    let node = ctx.authored_node_id(&pair);
     let context = match pair.as_rule() {
         Rule::add_op => "additive operator",
         Rule::multiplicative_op => "multiplicative operator",
@@ -105,7 +106,7 @@ pub(crate) fn parse_integer_operator(
             context: context.to_string(),
         });
     }
-    Ok((op, IntegerOperatorSpan::authored(location)))
+    Ok((op, IntegerOperatorSpan::authored(location).with_node(node)))
 }
 
 pub(crate) fn combine_integer_operands(

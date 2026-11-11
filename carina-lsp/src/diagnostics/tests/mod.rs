@@ -4,11 +4,14 @@ use super::*;
 use crate::document::Document;
 use carina_core::parser::ProviderContext;
 use carina_core::provider::ProviderFactory;
+use carina_core::resource::knowledge::collect_classified_attributes;
 use carina_core::schema::SchemaRegistry;
 
 mod basic;
 mod extended;
 mod located;
+mod seam_review;
+mod seam_round2;
 mod single_value_walk;
 
 pub(super) fn create_document(content: &str) -> Document {

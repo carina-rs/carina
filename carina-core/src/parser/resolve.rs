@@ -603,6 +603,7 @@ trait PreApplyResourceMut {
     fn attributes(&self) -> &IndexMap<String, Value>;
     fn dependency_bindings(&self) -> &BTreeSet<RelativeBindingName>;
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value>;
+    fn authored_slots_mut(&mut self) -> &mut super::retained::AuthoredSlots;
     fn directives_mut(&mut self) -> &mut crate::resource::AuthoredDirectives;
     fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<RelativeBindingName>;
     fn declaration(&self) -> &super::DeclarationProvenance;
@@ -620,6 +621,9 @@ impl PreApplyResourceMut for Resource {
     }
     fn dependency_bindings(&self) -> &BTreeSet<RelativeBindingName> {
         &self.dependencies.value_bindings
+    }
+    fn authored_slots_mut(&mut self) -> &mut super::retained::AuthoredSlots {
+        &mut self.authored_slots
     }
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value> {
         &mut self.attributes
@@ -644,6 +648,9 @@ impl PreApplyResourceMut for DataSource {
     }
     fn dependency_bindings(&self) -> &BTreeSet<RelativeBindingName> {
         &self.dependencies.value_bindings
+    }
+    fn authored_slots_mut(&mut self) -> &mut super::retained::AuthoredSlots {
+        &mut self.authored_slots
     }
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value> {
         &mut self.attributes
@@ -1053,6 +1060,9 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
             resolved_attrs.insert(key.clone(), resolved);
         }
 
+        resource
+            .authored_slots_mut()
+            .replace_projections(&resolved_attrs);
         *resource.attributes_mut() = resolved_attrs;
         resolve_directive_function_calls(
             resource.directives_mut(),

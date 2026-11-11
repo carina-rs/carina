@@ -2389,6 +2389,7 @@ fn create_test_module() -> ParsedFile {
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
+            authored_slots: Default::default(),
             declaration: Default::default(),
         }],
         variables: IndexMap::new(),
@@ -2630,6 +2631,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
+            authored_slots: Default::default(),
             declaration: Default::default(),
         }],
         variables: IndexMap::new(),
@@ -2851,6 +2853,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
+            authored_slots: Default::default(),
             declaration: Default::default(),
         }],
         variables: IndexMap::new(),
@@ -2980,6 +2983,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
         default_tag_keys: Default::default(),
         loop_provenance: Default::default(),
         quoted_string_attrs: std::collections::HashSet::new(),
+        authored_slots: Default::default(),
         declaration: Default::default(),
     }];
     let mut resources: Vec<
@@ -3034,6 +3038,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 default_tag_keys: Default::default(),
                 loop_provenance: Default::default(),
                 quoted_string_attrs: std::collections::HashSet::new(),
+                authored_slots: Default::default(),
                 declaration: Default::default(),
             },
             Resource {
@@ -3055,6 +3060,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 default_tag_keys: Default::default(),
                 loop_provenance: Default::default(),
                 quoted_string_attrs: std::collections::HashSet::new(),
+                authored_slots: Default::default(),
                 declaration: Default::default(),
             },
         ],
@@ -3223,6 +3229,7 @@ fn create_module_with_attributes() -> ParsedFile {
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
+            authored_slots: Default::default(),
             declaration: Default::default(),
         }],
         variables: IndexMap::new(),
@@ -4741,6 +4748,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
+            authored_slots: Default::default(),
             declaration: Default::default(),
         });
         m.wait_bindings.push(WaitBinding {
@@ -5082,6 +5090,7 @@ fn create_module_with_interpolation() -> ParsedFile {
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
+            authored_slots: Default::default(),
             declaration: Default::default(),
         }],
         variables: IndexMap::new(),
@@ -9166,6 +9175,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
+            authored_slots: Default::default(),
             declaration: Default::default(),
         });
         m.parsed_deferred_for_expressions_mut()
@@ -9204,6 +9214,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
                     default_tag_keys: Default::default(),
                     loop_provenance: Default::default(),
                     quoted_string_attrs: std::collections::HashSet::new(),
+                    authored_slots: Default::default(),
                     declaration: Default::default(),
                 },
             )));
@@ -9419,6 +9430,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
                     default_tag_keys: Default::default(),
                     loop_provenance: Default::default(),
                     quoted_string_attrs: std::collections::HashSet::new(),
+                    authored_slots: Default::default(),
                     declaration: Default::default(),
                 },
             )));

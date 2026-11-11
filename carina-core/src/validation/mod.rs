@@ -2948,11 +2948,56 @@ fn invalid_integer_operand<B: BindingAddress>(
     }
 }
 
+trait IntegerOperandEvidence<B: BindingAddress> {
+    fn operand<'a>(
+        &'a self,
+        expression: &crate::integer_arithmetic::ValidatedIntegerExpr<ParserPlaceholder, B>,
+        side: crate::integer_arithmetic::IntegerOperandSide,
+    ) -> Result<&'a crate::parser::retained::JudgedExpr, crate::parser::retained::MissingEvidence>;
+}
+impl<B: BindingAddress> IntegerOperandEvidence<B> for crate::parser::retained::ExpressionReport<B> {
+    fn operand<'a>(
+        &'a self,
+        expression: &crate::integer_arithmetic::ValidatedIntegerExpr<ParserPlaceholder, B>,
+        side: crate::integer_arithmetic::IntegerOperandSide,
+    ) -> Result<&'a crate::parser::retained::JudgedExpr, crate::parser::retained::MissingEvidence>
+    {
+        let span = expression.operator_span();
+        let location = span.location().ok_or_else(|| {
+            crate::parser::retained::MissingEvidence::new("integer operator location")
+        })?;
+        self.operand(location, side)
+    }
+}
+impl<B: BindingAddress> IntegerOperandEvidence<B>
+    for crate::parser::retained::JudgedNodeRef<'_, B>
+{
+    fn operand<'a>(
+        &'a self,
+        expression: &crate::integer_arithmetic::ValidatedIntegerExpr<ParserPlaceholder, B>,
+        side: crate::integer_arithmetic::IntegerOperandSide,
+    ) -> Result<&'a crate::parser::retained::JudgedExpr, crate::parser::retained::MissingEvidence>
+    {
+        let id = expression.operator_span().node_id().ok_or_else(|| {
+            crate::parser::retained::MissingEvidence::new("integer operator parser identity")
+        })?;
+        let node = self.retained_node(id)?;
+        let index = match side {
+            crate::integer_arithmetic::IntegerOperandSide::Left => 0,
+            crate::integer_arithmetic::IntegerOperandSide::Right => 1,
+        };
+        node.children()
+            .nth(index)
+            .ok_or_else(|| crate::parser::retained::MissingEvidence::new("integer operand child"))?
+            .map(|node| node.judgement())
+    }
+}
+
 fn prove_integer_operand<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     expression: &crate::integer_arithmetic::ValidatedIntegerExpr<ParserPlaceholder, B>,
     side: crate::integer_arithmetic::IntegerOperandSide,
-    report: &crate::parser::retained::ExpressionReport<B>,
+    report: &(impl IntegerOperandEvidence<B> + ?Sized),
     binding_index: &BindingIndex<'_, B>,
 ) -> Result<(), DeferredAccessTypeError> {
     let integer = lift_type_expr(&TypeExpr::Int).expect("built-in Int lifts");
@@ -3031,11 +3076,8 @@ fn prove_integer_operand<B: BindingAddress>(
             });
     }
 
-    match expression
-        .operator_span()
-        .location()
-        .ok_or_else(|| crate::parser::retained::MissingEvidence::new("integer operator location"))
-        .and_then(|location| report.operand(location, side))
+    match report
+        .operand(expression, side)
         .map_err(|error| DeferredAccessTypeError::InvalidAccess {
             error: error.into(),
         })?
@@ -3137,7 +3179,7 @@ fn check_integer_result_sink<B: BindingAddress>(
 fn check_integer_arithmetic_types_with_sink<'a, B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     sink: Option<RefSink<'a>>,
-    report: &crate::parser::retained::ExpressionReport<B>,
+    report: &(impl IntegerOperandEvidence<B> + ?Sized),
     binding_index: &BindingIndex<'_, B>,
 ) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
     let findings =
@@ -5418,8 +5460,8 @@ fn resource_admission_report<
     let registry = judged.schemas();
     let mut all_errors = Vec::new();
     let mut attributes = HashMap::new();
+    let mut coverage = admission::WalkCoverage::default();
     let inference_bindings = inference::bindings_from_parsed(parsed);
-    let report = parsed.expression_report();
     let tree = crate::parser::AnalysisTree::try_from_file(parsed)?;
 
     // Validate declarations directly instead of relying on a later resource
@@ -5444,28 +5486,31 @@ fn resource_admission_report<
                         continue;
                     };
                     let attrs = resource.attributes();
-                    let classified = crate::resource::knowledge::collect_classified_attributes(
-                        attrs.iter().map(|(name, value)| (name.clone(), value)),
-                        &crate::resource::knowledge::KnowledgeContext::validation(),
-                        |_, _| {},
-                    );
-                    let report = match report.for_resource(resource.id()) {
-                        Ok(report) => report,
+                    let inputs = match admission::attributes::ResourceAttributeInputs::for_resource(
+                        resource,
+                        judged.report(),
+                    ) {
+                        Ok(inputs) => inputs,
                         Err(error) => {
                             all_errors.push(error.to_string());
                             continue;
                         }
                     };
+                    let classified = inputs.classify(
+                        &crate::resource::knowledge::KnowledgeContext::validation(),
+                        |_, _| {},
+                    );
                     let values = admission::attributes::resource_attribute_admissions(
                         resource,
                         parsed,
                         schema,
                         &classified,
                         resource.quoted_string_attrs(),
-                        report,
+                        &inputs,
                         bindings,
                         session,
                         registry,
+                        &mut coverage,
                     );
                     let location = resource.diagnostic_label();
                     for (attribute, path, error) in values.symbolic_errors() {

@@ -19,6 +19,7 @@ use std::ops::Deref;
 pub struct SavedPlanReplay<V: PlanValueKind = NoPlaceholder> {
     plan: Plan<SavedModuleSource, V>,
 }
+
 impl<V: PlanValueKind> Deref for SavedPlanReplay<V> {
     type Target = Plan<SavedModuleSource, V>;
     fn deref(&self) -> &Self::Target {
