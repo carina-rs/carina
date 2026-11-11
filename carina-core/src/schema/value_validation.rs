@@ -1007,7 +1007,7 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
                             .child(discarded, EdgeRole::IfBranch)
                             .map_err(seam_error)?;
                         let mut coverage = self.coverage.borrow_mut();
-                        let mut report = visit_discarded(
+                        findings.extend(visit_discarded(
                             attr,
                             defs,
                             &path.canonical(),
@@ -1015,14 +1015,19 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
                             discarded,
                             self.check,
                             &mut coverage,
-                        );
-                        findings.extend(report.take_assignment());
+                        )?);
                     }
-                    AuthoredCursor::Authored(
-                        usage
-                            .child(selected, EdgeRole::IfBranch)
-                            .map_err(seam_error)?,
-                    )
+                    if selected == 2 && usage.child_count() == 2 {
+                        // A false structural conditional without else has an
+                        // empty projection, covered by the conditional itself.
+                        self.cursor.covered()
+                    } else {
+                        AuthoredCursor::Authored(
+                            usage
+                                .child(selected, EdgeRole::IfBranch)
+                                .map_err(seam_error)?,
+                        )
+                    }
                 }
                 AuthoredForm::Coalesce if value.coalesce().is_none() => {
                     findings.extend(self.check_selection(
@@ -1034,7 +1039,7 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
                         .child(1, EdgeRole::CoalesceOperand)
                         .map_err(seam_error)?;
                     let mut coverage = self.coverage.borrow_mut();
-                    let mut report = visit_discarded(
+                    findings.extend(visit_discarded(
                         attr,
                         defs,
                         &path.canonical(),
@@ -1042,8 +1047,7 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
                         discarded,
                         self.check,
                         &mut coverage,
-                    );
-                    findings.extend(report.take_assignment());
+                    )?);
                     AuthoredCursor::Authored(
                         usage
                             .child(0, EdgeRole::CoalesceOperand)
@@ -1112,7 +1116,7 @@ pub(crate) fn visit_discarded<P: PlaceholderKind, B: BindingAddress>(
     cursor: AuthoredUse<'_, B>,
     assignment: AssignmentCheck<'_, P, B>,
     coverage: &mut WalkCoverage,
-) -> ValueValidationFindings {
+) -> Result<AssignmentFindings, TypeError> {
     fn descend<P: PlaceholderKind, B: BindingAddress>(
         attr: &CompiledAttributeType,
         defs: &BTreeMap<String, CompiledAttributeType>,
@@ -1254,21 +1258,21 @@ pub(crate) fn visit_discarded<P: PlaceholderKind, B: BindingAddress>(
             | AuthoredForm::Computed => Ok(()),
         }
     }
-    let mut findings = ValueValidationFindings::default();
-    if let Err(error) = descend(
+    let mut findings = AssignmentFindings::default();
+    let mut completed = WalkCoverage::default();
+    descend(
         attr,
         defs,
         path,
         ancestry,
         cursor,
         assignment,
-        coverage,
-        &mut findings.assignment,
+        &mut completed,
+        &mut findings,
         &mut Default::default(),
-    ) {
-        findings.assignment.errors.push((path.clone(), error));
-    }
-    findings
+    )?;
+    coverage.extend(completed);
+    Ok(findings)
 }
 
 /// The declaration selected by the resource schema walk, including its slot.

@@ -1334,6 +1334,16 @@ where
     Ok(dependency_edges)
 }
 
+/// Cross-parse source address of one resource instance. Loop elements and
+/// generated bindings distinguish uses of the same authored declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuthoredResourceInstanceKey<'a, B: BindingAddress = RelativeBindingName> {
+    declaration: &'a super::retained::SlotDeclarationId,
+    binding: Option<&'a B>,
+    element: Option<&'a crate::resource::LoopOriginKind>,
+    module_scope: Option<&'a str>,
+}
+
 impl<'a, P, T, D, B> AnalysisResourceRef<'a, P, T, D, B>
 where
     P: ValueKind,
@@ -1386,6 +1396,33 @@ where
             }
             ResourceRef::LiveComposition(_) => None,
         }
+    }
+
+    /// Stable source address of a resource use, including its loop element.
+    /// Unlike a declaration address, this distinguishes materialized instances
+    /// when the buffer and directory were parsed independently.
+    pub fn authored_instance_key(&self) -> Option<AuthoredResourceInstanceKey<'a, B>> {
+        let (origin, source) = match self.resource {
+            ResourceRef::Resource(resource) => (
+                resource.loop_provenance.display_origin(),
+                resource.module_source.as_ref(),
+            ),
+            ResourceRef::Deferred { resource, .. } => (
+                resource.as_resource().loop_provenance.display_origin(),
+                resource.as_resource().module_source.as_ref(),
+            ),
+            ResourceRef::DataSource(source) => (None, source.module_source.as_ref()),
+            ResourceRef::LiveComposition(_) => (None, None),
+        };
+        self.authored_declaration_id()
+            .map(|declaration| AuthoredResourceInstanceKey {
+                declaration,
+                element: origin.map(crate::resource::LoopElementOrigin::kind),
+                binding: self.binding_address(),
+                module_scope: source
+                    .and_then(crate::resource::ModuleSource::module_call)
+                    .map(|call| call.identity_scope().key()),
+            })
     }
 
     pub(crate) fn projected_phase(&self, name: &str) -> Option<super::retained::ProjectedPhase> {
