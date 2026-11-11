@@ -3796,6 +3796,424 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
 }
 
 #[test]
+fn newly_authored_tags_match_refreshed_current_is_no_change() {
+    let result = newly_authored_tags_diff("carina-rs/infra", false);
+    assert!(matches!(result, Diff::NoChange(_)), "got {result:?}");
+}
+
+#[test]
+fn newly_authored_tags_value_drift_is_an_update() {
+    let result = newly_authored_tags_diff("carina-rs/other", false);
+    let Diff::Update {
+        changed_attributes, ..
+    } = result
+    else {
+        panic!("tag drift must produce an update: {result:?}");
+    };
+    assert_eq!(changed_attributes, ["tags"]);
+}
+
+#[test]
+fn newly_authored_tags_hide_server_added_map_keys() {
+    let result = newly_authored_tags_diff("carina-rs/infra", true);
+    assert!(matches!(result, Diff::NoChange(_)), "got {result:?}");
+}
+
+fn newly_authored_tags_diff(repository: &str, server_tag: bool) -> Diff {
+    use crate::schema::CompiledAttributeSchema as AttributeSchema;
+
+    let text = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
+    let tags = |repository: &str| {
+        IndexMap::from([
+            ("ManagedBy".to_string(), text("carina")),
+            ("Repository".to_string(), text(repository)),
+        ])
+    };
+    let prior = Resource::new("test.HostedZone", "zone")
+        .with_attribute("name", text("carina-rs.dev"))
+        .with_attribute(
+            "hosted_zone_tags",
+            Value::Concrete(ConcreteValue::List(vec![])),
+        );
+    let explicit = crate::explicit::build_from_resource(&prior);
+    let saved = crate::test_support::snapshot_attributes(prior.attributes);
+    let desired = Resource::new("test.HostedZone", "zone")
+        .with_attribute("name", text("carina-rs.dev"))
+        .with_attribute(
+            "tags",
+            Value::Concrete(ConcreteValue::Map(tags("carina-rs/infra"))),
+        );
+    let mut current_tags = tags(repository);
+    if server_tag {
+        current_tags.insert("ServerAdded".into(), text("hidden"));
+    }
+    let current = State::existing(
+        desired.id.clone(),
+        HashMap::from([
+            ("name".into(), text("carina-rs.dev")),
+            (
+                "tags".into(),
+                Value::Concrete(ConcreteValue::Map(current_tags)),
+            ),
+        ]),
+    );
+    let schema = ResourceSchema::new("test.HostedZone")
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+        );
+
+    diff_test(
+        &desired,
+        &current,
+        Some(&saved),
+        Some(&explicit),
+        Some(&schema),
+    )
+}
+
+#[test]
+fn newly_authored_nested_field_match_is_no_change() {
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledStructField as StructField,
+    };
+
+    let text = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
+    let prior = Resource::new("test.Widget", "widget").with_attribute(
+        "config",
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "mode".into(),
+            text("active"),
+        )]))),
+    );
+    let explicit = crate::explicit::build_from_resource(&prior);
+    let saved = crate::test_support::snapshot_attributes(prior.attributes);
+    let config = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("mode".into(), text("active")),
+        ("label".into(), text("authored now")),
+    ])));
+    let desired = Resource::new("test.Widget", "widget").with_attribute("config", config.clone());
+    let current = State::existing(
+        desired.id.clone(),
+        HashMap::from([("config".into(), config)]),
+    );
+    let schema = ResourceSchema::new("test.Widget").attribute(
+        AttributeSchema::optional(
+            "config",
+            AttributeType::struct_(
+                "Config",
+                vec![
+                    StructField::optional("mode", AttributeType::string()).build(),
+                    StructField::optional("label", AttributeType::string()).build(),
+                ],
+            ),
+        )
+        .build(),
+    );
+
+    let result = diff_test(
+        &desired,
+        &current,
+        Some(&saved),
+        Some(&explicit),
+        Some(&schema),
+    );
+    assert!(matches!(result, Diff::NoChange(_)), "got {result:?}");
+}
+
+#[test]
+fn newly_authored_legacy_rules_match_refreshed_current_is_no_change() {
+    let prior = ExplicitFields::List {
+        element: Box::new(ExplicitFields::Struct {
+            children: HashMap::from([("port".into(), ExplicitFields::Leaf)]),
+        }),
+    };
+    let result = newly_authored_rules_diff(prior, false);
+    assert!(matches!(result, Diff::NoChange(_)), "got {result:?}");
+}
+
+#[test]
+fn newly_authored_unaligned_rules_match_refreshed_current_is_no_change() {
+    let prior = ExplicitFields::ListElements {
+        elements: vec![ExplicitFields::Struct {
+            children: HashMap::from([("port".into(), ExplicitFields::Leaf)]),
+        }],
+    };
+    let result = newly_authored_rules_diff(prior, false);
+    assert!(matches!(result, Diff::NoChange(_)), "got {result:?}");
+}
+
+#[test]
+fn newly_authored_legacy_rules_hide_server_added_fields() {
+    let prior = ExplicitFields::List {
+        element: Box::new(ExplicitFields::Struct {
+            children: HashMap::from([("port".into(), ExplicitFields::Leaf)]),
+        }),
+    };
+    let result = newly_authored_rules_diff(prior, true);
+    assert!(matches!(result, Diff::NoChange(_)), "got {result:?}");
+}
+
+fn newly_authored_rules_diff(prior_rules: ExplicitFields, server_added: bool) -> Diff {
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledStructField as StructField,
+    };
+
+    let rules = |with_description: bool, with_server: bool| {
+        Value::Concrete(ConcreteValue::List(
+            [80, 443]
+                .into_iter()
+                .map(|port| {
+                    let mut fields = IndexMap::from([(
+                        "port".into(),
+                        Value::Concrete(ConcreteValue::Int(port)),
+                    )]);
+                    if with_description {
+                        fields.insert(
+                            "description".into(),
+                            Value::Concrete(ConcreteValue::String("web".into())),
+                        );
+                    }
+                    if with_server {
+                        fields.insert(
+                            "server_only".into(),
+                            Value::Concrete(ConcreteValue::Bool(true)),
+                        );
+                    }
+                    Value::Concrete(ConcreteValue::Map(fields))
+                })
+                .collect(),
+        ))
+    };
+    let desired =
+        Resource::new("test.Listener", "listener").with_attribute("rules", rules(true, false));
+    let current = State::existing(
+        desired.id.clone(),
+        HashMap::from([("rules".into(), rules(true, server_added))]),
+    );
+    let saved = crate::test_support::snapshot_attributes([("rules".into(), rules(false, false))]);
+    let explicit = ExplicitFields::Struct {
+        children: HashMap::from([("rules".into(), prior_rules)]),
+    };
+    let schema = ResourceSchema::new("test.Listener").attribute(
+        AttributeSchema::optional(
+            "rules",
+            AttributeType::list(AttributeType::struct_(
+                "Rule",
+                vec![
+                    StructField::optional("port", AttributeType::int()).build(),
+                    StructField::optional("description", AttributeType::string()).build(),
+                    StructField::optional("server_only", AttributeType::bool()).build(),
+                ],
+            )),
+        )
+        .build(),
+    );
+
+    diff_test(
+        &desired,
+        &current,
+        Some(&saved),
+        Some(&explicit),
+        Some(&schema),
+    )
+}
+
+#[test]
+fn opaque_prior_list_fallback_keeps_description_drift_visible() {
+    let rule = |port, description: Option<&str>| {
+        let mut fields =
+            IndexMap::from([("port".into(), Value::Concrete(ConcreteValue::Int(port)))]);
+        if let Some(description) = description {
+            fields.insert(
+                "description".into(),
+                Value::Concrete(ConcreteValue::String(description.into())),
+            );
+        }
+        Value::Concrete(ConcreteValue::Map(fields))
+    };
+    let desired = Resource::new("test.Listener", "listener").with_attribute(
+        "rules",
+        Value::Concrete(ConcreteValue::List(vec![rule(80, None), rule(443, None)])),
+    );
+    let current = State::existing(
+        desired.id.clone(),
+        HashMap::from([(
+            "rules".into(),
+            Value::Concrete(ConcreteValue::List(vec![
+                rule(80, Some("web")),
+                rule(443, Some("tls")),
+            ])),
+        )]),
+    );
+    let saved = crate::test_support::snapshot_attributes([(
+        "rules".into(),
+        Value::Concrete(ConcreteValue::List(vec![rule(80, None)])),
+    )]);
+    let explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "rules".into(),
+            ExplicitFields::ListElements {
+                elements: vec![ExplicitFields::Unrecorded, ExplicitFields::Unrecorded],
+            },
+        )]),
+    };
+
+    let result = diff_test(&desired, &current, Some(&saved), Some(&explicit), None);
+    let Diff::Update {
+        changed_attributes, ..
+    } = result
+    else {
+        panic!("opaque prior authoring must keep description drift visible: {result:?}");
+    };
+    assert_eq!(changed_attributes, ["rules"]);
+}
+
+#[test]
+fn nested_aligned_rules_hide_provider_added_elements() {
+    let result = nested_aligned_rules_diff(None);
+    assert!(matches!(result, Diff::NoChange(_)), "got {result:?}");
+}
+
+#[test]
+fn nested_aligned_rules_keep_newly_authored_description() {
+    let result = nested_aligned_rules_diff(Some("web"));
+    assert!(matches!(result, Diff::NoChange(_)), "got {result:?}");
+}
+
+fn nested_aligned_rules_diff(description: Option<&str>) -> Diff {
+    let rule = |port, description: Option<&str>| {
+        let mut fields =
+            IndexMap::from([("port".into(), Value::Concrete(ConcreteValue::Int(port)))]);
+        if let Some(description) = description {
+            fields.insert(
+                "description".into(),
+                Value::Concrete(ConcreteValue::String(description.into())),
+            );
+        }
+        Value::Concrete(ConcreteValue::Map(fields))
+    };
+    let outer = |nested| {
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([
+                ("port".into(), Value::Concrete(ConcreteValue::Int(80))),
+                (
+                    "nested".into(),
+                    Value::Concrete(ConcreteValue::List(nested)),
+                ),
+            ])),
+        )]))
+    };
+    let desired = Resource::new("test.Listener", "listener")
+        .with_attribute("rules", outer(vec![rule(8080, description)]));
+    let current = State::existing(
+        desired.id.clone(),
+        HashMap::from([(
+            "rules".into(),
+            outer(vec![rule(8080, description), rule(8443, None)]),
+        )]),
+    );
+    let saved = crate::test_support::snapshot_attributes([(
+        "rules".into(),
+        outer(vec![rule(8080, None), rule(8443, None)]),
+    )]);
+    let explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "rules".into(),
+            ExplicitFields::ListElements {
+                elements: vec![ExplicitFields::Struct {
+                    children: HashMap::from([
+                        ("port".into(), ExplicitFields::Leaf),
+                        (
+                            "nested".into(),
+                            ExplicitFields::ListElements {
+                                elements: vec![
+                                    ExplicitFields::Struct {
+                                        children: HashMap::from([(
+                                            "port".into(),
+                                            ExplicitFields::Leaf,
+                                        )]),
+                                    },
+                                    ExplicitFields::Unrecorded,
+                                ],
+                            },
+                        ),
+                    ]),
+                }],
+            },
+        )]),
+    };
+
+    diff_test(&desired, &current, Some(&saved), Some(&explicit), None)
+}
+
+#[test]
+fn paired_rule_descriptions_do_not_leak_to_unauthored_siblings() {
+    let result = paired_rule_descriptions_diff("x");
+    assert!(matches!(result, Diff::NoChange(_)), "got {result:?}");
+}
+
+#[test]
+fn paired_rule_descriptions_detect_authored_element_drift() {
+    let result = paired_rule_descriptions_diff("changed");
+    let Diff::Update {
+        changed_attributes, ..
+    } = result
+    else {
+        panic!("authored description drift must remain visible: {result:?}");
+    };
+    assert_eq!(changed_attributes, ["rules"]);
+}
+
+fn paired_rule_descriptions_diff(description: &str) -> Diff {
+    let rule = |port, description: Option<&str>| {
+        let mut fields =
+            IndexMap::from([("port".into(), Value::Concrete(ConcreteValue::Int(port)))]);
+        if let Some(description) = description {
+            fields.insert(
+                "description".into(),
+                Value::Concrete(ConcreteValue::String(description.into())),
+            );
+        }
+        Value::Concrete(ConcreteValue::Map(fields))
+    };
+    let desired = Resource::new("test.Listener", "listener").with_attribute(
+        "rules",
+        Value::Concrete(ConcreteValue::List(vec![
+            rule(80, None),
+            rule(443, Some("x")),
+        ])),
+    );
+    let current = State::existing(
+        desired.id.clone(),
+        HashMap::from([(
+            "rules".into(),
+            Value::Concrete(ConcreteValue::List(vec![
+                rule(80, Some("provider default")),
+                rule(443, Some(description)),
+            ])),
+        )]),
+    );
+    let saved = crate::test_support::snapshot_attributes([(
+        "rules".into(),
+        Value::Concrete(ConcreteValue::List(vec![rule(80, None), rule(443, None)])),
+    )]);
+    let element = ExplicitFields::Struct {
+        children: HashMap::from([("port".into(), ExplicitFields::Leaf)]),
+    };
+    let explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "rules".into(),
+            ExplicitFields::ListElements {
+                elements: vec![element.clone(), element],
+            },
+        )]),
+    };
+
+    diff_test(&desired, &current, Some(&saved), Some(&explicit), None)
+}
+
+#[test]
 fn find_changed_attributes_unrecorded_prev_explicit_is_no_change_when_values_match() {
     // carina#3280: a legacy state row whose authoring record was
     // destroyed by an older for-loop expansion path is signalled by
