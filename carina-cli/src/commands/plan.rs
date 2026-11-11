@@ -7723,12 +7723,15 @@ mod load_upstream_states_tests {
         .unwrap_err();
         let message = crate::error::format_error_with_source_chain(&error);
         assert!(!message.contains("drifted"), "{message}");
-        assert!(
-            std::error::Error::source(&error)
-                .unwrap()
-                .is::<std::io::Error>(),
-            "{error:?}"
-        );
+        assert_eq!(error.to_string(), message);
+        assert!(std::error::Error::source(&error).is_none());
+        let AppError::UpstreamSourceResolution {
+            error: io_error, ..
+        } = &error
+        else {
+            panic!("source resolution must retain its typed I/O error: {error:?}");
+        };
+        assert!(message.ends_with(&io_error.to_string()), "{error:?}");
     }
 
     #[tokio::test]

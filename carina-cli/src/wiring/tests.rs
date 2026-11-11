@@ -123,8 +123,13 @@ fn round1_4_chained_upstream_diagnostics_are_rendered_once() {
                 diagnostics: "diagnostic-marker".into(),
             })),
         }));
-    assert!(std::error::Error::source(&error).unwrap().is::<AppError>());
+    assert!(std::error::Error::source(&error).is_none());
     let message = crate::error::format_error_with_source_chain(&error);
+    assert_eq!(error.to_string(), message);
+    assert_eq!(
+        message,
+        "snapshot-marker\ndiagnostic-marker\nupstream export 'orgs.count'\nexpected Int, got string"
+    );
     for fragment in [
         "snapshot-marker",
         "diagnostic-marker",
@@ -182,16 +187,25 @@ fn review_6_settlement_keeps_typed_admission_error_with_diagnostics() {
     let error = settle_upstream_admission(checks)
         .map_err(AppError::from)
         .unwrap_err();
-    let mut cause: &(dyn std::error::Error + 'static) = &error;
-    loop {
-        if cause
-            .downcast_ref::<AppError>()
-            .is_some_and(|error| matches!(error, AppError::UpstreamExportAdmission(_)))
-        {
-            break;
-        }
-        cause = cause.source().expect("settlement must retain the typed admission error, including when diagnostics are present");
-    }
+    assert!(std::error::Error::source(&error).is_none());
+    let AppError::TypeCheckDiagnostics(diagnostics) = &error else {
+        panic!("additional diagnostics must retain their typed primary error: {error:?}");
+    };
+    assert!(matches!(
+        diagnostics.error,
+        AppError::UpstreamExportAdmission(_)
+    ));
+    let message = crate::error::format_error_with_source_chain(&error);
+    assert_eq!(
+        message.matches("upstream export 'up.count'").count(),
+        1,
+        "{message}"
+    );
+    assert_eq!(
+        message.matches("expected Int, got string").count(),
+        1,
+        "{message}"
+    );
 }
 use crate::provider_text_fixtures::*;
 use carina_core::provider::{Provider, ProviderError, ProviderNormalizer};

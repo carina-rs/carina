@@ -157,13 +157,12 @@ impl std::error::Error for InvalidCanonicalBindingError {
     }
 }
 
-/// Retain the concrete backend failure as a source, rather than a boxed error
-/// node whose source traversal would skip the original error variant.
+/// Keep the concrete backend failure available for classification while
+/// rendering the upstream context and inner diagnostic as one terminal error.
 #[derive(Debug, Error)]
-#[error("upstream_state '{binding}': failed to read published exports")]
+#[error("upstream_state '{binding}': failed to read published exports\n{error}")]
 pub struct UpstreamExportReadError {
     pub binding: String,
-    #[source]
     pub error: BackendError,
 }
 
@@ -883,16 +882,20 @@ mod tests {
     }
 
     #[test]
-    fn round1_3_upstream_export_read_retains_typed_backend_cause() {
+    fn round1_3_upstream_export_read_retains_typed_backend_error_with_terminal_display() {
         let error = BackendError::UpstreamExportRead(Box::new(UpstreamExportReadError {
             binding: "orgs".into(),
             error: BackendError::Io("read-marker".into()),
         }));
-        let cause =
-            std::error::Error::source(&error).expect("upstream reads must retain their cause");
-        assert!(
-            matches!(cause.downcast_ref::<BackendError>(), Some(BackendError::Io(message)) if message == "read-marker")
+        assert!(std::error::Error::source(&error).is_none());
+        assert_eq!(
+            error.to_string(),
+            "upstream_state 'orgs': failed to read published exports\nI/O error: read-marker"
         );
+        let BackendError::UpstreamExportRead(read) = error else {
+            panic!("upstream read context must remain typed");
+        };
+        assert!(matches!(read.error, BackendError::Io(message) if message == "read-marker"));
     }
 
     #[test]

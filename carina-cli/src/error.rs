@@ -999,11 +999,11 @@ impl std::fmt::Display for AwsCredentialStartupError {
 // CLI hint. The typed source remains available through `credential_error()`.
 impl std::error::Error for AwsCredentialStartupError {}
 
-/// Additional diagnostics retain the concrete primary error in the source chain.
+/// Additional diagnostics retain the typed primary error and embed its complete
+/// rendering in this terminal diagnostic.
 #[derive(Debug, thiserror::Error)]
-#[error("{diagnostics}")]
+#[error("{diagnostics}\n{}", format_error_with_source_chain(.error))]
 pub struct TypeCheckDiagnostics {
-    #[source]
     pub(crate) error: AppError,
     pub(crate) diagnostics: String,
 }
@@ -1049,10 +1049,9 @@ impl From<UpstreamLoadFailure> for AppError {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("{message}")]
+#[error("{message}\n{}", format_error_with_source_chain(.error))]
 pub struct UpstreamSnapshotChangedError {
     pub(crate) message: String,
-    #[source]
     pub(crate) error: AppError,
 }
 
@@ -1062,11 +1061,10 @@ pub enum AppError {
     #[error(transparent)]
     UpstreamSnapshotChanged(Box<UpstreamSnapshotChangedError>),
 
-    #[error("upstream_state '{binding}': cannot resolve source '{}'", source_path.display())]
+    #[error("upstream_state '{binding}': cannot resolve source '{}'\n{error}", source_path.display())]
     UpstreamSourceResolution {
         binding: String,
         source_path: std::path::PathBuf,
-        #[source]
         error: std::io::Error,
     },
 
