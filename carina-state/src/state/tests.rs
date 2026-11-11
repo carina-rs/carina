@@ -9,6 +9,7 @@ use carina_core::resource::{
 use carina_core::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
+use carina_core::upstream_exports::AdmittedUpstreamExports;
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -324,7 +325,14 @@ impl PublishedFixtureBindings for PublishedExports {
             carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         let admitted =
             carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
-                self.admit("upstream", None, session)
+                AdmittedUpstreamExports::decode_and_admit(
+                    "upstream",
+                    None,
+                    self.values()
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value)),
+                    session,
+                )
             })
             .expect("fixture published values pass admission");
         (*admitted).clone()
@@ -9409,7 +9417,15 @@ fn full_state_load_preserves_nested_null_exports_for_reapply() {
             carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         assert!(
             carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
-                published.admit("upstream", None, session)
+                AdmittedUpstreamExports::decode_and_admit(
+                    "upstream",
+                    None,
+                    published
+                        .values()
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value)),
+                    session,
+                )
             })
             .is_err(),
             "installed remote exports must reject nested nulls after legacy migration"
@@ -9455,7 +9471,15 @@ fn assert_published_export_null_rejected(value: serde_json::Value, error_path: &
         carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
     let result =
         carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
-            published.admit("upstream", Some(&declarations), session)
+            AdmittedUpstreamExports::decode_and_admit(
+                "upstream",
+                Some(&declarations),
+                published
+                    .values()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value)),
+                session,
+            )
         });
     assert!(
         result.is_err(),

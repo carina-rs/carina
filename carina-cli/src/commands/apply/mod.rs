@@ -36,6 +36,7 @@ use carina_core::resource::{
 #[cfg(test)]
 use carina_core::resource::{ConcreteValue, State};
 use carina_core::shutdown::ShutdownToken;
+use carina_core::upstream_exports::AdmittedRemoteBindings;
 use carina_core::value::{RenderedKey, render_value};
 use carina_state::{BackendLock, LockInfo, RowBasis, StateBackend, StateFile};
 
@@ -960,7 +961,7 @@ async fn verify_upstream_snapshot(
             binding: source.binding.clone(),
             source: source.source.clone(),
         };
-        let loaded = super::plan::load_upstream_states_with_schemas(
+        let loaded = super::plan::load_selected_upstream_states(
             wiring.runtime(),
             std::slice::from_ref(&state),
             project_dir,
@@ -968,6 +969,7 @@ async fn verify_upstream_snapshot(
             &mut cycle_guard,
             wiring.schemas(),
             super::plan::UpstreamMissingStatePolicy::Strict,
+            None,
         )
         .await
         .map_err(|error| AppError::UpstreamSnapshotChanged {
@@ -993,12 +995,9 @@ pub(crate) fn upstream_snapshot_drift(binding: &str, apply_target: ApplyTarget<'
 /// equal.
 ///
 /// Split out so it can be unit-tested without a real upstream backend.
-fn diff_upstream_snapshot<
-    S: std::borrow::Borrow<HashMap<String, Value>>,
-    C: std::borrow::Borrow<HashMap<String, Value>>,
->(
-    snapshot: &HashMap<String, S>,
-    current: &HashMap<String, C>,
+fn diff_upstream_snapshot(
+    snapshot: &HashMap<String, HashMap<String, Value>>,
+    current: &AdmittedRemoteBindings,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), String> {
     for (binding, planned_attrs) in snapshot {
@@ -1011,13 +1010,8 @@ fn diff_upstream_snapshot<
                     apply_target.replan_command()
                 ));
             }
-            Some(current_attrs) if current_attrs.borrow() != planned_attrs.borrow() => {
-                return Err(format!(
-                    "upstream_state '{}' has drifted since the plan was created. \
-                     Re-run `{}` so the apply uses the values it was computed against.",
-                    binding,
-                    apply_target.replan_command()
-                ));
+            Some(current_attrs) if &**current_attrs != planned_attrs => {
+                return Err(upstream_snapshot_drift(binding, apply_target));
             }
             Some(_) => {}
         }
@@ -1038,6 +1032,7 @@ fn diff_upstream_snapshot<
 #[cfg(test)]
 mod upstream_snapshot_tests {
     use super::*;
+    use carina_core::upstream_exports::remote_bindings_for_test;
 
     fn binding(name: &str, attrs: &[(&str, &str)]) -> (String, HashMap<String, Value>) {
         let map = attrs
@@ -1058,7 +1053,7 @@ mod upstream_snapshot_tests {
             vec![binding("network", &[("vpc_id", "vpc-A")])]
                 .into_iter()
                 .collect();
-        let current = snapshot.clone();
+        let current = remote_bindings_for_test(snapshot.clone());
         assert!(
             diff_upstream_snapshot(&snapshot, &current, ApplyTarget::Project(Path::new(".")))
                 .is_ok()
@@ -1074,10 +1069,11 @@ mod upstream_snapshot_tests {
             vec![binding("network", &[("vpc_id", "vpc-A")])]
                 .into_iter()
                 .collect();
-        let current: HashMap<String, HashMap<String, Value>> =
+        let current = remote_bindings_for_test(
             vec![binding("network", &[("vpc_id", "vpc-B")])]
                 .into_iter()
-                .collect();
+                .collect(),
+        );
         let err = diff_upstream_snapshot(&snapshot, &current, ApplyTarget::Project(Path::new(".")))
             .expect_err("must fail");
         assert!(
@@ -1093,7 +1089,7 @@ mod upstream_snapshot_tests {
             vec![binding("network", &[("vpc_id", "vpc-A")])]
                 .into_iter()
                 .collect();
-        let current: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let current = remote_bindings_for_test(HashMap::new());
         let err = diff_upstream_snapshot(&snapshot, &current, ApplyTarget::Project(Path::new(".")))
             .expect_err("must fail");
         assert!(err.contains("missing now"), "got: {err}");
@@ -1102,10 +1098,11 @@ mod upstream_snapshot_tests {
     #[test]
     fn binding_appeared_fails() {
         let snapshot: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        let current: HashMap<String, HashMap<String, Value>> =
+        let current = remote_bindings_for_test(
             vec![binding("network", &[("vpc_id", "vpc-A")])]
                 .into_iter()
-                .collect();
+                .collect(),
+        );
         let err = diff_upstream_snapshot(&snapshot, &current, ApplyTarget::Project(Path::new(".")))
             .expect_err("must fail");
         assert!(err.contains("added since"), "got: {err}");
@@ -1114,8 +1111,9 @@ mod upstream_snapshot_tests {
     #[test]
     fn empty_both_sides_passes() {
         let empty: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let current = remote_bindings_for_test(HashMap::new());
         assert!(
-            diff_upstream_snapshot(&empty, &empty, ApplyTarget::Project(Path::new("."))).is_ok()
+            diff_upstream_snapshot(&empty, &current, ApplyTarget::Project(Path::new("."))).is_ok()
         );
     }
 }

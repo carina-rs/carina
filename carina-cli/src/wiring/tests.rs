@@ -31,9 +31,9 @@ fn review_6_settlement_keeps_typed_admission_error_with_diagnostics() {
             )
             .unwrap();
             session.record_type(&unavailable, "another declaration");
-            AdmittedUpstreamExports::admit(
+            AdmittedUpstreamExports::admit_snapshot(
                 "up",
-                &declarations,
+                Some(&declarations),
                 HashMap::from([(
                     "count".into(),
                     carina_core::resource::Value::Concrete(

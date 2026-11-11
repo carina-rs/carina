@@ -2389,9 +2389,10 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
                     .collect(),
             };
             parser_bindings.insert(binding_name.to_string(), attributes.clone());
-            bindings.set_local_with_completeness(
+            bindings.set_values_with_completeness(
                 binding_name,
                 attributes,
+                crate::binding_index::BindingValueSource::Local,
                 crate::binding_index::BindingCompleteness::Incomplete,
             );
         }

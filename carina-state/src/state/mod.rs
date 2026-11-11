@@ -462,42 +462,19 @@ impl PublishedExports {
     /// through the legacy full-state path because their value encoding may
     /// require the v12-v14 migrations.
     pub fn from_state_bytes(bytes: &[u8]) -> Result<Self, BackendError> {
-        Self::decode_state_bytes(bytes).map(|(exports, _)| exports)
-    }
-
-    pub(crate) fn decode_state_bytes(
-        bytes: &[u8],
-    ) -> Result<(Self, Option<MigrationInfo>), BackendError> {
-        let (encoded, migration) = EncodedPublishedExports::decode_state_bytes(bytes)?;
-        Ok((
-            Self {
-                values: encoded.values,
-            },
-            migration,
-        ))
+        EncodedPublishedExports::from_state_bytes(bytes).map(Self::from)
     }
 
     pub fn values(&self) -> &HashMap<String, PersistedExportValue> {
         &self.values
     }
+}
 
-    /// The only remote-binding construction path selects source keys before
-    /// fallible value decoding and returns the sealed admitted form.
-    pub fn admit(
-        &self,
-        binding: &str,
-        declarations: Option<&carina_core::upstream_exports::UpstreamExportEntries>,
-        context: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
-    ) -> Result<
-        carina_core::upstream_exports::AdmittedUpstreamExports,
-        carina_core::upstream_exports::UpstreamExportAdmissionError,
-    > {
-        carina_core::upstream_exports::AdmittedUpstreamExports::decode_and_admit(
-            binding,
-            declarations,
-            self.values.iter().map(|(key, value)| (key.clone(), value)),
-            context,
-        )
+impl From<EncodedPublishedExports> for PublishedExports {
+    fn from(encoded: EncodedPublishedExports) -> Self {
+        Self {
+            values: encoded.values,
+        }
     }
 }
 
@@ -916,20 +893,15 @@ fn decode_persisted_exports(
     exports
         .into_iter()
         .map(|(name, value)| {
-            serde_json::from_value::<PersistedExportValue>(value)
+            serde_json::from_value(value)
                 .map(|value| (name.clone(), value))
-                .map_err(|error| persisted_export_decode_error(&name, error))
+                .map_err(|error| {
+                    StateFileDecodeError::Validation(format!(
+                        "persisted export {name:?} is not valid persisted JSON: {error}"
+                    ))
+                })
         })
         .collect()
-}
-
-fn persisted_export_decode_error(
-    name: &str,
-    error: impl std::fmt::Display,
-) -> StateFileDecodeError {
-    StateFileDecodeError::Validation(format!(
-        "persisted export {name:?} is not valid persisted JSON: {error}"
-    ))
 }
 
 fn map_state_file_decode_error(

@@ -1,4 +1,5 @@
 use carina_core::resource::{ConcreteValue, Value};
+use carina_core::upstream_exports::AdmittedUpstreamExports;
 use carina_state::{PublishedExports, StateFile, check_and_migrate_bytes};
 
 fn finite(value: f64) -> carina_core::FiniteF64 {
@@ -33,7 +34,15 @@ fn finite_published_exports_preserve_signed_zero_when_loading_bindings() {
             carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         let bindings =
             carina_core::validation::deferred_types::TypeCheckSession::run(&context, |session| {
-                loaded.admit("upstream", None, session)
+                AdmittedUpstreamExports::decode_and_admit(
+                    "upstream",
+                    None,
+                    loaded
+                        .values()
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value)),
+                    session,
+                )
             })
             .publish(&mut Vec::new())
             .unwrap();

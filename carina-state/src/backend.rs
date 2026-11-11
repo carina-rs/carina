@@ -828,27 +828,20 @@ pub trait StateBackend: Send + Sync {
 pub async fn read_published_exports(
     backend: &dyn StateBackend,
 ) -> BackendResult<Option<PublishedExports>> {
-    read_exports_with_decoder(backend, PublishedExports::decode_state_bytes).await
+    read_encoded_published_exports(backend)
+        .await
+        .map(|exports| exports.map(PublishedExports::from))
 }
 
 /// Read encoded exports for display without applying remote-binding semantics.
 pub async fn read_encoded_published_exports(
     backend: &dyn StateBackend,
 ) -> BackendResult<Option<EncodedPublishedExports>> {
-    read_exports_with_decoder(backend, EncodedPublishedExports::decode_state_bytes).await
-}
-
-type ExportsDecoder<T> = fn(&[u8]) -> BackendResult<(T, Option<state::MigrationInfo>)>;
-
-async fn read_exports_with_decoder<T>(
-    backend: &dyn StateBackend,
-    decode: ExportsDecoder<T>,
-) -> BackendResult<Option<T>> {
     let Some(raw_state) = backend.read_state_bytes().await? else {
         return Ok(None);
     };
-    let (exports, migration) =
-        decode(raw_state.bytes()).map_err(|error| raw_state.locate_error(error))?;
+    let (exports, migration) = EncodedPublishedExports::decode_state_bytes(raw_state.bytes())
+        .map_err(|error| raw_state.locate_error(error))?;
     if let Some(info) = migration {
         state::log_state_migration(info, &raw_state.display_location());
     }

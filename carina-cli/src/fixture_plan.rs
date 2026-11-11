@@ -21,6 +21,7 @@ use carina_core::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, StructField,
     TypeIdentity, ValidatedResourceSchema,
 };
+use carina_core::upstream_exports::AdmittedUpstreamExports;
 use carina_state::{PublishedExports, StateFile, check_and_migrate};
 
 use crate::commands::plan::compute_export_diffs;
@@ -526,31 +527,37 @@ where
         let state_path = dir
             .join(carina_state::LocalBackend::DEFAULT_STATE_FILE)
             .unwrap();
-        let bindings = state_path
+        let exports = state_path
             .read()
             .ok()
-            .and_then(|bytes| PublishedExports::from_state_bytes(&bytes).ok())
-            .and_then(|exports| {
-                carina_core::validation::deferred_types::with_session_for_test(
-                    &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
-                    |session| exports.admit(us.binding.as_str(), None, session),
-                )
-                .ok()
-            })
-            .unwrap_or_else(|| {
-                carina_core::validation::deferred_types::with_session_for_test(
-                    &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
-                    |session| {
-                        carina_core::upstream_exports::AdmittedUpstreamExports::admit_snapshot(
-                            us.binding.as_str(),
-                            None,
-                            HashMap::new(),
-                            session,
-                        )
-                    },
-                )
-                .expect("empty fixture snapshot passes admission")
-            });
+            .and_then(|bytes| PublishedExports::from_state_bytes(&bytes).ok());
+        let bindings = carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
+            |session| {
+                let admitted = match exports {
+                    Some(exports) => AdmittedUpstreamExports::decode_and_admit(
+                        us.binding.as_str(),
+                        None,
+                        exports
+                            .values()
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value)),
+                        session,
+                    )
+                    .ok(),
+                    None => None,
+                };
+                admitted.unwrap_or_else(|| {
+                    AdmittedUpstreamExports::admit_snapshot(
+                        us.binding.as_str(),
+                        None,
+                        HashMap::new(),
+                        session,
+                    )
+                    .expect("empty fixture snapshot passes admission")
+                })
+            },
+        );
         remote_bindings.insert(us.binding.to_string(), bindings);
     }
     let resolved_provider_configs = carina_core::validation::deferred_types::with_session_for_test(

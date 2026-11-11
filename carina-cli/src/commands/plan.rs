@@ -6630,7 +6630,7 @@ pub(crate) async fn load_and_resolve_provider_configs<E>(
                 let mut cycle_guard = seed_cycle_guard(base_dir);
                 let remote_bindings = match scope {
                     ProviderUpstreamScope::All => {
-                        load_upstream_states_with_schemas(
+                        load_selected_upstream_states(
                             runtime,
                             &parsed.upstream_states,
                             base_dir,
@@ -6638,6 +6638,7 @@ pub(crate) async fn load_and_resolve_provider_configs<E>(
                             &mut cycle_guard,
                             schemas,
                             policy,
+                            None,
                         )
                         .await?
                     }
@@ -6989,30 +6990,7 @@ fn resolve_upstream_source(
 /// errors remain hard errors regardless — they indicate structural
 /// problems the user must fix before plan output can mean anything.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn load_upstream_states_with_schemas<B: carina_core::resource::BindingAddress>(
-    runtime: &crate::runtime::CommandRuntime,
-    upstream_states: &[UpstreamState<B>],
-    base_dir: &ResolvedPath,
-    provider_context: &ProviderContext,
-    cycle_guard: &mut HashSet<CanonicalPath>,
-    schemas: &carina_core::schema::SchemaRegistry,
-    policy: UpstreamMissingStatePolicy,
-) -> Result<AdmittedRemoteBindings, AppError> {
-    load_selected_upstream_states(
-        runtime,
-        upstream_states,
-        base_dir,
-        provider_context,
-        cycle_guard,
-        schemas,
-        policy,
-        None,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn load_selected_upstream_states<B: carina_core::resource::BindingAddress>(
+pub(crate) async fn load_selected_upstream_states<B: carina_core::resource::BindingAddress>(
     runtime: &crate::runtime::CommandRuntime,
     upstream_states: &[UpstreamState<B>],
     base_dir: &ResolvedPath,
@@ -7173,7 +7151,7 @@ pub(crate) fn admit_saved_upstream_snapshot(
             message: drift(),
             error: Box::new(error),
         })?;
-        if exports.len() != values.len() || values.keys().any(|key| !exports.contains_key(key)) {
+        if exports.len() != values.len() {
             return Err(AppError::Config(drift()));
         }
         admitted.insert(binding, exports);
@@ -7190,7 +7168,7 @@ pub(crate) async fn load_upstream_states<B: carina_core::resource::BindingAddres
     cycle_guard: &mut HashSet<CanonicalPath>,
     policy: UpstreamMissingStatePolicy,
 ) -> Result<AdmittedRemoteBindings, AppError> {
-    load_upstream_states_with_schemas(
+    load_selected_upstream_states(
         runtime,
         upstream_states,
         base_dir,
@@ -7198,6 +7176,7 @@ pub(crate) async fn load_upstream_states<B: carina_core::resource::BindingAddres
         cycle_guard,
         &carina_core::schema::SchemaRegistry::new(),
         policy,
+        None,
     )
     .await
 }
@@ -7416,7 +7395,7 @@ mod load_upstream_states_tests {
             source: dir.path().to_path_buf(),
         }];
         let base = ResolvedPath::new(dir.path().parent().unwrap()).unwrap();
-        let first = load_upstream_states_with_schemas(
+        let first = load_selected_upstream_states(
             &runtime,
             &sources,
             &base,
@@ -7424,6 +7403,7 @@ mod load_upstream_states_tests {
             &mut HashSet::new(),
             &schemas,
             UpstreamMissingStatePolicy::Strict,
+            None,
         )
         .await
         .unwrap();
@@ -7433,7 +7413,7 @@ mod load_upstream_states_tests {
         );
         fs::write(dir.path().join("exports.crn"), "not valid source syntax").unwrap();
         write_state(dir.path(), &[("count", serde_json::json!(43))]);
-        let fresh_state = load_upstream_states_with_schemas(
+        let fresh_state = load_selected_upstream_states(
             &runtime,
             &sources,
             &base,
@@ -7441,6 +7421,7 @@ mod load_upstream_states_tests {
             &mut HashSet::new(),
             &schemas,
             UpstreamMissingStatePolicy::Strict,
+            None,
         )
         .await
         .expect("one command must reuse its captured source metadata");
@@ -7449,14 +7430,15 @@ mod load_upstream_states_tests {
             Value::Concrete(ConcreteValue::Int(43))
         );
         assert!(
-            load_upstream_states_with_schemas(
+            load_selected_upstream_states(
                 &crate::test_support::TestCommandRuntime::new(),
                 &sources,
                 &base,
                 &context,
                 &mut HashSet::new(),
                 &schemas,
-                UpstreamMissingStatePolicy::Strict
+                UpstreamMissingStatePolicy::Strict,
+                None,
             )
             .await
             .is_err(),
@@ -7583,7 +7565,7 @@ mod load_upstream_states_tests {
         }];
         let base = ResolvedPath::new(dir.path().parent().unwrap()).unwrap();
         write_state(dir.path(), &[("claim", value("repo"))]);
-        let valid = load_upstream_states_with_schemas(
+        let valid = load_selected_upstream_states(
             &runtime,
             &source,
             &base,
@@ -7591,12 +7573,13 @@ mod load_upstream_states_tests {
             &mut HashSet::new(),
             wiring.schemas(),
             UpstreamMissingStatePolicy::Strict,
+            None,
         )
         .await
         .unwrap();
         assert!(valid["orgs"].contains_key("claim"));
         write_state(dir.path(), &[("claim", value("retired"))]);
-        let error = load_upstream_states_with_schemas(
+        let error = load_selected_upstream_states(
             &runtime,
             &source,
             &base,
@@ -7604,6 +7587,7 @@ mod load_upstream_states_tests {
             &mut HashSet::new(),
             wiring.schemas(),
             UpstreamMissingStatePolicy::Strict,
+            None,
         )
         .await
         .unwrap_err();
@@ -8048,7 +8032,6 @@ mod load_upstream_states_tests {
             "exports { count: Int = seed }\n",
         )
         .unwrap();
-        let mut installed = Vec::new();
         for (name, policy) in [
             ("Strict", UpstreamMissingStatePolicy::Strict),
             ("Lenient", UpstreamMissingStatePolicy::Lenient),
@@ -8060,15 +8043,12 @@ mod load_upstream_states_tests {
                 bindings["orgs"]["count"],
                 Value::Concrete(ConcreteValue::Int(42))
             );
-            if bindings["orgs"].contains_key("retired") {
-                installed.push(format!("{name} installed {:?}", bindings["orgs"]));
-            }
+            assert!(
+                !bindings["orgs"].contains_key("retired"),
+                "stale undeclared upstream export 'orgs.retired' must be omitted without error; {name} installed {:?}",
+                bindings["orgs"],
+            );
         }
-        assert!(
-            installed.is_empty(),
-            "stale undeclared upstream export 'orgs.retired' must be omitted without error; {}",
-            installed.join("; "),
-        );
     }
 
     #[tokio::test]
@@ -8181,29 +8161,23 @@ mod load_upstream_states_tests {
         }
 
         write_state(dir.path(), &[(key, invalid)]);
-        let mut accepted = Vec::new();
         for (name, policy) in [
             ("Strict", UpstreamMissingStatePolicy::Strict),
             ("Lenient", UpstreamMissingStatePolicy::Lenient),
         ] {
-            match load_upstream_admission_fixture(dir.path(), policy).await {
-                Ok(bindings) => accepted.push(format!("{name} installed {bindings:?}")),
-                Err(error) => {
-                    let message = error.to_string();
-                    for fragment in std::iter::once("orgs").chain(error_path.iter().copied()) {
-                        assert!(
-                            message.contains(fragment),
-                            "{name} must name the upstream binding and export path {error_path:?}: {message}",
-                        );
-                    }
-                }
+            let error = load_upstream_admission_fixture(dir.path(), policy)
+                .await
+                .expect_err(
+                    "present invalid upstream export must fail before remote binding installation",
+                );
+            let message = error.to_string();
+            for fragment in std::iter::once("orgs").chain(error_path.iter().copied()) {
+                assert!(
+                    message.contains(fragment),
+                    "{name} must name the upstream binding and export path {error_path:?}: {message}",
+                );
             }
         }
-        assert!(
-            accepted.is_empty(),
-            "present invalid upstream export 'orgs.{key}' must be a hard error before remote binding installation; {}",
-            accepted.join("; "),
-        );
     }
 
     #[tokio::test]

@@ -1,7 +1,6 @@
 //! Admission of persisted exports to the source's consumer-visible contract.
 
 use crate::value::{PersistedExportValue, PersistedValueDecodeError};
-use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -67,16 +66,6 @@ pub enum UpstreamExportAdmissionError {
 }
 
 impl AdmittedUpstreamExports {
-    /// Re-admit an already-decoded saved snapshot against a known source surface.
-    pub fn admit(
-        binding: &str,
-        declarations: &UpstreamExportEntries,
-        values: HashMap<String, Value>,
-        context: &dyn ProviderTypeCheckContext,
-    ) -> Result<Self, UpstreamExportAdmissionError> {
-        Self::admit_snapshot(binding, Some(declarations), values, context)
-    }
-
     /// An unavailable source surface intentionally installs all supplied keys
     /// without source-type checking. Consumers still check the actual values.
     pub fn admit_snapshot(
@@ -168,12 +157,6 @@ impl AdmittedUpstreamExports {
     }
 }
 
-impl Borrow<HashMap<String, Value>> for AdmittedUpstreamExports {
-    fn borrow(&self) -> &HashMap<String, Value> {
-        &self.values
-    }
-}
-
 impl Deref for AdmittedUpstreamExports {
     type Target = HashMap<String, Value>;
 
@@ -182,76 +165,23 @@ impl Deref for AdmittedUpstreamExports {
     }
 }
 
-/// Admit hand-built resolver fixtures against synthetic source declarations.
+/// Install hand-built resolver fixtures without source-type checking.
 /// This adapter does not read source directories or provider metadata.
 #[cfg(any(test, feature = "test-utils"))]
 pub fn remote_bindings_for_test(
     bindings: HashMap<String, HashMap<String, Value>>,
 ) -> AdmittedRemoteBindings {
-    use crate::parser::{ProviderContext, TypeExpr};
-    use crate::static_type::{ConsumerExportStaticType, ConsumerResolvedType, StaticType};
-    use crate::validation::inference::{RuntimeTypeInput, infer_runtime_type};
-
-    fn fixture_type(value: &Value, context: &ProviderContext) -> TypeExpr {
-        match value {
-            Value::Concrete(crate::resource::ConcreteValue::Map(fields)) => TypeExpr::Struct {
-                fields: fields
-                    .iter()
-                    .map(|(key, value)| (key.clone(), fixture_type(value, context)))
-                    .collect(),
-            },
-            Value::Concrete(crate::resource::ConcreteValue::List(items)) => {
-                let members = items
-                    .iter()
-                    .map(|value| fixture_type(value, context))
-                    .collect::<Vec<_>>();
-                TypeExpr::List(Box::new(match members.len() {
-                    0 => TypeExpr::String,
-                    1 => members.into_iter().next().unwrap(),
-                    _ => TypeExpr::Union(members),
-                }))
-            }
-            _ => {
-                let state = crate::resource::State::existing(
-                    crate::resource::ResourceId::with_identity("test.fixture", "exports"),
-                    HashMap::from([("value".into(), value.clone())]),
-                );
-                infer_runtime_type(
-                    RuntimeTypeInput::state_attribute(&state, "value").unwrap(),
-                    &Default::default(),
-                    &crate::schema::SchemaRegistry::new(),
-                    context,
-                )
-                .expect("remote fixture has a runtime type")
-            }
-        }
-    }
+    use crate::parser::ProviderContext;
 
     let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     bindings
         .into_iter()
         .map(|(name, values)| {
-            let declarations = values
-                .iter()
-                .map(|(key, value)| {
-                    (
-                        key.clone(),
-                        super::UpstreamExportEntry {
-                            static_type: UpstreamExportType::Static(
-                                ConsumerExportStaticType::Declared(StaticType::Known(
-                                    ConsumerResolvedType::new(fixture_type(value, &context)),
-                                )),
-                            ),
-                            value: None,
-                        },
-                    )
-                })
-                .collect();
             let admitted =
                 crate::validation::deferred_types::with_session_for_test(&context, |session| {
-                    AdmittedUpstreamExports::admit(&name, &declarations, values, session)
+                    AdmittedUpstreamExports::admit_snapshot(&name, None, values, session)
                 })
-                .expect("remote fixture passes its synthetic export declaration");
+                .expect("remote fixture values are fully resolved");
             (name, admitted)
         })
         .collect()
@@ -280,9 +210,9 @@ mod tests {
             },
         )]);
         let error = crate::validation::deferred_types::with_session_for_test(&context, |session| {
-            AdmittedUpstreamExports::admit(
+            AdmittedUpstreamExports::admit_snapshot(
                 "up",
-                &declarations,
+                Some(&declarations),
                 HashMap::from([(
                     "broken".into(),
                     Value::root_resource_ref("waiting", "id", vec![]),
@@ -327,9 +257,9 @@ mod tests {
         )]);
         let checks =
             crate::validation::deferred_types::TypeCheckSession::run(&context, |session| {
-                AdmittedUpstreamExports::admit(
+                AdmittedUpstreamExports::admit_snapshot(
                     "orgs",
-                    &declarations,
+                    Some(&declarations),
                     HashMap::from([("number".into(), Value::Concrete(ConcreteValue::Int(73)))]),
                     session,
                 )
@@ -439,9 +369,9 @@ mod tests {
         )]);
         let checks =
             crate::validation::deferred_types::TypeCheckSession::run(&context, |session| {
-                AdmittedUpstreamExports::admit(
+                AdmittedUpstreamExports::admit_snapshot(
                     "orgs",
-                    &declarations,
+                    Some(&declarations),
                     HashMap::from([(
                         "id".into(),
                         Value::Concrete(ConcreteValue::String("id-123".into())),

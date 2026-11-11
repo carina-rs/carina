@@ -3188,15 +3188,6 @@ impl ResolvedBindings {
         self.set_values_with_completeness(name, attrs, source, completeness);
     }
 
-    pub(crate) fn set_local_with_completeness(
-        &mut self,
-        name: &str,
-        attrs: HashMap<String, Value>,
-        completeness: BindingCompleteness,
-    ) {
-        self.set_values_with_completeness(name, attrs, BindingValueSource::Local, completeness);
-    }
-
     pub(crate) fn install_upstream(
         &mut self,
         remote_bindings: &crate::upstream_exports::AdmittedRemoteBindings,
@@ -3211,7 +3202,7 @@ impl ResolvedBindings {
         }
     }
 
-    fn set_values_with_completeness(
+    pub(crate) fn set_values_with_completeness(
         &mut self,
         name: &str,
         attrs: HashMap<String, Value>,

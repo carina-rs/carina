@@ -392,7 +392,7 @@ pub fn discover_upstream_exports<B: BindingAddress>(
     .unwrap_or_default()
 }
 
-pub fn resolve_upstream_exports_with_context<B: BindingAddress>(
+fn resolve_upstream_exports_with_context<B: BindingAddress>(
     base_dir: &ResolvedPath,
     upstream_states: &[UpstreamState<B>],
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
