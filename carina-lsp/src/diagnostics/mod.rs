@@ -38,13 +38,40 @@ fn authored_validation_resources<'t, 'a>(
     carina_core::parser::AuthoredResourceInstanceKey<'a>,
     &'t carina_core::parser::AnalysisResourceRef<'a>,
 > {
-    #[cfg(test)]
-    if tests::seam_round2::fault() == tests::seam_round2::Fault::NoKeys {
-        return HashMap::new();
-    }
     tree.project_resources()
         .filter_map(|resource| resource.authored_instance_key().map(|key| (key, resource)))
         .collect()
+}
+
+fn select_admission_inputs<'r, 'a>(
+    resource: &'r carina_core::parser::AnalysisResourceRef<'a>,
+    authored_resources: Option<
+        &HashMap<
+            carina_core::parser::AuthoredResourceInstanceKey<'a>,
+            &'r carina_core::parser::AnalysisResourceRef<'a>,
+        >,
+    >,
+    values: &HashMap<String, Value>,
+    report: &carina_core::parser::retained::ExpressionReport,
+) -> (
+    &'r carina_core::parser::AnalysisResourceRef<'a>,
+    carina_core::validation::admission::attributes::ResourceAttributeInputs<RelativeBindingName>,
+) {
+    use carina_core::validation::admission::attributes::ResourceAttributeInputs;
+    let authored = resource
+        .authored_instance_key()
+        .and_then(|key| authored_resources?.get(&key).copied());
+    match authored.and_then(|resource| {
+        ResourceAttributeInputs::from_resolved(resource, values, report)
+            .ok()
+            .map(|inputs| (resource, inputs))
+    }) {
+        Some(authored) => authored,
+        None => (
+            resource,
+            ResourceAttributeInputs::from_report(resource, values, report),
+        ),
+    }
 }
 
 type ExpandedAnalysis<'a> = carina_core::parser::AnalysisTree<
@@ -1525,13 +1552,6 @@ impl DiagnosticRun<'_> {
                 pre_expansion_configuration.judged().file(),
             )
             .ok();
-            #[cfg(test)]
-            let authored_tree = if tests::seam_round2::fault() == tests::seam_round2::Fault::NoTree
-            {
-                None
-            } else {
-                authored_tree
-            };
             let authored_resources = authored_tree.as_ref().map(authored_validation_resources);
             // The document AST intentionally preserves function calls for
             // source-oriented checks. Build a parallel, same-order view with
@@ -1662,16 +1682,12 @@ impl DiagnosticRun<'_> {
                         .as_ref()
                         .map(carina_core::resource::attrs_to_hashmap)
                         .unwrap_or_else(|| rref.resolved_attributes());
-                    let authored_resource = rref
-                        .authored_instance_key()
-                        .and_then(|key| authored_resources.as_ref()?.get(&key).copied());
-                    let (admission_resource, inputs) = match authored_resource.and_then(|resource| {
-                        carina_core::validation::admission::attributes::ResourceAttributeInputs::from_resolved(resource, &resolved_attrs, expression_report)
-                            .ok().map(|inputs| (resource, inputs))
-                    }) {
-                        Some(authored) => authored,
-                        None => (rref, carina_core::validation::admission::attributes::ResourceAttributeInputs::from_report(rref, &resolved_attrs, expression_report)),
-                    };
+                    let (admission_resource, inputs) = select_admission_inputs(
+                        rref,
+                        authored_resources.as_ref(),
+                        &resolved_attrs,
+                        expression_report,
+                    );
                     let knowledge_context =
                         carina_core::resource::knowledge::KnowledgeContext::validation();
                     let mut classification_error =

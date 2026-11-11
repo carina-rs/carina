@@ -481,8 +481,7 @@ fn needs_local_without_pending_sites_remains_pending() {
                     session,
                 );
                 let local_check = |_: &CompiledAttributeType,
-                                   _: crate::schema::value_validation::CheckValue<
-                    '_,
+                                   _: &crate::resource::Value<
                     crate::resource::NoPlaceholder,
                     AbsoluteBindingAddress,
                 >,
@@ -499,7 +498,7 @@ fn needs_local_without_pending_sites_remains_pending() {
                         ..Default::default()
                     })
                 };
-                context.assignment = Some(&local_check);
+                context.assignment.ordinary = Some(&local_check);
                 assert!(context.sites().is_empty());
                 assert!(matches!(
                     assignment::judge_with_findings(destination, &candidate, &context)
@@ -2931,4 +2930,205 @@ fn round2_plain_reference_skips_expression_callback() {
     .unwrap();
     let actual = serde_json::json!(actual);
     assert_eq!(actual, expected["plain_reference"]);
+}
+
+#[derive(Debug)]
+struct Round3HookVisit {
+    edge: crate::parser::retained::EdgeRole,
+    discarded: bool,
+    covered: bool,
+    selection: bool,
+}
+
+fn round3_admission_hook(source: &str, declaration: AttributeType) -> Vec<Round3HookVisit> {
+    use crate::parser::retained::{AuthoredCursor, CursorKind};
+    use crate::resource::{ParserPlaceholder, RelativeBindingName};
+    use crate::schema::value_validation::CheckValue;
+
+    let catalog = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Source")
+            .attribute(AttributeSchema::optional("output", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(AttributeSchema::optional("input", declaration).build())
+            .validate()
+            .unwrap(),
+    );
+    let parsed =
+        crate::parser::parse_file(source, std::path::Path::new("round3-hook.crn"), &catalog)
+            .unwrap();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let judged = configuration.judged();
+    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let resource = tree
+        .resources()
+        .find(|resource| resource.id().resource_type == "Sink")
+        .unwrap();
+    let slot = resource.authored_slot("input").unwrap();
+    let proof = slot
+        .projection()
+        .unwrap()
+        .knowledge(&KnowledgeContext::validation())
+        .unwrap()
+        .into_classification();
+    let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+    let destination = schemas
+        .resource_attribute_destination(resource.id(), "input", &catalog)
+        .unwrap();
+    let visits = std::cell::RefCell::new(Vec::new());
+    let seen = std::cell::RefCell::new(std::collections::HashSet::new());
+    with_session_for_test(&catalog, |session| {
+        let hook = |_: &crate::schema::CompiledAttributeType,
+                    value: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                    _: &crate::schema::LeafPath,
+                    cursor: AuthoredCursor<'_>| {
+            let selection = cursor.is_selection();
+            let (usage, covered) = match cursor.kind {
+                CursorKind::Authored(usage) => (usage, false),
+                CursorKind::CoveredBy(usage) => (usage, true),
+                CursorKind::Projected(_) => panic!("authored slot lost its cursor"),
+            };
+            let discarded = matches!(value, CheckValue::Discarded);
+            assert!(
+                seen.borrow_mut().insert((
+                    usage.node().node_id(),
+                    usage.occurrence(),
+                    discarded,
+                    selection,
+                )),
+                "hook called twice for one authored position"
+            );
+            visits.borrow_mut().push(Round3HookVisit {
+                edge: usage.edge(),
+                discarded,
+                covered,
+                selection,
+            });
+            Ok(Default::default())
+        };
+        let ordinary = |_: &crate::schema::CompiledAttributeType,
+                        value: &crate::resource::Value<ParserPlaceholder, RelativeBindingName>,
+                        _: &crate::schema::LeafPath,
+                        cursor: AuthoredCursor<'_>| {
+            assert!(matches!(
+                assignment::CandidateOrigin::of(value),
+                assignment::CandidateOrigin::Expression
+            ));
+            assert!(!cursor.is_selection());
+            let (node, usage, _, _) = cursor.identity().unwrap();
+            assert!(
+                seen.borrow().contains(&(node, usage, false, false)),
+                "the authored hook must precede ordinary checks"
+            );
+            Ok(Default::default())
+        };
+        let untyped = Vec::new;
+        let (candidate, context) =
+            Candidate::validation_slot(slot, proof, Some(&bindings), session).unwrap();
+        let context = context.with_checks(
+            AssignmentChecks {
+                authored: Some(&hook),
+                ordinary: Some(&ordinary),
+            },
+            &untyped,
+        );
+        let result = admit(&destination, candidate, &context);
+        assert!(result.is_ok(), "main accepts this no-as input: {result:?}");
+    });
+    visits.into_inner()
+}
+
+#[test]
+fn round3_admission_hook_receives_authored_literals_in_containers() {
+    use crate::parser::retained::EdgeRole;
+    for (expression, declaration, edge) in [
+        ("'value'", AttributeType::string(), EdgeRole::SlotRoot),
+        (
+            "['value']",
+            AttributeType::list(AttributeType::string()),
+            EdgeRole::ListItem,
+        ),
+        (
+            "{ key = 'value' }",
+            AttributeType::map(AttributeType::string()),
+            EdgeRole::MapValue,
+        ),
+        (
+            "{ field = 'value' }",
+            AttributeType::struct_(
+                "Entry",
+                vec![StructField::required("field", AttributeType::string()).build()],
+            ),
+            EdgeRole::StructField,
+        ),
+    ] {
+        let visits = round3_admission_hook(
+            &format!("mock.Sink {{ input = {expression} }}"),
+            declaration,
+        );
+        assert!(
+            visits.iter().any(|visit| visit.edge == edge
+                && !visit.covered
+                && !visit.discarded
+                && !visit.selection),
+            "{visits:?}"
+        );
+    }
+}
+
+#[test]
+fn round3_admission_hook_receives_reference_origins() {
+    let visits = round3_admission_hook(
+        "let source = mock.Source {}\nmock.Sink { input = source.output }",
+        AttributeType::string(),
+    );
+    assert_eq!(visits.len(), 1, "{visits:?}");
+    assert_eq!(visits[0].edge, crate::parser::retained::EdgeRole::SlotRoot);
+    assert!(!visits[0].covered);
+}
+
+fn round3_assert_alternatives(expression: &str, edge: crate::parser::retained::EdgeRole) {
+    let visits = round3_admission_hook(
+        &format!("mock.Sink {{ input = {expression} }}"),
+        AttributeType::string(),
+    );
+    assert!(visits.iter().any(|visit| visit.selection), "{visits:?}");
+    for discarded in [false, true] {
+        assert!(
+            visits
+                .iter()
+                .any(|visit| visit.edge == edge && visit.discarded == discarded && !visit.covered),
+            "{visits:?}"
+        );
+    }
+}
+
+#[test]
+fn round3_admission_hook_receives_discarded_if_alternative() {
+    round3_assert_alternatives(
+        "if true { 'live' } else { 'dead' }",
+        crate::parser::retained::EdgeRole::IfBranch,
+    );
+}
+
+#[test]
+fn round3_admission_hook_receives_discarded_coalesce_alternative() {
+    round3_assert_alternatives(
+        "'live' ?? 'dead'",
+        crate::parser::retained::EdgeRole::CoalesceOperand,
+    );
+}
+
+#[test]
+fn round3_admission_hook_receives_covered_positions() {
+    let visits = round3_admission_hook("mock.Sink { input = 1 + 2 }", AttributeType::int());
+    assert!(visits.iter().any(|visit| visit.covered), "{visits:?}");
 }

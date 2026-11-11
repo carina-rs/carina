@@ -1,25 +1,13 @@
 use super::*;
-use std::cell::Cell;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Fault {
-    None,
-    NoTree,
-    NoKeys,
-}
-thread_local! { static FAULT: Cell<Fault> = const { Cell::new(Fault::None) }; }
-pub(crate) fn fault() -> Fault {
-    FAULT.get()
-}
-struct Reset;
-impl Drop for Reset {
-    fn drop(&mut self) {
-        FAULT.set(Fault::None);
-    }
-}
-
-fn check(name: &str, fault: Fault) {
+fn check_report_selection(with_empty_map: bool) {
+    use carina_core::resource::knowledge::KnowledgeContext;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use carina_core::validation::admission::attributes::{
+        ResourceAttributeInputs, resource_attribute_admissions,
+    };
+
+    let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
@@ -28,27 +16,74 @@ fn check(name: &str, fault: Fault) {
             .validate()
             .unwrap(),
     );
-    let engine = custom_engine(schemas);
-    let doc = create_document(if name == "no_keys_valid" {
-        "provider mock {}\nmock.Test { input = 1 }\n"
-    } else {
-        "provider mock {}\nmock.Test { input = 'bad' }\n"
-    });
-    FAULT.set(fault);
-    let _reset = Reset;
-    let actual = serde_json::to_value(engine.analyze(&doc, None)).unwrap();
-    let expected: serde_json::Value =
-        serde_json::from_str(include_str!("seam_round2_main.json")).unwrap();
-    assert_eq!(actual, expected[name], "{name}");
+    let parsed = carina_core::parser::parse_file(
+        "mock.Test { input = 'bad' }",
+        std::path::Path::new("test.crn"),
+        &config,
+    )
+    .unwrap();
+    let configuration =
+        carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &config);
+    let judged = configuration.judged();
+    let tree = carina_core::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let resource = tree.resources().next().unwrap();
+    let empty = HashMap::new();
+    let values = resource.resolved_attributes();
+    let (selected, inputs) = select_admission_inputs(
+        resource,
+        with_empty_map.then_some(&empty),
+        &values,
+        judged.report(),
+    );
+    assert!(std::ptr::eq(selected, resource));
+    let bindings =
+        carina_core::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &config);
+    let admit = |inputs: &ResourceAttributeInputs<_>| {
+        let classified = inputs.classify(&KnowledgeContext::validation(), |_, error| {
+            panic!("{error}")
+        });
+        let mut coverage = Default::default();
+        let errors =
+            carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
+                let report = resource_attribute_admissions(
+                    selected,
+                    judged.file(),
+                    selected.schema(&schemas).unwrap(),
+                    &classified,
+                    selected.quoted_string_attrs(),
+                    inputs,
+                    &bindings,
+                    session,
+                    &schemas,
+                    &mut coverage,
+                );
+                report
+                    .errors()
+                    .chain(report.symbolic_errors().map(|(_, _, error)| error))
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            });
+        (errors, coverage)
+    };
+    let (errors, coverage) = admit(&inputs);
+    let (expected, _) = admit(&ResourceAttributeInputs::from_report(
+        resource,
+        &values,
+        judged.report(),
+    ));
+    assert_eq!(errors, expected);
+    assert_eq!(errors.len(), 1);
+    assert!(coverage.is_empty(), "fallback must use report evidence");
 }
 
 #[test]
-fn round2_lsp_missing_authored_tree_keeps_main_schema_diagnostics() {
-    check("no_tree", Fault::NoTree);
+fn round3_lsp_absent_authored_map_selects_report_inputs() {
+    check_report_selection(false);
 }
+
 #[test]
-fn round2_lsp_missing_instance_key_keeps_main_schema_diagnostics() {
-    check("no_keys", Fault::NoKeys);
+fn round3_lsp_empty_authored_map_selects_report_inputs() {
+    check_report_selection(true);
 }
 
 #[test]
@@ -132,9 +167,4 @@ fn round2_lsp_missing_expanded_report_selects_main_fallback() {
         serde_json::from_str(include_str!("seam_round2_main.json")).unwrap();
     let actual = serde_json::json!(actual);
     assert_eq!(actual, expected["no_expanded_report"]);
-}
-
-#[test]
-fn round2_lsp_missing_key_does_not_reject_main_accepted_input() {
-    check("no_keys_valid", Fault::NoKeys);
 }

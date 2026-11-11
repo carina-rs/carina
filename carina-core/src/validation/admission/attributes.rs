@@ -483,12 +483,9 @@ fn admit_validation_attributes_with_input<
         };
         let assignment = destination.contract.as_deref().map(|contract| {
             move |attr: &CompiledAttributeType,
-                  value: crate::schema::value_validation::CheckValue<'_, P, B>,
+                  value: &Value<P, B>,
                   path: &LeafPath,
                   cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
-                let crate::schema::value_validation::CheckValue::Current(value) = value else {
-                    return Ok(Default::default());
-                };
                 match check {
                     Some(check) => check(
                         name,
@@ -534,7 +531,13 @@ fn admit_validation_attributes_with_input<
             })
             .collect()
         };
-        let boundary = boundary.with_checks(assignment.as_ref().map(|check| check as &_), &untyped);
+        let boundary = boundary.with_checks(
+            super::AssignmentChecks {
+                authored: None,
+                ordinary: assignment.as_ref().map(|check| check as &_),
+            },
+            &untyped,
+        );
         let findings = admission_findings(&mut admit(destination, candidate, &boundary));
         if let ValidationInput::Authored { coverage, .. } = &input {
             coverage.borrow_mut().extend(boundary.coverage.take());

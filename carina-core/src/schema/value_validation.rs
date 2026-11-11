@@ -944,7 +944,7 @@ pub(crate) struct AssignmentFindings {
     pub(crate) errors: Vec<(LeafPath, TypeError)>,
 }
 impl AssignmentFindings {
-    fn extend(&mut self, other: Self) {
+    pub(crate) fn extend(&mut self, other: Self) {
         self.local.extend(other.local);
         self.schema.extend(other.schema);
         self.errors.extend(other.errors);

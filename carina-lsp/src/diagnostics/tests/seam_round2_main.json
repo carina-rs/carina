@@ -1,39 +1,9 @@
 {
-  "no_tree": [
-    {
-      "message": "Type mismatch: expected Int, got string 'bad'.",
-      "range": {
-        "end": {
-          "character": 17,
-          "line": 1
-        },
-        "start": {
-          "character": 12,
-          "line": 1
-        }
-      },
-      "severity": 2,
-      "source": "carina"
-    }
-  ],
-  "no_keys": [
-    {
-      "message": "Type mismatch: expected Int, got string 'bad'.",
-      "range": {
-        "end": {
-          "character": 17,
-          "line": 1
-        },
-        "start": {
-          "character": 12,
-          "line": 1
-        }
-      },
-      "severity": 2,
-      "source": "carina"
-    }
-  ],
-  "no_keys_valid": [],
+  "_provenance": {
+    "revision": "ea66ae7a157bd6e28f374f80286a29eb8d77a557",
+    "no_expanded_report": "Recorded on main with the same expanded-resource id replacement, so the per-resource report is absent. Main returns None for all four expressions. The NoTree/NoKeys fault cases and their derived healthy-input goldens were removed in round 3.",
+    "source": "merge-base ea66ae7a (the local origin/main used for the recordings)"
+  },
   "no_expanded_report": [
     null,
     null,

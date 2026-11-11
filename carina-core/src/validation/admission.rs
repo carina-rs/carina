@@ -376,6 +376,30 @@ enum AdmissionProof<'a, P: PlaceholderKind, B: BindingAddress> {
     Apply(KnownValue<'a, P, B>),
 }
 
+/// Main's ordinary assignment work requires a current, expression-origin value.
+/// Authored policy instead uses AssignmentCheck, including discarded positions.
+type OrdinaryAssignmentCheck<'a, P, B> =
+    &'a dyn Fn(
+        &CompiledAttributeType,
+        &Value<P, B>,
+        &LeafPath,
+        crate::parser::retained::AuthoredCursor<'_, B>,
+    ) -> Result<crate::schema::value_validation::AssignmentFindings, TypeError>;
+
+struct AssignmentChecks<'a, P: PlaceholderKind, B: BindingAddress> {
+    authored: Option<crate::schema::value_validation::AssignmentCheck<'a, P, B>>,
+    ordinary: Option<OrdinaryAssignmentCheck<'a, P, B>>,
+}
+
+impl<P: PlaceholderKind, B: BindingAddress> Default for AssignmentChecks<'_, P, B> {
+    fn default() -> Self {
+        Self {
+            authored: None,
+            ordinary: None,
+        }
+    }
+}
+
 pub struct AdmissionContext<
     'a,
     P: PlaceholderKind = NoPlaceholder,
@@ -385,7 +409,7 @@ pub struct AdmissionContext<
     proof: AdmissionProof<'a, P, B>,
     bindings: Option<&'a BindingIndex<'a, B>>,
     provider: &'a dyn ProviderTypeCheckContext,
-    assignment: Option<crate::schema::value_validation::AssignmentCheck<'a, P, B>>,
+    assignment: AssignmentChecks<'a, P, B>,
     cursor: crate::parser::retained::AuthoredCursor<'a, B>,
     coverage: std::cell::RefCell<crate::schema::value_validation::WalkCoverage>,
     untyped: Option<&'a dyn Fn() -> Vec<TypeError>>,
@@ -482,7 +506,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
             proof: AdmissionProof::Apply(proof.clone()),
             bindings: None,
             provider,
-            assignment: None,
+            assignment: Default::default(),
             cursor: crate::parser::retained::AuthoredCursor::projected(phase),
             coverage: Default::default(),
             untyped: None,
@@ -520,7 +544,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
                 proof,
                 bindings,
                 provider,
-                assignment: None,
+                assignment: Default::default(),
                 cursor,
                 coverage: Default::default(),
                 untyped: None,
@@ -575,7 +599,7 @@ impl<B: BindingAddress> Candidate<crate::resource::ParserPlaceholder, B> {
 impl<'a, P: PlaceholderKind, B: BindingAddress> AdmissionContext<'a, P, B> {
     fn with_checks<'s>(
         self,
-        assignment: Option<crate::schema::value_validation::AssignmentCheck<'s, P, B>>,
+        assignment: AssignmentChecks<'s, P, B>,
         untyped: &'s dyn Fn() -> Vec<TypeError>,
     ) -> AdmissionContext<'s, P, B>
     where

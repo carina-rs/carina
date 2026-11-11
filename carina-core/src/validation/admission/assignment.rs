@@ -503,15 +503,17 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                  path: &LeafPath,
                  cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
                     let path = join(&contract.path, path);
-                    // B1's authored policy belongs here, before lowered-origin
-                    // dispatch, and receives this exact declaration and cursor.
+                    // Authored policy sees every position before main's
+                    // ordinary selection, value and origin dispatch.
+                    let mut findings = match context.assignment.authored {
+                        Some(hook) => hook(attr, checked, &path, cursor.clone())?,
+                        None => Default::default(),
+                    };
                     // Selection parents are policy-only: main's ordinary local
                     // and reference obligations belong to the selected child.
                     if cursor.is_selection() {
-                        return Ok(Default::default());
+                        return Ok(findings);
                     }
-                    let mut findings =
-                        crate::schema::value_validation::AssignmentFindings::default();
                     let crate::schema::value_validation::CheckValue::Current(value) = checked
                     else {
                         return Ok(findings);
@@ -525,8 +527,8 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                             &mut findings,
                         )?,
                         CandidateOrigin::Expression => {
-                            if let Some(check) = context.assignment {
-                                findings = check(attr, checked, &path, cursor)?;
+                            if let Some(check) = context.assignment.ordinary {
+                                findings.extend(check(attr, value, &path, cursor)?);
                             }
                         }
                     }

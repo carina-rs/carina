@@ -1,4 +1,12 @@
 {
+  "_provenance": {
+    "revision": "ea66ae7a157bd6e28f374f80286a29eb8d77a557",
+    "missing_report": "Recorded on main after clearing the resource reports, matching the test mutation.",
+    "unbound_alias": "Derived: main was run on the healthy canonical input without unbind_alias_for_test, which is a seam-only mutation unavailable on main. Its empty output is the compatibility requirement, not a recording of that mutation on main.",
+    "unknown_schema": "Recorded on main for the same input, without mutations.",
+    "plain_reference": "Recorded on main with its expression-only callback failing if invoked on the same reference-origin attribute; the callback signature there has no cursor.",
+    "source": "merge-base ea66ae7a (the local origin/main used for the recordings)"
+  },
   "missing_report": [
     "missing expression evidence: resource mock.Test.<pending>"
   ],

@@ -11,7 +11,7 @@ mod basic;
 mod extended;
 mod located;
 mod seam_review;
-pub(super) mod seam_round2;
+mod seam_round2;
 mod single_value_walk;
 
 pub(super) fn create_document(content: &str) -> Document {
