@@ -3233,6 +3233,256 @@ mod tests {
     }
 
     #[test]
+    fn newly_authored_tags_do_not_render_additions_when_current_matches() {
+        let rows = newly_authored_tag_rows("carina-rs/infra");
+        assert_eq!(rows, [DetailRow::HiddenUnchanged { count: 2 }]);
+    }
+
+    #[test]
+    fn newly_authored_tags_render_only_real_value_drift() {
+        let rows = newly_authored_tag_rows("carina-rs/other");
+        let [
+            DetailRow::MapDiff { key, entries },
+            DetailRow::HiddenUnchanged { count: 1 },
+        ] = rows.as_slice()
+        else {
+            panic!("only tags should change: {rows:#?}");
+        };
+        assert_eq!(key, "tags");
+        assert_eq!(
+            entries.as_slice(),
+            &[MapDiffEntryIR::Changed {
+                key: rendered_key("Repository"),
+                old: render_value(&Value::Concrete(ConcreteValue::String(
+                    "carina-rs/other".into()
+                ))),
+                new: render_value(&Value::Concrete(ConcreteValue::String(
+                    "carina-rs/infra".into()
+                ))),
+                annotation: None,
+            },]
+        );
+    }
+
+    fn newly_authored_tag_rows(repository: &str) -> Vec<DetailRow> {
+        let text = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
+        let tags = |repository: &str| {
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                ("ManagedBy".into(), text("carina")),
+                ("Repository".into(), text(repository)),
+            ])))
+        };
+        let to = Resource::with_provider("test", "test.HostedZone", "zone", None)
+            .with_attribute("name", text("carina-rs.dev"))
+            .with_attribute("tags", tags("carina-rs/infra"));
+        let from = State::existing(
+            to.id.clone(),
+            HashMap::from([
+                ("name".into(), text("carina-rs.dev")),
+                ("tags".into(), tags(repository)),
+            ]),
+        );
+        let explicit = HashMap::from([(
+            to.id.clone(),
+            ExplicitFields::Struct {
+                children: HashMap::from([
+                    ("name".into(), ExplicitFields::Leaf),
+                    (
+                        "hosted_zone_tags".into(),
+                        ExplicitFields::ListElements { elements: vec![] },
+                    ),
+                ]),
+            },
+        )]);
+        let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier("zone"),
+            from: Box::new(from.to_snapshot()),
+            to: resolved(to),
+            changed_attributes: vec!["tags".into()],
+        };
+        let schema = PatternResourceSchema::new("test.HostedZone")
+            .attribute(
+                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "tags",
+                    PatternAttributeType::map(PatternAttributeType::string()),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let mut registry = SchemaRegistry::new();
+        registry.insert("test", schema);
+
+        build_detail_rows(
+            &effect,
+            Some(&registry),
+            DetailLevel::Full,
+            None,
+            Some(&explicit),
+        )
+    }
+
+    #[test]
+    fn nested_aligned_rules_do_not_render_provider_added_elements() {
+        let rule = |port, description: Option<&str>| {
+            let mut fields =
+                IndexMap::from([("port".into(), Value::Concrete(ConcreteValue::Int(port)))]);
+            if let Some(description) = description {
+                fields.insert(
+                    "description".into(),
+                    Value::Concrete(ConcreteValue::String(description.into())),
+                );
+            }
+            Value::Concrete(ConcreteValue::Map(fields))
+        };
+        let outer = |nested| {
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(IndexMap::from([
+                    ("port".into(), Value::Concrete(ConcreteValue::Int(80))),
+                    (
+                        "nested".into(),
+                        Value::Concrete(ConcreteValue::List(nested)),
+                    ),
+                ])),
+            )]))
+        };
+        for description in [None, Some("web")] {
+            let to = Resource::new("test.Listener", "listener")
+                .with_attribute("rules", outer(vec![rule(8080, description)]));
+            let from = State::existing(
+                to.id.clone(),
+                HashMap::from([(
+                    "rules".into(),
+                    outer(vec![rule(8080, description), rule(8443, None)]),
+                )]),
+            );
+            let explicit = HashMap::from([(
+                to.id.clone(),
+                ExplicitFields::Struct {
+                    children: HashMap::from([(
+                        "rules".into(),
+                        ExplicitFields::ListElements {
+                            elements: vec![ExplicitFields::Struct {
+                                children: HashMap::from([
+                                    ("port".into(), ExplicitFields::Leaf),
+                                    (
+                                        "nested".into(),
+                                        ExplicitFields::ListElements {
+                                            elements: vec![
+                                                ExplicitFields::Struct {
+                                                    children: HashMap::from([(
+                                                        "port".into(),
+                                                        ExplicitFields::Leaf,
+                                                    )]),
+                                                },
+                                                ExplicitFields::Unrecorded,
+                                            ],
+                                        },
+                                    ),
+                                ]),
+                            }],
+                        },
+                    )]),
+                },
+            )]);
+            let effect = Effect::Update {
+                identifier: crate::effect::fixture_applied_identifier("listener"),
+                from: Box::new(from.to_snapshot()),
+                to: resolved(to),
+                changed_attributes: vec!["rules".into()],
+            };
+
+            let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, Some(&explicit));
+            assert_eq!(rows, [DetailRow::HiddenUnchanged { count: 1 }]);
+        }
+    }
+
+    #[test]
+    fn paired_rule_descriptions_render_only_authored_element_drift() {
+        let rule = |port, description: Option<&str>| {
+            let mut fields =
+                IndexMap::from([("port".into(), Value::Concrete(ConcreteValue::Int(port)))]);
+            if let Some(description) = description {
+                fields.insert(
+                    "description".into(),
+                    Value::Concrete(ConcreteValue::String(description.into())),
+                );
+            }
+            Value::Concrete(ConcreteValue::Map(fields))
+        };
+        for description in ["x", "changed"] {
+            let to = Resource::new("test.Listener", "listener").with_attribute(
+                "rules",
+                Value::Concrete(ConcreteValue::List(vec![
+                    rule(80, None),
+                    rule(443, Some("x")),
+                ])),
+            );
+            let from = State::existing(
+                to.id.clone(),
+                HashMap::from([(
+                    "rules".into(),
+                    Value::Concrete(ConcreteValue::List(vec![
+                        rule(80, Some("provider default")),
+                        rule(443, Some(description)),
+                    ])),
+                )]),
+            );
+            let element = ExplicitFields::Struct {
+                children: HashMap::from([("port".into(), ExplicitFields::Leaf)]),
+            };
+            let explicit = HashMap::from([(
+                to.id.clone(),
+                ExplicitFields::Struct {
+                    children: HashMap::from([(
+                        "rules".into(),
+                        ExplicitFields::ListElements {
+                            elements: vec![element.clone(), element],
+                        },
+                    )]),
+                },
+            )]);
+            let effect = Effect::Update {
+                identifier: crate::effect::fixture_applied_identifier("listener"),
+                from: Box::new(from.to_snapshot()),
+                to: resolved(to),
+                changed_attributes: vec!["rules".into()],
+            };
+            let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, Some(&explicit));
+            if description == "x" {
+                assert_eq!(rows, [DetailRow::HiddenUnchanged { count: 1 }]);
+                continue;
+            }
+            let [DetailRow::ListOfMapsDiff { key, block }] = rows.as_slice() else {
+                panic!("only the authored description should change: {rows:#?}")
+            };
+            assert_eq!(key, "rules");
+            assert!(block.added().is_empty());
+            assert!(block.removed().is_empty());
+            assert_eq!(block.unchanged().len(), 1);
+            let [modified] = block.modified() else {
+                panic!("only port 443 should change: {rows:#?}")
+            };
+            let [ListOfMapsDiffField::Changed { key, old, new }] = modified.fields.as_slice()
+            else {
+                panic!("only description should change: {rows:#?}")
+            };
+            assert_eq!(key.raw(), "description");
+            assert_eq!(
+                old,
+                &render_value(&Value::Concrete(ConcreteValue::String("changed".into())))
+            );
+            assert_eq!(
+                new,
+                &render_value(&Value::Concrete(ConcreteValue::String("x".into())))
+            );
+        }
+    }
+
+    #[test]
     fn round2_saved_plan_update_preserves_nested_explicit_aware_rows() {
         let text = |s: &str| Value::Concrete(ConcreteValue::String(s.into()));
         let map = |items: &[(&str, &str)]| {
@@ -4630,11 +4880,48 @@ mod tests {
 
     #[test]
     fn unchanged_count_excludes_server_only_field() {
-        // `from.attributes` has authored + server_only, both unchanged
-        // against `to`. Without prev_explicit, both contribute to the
-        // hidden-unchanged count. With prev_explicit listing only
-        // "authored", the projection drops server_only before counting,
-        // shrinking the count from 2 to 1 — the awscc#206 effect.
+        // awscc#206: server-only values exist in current, never in desired.
+        let text = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
+        let from = State::existing(
+            ResourceId::with_identity("s3.Bucket", "my-bucket"),
+            HashMap::from([
+                ("authored".into(), text("a")),
+                ("server_only".into(), text("s")),
+                ("trigger_diff".into(), text("old-value")),
+            ]),
+        );
+        let to = Resource::new("s3.Bucket", "my-bucket")
+            .with_attribute("authored", text("a"))
+            .with_attribute("trigger_diff", text("new-value"));
+        let explicit = HashMap::from([(
+            to.id.clone(),
+            ExplicitFields::Struct {
+                children: HashMap::from([("authored".into(), ExplicitFields::Leaf)]),
+            },
+        )]);
+        let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier("my-bucket"),
+            from: Box::new(from.to_snapshot()),
+            to: resolved(to),
+            changed_attributes: vec!["trigger_diff".into()],
+        };
+
+        for prior in [None, Some(&explicit)] {
+            let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, prior);
+            let [
+                DetailRow::Changed { key, .. },
+                DetailRow::HiddenUnchanged { count: 1 },
+            ] = rows.as_slice()
+            else {
+                panic!("server-only values must stay hidden: {rows:#?}");
+            };
+            assert_eq!(key, "trigger_diff");
+        }
+    }
+
+    #[test]
+    fn unchanged_count_includes_currently_authored_field() {
+        // Both desired fields contribute even when prior authoring records only one.
         use crate::explicit::ExplicitFields;
 
         let from = State::existing(
@@ -4645,7 +4932,7 @@ mod tests {
                     Value::Concrete(ConcreteValue::String("a".into())),
                 ),
                 (
-                    "server_only".to_string(),
+                    "newly_authored".to_string(),
                     Value::Concrete(ConcreteValue::String("s".into())),
                 ),
                 (
@@ -4662,7 +4949,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("a".into())),
             )
             .with_attribute(
-                "server_only",
+                "newly_authored",
                 Value::Concrete(ConcreteValue::String("s".into())),
             )
             .with_attribute(
@@ -4678,8 +4965,7 @@ mod tests {
             changed_attributes: vec!["trigger_diff".to_string()],
         };
 
-        // Without prev_explicit: both authored and server_only contribute
-        // to the unchanged count.
+        // Without prior evidence, both desired fields are unchanged.
         let rows_no_explicit = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
         let no_explicit_count = rows_no_explicit.iter().find_map(|r| match r {
             DetailRow::HiddenUnchanged { count } => Some(*count),
@@ -4688,11 +4974,10 @@ mod tests {
         assert_eq!(
             no_explicit_count,
             Some(2),
-            "Without prev_explicit, both authored and server_only contribute to unchanged count"
+            "both desired fields contribute to the unchanged count"
         );
 
-        // With prev_explicit listing only "authored": server_only is
-        // projected out, leaving only "authored" as the unchanged tally.
+        // Current desired authoring supplements the prior explicit tree.
         let mut explicit_map = HashMap::new();
         explicit_map.insert(
             ResourceId::with_identity("s3.Bucket", "my-bucket"),
@@ -4710,8 +4995,8 @@ mod tests {
         });
         assert_eq!(
             projected_count,
-            Some(1),
-            "With prev_explicit, server_only should not contribute to unchanged count"
+            Some(2),
+            "current desired authoring must survive a missing prior child"
         );
     }
 
