@@ -7241,6 +7241,144 @@ mod load_upstream_states_tests {
     use std::fs;
 
     #[tokio::test]
+    async fn round4_loader_defers_unknown_types_without_changing_static_discovery() {
+        for (main, declaration) in [
+            (
+                "fn upstream_only(value: Foo): Foo { value }\nlet unrelated = upstream_only('upstream-only')\nlet seed = 7\n",
+                "count: Int = seed",
+            ),
+            ("let seed = 7\n", "count: Foo = seed"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let upstream = root.path().join("upstream");
+            let downstream = root.path().join("downstream");
+            fs::create_dir(&upstream).unwrap();
+            fs::create_dir(&downstream).unwrap();
+            write_upstream_admission_source(&upstream, declaration);
+            fs::write(upstream.join("main.crn"), main).unwrap();
+            fs::write(downstream.join("main.crn"), "provider mock {}\nlet orgs = upstream_state { source = '../upstream' }\nexports { selected: Int = orgs.count }\n").unwrap();
+            write_state(&upstream, &[("count", serde_json::json!(73))]);
+            let runtime = crate::test_support::TestCommandRuntime::new();
+            let ambient = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+            let base = ResolvedPath::new(&downstream).unwrap();
+            let parsed = load_configuration_with_config(
+                &base,
+                &ambient,
+                &carina_core::schema::SchemaRegistry::new(),
+            )
+            .unwrap()
+            .parsed
+            .into_parsed();
+            let wiring = crate::wiring::WiringContext::new_for_test_with_provider_phase(
+                &runtime,
+                vec![Box::new(EnumMetadataFactory)],
+                &parsed.providers,
+            );
+            let context = wiring.provider_context().with_runtime(&ambient);
+            assert!(context.custom_types_loaded());
+            let parsed = parsed.into_expanded(wiring.schemas(), &context).unwrap();
+            let loaded = load_selected_upstream_states(
+                &runtime,
+                &parsed.upstream_states,
+                &base,
+                &context,
+                &mut seed_cycle_guard(&base),
+                wiring.schemas(),
+                UpstreamMissingStatePolicy::Strict,
+                None,
+            )
+            .await
+            .map_err(AppError::from)
+            .expect("plan and live-apply loaders must use bootstrap parsing");
+            assert_eq!(
+                loaded["orgs"]["count"],
+                Value::Concrete(ConcreteValue::Int(73))
+            );
+
+            let snapshot = HashMap::from([(
+                "orgs".into(),
+                HashMap::from([("count".into(), Value::Concrete(ConcreteValue::Int(73)))]),
+            )]);
+            let saved = admit_saved_upstream_snapshot(
+                &runtime,
+                &[UpstreamSource {
+                    binding: absolute_binding("orgs"),
+                    source: "../upstream".into(),
+                }],
+                &base,
+                &context,
+                wiring.schemas(),
+                &snapshot,
+                crate::commands::apply::ApplyTarget::Project(&downstream),
+            )
+            .expect("saved-apply admission must also use bootstrap parsing");
+            assert_eq!(saved, loaded);
+
+            let managed_current = HashMap::new();
+            let data_source_values =
+                carina_core::data_source_value::DataSourceValues::from_data_sources(
+                    &parsed.data_sources,
+                    |_| {
+                        carina_core::data_source_value::DataSourceValue::deferred_to_apply(
+                            Vec::new(),
+                        )
+                    },
+                );
+            let check_consumer = |remote_bindings: &AdmittedRemoteBindings| {
+                let bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+                    carina_core::binding_index::LivePreApplyInputs {
+                        managed: &parsed.resources,
+                        compositions: &parsed.compositions,
+                        managed_current: &managed_current,
+                        data_source_values: &data_source_values,
+                        remote_bindings,
+                        wait_aliases: &[],
+                    },
+                );
+                carina_core::validation::deferred_types::with_session_for_test(
+                    &context,
+                    |session| {
+                        carina_core::validation::check_export_values_pre_apply(
+                            &parsed.export_params,
+                            &bindings,
+                            session,
+                        )
+                    },
+                )
+            };
+            assert!(check_consumer(&loaded).is_ok());
+            if declaration == "count: Foo = seed" {
+                write_state(&upstream, &[("count", serde_json::json!("wrong kind"))]);
+                let loaded = load_selected_upstream_states(
+                    &runtime,
+                    &parsed.upstream_states,
+                    &base,
+                    &context,
+                    &mut seed_cycle_guard(&base),
+                    wiring.schemas(),
+                    UpstreamMissingStatePolicy::Strict,
+                    None,
+                )
+                .await
+                .map_err(AppError::from)
+                .unwrap();
+                assert_eq!(
+                    loaded["orgs"]["count"],
+                    Value::Concrete(ConcreteValue::String("wrong kind".into()))
+                );
+                let error =
+                    check_consumer(&loaded).expect_err("consumer must check the actual value");
+                assert!(
+                    error.contains("selected") && error.contains("expected Int, got string"),
+                    "{error}"
+                );
+                assert!(!error.contains("upstream export 'orgs.count'"), "{error}");
+            }
+            assert!(!downstream.join("carina.state.json").exists());
+        }
+    }
+
+    #[tokio::test]
     async fn review_1_stale_nested_null_is_never_decoded() {
         let dir = tempfile::tempdir().unwrap();
         write_upstream_admission_source(dir.path(), "count: Int = seed");
