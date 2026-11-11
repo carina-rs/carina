@@ -444,6 +444,16 @@ impl TypeExprValueError {
     }
 }
 
+impl std::error::Error for TypeExprValueError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidAccess { error } => Some(error),
+            Self::CustomTypeValidation { error, .. } => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
+
 fn write_path(f: &mut fmt::Formatter<'_>, path: &[TypeExprValuePathSegment]) -> fmt::Result {
     if path.is_empty() {
         return Ok(());

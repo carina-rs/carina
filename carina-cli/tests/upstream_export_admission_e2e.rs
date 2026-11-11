@@ -85,6 +85,92 @@ fn write_exports(upstream: &Path, exports: serde_json::Value) {
     .unwrap();
 }
 
+fn assert_saved_upstream_change_is_drift(change: impl FnOnce(&Path)) {
+    let root = tempfile::tempdir().unwrap();
+    let (upstream, downstream) = write_fixture(root.path());
+    write_exports(&upstream, serde_json::json!({"count": 73, "unused": true}));
+    assert_success(
+        &run_cli(&downstream, &["plan", "--out", "saved.plan", "."]),
+        "save upstream snapshot",
+    );
+    change(&upstream);
+    let output = run_cli(&downstream, &["apply", "--auto-approve", "saved.plan"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "changed upstream admission must invalidate the plan\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("upstream_state 'orgs'")
+            && stderr.contains("drifted since the plan was created"),
+        "upstream admission changes must use the existing drift error\n{stderr}"
+    );
+    assert!(
+        !downstream.join("carina.state.json").exists(),
+        "upstream drift must be detected before state writeback"
+    );
+}
+
+#[test]
+fn review_2_saved_apply_detects_removed_export_declaration() {
+    assert_saved_upstream_change_is_drift(|upstream| {
+        fs::write(
+            upstream.join("exports.crn"),
+            "exports { count: Int = authored_count }\n",
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn review_2_saved_apply_reports_new_admission_failure_as_drift() {
+    assert_saved_upstream_change_is_drift(|upstream| {
+        fs::write(
+            upstream.join("exports.crn"),
+            "exports { count: String = 'changed'\nunused: Bool = true }\n",
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn review_2_saved_apply_allows_known_to_unchecked_admission_change() {
+    let root = tempfile::tempdir().unwrap();
+    let (upstream, downstream) = write_fixture(root.path());
+    write_exports(&upstream, serde_json::json!({"count": 73, "unused": true}));
+    assert_success(
+        &run_cli(&downstream, &["plan", "--out", "saved.plan", "."]),
+        "save upstream snapshot",
+    );
+    fs::write(upstream.join("main.crn"), "let authored_count = 7\nlet untyped = unavailable.thing { name = 'metadata unavailable' }\n").unwrap();
+    fs::write(
+        upstream.join("exports.crn"),
+        "exports { count: Int = authored_count\nunused = untyped.value }\n",
+    )
+    .unwrap();
+    assert_success(
+        &run_cli(&downstream, &["apply", "--auto-approve", "saved.plan"]),
+        "apply unchanged values with an unchecked source type",
+    );
+
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(downstream.join("saved.plan")).unwrap()).unwrap();
+    assert_eq!(saved["version"], serde_json::json!(44));
+    let sources = saved["upstream_sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(
+        sources[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["binding", "source"]),
+        "format 44 must not acquire source-type evidence fields",
+    );
+}
+
 #[test]
 fn upstream_export_violating_declared_type_is_rejected_by_directory_plan() {
     let root = tempfile::tempdir().unwrap();

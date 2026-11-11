@@ -313,6 +313,24 @@ fn published_exports_from_state(state: &StateFile) -> PublishedExports {
     PublishedExports::from_state_bytes(&bytes).expect("serialized test exports must decode")
 }
 
+// Preserve the original decoder-fixture assertions while exercising admission
+// before exposing their decoded maps to resolver fixtures.
+trait PublishedFixtureBindings {
+    fn build_remote_bindings(&self) -> HashMap<String, Value>;
+}
+impl PublishedFixtureBindings for PublishedExports {
+    fn build_remote_bindings(&self) -> HashMap<String, Value> {
+        let context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let admitted =
+            carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+                self.admit("upstream", None, session)
+            })
+            .expect("fixture published values pass admission");
+        (*admitted).clone()
+    }
+}
+
 fn persisted_prevent_destroy_json(directives: &PersistedDirectives) -> serde_json::Value {
     serde_json::to_value(directives)
         .expect("persisted directives must serialize")["prevent_destroy"]
@@ -6774,14 +6792,11 @@ fn published_exports_ignore_future_state_version_and_resource_shape() {
     let exports = PublishedExports::from_state_bytes(json.to_string().as_bytes())
         .expect("supported exports must load independently of resource state");
     assert_eq!(
-        PersistedExportValue::encode(
-            exports
-                .values()
-                .get("account_id")
-                .expect("fixture export exists"),
-        )
-        .expect("decoded export is persistable")
-        .decoded_json(),
+        exports
+            .values()
+            .get("account_id")
+            .expect("fixture export exists")
+            .decoded_json(),
         serde_json::json!("123456789012")
     );
 
@@ -6884,14 +6899,11 @@ fn published_exports_load_v16_without_exports_version_through_legacy_migration()
     let exports = PublishedExports::from_state_bytes(json.to_string().as_bytes())
         .expect("v16 exports must use the legacy full-state migration path");
     assert_eq!(
-        PersistedExportValue::encode(
-            exports
-                .values()
-                .get("user_map")
-                .expect("fixture export exists"),
-        )
-        .expect("decoded export is persistable")
-        .decoded_json(),
+        exports
+            .values()
+            .get("user_map")
+            .expect("fixture export exists")
+            .decoded_json(),
         serde_json::json!({ "$user": true })
     );
 }
@@ -9392,9 +9404,15 @@ fn full_state_load_preserves_nested_null_exports_for_reapply() {
         let displayed = EncodedPublishedExports::from_state_bytes(&bytes)
             .expect("export display must preserve encoded nulls");
         assert_eq!(serde_json::to_value(displayed.values()).unwrap(), exports);
+        let published = PublishedExports::from_state_bytes(&bytes).unwrap();
+        let context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         assert!(
-            PublishedExports::from_state_bytes(&bytes).is_err(),
-            "remote bindings must still reject nested nulls after legacy migration",
+            carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+                published.admit("upstream", None, session)
+            })
+            .is_err(),
+            "installed remote exports must reject nested nulls after legacy migration"
         );
     }
 }
@@ -9419,13 +9437,32 @@ fn assert_published_export_null_rejected(value: serde_json::Value, error_path: &
     let mut state = serde_json::to_value(StateFile::new()).unwrap();
     state["exports"] = serde_json::json!({"valid": "keep", "broken": value});
     let bytes = serde_json::to_vec(&state).unwrap();
-    let result = PublishedExports::from_state_bytes(&bytes);
+    let published = PublishedExports::from_state_bytes(&bytes).unwrap();
+    let declarations = published
+        .values()
+        .keys()
+        .map(|key| {
+            (
+                key.clone(),
+                carina_core::upstream_exports::UpstreamExportEntry {
+                    static_type: carina_core::upstream_exports::UpstreamExportType::InferenceNotRun,
+                    value: None,
+                },
+            )
+        })
+        .collect();
+    let context =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let result =
+        carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+            published.admit("upstream", Some(&declarations), session)
+        });
     assert!(
         result.is_err(),
-        "present export {error_path:?} containing null must fail decoding, not silently drop data; decoded bindings: {:?}",
-        result.as_ref().map(PublishedExports::build_remote_bindings),
+        "a present installed export containing null must fail admission instead of silently dropping data"
     );
     let message = result.unwrap_err().to_string();
+    assert!(message.contains("upstream.broken"), "{message}");
     for fragment in error_path {
         assert!(
             message.contains(fragment),

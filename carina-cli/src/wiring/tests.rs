@@ -1,4 +1,62 @@
 use super::*;
+
+#[test]
+fn review_6_settlement_keeps_typed_admission_error_with_diagnostics() {
+    use carina_core::static_type::ExportStaticType;
+    use carina_core::upstream_exports::{
+        AdmittedUpstreamExports, UpstreamExportEntry, UpstreamExportType,
+    };
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let wiring = WiringContext::new_for_test(&runtime, vec![], &[]);
+    let context = wiring.provider_context().as_provider_context();
+    let declarations = HashMap::from([(
+        "count".into(),
+        UpstreamExportEntry {
+            static_type: UpstreamExportType::Static(
+                carina_core::validation::resolve_export_static_type_for_consumer(
+                    ExportStaticType::Declared(carina_core::parser::TypeExpr::Int),
+                    context,
+                ),
+            ),
+            value: None,
+        },
+    )]);
+    let checks =
+        carina_core::validation::deferred_types::TypeCheckSession::run(context, |session| {
+            let unavailable = carina_core::parser::parse_type_expr_str(
+                "Missing",
+                &carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                ),
+            )
+            .unwrap();
+            session.record_type(&unavailable, "another declaration");
+            AdmittedUpstreamExports::admit(
+                "up",
+                &declarations,
+                HashMap::from([(
+                    "count".into(),
+                    carina_core::resource::Value::Concrete(
+                        carina_core::resource::ConcreteValue::String("bad".into()),
+                    ),
+                )]),
+                session,
+            )
+            .map_err(|error| AppError::UpstreamExportAdmission(Box::new(error)))
+        });
+    assert!(!checks.diagnostics().is_empty());
+    let error = settle_type_checks(checks, AppError::Validation).unwrap_err();
+    let mut cause: &(dyn std::error::Error + 'static) = &error;
+    loop {
+        if cause
+            .downcast_ref::<AppError>()
+            .is_some_and(|error| matches!(error, AppError::UpstreamExportAdmission(_)))
+        {
+            break;
+        }
+        cause = cause.source().expect("settlement must retain the typed admission error, including when diagnostics are present");
+    }
+}
 use crate::provider_text_fixtures::*;
 use carina_core::provider::{Provider, ProviderError, ProviderNormalizer};
 use carina_core::schema::{

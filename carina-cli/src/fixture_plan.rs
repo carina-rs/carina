@@ -16,7 +16,7 @@ use carina_core::plan::Plan;
 use carina_core::provider::{
     BoxFuture, ProviderFactory, ProviderInitialization, ProviderInstanceKey, ProviderRouter,
 };
-use carina_core::resource::{Current, ResolvedResource, ResourceId, SnapshotState, State, Value};
+use carina_core::resource::{Current, ResolvedResource, ResourceId, SnapshotState, State};
 use carina_core::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, StructField,
     TypeIdentity, ValidatedResourceSchema,
@@ -520,7 +520,7 @@ where
     // unreadable — so `resolve_refs_for_plan` knows the binding name
     // and can stamp surviving refs as `(known after upstream apply: <ref>)`
     // instead of leaving the raw dot-form (#2366).
-    let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    let mut remote_bindings: carina_core::upstream_exports::AdmittedRemoteBindings = HashMap::new();
     for us in &parsed.upstream_states {
         let dir = base_dir.join(&us.source).unwrap();
         let state_path = dir
@@ -530,11 +530,29 @@ where
             .read()
             .ok()
             .and_then(|bytes| PublishedExports::from_state_bytes(&bytes).ok())
-            .map(|exports| exports.build_remote_bindings())
-            .unwrap_or_default();
+            .and_then(|exports| {
+                carina_core::validation::deferred_types::with_session_for_test(
+                    &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
+                    |session| exports.admit(us.binding.as_str(), None, session),
+                )
+                .ok()
+            })
+            .unwrap_or_else(|| {
+                carina_core::validation::deferred_types::with_session_for_test(
+                    &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
+                    |session| {
+                        carina_core::upstream_exports::AdmittedUpstreamExports::admit_snapshot(
+                            us.binding.as_str(),
+                            None,
+                            HashMap::new(),
+                            session,
+                        )
+                    },
+                )
+                .expect("empty fixture snapshot passes admission")
+            });
         remote_bindings.insert(us.binding.to_string(), bindings);
     }
-    let remote_bindings = carina_core::upstream_exports::remote_bindings_for_test(remote_bindings);
     let resolved_provider_configs = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
         |session| {

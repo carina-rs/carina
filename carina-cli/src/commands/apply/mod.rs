@@ -948,39 +948,43 @@ async fn execute_rehydrated_saved_plan(
 async fn verify_upstream_snapshot(
     wiring: &crate::wiring::WiringContext,
     sources: &[crate::commands::plan::UpstreamSource],
-    snapshot: &carina_core::upstream_exports::AdmittedRemoteBindings,
+    snapshot: &HashMap<String, HashMap<String, Value>>,
     project_dir: &ResolvedPath,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
-    let upstream_states: Vec<ExpandedUpstreamState> = sources
-        .iter()
-        .map(|s| ExpandedUpstreamState {
-            binding: s.binding.clone(),
-            source: s.source.clone(),
-        })
-        .collect();
     let provider_context = wiring.provider_context().as_provider_context();
     let mut cycle_guard = super::plan::seed_cycle_guard(project_dir);
-    let current = super::plan::load_upstream_states_with_schemas(
-        wiring.runtime(),
-        &upstream_states,
-        project_dir,
-        provider_context,
-        &mut cycle_guard,
-        wiring.schemas(),
-        super::plan::UpstreamMissingStatePolicy::Strict,
-    )
-    .await?;
+    let mut current = HashMap::new();
+    for source in sources {
+        let state = ExpandedUpstreamState {
+            binding: source.binding.clone(),
+            source: source.source.clone(),
+        };
+        let loaded = super::plan::load_upstream_states_with_schemas(
+            wiring.runtime(),
+            std::slice::from_ref(&state),
+            project_dir,
+            provider_context,
+            &mut cycle_guard,
+            wiring.schemas(),
+            super::plan::UpstreamMissingStatePolicy::Strict,
+        )
+        .await
+        .map_err(|error| AppError::UpstreamSnapshotChanged {
+            message: upstream_snapshot_drift(source.binding.as_str(), apply_target),
+            error: Box::new(error),
+        })?;
+        current.extend(loaded);
+    }
+    diff_upstream_snapshot(snapshot, &current, apply_target).map_err(AppError::Config)
+}
 
-    let snapshot = snapshot
-        .iter()
-        .map(|(binding, exports)| (binding.clone(), (**exports).clone()))
-        .collect();
-    let current = current
-        .iter()
-        .map(|(binding, exports)| (binding.clone(), (**exports).clone()))
-        .collect();
-    diff_upstream_snapshot(&snapshot, &current, apply_target).map_err(AppError::Config)
+pub(crate) fn upstream_snapshot_drift(binding: &str, apply_target: ApplyTarget<'_>) -> String {
+    format!(
+        "upstream_state '{}' has drifted since the plan was created. Re-run `{}` so the apply uses the values it was computed against.",
+        binding,
+        apply_target.replan_command()
+    )
 }
 
 /// Pure comparison between a planned snapshot and a freshly-loaded
@@ -989,9 +993,12 @@ async fn verify_upstream_snapshot(
 /// equal.
 ///
 /// Split out so it can be unit-tested without a real upstream backend.
-fn diff_upstream_snapshot(
-    snapshot: &HashMap<String, HashMap<String, Value>>,
-    current: &HashMap<String, HashMap<String, Value>>,
+fn diff_upstream_snapshot<
+    S: std::borrow::Borrow<HashMap<String, Value>>,
+    C: std::borrow::Borrow<HashMap<String, Value>>,
+>(
+    snapshot: &HashMap<String, S>,
+    current: &HashMap<String, C>,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), String> {
     for (binding, planned_attrs) in snapshot {
@@ -1004,7 +1011,7 @@ fn diff_upstream_snapshot(
                     apply_target.replan_command()
                 ));
             }
-            Some(current_attrs) if current_attrs != planned_attrs => {
+            Some(current_attrs) if current_attrs.borrow() != planned_attrs.borrow() => {
                 return Err(format!(
                     "upstream_state '{}' has drifted since the plan was created. \
                      Re-run `{}` so the apply uses the values it was computed against.",
@@ -4192,12 +4199,10 @@ async fn run_apply_from_plan_locked_owned(
             let plan = checked_plan_file.plan();
 
             // Admit upstream values before any migration write or binding installation.
-            let upstream_states = rehydrated_plan_file.upstream_sources().iter().map(|source| ExpandedUpstreamState {
-                binding: source.binding.clone(), source: source.source.clone(),
-            }).collect::<Vec<_>>();
-            let upstream_snapshot = super::plan::admit_upstream_snapshot(
-                &upstream_states, source, wiring.provider_context().as_provider_context(),
-                wiring.schemas(), rehydrated_plan_file.upstream_snapshot().clone(),
+            let upstream_snapshot = super::plan::admit_saved_upstream_snapshot(
+                wiring.runtime(), rehydrated_plan_file.upstream_sources(), source,
+                wiring.provider_context().as_provider_context(), wiring.schemas(),
+                rehydrated_plan_file.upstream_snapshot(), apply_target,
             )?;
 
             // Persist migrations only after successful re-admission, using
@@ -4361,7 +4366,7 @@ async fn run_apply_from_plan_locked_owned(
                 verify_upstream_snapshot(
                     wiring,
                     rehydrated_plan_file.upstream_sources(),
-                    &upstream_snapshot,
+                    rehydrated_plan_file.upstream_snapshot(),
                     source,
                     apply_target,
                 )

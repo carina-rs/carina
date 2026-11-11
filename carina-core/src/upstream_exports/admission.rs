@@ -1,7 +1,10 @@
 //! Admission of persisted exports to the source's consumer-visible contract.
 
+use crate::value::{PersistedExportValue, PersistedValueDecodeError};
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::ops::Deref;
+use std::sync::Arc;
 
 use super::{UpstreamExportEntries, UpstreamExportType};
 use crate::resource::{Value, knowledge::KnowledgeContext};
@@ -35,19 +38,7 @@ pub type AdmittedRemoteBindings = HashMap<String, AdmittedUpstreamExports>;
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdmittedUpstreamExports {
-    values: HashMap<String, Value>,
-    source_admission: HashMap<String, ExportSourceAdmission>,
-}
-
-/// The source-side evidence attached to one installed export.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExportSourceAdmission {
-    /// The value satisfies its declared-Known or inferred-Known source type.
-    Admitted,
-    /// Source inference or declaration resolution supplied no known type.
-    /// Destination checks use the actual value at plan/apply, as they do for
-    /// unchecked references.
-    InstalledWithoutSourceType,
+    values: Arc<HashMap<String, Value>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -56,42 +47,110 @@ pub enum UpstreamExportAdmissionError {
     InvalidValue {
         binding: String,
         key: String,
+        #[source]
         error: Box<TypeExprValueError>,
     },
-    #[error("upstream export '{binding}.{key}': value is not fully resolved")]
-    UnresolvedValue { binding: String, key: String },
+    #[error("upstream export '{binding}.{key}': {error}")]
+    UnresolvedValue {
+        binding: String,
+        key: String,
+        #[source]
+        error: crate::resource::knowledge::KnowledgeError,
+    },
+    #[error("upstream export '{binding}.{key}': {error}")]
+    Decode {
+        binding: String,
+        key: String,
+        #[source]
+        error: PersistedValueDecodeError,
+    },
 }
 
 impl AdmittedUpstreamExports {
-    /// Classify every supplied source export without evaluating source values.
-    /// Known types are checked; unavailable inference or declaration metadata
-    /// intentionally leaves the value for destination admission. Stale keys are
-    /// omitted.
+    /// Re-admit an already-decoded saved snapshot against a known source surface.
     pub fn admit(
         binding: &str,
         declarations: &UpstreamExportEntries,
         values: HashMap<String, Value>,
         context: &dyn ProviderTypeCheckContext,
     ) -> Result<Self, UpstreamExportAdmissionError> {
+        Self::admit_snapshot(binding, Some(declarations), values, context)
+    }
+
+    /// An unavailable source surface intentionally installs all supplied keys
+    /// without source-type checking. Consumers still check the actual values.
+    pub fn admit_snapshot(
+        binding: &str,
+        declarations: Option<&UpstreamExportEntries>,
+        values: HashMap<String, Value>,
+        context: &dyn ProviderTypeCheckContext,
+    ) -> Result<Self, UpstreamExportAdmissionError> {
+        Self::admit_supplied(
+            binding,
+            declarations,
+            values,
+            |value| Ok(Some(value)),
+            context,
+        )
+    }
+
+    /// Select source keys before decoding persisted values. Stale keys are never
+    /// decoded; top-level null stays absent; installed nested nulls are errors.
+    pub fn decode_and_admit<'a>(
+        binding: &str,
+        declarations: Option<&UpstreamExportEntries>,
+        values: impl IntoIterator<Item = (String, &'a PersistedExportValue)>,
+        context: &dyn ProviderTypeCheckContext,
+    ) -> Result<Self, UpstreamExportAdmissionError> {
+        Self::admit_supplied(
+            binding,
+            declarations,
+            values,
+            PersistedExportValue::decode,
+            context,
+        )
+    }
+
+    fn admit_supplied<S>(
+        binding: &str,
+        declarations: Option<&UpstreamExportEntries>,
+        values: impl IntoIterator<Item = (String, S)>,
+        decode: impl Fn(S) -> Result<Option<Value>, PersistedValueDecodeError>,
+        context: &dyn ProviderTypeCheckContext,
+    ) -> Result<Self, UpstreamExportAdmissionError> {
         let mut admitted = HashMap::new();
-        let mut source_admission = HashMap::new();
-        for (key, value) in values {
-            let Some(declaration) = declarations.get(&key) else {
+        for (key, supplied) in values {
+            let declaration = match declarations {
+                Some(surface) => match surface.get(&key) {
+                    Some(declaration) => Some(declaration),
+                    None => continue,
+                },
+                None => None,
+            };
+            let Some(value) =
+                decode(supplied).map_err(|error| UpstreamExportAdmissionError::Decode {
+                    binding: binding.into(),
+                    key: key.clone(),
+                    error,
+                })?
+            else {
                 continue;
             };
-            let expected = match &declaration.static_type {
+            let known = value
+                .knowledge(&KnowledgeContext::validation())
+                .and_then(|proof| proof.into_classification().into_known())
+                .map_err(|error| UpstreamExportAdmissionError::UnresolvedValue {
+                    binding: binding.into(),
+                    key: key.clone(),
+                    error,
+                })?;
+            // None covers both unavailable declarations and an explicit
+            // Unchecked declaration/inference result: InstalledWithoutSourceType.
+            let expected = declaration.and_then(|entry| match &entry.static_type {
                 UpstreamExportType::Static(static_type) => static_type.known(),
                 UpstreamExportType::InferenceNotRun => None,
-            };
-            let classification = if let Some(expected) = expected {
-                let known = value
-                    .knowledge(&KnowledgeContext::validation())
-                    .ok()
-                    .and_then(|proof| proof.into_classification().into_known().ok())
-                    .ok_or_else(|| UpstreamExportAdmissionError::UnresolvedValue {
-                        binding: binding.into(),
-                        key: key.clone(),
-                    })?;
+            });
+            if let Some(expected) = expected {
                 TypecheckProviderContext::for_session(context)
                     .check_upstream_export_constraints(expected, &known)
                     .require_provider_schemas()
@@ -100,21 +159,18 @@ impl AdmittedUpstreamExports {
                         key: key.clone(),
                         error: Box::new(error),
                     })?;
-                ExportSourceAdmission::Admitted
-            } else {
-                ExportSourceAdmission::InstalledWithoutSourceType
-            };
-            source_admission.insert(key.clone(), classification);
+            }
             admitted.insert(key, value);
         }
         Ok(Self {
-            values: admitted,
-            source_admission,
+            values: Arc::new(admitted),
         })
     }
+}
 
-    pub fn source_admission(&self, key: &str) -> Option<ExportSourceAdmission> {
-        self.source_admission.get(key).copied()
+impl Borrow<HashMap<String, Value>> for AdmittedUpstreamExports {
+    fn borrow(&self) -> &HashMap<String, Value> {
+        &self.values
     }
 }
 
@@ -206,6 +262,44 @@ mod tests {
     use super::*;
     use crate::parser::{ProviderContext, ResourceTypePath, TypeExpr};
     use crate::resource::ConcreteValue;
+
+    #[test]
+    fn review_5_unresolved_export_preserves_knowledge_error_source() {
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let declarations = HashMap::from([(
+            "broken".into(),
+            super::super::UpstreamExportEntry {
+                static_type: UpstreamExportType::Static(
+                    crate::static_type::ConsumerExportStaticType::Declared(
+                        crate::static_type::StaticType::Known(
+                            crate::static_type::ConsumerResolvedType::new(TypeExpr::Int),
+                        ),
+                    ),
+                ),
+                value: None,
+            },
+        )]);
+        let error = crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            AdmittedUpstreamExports::admit(
+                "up",
+                &declarations,
+                HashMap::from([(
+                    "broken".into(),
+                    Value::root_resource_ref("waiting", "id", vec![]),
+                )]),
+                session,
+            )
+        })
+        .unwrap_err();
+        let cause = std::error::Error::source(&error)
+            .expect("admission must retain the knowledge classification failure");
+        assert!(
+            cause
+                .downcast_ref::<crate::resource::knowledge::KnowledgeError>()
+                .is_some(),
+            "{cause:?}"
+        );
+    }
     use crate::static_type::{
         ConsumerExportStaticType, ConsumerInferredUncheckedReason, ConsumerResolvedType,
         InferenceError, NotInferableReason, StaticType,
@@ -248,10 +342,6 @@ mod tests {
     fn inference_not_run_installs_without_source_admission() {
         let installed = install_number(UpstreamExportType::InferenceNotRun);
         assert_eq!(installed["number"], Value::Concrete(ConcreteValue::Int(73)));
-        assert_eq!(
-            installed.source_admission("number"),
-            Some(ExportSourceAdmission::InstalledWithoutSourceType)
-        );
     }
 
     #[test]
@@ -300,10 +390,6 @@ mod tests {
                 ConsumerExportStaticType::Inferred(StaticType::Unchecked(reason)),
             ));
             assert_eq!(installed["number"], Value::Concrete(ConcreteValue::Int(73)));
-            assert_eq!(
-                installed.source_admission("number"),
-                Some(ExportSourceAdmission::InstalledWithoutSourceType)
-            );
 
             let known = installed["number"]
                 .knowledge(&KnowledgeContext::validation())
@@ -324,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn declared_and_inferred_known_exports_record_source_admission() {
+    fn declared_and_inferred_known_exports_are_checked() {
         for static_type in [
             ConsumerExportStaticType::Declared(StaticType::Known(ConsumerResolvedType::new(
                 TypeExpr::Int,
@@ -334,10 +420,7 @@ mod tests {
             ))),
         ] {
             let installed = install_number(UpstreamExportType::Static(static_type));
-            assert_eq!(
-                installed.source_admission("number"),
-                Some(ExportSourceAdmission::Admitted)
-            );
+            assert_eq!(installed["number"], Value::Concrete(ConcreteValue::Int(73)));
         }
     }
 
@@ -371,10 +454,6 @@ mod tests {
         assert_eq!(
             installed["id"],
             Value::Concrete(ConcreteValue::String("id-123".into()))
-        );
-        assert_eq!(
-            installed.source_admission("id"),
-            Some(ExportSourceAdmission::InstalledWithoutSourceType)
         );
     }
 }

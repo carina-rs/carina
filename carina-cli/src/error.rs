@@ -999,9 +999,28 @@ impl std::fmt::Display for AwsCredentialStartupError {
 // CLI hint. The typed source remains available through `credential_error()`.
 impl std::error::Error for AwsCredentialStartupError {}
 
+/// Additional diagnostics retain the concrete primary error in the source chain.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}\n{diagnostics}")]
+pub struct TypeCheckDiagnostics {
+    #[source]
+    pub(crate) error: AppError,
+    pub(crate) diagnostics: String,
+}
+
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error("{message}\n{error}")]
+    UpstreamSnapshotChanged {
+        message: String,
+        #[source]
+        error: Box<AppError>,
+    },
+
+    #[error(transparent)]
+    TypeCheckDiagnostics(Box<TypeCheckDiagnostics>),
+
     #[error(transparent)]
     UpstreamExportAdmission(Box<carina_core::upstream_exports::UpstreamExportAdmissionError>),
 

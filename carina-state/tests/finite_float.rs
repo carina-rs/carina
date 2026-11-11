@@ -29,7 +29,14 @@ fn finite_published_exports_preserve_signed_zero_when_loading_bindings() {
         let json = serde_json::to_string(&finite(raw)).unwrap();
         let bytes = state_with_export_json(&json);
         let loaded = PublishedExports::from_state_bytes(&bytes).unwrap();
-        let bindings = loaded.build_remote_bindings();
+        let context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let bindings =
+            carina_core::validation::deferred_types::TypeCheckSession::run(&context, |session| {
+                loaded.admit("upstream", None, session)
+            })
+            .publish(&mut Vec::new())
+            .unwrap();
         let Value::Concrete(ConcreteValue::Float(value)) = bindings["ratio"] else {
             panic!("expected float")
         };

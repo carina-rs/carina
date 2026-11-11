@@ -19,8 +19,7 @@ mod admission;
 #[cfg(any(test, feature = "test-utils"))]
 pub use admission::remote_bindings_for_test;
 pub use admission::{
-    AdmittedRemoteBindings, AdmittedUpstreamExports, ExportSourceAdmission,
-    UpstreamExportAdmissionError,
+    AdmittedRemoteBindings, AdmittedUpstreamExports, UpstreamExportAdmissionError,
 };
 use std::collections::HashMap;
 #[cfg(test)]
@@ -400,8 +399,6 @@ pub fn resolve_upstream_exports_with_context<B: BindingAddress>(
     schemas: Option<&crate::schema::SchemaRegistry>,
     overrides: &crate::config_loader::SourceOverrides,
 ) -> Result<(UpstreamExports<B>, Vec<UpstreamResolveError>), crate::parser::AnalysisTreeError> {
-    let provider_context =
-        crate::validation::typecheck::TypecheckProviderContext::for_session(config);
     let mut out: UpstreamExports<B> = HashMap::new();
     let mut errors: Vec<UpstreamResolveError> = Vec::new();
     for us in upstream_states {
@@ -429,174 +426,25 @@ pub fn resolve_upstream_exports_with_context<B: BindingAddress>(
             &crate::config_loader::directory_source_overrides(&source_abs, overrides),
             schemas.unwrap_or(&crate::schema::SchemaRegistry::new()),
         ) {
-            Ok(parsed) => {
-                let parsed = parsed.try_update(|parsed| {
-                    crate::validation::resolve_file_type_exprs_best_effort(parsed, config)
-                })?;
-                // Normalize every consumer-visible declaration before module
-                // expansion and export inference. Inference compares the
-                // structural TypeExpr values it receives, so leaving one
-                // declaration as DottedUnresolved while an equivalent schema
-                // projection is already SchemaType creates a false mismatch.
-
-                // Expand module calls before inference so that
-                // `attributes { ... }`-typed `Virtual` resources land in
-                // `parsed.resources` (#2493). Without this the inferer
-                // sees module-call bindings as known-but-non-inferable
-                // and any `exports` value referencing
-                // `<module_call_binding>.<attr>` (e.g.
-                // `oidc_provider_arn = bs.oidc_provider_arn` at
-                // `infra/registry/dev/bootstrap/exports.crn`) remains
-                // unchecked even when the type is fully derivable.
-                // `resolve_modules_with_config` is the same expansion
-                // pass `load_configuration` runs, so the inference reach
-                // here matches what the CLI sees post-expansion.
-                let empty_schemas = crate::schema::SchemaRegistry::new();
-                let expansion_schemas = schemas.unwrap_or(&empty_schemas);
-                let module_resolution = match provider_context.loaded_context() {
-                    Some(_loaded) => crate::module_resolver::resolve_upstream_modules_with_config(
-                        parsed,
-                        &source_abs,
-                        config,
-                        expansion_schemas,
-                        overrides,
-                    ),
-                    None => {
-                        crate::module_resolver::resolve_upstream_modules_with_providerless_config(
-                            parsed,
-                            &source_abs,
-                            config,
-                            expansion_schemas,
-                            overrides,
-                        )
-                    }
-                };
-                let parsed = match module_resolution {
-                    Ok(parsed) => parsed,
-                    Err(reason) => {
-                        if let crate::module_resolver::ModuleError::AnalysisInvariant(error) =
-                            reason.root_cause()
-                        {
-                            return Err(error.clone());
-                        }
-                        errors.push(UpstreamResolveError {
-                            binding: us.binding.to_string(),
-                            source: us.source.clone(),
-                            reason: reason.to_string(),
-                        });
-                        continue;
-                    }
-                };
-                // Declarations were resolved before expansion so inference
-                // compares canonical identities. Resolve once more afterward
-                // to classify newly inferred names that the consumer cannot
-                // name, preserving that distinction from inference failure.
-                if schemas.is_none() {
-                    // Even the providerless discovery API is a state-boundary
-                    // loader. Handle RHSs and declared Ref types are
-                    // inferable without schemas and must never be advertised
-                    // as value-shaped upstream exports.
-                    let inferred = crate::validation::inference::infer_export_params(
-                        crate::config_loader::load_buffer_configuration(
-                            &parsed,
-                            &empty_schemas,
-                            config.catalog(),
-                        )
-                        .judged(),
-                    );
-                    if let Err(boundary_errors) =
-                        crate::validation::validate_export_handle_boundaries(inferred.parameters())
-                    {
-                        errors.push(UpstreamResolveError {
-                            binding: us.binding.to_string(),
-                            source: us.source.clone(),
-                            reason: boundary_errors
-                                .into_iter()
-                                .map(|error| error.to_string())
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        });
-                        continue;
-                    }
+            Ok(parsed) => match resolve_upstream_exports_from_parsed(
+                parsed,
+                &source_abs,
+                config,
+                schemas,
+                overrides,
+            ) {
+                Ok(entries) => {
+                    out.insert(us.binding.clone(), entries);
                 }
-                let entries: UpstreamExportEntries = match schemas {
-                    Some(s) => {
-                        let inferred = crate::validation::inference::apply_inference(
-                            parsed,
-                            s,
-                            config.catalog(),
-                        );
-                        if let Err(boundary_errors) =
-                            crate::validation::validate_export_handle_boundaries(
-                                &inferred.export_params,
-                            )
-                        {
-                            errors.push(UpstreamResolveError {
-                                binding: us.binding.to_string(),
-                                source: us.source.clone(),
-                                reason: boundary_errors
-                                    .into_iter()
-                                    .map(|error| error.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join("\n"),
-                            });
-                            continue;
-                        }
-                        inferred
-                            .export_params
-                            .into_iter()
-                            .map(|e| {
-                                (
-                                    e.name,
-                                    UpstreamExportEntry {
-                                        static_type: UpstreamExportType::Static(
-                                            crate::validation::resolve_export_static_type_for_consumer(
-                                                e.static_type,
-                                                config.catalog(),
-                                            ),
-                                        ),
-                                        value: e.value,
-                                    },
-                                )
-                            })
-                            .collect()
-                    }
-                    // `schemas` is None (legacy entry point) — forward
-                    // the declared type unchanged. Note that without
-                    // schemas there is no way to run inference, so
-                    // unannotated exports are marked `InferenceNotRun`.
-                    None => parsed
-                        .export_params
-                        .into_iter()
-                        .map(|e| {
-                            let static_type = match e.static_type {
-                                Some(static_type) => {
-                                    UpstreamExportType::Static(ConsumerExportStaticType::Declared(
-                                        crate::validation::resolve_consumer_static_type(
-                                            &static_type,
-                                            config.catalog(),
-                                        ),
-                                    ))
-                                }
-                                None => UpstreamExportType::InferenceNotRun,
-                            };
-                            (
-                                e.name,
-                                UpstreamExportEntry {
-                                    static_type,
-                                    value: e.value.and_then(|expression| match expression {
-                                        crate::parser::BoundaryExpression::Value(value) => {
-                                            Some(value)
-                                        }
-                                        crate::parser::BoundaryExpression::Handle(_handle) => None,
-                                    }),
-                                },
-                            )
-                        })
-                        .collect(),
-                };
-                out.insert(us.binding.clone(), entries);
-            }
+                Err(UpstreamExportSourceError::Invariant(error)) => return Err(error),
+                Err(UpstreamExportSourceError::Unavailable(reason)) => {
+                    errors.push(UpstreamResolveError {
+                        binding: us.binding.to_string(),
+                        source: us.source.clone(),
+                        reason,
+                    })
+                }
+            },
             Err(reason) => {
                 errors.push(UpstreamResolveError {
                     binding: us.binding.to_string(),
@@ -607,6 +455,174 @@ pub fn resolve_upstream_exports_with_context<B: BindingAddress>(
         }
     }
     Ok((out, errors))
+}
+
+/// Failure to compute a source surface is distinct from an analysis invariant.
+#[derive(Debug, thiserror::Error)]
+pub enum UpstreamExportSourceError {
+    #[error(transparent)]
+    Invariant(#[from] crate::parser::AnalysisTreeError),
+    #[error("{0}")]
+    Unavailable(String),
+}
+
+/// Reuse a loader-owned source parse for export discovery. This performs the
+/// same normalization, module expansion and inference as directory discovery.
+pub fn resolve_upstream_exports_from_parsed(
+    parsed: crate::config_loader::ParsedRootDirectory,
+    source_abs: &ResolvedPath,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    schemas: Option<&crate::schema::SchemaRegistry>,
+    overrides: &crate::config_loader::SourceOverrides,
+) -> Result<UpstreamExportEntries, UpstreamExportSourceError> {
+    let provider_context =
+        crate::validation::typecheck::TypecheckProviderContext::for_session(config);
+    let parsed = parsed.try_update(|parsed| {
+        crate::validation::resolve_file_type_exprs_best_effort(parsed, config)
+    })?;
+    // Normalize every consumer-visible declaration before module
+    // expansion and export inference. Inference compares the
+    // structural TypeExpr values it receives, so leaving one
+    // declaration as DottedUnresolved while an equivalent schema
+    // projection is already SchemaType creates a false mismatch.
+
+    // Expand module calls before inference so that
+    // `attributes { ... }`-typed `Virtual` resources land in
+    // `parsed.resources` (#2493). Without this the inferer
+    // sees module-call bindings as known-but-non-inferable
+    // and any `exports` value referencing
+    // `<module_call_binding>.<attr>` (e.g.
+    // `oidc_provider_arn = bs.oidc_provider_arn` at
+    // `infra/registry/dev/bootstrap/exports.crn`) remains
+    // unchecked even when the type is fully derivable.
+    // `resolve_modules_with_config` is the same expansion
+    // pass `load_configuration` runs, so the inference reach
+    // here matches what the CLI sees post-expansion.
+    let empty_schemas = crate::schema::SchemaRegistry::new();
+    let expansion_schemas = schemas.unwrap_or(&empty_schemas);
+    let module_resolution = match provider_context.loaded_context() {
+        Some(_loaded) => crate::module_resolver::resolve_upstream_modules_with_config(
+            parsed,
+            source_abs,
+            config,
+            expansion_schemas,
+            overrides,
+        ),
+        None => crate::module_resolver::resolve_upstream_modules_with_providerless_config(
+            parsed,
+            source_abs,
+            config,
+            expansion_schemas,
+            overrides,
+        ),
+    };
+    let parsed = match module_resolution {
+        Ok(parsed) => parsed,
+        Err(reason) => {
+            if let crate::module_resolver::ModuleError::AnalysisInvariant(error) =
+                reason.root_cause()
+            {
+                return Err(UpstreamExportSourceError::Invariant(error.clone()));
+            }
+            return Err(UpstreamExportSourceError::Unavailable(reason.to_string()));
+        }
+    };
+    // Declarations were resolved before expansion so inference
+    // compares canonical identities. Resolve once more afterward
+    // to classify newly inferred names that the consumer cannot
+    // name, preserving that distinction from inference failure.
+    if schemas.is_none() {
+        // Even the providerless discovery API is a state-boundary
+        // loader. Handle RHSs and declared Ref types are
+        // inferable without schemas and must never be advertised
+        // as value-shaped upstream exports.
+        let inferred = crate::validation::inference::infer_export_params(
+            crate::config_loader::load_buffer_configuration(
+                &parsed,
+                &empty_schemas,
+                config.catalog(),
+            )
+            .judged(),
+        );
+        if let Err(boundary_errors) =
+            crate::validation::validate_export_handle_boundaries(inferred.parameters())
+        {
+            return Err(UpstreamExportSourceError::Unavailable(
+                boundary_errors
+                    .into_iter()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ));
+        }
+    }
+    let entries: UpstreamExportEntries = match schemas {
+        Some(s) => {
+            let inferred =
+                crate::validation::inference::apply_inference(parsed, s, config.catalog());
+            if let Err(boundary_errors) =
+                crate::validation::validate_export_handle_boundaries(&inferred.export_params)
+            {
+                return Err(UpstreamExportSourceError::Unavailable(
+                    boundary_errors
+                        .into_iter()
+                        .map(|error| error.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ));
+            }
+            inferred
+                .export_params
+                .into_iter()
+                .map(|e| {
+                    (
+                        e.name,
+                        UpstreamExportEntry {
+                            static_type: UpstreamExportType::Static(
+                                crate::validation::resolve_export_static_type_for_consumer(
+                                    e.static_type,
+                                    config.catalog(),
+                                ),
+                            ),
+                            value: e.value,
+                        },
+                    )
+                })
+                .collect()
+        }
+        // `schemas` is None (legacy entry point) — forward
+        // the declared type unchanged. Note that without
+        // schemas there is no way to run inference, so
+        // unannotated exports are marked `InferenceNotRun`.
+        None => parsed
+            .export_params
+            .into_iter()
+            .map(|e| {
+                let static_type = match e.static_type {
+                    Some(static_type) => {
+                        UpstreamExportType::Static(ConsumerExportStaticType::Declared(
+                            crate::validation::resolve_consumer_static_type(
+                                &static_type,
+                                config.catalog(),
+                            ),
+                        ))
+                    }
+                    None => UpstreamExportType::InferenceNotRun,
+                };
+                (
+                    e.name,
+                    UpstreamExportEntry {
+                        static_type,
+                        value: e.value.and_then(|expression| match expression {
+                            crate::parser::BoundaryExpression::Value(value) => Some(value),
+                            crate::parser::BoundaryExpression::Handle(_handle) => None,
+                        }),
+                    },
+                )
+            })
+            .collect(),
+    };
+    Ok(entries)
 }
 
 /// Walk a parsed project and return an error for every reference whose root

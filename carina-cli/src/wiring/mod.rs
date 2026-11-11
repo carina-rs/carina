@@ -362,7 +362,7 @@ pub struct PlanContext {
     /// the upstream values have not drifted before re-using them for
     /// cascade re-resolution. Empty when the configuration declares no
     /// `upstream_state` blocks.
-    pub upstream_snapshot: HashMap<String, HashMap<String, carina_core::resource::Value>>,
+    pub upstream_snapshot: carina_core::upstream_exports::AdmittedRemoteBindings,
     /// Per-resource user-authoring trees lifted from the saved state.
     /// Forwarded to the display layer so server-side default fields the
     /// user never wrote do not surface in plan output (refs awscc#206).
@@ -883,7 +883,7 @@ impl NonEmptyValidationErrors {
 }
 
 /// Publish a phase only after consuming the session that checked it.
-pub(crate) fn settle_type_checks<T, E: std::fmt::Display>(
+pub(crate) fn settle_type_checks<T, E: TypeCheckError>(
     checks: carina_core::validation::deferred_types::ProviderTypeCheckResult<Result<T, E>>,
     make_error: impl FnOnce(String) -> E,
 ) -> Result<T, E> {
@@ -892,10 +892,33 @@ pub(crate) fn settle_type_checks<T, E: std::fmt::Display>(
     if sink.errors.is_empty() {
         return result;
     }
-    if let Err(error) = result {
-        sink.errors.insert(0, error.to_string());
+    match result {
+        Err(error) => Err(error.with_type_check_diagnostics(sink.errors.join("\n"))),
+        Ok(_) => Err(make_error(sink.errors.join("\n"))),
     }
-    Err(make_error(sink.errors.join("\n")))
+}
+
+/// Preserve typed primary errors when additional checks also failed.
+pub(crate) trait TypeCheckError: std::fmt::Display {
+    fn with_type_check_diagnostics(self, diagnostics: String) -> Self;
+}
+impl TypeCheckError for String {
+    fn with_type_check_diagnostics(self, diagnostics: String) -> Self {
+        format!("{self}\n{diagnostics}")
+    }
+}
+impl TypeCheckError for AppError {
+    fn with_type_check_diagnostics(self, diagnostics: String) -> Self {
+        AppError::TypeCheckDiagnostics(Box::new(crate::error::TypeCheckDiagnostics {
+            error: self,
+            diagnostics,
+        }))
+    }
+}
+impl TypeCheckError for PlanPreparationError {
+    fn with_type_check_diagnostics(self, diagnostics: String) -> Self {
+        PlanPreparationError::Provider(HostError::internal(format!("{self}\n{diagnostics}")))
+    }
 }
 
 struct CliTypeCheckSink {
@@ -8835,10 +8858,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
             managed_current,
             data_source_values,
             moved_origins,
-            upstream_snapshot: remote_bindings
-                .iter()
-                .map(|(binding, exports)| (binding.clone(), (**exports).clone()))
-                .collect(),
+            upstream_snapshot: remote_bindings.clone(),
             prev_explicit,
             residual_deferred_for,
             expansion_trace,

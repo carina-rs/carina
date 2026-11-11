@@ -419,13 +419,14 @@ enum DesiredAuthoringBasis<'a> {
     CarriedRead,
 }
 
-/// Published values decoded for use as upstream remote bindings.
+/// Published values retained until source-key selection and admission.
 ///
-/// Construction rejects nested nulls before any binding map can be built.
+/// Construction validates the persisted namespace and structure. Only admission
+/// decodes installed keys, so corrupt stale values cannot block downstreams.
 /// Managed resource rows are not decoded or checked against the state version.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublishedExports {
-    values: HashMap<String, Value>,
+    values: HashMap<String, PersistedExportValue>,
 }
 
 /// Published JSON retained for export display, including nulls.
@@ -468,25 +469,35 @@ impl PublishedExports {
         bytes: &[u8],
     ) -> Result<(Self, Option<MigrationInfo>), BackendError> {
         let (encoded, migration) = EncodedPublishedExports::decode_state_bytes(bytes)?;
-        let mut values = HashMap::with_capacity(encoded.values.len());
-        for (name, encoded) in encoded.values {
-            let decoded = encoded.decode().map_err(|error| {
-                map_state_file_decode_error(persisted_export_decode_error(&name, error), None)
-            })?;
-            if let Some(value) = decoded {
-                values.insert(name, value);
-            }
-        }
-        Ok((Self { values }, migration))
+        Ok((
+            Self {
+                values: encoded.values,
+            },
+            migration,
+        ))
     }
 
-    pub fn values(&self) -> &HashMap<String, Value> {
+    pub fn values(&self) -> &HashMap<String, PersistedExportValue> {
         &self.values
     }
 
-    /// Copy the already-decoded export values consumed by `upstream_state`.
-    pub fn build_remote_bindings(&self) -> HashMap<String, Value> {
-        self.values.clone()
+    /// The only remote-binding construction path selects source keys before
+    /// fallible value decoding and returns the sealed admitted form.
+    pub fn admit(
+        &self,
+        binding: &str,
+        declarations: Option<&carina_core::upstream_exports::UpstreamExportEntries>,
+        context: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Result<
+        carina_core::upstream_exports::AdmittedUpstreamExports,
+        carina_core::upstream_exports::UpstreamExportAdmissionError,
+    > {
+        carina_core::upstream_exports::AdmittedUpstreamExports::decode_and_admit(
+            binding,
+            declarations,
+            self.values.iter().map(|(key, value)| (key.clone(), value)),
+            context,
+        )
     }
 }
 

@@ -6,7 +6,7 @@ use crate::wiring::TrustedLocalGrantInputs;
 use carina_core::paths::{CanonicalPath, ResolvedPath};
 use carina_core::{EnvironmentSnapshot, UserDirs};
 use carina_provider_mock::ConfiguredBuiltinMock;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 #[cfg(any(test, feature = "test-utils"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -61,6 +61,8 @@ pub struct CommandInputs {
 struct InvocationState {
     inputs: CommandInputs,
     warned_upstream: Mutex<HashSet<CanonicalPath>>,
+    upstream_sources:
+        Mutex<HashMap<CanonicalPath, Arc<crate::commands::plan::CachedUpstreamSource>>>,
     #[cfg(any(test, feature = "test-utils"))]
     provider_loads: AtomicUsize,
 }
@@ -80,6 +82,7 @@ impl CommandRuntime {
             state: Arc::new(InvocationState {
                 inputs,
                 warned_upstream: Mutex::new(HashSet::new()),
+                upstream_sources: Mutex::new(HashMap::new()),
                 #[cfg(any(test, feature = "test-utils"))]
                 provider_loads: AtomicUsize::new(0),
             }),
@@ -87,6 +90,26 @@ impl CommandRuntime {
             directory_owner: None,
         }
     }
+    /// Source metadata is immutable for one command; state bytes are never
+    /// cached. Holding this lock only covers synchronous parse/expansion.
+    pub(crate) fn upstream_source(
+        &self,
+        path: &ResolvedPath,
+        load: impl FnOnce() -> Result<crate::commands::plan::CachedUpstreamSource, AppError>,
+    ) -> Result<Arc<crate::commands::plan::CachedUpstreamSource>, AppError> {
+        let mut sources = self
+            .state
+            .upstream_sources
+            .lock()
+            .expect("upstream source cache");
+        if let Some(source) = sources.get(&path.identity()) {
+            return Ok(Arc::clone(source));
+        }
+        let source = Arc::new(load()?);
+        sources.insert(path.identity(), Arc::clone(&source));
+        Ok(source)
+    }
+
     pub fn user_dirs(&self) -> &UserDirs {
         &self.user_dirs
     }
