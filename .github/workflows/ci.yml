@@ -67,7 +67,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/rust-cache
       - run: scripts/verify.sh check
 
@@ -80,7 +80,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/rust-cache
       - uses: taiki-e/install-action@cargo-hack
       - run: scripts/verify.sh feature-isolation
@@ -92,9 +92,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - uses: ./.github/actions/rust-toolchain
       - run: scripts/verify.sh fmt
 
   clippy:
@@ -106,9 +104,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/rust-cache
       - run: scripts/verify.sh clippy
 
@@ -182,7 +178,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - run: scripts/verify.sh wit-bindgen-workspace
 
   check-plan-fixtures:
@@ -201,6 +197,14 @@ jobs:
       - uses: actions/checkout@v4
       - run: scripts/verify.sh rust-cache
 
+  check-pinned-toolchain:
+    name: Check Pinned Rust Toolchain
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/verify.sh pinned-toolchain
+
   check-vendored-patches-used:
     name: Check Vendored Patches Used
     if: github.event_name != 'push'
@@ -209,7 +213,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - run: scripts/verify.sh vendored-patches
 
   check-examples:
@@ -219,7 +223,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/rust-cache
       - run: echo "Provider examples moved to standalone repos"
 
@@ -232,7 +236,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/rust-cache
       - run: scripts/verify.sh validate-crn
 
@@ -245,7 +249,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/rust-cache
       - run: scripts/verify.sh example-warnings
 
@@ -254,19 +258,13 @@ jobs:
     # checks restore this namespace; push still only builds, without testing.
     name: Build Test Archive
     needs: changes
-    outputs:
-      toolchain: ${{ steps.toolchain.outputs.version }}
     if: needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-wasip2
-      - id: toolchain
-        run: rustc --version | awk '{print "version=" $2}' >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/rust-cache
       - uses: ./.github/actions/setup-nextest
         timeout-minutes: 3
@@ -314,9 +312,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ needs.test.outputs.toolchain }}
+      - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/setup-nextest
         timeout-minutes: 3
         with:
@@ -343,9 +339,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ needs.test.outputs.toolchain }}
+      - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/setup-nextest
         timeout-minutes: 3
         with:
@@ -369,9 +363,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-wasip2
+      - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/rust-cache
         with:
           cache-job: test
@@ -388,7 +380,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/rust-cache
         with:
           cache-job: test
@@ -431,7 +423,7 @@ jobs:
           submodules: recursive
       - name: Trust the checkout inside the container
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/rust-cache
         with:
           shared-key: binary-bookworm

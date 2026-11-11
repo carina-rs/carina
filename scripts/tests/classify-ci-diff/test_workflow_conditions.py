@@ -27,7 +27,7 @@ SCRIPT_JOBS = {
     "docs-spellings", "check-resources-access", "check-cli-hints",
     "check-no-home-env-reads", "check-crates-not-publishable",
     "check-wit-bindgen-workspace", "check-plan-fixtures",
-    "check-rust-cache-via-local-action", "check-vendored-patches-used",
+    "check-rust-cache-via-local-action", "check-pinned-toolchain", "check-vendored-patches-used",
 }
 ALL_JOBS = CODE_JOBS | SCRIPT_JOBS | TEST_JOBS | {"changes", "test-result"}
 
@@ -172,6 +172,7 @@ class WorkflowConditionTests(unittest.TestCase):
             write("carina-provider-resolver/tests/examples.rs",
                   'root.join("site/src/content/reference/registry");\n')
             inputs = {
+                "rust-toolchain.toml": True,
                 "site/src/content/providers/writing/schemas.md": True,
                 "site/src/content/reference/registry/static-registry.md": True,
                 "site/src/content/reference/dsl/types-and-values.md": True,
@@ -294,10 +295,9 @@ class WorkflowConditionTests(unittest.TestCase):
     def test_push_only_compiles_test_artifacts(self):
         build = "scripts/verify.sh wasm-fixtures"
         archive = "scripts/verify.sh nextest-archive nextest-archive.tar.zst"
-        version = "rustc --version | awk '{print \"version=\" $2}' >> \"$GITHUB_OUTPUT\""
-        self.assertEqual(self.commands("test", "push"), [version, build, "scripts/verify.sh nextest-compile"])
+        self.assertEqual(self.commands("test", "push"), [build, "scripts/verify.sh nextest-compile"])
         for event in ("merge_group", "pull_request"):
-            self.assertEqual(self.commands("test", event), [version, build, archive])
+            self.assertEqual(self.commands("test", event), [build, archive])
         self.assertEqual(self.commands("test-doctests", "pull_request"), ["scripts/verify.sh doctests"])
         for arguments, expected in [
             (("wasm-fixtures", "doctests"), [
@@ -324,15 +324,12 @@ class WorkflowConditionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(commands, ["cargo fetch --locked", "check-provider-cause-test-api.sh"])
 
-    def test_archive_consumers_install_the_build_rustc_release(self):
-        build = self.jobs["test"]
-        self.assertIn("toolchain: ${{ steps.toolchain.outputs.version }}", build)
-        self.assertIn("      - id: toolchain", build)
-        for job in ("test-partition", "test-isolation"):
+    def test_archive_build_and_consumers_install_the_same_pinned_toolchain(self):
+        self.assertNotIn("      - id: toolchain", self.jobs["test"])
+        for job in ("test", "test-partition", "test-isolation"):
             with self.subTest(job=job):
-                self.assertNotIn("uses: dtolnay/rust-toolchain@stable", self.jobs[job])
-                self.assertIn("uses: dtolnay/rust-toolchain@master", self.jobs[job])
-                self.assertIn("toolchain: ${{ needs.test.outputs.toolchain }}", self.jobs[job])
+                self.assertIn("uses: ./.github/actions/rust-toolchain", self.jobs[job])
+                self.assertNotRegex(self.jobs[job], r"(?m)^\s+toolchain:")
 
     def test_cache_consumers_never_save_the_build_cache(self):
         action = (WORKFLOW.parent.parent / "actions/rust-cache/action.yml").read_text()

@@ -313,10 +313,12 @@ aws-vault exec <profile> -- cargo run -- plan
 
 ## Verify Protocol
 
-`scripts/verify.sh` requires Bash 4.4 or newer and needs cargo-nextest,
-cargo-hack, and the `wasm32-wasip2` target (`rustup target add wasm32-wasip2`)
-for its full check set. When selecting kinds, only their required tools are
-checked before execution.
+`scripts/verify.sh` requires Bash 4.4 or newer, cargo-nextest and cargo-hack
+for its full check set. Rustup automatically reads `rust-toolchain.toml` to
+select the pinned toolchain, `clippy`, `rustfmt` and `wasm32-wasip2` target.
+Run `rustup toolchain install` (rustup 1.28.0 or newer) to install them.
+Upgrade the toolchain by editing that one file in an explicit PR.
+When selecting kinds, only their required tools are checked before execution.
 
 `--local` has a known limit: a `-p` scope resolves dependency features only for
 the selected packages, so feature unification can differ from CI's `--workspace`
