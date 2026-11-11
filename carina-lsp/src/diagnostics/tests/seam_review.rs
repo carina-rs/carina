@@ -84,7 +84,7 @@ fn review_seam_expanded_admission_retains_instantiated_judgements() {
         let judged = configuration.judged();
         let instances = judged.file().clone();
         let tree = carina_core::parser::AnalysisTree::try_from_file(&instances).unwrap();
-        let inputs = ExpandedDiagnosticValidationInputs {
+        let mut inputs = ExpandedDiagnosticValidationInputs {
             configuration: judged,
             resources: tree
                 .resources()

@@ -2988,8 +2988,8 @@ impl<B: BindingAddress> IntegerOperandEvidence<B>
         };
         node.children()
             .nth(index)
+            .ok_or_else(|| crate::parser::retained::MissingEvidence::new("integer operand child"))?
             .map(|node| node.judgement())
-            .ok_or_else(|| crate::parser::retained::MissingEvidence::new("integer operand child"))
     }
 }
 

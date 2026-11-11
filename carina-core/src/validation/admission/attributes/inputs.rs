@@ -68,9 +68,58 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        let inputs = resource
-            .attributes()
-            .iter()
+        Self::prepare(resource, resource.attributes().iter(), false)
+    }
+
+    /// Produce inputs for exactly the resolved attribute key set. Evaluation
+    /// owns this materialization; admission still borrows each slot's value.
+    pub fn from_resolved<D>(
+        resource: &crate::parser::AnalysisResourceRef<
+            '_,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            B,
+        >,
+        values: &HashMap<String, Value<ParserPlaceholder, B>>,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        Self::prepare(resource, values.iter(), true)
+    }
+
+    fn prepare<'v, D>(
+        resource: &crate::parser::AnalysisResourceRef<
+            '_,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            B,
+        >,
+        values: impl Iterator<Item = (&'v String, &'v Value<ParserPlaceholder, B>)>,
+        materialize: bool,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+        B: 'v,
+    {
+        let authored = resource.attributes();
+        // Resolved names may be canonical schema aliases. Verify the original
+        // owner pairing by use identity before producing a new projection;
+        // materialization cannot repair a stale or foreign source slot.
+        let sources = materialize.then(|| {
+            authored
+                .iter()
+                .filter_map(|(name, value)| {
+                    resource
+                        .authored_slot(name)
+                        .ok()
+                        .map(|slot| ((slot.occurrence(), slot.instance()), value))
+                })
+                .collect::<HashMap<_, _>>()
+        });
+        let inputs = values
             .map(|(name, value)| {
                 let prepare = || {
                     if resource.kind() == crate::parser::AnalysisItemKind::Composition {
@@ -83,12 +132,22 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
                         });
                     }
                     let slot = resource.authored_slot(name)?;
-                    if slot.projection() != Some(value) {
+                    let source = match &sources {
+                        Some(sources) => {
+                            sources.get(&(slot.occurrence(), slot.instance())).copied()
+                        }
+                        None => Some(value),
+                    };
+                    if slot.projection() != source {
                         return Err(MissingEvidence::new("resource slot/projection pairing"));
                     }
                     slot.cursor()?;
                     Ok(StoredInput::Authored {
-                        slot: Arc::new(slot.clone()),
+                        slot: Arc::new(if materialize {
+                            slot.materialized(value)
+                        } else {
+                            slot.clone()
+                        }),
                         source_generation: slot.generation(),
                     })
                 };
@@ -140,7 +199,19 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         &'a Self,
         HashMap<String, Classification<'a, ParserPlaceholder, B>>,
     ) {
-        self.materialize(values);
+        // Evaluation normally returns a subset of this owner's names. Retain
+        // a typed per-attribute outcome if that producer contract is broken;
+        // classifications and sibling admission must still run.
+        for (name, error) in self.unmatched_materializations(values) {
+            self.inputs.insert(
+                name.clone(),
+                StoredInput::Unavailable {
+                    value: Arc::new(values[&name].clone()),
+                    error,
+                },
+            );
+        }
+        self.apply_materializations(values);
         let inputs: &Self = self;
         let classified = collect_classified_attributes(
             values
@@ -154,9 +225,40 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
 
     /// Called where evaluation produces new projections. Unchanged slots share
     /// their allocations, so existing classifications still name that value.
-    pub fn materialize(&mut self, values: &HashMap<String, Value<ParserPlaceholder, B>>) {
-        for (name, value) in values {
-            let Some(input) = self.inputs.get_mut(name) else {
+    pub fn materialize(
+        &mut self,
+        values: &HashMap<String, Value<ParserPlaceholder, B>>,
+    ) -> Result<(), MissingEvidence> {
+        let unmatched = self.unmatched_materializations(values);
+        if !unmatched.is_empty() {
+            return Err(MissingEvidence::new(format!(
+                "unmatched materialized attributes: {:?}",
+                unmatched.iter().map(|(name, _)| name).collect::<Vec<_>>()
+            )));
+        }
+        self.apply_materializations(values);
+        Ok(())
+    }
+
+    fn unmatched_materializations(
+        &self,
+        values: &HashMap<String, Value<ParserPlaceholder, B>>,
+    ) -> Vec<(String, MissingEvidence)> {
+        values
+            .keys()
+            .filter(|name| !self.inputs.contains_key(*name))
+            .map(|name| {
+                (
+                    name.clone(),
+                    MissingEvidence::new(format!("unmatched materialized attribute {name}")),
+                )
+            })
+            .collect()
+    }
+
+    fn apply_materializations(&mut self, values: &HashMap<String, Value<ParserPlaceholder, B>>) {
+        for (name, input) in &mut self.inputs {
+            let Some(value) = values.get(name) else {
                 continue;
             };
             if input.value() == value {

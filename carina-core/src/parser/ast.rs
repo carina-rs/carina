@@ -9107,7 +9107,7 @@ fn substitute_attrs<S, D>(
     }
     let mut authored_slots = authored_slots;
     for (_, slot) in authored_slots.iter_mut() {
-        crate::value_walk::substitute_loop_slot(slot, index, key, value, miss_policy);
+        slot.invalidate_judgement();
     }
     authored_slots.synchronize(
         &expanded_attributes

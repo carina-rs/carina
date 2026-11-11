@@ -15,7 +15,7 @@ pub(crate) use functions::{substitute_function_call_argument, substitute_functio
 pub(crate) use modules::select_authored_module_ifs;
 pub(crate) use modules::{
     evaluate_expanded_module_functions, select_expanded_module_ifs_with_conditions,
-    substitute_module_arguments, substitute_module_slot,
+    substitute_module_arguments,
 };
 
 #[derive(Clone, Copy)]
@@ -121,82 +121,6 @@ pub(super) trait ParserRewrite<B: BindingAddress> {
                 ))
             })
     }
-}
-
-/// Transport archived syntax payloads without executing functions or provider
-/// checks. The caller installs the already-substituted live projection.
-pub(crate) fn substitute_loop_slot<B: BindingAddress>(
-    slot: &mut crate::parser::retained::JudgedSlot<B>,
-    index: Option<i64>,
-    key: Option<&str>,
-    value: &Value<NoPlaceholder, B>,
-    miss_policy: crate::resource::AccessMissPolicy,
-) {
-    struct LoopRewrite<'a, B: BindingAddress> {
-        index: Option<i64>,
-        key: Option<&'a str>,
-        value: &'a Value<NoPlaceholder, B>,
-        miss_policy: crate::resource::AccessMissPolicy,
-    }
-    impl<B: BindingAddress> ParserRewrite<B> for LoopRewrite<'_, B> {
-        type Error = ParseError;
-        fn error(&mut self, error: ParseError) -> Self::Error {
-            error
-        }
-        fn source_line(&self) -> usize {
-            0
-        }
-        fn leaf(
-            &mut self,
-            input: &LeafInput<'_, Transform, ParserPlaceholder, B>,
-            _: RewritePosition,
-        ) -> Result<Option<Value<ParserPlaceholder, B>>, Self::Error> {
-            let Some(ParserPlaceholder::Loop(slot)) = input.placeholder() else {
-                return Ok(None);
-            };
-            let value = match slot {
-                crate::resource::LoopSlot::Value => {
-                    Some(self.value.clone().into_placeholder_type())
-                }
-                crate::resource::LoopSlot::Key => self
-                    .key
-                    .map(|key| Value::Concrete(ConcreteValue::String(key.into()))),
-                crate::resource::LoopSlot::Index => self
-                    .index
-                    .map(|index| Value::Concrete(ConcreteValue::Int(index))),
-            };
-            value
-                .map(Some)
-                .ok_or_else(|| ParseError::InvalidExpression {
-                    line: 0,
-                    message: "retained loop slot has no matching binding".into(),
-                })
-        }
-        fn access(
-            &mut self,
-            access: crate::resource::AccessExpr<ParserPlaceholder, B>,
-            base: Value<ParserPlaceholder, B>,
-        ) -> Result<Value<ParserPlaceholder, B>, Self::Error> {
-            access
-                .rebuild_with_base(base, self.miss_policy)
-                .map_err(|error| ParseError::InvalidExpression {
-                    line: access.source_line(),
-                    message: error.to_string(),
-                })
-        }
-    }
-    slot.map_archived_projections(|projection| {
-        rewrite_parser_value(
-            projection,
-            RewritePosition::Value,
-            &mut LoopRewrite {
-                index,
-                key,
-                value,
-                miss_policy,
-            },
-        )
-    });
 }
 
 pub(super) fn rewrite_parser_value<B: BindingAddress, R: ParserRewrite<B>>(

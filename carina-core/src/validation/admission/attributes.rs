@@ -668,6 +668,7 @@ fn typed_resource_attribute_admissions<
     coverage: &std::cell::RefCell<crate::schema::value_validation::WalkCoverage>,
 ) -> crate::schema::ResourceValueValidation {
     use crate::resource::{DeferredValue, ParserPlaceholder};
+    let mut declaration_errors = std::collections::HashMap::new();
     let declarations = attributes
         .iter()
         .map(|(name, proof)| {
@@ -704,15 +705,14 @@ fn typed_resource_attribute_admissions<
             )
             .map(|(source_name, source)| (name.clone(), (source_name.to_owned(), source))))
         })
-        .collect::<Result<Vec<_>, _>>();
-    let declarations = match declarations {
-        Ok(declarations) => declarations.into_iter().flatten().collect(),
-        Err((name, error)) => {
-            let mut findings = crate::schema::ResourceValueValidation::default();
-            findings.push_attribute_error(name, assignment_seam_error(error));
-            return findings;
-        }
-    };
+        .filter_map(|prepared| match prepared {
+            Ok(declaration) => declaration,
+            Err((name, error)) => {
+                declaration_errors.insert(name.clone(), error);
+                None
+            }
+        })
+        .collect();
     let check = |name: &str,
                  attr: &CompiledAttributeType,
                  value: &Value<ParserPlaceholder, B>,
@@ -720,6 +720,9 @@ fn typed_resource_attribute_admissions<
                  contract: &DestinationContract,
                  boundary: &assignment::ReferenceContext<'_, B>,
                  cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
+        if let Some(error) = declaration_errors.get(name) {
+            return Err(assignment_seam_error(error.clone()));
+        }
         match value {
             Value::Deferred(
                 DeferredValue::Interpolation(_)
@@ -969,8 +972,11 @@ fn typed_resource_attribute_admissions<
         }
         Ok(Default::default())
     };
-    let candidate =
-        |name: &str, proof| match inputs.input(resource, name).map_err(seam_constraint)? {
+    let candidate = |name: &str, proof| {
+        if let Some(error) = declaration_errors.get(name) {
+            return Err(seam_constraint(error.clone()));
+        }
+        match inputs.input(resource, name).map_err(seam_constraint)? {
             AttributeInput::Authored { slot, .. } => {
                 Candidate::validation_slot(slot, proof, Some(bindings), session)
             }
@@ -985,7 +991,8 @@ fn typed_resource_attribute_admissions<
                 Some(bindings),
                 session,
             )),
-        };
+        }
+    };
     let input = if resource.kind() == crate::parser::AnalysisItemKind::Composition {
         ValidationInput::Classified
     } else {

@@ -349,13 +349,13 @@ type ExpandedConfiguration<'a> = carina_core::parser::retained::JudgedFile<
 struct ExpandedDiagnosticValidationInputs<'a> {
     configuration: &'a ExpandedConfiguration<'a>,
     resources: HashMap<&'a carina_core::resource::ResourceId, &'a ExpandedResource<'a>>,
-    coverage: Mutex<carina_core::validation::admission::WalkCoverage>,
+    coverage: carina_core::validation::admission::WalkCoverage,
     binding_index: carina_core::binding_index::BindingIndex<'a, AbsoluteBindingAddress>,
 }
 
 impl ExpandedDiagnosticValidationInputs<'_> {
     fn resource_admissions(
-        &self,
+        &mut self,
         resource_id: &carina_core::resource::ResourceId,
         session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Option<carina_core::schema::ResourceValueValidation> {
@@ -394,10 +394,7 @@ impl ExpandedDiagnosticValidationInputs<'_> {
                 &self.binding_index,
                 session,
                 schemas,
-                &mut self
-                    .coverage
-                    .lock()
-                    .expect("configuration admission coverage"),
+                &mut self.coverage,
             ),
         )
     }
@@ -1191,7 +1188,7 @@ impl DiagnosticRun<'_> {
                     carina_core::parser::AnalysisTree::try_from_file(configuration.judged().file())
                         .ok()
                 });
-            let expanded_validation_inputs = expanded_configuration.as_ref().and_then(|configuration| {
+            let mut expanded_validation_inputs = expanded_configuration.as_ref().and_then(|configuration| {
                 let configuration = configuration.judged();
                 let graph = configuration.file();
                 let tree = expanded_validation_tree.as_ref()?;
@@ -1466,7 +1463,7 @@ impl DiagnosticRun<'_> {
                     );
                 }
             }
-            if let Some(inputs) = expanded_validation_inputs.as_ref() {
+            if let Some(inputs) = expanded_validation_inputs.as_mut() {
                 // A rejected call already owns the diagnostic. Do not add a
                 // downstream resource consequence of that same rejection.
                 let rejected_calls: Vec<_> = diagnostics
@@ -1478,7 +1475,8 @@ impl DiagnosticRun<'_> {
                     .project_resources()
                     .map(|resource| resource.id().clone())
                     .collect();
-                for resource in &inputs.configuration.file().resources {
+                let configuration = inputs.configuration;
+                for resource in &configuration.file().resources {
                     if authored_ids.contains(&resource.id) {
                         continue;
                     }
@@ -1521,13 +1519,17 @@ impl DiagnosticRun<'_> {
                 return diagnostics;
             };
             let authored_resources = authored_validation_resources(&authored_tree);
-            // A buffer can still contain a deferred template after the
-            // directory has materialized its elements. That template has its
-            // own cursor root; it must not borrow the first element's slot.
-            let template_configuration = tree
+            // A buffer may retain a deferred template or use a different file
+            // identity than the directory view. Judge its own inventory when
+            // a directory instance is absent. Loading clones this same parse,
+            // so its declaration/binding/loop key is preserved by construction.
+            let buffer_configuration = tree
                 .project_resources()
                 .any(|resource| {
-                    resource.kind() == carina_core::parser::AnalysisItemKind::DeferredResource
+                    resource.kind() != carina_core::parser::AnalysisItemKind::Composition
+                        && resource
+                            .authored_instance_key()
+                            .is_none_or(|key| !authored_resources.contains_key(&key))
                 })
                 .then(|| {
                     carina_core::config_loader::load_buffer_configuration(
@@ -1536,10 +1538,12 @@ impl DiagnosticRun<'_> {
                         self.provider_context.catalog(),
                     )
                 });
-            let template_tree = template_configuration.as_ref().and_then(|configuration| {
+            let buffer_validation_tree = buffer_configuration.as_ref().and_then(|configuration| {
                 analysis_tree(doc, configuration.judged().file(), &mut diagnostics)
             });
-            let template_resources = template_tree.as_ref().map(authored_validation_resources);
+            let buffer_validation_resources = buffer_validation_tree
+                .as_ref()
+                .map(authored_validation_resources);
             // The document AST intentionally preserves function calls for
             // source-oriented checks. Build a parallel, same-order view with
             // locally resolvable calls evaluated so schema diagnostics see
@@ -1669,15 +1673,11 @@ impl DiagnosticRun<'_> {
                         if rref.kind() == carina_core::parser::AnalysisItemKind::Composition {
                             Some(rref)
                         } else {
-                            let resources = if rref.kind()
-                                == carina_core::parser::AnalysisItemKind::DeferredResource
-                            {
-                                template_resources.as_ref()
-                            } else {
-                                Some(&authored_resources)
-                            };
-                            rref.authored_instance_key()
-                                .and_then(|address| resources?.get(&address).copied())
+                            rref.authored_instance_key().and_then(|address| {
+                                authored_resources.get(&address).copied().or_else(|| {
+                                    buffer_validation_resources.as_ref()?.get(&address).copied()
+                                })
+                            })
                         };
                     let Some(admission_resource) = admission_resource else {
                         let error = carina_core::parser::retained::MissingEvidence::for_resource(
@@ -1695,8 +1695,7 @@ impl DiagnosticRun<'_> {
                         .as_ref()
                         .map(carina_core::resource::attrs_to_hashmap)
                         .unwrap_or_else(|| rref.resolved_attributes());
-                    let mut inputs = carina_core::validation::admission::attributes::ResourceAttributeInputs::new(admission_resource);
-                    inputs.materialize(&resolved_attrs);
+                    let inputs = carina_core::validation::admission::attributes::ResourceAttributeInputs::from_resolved(admission_resource, &resolved_attrs);
                     let knowledge_context =
                         carina_core::resource::knowledge::KnowledgeContext::validation();
                     let mut classification_error =
@@ -1760,7 +1759,7 @@ impl DiagnosticRun<'_> {
                             })
                         })
                     });
-                    let mut value_validation = expanded_validation_inputs.as_ref()
+                    let mut value_validation = expanded_validation_inputs.as_mut()
                         .filter(|_| uses_composition_output)
                         .and_then(|inputs| inputs.resource_admissions(resource_id, self.provider_context))
                         .unwrap_or_else(|| carina_core::validation::admission::attributes::resource_attribute_admissions(

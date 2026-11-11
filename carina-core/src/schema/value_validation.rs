@@ -9,6 +9,77 @@ use crate::resource::ValueKind;
 use crate::resource::knowledge::{KnownView, ShapeView};
 use crate::validation::admission::assignment_seam_error as seam_error;
 
+#[cfg(test)]
+mod cursor_allocations {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+    struct CountingAllocator;
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    fn allocated() {
+        let _ = COUNT.try_with(|count| {
+            if let Some(current) = count.get() {
+                count.set(Some(current + 1));
+            }
+        });
+    }
+    // This test-only allocator forwards every operation and its layout to
+    // System. Only a scoped counter on the current test thread is added.
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            allocated();
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            allocated();
+            unsafe { System.alloc_zeroed(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            allocated();
+            unsafe { System.realloc(ptr, layout, size) }
+        }
+    }
+    pub(super) fn count(run: impl FnOnce()) -> usize {
+        COUNT.set(Some(0));
+        run();
+        COUNT.replace(None).unwrap()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cursor_step_allocations(cursor: AuthoredCursor<'_>) -> usize {
+    let coverage = Default::default();
+    let walk = AssignmentWalk {
+        cursor,
+        check: &|_, _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>, _, _| {
+            Ok(Default::default())
+        },
+        coverage: &coverage,
+    };
+    // Warm the use interner; repeated transport of the same authored edge
+    // must not allocate a new cursor or clone an owned module environment.
+    std::hint::black_box(
+        walk.step(|cursor| cursor.child(0, EdgeRole::ListItem))
+            .unwrap(),
+    );
+    cursor_allocations::count(|| {
+        for _ in 0..128 {
+            std::hint::black_box(
+                walk.step(|cursor| cursor.child(0, EdgeRole::ListItem))
+                    .unwrap(),
+            );
+        }
+    })
+}
+
 /// Assignment checks distinguish a current projection from authored syntax
 /// discarded by selection. Discarded syntax never supplies a fabricated Value.
 #[derive(Debug)]
@@ -30,7 +101,7 @@ pub struct WalkCoverage {
     visits: std::collections::HashSet<(NodeId, UseId, ExpansionInstanceId, ProjectionGeneration)>,
     work: usize,
     generations: std::collections::HashMap<(UseId, ExpansionInstanceId), ProjectionGeneration>,
-    nodes: std::collections::HashSet<(NodeId, crate::parser::retained::ExpressionInstance)>,
+    nodes: std::collections::HashSet<(NodeId, crate::parser::retained::ExpressionEnvironmentId)>,
 }
 
 impl WalkCoverage {
@@ -56,7 +127,7 @@ impl WalkCoverage {
         self.bump((authored.occurrence(), authored.instance()), generation);
         self.nodes.insert((
             authored.node().node_id(),
-            authored.node().environment().clone(),
+            authored.node().environment().id(),
         ));
         self.visits.insert((
             authored.node().node_id(),
@@ -90,7 +161,7 @@ impl WalkCoverage {
         node: NodeId,
         environment: &crate::parser::retained::ExpressionInstance,
     ) -> bool {
-        self.nodes.contains(&(node, environment.clone()))
+        self.nodes.contains(&(node, environment.id()))
     }
     #[cfg(test)]
     pub(crate) fn work(&self) -> usize {
@@ -910,7 +981,7 @@ pub(crate) type AssignmentCheck<'a, P, B> = &'a dyn Fn(
 /// constructs this complete input.
 #[derive(Clone)]
 struct AssignmentWalk<'a, 's, P: PlaceholderKind, B: BindingAddress> {
-    cursor: std::sync::Arc<AuthoredCursor<'s, B>>,
+    cursor: AuthoredCursor<'s, B>,
     check: AssignmentCheck<'a, P, B>,
     coverage: &'a std::cell::RefCell<WalkCoverage>,
 }
@@ -924,7 +995,7 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
             -> Result<AuthoredCursor<'s, B>, crate::parser::retained::MissingEvidence>,
     ) -> Result<Self, TypeError> {
         Ok(Self {
-            cursor: std::sync::Arc::new(advance(&self.cursor).map_err(seam_error)?),
+            cursor: advance(&self.cursor).map_err(seam_error)?,
             ..self.clone()
         })
     }
@@ -934,7 +1005,7 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
         value: CheckValue<'_, P, B>,
         path: &FieldPath,
     ) -> Result<AssignmentFindings, TypeError> {
-        (self.check)(attr, value, &path.canonical(), self.cursor.as_ref().clone())
+        (self.check)(attr, value, &path.canonical(), self.cursor.clone())
     }
 
     fn check_selection(
@@ -956,14 +1027,14 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
     ) -> Result<(Self, AssignmentFindings), TypeError> {
         let mut findings = AssignmentFindings::default();
         let mut followed = std::collections::HashSet::new();
-        while let AuthoredCursor::Authored(usage) = self.cursor.as_ref() {
+        while let AuthoredCursor::Authored(usage) = &self.cursor {
             self.coverage.borrow_mut().record(usage);
             if !followed.insert((usage.node().node_id(), usage.occurrence())) {
                 return Err(seam_error(crate::parser::retained::MissingEvidence::new(
                     "cyclic authored use",
                 )));
             }
-            self.cursor = std::sync::Arc::new(match usage.form() {
+            self.cursor = match usage.form() {
                 AuthoredForm::Forward if usage.child_count() != 0 => AuthoredCursor::Authored(
                     usage
                         .child(usage.child_count() - 1, usage.edge())
@@ -1054,7 +1125,7 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
                 | AuthoredForm::If
                 | AuthoredForm::Coalesce
                 | AuthoredForm::Reference => break,
-            });
+            };
         }
         Ok((self, findings))
     }
@@ -1086,7 +1157,7 @@ pub(crate) fn validate_authored_value_for_admission<
             ancestry,
             &mut Vec::new(),
             Some(AssignmentWalk {
-                cursor: std::sync::Arc::new(cursor),
+                cursor,
                 check: assignment,
                 coverage: &visits,
             }),
@@ -1163,7 +1234,7 @@ pub(crate) fn visit_discarded<P: PlaceholderKind, B: BindingAddress>(
             ),
             AuthoredForm::Parens => child(
                 attr,
-                cursor.child(0, EdgeRole::Parens).map_err(seam_error)?,
+                cursor.child(0, EdgeRole::ListItem).map_err(seam_error)?,
                 path.clone(),
                 ancestry,
             ),
@@ -1361,7 +1432,7 @@ impl<'a> ValueValidator<'a, '_> {
                                 usage,
                                 instance,
                                 generation,
-                                matches!(walk.cursor.as_ref(), AuthoredCursor::CoveredBy(_)),
+                                matches!(&walk.cursor, AuthoredCursor::CoveredBy(_)),
                             )
                         })
                 }),
@@ -1398,7 +1469,7 @@ impl<'a> ValueValidator<'a, '_> {
         if let Some(inner) = value.protected_for_schema(&SchemaEvidenceAuthority(())) {
             let assignment = match assignment {
                 Some(walk) => {
-                    let cursor = match walk.cursor.as_ref() {
+                    let cursor = match &walk.cursor {
                         AuthoredCursor::Authored(usage) if usage.form() == AuthoredForm::Secret => {
                             match walk.step(|cursor| cursor.child(0, EdgeRole::SecretArgument)) {
                                 Ok(child) => child,
@@ -1511,7 +1582,7 @@ impl<'a> ValueValidator<'a, '_> {
             let mut checked =
                 CheckedValue::accepted(attr, FitExactness::EXACT, FitKind::Deferred(pending.fit()));
             if let Some(walk) = &assignment
-                && matches!(walk.cursor.as_ref(), AuthoredCursor::Authored(usage) if usage.form() == AuthoredForm::If)
+                && matches!(&walk.cursor, AuthoredCursor::Authored(usage) if usage.form() == AuthoredForm::If)
             {
                 match walk.check_selection(
                     attr,
@@ -1870,23 +1941,22 @@ impl<'a> ValueValidator<'a, '_> {
             let value = cached[key.as_str()];
             let child_path = path.push_field(key.clone());
             let field = struct_field_for_key(fields, key, ancestry);
-            let child_assignment = match step_assignment(assignment.as_ref(), |cursor| {
-                cursor.field_child(key, field.and_then(|field| ancestry.block_name(field)))
-            }) {
-                Ok(walk) => walk,
-                Err(error) => return CheckedValue::rejected(&child_path, error),
-            };
             let child = match field {
                 Some(field) => match validate_struct_field_assignment(field, key, ancestry) {
                     Some(error) => CheckedValue::rejected(&child_path, error),
-                    None => self.walk_with_assignment(
-                        &field.field_type,
-                        value,
-                        &child_path,
-                        ancestry.descend(field),
-                        &mut Vec::new(),
-                        child_assignment,
-                    ),
+                    None => match step_assignment(assignment.as_ref(), |cursor| {
+                        cursor.field_child(key, ancestry.block_name(field))
+                    }) {
+                        Err(error) => CheckedValue::rejected(&child_path, error),
+                        Ok(child_assignment) => self.walk_with_assignment(
+                            &field.field_type,
+                            value,
+                            &child_path,
+                            ancestry.descend(field),
+                            &mut Vec::new(),
+                            child_assignment,
+                        ),
+                    },
                 },
                 None => CheckedValue::rejected(
                     &child_path,
@@ -2000,20 +2070,19 @@ impl<'a> ValueValidator<'a, '_> {
                 checked.reject(path, error.clone());
                 checked.findings.push_local(next_path.clone(), error);
             }
-            let child_assignment = match step_assignment(assignment.as_ref(), |cursor| {
+            let child = match step_assignment(assignment.as_ref(), |cursor| {
                 cursor.map_child(map_key, EdgeRole::MapValue)
             }) {
-                Ok(walk) => walk,
-                Err(error) => return CheckedValue::rejected(&next_path, error),
+                Err(error) => CheckedValue::rejected(&next_path, error),
+                Ok(child_assignment) => self.walk_with_assignment(
+                    value_type,
+                    map_value,
+                    &next_path,
+                    ancestry,
+                    &mut Vec::new(),
+                    child_assignment,
+                ),
             };
-            let child = self.walk_with_assignment(
-                value_type,
-                map_value,
-                &next_path,
-                ancestry,
-                &mut Vec::new(),
-                child_assignment,
-            );
             let has_coarse_error = child
                 .findings
                 .local
@@ -2100,22 +2169,20 @@ impl<'a> ValueValidator<'a, '_> {
         let mut children = Vec::new();
         let mut child_fits = Vec::new();
         for (i, value) in items.iter().enumerate() {
-            let child_assignment = match step_assignment(assignment.as_ref(), |cursor| {
+            let child = match step_assignment(assignment.as_ref(), |cursor| {
                 cursor.child(i, EdgeRole::ListItem)
             }) {
-                Ok(walk) => walk,
-                Err(error) => return CheckedValue::rejected(&path.push_index(i), error),
-            };
-            let child = self
-                .walk_with_assignment(
+                Err(error) => CheckedValue::rejected(&path.push_index(i), error),
+                Ok(child_assignment) => self.walk_with_assignment(
                     inner,
                     *value,
                     &path.push_index(i),
                     ancestry,
                     &mut Vec::new(),
                     child_assignment,
-                )
-                .wrap_local_errors(|error| error.at_list_index(i));
+                ),
+            }
+            .wrap_local_errors(|error| error.at_list_index(i));
             let (fit, error) = match child.local {
                 LocalOutcome::Accepted(fit) => (Some(fit), None),
                 LocalOutcome::Rejected {

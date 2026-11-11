@@ -243,12 +243,8 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         token: &pest::iterators::Pair<'_, Rule>,
         selected: bool,
     ) {
-        self.record_retained_eval(
-            token,
-            &crate::eval_value::EvalValue::from_value(Value::Concrete(
-                crate::resource::ConcreteValue::Bool(selected),
-            )),
-        );
+        self.authored_nodes
+            .record_selected_condition(token, selected);
     }
 
     pub(super) fn set_authored_nodes(&mut self, nodes: Arc<super::retained::CapturedNodes>) {

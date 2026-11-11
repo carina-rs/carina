@@ -1984,7 +1984,7 @@ struct ModuleScopeResolver<'a> {
     arguments: ArgumentSubstitutions<'a>,
     call_path: &'a crate::resource::ExpandedCompositionCallPath,
     argument_placeholders: HashMap<String, ResolvedArgument<RelativeBindingName>>,
-    condition_selections: std::cell::RefCell<HashMap<crate::parser::retained::NodeId, bool>>,
+    condition_selections: crate::parser::retained::ConditionRecorder,
 }
 
 impl ModuleScopeResolver<'_> {
@@ -2096,7 +2096,7 @@ impl ModuleScopeResolver<'_> {
         let evaluated = evaluate_expanded_module_functions(&substituted, self.arguments.config)?;
         let (value, conditions) =
             crate::value_walk::select_expanded_module_ifs_with_conditions(&evaluated)?;
-        self.condition_selections.borrow_mut().extend(conditions);
+        self.condition_selections.extend(conditions);
         Ok(value)
     }
 
@@ -3174,9 +3174,9 @@ fn expand_module_attributes(
     let mut authored_slots =
         authored_slots.map_bindings(&mut |binding| resolver.scope.resolve(binding));
     for (_, slot) in authored_slots.iter_mut() {
-        crate::value_walk::substitute_module_slot(slot, resolver.arguments);
+        slot.invalidate_judgement();
     }
-    authored_slots.record_condition_selections(&resolver.condition_selections.borrow());
+    authored_slots.record_condition_selections(&resolver.condition_selections);
     authored_slots.replace_projections(&attributes);
     Ok((attributes, authored_slots))
 }

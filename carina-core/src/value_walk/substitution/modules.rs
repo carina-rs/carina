@@ -21,15 +21,6 @@ pub(crate) fn substitute_module_arguments<B: BindingAddress>(
 ) -> Result<Value<ParserPlaceholder, B>, ArgumentSubstitutionError> {
     rewrite_parser_value(value, position, &mut ModuleArgumentRewrite { arguments })
 }
-pub(crate) fn substitute_module_slot<B: BindingAddress>(
-    slot: &mut crate::parser::retained::JudgedSlot<B>,
-    arguments: ArgumentSubstitutions<'_, B>,
-) {
-    slot.map_archived_projections(|value| {
-        substitute_module_arguments(value, arguments, RewritePosition::Value)
-    });
-}
-
 /// Preserve decisions from the existing selection pass without evaluating again.
 pub(crate) fn select_expanded_module_ifs_with_conditions(
     value: &ModuleResolvedValue,

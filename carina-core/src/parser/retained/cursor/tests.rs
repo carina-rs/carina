@@ -25,12 +25,151 @@ fn slot(source: &str) -> JudgedSlot {
 }
 
 #[test]
+fn round1_seam_projection_copies_scale_linearly_for_subnet_slots() {
+    let mut copies = Vec::new();
+    for count in [16, 32] {
+        let subnets = (0..count)
+            .map(|index| format!("{{ cidr = 'net-{index}' zone = 'z' }}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source = format!(
+            "let subnets = [{subnets}]\nfor s in subnets {{ mock.Test {{ input = s.cidr zone = s.zone }} }}"
+        );
+        let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let (parsed, work) = super::super::count_projection_copy_work(|| {
+            crate::parser::parse_file(&source, std::path::Path::new("subnets.crn"), &catalog)
+                .unwrap()
+        });
+        assert_eq!(parsed.iter_all_resources().count(), count);
+        copies.push(work);
+    }
+    assert!(copies[0] > 0, "the shared snapshot copies are counted");
+    assert!(
+        copies[1] <= 2 * copies[0] + 64,
+        "projection copies: {copies:?}"
+    );
+    println!("projection copies for 16/32 instances: {copies:?}");
+}
+
+#[test]
+fn round1_seam_cursor_steps_do_not_allocate() {
+    let slot = slot("let input = ['value']");
+    let mut usage = slot.cursor().unwrap();
+    while usage.form() != AuthoredForm::List {
+        usage = usage.child(0, EdgeRole::ListItem).unwrap();
+    }
+    let allocations =
+        crate::schema::value_validation::cursor_step_allocations(AuthoredCursor::Authored(usage));
+    assert_eq!(allocations, 0, "main has no per-cursor heap allocation");
+}
+
+#[test]
+fn round1_seam_children_are_fallible_instead_of_panicking() {
+    let mut slot = slot("let input = 1 + 2");
+    let child = slot.root.children[0].node_id();
+    let instance = slot.snapshot.instance.clone();
+    Arc::make_mut(&mut Arc::make_mut(&mut slot.snapshot).nodes).remove(&(instance, child));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        slot.cursor().unwrap().node().children().collect::<Vec<_>>()
+    }));
+    assert!(result.is_ok(), "missing child evidence must never panic");
+    assert!(result.unwrap().iter().any(Result::is_err));
+}
+
+#[test]
+fn round1_seam_expansion_records_a_decision_without_a_parse_projection() {
+    let mut slot = slot("arguments { flag: Bool }\nlet input = if flag { 'yes' } else { 'no' }");
+    let mut usage = slot.cursor().unwrap();
+    while usage.form() != AuthoredForm::If {
+        usage = usage.child(usage.child_count() - 1, usage.edge()).unwrap();
+    }
+    let condition = usage.node.node.children[0].node_id();
+    let instance = usage.node.environment.clone();
+    let mut snapshot = (*slot.snapshot).clone();
+    Arc::make_mut(&mut snapshot.projections).remove(&(instance, condition));
+    slot.snapshot = Arc::new(snapshot);
+    slot.conditions = ConditionSnapshot::default();
+    // Model an unavailable parse-time projection and the value already
+    // selected by module expansion. Main admits this String without findings.
+    slot = slot.materialized(&Value::Concrete(crate::resource::ConcreteValue::String(
+        "yes".into(),
+    )));
+    let mut slots = AuthoredSlots::default();
+    slots.slots.insert("input".into(), slot);
+    let decisions = super::super::ConditionRecorder::default();
+    decisions.extend([(condition, true)]);
+    slots.record_condition_selections(&decisions);
+    let slot = slots.get("input").unwrap();
+    let mut usage = slot.cursor().unwrap();
+    while usage.form() != AuthoredForm::If {
+        usage = usage.child(usage.child_count() - 1, usage.edge()).unwrap();
+    }
+    assert_eq!(
+        usage.known_condition(),
+        Ok(true),
+        "the selection already taken by expansion is authoritative"
+    );
+    let schema = crate::schema::ResourceSchema::new("Test")
+        .attribute(
+            crate::schema::AttributeSchema::optional(
+                "input",
+                crate::schema::AttributeType::string(),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let proof = slot
+        .projection()
+        .unwrap()
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .unwrap()
+        .into_classification();
+    let findings = crate::schema::value_validation::validate_authored_value_for_admission(
+        &schema.as_schema().attributes()["input"].attr_type,
+        &proof,
+        schema.as_schema().defs(),
+        crate::schema::FieldAncestry::WRITABLE,
+        &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
+        AuthoredCursor::Authored(slot.cursor().unwrap()),
+        &|_, _, _, _| Ok(Default::default()),
+        &mut Default::default(),
+    );
+    assert!(findings.local_error().is_none(), "{findings:?}");
+}
+
+#[test]
+fn round1_seam_materialization_reports_unmatched_attribute_names() {
+    let parsed = crate::parser::parse_and_resolve("mock.Test { input = 'value' }").unwrap();
+    let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let schemas = SchemaRegistry::new();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let tree = crate::parser::AnalysisTree::try_from_file(configuration.judged().file()).unwrap();
+    let mut inputs = crate::validation::admission::attributes::ResourceAttributeInputs::new(
+        tree.resources().next().unwrap(),
+    );
+    let outcome = inputs.materialize(&std::collections::HashMap::from([(
+        "unmatched".into(),
+        Value::Concrete(crate::resource::ConcreteValue::Int(1)),
+    )]));
+    assert!(
+        format!("{outcome:?}").contains("unmatched"),
+        "unmatched names must be reported: {outcome:?}"
+    );
+}
+
+#[test]
 fn cursor_api_children_and_edges_share_the_judged_snapshot() {
     let slot = slot("let input = secret(('text'))");
     let mut usage = slot.cursor().unwrap();
     assert_eq!(usage.edge(), EdgeRole::SlotRoot);
     loop {
-        let children = usage.node().children().collect::<Vec<_>>();
+        let children = usage
+            .node()
+            .children()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         for child in &children {
             assert_eq!(child.generation(), slot.generation());
             assert_eq!(
@@ -335,7 +474,7 @@ fn seam_computed_operand_evidence_is_paired_by_parser_identity() {
         .node()
         .retained_node(expression.operator_span().node_id().unwrap())
         .unwrap();
-    let operands = node.children().collect::<Vec<_>>();
+    let operands = node.children().collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(operands.len(), 2);
     assert_eq!(operands[0].judgement().static_type(), Ok(&TypeExpr::Int));
     assert_eq!(operands[1].judgement().static_type(), Ok(&TypeExpr::Int));
@@ -1704,10 +1843,12 @@ fn review_seam_producer_materialization_keeps_a_real_projection_pairing() {
     let resource = tree.resources().next().unwrap();
     let source = resource.authored_slot("input").unwrap();
     let mut inputs = ResourceAttributeInputs::new(resource);
-    inputs.materialize(&std::collections::HashMap::from([(
-        "input".into(),
-        Value::Concrete(crate::resource::ConcreteValue::String("after".into())),
-    )]));
+    inputs
+        .materialize(&std::collections::HashMap::from([(
+            "input".into(),
+            Value::Concrete(crate::resource::ConcreteValue::String("after".into())),
+        )]))
+        .unwrap();
     let proofs = inputs.classify(
         &crate::resource::knowledge::KnowledgeContext::validation(),
         |_, error| panic!("{error}"),
