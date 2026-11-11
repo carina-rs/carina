@@ -5,7 +5,6 @@ use std::ops::Deref;
 
 use super::{UpstreamExportEntries, UpstreamExportType};
 use crate::resource::{Value, knowledge::KnowledgeContext};
-use crate::static_type::{ConsumerExportStaticType, StaticType, StaticTypeResolutionError};
 use crate::validation::deferred_types::ProviderTypeCheckContext;
 use crate::validation::typecheck::{TypeExprValueError, TypecheckProviderContext};
 
@@ -17,9 +16,10 @@ pub type AdmittedRemoteBindings = HashMap<String, AdmittedUpstreamExports>;
 ///
 /// Known source types have passed admission. When the source has no known type,
 /// values are explicitly installed without source-type admission; consumers still
-/// check their actual values against destination types. An unresolved explicit
-/// named declaration remains an error. Only admission constructs this snapshot;
-/// it has no mutable view or deserialization path.
+/// check their actual values against destination types. This also covers explicit
+/// named declarations unavailable in the consumer's installed schemas. Only
+/// admission constructs this snapshot; it has no mutable view or deserialization
+/// path.
 ///
 /// ```compile_fail
 /// use carina_core::upstream_exports::AdmittedUpstreamExports;
@@ -44,19 +44,14 @@ pub struct AdmittedUpstreamExports {
 pub enum ExportSourceAdmission {
     /// The value satisfies its declared-Known or inferred-Known source type.
     Admitted,
-    /// Source inference supplied no known type. Destination checks use the
-    /// actual value at plan/apply, as they do for unchecked references.
+    /// Source inference or declaration resolution supplied no known type.
+    /// Destination checks use the actual value at plan/apply, as they do for
+    /// unchecked references.
     InstalledWithoutSourceType,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum UpstreamExportAdmissionError {
-    #[error("upstream export '{binding}.{key}': source declaration could not be resolved: {error}")]
-    DeclaredTypeUnavailable {
-        binding: String,
-        key: String,
-        error: Box<StaticTypeResolutionError>,
-    },
     #[error("upstream export '{binding}.{key}': {error}")]
     InvalidValue {
         binding: String,
@@ -69,9 +64,9 @@ pub enum UpstreamExportAdmissionError {
 
 impl AdmittedUpstreamExports {
     /// Classify every supplied source export without evaluating source values.
-    /// Known types are checked; unavailable inference intentionally leaves the
-    /// value for destination admission. Explicit named declarations still need
-    /// downstream provider metadata. Stale keys are omitted.
+    /// Known types are checked; unavailable inference or declaration metadata
+    /// intentionally leaves the value for destination admission. Stale keys are
+    /// omitted.
     pub fn admit(
         binding: &str,
         declarations: &UpstreamExportEntries,
@@ -85,17 +80,6 @@ impl AdmittedUpstreamExports {
                 continue;
             };
             let expected = match &declaration.static_type {
-                // This provenance means an explicit annotation failed named-type
-                // resolution, rather than that source inference found no type.
-                UpstreamExportType::Static(ConsumerExportStaticType::Declared(
-                    StaticType::Unchecked(reason),
-                )) => {
-                    return Err(UpstreamExportAdmissionError::DeclaredTypeUnavailable {
-                        binding: binding.into(),
-                        key,
-                        error: Box::new(reason.resolution_error().clone()),
-                    });
-                }
                 UpstreamExportType::Static(static_type) => static_type.known(),
                 UpstreamExportType::InferenceNotRun => None,
             };
@@ -224,7 +208,7 @@ mod tests {
     use crate::resource::ConcreteValue;
     use crate::static_type::{
         ConsumerExportStaticType, ConsumerInferredUncheckedReason, ConsumerResolvedType,
-        InferenceError, NotInferableReason,
+        InferenceError, NotInferableReason, StaticType,
     };
 
     struct NoWarnings;
@@ -358,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn named_export_without_provider_metadata_is_a_typed_error() {
+    fn named_export_without_provider_metadata_installs_without_source_admission() {
         let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let expected = TypeExpr::DottedUnresolved(ResourceTypePath::new("unavailable", "Thing.Id"));
         let declarations = HashMap::from([(
@@ -370,23 +354,27 @@ mod tests {
                 value: None,
             },
         )]);
-        let error = crate::validation::deferred_types::with_session_for_test(&context, |session| {
-            AdmittedUpstreamExports::admit(
-                "orgs",
-                &declarations,
-                HashMap::from([(
-                    "id".into(),
-                    Value::Concrete(ConcreteValue::String("id-123".into())),
-                )]),
-                session,
-            )
-        })
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            UpstreamExportAdmissionError::DeclaredTypeUnavailable { .. }
-                | UpstreamExportAdmissionError::InvalidValue { .. }
-        ));
-        assert!(error.to_string().contains("orgs.id"));
+        let checks =
+            crate::validation::deferred_types::TypeCheckSession::run(&context, |session| {
+                AdmittedUpstreamExports::admit(
+                    "orgs",
+                    &declarations,
+                    HashMap::from([(
+                        "id".into(),
+                        Value::Concrete(ConcreteValue::String("id-123".into())),
+                    )]),
+                    session,
+                )
+            });
+        assert!(checks.diagnostics().is_empty());
+        let installed = checks.publish(&mut NoWarnings).unwrap();
+        assert_eq!(
+            installed["id"],
+            Value::Concrete(ConcreteValue::String("id-123".into()))
+        );
+        assert_eq!(
+            installed.source_admission("id"),
+            Some(ExportSourceAdmission::InstalledWithoutSourceType)
+        );
     }
 }
