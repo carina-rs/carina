@@ -17,7 +17,7 @@ use crate::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StringIdentityLayer,
     StringMemberConstraints, StructField, TypeIdentity,
 };
-use crate::validation::admission::{Candidate, admit};
+use crate::validation::admission::{Candidate, admit, attributes::ResourceAttributeInputs};
 use crate::validation::deferred_types::with_session_for_test;
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
@@ -310,7 +310,13 @@ where
     D: Clone
         + DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, AbsoluteBindingAddress>,
 {
-    let configuration = crate::config_loader::load_buffer_configuration(parsed, schemas, catalog);
+    // Reports now travel with the file. Seed stale or detached reports before
+    // the ordinary judgement boundary so these cases still require rejudging.
+    let mut parsed = parsed.clone();
+    if let Some(report) = supplied {
+        crate::parser::retained::attach_report(&mut parsed, report.clone());
+    }
+    let configuration = crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
     let judged = configuration.judged();
     let tree =
         crate::parser::AnalysisTree::try_from_file(judged.file()).map_err(|e| e.to_string())?;
@@ -334,8 +340,11 @@ where
             .filter(|resource| resource.kind() != crate::parser::AnalysisItemKind::Composition)
         {
             let attributes = resource.attributes();
+            let inputs = ResourceAttributeInputs::new(resource);
             let classified = collect_classified_attributes(
-                attributes.iter().map(|(name, value)| (name.clone(), value)),
+                inputs
+                    .values()
+                    .map(|(name, value)| (name.to_owned(), value)),
                 &KnowledgeContext::validation(),
                 |_, _| {},
             );
@@ -344,7 +353,7 @@ where
                 .ok_or_else(|| format!("missing fixture schema: {:?}", resource.id()))?;
             let admitted = crate::validation::admission::attributes::resource_attribute_admissions_with_coverage(
                 resource, judged.file(), schema, &classified, resource.quoted_string_attrs(),
-                supplied.unwrap_or_else(|| judged.report()), &bindings, session, schemas, &mut coverage,
+                &inputs, &bindings, session, schemas, &mut coverage,
             );
             let local = admitted
                 .errors()
