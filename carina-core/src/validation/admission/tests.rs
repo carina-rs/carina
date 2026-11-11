@@ -222,13 +222,9 @@ fn retained_reference_boundaries_are_built_per_attribute_not_per_leaf() {
                 .unwrap();
             let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
             let inputs = attributes::ResourceAttributeInputs::new(resource);
-            let attributes = crate::resource::knowledge::collect_classified_attributes(
-                inputs
-                    .values()
-                    .map(|(name, value)| (name.to_owned(), value)),
-                &KnowledgeContext::validation(),
-                |_, error| panic!("classification: {error:?}"),
-            );
+            let attributes = inputs.classify(&KnowledgeContext::validation(), |_, error| {
+                panic!("classification: {error:?}")
+            });
             with_session_for_test(&catalog, |session| {
                 let (findings, work) = count_admission_work(|| {
                     attributes::resource_attribute_admissions(
@@ -241,6 +237,7 @@ fn retained_reference_boundaries_are_built_per_attribute_not_per_leaf() {
                         &bindings,
                         session,
                         &schemas,
+                        &mut Default::default(),
                     )
                 });
                 assert_eq!(findings.errors().count(), 0, "{leaf}: {findings:?}");

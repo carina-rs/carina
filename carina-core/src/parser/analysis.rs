@@ -1387,15 +1387,17 @@ where
         }
     }
 
-    pub fn authored_declaration_id(&self) -> Option<&'a super::retained::SlotDeclarationId> {
+    fn authored_slots(&self) -> Option<&'a super::retained::AuthoredSlots<B>> {
         match self.resource {
-            ResourceRef::Resource(resource) => resource.authored_slots.declaration_id(),
-            ResourceRef::DataSource(resource) => resource.authored_slots.declaration_id(),
-            ResourceRef::Deferred { resource, .. } => {
-                resource.as_resource().authored_slots.declaration_id()
-            }
+            ResourceRef::Resource(resource) => Some(&resource.authored_slots),
+            ResourceRef::DataSource(source) => Some(&source.authored_slots),
+            ResourceRef::Deferred { resource, .. } => Some(&resource.as_resource().authored_slots),
             ResourceRef::LiveComposition(_) => None,
         }
+    }
+
+    pub fn authored_declaration_id(&self) -> Option<&'a super::retained::SlotDeclarationId> {
+        self.authored_slots()?.declaration_id()
     }
 
     /// Stable source address of a resource use, including its loop element.
@@ -1426,30 +1428,20 @@ where
     }
 
     pub(crate) fn projected_phase(&self, name: &str) -> Option<super::retained::ProjectedPhase> {
-        match self.resource {
-            ResourceRef::Resource(resource) => resource.authored_slots.projected_phase(name),
-            ResourceRef::DataSource(resource) => resource.authored_slots.projected_phase(name),
-            ResourceRef::Deferred { resource, .. } => {
-                resource.as_resource().authored_slots.projected_phase(name)
-            }
-            ResourceRef::LiveComposition(_) => None,
-        }
+        self.authored_slots()?.projected_phase(name)
     }
 
     pub fn authored_slot(
         &self,
         name: &str,
     ) -> Result<&'a super::retained::JudgedSlot<B>, super::retained::MissingEvidence> {
-        match self.resource {
-            ResourceRef::Resource(resource) => resource.authored_slots.get(name),
-            ResourceRef::DataSource(resource) => resource.authored_slots.get(name),
-            ResourceRef::Deferred { resource, .. } => {
-                resource.as_resource().authored_slots.get(name)
-            }
-            ResourceRef::LiveComposition(_) => Err(super::retained::MissingEvidence::new(
-                "composition attribute has no authored resource slot",
-            )),
-        }
+        self.authored_slots()
+            .ok_or_else(|| {
+                super::retained::MissingEvidence::new(
+                    "composition attribute has no authored resource slot",
+                )
+            })?
+            .get(name)
     }
 
     pub fn location(&self) -> &'a DeclarationLocation {

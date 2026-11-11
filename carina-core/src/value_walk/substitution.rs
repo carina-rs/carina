@@ -11,12 +11,12 @@ use crate::{
     resource::{DiagnosticSourceLine, InsideSecret, ParserPlaceholder},
 };
 pub(crate) use functions::{substitute_function_call_argument, substitute_function_parameters};
+#[cfg(test)]
+pub(crate) use modules::select_authored_module_ifs;
 pub(crate) use modules::{
     evaluate_expanded_module_functions, select_expanded_module_ifs_with_conditions,
     substitute_module_arguments, substitute_module_slot,
 };
-#[cfg(test)]
-pub(crate) use modules::{select_authored_module_ifs, select_expanded_module_ifs};
 
 #[derive(Clone, Copy)]
 pub(crate) enum RewritePosition {

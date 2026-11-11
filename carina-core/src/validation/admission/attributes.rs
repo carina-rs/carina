@@ -611,56 +611,6 @@ pub fn resource_attribute_admissions<
     bindings: &BindingIndex<'_, B>,
     session: &dyn ProviderTypeCheckContext,
     schemas: &SchemaRegistry,
-) -> crate::schema::ResourceValueValidation {
-    resource_attribute_admissions_with_coverage(
-        resource,
-        parsed,
-        schema,
-        attributes,
-        quoted,
-        inputs,
-        bindings,
-        session,
-        schemas,
-        &mut WalkCoverage::default(),
-    )
-}
-
-/// Admit every analysis item using the same destination-kind policy.
-#[allow(clippy::too_many_arguments)]
-pub fn resource_attribute_admissions_with_coverage<
-    B: BindingAddress,
-    D: crate::parser::DeferredForPhaseTraversal<
-            crate::resource::ParserPlaceholder,
-            crate::resource::ParserPlaceholder,
-            B,
-        >,
-    E,
->(
-    resource: &crate::parser::AnalysisResourceRef<
-        '_,
-        crate::resource::ParserPlaceholder,
-        crate::resource::ParserPlaceholder,
-        D,
-        B,
-    >,
-    parsed: &crate::parser::File<
-        E,
-        crate::resource::ParserPlaceholder,
-        crate::resource::ParserPlaceholder,
-        D,
-        B,
-    >,
-    schema: crate::schema::OwnerBoundResourceSchema<'_>,
-    attributes: &std::collections::HashMap<
-        String,
-        crate::resource::knowledge::Classification<'_, crate::resource::ParserPlaceholder, B>,
-    >,
-    quoted: &std::collections::HashSet<String>,
-    inputs: &ResourceAttributeInputs<B>,
-    bindings: &BindingIndex<'_, B>,
-    session: &dyn ProviderTypeCheckContext,
-    schemas: &SchemaRegistry,
     coverage: &mut WalkCoverage,
 ) -> crate::schema::ResourceValueValidation {
     let visits = std::cell::RefCell::new(std::mem::take(coverage));
@@ -721,26 +671,16 @@ fn typed_resource_attribute_admissions<
     let declarations = attributes
         .iter()
         .map(|(name, proof)| {
-            let source = inputs
+            let expression = match inputs
                 .input(resource, name)
-                .map_err(|error| (name, error))?;
-            let cursor = match source {
-                AttributeInput::Authored { slot, .. } => {
-                    Some(slot.cursor().map_err(|error| (name, error))?)
-                }
-                AttributeInput::Composition(_) => None,
-                AttributeInput::Projected { .. } => return Ok(None),
-                AttributeInput::Unavailable { error, .. } => return Err((name, error.clone())),
-            };
-            let expression = match &cursor {
-                Some(
-                    crate::parser::retained::AuthoredCursor::Authored(usage)
-                    | crate::parser::retained::AuthoredCursor::CoveredBy(usage),
-                ) => usage.node().judgement(),
-                Some(crate::parser::retained::AuthoredCursor::Projected(_)) => {
-                    unreachable!("authored slot")
-                }
-                None => parsed
+                .map_err(|error| (name, error))?
+            {
+                AttributeInput::Authored { slot } => slot
+                    .cursor()
+                    .map_err(|error| (name, error))?
+                    .node()
+                    .judgement(),
+                AttributeInput::Composition => parsed
                     .expression_report()
                     .for_resource(resource.id())
                     .and_then(|report| {
@@ -750,6 +690,7 @@ fn typed_resource_attribute_admissions<
                         )
                     })
                     .map_err(|error| (name, error))?,
+                AttributeInput::Projected { .. } => return Ok(None),
             };
             let value = expression.assignment_value(
                 crate::resource::knowledge::ClassifiedRef::from(proof).diagnostic_value(),
@@ -800,48 +741,48 @@ fn typed_resource_attribute_admissions<
                 | DeferredValue::Placeholder(_),
             ) => return Ok(Default::default()),
         }
-        let authored = match &cursor {
+        enum Evidence<'a, B: BindingAddress> {
+            Node(crate::parser::retained::JudgedNodeRef<'a, B>),
+            Report(&'a crate::parser::retained::ExpressionReport<B>),
+        }
+        let evidence = match &cursor {
             crate::parser::retained::AuthoredCursor::Authored(usage)
-            | crate::parser::retained::AuthoredCursor::CoveredBy(usage) => Some(usage.node()),
+            | crate::parser::retained::AuthoredCursor::CoveredBy(usage) => {
+                Evidence::Node(usage.node().clone())
+            }
             crate::parser::retained::AuthoredCursor::Projected(_)
                 if resource.kind() == crate::parser::AnalysisItemKind::Composition =>
             {
-                None
+                Evidence::Report(
+                    parsed
+                        .expression_report()
+                        .for_resource(resource.id())
+                        .map_err(assignment_seam_error)?,
+                )
             }
             crate::parser::retained::AuthoredCursor::Projected(_) => return Ok(Default::default()),
         };
-        // Compositions have no resource slot in 1b. Retain main's scoped
-        // report path until their producer captures authored slots as well.
-        let compatibility_report = if authored.is_none() {
-            Some(
-                parsed
-                    .expression_report()
-                    .for_resource(resource.id())
-                    .map_err(assignment_seam_error)?,
-            )
-        } else {
-            None
-        };
-        let expression = if let Some(authored) = authored {
-            authored.judgement()
-        } else {
-            let relative = _path.segments().iter().skip(1).fold(
-                crate::schema::FieldPath::new(),
-                |path, step| match step {
-                    LeafPathSegment::StructField(name) => path.push_field(name),
-                    LeafPathSegment::ListIndex(index) => path.push_index(*index),
-                    LeafPathSegment::MapKey(key) => path.push_map_key(key.expose_plaintext()),
-                },
-            );
-            let report = compatibility_report.expect("composition report");
-            report
-                .expression(resource.attribute_value_location(name, &relative))
-                .or_else(|_| {
-                    report.expression(
-                        resource.attribute_value_location(name, &crate::schema::FieldPath::new()),
-                    )
-                })
-                .map_err(assignment_seam_error)?
+        let expression = match &evidence {
+            Evidence::Node(node) => node.judgement(),
+            Evidence::Report(report) => {
+                let relative = _path.segments().iter().skip(1).fold(
+                    crate::schema::FieldPath::new(),
+                    |path, step| match step {
+                        LeafPathSegment::StructField(name) => path.push_field(name),
+                        LeafPathSegment::ListIndex(index) => path.push_index(*index),
+                        LeafPathSegment::MapKey(key) => path.push_map_key(key.expose_plaintext()),
+                    },
+                );
+                report
+                    .expression(resource.attribute_value_location(name, &relative))
+                    .or_else(|_| {
+                        report.expression(
+                            resource
+                                .attribute_value_location(name, &crate::schema::FieldPath::new()),
+                        )
+                    })
+                    .map_err(assignment_seam_error)?
+            }
         };
         let sink = attr
             .in_schema(schema.schema().as_schema().defs())
@@ -902,8 +843,8 @@ fn typed_resource_attribute_admissions<
                     };
                     let expression = match access {
                         Value::Deferred(DeferredValue::Access(access)) => {
-                            let evidence = if let Some(authored) = authored {
-                                access
+                            let access_evidence = match &evidence {
+                                Evidence::Node(authored) => access
                                     .access_locations()
                                     .ok_or_else(|| {
                                         crate::parser::retained::MissingEvidence::new(
@@ -912,13 +853,10 @@ fn typed_resource_attribute_admissions<
                                     })
                                     .and_then(|locations| locations.node_id())
                                     .and_then(|id| authored.retained_node(id))
-                                    .map(|node| node.judgement())
-                            } else {
-                                compatibility_report
-                                    .expect("composition report")
-                                    .access(access)
+                                    .map(|node| node.judgement()),
+                                Evidence::Report(report) => report.access(access),
                             };
-                            match evidence {
+                            match access_evidence {
                                 Ok(expression) => expression,
                                 Err(error) => {
                                     return vec![
@@ -985,9 +923,9 @@ fn typed_resource_attribute_admissions<
                 })?;
             }
             Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
-                let operands: &dyn crate::validation::IntegerOperandEvidence<B> = match authored {
-                    Some(node) => node,
-                    None => compatibility_report.expect("composition report"),
+                let operands: &dyn crate::validation::IntegerOperandEvidence<B> = match &evidence {
+                    Evidence::Node(node) => node,
+                    Evidence::Report(report) => *report,
                 };
                 if let Some(finding) = crate::validation::check_integer_arithmetic_types_with_sink(
                     value,
@@ -1031,14 +969,8 @@ fn typed_resource_attribute_admissions<
         }
         Ok(Default::default())
     };
-    let candidate = |name: &str, proof| {
-        let mismatch = |error| {
-            constraints(vec![AdmissionFinding {
-                path: LeafPath::from_segments([]),
-                error: assignment_seam_error(error),
-            }])
-        };
-        match inputs.input(resource, name).map_err(mismatch)? {
+    let candidate =
+        |name: &str, proof| match inputs.input(resource, name).map_err(seam_constraint)? {
             AttributeInput::Authored { slot, .. } => {
                 Candidate::validation_slot(slot, proof, Some(bindings), session)
             }
@@ -1046,16 +978,14 @@ fn typed_resource_attribute_admissions<
                 proof,
                 Some(bindings),
                 session,
-                *phase,
+                phase,
             )),
-            AttributeInput::Composition(_) => Ok(Candidate::validation_classified(
+            AttributeInput::Composition => Ok(Candidate::validation_classified(
                 proof,
                 Some(bindings),
                 session,
             )),
-            AttributeInput::Unavailable { error, .. } => Err(mismatch(error.clone())),
-        }
-    };
+        };
     let input = if resource.kind() == crate::parser::AnalysisItemKind::Composition {
         ValidationInput::Classified
     } else {

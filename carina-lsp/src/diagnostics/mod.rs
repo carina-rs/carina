@@ -38,24 +38,10 @@ fn authored_validation_resources<'t, 'a>(
     carina_core::parser::AuthoredResourceInstanceKey<'a>,
     &'t carina_core::parser::AnalysisResourceRef<'a>,
 > {
-    let mut resources = HashMap::new();
-    for resource in tree.project_resources() {
-        if let Some(address) = resource.authored_instance_key() {
-            resources.insert(address, resource);
-        }
-    }
-    resources
+    tree.project_resources()
+        .filter_map(|resource| resource.authored_instance_key().map(|key| (key, resource)))
+        .collect()
 }
-
-fn authored_validation_tree<'a>(
-    doc: &Document,
-    file: &'a carina_core::parser::ParsedFile,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Option<carina_core::parser::AnalysisTree<'a>> {
-    analysis_tree(doc, file, diagnostics)
-}
-
-use carina_core::resource::knowledge::collect_classified_attributes;
 
 type ExpandedAnalysis<'a> = carina_core::parser::AnalysisTree<
     'a,
@@ -378,10 +364,7 @@ impl ExpandedDiagnosticValidationInputs<'_> {
         let schema = resource.schema(schemas)?;
         let inputs =
             carina_core::validation::admission::attributes::ResourceAttributeInputs::new(resource);
-        let mut classified = collect_classified_attributes(
-            inputs
-                .values()
-                .map(|(name, value)| (name.to_owned(), value)),
+        let mut classified = inputs.classify(
             &carina_core::resource::knowledge::KnowledgeContext::validation(),
             |_, _| {},
         );
@@ -394,31 +377,29 @@ impl ExpandedDiagnosticValidationInputs<'_> {
             })
             .collect::<HashMap<_, _>>();
         let mut evaluated_inputs = inputs.clone();
-        evaluated_inputs.materialize(&evaluated);
-        classified.extend(collect_classified_attributes(
-            evaluated.keys().map(|name| {
-                (
-                    name.clone(),
-                    evaluated_inputs
-                        .value(name)
-                        .expect("evaluated prepared attribute"),
-                )
-            }),
+        let (evaluated_inputs, updated) = evaluated_inputs.materialize_and_classify(
+            &evaluated,
             &carina_core::resource::knowledge::KnowledgeContext::validation(),
             |_, _| {},
-        ));
-        Some(carina_core::validation::admission::attributes::resource_attribute_admissions_with_coverage(
-            resource,
-            self.configuration.file(),
-            schema,
-            &classified,
-            resource.quoted_string_attrs(),
-            &evaluated_inputs,
-            &self.binding_index,
-            session,
-            schemas,
-            &mut self.coverage.lock().expect("configuration admission coverage"),
-        ))
+        );
+        classified.extend(updated);
+        Some(
+            carina_core::validation::admission::attributes::resource_attribute_admissions(
+                resource,
+                self.configuration.file(),
+                schema,
+                &classified,
+                resource.quoted_string_attrs(),
+                evaluated_inputs,
+                &self.binding_index,
+                session,
+                schemas,
+                &mut self
+                    .coverage
+                    .lock()
+                    .expect("configuration admission coverage"),
+            ),
+        )
     }
 }
 
@@ -1532,7 +1513,7 @@ impl DiagnosticRun<'_> {
             }
             // Admission reads the sealed slots and projections owned by the
             // judged directory. Source locations still anchor each diagnostic.
-            let Some(authored_tree) = authored_validation_tree(
+            let Some(authored_tree) = analysis_tree(
                 doc,
                 pre_expansion_configuration.judged().file(),
                 &mut diagnostics,
@@ -1556,7 +1537,7 @@ impl DiagnosticRun<'_> {
                     )
                 });
             let template_tree = template_configuration.as_ref().and_then(|configuration| {
-                authored_validation_tree(doc, configuration.judged().file(), &mut diagnostics)
+                analysis_tree(doc, configuration.judged().file(), &mut diagnostics)
             });
             let template_resources = template_tree.as_ref().map(authored_validation_resources);
             // The document AST intentionally preserves function calls for
@@ -1738,13 +1719,8 @@ impl DiagnosticRun<'_> {
                                 finding.detail().clone(),
                             ));
                         };
-                    let mut classified_attrs = collect_classified_attributes(
-                        inputs
-                            .values()
-                            .map(|(name, value)| (name.to_owned(), value)),
-                        &knowledge_context,
-                        &mut classification_error,
-                    );
+                    let mut classified_attrs =
+                        inputs.classify(&knowledge_context, &mut classification_error);
                     // Reuse each authored classification. Fully known inputs
                     // already contain their value; only a newly evaluated
                     // candidate needs its own classification.
@@ -1768,19 +1744,12 @@ impl DiagnosticRun<'_> {
                         })
                         .collect::<HashMap<_, _>>();
                     let mut evaluated_inputs = inputs.clone();
-                    evaluated_inputs.materialize(&evaluated_attrs);
-                    classified_attrs.extend(collect_classified_attributes(
-                        evaluated_attrs.keys().map(|name| {
-                            (
-                                name.clone(),
-                                evaluated_inputs
-                                    .value(name)
-                                    .expect("evaluated prepared attribute"),
-                            )
-                        }),
+                    let (evaluated_inputs, updated) = evaluated_inputs.materialize_and_classify(
+                        &evaluated_attrs,
                         &knowledge_context,
                         classification_error,
-                    ));
+                    );
+                    classified_attrs.extend(updated);
                     // Expansion supplies the binding authority for composition
                     // exports. Select that input before admitting attributes;
                     // the authored tree below supplies only rendering locations.
@@ -1794,8 +1763,8 @@ impl DiagnosticRun<'_> {
                     let mut value_validation = expanded_validation_inputs.as_ref()
                         .filter(|_| uses_composition_output)
                         .and_then(|inputs| inputs.resource_admissions(resource_id, self.provider_context))
-                        .unwrap_or_else(|| carina_core::validation::admission::attributes::resource_attribute_admissions_with_coverage(
-                            admission_resource, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, &evaluated_inputs, &binding_index, self.provider_context, &self.schemas, &mut authored_coverage,
+                        .unwrap_or_else(|| carina_core::validation::admission::attributes::resource_attribute_admissions(
+                            admission_resource, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, evaluated_inputs, &binding_index, self.provider_context, &self.schemas, &mut authored_coverage,
                         ));
                     let mut reported_attribute_diagnostics = HashSet::new();
                     let retained_failures = resource_attributes

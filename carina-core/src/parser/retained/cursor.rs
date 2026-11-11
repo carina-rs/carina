@@ -2,7 +2,7 @@
 
 use super::{
     AuthoredExpr, ExprKind, ExpressionInstance, ExpressionLocation, ExpressionReport, JudgedExpr,
-    MissingEvidence, Projection, SinkExpression,
+    MissingEvidence, Projection,
 };
 use crate::resource::knowledge::{Apply, Knowledge, PlanResolved};
 use crate::resource::{
@@ -170,17 +170,7 @@ impl<B: BindingAddress> UseRoot<B> {
             projections: Arc::new(
                 self.projections
                     .iter()
-                    .map(|(id, value)| {
-                        (
-                            *id,
-                            match value {
-                                Projection::Pending => Projection::Pending,
-                                Projection::Value(value) => {
-                                    Projection::Value(value.clone().map_bindings(map))
-                                }
-                            },
-                        )
-                    })
+                    .map(|(id, value)| (*id, value.clone().map_bindings(map)))
                     .collect(),
             ),
         }
@@ -592,6 +582,7 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
             Self::Projected(_) => None,
         }
     }
+    #[cfg(test)]
     pub(crate) fn for_map_key(&self) -> Self {
         match self {
             Self::Authored(usage) | Self::CoveredBy(usage) => {
@@ -684,16 +675,6 @@ impl<B: BindingAddress> std::fmt::Debug for JudgedSlot<B> {
 }
 
 impl JudgedSlot {
-    /// Capture the complete parser sink. Only a current report can subsequently
-    /// seal its cursor; the parser cannot mint judgement from a reduced value.
-    pub(in crate::parser) fn from_sink(
-        sink: SinkExpression,
-        schema_kind: crate::schema::SchemaKind,
-        instance: ExpansionInstanceId,
-    ) -> Self {
-        Self::from_expression(sink.expression, schema_kind, instance)
-    }
-
     fn from_expression(
         expression: super::ExprValue,
         schema_kind: crate::schema::SchemaKind,
@@ -740,24 +721,20 @@ impl<B: BindingAddress> JudgedSlot<B> {
         }
     }
 
-    pub fn cursor(&self) -> Result<AuthoredCursor<'_, B>, MissingEvidence> {
-        if self
+    pub fn cursor(&self) -> Result<AuthoredUse<'_, B>, MissingEvidence> {
+        let judgement = self
             .snapshot
             .node(&self.snapshot.instance, self.root.id)
-            .is_none()
-        {
-            return Err(MissingEvidence::new(format!(
-                "slot {:?} requires a current judgement",
-                self.root.id
-            )));
-        }
-        Ok(AuthoredCursor::Authored(AuthoredUse {
+            .ok_or_else(|| {
+                MissingEvidence::new(format!(
+                    "slot {:?} requires a current judgement",
+                    self.root.id
+                ))
+            })?;
+        Ok(AuthoredUse {
             node: JudgedNodeRef {
                 node: &self.root,
-                judgement: self
-                    .snapshot
-                    .node(&self.snapshot.instance, self.root.id)
-                    .expect("checked current slot judgement"),
+                judgement,
                 snapshot: &self.snapshot,
                 generation: self.generation,
                 projections: &self.node_projections,
@@ -767,7 +744,7 @@ impl<B: BindingAddress> JudgedSlot<B> {
             instance: self.instance,
             edge: EdgeRole::SlotRoot,
             visit: ProjectionVisit::Value,
-        }))
+        })
     }
 
     /// Materialization keeps original-source judgement. It renews value-proof
@@ -1039,16 +1016,24 @@ impl<B: BindingAddress> AuthoredSlots<B> {
             }
         }
     }
+    fn authored_name<'n>(
+        slots: &indexmap::IndexMap<String, JudgedSlot<B>>,
+        aliases: &'n std::collections::HashMap<String, String>,
+        name: &'n str,
+    ) -> &'n str {
+        if slots.contains_key(name) {
+            name
+        } else {
+            aliases.get(name).map(String::as_str).unwrap_or(name)
+        }
+    }
+
     pub(crate) fn synchronize(
         &mut self,
         attributes: &indexmap::IndexMap<String, Value<ParserPlaceholder, B>>,
     ) {
         for (name, value) in attributes {
-            let authored = if self.slots.contains_key(name) {
-                name
-            } else {
-                self.aliases.get(name).unwrap_or(name)
-            };
+            let authored = Self::authored_name(&self.slots, &self.aliases, name);
             if let Some(slot) = self.slots.get_mut(authored)
                 && slot.projection() != Some(value)
             {
@@ -1099,10 +1084,7 @@ impl<B: BindingAddress> AuthoredSlots<B> {
                 .slots
                 .into_iter()
                 .map(|(name, slot)| {
-                    let projection = match slot.projection {
-                        Projection::Pending => Projection::Pending,
-                        Projection::Value(value) => Projection::Value(value.map_bindings(map)),
-                    };
+                    let projection = slot.projection.map_bindings(map);
                     let expression = super::ExprValue {
                         authored: slot.root,
                         payload: Projection::Pending,
@@ -1121,17 +1103,7 @@ impl<B: BindingAddress> AuthoredSlots<B> {
                             node_projections: Arc::new(
                                 slot.node_projections
                                     .iter()
-                                    .map(|(id, value)| {
-                                        (
-                                            *id,
-                                            match value {
-                                                Projection::Pending => Projection::Pending,
-                                                Projection::Value(value) => Projection::Value(
-                                                    value.clone().map_bindings(map),
-                                                ),
-                                            },
-                                        )
-                                    })
+                                    .map(|(id, value)| (*id, value.clone().map_bindings(map)))
                                     .collect(),
                             ),
                         },
@@ -1154,28 +1126,13 @@ impl<B: BindingAddress> AuthoredSlots<B> {
             }
         }
     }
-    pub(crate) fn replace_expanded_projections(
-        &mut self,
-        attributes: &indexmap::IndexMap<String, Value<crate::resource::NoPlaceholder, B>>,
-    ) {
-        let attributes = attributes
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone().into_placeholder_type()))
-            .collect();
-        self.synchronize(&attributes);
-    }
-
     pub(crate) fn replace_projections(
         &mut self,
         attributes: &indexmap::IndexMap<String, Value<ParserPlaceholder, B>>,
     ) {
         let mut updated = std::collections::HashSet::new();
         for (name, value) in attributes {
-            let authored = if self.slots.contains_key(name) {
-                name
-            } else {
-                self.aliases.get(name).unwrap_or(name)
-            };
+            let authored = Self::authored_name(&self.slots, &self.aliases, name);
             if let Some(slot) = self.slots.get_mut(authored) {
                 updated.insert(slot.occurrence);
                 slot.replace_projection(value.clone());
@@ -1196,24 +1153,6 @@ impl AuthoredSlots {
     pub(in crate::parser) fn insert(
         &mut self,
         name: String,
-        sink: SinkExpression,
-        kind: crate::schema::SchemaKind,
-        instance: ExpansionInstanceId,
-        projections: std::collections::HashMap<
-            NodeId,
-            Value<ParserPlaceholder, RelativeBindingName>,
-        >,
-    ) {
-        self.insert_slot(
-            name,
-            JudgedSlot::from_sink(sink, kind, instance),
-            projections,
-        );
-    }
-
-    pub(in crate::parser) fn insert_container(
-        &mut self,
-        name: String,
         expression: super::ExprValue,
         kind: crate::schema::SchemaKind,
         instance: ExpansionInstanceId,
@@ -1222,22 +1161,7 @@ impl AuthoredSlots {
             Value<ParserPlaceholder, RelativeBindingName>,
         >,
     ) {
-        self.insert_slot(
-            name,
-            JudgedSlot::from_expression(expression, kind, instance),
-            projections,
-        );
-    }
-
-    fn insert_slot(
-        &mut self,
-        name: String,
-        mut slot: JudgedSlot,
-        projections: std::collections::HashMap<
-            NodeId,
-            Value<ParserPlaceholder, RelativeBindingName>,
-        >,
-    ) {
+        let mut slot = JudgedSlot::from_expression(expression, kind, instance);
         slot.node_projections = Arc::new(
             projections
                 .into_iter()

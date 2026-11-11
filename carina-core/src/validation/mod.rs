@@ -5487,14 +5487,11 @@ fn resource_admission_report<
                     };
                     let attrs = resource.attributes();
                     let inputs = admission::attributes::ResourceAttributeInputs::new(resource);
-                    let classified = crate::resource::knowledge::collect_classified_attributes(
-                        inputs
-                            .values()
-                            .map(|(name, value)| (name.to_owned(), value)),
+                    let classified = inputs.classify(
                         &crate::resource::knowledge::KnowledgeContext::validation(),
                         |_, _| {},
                     );
-                    let values = admission::attributes::resource_attribute_admissions_with_coverage(
+                    let values = admission::attributes::resource_attribute_admissions(
                         resource,
                         parsed,
                         schema,

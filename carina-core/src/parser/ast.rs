@@ -9109,7 +9109,12 @@ fn substitute_attrs<S, D>(
     for (_, slot) in authored_slots.iter_mut() {
         crate::value_walk::substitute_loop_slot(slot, index, key, value, miss_policy);
     }
-    authored_slots.replace_expanded_projections(&expanded_attributes);
+    authored_slots.synchronize(
+        &expanded_attributes
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone().into_placeholder_type()))
+            .collect(),
+    );
     Ok(crate::resource::Resource {
         id,
         attributes: expanded_attributes,

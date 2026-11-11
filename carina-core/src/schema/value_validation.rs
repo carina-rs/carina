@@ -7,6 +7,7 @@ use crate::parser::retained::{
 };
 use crate::resource::ValueKind;
 use crate::resource::knowledge::{KnownView, ShapeView};
+use crate::validation::admission::assignment_seam_error as seam_error;
 
 /// Assignment checks distinguish a current projection from authored syntax
 /// discarded by selection. Discarded syntax never supplies a fabricated Value.
@@ -33,25 +34,26 @@ pub struct WalkCoverage {
 }
 
 impl WalkCoverage {
+    fn bump(&mut self, identity: (UseId, ExpansionInstanceId), generation: ProjectionGeneration) {
+        self.generations
+            .entry(identity)
+            .and_modify(|current| *current = current.latest(generation))
+            .or_insert(generation);
+    }
+
     pub(crate) fn extend(&mut self, other: Self) {
         self.visits.extend(other.visits);
         self.nodes.extend(other.nodes);
         self.work += other.work;
         for (identity, generation) in other.generations {
-            self.generations
-                .entry(identity)
-                .and_modify(|current| *current = current.latest(generation))
-                .or_insert(generation);
+            self.bump(identity, generation);
         }
     }
 
     pub(crate) fn record<B: BindingAddress>(&mut self, authored: &AuthoredUse<'_, B>) {
         self.work += 1;
         let generation = authored.node().generation();
-        self.generations
-            .entry((authored.occurrence(), authored.instance()))
-            .and_modify(|current| *current = current.latest(generation))
-            .or_insert(generation);
+        self.bump((authored.occurrence(), authored.instance()), generation);
         self.nodes.insert((
             authored.node().node_id(),
             authored.node().environment().clone(),
@@ -913,26 +915,16 @@ struct AssignmentWalk<'a, 's, P: PlaceholderKind, B: BindingAddress> {
     coverage: &'a std::cell::RefCell<WalkCoverage>,
 }
 
-fn seam_error(error: crate::parser::retained::MissingEvidence) -> TypeError {
-    crate::validation::admission::assignment_seam_error(error)
-}
-
 impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B> {
-    fn child(&self, index: usize, edge: EdgeRole) -> Result<Self, TypeError> {
+    fn step(
+        &self,
+        advance: impl FnOnce(
+            &AuthoredCursor<'s, B>,
+        )
+            -> Result<AuthoredCursor<'s, B>, crate::parser::retained::MissingEvidence>,
+    ) -> Result<Self, TypeError> {
         Ok(Self {
-            cursor: std::sync::Arc::new(self.cursor.child(index, edge).map_err(seam_error)?),
-            ..self.clone()
-        })
-    }
-    fn map_child(&self, key: &str, edge: EdgeRole) -> Result<Self, TypeError> {
-        Ok(Self {
-            cursor: std::sync::Arc::new(self.cursor.map_child(key, edge).map_err(seam_error)?),
-            ..self.clone()
-        })
-    }
-    fn field_child(&self, key: &str, alias: Option<&str>) -> Result<Self, TypeError> {
-        Ok(Self {
-            cursor: std::sync::Arc::new(self.cursor.field_child(key, alias).map_err(seam_error)?),
+            cursor: std::sync::Arc::new(advance(&self.cursor).map_err(seam_error)?),
             ..self.clone()
         })
     }
@@ -1010,7 +1002,7 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
                         findings.extend(visit_discarded(
                             attr,
                             defs,
-                            &path.canonical(),
+                            path,
                             ancestry,
                             discarded,
                             self.check,
@@ -1042,7 +1034,7 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
                     findings.extend(visit_discarded(
                         attr,
                         defs,
-                        &path.canonical(),
+                        path,
                         ancestry,
                         discarded,
                         self.check,
@@ -1105,13 +1097,25 @@ pub(crate) fn validate_authored_value_for_admission<
     findings
 }
 
+fn step_assignment<'a, 's, P: PlaceholderKind, B: BindingAddress>(
+    assignment: Option<&AssignmentWalk<'a, 's, P, B>>,
+    advance: impl FnOnce(
+        &AuthoredCursor<'s, B>,
+    ) -> Result<AuthoredCursor<'s, B>, crate::parser::retained::MissingEvidence>,
+) -> Result<Option<AssignmentWalk<'a, 's, P, B>>, TypeError> {
+    let Some(walk) = assignment else {
+        return Ok(None);
+    };
+    walk.step(advance).map(Some)
+}
+
 /// Discarded alternatives consume syntax and declarations only. No value is
 /// evaluated, classified, normalized or sent to a provider here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn visit_discarded<P: PlaceholderKind, B: BindingAddress>(
     attr: &CompiledAttributeType,
     defs: &BTreeMap<String, CompiledAttributeType>,
-    path: &LeafPath,
+    path: &FieldPath,
     ancestry: FieldAncestry,
     cursor: AuthoredUse<'_, B>,
     assignment: AssignmentCheck<'_, P, B>,
@@ -1120,7 +1124,7 @@ pub(crate) fn visit_discarded<P: PlaceholderKind, B: BindingAddress>(
     fn descend<P: PlaceholderKind, B: BindingAddress>(
         attr: &CompiledAttributeType,
         defs: &BTreeMap<String, CompiledAttributeType>,
-        path: &LeafPath,
+        path: &FieldPath,
         ancestry: FieldAncestry,
         cursor: AuthoredUse<'_, B>,
         assignment: AssignmentCheck<'_, P, B>,
@@ -1139,11 +1143,11 @@ pub(crate) fn visit_discarded<P: PlaceholderKind, B: BindingAddress>(
         findings.extend(assignment(
             attr,
             CheckValue::Discarded,
-            path,
+            &path.canonical(),
             AuthoredCursor::Authored(cursor.clone()),
         )?);
         let mut child =
-            |attr: &CompiledAttributeType, child: AuthoredUse<'_, B>, path: LeafPath, ancestry| {
+            |attr: &CompiledAttributeType, child: AuthoredUse<'_, B>, path: FieldPath, ancestry| {
                 descend(
                     attr, defs, &path, ancestry, child, assignment, coverage, findings, visited,
                 )
@@ -1207,12 +1211,7 @@ pub(crate) fn visit_discarded<P: PlaceholderKind, B: BindingAddress>(
                             cursor
                                 .child(index, EdgeRole::ListItem)
                                 .map_err(seam_error)?,
-                            LeafPath::from_segments(
-                                path.segments()
-                                    .iter()
-                                    .cloned()
-                                    .chain([super::LeafPathSegment::ListIndex(index)]),
-                            ),
+                            path.push_index(index),
                             ancestry,
                         )?;
                     }
@@ -1240,12 +1239,7 @@ pub(crate) fn visit_discarded<P: PlaceholderKind, B: BindingAddress>(
                         child(
                             attr,
                             cursor.map_child(key, edge).map_err(seam_error)?,
-                            LeafPath::from_segments(
-                                path.segments()
-                                    .iter()
-                                    .cloned()
-                                    .chain([super::LeafPathSegment::StructField(key.into())]),
-                            ),
+                            path.push_field(key),
                             ancestry,
                         )?;
                     }
@@ -1406,7 +1400,7 @@ impl<'a> ValueValidator<'a, '_> {
                 Some(walk) => {
                     let cursor = match walk.cursor.as_ref() {
                         AuthoredCursor::Authored(usage) if usage.form() == AuthoredForm::Secret => {
-                            match walk.child(0, EdgeRole::SecretArgument) {
+                            match walk.step(|cursor| cursor.child(0, EdgeRole::SecretArgument)) {
                                 Ok(child) => child,
                                 Err(error) => return CheckedValue::rejected(path, error),
                             }
@@ -1436,19 +1430,15 @@ impl<'a> ValueValidator<'a, '_> {
                 Some(walk) => walk.check(attr, CheckValue::Current(value.diagnostic_value()), path),
                 None => Ok(AssignmentFindings::default()),
             };
-            let left_assignment = match assignment
-                .as_ref()
-                .map(|walk| walk.child(0, EdgeRole::CoalesceOperand))
-                .transpose()
-            {
+            let left_assignment = match step_assignment(assignment.as_ref(), |cursor| {
+                cursor.child(0, EdgeRole::CoalesceOperand)
+            }) {
                 Ok(walk) => walk,
                 Err(error) => return CheckedValue::rejected(path, error),
             };
-            let right_assignment = match assignment
-                .as_ref()
-                .map(|walk| walk.child(1, EdgeRole::CoalesceOperand))
-                .transpose()
-            {
+            let right_assignment = match step_assignment(assignment.as_ref(), |cursor| {
+                cursor.child(1, EdgeRole::CoalesceOperand)
+            }) {
                 Ok(walk) => walk,
                 Err(error) => return CheckedValue::rejected(path, error),
             };
@@ -1533,11 +1523,9 @@ impl<'a> ValueValidator<'a, '_> {
                 }
             }
             for (index, branch) in branches.into_iter().enumerate() {
-                let branch_assignment = match assignment
-                    .as_ref()
-                    .map(|walk| walk.child(index + 1, EdgeRole::IfBranch))
-                    .transpose()
-                {
+                let branch_assignment = match step_assignment(assignment.as_ref(), |cursor| {
+                    cursor.child(index + 1, EdgeRole::IfBranch)
+                }) {
                     Ok(walk) => walk,
                     Err(error) => return CheckedValue::rejected(path, error),
                 };
@@ -1882,13 +1870,9 @@ impl<'a> ValueValidator<'a, '_> {
             let value = cached[key.as_str()];
             let child_path = path.push_field(key.clone());
             let field = struct_field_for_key(fields, key, ancestry);
-            let child_assignment = match assignment
-                .as_ref()
-                .map(|walk| {
-                    walk.field_child(key, field.and_then(|field| ancestry.block_name(field)))
-                })
-                .transpose()
-            {
+            let child_assignment = match step_assignment(assignment.as_ref(), |cursor| {
+                cursor.field_child(key, field.and_then(|field| ancestry.block_name(field)))
+            }) {
                 Ok(walk) => walk,
                 Err(error) => return CheckedValue::rejected(&child_path, error),
             };
@@ -1998,25 +1982,15 @@ impl<'a> ValueValidator<'a, '_> {
                 Ok(proof) => proof,
                 Err(error) => return CheckedValue::rejected(path, error.into()),
             };
-            // Map keys keep a covered container cursor and today's
-            // disabled assignment/provider callbacks.
-            let key_check =
-                |_: &CompiledAttributeType,
-                 _: CheckValue<'_, P, B>,
-                 _: &LeafPath,
-                 _: AuthoredCursor<'_, B>| Ok(AssignmentFindings::default());
-            let key_assignment = assignment.as_ref().map(|walk| AssignmentWalk {
-                cursor: std::sync::Arc::new(walk.cursor.for_map_key()),
-                check: &key_check,
-                coverage: walk.coverage,
-            });
+            // The already-visited container covers its keys. Assignment
+            // and provider callbacks remain disabled for key validation.
             let key_checked = ValueValidator::new(self.defs, None).walk_with_assignment(
                 key,
                 (&key_proof).into(),
                 &next_path,
                 ancestry,
                 &mut Vec::new(),
-                key_assignment,
+                None,
             );
             if let Some(error) = key_checked.local.error().cloned() {
                 let error = TypeError::MapKeyError {
@@ -2026,11 +2000,9 @@ impl<'a> ValueValidator<'a, '_> {
                 checked.reject(path, error.clone());
                 checked.findings.push_local(next_path.clone(), error);
             }
-            let child_assignment = match assignment
-                .as_ref()
-                .map(|walk| walk.map_child(map_key, EdgeRole::MapValue))
-                .transpose()
-            {
+            let child_assignment = match step_assignment(assignment.as_ref(), |cursor| {
+                cursor.map_child(map_key, EdgeRole::MapValue)
+            }) {
                 Ok(walk) => walk,
                 Err(error) => return CheckedValue::rejected(&next_path, error),
             };
@@ -2128,11 +2100,9 @@ impl<'a> ValueValidator<'a, '_> {
         let mut children = Vec::new();
         let mut child_fits = Vec::new();
         for (i, value) in items.iter().enumerate() {
-            let child_assignment = match assignment
-                .as_ref()
-                .map(|walk| walk.child(i, EdgeRole::ListItem))
-                .transpose()
-            {
+            let child_assignment = match step_assignment(assignment.as_ref(), |cursor| {
+                cursor.child(i, EdgeRole::ListItem)
+            }) {
                 Ok(walk) => walk,
                 Err(error) => return CheckedValue::rejected(&path.push_index(i), error),
             };

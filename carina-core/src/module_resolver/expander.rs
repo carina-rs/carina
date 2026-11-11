@@ -2944,13 +2944,6 @@ pub(crate) fn decide_expanded_if_condition(
     }
 }
 
-#[cfg(test)]
-fn select_expanded_module_ifs(
-    value: &ModuleResolvedValue,
-) -> Result<ModuleResolvedValue, ArgumentSubstitutionError> {
-    crate::value_walk::select_expanded_module_ifs(value)
-}
-
 fn evaluate_expanded_module_functions(
     value: &ModuleResolvedValue,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
@@ -3130,17 +3123,8 @@ fn expand_module_resource_with_identity(
     )?;
     let directives = resolve_module_directives(directives, resolver)?;
 
-    let attributes = attributes
-        .into_iter()
-        .map(|(name, value)| Ok((name, resolve_plain_module_value(&value, resolver)?)))
-        .collect::<Result<IndexMap<_, _>, ArgumentSubstitutionError>>()?;
-    let mut authored_slots =
-        authored_slots.map_bindings(&mut |binding| resolver.scope.resolve(binding));
-    for (_, slot) in authored_slots.iter_mut() {
-        crate::value_walk::substitute_module_slot(slot, resolver.arguments);
-    }
-    authored_slots.record_condition_selections(&resolver.condition_selections.borrow());
-    authored_slots.replace_projections(&attributes);
+    let (attributes, authored_slots) =
+        expand_module_attributes(attributes, authored_slots, resolver)?;
     Ok(crate::resource::Resource {
         id,
         attributes,
@@ -3172,6 +3156,31 @@ fn expand_module_resource_with_identity(
     })
 }
 
+fn expand_module_attributes(
+    attributes: IndexMap<String, Value>,
+    authored_slots: crate::parser::retained::AuthoredSlots,
+    resolver: &ModuleScopeResolver<'_>,
+) -> Result<
+    (
+        IndexMap<String, ModuleResolvedValue>,
+        crate::parser::retained::AuthoredSlots<AbsoluteBindingAddress>,
+    ),
+    ArgumentSubstitutionError,
+> {
+    let attributes = attributes
+        .into_iter()
+        .map(|(name, value)| Ok((name, resolve_plain_module_value(&value, resolver)?)))
+        .collect::<Result<IndexMap<_, _>, ArgumentSubstitutionError>>()?;
+    let mut authored_slots =
+        authored_slots.map_bindings(&mut |binding| resolver.scope.resolve(binding));
+    for (_, slot) in authored_slots.iter_mut() {
+        crate::value_walk::substitute_module_slot(slot, resolver.arguments);
+    }
+    authored_slots.record_condition_selections(&resolver.condition_selections.borrow());
+    authored_slots.replace_projections(&attributes);
+    Ok((attributes, authored_slots))
+}
+
 fn expand_module_data_source(
     data_source: &DataSource,
     dependency_values: Option<&IndexMap<String, Value>>,
@@ -3201,17 +3210,8 @@ fn expand_module_data_source(
         resolver,
     )?;
     let directives = resolve_module_directives(directives, resolver)?;
-    let attributes = attributes
-        .into_iter()
-        .map(|(name, value)| Ok((name, resolve_plain_module_value(&value, resolver)?)))
-        .collect::<Result<IndexMap<_, _>, ArgumentSubstitutionError>>()?;
-    let mut authored_slots =
-        authored_slots.map_bindings(&mut |binding| resolver.scope.resolve(binding));
-    for (_, slot) in authored_slots.iter_mut() {
-        crate::value_walk::substitute_module_slot(slot, resolver.arguments);
-    }
-    authored_slots.record_condition_selections(&resolver.condition_selections.borrow());
-    authored_slots.replace_projections(&attributes);
+    let (attributes, authored_slots) =
+        expand_module_attributes(attributes, authored_slots, resolver)?;
     Ok(crate::resource::DataSource {
         id,
         attributes,
@@ -4340,7 +4340,9 @@ mod tests {
         ]));
         let value = value.resolve_root(&crate::resource::RootScope::new());
         assert_eq!(
-            select_expanded_module_ifs(&value).unwrap(),
+            crate::value_walk::select_expanded_module_ifs_with_conditions(&value)
+                .unwrap()
+                .0,
             ModuleResolvedValue::Concrete(ConcreteValue::String("prefix-a".into()))
         );
     }
@@ -4405,10 +4407,11 @@ mod tests {
                 ArgumentSubstitutionPosition::Value,
             )
             .unwrap();
-            let selected = select_expanded_module_ifs(
+            let selected = crate::value_walk::select_expanded_module_ifs_with_conditions(
                 &substituted.resolve_root(&crate::resource::RootScope::new()),
             )
-            .unwrap();
+            .unwrap()
+            .0;
             assert!(
                 matches!(&selected, crate::resource::Value::Deferred(crate::resource::DeferredValue::ResourceRef { path }) if path.binding() == "source" && path.attribute() == "field"),
                 "{selected:?}"
@@ -4431,7 +4434,9 @@ mod tests {
             ));
         let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
         for result in [
-            select_expanded_module_ifs(&value).unwrap(),
+            crate::value_walk::select_expanded_module_ifs_with_conditions(&value)
+                .unwrap()
+                .0,
             crate::validation::deferred_types::with_session_for_test(&config, |session| {
                 evaluate_expanded_module_functions(&value, session)
             })

@@ -104,6 +104,15 @@ enum Projection<P: ValueKind, B: BindingAddress> {
     Value(Value<P, B>),
 }
 
+impl<P: ValueKind, B: BindingAddress> Projection<P, B> {
+    fn map_bindings<C: BindingAddress>(self, map: &mut impl FnMut(B) -> C) -> Projection<P, C> {
+        match self {
+            Self::Pending => Projection::Pending,
+            Self::Value(value) => Projection::Value(value.map_bindings(map)),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AuthoredExpr<P: ValueKind, B: BindingAddress> {
     id: NodeId,
@@ -405,7 +414,13 @@ pub(in crate::parser) fn resource_slots(
         };
         if let Some(sink) = sinks.get(name) {
             let projections = captures.projections_for(&sink.expression.authored);
-            slots.insert(name.clone(), sink.clone(), kind, instance, projections);
+            slots.insert(
+                name.clone(),
+                sink.expression.clone(),
+                kind,
+                instance,
+                projections,
+            );
         } else {
             // Grouped blocks have explicit compiler-owned container handles,
             // including when a pending child prevents a provisional Value.
@@ -414,7 +429,7 @@ pub(in crate::parser) fn resource_slots(
                 expression.payload = Projection::Value(value.clone());
             }
             let projections = captures.projections_for(&expression.authored);
-            slots.insert_container(name.clone(), expression, kind, instance, projections);
+            slots.insert(name.clone(), expression, kind, instance, projections);
         }
     }
     Ok(slots)
@@ -3620,21 +3635,18 @@ mod judgement {
             if !resources.insert(resource.id().clone()) {
                 continue;
             }
-            let slots = match resource {
-                super::super::ResourceRef::Resource(resource) => &resource.authored_slots,
-                super::super::ResourceRef::DataSource(source) => &source.authored_slots,
-                super::super::ResourceRef::Deferred { resource, .. } => {
-                    &resource.as_resource().authored_slots
+            let (slots, source) = match resource {
+                super::super::ResourceRef::Resource(resource) => {
+                    (&resource.authored_slots, resource.module_source.as_ref())
                 }
+                super::super::ResourceRef::DataSource(source) => {
+                    (&source.authored_slots, source.module_source.as_ref())
+                }
+                super::super::ResourceRef::Deferred { resource, .. } => (
+                    &resource.as_resource().authored_slots,
+                    resource.as_resource().module_source.as_ref(),
+                ),
                 super::super::ResourceRef::LiveComposition(_) => continue,
-            };
-            let source = match resource {
-                super::super::ResourceRef::Resource(resource) => resource.module_source.as_ref(),
-                super::super::ResourceRef::DataSource(source) => source.module_source.as_ref(),
-                super::super::ResourceRef::Deferred { resource, .. } => {
-                    resource.as_resource().module_source.as_ref()
-                }
-                super::super::ResourceRef::LiveComposition(_) => None,
             };
             let environment = source
                 .and_then(crate::resource::ModuleSource::identity_scope)

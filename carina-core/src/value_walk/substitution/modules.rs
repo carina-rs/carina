@@ -30,13 +30,6 @@ pub(crate) fn substitute_module_slot<B: BindingAddress>(
     });
 }
 
-#[cfg(test)]
-pub(crate) fn select_expanded_module_ifs(
-    value: &ModuleResolvedValue,
-) -> Result<ModuleResolvedValue, ArgumentSubstitutionError> {
-    select_expanded_module_ifs_with_conditions(value).map(|(value, _)| value)
-}
-
 /// Preserve decisions from the existing selection pass without evaluating again.
 pub(crate) fn select_expanded_module_ifs_with_conditions(
     value: &ModuleResolvedValue,

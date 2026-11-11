@@ -31,6 +31,8 @@ use bound_transform::{BoundTransform, PublicTransform, TransformOutput};
 
 mod substitution;
 #[cfg(test)]
+pub(crate) use substitution::select_authored_module_ifs;
+#[cfg(test)]
 use substitution::{ParserRewrite, rewrite_parser_value};
 pub(crate) use substitution::{
     RewritePosition, evaluate_expanded_module_functions,
@@ -38,8 +40,6 @@ pub(crate) use substitution::{
     substitute_function_parameters, substitute_loop_slot, substitute_module_arguments,
     substitute_module_slot, value_argument,
 };
-#[cfg(test)]
-pub(crate) use substitution::{select_authored_module_ifs, select_expanded_module_ifs};
 mod unavailable;
 pub(crate) use unavailable::{
     UnavailableSearchPolicy, contains_unavailable, find_required_unavailable,

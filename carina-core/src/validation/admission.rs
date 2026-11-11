@@ -550,27 +550,18 @@ impl<B: BindingAddress> Candidate<crate::resource::ParserPlaceholder, B> {
         ),
         AdmissionErrors,
     > {
-        let mismatch = |request| {
-            constraints(vec![AdmissionFinding {
-                path: LeafPath::from_segments([]),
-                error: assignment_seam_error(crate::parser::retained::MissingEvidence::new(
-                    request,
-                )),
-            }])
-        };
         let value = crate::resource::knowledge::ClassifiedRef::from(&proof).diagnostic_value();
         if !slot
             .projection()
             .is_some_and(|projection| std::ptr::eq(projection, value))
         {
-            return Err(mismatch("slot/projection proof pairing"));
+            return Err(seam_constraint(
+                crate::parser::retained::MissingEvidence::new("slot/projection proof pairing"),
+            ));
         }
-        let cursor = slot.cursor().map_err(|error| {
-            constraints(vec![AdmissionFinding {
-                path: LeafPath::from_segments([]),
-                error: assignment_seam_error(error),
-            }])
-        })?;
+        let cursor = crate::parser::retained::AuthoredCursor::Authored(
+            slot.cursor().map_err(seam_constraint)?,
+        );
         Ok(Self::paired(
             value.clone(),
             AdmissionProof::Validation(proof),
@@ -844,6 +835,13 @@ pub(crate) fn assignment_seam_error(error: crate::parser::retained::MissingEvide
             error: error.into(),
         },
     ))
+}
+
+pub(crate) fn seam_constraint(error: crate::parser::retained::MissingEvidence) -> AdmissionErrors {
+    constraints(vec![AdmissionFinding {
+        path: LeafPath::from_segments([]),
+        error: assignment_seam_error(error),
+    }])
 }
 
 fn join(root: &LeafPath, relative: &LeafPath) -> LeafPath {

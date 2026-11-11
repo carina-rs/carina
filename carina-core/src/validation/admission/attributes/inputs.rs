@@ -1,6 +1,10 @@
 use super::*;
 use crate::parser::retained::{JudgedSlot, MissingEvidence, ProjectedPhase, ProjectionGeneration};
 use crate::resource::ParserPlaceholder;
+use crate::resource::knowledge::{
+    Classification, ClassificationStage, KnowledgeContext, KnowledgeError,
+    collect_classified_attributes,
+};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,11 +16,17 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct ResourceAttributeInputs<B: BindingAddress> {
     owner: ResourceId,
-    inputs: IndexMap<String, AttributeInput<B>>,
+    inputs: IndexMap<String, StoredInput<B>>,
+}
+
+pub(super) enum AttributeInput<'a, B: BindingAddress> {
+    Authored { slot: &'a JudgedSlot<B> },
+    Projected { phase: ProjectedPhase },
+    Composition,
 }
 
 #[derive(Clone)]
-pub(super) enum AttributeInput<B: BindingAddress> {
+enum StoredInput<B: BindingAddress> {
     Authored {
         slot: Arc<JudgedSlot<B>>,
         source_generation: ProjectionGeneration,
@@ -34,7 +44,7 @@ pub(super) enum AttributeInput<B: BindingAddress> {
     },
 }
 
-impl<B: BindingAddress> AttributeInput<B> {
+impl<B: BindingAddress> StoredInput<B> {
     fn value(&self) -> &Value<ParserPlaceholder, B> {
         match self {
             Self::Authored { slot, .. } => slot.projection().expect("prepared materialized slot"),
@@ -64,10 +74,10 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             .map(|(name, value)| {
                 let prepare = || {
                     if resource.kind() == crate::parser::AnalysisItemKind::Composition {
-                        return Ok(AttributeInput::Composition(Arc::new(value.clone())));
+                        return Ok(StoredInput::Composition(Arc::new(value.clone())));
                     }
                     if let Some(phase) = resource.projected_phase(name) {
-                        return Ok(AttributeInput::Projected {
+                        return Ok(StoredInput::Projected {
                             value: Arc::new(value.clone()),
                             phase,
                         });
@@ -77,14 +87,14 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
                         return Err(MissingEvidence::new("resource slot/projection pairing"));
                     }
                     slot.cursor()?;
-                    Ok(AttributeInput::Authored {
+                    Ok(StoredInput::Authored {
                         slot: Arc::new(slot.clone()),
                         source_generation: slot.generation(),
                     })
                 };
                 (
                     name.clone(),
-                    prepare().unwrap_or_else(|error| AttributeInput::Unavailable {
+                    prepare().unwrap_or_else(|error| StoredInput::Unavailable {
                         value: Arc::new(value.clone()),
                         error,
                     }),
@@ -104,7 +114,42 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     }
 
     pub fn value(&self, name: &str) -> Option<&Value<ParserPlaceholder, B>> {
-        self.inputs.get(name).map(AttributeInput::value)
+        self.inputs.get(name).map(StoredInput::value)
+    }
+
+    pub fn classify<'a, S: ClassificationStage>(
+        &'a self,
+        context: &KnowledgeContext<'_, ParserPlaceholder, B, S>,
+        failed: impl FnMut(&str, KnowledgeError<B>),
+    ) -> HashMap<String, Classification<'a, ParserPlaceholder, B>> {
+        collect_classified_attributes(
+            self.values().map(|(name, value)| (name.to_owned(), value)),
+            context,
+            failed,
+        )
+    }
+
+    /// Return a shared owner with the classifications borrowing its new values.
+    /// Unchanged values keep their allocations and their existing proofs.
+    pub fn materialize_and_classify<'a, S: ClassificationStage>(
+        &'a mut self,
+        values: &HashMap<String, Value<ParserPlaceholder, B>>,
+        context: &KnowledgeContext<'_, ParserPlaceholder, B, S>,
+        failed: impl FnMut(&str, KnowledgeError<B>),
+    ) -> (
+        &'a Self,
+        HashMap<String, Classification<'a, ParserPlaceholder, B>>,
+    ) {
+        self.materialize(values);
+        let inputs: &Self = self;
+        let classified = collect_classified_attributes(
+            values
+                .keys()
+                .filter_map(|name| inputs.value(name).map(|value| (name.clone(), value))),
+            context,
+            failed,
+        );
+        (inputs, classified)
     }
 
     /// Called where evaluation produces new projections. Unchanged slots share
@@ -118,12 +163,12 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
                 continue;
             }
             match input {
-                AttributeInput::Authored { slot, .. } => *slot = Arc::new(slot.materialized(value)),
-                AttributeInput::Projected {
+                StoredInput::Authored { slot, .. } => *slot = Arc::new(slot.materialized(value)),
+                StoredInput::Projected {
                     value: projection, ..
                 }
-                | AttributeInput::Composition(projection)
-                | AttributeInput::Unavailable {
+                | StoredInput::Composition(projection)
+                | StoredInput::Unavailable {
                     value: projection, ..
                 } => *projection = Arc::new(value.clone()),
             }
@@ -140,7 +185,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             B,
         >,
         name: &str,
-    ) -> Result<&AttributeInput<B>, MissingEvidence>
+    ) -> Result<AttributeInput<'_, B>, MissingEvidence>
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
@@ -152,7 +197,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             .get(name)
             .ok_or_else(|| MissingEvidence::new(format!("prepared attribute {name}")))?;
         match input {
-            AttributeInput::Authored {
+            StoredInput::Authored {
                 slot,
                 source_generation,
             } => {
@@ -161,10 +206,11 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
                 {
                     return Err(MissingEvidence::new("resource instance/generation pairing"));
                 }
+                Ok(AttributeInput::Authored { slot })
             }
-            AttributeInput::Unavailable { error, .. } => return Err(error.clone()),
-            AttributeInput::Projected { .. } | AttributeInput::Composition(_) => {}
+            StoredInput::Unavailable { error, .. } => Err(error.clone()),
+            StoredInput::Projected { phase, .. } => Ok(AttributeInput::Projected { phase: *phase }),
+            StoredInput::Composition(_) => Ok(AttributeInput::Composition),
         }
-        Ok(input)
     }
 }
