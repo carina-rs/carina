@@ -3343,10 +3343,15 @@ fn builtin_type_documentation_matches_registry() {
             Some((name.to_string(), base.to_string()))
         })
         .collect::<std::collections::BTreeMap<_, _>>();
+    let declarations = builtin_identified_declarations();
     let registered = builtin_type_registry()
-        .iter()
-        .map(|(identity, declaration)| {
-            let kind = identified_declaration_scalar_kind(declaration)
+        .keys()
+        .map(|identity| {
+            let declaration = declarations
+                .get(identity)
+                .expect("every built-in must occur in the derived declarations");
+            let kind = declaration
+                .scalar_kind()
                 .expect("every core built-in must declare a scalar kind");
             (identity.kind.clone(), kind.to_string())
         })
@@ -18587,20 +18592,44 @@ fn round11_builtin_matching_requires_a_shared_callback() {
         None,
         None,
     );
+    let config =
+        ValidatedConfigSchema::validate(BTreeMap::from([("value".into(), declaration)])).unwrap();
+    let declarations = identified_declarations_from_witnesses(&[], &config);
     assert!(
-        !same_builtin_declaration(
-            declaration.scalar_identity_parts(),
-            declaration.scalar_identity_parts().unwrap()
-        ),
+        !same_builtin_declaration(&declarations[0], &declarations[0]),
         "absence of both callbacks is not pointer identity"
     );
-    for builtin in builtin_type_registry().values() {
-        let parts = builtin.scalar_identity_parts().unwrap();
+    for builtin in builtin_identified_declarations().values() {
+        let IdentityDefinition::Scalar(parts) = builtin.definition() else {
+            panic!("canonical builtins must have scalar definitions");
+        };
         assert!(
             parts.callback().is_some(),
             "all canonical builtins retain their semantic validator"
         );
-        assert!(same_builtin_declaration(Some(parts), parts));
+        assert!(same_builtin_declaration(builtin, builtin));
+        let identity = builtin.identity().clone();
+        let config = ValidatedConfigSchema::validate(BTreeMap::from([
+            (
+                "reference".into(),
+                super::AttributeType::reference(identity.clone(), None, None),
+            ),
+            (
+                "enum".into(),
+                super::AttributeType::enum_(
+                    identity,
+                    Some(vec!["value".into()]),
+                    vec![],
+                    None,
+                    None,
+                ),
+            ),
+        ]))
+        .unwrap();
+        for declaration in identified_declarations_from_witnesses(&[], &config) {
+            assert!(!same_builtin_declaration(&declaration, builtin));
+            assert!(!same_builtin_declaration(builtin, &declaration));
+        }
     }
 }
 
