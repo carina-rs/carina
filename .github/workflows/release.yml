@@ -61,7 +61,7 @@ jobs:
         if: matrix.container
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
         with:
           targets: ${{ matrix.target }}
 

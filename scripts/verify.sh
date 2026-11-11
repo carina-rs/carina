@@ -10,7 +10,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 default_kinds=(
     fmt provider-boundaries error-source-display no-wall-clock-test-assertions
     docs-spellings resources-access cli-hints no-home-env-reads
-    crates-not-publishable wit-bindgen-workspace plan-fixtures rust-cache
+    crates-not-publishable wit-bindgen-workspace plan-fixtures rust-cache pinned-toolchain
     vendored-patches check feature-isolation clippy validate-crn example-warnings
     wasm-fixtures nextest isolation provider-cause doctests
 )
@@ -32,7 +32,7 @@ running checks (isolation-with-archive means isolation <archive>).
 Kinds:
   fmt provider-boundaries error-source-display no-wall-clock-test-assertions
   docs-spellings resources-access cli-hints no-home-env-reads
-  crates-not-publishable wit-bindgen-workspace plan-fixtures rust-cache
+  crates-not-publishable wit-bindgen-workspace plan-fixtures rust-cache pinned-toolchain
   vendored-patches check feature-isolation clippy validate-crn example-warnings
   wasm-fixtures nextest isolation provider-cause doctests
 
@@ -163,6 +163,10 @@ run_kind() {
             bash scripts/test-rust-cache-key.sh
             bash scripts/test-verify-sh.sh
             bash scripts/test-touched-crates.sh
+            ;;
+        pinned-toolchain)
+            bash scripts/check-pinned-toolchain.sh
+            bash scripts/test-check-pinned-toolchain.sh
             ;;
         vendored-patches) bash scripts/check-vendored-patches-used.sh ;;
         check) cargo check "${scope[@]}" --all-targets --all-features ;;

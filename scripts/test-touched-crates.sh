@@ -141,6 +141,7 @@ class TouchedCratesTests(unittest.TestCase):
             "scripts/verify.sh", "scripts/touched-crates.sh",
             "scripts/test-in-process-isolation.sh", "scripts/setup-nextest-user-dirs.sh",
             "scripts/require-wasm-fixtures.sh", "scripts/wasm-fixture-crates.txt",
+            "rust-toolchain.toml", ".github/actions/rust-toolchain/action.yml",
             ".config/nextest.toml", ".config/nested/new-config.toml",
             ".cargo/config.toml", ".cargo/nested/new-config.toml",
             ".github/workflows/ci.yml", ".github/actions/rust-cache/action.yml",
@@ -171,6 +172,11 @@ class TouchedCratesTests(unittest.TestCase):
     def test_release_scripts_do_not_select_rust_crates(self):
         for filename in ("scripts/release-tag-channel.sh", "scripts/test-release-tag-channel.sh",
                          ".github/workflows/release.yml"):
+            with self.subTest(filename=filename):
+                self.assertEqual(self.scope(filename), "")
+
+    def test_pinned_toolchain_guard_scripts_do_not_select_rust_crates(self):
+        for filename in ("scripts/check-pinned-toolchain.sh", "scripts/test-check-pinned-toolchain.sh"):
             with self.subTest(filename=filename):
                 self.assertEqual(self.scope(filename), "")
 
