@@ -2027,7 +2027,8 @@ async fn run_apply_with_observer_factory(
                     base_dir,
                     &validated_config
                         .context()
-                        .upstream_provider_context(provider_context),
+                        .provider_context()
+                        .with_runtime(provider_context),
                     validated_config.context().schemas(),
                 )
                 .await?;
@@ -2433,7 +2434,8 @@ async fn run_apply_locked_owned(
                 project_dir,
                 &validated_config
                     .context()
-                    .upstream_provider_context(provider_context),
+                    .provider_context()
+                    .with_runtime(provider_context),
                 validated_config.context().schemas(),
             )
             .await?;

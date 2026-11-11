@@ -637,10 +637,11 @@ impl BackendError {
         }
     }
 
-    /// Return the typed legacy-row error when this is one.
+    /// Return the typed legacy-row error, including through upstream read context.
     pub fn invalid_resource_identity(&self) -> Option<&InvalidResourceIdentityError> {
         match self {
             Self::InvalidResourceIdentity(error) => Some(error),
+            Self::UpstreamExportRead(error) => error.error.invalid_resource_identity(),
             _ => None,
         }
     }
@@ -857,6 +858,29 @@ mod tests {
     use super::*;
     use crate::backend_config::{BackendConfig, BackendConfigError};
     use crate::lock::LockInfo;
+
+    #[test]
+    fn round3_upstream_read_preserves_legacy_identity_classification() {
+        let error = BackendError::UpstreamExportRead(Box::new(UpstreamExportReadError {
+            binding: "orgs".into(),
+            error: BackendError::InvalidResourceIdentity(InvalidResourceIdentityError::new(
+                0,
+                "mock".into(),
+                "test.resource".into(),
+                None,
+                ResourceIdentityError::Empty,
+            )),
+        }));
+        let identity = error
+            .invalid_resource_identity()
+            .expect("upstream reads retain the typed legacy-state recovery classifier");
+        assert_eq!(identity.identity_error(), &ResourceIdentityError::Empty);
+        assert!(
+            identity
+                .render_with_plan_command("carina plan downstream")
+                .contains("Run `carina plan downstream`")
+        );
+    }
 
     #[test]
     fn round1_3_upstream_export_read_retains_typed_backend_cause() {

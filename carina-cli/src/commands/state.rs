@@ -1572,7 +1572,8 @@ async fn run_state_bucket_delete(
         base_dir,
         &validated_config
             .context()
-            .upstream_provider_context(provider_context),
+            .provider_context()
+            .with_runtime(provider_context),
         validated_config.context().schemas(),
     )
     .await?;
@@ -1829,7 +1830,7 @@ pub(crate) async fn run_state_refresh_locked(
         validated_config.context().runtime(),
         parsed,
         base_dir,
-        &ctx.upstream_provider_context(provider_context),
+        &ctx.provider_context().with_runtime(provider_context),
         ctx.schemas(),
         UpstreamMissingStatePolicy::Strict,
         ProviderUpstreamScope::ProviderReferences,

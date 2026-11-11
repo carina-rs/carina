@@ -229,7 +229,7 @@ fn upstream_metadata_retains_the_command_environment_and_decryptor() {
         carina_core::EnvironmentSnapshot::new([("UPSTREAM_VALUE".into(), "captured-value".into())]),
     );
     ambient.decryptor = Some(Arc::new(|_, _| Ok("decrypted-value".into())));
-    let enriched = ctx.upstream_provider_context(&ambient);
+    let enriched = ctx.provider_context().with_runtime(&ambient);
 
     assert_eq!(
         enriched.environment.get("UPSTREAM_VALUE"),

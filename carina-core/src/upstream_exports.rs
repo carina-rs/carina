@@ -67,6 +67,56 @@ pub struct UpstreamExportEntry {
 /// Exports for a single `upstream_state` binding: export name → entry.
 pub type UpstreamExportEntries = HashMap<String, UpstreamExportEntry>;
 
+/// Upstream parsing has bootstrap authority only. Copy the command's runtime
+/// hooks, never its installed provider catalog; admission resolves source types
+/// separately against the downstream's loaded metadata.
+pub struct UpstreamBootstrapContext(crate::parser::ProviderContext);
+
+impl UpstreamBootstrapContext {
+    pub fn from_runtime(context: &crate::parser::ProviderContext) -> Self {
+        let mut bootstrap = crate::parser::ProviderContext::new(context.environment.clone());
+        bootstrap.decryptor = context.decryptor.clone();
+        Self(bootstrap)
+    }
+
+    fn load_source(
+        &self,
+        source: &ResolvedPath,
+    ) -> Result<crate::config_loader::LoadedConfig, String> {
+        crate::config_loader::load_configuration_for_bootstrap(
+            source,
+            &self.0,
+            &crate::schema::SchemaRegistry::new(),
+        )
+    }
+
+    /// Discover transitive upstream declarations without consuming their
+    /// backend or values. A loaded provider catalog cannot enter this parse.
+    pub fn load_metadata(
+        &self,
+        source: &ResolvedPath,
+    ) -> Result<crate::config_loader::LoadedConfig, String> {
+        crate::config_loader::load_configuration_for_metadata(
+            source,
+            &self.0,
+            &crate::schema::SchemaRegistry::new(),
+        )
+    }
+
+    fn parse_metadata(
+        &self,
+        source: &ResolvedPath,
+        overrides: &HashMap<String, String>,
+    ) -> Result<crate::config_loader::ParsedRootDirectory, String> {
+        crate::config_loader::parse_directory_for_metadata(
+            source,
+            &self.0,
+            overrides,
+            &crate::schema::SchemaRegistry::new(),
+        )
+    }
+}
+
 /// A binding and its pinned source directory, resolved together from one
 /// upstream declaration. Loading cannot substitute an unrelated directory.
 #[derive(Debug, Clone)]
@@ -93,19 +143,26 @@ impl UpstreamSourceIdentity {
         &self.source
     }
 
+    /// Parsing cannot receive the downstream's loaded catalog.
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_core::{upstream_exports::UpstreamSourceIdentity, schema::SchemaRegistry};
+    /// use carina_core::validation::deferred_types::ProviderTypeCheckContext;
+    /// fn load(identity: &UpstreamSourceIdentity, session: &dyn ProviderTypeCheckContext, schemas: &SchemaRegistry) {
+    ///     identity.load(session.catalog(), session, schemas);
+    /// }
+    /// ```
     pub fn load(
         &self,
+        bootstrap: &UpstreamBootstrapContext,
         context: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
         schemas: &crate::schema::SchemaRegistry,
     ) -> Result<ResolvedUpstreamSource, UpstreamSourceLoadError> {
-        let loaded = crate::config_loader::load_configuration_for_bootstrap(
-            &self.source,
-            context.catalog(),
-            &crate::schema::SchemaRegistry::new(),
-        )
-        .map_err(|message| UpstreamSourceLoadError::Configuration {
-            binding: self.binding.clone(),
-            message,
+        let loaded = bootstrap.load_source(&self.source).map_err(|message| {
+            UpstreamSourceLoadError::Configuration {
+                binding: self.binding.clone(),
+                message,
+            }
         })?;
         let surface = resolve_upstream_source_surface(&loaded, &self.source, context, schemas)?;
         Ok(ResolvedUpstreamSource {
@@ -607,6 +664,7 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
 ) -> Result<(UpstreamExports<B>, Vec<UpstreamResolveError>), crate::parser::AnalysisTreeError> {
     let mut out: UpstreamExports<B> = HashMap::new();
     let mut errors: Vec<UpstreamResolveError> = Vec::new();
+    let bootstrap = UpstreamBootstrapContext::from_runtime(config.catalog());
     for us in upstream_states {
         let source_abs = match base_dir.join(&us.source) {
             Ok(source) => source,
@@ -626,11 +684,9 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
             out.insert(us.binding.clone(), HashMap::new());
             continue;
         }
-        match crate::config_loader::parse_directory_for_metadata(
+        match bootstrap.parse_metadata(
             &source_abs,
-            config.catalog(),
             &crate::config_loader::directory_source_overrides(&source_abs, overrides),
-            schemas.unwrap_or(&crate::schema::SchemaRegistry::new()),
         ) {
             Ok(parsed) => match resolve_upstream_exports_from_parsed(
                 parsed,

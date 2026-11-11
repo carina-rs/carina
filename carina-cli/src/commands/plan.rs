@@ -6358,7 +6358,8 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs(
         base_dir,
         &validated_config
             .context()
-            .upstream_provider_context(provider_context),
+            .provider_context()
+            .with_runtime(provider_context),
         validated_config.context().schemas(),
         upstream_policy,
         ProviderUpstreamScope::All,
@@ -7135,7 +7136,7 @@ async fn build_upstream_backend(
     Box::pin(walk_upstream_cycles_only(
         loaded.upstream_states(),
         source_abs,
-        provider_context,
+        &carina_core::upstream_exports::UpstreamBootstrapContext::from_runtime(provider_context),
         cycle_guard,
     ))
     .await?;
@@ -7172,7 +7173,7 @@ async fn build_upstream_backend(
 async fn walk_upstream_cycles_only<B: carina_core::resource::BindingAddress>(
     upstream_states: &[UpstreamState<B>],
     base_dir: &ResolvedPath,
-    provider_context: &ProviderContext,
+    bootstrap: &carina_core::upstream_exports::UpstreamBootstrapContext,
     cycle_guard: &mut HashSet<CanonicalPath>,
 ) -> Result<(), AppError> {
     for us in upstream_states {
@@ -7202,19 +7203,16 @@ async fn walk_upstream_cycles_only<B: carina_core::resource::BindingAddress>(
 
         // Parse the upstream so we can see its own `upstream_state`
         // blocks. We deliberately do NOT touch its backend.
-        let loaded = carina_core::config_loader::load_configuration_for_metadata(
-            &source_abs,
-            provider_context,
-            &carina_core::schema::SchemaRegistry::new(),
-        )
-        .map_err(|e| AppError::Config(format!("upstream_state '{}': {}", us.binding, e)));
+        let loaded = bootstrap
+            .load_metadata(&source_abs)
+            .map_err(|e| AppError::Config(format!("upstream_state '{}': {}", us.binding, e)));
 
         let result = match loaded {
             Ok(loaded) => {
                 Box::pin(walk_upstream_cycles_only(
                     &loaded.parsed.upstream_states,
                     &source_abs,
-                    provider_context,
+                    bootstrap,
                     cycle_guard,
                 ))
                 .await
@@ -7526,13 +7524,13 @@ mod load_upstream_states_tests {
             vec![Box::new(EnumMetadataFactory)],
             &providers,
         );
-        let context = wiring.upstream_provider_context(&empty);
+        let context = wiring.provider_context().with_runtime(&empty);
         let source = [UpstreamState {
             binding: absolute_binding("orgs"),
             source: dir.path().to_path_buf(),
         }];
         let base = ResolvedPath::new(dir.path().parent().unwrap()).unwrap();
-        for warm_context in [&empty, &context] {
+        for warm_context in [&empty, &*context] {
             let runtime = crate::test_support::TestCommandRuntime::new();
             load_selected_upstream_states(
                 &runtime,
@@ -7614,7 +7612,7 @@ mod load_upstream_states_tests {
             &providers,
         );
         assert!(wiring.schemas().has_managed("mock", "actions.OidcSubject"));
-        let context = wiring.upstream_provider_context(&empty);
+        let context = wiring.provider_context().with_runtime(&empty);
         let value = |api_value: &str| serde_json::json!({"$enum": {"identity": {"provider": "mock", "segments": ["actions", "OidcSubject"], "kind": "ClaimKey"}, "api_value": api_value}});
         let source = [UpstreamState {
             binding: absolute_binding("orgs"),
@@ -7678,7 +7676,7 @@ mod load_upstream_states_tests {
         walk_upstream_cycles_only(
             &root.parsed.upstream_states,
             &base,
-            &context,
+            &carina_core::upstream_exports::UpstreamBootstrapContext::from_runtime(&context),
             &mut HashSet::new(),
         )
         .await
@@ -8555,7 +8553,9 @@ mod load_upstream_states_tests {
         let error = walk_upstream_cycles_only(
             &upstreams,
             &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
-            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &carina_core::upstream_exports::UpstreamBootstrapContext::from_runtime(
+                &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            ),
             &mut guard,
         )
         .await

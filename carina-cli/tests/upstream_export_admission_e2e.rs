@@ -111,6 +111,119 @@ fn write_exports(upstream: &Path, exports: serde_json::Value) {
     .unwrap();
 }
 
+#[test]
+fn round3_unknown_type_on_upstream_let_does_not_block_plan_or_apply() {
+    let root = tempfile::tempdir().unwrap();
+    let (upstream, downstream) = write_fixture(root.path());
+    fs::write(
+        upstream.join("main.crn"),
+        "fn upstream_only(value: Foo): Foo { value }\nlet unrelated = upstream_only('upstream-only')\nlet authored_count = 7\n",
+    )
+    .unwrap();
+    write_exports(&upstream, serde_json::json!({"count": 73, "unused": true}));
+
+    let plan = assert_success(
+        &run_cli(&downstream, &["plan", "--out", "saved.plan", "."]),
+        "plan with an upstream-only let type",
+    );
+    assert!(plan.contains("comment: '73'"), "{plan}");
+    assert_success(
+        &run_cli(&downstream, &["apply", "--auto-approve", "saved.plan"]),
+        "apply saved plan with an upstream-only let type",
+    );
+    assert_success(
+        &run_cli(&downstream, &["apply", "--auto-approve", "."]),
+        "live apply with an upstream-only let type",
+    );
+}
+
+#[test]
+fn round3_unknown_declared_export_type_installs_value_for_destination_check() {
+    let root = tempfile::tempdir().unwrap();
+    let (upstream, downstream) = write_fixture(root.path());
+    fs::write(
+        upstream.join("exports.crn"),
+        "exports { count: Foo = authored_count }\n",
+    )
+    .unwrap();
+    fs::write(
+        downstream.join("main.crn"),
+        "let orgs = upstream_state { source = '../upstream' }\nlet consumer = mock.test.resource { name = 'consumer'\ncomment = orgs.count }\n",
+    )
+    .unwrap();
+    write_exports(
+        &upstream,
+        serde_json::json!({"count": "installed unchanged"}),
+    );
+    for args in [vec!["plan", "."], vec!["apply", "--auto-approve", "."]] {
+        let output = run_cli(&downstream, &args);
+        assert_success(&output, "consume export whose source type is unavailable");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("Foo"), "no source-type warning: {stderr}");
+    }
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(downstream.join("carina.state.json")).unwrap()).unwrap();
+    assert_eq!(
+        state["resources"][0]["current"]["attributes"]["comment"],
+        serde_json::json!("installed unchanged")
+    );
+
+    write_exports(&upstream, serde_json::json!({"count": 73}));
+    for args in [vec!["plan", "."], vec!["apply", "--auto-approve", "."]] {
+        let output = run_cli(&downstream, &args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "destination must reject Int as String"
+        );
+        assert!(
+            stderr.contains("comment") && stderr.contains("expected String, got Int"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("upstream export 'orgs.count'"), "{stderr}");
+        assert!(!stderr.contains("unknown custom type"), "{stderr}");
+    }
+}
+
+#[test]
+fn round3_cycle_walk_defers_transitive_upstream_unknown_types_without_state_io() {
+    let root = tempfile::tempdir().unwrap();
+    let (upstream, downstream) = write_fixture(root.path());
+    let transitive = root.path().join("transitive");
+    fs::create_dir(&transitive).unwrap();
+    fs::write(
+        upstream.join("main.crn"),
+        "let ancestor = upstream_state { source = '../transitive' }\nlet authored_count = 7\n",
+    )
+    .unwrap();
+    fs::write(
+        transitive.join("main.crn"),
+        "arguments { unrelated: Foo = 'upstream-only' }\nexports { value: Foo = unrelated }\n",
+    )
+    .unwrap();
+    fs::write(
+        transitive.join("backend.crn"),
+        "backend local { path = 'poison.state.json' }\n",
+    )
+    .unwrap();
+    fs::write(transitive.join("poison.state.json"), "must never be read").unwrap();
+    write_exports(&upstream, serde_json::json!({"count": 73, "unused": true}));
+
+    assert_success(
+        &run_cli(&downstream, &["plan", "--out", "saved.plan", "."]),
+        "plan through transitive upstream with unknown types",
+    );
+    assert_success(
+        &run_cli(&downstream, &["apply", "--auto-approve", "saved.plan"]),
+        "apply saved plan through transitive upstream with unknown types",
+    );
+    assert_eq!(
+        fs::read_to_string(transitive.join("poison.state.json")).unwrap(),
+        "must never be read"
+    );
+    assert!(!transitive.join(".carina").exists());
+}
+
 fn assert_saved_upstream_change_is_drift(change: impl FnOnce(&Path)) {
     let root = tempfile::tempdir().unwrap();
     let (upstream, downstream) = write_fixture(root.path());

@@ -2775,19 +2775,6 @@ impl WiringContext {
         self.loaded_providers.schema_registry()
     }
 
-    /// Reuse downstream schema authority without replacing the command's
-    /// environment snapshot or decryptor while reading upstream configuration.
-    pub(crate) fn upstream_provider_context(
-        &self,
-        context: &carina_core::parser::ProviderContext,
-    ) -> carina_core::parser::ProviderContext {
-        carina_core::parser::ProviderContext {
-            custom_types: self.provider_context().custom_types.clone(),
-            resource_types: self.provider_context().resource_types.clone(),
-            ..context.clone()
-        }
-    }
-
     pub(crate) fn loaded_provider_schemas(&self) -> &ProviderLoadedSchemaRegistry {
         self.loaded_providers.schemas()
     }

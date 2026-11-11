@@ -115,9 +115,11 @@ impl CommandRuntime {
         if let Some((_, source)) = sources.iter().find(|(existing, _)| existing == &authority) {
             return Ok(Arc::clone(source));
         }
+        let bootstrap =
+            carina_core::upstream_exports::UpstreamBootstrapContext::from_runtime(context);
         let source = Arc::new(
             carina_core::validation::deferred_types::TypeCheckSession::run(context, |session| {
-                identity.load(session, schemas)
+                identity.load(&bootstrap, session, schemas)
             })
             .publish(&mut Vec::new())?,
         );
