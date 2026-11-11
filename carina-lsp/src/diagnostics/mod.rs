@@ -61,7 +61,10 @@ fn select_admission_inputs<'r, 'a>(
     let authored = resource
         .authored_instance_key()
         .and_then(|key| authored_resources?.get(&key).copied());
-    match authored.and_then(|resource| {
+    // Both successful admission and the report-only outcome describe this
+    // source owner. Expanded views have independent node/use identities.
+    let resource = authored.unwrap_or(resource);
+    match authored.and_then(|_| {
         ResourceAttributeInputs::from_resolved(resource, values, report)
             .ok()
             .map(|inputs| (resource, inputs))

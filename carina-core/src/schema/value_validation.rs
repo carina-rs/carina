@@ -59,12 +59,12 @@ pub(crate) fn cursor_step_allocations(cursor: AuthoredCursor<'_>) -> usize {
     let coverage = Default::default();
     let walk = AssignmentWalk {
         cursor,
-        callbacks: AssignmentCallbacks {
+        callbacks: WalkCallbacks::new(AssignmentCallbacks {
             ordinary: &|_, _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>, _, _| {
                 Ok(Default::default())
             },
             authored: None,
-        },
+        }),
         coverage: &coverage,
     };
     // Warm the use interner; repeated transport of the same authored edge
@@ -724,6 +724,15 @@ impl<'a> CheckedValue<'a> {
 
     fn into_findings(mut self) -> ValueValidationFindings {
         self.retain_primary_finding();
+        for (path, error) in self.findings.authored.errors.clone() {
+            let path = FieldPath::from_canonical_segments(path.segments().iter().cloned());
+            if self.local.error().is_some() {
+                self.findings.additional_local_errors.push(error.clone());
+            }
+            self.reject(&path, error.clone());
+            self.findings.local.push((path.clone(), error.clone()));
+            self.findings.located.push((path, error));
+        }
         self.findings.assignment.extend(self.findings.authored);
         ValueValidationFindings {
             structure: ValueStructure::Scalar,
@@ -985,12 +994,14 @@ pub(crate) struct AssignmentFindings {
     pub(crate) local: Vec<crate::validation::admission::LocalPath>,
     pub(crate) schema: crate::validation::admission::SchemaObligation,
     pub(crate) errors: Vec<(LeafPath, TypeError)>,
+    pub(crate) deferred: Vec<DeferredHook>,
 }
 impl AssignmentFindings {
     pub(crate) fn extend(&mut self, other: Self) {
         self.local.extend(other.local);
         self.schema.extend(other.schema);
         self.errors.extend(other.errors);
+        self.deferred.extend(other.deferred);
     }
 }
 impl InsideSecret for AssignmentFindings {
@@ -1000,6 +1011,14 @@ impl InsideSecret for AssignmentFindings {
                 .local
                 .into_iter()
                 .map(InsideSecret::inside_secret)
+                .collect(),
+            deferred: self
+                .deferred
+                .into_iter()
+                .map(|mut hook| {
+                    hook.secret = true;
+                    hook
+                })
                 .collect(),
             schema: self.schema,
             errors: self
@@ -1044,23 +1063,140 @@ impl AssignmentProbe {
     }
 }
 
+/// Member probes collect calls, never execute policy. Only the selected
+/// probe's tokens survive in CheckedValue; each token owns one FnOnce call.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct DeferredHook {
+    index: usize,
+    secret: bool,
+}
+
+type HookCall<'a> = Box<dyn FnOnce() -> AssignmentFindings + 'a>;
+#[derive(Default)]
+struct AuthoredHooks<'a> {
+    calls: std::cell::RefCell<Vec<Option<HookCall<'a>>>>,
+}
+impl<'a> AuthoredHooks<'a> {
+    fn record(&self, call: HookCall<'a>) -> AssignmentFindings {
+        let mut calls = self.calls.borrow_mut();
+        let index = calls.len();
+        calls.push(Some(call));
+        AssignmentFindings {
+            deferred: vec![DeferredHook {
+                index,
+                secret: false,
+            }],
+            ..Default::default()
+        }
+    }
+    fn finish(&self, findings: &mut AssignmentFindings) {
+        for hook in std::mem::take(&mut findings.deferred) {
+            let call = self.calls.borrow_mut()[hook.index].take();
+            if let Some(call) = call {
+                let result = call();
+                findings.extend(if hook.secret {
+                    result.inside_secret()
+                } else {
+                    result
+                });
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HookExecution {
+    Immediate,
+    UnionProbe,
+}
+
+#[derive(Clone)]
+struct AuthoredHook<'a, P: ValueKind, B: BindingAddress> {
+    callback: AssignmentCheck<'a, P, B>,
+    hooks: std::rc::Rc<AuthoredHooks<'a>>,
+    execution: HookExecution,
+}
+impl<'a, P: ValueKind, B: BindingAddress> AuthoredHook<'a, P, B> {
+    fn record(
+        &self,
+        attr: &'a CompiledAttributeType,
+        value: CheckValue<'a, P, B>,
+        path: &LeafPath,
+        cursor: AuthoredCursor<'a, B>,
+    ) -> AssignmentFindings {
+        let callback = self.callback;
+        let path = path.clone();
+        let call = move || match callback(attr, value, &path, cursor) {
+            Ok(findings) => findings,
+            Err(error) => AssignmentFindings {
+                errors: vec![(path, error)],
+                ..Default::default()
+            },
+        };
+        match self.execution {
+            HookExecution::Immediate => call(),
+            HookExecution::UnionProbe => self.hooks.record(Box::new(call)),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct WalkCallbacks<'a, P: ValueKind, B: BindingAddress> {
+    ordinary: AssignmentCheck<'a, P, B>,
+    authored: Option<AuthoredHook<'a, P, B>>,
+}
+impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
+    fn new(callbacks: AssignmentCallbacks<'a, P, B>) -> Self {
+        Self {
+            ordinary: callbacks.ordinary,
+            authored: callbacks.authored.map(|callback| AuthoredHook {
+                callback,
+                hooks: Default::default(),
+                execution: HookExecution::Immediate,
+            }),
+        }
+    }
+    fn probing(&self) -> Self {
+        let mut callbacks = self.clone();
+        if let Some(authored) = &mut callbacks.authored {
+            authored.execution = HookExecution::UnionProbe;
+        }
+        callbacks
+    }
+    fn finish(&self, findings: &mut AssignmentFindings) {
+        if let Some(authored) = &self.authored
+            && matches!(authored.execution, HookExecution::Immediate)
+        {
+            authored.hooks.finish(findings);
+        }
+    }
+}
+
+impl<'a, P: ValueKind, B: BindingAddress> From<AssignmentCallbacks<'a, P, B>>
+    for WalkCallbacks<'a, P, B>
+{
+    fn from(callbacks: AssignmentCallbacks<'a, P, B>) -> Self {
+        Self::new(callbacks)
+    }
+}
+
 /// Cursor and callback travel together, including through union probes. A
 /// structural schema-only walk has no assignment work; live admission always
 /// constructs this complete input.
 #[derive(Clone)]
-struct AssignmentWalk<'a, 's, P: PlaceholderKind, B: BindingAddress> {
-    cursor: AuthoredCursor<'s, B>,
-    callbacks: AssignmentCallbacks<'a, P, B>,
+struct AssignmentWalk<'a, P: PlaceholderKind, B: BindingAddress> {
+    cursor: AuthoredCursor<'a, B>,
+    callbacks: WalkCallbacks<'a, P, B>,
     coverage: &'a std::cell::RefCell<WalkCoverage>,
 }
 
-impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B> {
+impl<'a, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, P, B> {
     fn step(
         &self,
         advance: impl FnOnce(
-            &AuthoredCursor<'s, B>,
+            &AuthoredCursor<'a, B>,
         )
-            -> Result<AuthoredCursor<'s, B>, crate::parser::retained::MissingEvidence>,
+            -> Result<AuthoredCursor<'a, B>, crate::parser::retained::MissingEvidence>,
     ) -> Result<Self, TypeError> {
         Ok(Self {
             cursor: advance(&self.cursor).map_err(seam_error)?,
@@ -1087,23 +1223,23 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
 
     fn authored(
         &self,
-        attr: &CompiledAttributeType,
-        value: CheckValue<'_, P, B>,
+        attr: &'a CompiledAttributeType,
+        value: CheckValue<'a, P, B>,
         path: &FieldPath,
-    ) -> Result<AssignmentFindings, TypeError> {
+    ) -> AssignmentFindings {
         if self.cursor.is_projection_only() {
-            return Ok(Default::default());
+            return Default::default();
         }
-        match self.callbacks.authored {
-            Some(hook) => hook(attr, value, &path.canonical(), self.cursor.clone()),
-            None => Ok(Default::default()),
+        match &self.callbacks.authored {
+            Some(hook) => hook.record(attr, value, &path.canonical(), self.cursor.clone()),
+            None => Default::default(),
         }
     }
 
     fn authored_parts(
         &self,
-        attr: &CompiledAttributeType,
-        defs: &BTreeMap<String, CompiledAttributeType>,
+        attr: &'a CompiledAttributeType,
+        defs: &'a BTreeMap<String, CompiledAttributeType>,
         path: &FieldPath,
         ancestry: FieldAncestry,
     ) -> AssignmentFindings {
@@ -1121,7 +1257,7 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
                         path,
                         ancestry,
                         child,
-                        self.callbacks,
+                        self.callbacks.clone(),
                         &mut self.coverage.borrow_mut(),
                         SyntaxVisit::Covered,
                     )
@@ -1135,14 +1271,14 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
         authored
     }
 
-    fn prepare<'v, T: StructuralPending<'v, P, B>>(
+    fn prepare<'v: 'a, T: StructuralPending<'v, P, B>>(
         mut self,
-        attr: &CompiledAttributeType,
-        defs: &BTreeMap<String, CompiledAttributeType>,
+        attr: &'a CompiledAttributeType,
+        defs: &'a BTreeMap<String, CompiledAttributeType>,
         value: ClassifiedRef<'_, 'v, P, B, T>,
         path: &FieldPath,
         ancestry: FieldAncestry,
-    ) -> Result<(Self, AssignmentProbe, Vec<AuthoredCursor<'s, B>>), TypeError> {
+    ) -> Result<(Self, AssignmentProbe, Vec<AuthoredCursor<'a, B>>), TypeError> {
         let mut findings = AssignmentProbe::default();
         let mut wrappers = Vec::new();
         let mut followed = std::collections::HashSet::new();
@@ -1181,7 +1317,7 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
                             path,
                             ancestry,
                             usage.alternative(discarded).map_err(seam_error)?,
-                            self.callbacks,
+                            self.callbacks.clone(),
                             &mut self.coverage.borrow_mut(),
                         )?);
                     }
@@ -1209,7 +1345,7 @@ impl<'a, 's, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, 's, P, B>
                         path,
                         ancestry,
                         usage.alternative(1).map_err(seam_error)?,
-                        self.callbacks,
+                        self.callbacks.clone(),
                         &mut self.coverage.borrow_mut(),
                     )?);
                     AuthoredCursor::authored(usage.alternative(0).map_err(seam_error)?)
@@ -1243,31 +1379,33 @@ pub(crate) fn validate_authored_value_for_admission<
     coverage: &mut WalkCoverage,
 ) -> ValueValidationFindings {
     let visits = std::cell::RefCell::new(std::mem::take(coverage));
-    let mut findings = ValueValidator::new(defs, Some(lookup))
-        .walk_with_assignment(
-            attr,
-            value.into(),
-            &FieldPath::new(),
-            ancestry,
-            &mut Vec::new(),
-            Some(AssignmentWalk {
-                cursor,
-                callbacks,
-                coverage: &visits,
-            }),
-        )
-        .into_findings();
+    let callbacks = WalkCallbacks::new(callbacks);
+    let mut checked = ValueValidator::new(defs, Some(lookup)).walk_with_assignment(
+        attr,
+        value.into(),
+        &FieldPath::new(),
+        ancestry,
+        &mut Vec::new(),
+        Some(AssignmentWalk {
+            cursor,
+            callbacks: callbacks.clone(),
+            coverage: &visits,
+        }),
+    );
+    callbacks.finish(&mut checked.findings.authored);
+    drop(callbacks);
+    let mut findings = checked.into_findings();
     *coverage = visits.into_inner();
     findings.structure = value_structure(value);
     findings
 }
 
-fn step_assignment<'a, 's, P: PlaceholderKind, B: BindingAddress>(
-    assignment: Option<&AssignmentWalk<'a, 's, P, B>>,
+fn step_assignment<'a, P: PlaceholderKind, B: BindingAddress>(
+    assignment: Option<&AssignmentWalk<'a, P, B>>,
     advance: impl FnOnce(
-        &AuthoredCursor<'s, B>,
-    ) -> Result<AuthoredCursor<'s, B>, crate::parser::retained::MissingEvidence>,
-) -> Result<Option<AssignmentWalk<'a, 's, P, B>>, TypeError> {
+        &AuthoredCursor<'a, B>,
+    ) -> Result<AuthoredCursor<'a, B>, crate::parser::retained::MissingEvidence>,
+) -> Result<Option<AssignmentWalk<'a, P, B>>, TypeError> {
     let Some(walk) = assignment else {
         return Ok(None);
     };
@@ -1309,25 +1447,28 @@ impl ChildRoute<'_> {
 /// evaluated, classified, normalized or sent to a provider here. Union probes
 /// own their findings and coverage; only a chosen authored probe survives.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn visit_discarded<P: PlaceholderKind, B: BindingAddress>(
-    attr: &CompiledAttributeType,
-    defs: &BTreeMap<String, CompiledAttributeType>,
+pub(crate) fn visit_discarded<'w, 's: 'w, P: PlaceholderKind + 'w, B: BindingAddress>(
+    attr: &'w CompiledAttributeType,
+    defs: &'w BTreeMap<String, CompiledAttributeType>,
     path: &FieldPath,
     ancestry: FieldAncestry,
-    cursor: AuthoredUse<'_, B>,
-    callbacks: AssignmentCallbacks<'_, P, B>,
+    cursor: AuthoredUse<'s, B>,
+    callbacks: impl Into<WalkCallbacks<'w, P, B>>,
     coverage: &mut WalkCoverage,
 ) -> Result<AssignmentProbe, TypeError> {
-    visit_syntax(
+    let callbacks = callbacks.into();
+    let mut probe = visit_syntax(
         attr,
         defs,
         path,
         ancestry,
         cursor,
-        callbacks,
+        callbacks.clone(),
         coverage,
         SyntaxVisit::Discarded,
-    )
+    )?;
+    callbacks.finish(&mut probe.authored);
+    Ok(probe)
 }
 
 #[derive(Clone, Copy)]
@@ -1352,23 +1493,23 @@ impl SyntaxVisit {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn visit_syntax<P: PlaceholderKind, B: BindingAddress>(
-    attr: &CompiledAttributeType,
-    defs: &BTreeMap<String, CompiledAttributeType>,
+fn visit_syntax<'w, 's: 'w, P: PlaceholderKind, B: BindingAddress>(
+    attr: &'w CompiledAttributeType,
+    defs: &'w BTreeMap<String, CompiledAttributeType>,
     path: &FieldPath,
     ancestry: FieldAncestry,
-    cursor: AuthoredUse<'_, B>,
-    callbacks: AssignmentCallbacks<'_, P, B>,
+    cursor: AuthoredUse<'s, B>,
+    callbacks: WalkCallbacks<'w, P, B>,
     coverage: &mut WalkCoverage,
     visit: SyntaxVisit,
 ) -> Result<AssignmentProbe, TypeError> {
-    fn descend<P: PlaceholderKind, B: BindingAddress>(
-        attr: &CompiledAttributeType,
-        defs: &BTreeMap<String, CompiledAttributeType>,
+    fn descend<'w, 's: 'w, P: PlaceholderKind, B: BindingAddress>(
+        attr: &'w CompiledAttributeType,
+        defs: &'w BTreeMap<String, CompiledAttributeType>,
         path: &FieldPath,
         ancestry: FieldAncestry,
-        cursor: AuthoredUse<'_, B>,
-        callbacks: AssignmentCallbacks<'_, P, B>,
+        cursor: AuthoredUse<'s, B>,
+        callbacks: WalkCallbacks<'w, P, B>,
         visit: SyntaxVisit,
         coverage: &mut WalkCoverage,
         findings: &mut AssignmentProbe,
@@ -1385,7 +1526,16 @@ fn visit_syntax<P: PlaceholderKind, B: BindingAddress>(
         } = navigation
         {
             return descend(
-                attr, defs, path, ancestry, child, callbacks, visit, coverage, findings, visited,
+                attr,
+                defs,
+                path,
+                ancestry,
+                child,
+                callbacks.clone(),
+                visit,
+                coverage,
+                findings,
+                visited,
             );
         }
         if let AttrTypeKind::Union(members) = &attr.kind {
@@ -1427,7 +1577,7 @@ fn visit_syntax<P: PlaceholderKind, B: BindingAddress>(
                     path,
                     ancestry,
                     cursor.clone(),
-                    callbacks,
+                    callbacks.probing(),
                     visit,
                     &mut reached,
                     &mut probe,
@@ -1435,7 +1585,7 @@ fn visit_syntax<P: PlaceholderKind, B: BindingAddress>(
                 )?;
                 let rank = (
                     std::cmp::Reverse(authored_shape_matches(resolved.attr, &cursor)),
-                    probe.ordinary.errors.len() + probe.authored.errors.len(),
+                    probe.ordinary.errors.len(),
                     std::cmp::Reverse(reached.len()),
                 );
                 if best.as_ref().is_none_or(|(current, _, _)| rank < *current) {
@@ -1473,19 +1623,29 @@ fn visit_syntax<P: PlaceholderKind, B: BindingAddress>(
                 authored.clone(),
             )?);
         }
-        if let Some(hook) = callbacks.authored {
+        if let Some(hook) = &callbacks.authored {
             findings
                 .authored
-                .extend(hook(attr, visit.value(), &path.canonical(), authored)?);
+                .extend(hook.record(attr, visit.value(), &path.canonical(), authored));
         }
         coverage.record(&cursor);
-        let mut child =
-            |attr: &CompiledAttributeType, child: AuthoredUse<'_, B>, path: FieldPath, ancestry| {
-                descend(
-                    attr, defs, &path, ancestry, child, callbacks, visit, coverage, findings,
-                    visited,
-                )
-            };
+        let mut child = |attr: &'w CompiledAttributeType,
+                         child: AuthoredUse<'s, B>,
+                         path: FieldPath,
+                         ancestry| {
+            descend(
+                attr,
+                defs,
+                &path,
+                ancestry,
+                child,
+                callbacks.clone(),
+                visit,
+                coverage,
+                findings,
+                visited,
+            )
+        };
         match navigation {
             AuthoredNavigation::Forward { child: next, .. } => {
                 child(attr, next, path.clone(), ancestry)
@@ -1579,7 +1739,7 @@ fn visit_syntax<P: PlaceholderKind, B: BindingAddress>(
         path,
         ancestry,
         cursor,
-        callbacks,
+        callbacks.clone(),
         visit,
         &mut completed,
         &mut findings,
@@ -1676,7 +1836,8 @@ impl<'a> ValueValidator<'a, '_> {
     }
 
     fn walk_with_assignment<
-        'v,
+        'w,
+        'v: 'w,
         P: PlaceholderKind,
         B: BindingAddress,
         T: StructuralPending<'v, P, B>,
@@ -1687,8 +1848,11 @@ impl<'a> ValueValidator<'a, '_> {
         path: &FieldPath,
         ancestry: FieldAncestry,
         visited: &mut Vec<&'a str>,
-        assignment: Option<AssignmentWalk<'_, '_, P, B>>,
-    ) -> CheckedValue<'a> {
+        assignment: Option<AssignmentWalk<'w, P, B>>,
+    ) -> CheckedValue<'a>
+    where
+        'a: 'w,
+    {
         let (assignment, extra, wrappers) = match assignment {
             Some(assignment) => match assignment.prepare(attr, self.defs, value, path, ancestry) {
                 Ok((assignment, findings, wrappers)) => (Some(assignment), findings, wrappers),
@@ -1735,7 +1899,8 @@ impl<'a> ValueValidator<'a, '_> {
 
     #[allow(clippy::too_many_arguments)]
     fn complete_authored_walk<
-        'v,
+        'w,
+        'v: 'w,
         P: PlaceholderKind,
         B: BindingAddress,
         T: StructuralPending<'v, P, B>,
@@ -1745,10 +1910,12 @@ impl<'a> ValueValidator<'a, '_> {
         attr: &'a CompiledAttributeType,
         value: ClassifiedRef<'_, 'v, P, B, T>,
         path: &FieldPath,
-        assignment: Option<AssignmentWalk<'_, '_, P, B>>,
+        assignment: Option<AssignmentWalk<'w, P, B>>,
         extra: AssignmentProbe,
-        wrappers: Vec<AuthoredCursor<'_, B>>,
-    ) {
+        wrappers: Vec<AuthoredCursor<'w, B>>,
+    ) where
+        'a: 'w,
+    {
         let mut authored = AssignmentFindings::default();
         if let Some(walk) = assignment {
             for cursor in wrappers {
@@ -1756,18 +1923,15 @@ impl<'a> ValueValidator<'a, '_> {
                     cursor,
                     ..walk.clone()
                 };
-                match wrapper.authored(
+                authored.extend(wrapper.authored(
                     checked.selected.unwrap_or(attr),
                     CheckValue::Current(value.diagnostic_value()),
                     path,
-                ) {
-                    Ok(findings) => authored.extend(findings),
-                    Err(error) => authored.errors.push((path.canonical(), error)),
-                }
+                ));
             }
         }
         authored.extend(extra.authored);
-        for (_, error) in extra.ordinary.errors.iter().chain(&authored.errors) {
+        for (_, error) in &extra.ordinary.errors {
             checked.reject(path, error.clone());
         }
         authored.extend(std::mem::take(&mut checked.findings.authored));
@@ -1776,16 +1940,25 @@ impl<'a> ValueValidator<'a, '_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn walk_secret<'v, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'v, P, B>>(
+    fn walk_secret<
+        'w,
+        'v: 'w,
+        P: PlaceholderKind,
+        B: BindingAddress,
+        T: StructuralPending<'v, P, B>,
+    >(
         &self,
         attr: &'a CompiledAttributeType,
         evidence: ClassifiedRef<'_, 'v, P, B, T>,
-        original: &Value<P, B>,
+        original: &'v Value<P, B>,
         path: &FieldPath,
         ancestry: FieldAncestry,
         visited: &mut Vec<&'a str>,
-        assignment: Option<AssignmentWalk<'_, '_, P, B>>,
-    ) -> CheckedValue<'a> {
+        assignment: Option<AssignmentWalk<'w, P, B>>,
+    ) -> CheckedValue<'a>
+    where
+        'a: 'w,
+    {
         let (assignment, wrapper) = match assignment {
             Some(walk) => match &walk.cursor.kind {
                 CursorKind::Authored(usage) => match usage.navigation().map_err(seam_error) {
@@ -1812,20 +1985,11 @@ impl<'a> ValueValidator<'a, '_> {
             assignment,
         );
         if let Some(wrapper) = wrapper {
-            let mut authored = match wrapper.authored(
+            let mut authored = wrapper.authored(
                 checked.selected.unwrap_or(attr),
                 CheckValue::Current(original),
                 path,
-            ) {
-                Ok(findings) => findings,
-                Err(error) => AssignmentFindings {
-                    errors: vec![(path.canonical(), error)],
-                    ..Default::default()
-                },
-            };
-            for (_, error) in &authored.errors {
-                checked.reject(path, error.clone());
-            }
+            );
             authored.extend(std::mem::take(&mut checked.findings.authored));
             checked.findings.authored = authored;
         }
@@ -1834,8 +1998,9 @@ impl<'a> ValueValidator<'a, '_> {
 
     #[allow(clippy::too_many_arguments)]
     fn walk_coalesce<
+        'w,
         'c,
-        'v,
+        'v: 'w,
         P: PlaceholderKind,
         B: BindingAddress,
         T: StructuralPending<'v, P, B>,
@@ -1847,14 +2012,17 @@ impl<'a> ValueValidator<'a, '_> {
         default: ClassifiedRef<'c, 'v, P, B, T>,
         path: &FieldPath,
         ancestry: FieldAncestry,
-        assignment: Option<AssignmentWalk<'_, '_, P, B>>,
-    ) -> CheckedValue<'a> {
+        assignment: Option<AssignmentWalk<'w, P, B>>,
+    ) -> CheckedValue<'a>
+    where
+        'a: 'w,
+    {
         // A coalesce has an authored assignment of its own. Retain that
         // judgement while the existing walk checks both classified
         // alternatives, including their provider callbacks.
         let parent_authored = match &assignment {
             Some(walk) => walk.authored(attr, CheckValue::Current(value.diagnostic_value()), path),
-            None => Ok(AssignmentFindings::default()),
+            None => AssignmentFindings::default(),
         };
         let parent_assignment = match &assignment {
             Some(walk) => walk.check(attr, CheckValue::Current(value.diagnostic_value()), path),
@@ -1932,32 +2100,20 @@ impl<'a> ValueValidator<'a, '_> {
                     .push((path.canonical(), error));
             }
         }
-        match parent_authored {
-            Ok(mut findings) => {
-                if let Some(walk) = &assignment {
-                    findings.extend(walk.authored_parts(attr, self.defs, path, ancestry));
-                }
-                for (_, error) in &findings.errors {
-                    left.reject(path, error.clone());
-                }
-                findings.extend(std::mem::take(&mut left.findings.authored));
-                left.findings.authored = findings;
-            }
-            Err(error) => {
-                left.reject(path, error.clone());
-                left.findings
-                    .authored
-                    .errors
-                    .push((path.canonical(), error));
-            }
+        let mut authored = parent_authored;
+        if let Some(walk) = &assignment {
+            authored.extend(walk.authored_parts(attr, self.defs, path, ancestry));
         }
+        authored.extend(std::mem::take(&mut left.findings.authored));
+        left.findings.authored = authored;
         left.selected = Some(attr);
         left
     }
 
     fn walk_branches<
+        'w,
         'c,
-        'v,
+        'v: 'w,
         P: PlaceholderKind,
         B: BindingAddress,
         T: StructuralPending<'v, P, B>,
@@ -1968,8 +2124,11 @@ impl<'a> ValueValidator<'a, '_> {
         branches: Vec<ClassifiedRef<'c, 'v, P, B, T>>,
         path: &FieldPath,
         ancestry: FieldAncestry,
-        assignment: Option<AssignmentWalk<'_, '_, P, B>>,
-    ) -> CheckedValue<'a> {
+        assignment: Option<AssignmentWalk<'w, P, B>>,
+    ) -> CheckedValue<'a>
+    where
+        'a: 'w,
+    {
         let ClassifiedRef::Pending(pending) = value else {
             unreachable!("only an undecided conditional has branches")
         };
@@ -1982,10 +2141,11 @@ impl<'a> ValueValidator<'a, '_> {
                 cursor: walk.cursor.selection(),
                 ..walk.clone()
             };
-            match selection.authored(attr, CheckValue::Current(value.diagnostic_value()), path) {
-                Ok(findings) => checked.findings.authored.extend(findings),
-                Err(error) => return CheckedValue::rejected(path, error),
-            }
+            checked.findings.authored.extend(selection.authored(
+                attr,
+                CheckValue::Current(value.diagnostic_value()),
+                path,
+            ));
             match walk.check_selection(attr, CheckValue::Current(value.diagnostic_value()), path) {
                 Ok(findings) => checked.findings.assignment.extend(findings),
                 Err(error) => return CheckedValue::rejected(path, error),
@@ -1994,10 +2154,11 @@ impl<'a> ValueValidator<'a, '_> {
         if let Some(walk) = &assignment
             && !matches!(&walk.cursor.kind, CursorKind::Authored(usage) if usage.form() == AuthoredForm::If)
         {
-            match walk.authored(attr, CheckValue::Current(value.diagnostic_value()), path) {
-                Ok(findings) => checked.findings.authored.extend(findings),
-                Err(error) => return CheckedValue::rejected(path, error),
-            }
+            checked.findings.authored.extend(walk.authored(
+                attr,
+                CheckValue::Current(value.diagnostic_value()),
+                path,
+            ));
         }
         for (index, branch) in branches.into_iter().enumerate() {
             let branch_assignment =
@@ -2044,15 +2205,24 @@ impl<'a> ValueValidator<'a, '_> {
         checked
     }
 
-    fn walk_value<'v, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'v, P, B>>(
+    fn walk_value<
+        'w,
+        'v: 'w,
+        P: PlaceholderKind,
+        B: BindingAddress,
+        T: StructuralPending<'v, P, B>,
+    >(
         &self,
         attr: &'a CompiledAttributeType,
         value: ClassifiedRef<'_, 'v, P, B, T>,
         path: &FieldPath,
         ancestry: FieldAncestry,
         visited: &mut Vec<&'a str>,
-        assignment: Option<AssignmentWalk<'_, '_, P, B>>,
-    ) -> CheckedValue<'a> {
+        assignment: Option<AssignmentWalk<'w, P, B>>,
+    ) -> CheckedValue<'a>
+    where
+        'a: 'w,
+    {
         if let Some(inner) = value.protected_for_schema(&SchemaEvidenceAuthority(())) {
             return inner.validate(|evidence| {
                 self.walk_secret(
@@ -2082,61 +2252,34 @@ impl<'a> ValueValidator<'a, '_> {
         checked
     }
 
-    fn walk_resolved<'v, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'v, P, B>>(
+    fn walk_resolved<
+        'w,
+        'v: 'w,
+        P: PlaceholderKind,
+        B: BindingAddress,
+        T: StructuralPending<'v, P, B>,
+    >(
         &self,
         attr: &'a CompiledAttributeType,
         value: ClassifiedRef<'_, 'v, P, B, T>,
         path: &FieldPath,
         ancestry: FieldAncestry,
         visited: &mut Vec<&'a str>,
-        assignment: Option<AssignmentWalk<'_, '_, P, B>>,
-    ) -> CheckedValue<'a> {
+        assignment: Option<AssignmentWalk<'w, P, B>>,
+    ) -> CheckedValue<'a>
+    where
+        'a: 'w,
+    {
         // Main's union-level ordinary check remains before member trials.
         // The authored hook belongs to the chosen member's probe instead.
         let probes = matches!(attr.kind, AttrTypeKind::Union(_))
             && !matches!(value, ClassifiedRef::Failed(_))
             && !matches!(value, ClassifiedRef::Pending(pending) if !pending.arithmetic());
-        let authored = match assignment.as_ref().filter(|_| !probes) {
-            Some(walk) => {
-                match walk.authored(attr, CheckValue::Current(value.diagnostic_value()), path) {
-                    Ok(findings) if !findings.errors.is_empty() => {
-                        let mut checked =
-                            CheckedValue::rejected(path, findings.errors[0].1.clone());
-                        checked.selected = Some(attr);
-                        checked.findings.additional_local_errors.extend(
-                            findings
-                                .errors
-                                .iter()
-                                .skip(1)
-                                .map(|(_, error)| error.clone()),
-                        );
-                        checked.findings.located.extend(findings.errors.iter().map(
-                            |(path, error)| {
-                                (
-                                    FieldPath::from_canonical_segments(
-                                        path.segments().iter().cloned(),
-                                    ),
-                                    error.clone(),
-                                )
-                            },
-                        ));
-                        checked.findings.authored = findings;
-                        return checked;
-                    }
-                    Ok(findings) => findings,
-                    Err(error) => {
-                        let mut checked = CheckedValue::rejected(path, error.clone());
-                        checked
-                            .findings
-                            .authored
-                            .errors
-                            .push((path.canonical(), error));
-                        return checked;
-                    }
-                }
-            }
-            None => Default::default(),
-        };
+        let authored = assignment
+            .as_ref()
+            .filter(|_| !probes)
+            .map(|walk| walk.authored(attr, CheckValue::Current(value.diagnostic_value()), path))
+            .unwrap_or_default();
         let findings = match &assignment {
             Some(walk) => {
                 match walk.check(attr, CheckValue::Current(value.diagnostic_value()), path) {
@@ -2188,10 +2331,6 @@ impl<'a> ValueValidator<'a, '_> {
         if !probes && let Some(walk) = &assignment {
             authored.extend(walk.authored_parts(attr, self.defs, path, ancestry));
         }
-        for (_, error) in &authored.errors {
-            checked.reject(path, error.clone());
-        }
-
         authored.extend(std::mem::take(&mut checked.findings.authored));
         checked.findings.authored = authored;
         checked.selected.get_or_insert(attr);
@@ -2200,7 +2339,8 @@ impl<'a> ValueValidator<'a, '_> {
 
     #[allow(clippy::too_many_arguments)]
     fn walk_resolved_value<
-        'v,
+        'w,
+        'v: 'w,
         P: PlaceholderKind,
         B: BindingAddress,
         T: StructuralPending<'v, P, B>,
@@ -2211,8 +2351,11 @@ impl<'a> ValueValidator<'a, '_> {
         path: &FieldPath,
         ancestry: FieldAncestry,
         visited: &mut Vec<&'a str>,
-        assignment: Option<AssignmentWalk<'_, '_, P, B>>,
-    ) -> CheckedValue<'a> {
+        assignment: Option<AssignmentWalk<'w, P, B>>,
+    ) -> CheckedValue<'a>
+    where
+        'a: 'w,
+    {
         if let AttrTypeKind::UnloadedSchemaType(_) = &attr.kind {
             return CheckedValue::rejected(
                 path,
@@ -2392,15 +2535,24 @@ impl<'a> ValueValidator<'a, '_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn struct_value<'v, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'v, P, B>>(
+    fn struct_value<
+        'w,
+        'v: 'w,
+        P: PlaceholderKind,
+        B: BindingAddress,
+        T: StructuralPending<'v, P, B>,
+    >(
         &self,
         attr: &'a CompiledAttributeType,
         value: ClassifiedRef<'_, 'v, P, B, T>,
         map: &indexmap::IndexMap<String, Value<P, B>>,
         path: &FieldPath,
         ancestry: FieldAncestry,
-        assignment: Option<AssignmentWalk<'_, '_, P, B>>,
-    ) -> CheckedValue<'a> {
+        assignment: Option<AssignmentWalk<'w, P, B>>,
+    ) -> CheckedValue<'a>
+    where
+        'a: 'w,
+    {
         let AttrTypeKind::Struct {
             name,
             fields,
@@ -2522,15 +2674,24 @@ impl<'a> ValueValidator<'a, '_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn map_value<'v, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'v, P, B>>(
+    fn map_value<
+        'w,
+        'v: 'w,
+        P: PlaceholderKind,
+        B: BindingAddress,
+        T: StructuralPending<'v, P, B>,
+    >(
         &self,
         attr: &'a CompiledAttributeType,
         value: ClassifiedRef<'_, 'v, P, B, T>,
         map: &indexmap::IndexMap<String, Value<P, B>>,
         path: &FieldPath,
         ancestry: FieldAncestry,
-        assignment: Option<AssignmentWalk<'_, '_, P, B>>,
-    ) -> CheckedValue<'a> {
+        assignment: Option<AssignmentWalk<'w, P, B>>,
+    ) -> CheckedValue<'a>
+    where
+        'a: 'w,
+    {
         let AttrTypeKind::Map {
             key,
             value: value_type,
@@ -2667,7 +2828,7 @@ impl<'a> ValueValidator<'a, '_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn list<'v, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'v, P, B>>(
+    fn list<'w, 'v: 'w, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'v, P, B>>(
         &self,
         attr: &'a CompiledAttributeType,
         inner: &'a CompiledAttributeType,
@@ -2676,8 +2837,11 @@ impl<'a> ValueValidator<'a, '_> {
         string_list: bool,
         path: &FieldPath,
         ancestry: FieldAncestry,
-        assignment: Option<AssignmentWalk<'_, '_, P, B>>,
-    ) -> CheckedValue<'a> {
+        assignment: Option<AssignmentWalk<'w, P, B>>,
+    ) -> CheckedValue<'a>
+    where
+        'a: 'w,
+    {
         let mut children = Vec::new();
         let mut child_fits = Vec::new();
         for (i, value) in items.iter().enumerate() {
@@ -2771,7 +2935,8 @@ impl<'a> ValueValidator<'a, '_> {
     }
 
     fn union_with_assignment<
-        'v,
+        'w,
+        'v: 'w,
         P: PlaceholderKind,
         B: BindingAddress,
         T: StructuralPending<'v, P, B>,
@@ -2782,8 +2947,15 @@ impl<'a> ValueValidator<'a, '_> {
         path: &FieldPath,
         ancestry: FieldAncestry,
         visited: &mut Vec<&'a str>,
-        assignment: Option<AssignmentWalk<'_, '_, P, B>>,
-    ) -> Result<AdmittedUnion<'a>, Box<UnionFailure<'a>>> {
+        assignment: Option<AssignmentWalk<'w, P, B>>,
+    ) -> Result<AdmittedUnion<'a>, Box<UnionFailure<'a>>>
+    where
+        'a: 'w,
+    {
+        let assignment = assignment.map(|mut walk| {
+            walk.callbacks = walk.callbacks.probing();
+            walk
+        });
         let mut best_accepted: Option<AdmittedUnion<'a>> = None;
         let mut failure: Option<BestUnionMemberFailures> = None;
         let mut provider_failure: Option<UnionProviderFailure<'a>> = None;

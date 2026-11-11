@@ -268,3 +268,48 @@ fn round2_lsp_missing_expanded_report_selects_main_fallback() {
     let actual = serde_json::json!(actual);
     assert_eq!(actual, expected["no_expanded_report"]);
 }
+
+#[test]
+fn round6_report_fallback_records_the_matched_authored_slots() {
+    let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let parse = |source| {
+        carina_core::parser::parse_file(source, std::path::Path::new("buffer.crn"), &config)
+            .unwrap()
+    };
+    // Independent buffer and expanded parses share a declaration key, never
+    // their authored node/use identities. Neither has this report's resource.
+    let buffer = parse("mock.Test { input = ('bad') }");
+    let expanded = parse("mock.Test { input = ('bad') }");
+    let previous = parse("mock.Previous { input = 1 }");
+    let schemas = SchemaRegistry::new();
+    let sealed =
+        carina_core::config_loader::load_buffer_configuration(&previous, &schemas, &config);
+    let buffer_tree = carina_core::parser::AnalysisTree::try_from_file(&buffer).unwrap();
+    let expanded_tree = carina_core::parser::AnalysisTree::try_from_file(&expanded).unwrap();
+    let authored = buffer_tree.resources().next().unwrap();
+    let resource = expanded_tree.resources().next().unwrap();
+    assert_eq!(
+        authored.authored_instance_key(),
+        resource.authored_instance_key()
+    );
+    let map = authored_validation_resources(&buffer_tree);
+    let expected =
+        carina_core::validation::admission::attributes::ResourceAttributeInputs::from_report(
+            authored,
+            &authored.resolved_attributes(),
+            sealed.judged().report(),
+        );
+    let (_, actual) = select_admission_inputs(
+        resource,
+        Some(&map),
+        &resource.resolved_attributes(),
+        sealed.judged().report(),
+    );
+    let expected = expected.authored_evidence().unwrap_err();
+    let actual = actual.authored_evidence().unwrap_err();
+    assert_eq!(
+        actual.slots(),
+        expected.slots(),
+        "unreached identities belong to the authored match"
+    );
+}

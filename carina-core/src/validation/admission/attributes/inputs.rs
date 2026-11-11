@@ -245,16 +245,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             owner: resource.id().clone(),
             report: None,
             inputs,
-            evidence: if resource.authored_declaration_id().is_some() {
-                ResourceEvidence::Slots
-            } else {
-                ResourceEvidence::NoAuthoredEvidence(Arc::new(
-                    crate::parser::retained::NoAuthoredEvidence::for_resource(
-                        resource.id(),
-                        resource.authored_slots(),
-                    ),
-                ))
-            },
+            evidence: ResourceEvidence::Slots,
         }
     }
 

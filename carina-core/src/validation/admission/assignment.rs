@@ -429,6 +429,7 @@ fn verdict<K: DestinationKind>(
         local: paths,
         schema,
         errors: _,
+        deferred: _,
     } = findings;
     match K::local(destination, paths, schema) {
         Ok(obligation) => AssignmentVerdict::NeedsLocal(obligation),
