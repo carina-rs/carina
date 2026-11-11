@@ -10427,8 +10427,6 @@ fn contains_anonymous_scalar(attr: &AttributeType) -> bool {
             identity_layer:
                 crate::schema::StringIdentityLayer {
                     binding: RefinementBinding::MetadataOnly(None),
-                    pattern: _,
-                    length: _,
                     ..
                 },
             ..
@@ -10437,14 +10435,12 @@ fn contains_anonymous_scalar(attr: &AttributeType) -> bool {
             identity_layer:
                 crate::schema::IntIdentityLayer {
                     binding: RefinementBinding::MetadataOnly(None),
-                    range: _,
                     ..
                 },
             ..
         }
         | AttrTypeKind::Float {
             binding: RefinementBinding::MetadataOnly(None),
-            range: _,
             ..
         } => true,
         AttrTypeKind::List { element_type, .. } => contains_anonymous_scalar(element_type),
