@@ -418,4 +418,50 @@ mod tests {
             Err(ProviderSchemaValidationError::ConflictingIdentityDeclarations { .. })
         ));
     }
+
+    fn reference(pattern: &str, min: u64, max: u64) -> AttributeType {
+        AttributeType::reference(
+            TypeIdentity::bare("KeyReference"),
+            Some(PatternSpec::new(pattern, PatternMatch::Full)),
+            Some((Some(min), Some(max))),
+        )
+    }
+
+    fn admit_across_roots(
+        resource_type: AttributeType,
+        config_type: AttributeType,
+    ) -> Result<ValidatedProviderSchemaWitness, ProviderSchemaValidationError> {
+        let resource = ResourceSchema::new("Keys")
+            .attribute(AttributeSchema::optional("key", resource_type).build())
+            .validate()
+            .unwrap();
+        let config =
+            ValidatedConfigSchema::validate(BTreeMap::from([("key".into(), config_type)])).unwrap();
+        ValidatedProviderSchemaWitness::new(vec![resource], config, BTreeMap::new(), vec![])
+    }
+
+    #[test]
+    fn aggregate_admission_reference_rejects_different_lengths() {
+        assert!(matches!(
+            admit_across_roots(reference("[a-z]+", 1, 2048), reference("[a-z]+", 0, 256)),
+            Err(ProviderSchemaValidationError::ConflictingIdentityDeclarations { identity })
+                if identity == TypeIdentity::bare("KeyReference")
+        ));
+    }
+
+    #[test]
+    fn aggregate_admission_reference_rejects_different_patterns() {
+        assert!(matches!(
+            admit_across_roots(reference("[a-z]+", 1, 2048), reference("[A-Z]+", 1, 2048)),
+            Err(ProviderSchemaValidationError::ConflictingIdentityDeclarations { identity })
+                if identity == TypeIdentity::bare("KeyReference")
+        ));
+    }
+
+    #[test]
+    fn aggregate_admission_reference_accepts_identical_definitions() {
+        assert!(
+            admit_across_roots(reference("[a-z]+", 1, 2048), reference("[a-z]+", 1, 2048)).is_ok()
+        );
+    }
 }

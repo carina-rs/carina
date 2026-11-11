@@ -2305,6 +2305,40 @@ fn member_constraints_do_not_enter_multi_owner_identity_annotations() {
 }
 
 #[test]
+fn owners_conjoin_differing_reference_definitions() {
+    use crate::schema::{PatternMatch, PatternSpec};
+
+    let loaded = snapshot(vec![
+        (
+            "a",
+            vec![DraftType::reference(
+                identity(),
+                Some(PatternSpec::new("a.*", PatternMatch::Full)),
+                Some((Some(1), Some(16))),
+            )],
+        ),
+        (
+            "b",
+            vec![DraftType::reference(
+                identity(),
+                Some(PatternSpec::new(".*z", PatternMatch::Full)),
+                Some((Some(3), Some(32))),
+            )],
+        ),
+    ]);
+    let ty = annotation(&loaded);
+    let lifted = lift_type_expr(&ty).unwrap();
+    for (value, valid) in [("abz", true), ("az", false), ("xbz", false), ("abc", false)] {
+        assert_eq!(lifted.validate(&text(value)).is_ok(), valid, "{value}");
+    }
+    let restored: TypeExpr = serde_json::from_value(serde_json::to_value(&ty).unwrap()).unwrap();
+    assert_eq!(restored, ty);
+    let restored = lift_type_expr(&restored).unwrap();
+    assert!(restored.validate(&text("abz")).is_ok());
+    assert!(restored.validate(&text("abc")).is_err());
+}
+
+#[test]
 fn owners_conjoin_differing_identity_layers_without_member_constraints() {
     use crate::schema::{PatternMatch, PatternSpec};
     let loaded = snapshot(vec![
