@@ -592,11 +592,22 @@ A struct type represents a nested object with typed fields.
   bounds, and finally the semantic callback; retain first-failure diagnostics.
   Never repeat structural checks in callbacks. Within one provider, every
   occurrence of a String/Int/Float identity must have the same identity-layer
-  definition (including Float ranges);
-  aggregate admission rejects `ConflictingIdentityDeclarations`. Provider
-  migrations must move resource-specific bounds into the member layer rather
-  than redeclaring an identity with different constraints. Across different
-  owners (for example AWS and AWSCC), annotation constraints are conjoined:
+  definition (including Float ranges). Reference declarations must agree on
+  pattern and length too. Mixed String/Reference declarations must have equal
+  identity patterns and lengths, and the String's `to_dsl` must be absent.
+  Single-schema validation and aggregate admission share one identified-declaration
+  walk and agreement rule. Disagreements are schema-definition issues locally
+  and `ConflictingIdentityDeclarations` at aggregate admission. An Enum occurrence
+  never masks later scalar agreement. Single-schema identity-definition agreement
+  does not compare Enum and Reference occurrences of the same identity.
+  For identities with reference forms,
+  Enum/Reference mixing remains an aggregate-only `NonStringReferenceForm` error.
+  Callbacks do not participate in agreement. Dispatch merges callbacks per
+  identity, so a String declaration's callback also applies to Reference slots
+  of that identity.
+  Provider migrations must put resource-specific String/Int bounds in member
+  layers and Reference restrictions in input rules. Across different owners
+  (for example AWS and AWSCC), annotation constraints are conjoined:
   values must satisfy every owner's identity layer. Annotation-origin evidence
   uses an identity-only payload with no member slots. Read-value projections
   are identity-only too: their typed declarations preserve enum values,
