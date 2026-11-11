@@ -9,6 +9,7 @@ use carina_core::schema::SchemaRegistry;
 mod basic;
 mod extended;
 mod located;
+mod seam_review;
 mod single_value_walk;
 
 pub(super) fn create_document(content: &str) -> Document {

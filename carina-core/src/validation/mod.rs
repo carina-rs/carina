@@ -2997,7 +2997,7 @@ fn prove_integer_operand<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     expression: &crate::integer_arithmetic::ValidatedIntegerExpr<ParserPlaceholder, B>,
     side: crate::integer_arithmetic::IntegerOperandSide,
-    report: &impl IntegerOperandEvidence<B>,
+    report: &(impl IntegerOperandEvidence<B> + ?Sized),
     binding_index: &BindingIndex<'_, B>,
 ) -> Result<(), DeferredAccessTypeError> {
     let integer = lift_type_expr(&TypeExpr::Int).expect("built-in Int lifts");
@@ -3179,7 +3179,7 @@ fn check_integer_result_sink<B: BindingAddress>(
 fn check_integer_arithmetic_types_with_sink<'a, B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     sink: Option<RefSink<'a>>,
-    report: &impl IntegerOperandEvidence<B>,
+    report: &(impl IntegerOperandEvidence<B> + ?Sized),
     binding_index: &BindingIndex<'_, B>,
 ) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
     let findings =
@@ -5462,7 +5462,6 @@ fn resource_admission_report<
     let mut attributes = HashMap::new();
     let mut coverage = admission::WalkCoverage::default();
     let inference_bindings = inference::bindings_from_parsed(parsed);
-    let report = parsed.expression_report();
     let tree = crate::parser::AnalysisTree::try_from_file(parsed)?;
 
     // Validate declarations directly instead of relying on a later resource
@@ -5487,25 +5486,21 @@ fn resource_admission_report<
                         continue;
                     };
                     let attrs = resource.attributes();
+                    let inputs = admission::attributes::ResourceAttributeInputs::new(resource);
                     let classified = crate::resource::knowledge::collect_classified_attributes(
-                        attrs.iter().map(|(name, value)| (name.clone(), value)),
+                        inputs
+                            .values()
+                            .map(|(name, value)| (name.to_owned(), value)),
                         &crate::resource::knowledge::KnowledgeContext::validation(),
                         |_, _| {},
                     );
-                    let report = match report.for_resource(resource.id()) {
-                        Ok(report) => report,
-                        Err(error) => {
-                            all_errors.push(error.to_string());
-                            continue;
-                        }
-                    };
                     let values = admission::attributes::resource_attribute_admissions_with_coverage(
                         resource,
                         parsed,
                         schema,
                         &classified,
                         resource.quoted_string_attrs(),
-                        report,
+                        &inputs,
                         bindings,
                         session,
                         registry,

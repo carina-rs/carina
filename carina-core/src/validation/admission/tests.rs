@@ -221,15 +221,14 @@ fn retained_reference_boundaries_are_built_per_attribute_not_per_leaf() {
                 .find(|resource| resource.id().resource_type == "Sink")
                 .unwrap();
             let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
-            let resource_attributes = resource.attributes();
+            let inputs = attributes::ResourceAttributeInputs::new(resource);
             let attributes = crate::resource::knowledge::collect_classified_attributes(
-                resource_attributes
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value)),
+                inputs
+                    .values()
+                    .map(|(name, value)| (name.to_owned(), value)),
                 &KnowledgeContext::validation(),
                 |_, error| panic!("classification: {error:?}"),
             );
-            let report = judged.report().for_resource(resource.id()).unwrap();
             with_session_for_test(&catalog, |session| {
                 let (findings, work) = count_admission_work(|| {
                     attributes::resource_attribute_admissions(
@@ -238,7 +237,7 @@ fn retained_reference_boundaries_are_built_per_attribute_not_per_leaf() {
                         resource.schema(&schemas).unwrap(),
                         &attributes,
                         resource.quoted_string_attrs(),
-                        report,
+                        &inputs,
                         &bindings,
                         session,
                         &schemas,

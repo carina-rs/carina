@@ -1077,7 +1077,13 @@ impl<B: BindingAddress> AuthoredSlots<B> {
             slot.instance = instance;
             slot.occurrence = UseId::fresh();
             slot.generation = ProjectionGeneration::fresh();
-            slot.snapshot = Arc::new(ExpressionReport::empty());
+            // Identity-only cloning changes neither syntax, projection nor
+            // binding environment. Materialized slots retain that judgement;
+            // later substitution/remapping still invalidates it explicitly.
+            // Pending slots must first acquire their instance projection.
+            if slot.projection().is_none() {
+                slot.snapshot = Arc::new(ExpressionReport::empty());
+            }
         }
     }
     pub(crate) fn map_bindings<C: BindingAddress>(

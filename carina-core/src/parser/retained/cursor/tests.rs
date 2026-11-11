@@ -817,13 +817,18 @@ fn seam_admission_coverage_accumulates_across_resource_slots() {
                 let mut coverage = crate::validation::admission::WalkCoverage::default();
                 let mut counts = Vec::new();
                 for resource in tree.project_resources() {
-                    let values = resource.attributes();
+                    let inputs =
+                        crate::validation::admission::attributes::ResourceAttributeInputs::new(
+                            resource,
+                        );
                     let classified = crate::resource::knowledge::collect_classified_attributes(
-                        values.iter().map(|(name, value)| (name.clone(), value)),
+                        inputs
+                            .values()
+                            .map(|(name, value)| (name.to_owned(), value)),
                         &crate::resource::knowledge::KnowledgeContext::validation(),
                         |_, error| panic!("{error}"),
                     );
-                    let findings = crate::validation::admission::attributes::resource_attribute_admissions_with_coverage(resource, judged.file(), resource.schema(schemas).unwrap(), &classified, resource.quoted_string_attrs(), judged.report().for_resource(resource.id()).unwrap(), &bindings, session, schemas, &mut coverage);
+                    let findings = crate::validation::admission::attributes::resource_attribute_admissions_with_coverage(resource, judged.file(), resource.schema(schemas).unwrap(), &classified, resource.quoted_string_attrs(), &inputs, &bindings, session, schemas, &mut coverage);
                     assert_eq!(findings.errors().count(), 0, "{findings:?}");
                     counts.push(coverage.len());
                 }
@@ -1072,9 +1077,12 @@ fn seam_generated_prefix_result_has_explicit_projection_authority() {
     let bindings =
         crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-        let attributes = resource.attributes();
+        let inputs =
+            crate::validation::admission::attributes::ResourceAttributeInputs::new(resource);
         let classified = crate::resource::knowledge::collect_classified_attributes(
-            attributes.iter().map(|(name, value)| (name.clone(), value)),
+            inputs
+                .values()
+                .map(|(name, value)| (name.to_owned(), value)),
             &crate::resource::knowledge::KnowledgeContext::validation(),
             |_, error| panic!("{error}"),
         );
@@ -1084,7 +1092,7 @@ fn seam_generated_prefix_result_has_explicit_projection_authority() {
             resource.schema(&schemas).unwrap(),
             &classified,
             resource.quoted_string_attrs(),
-            judged.report().for_resource(resource.id()).unwrap(),
+            &inputs,
             &bindings,
             session,
             &schemas,
@@ -1395,4 +1403,373 @@ fn seam_directory_replacement_transports_canonical_block_slots() {
     assert_eq!(slot.projection(), Some(&replacement));
     assert_ne!(slot.generation(), generation);
     assert!(slot.cursor().is_err());
+}
+
+#[test]
+fn review_seam_false_if_without_else_preserves_absence() {
+    use crate::schema::value_validation::{WalkCoverage, validate_authored_value_for_admission};
+    let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed =
+        crate::parser::parse_and_resolve("let input = if false { mock.Other {} }").unwrap();
+    let expression = parsed
+        .parser_binding_metadata
+        .syntax()
+        .expressions()
+        .binding(&RelativeBindingName::new("input"))
+        .unwrap()
+        .clone();
+    let mut slot = JudgedSlot::from_expression(
+        expression,
+        crate::schema::SchemaKind::Resource,
+        ExpansionInstanceId::fresh(),
+    );
+    // A false structural conditional contributes no instances. There is no
+    // authored else node corresponding to that empty lowered projection.
+    slot.replace_projection(Value::Concrete(crate::resource::ConcreteValue::List(
+        vec![],
+    )));
+    slot.attach_snapshot(Arc::new(judge_expressions(
+        &parsed,
+        &SchemaRegistry::new(),
+        &catalog,
+    )))
+    .unwrap();
+    let schema = crate::schema::ResourceSchema::new("Test")
+        .attribute(
+            crate::schema::AttributeSchema::optional(
+                "input",
+                crate::schema::AttributeType::list(crate::schema::AttributeType::string()),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let proof = slot
+        .projection()
+        .unwrap()
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .unwrap()
+        .into_classification();
+    let findings = validate_authored_value_for_admission(
+        &schema.as_schema().attributes()["input"].attr_type,
+        &proof,
+        schema.as_schema().defs(),
+        crate::schema::FieldAncestry::WRITABLE,
+        &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
+        slot.cursor().unwrap(),
+        &|_, _, _, _| Ok(Default::default()),
+        &mut WalkCoverage::default(),
+    );
+    assert!(findings.local_error().is_none(), "{findings:?}");
+}
+
+#[test]
+fn review_seam_equal_projection_from_another_slot_is_not_a_proof() {
+    let first = slot("let input = 'same'");
+    let second = slot("let input = 'same'");
+    let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+        let proof = second
+            .projection()
+            .unwrap()
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .unwrap()
+            .into_classification();
+        assert!(
+            crate::validation::admission::Candidate::validation_slot(&first, proof, None, session,)
+                .is_err(),
+            "an equal value from another slot must not authorize this cursor"
+        );
+    });
+}
+
+#[test]
+fn review_seam_instantiated_materialized_slot_has_a_current_judgement() {
+    let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = crate::parser::parse_and_resolve("mock.Test { input = 'same' }").unwrap();
+    let schemas = SchemaRegistry::new();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let resource = &configuration.judged().file().resources[0];
+    let instance = resource.instantiate();
+    let original = resource.authored_slots.get("input").unwrap();
+    let slot = instance.authored_slots.get("input").unwrap();
+    assert_ne!(slot.instance(), original.instance());
+    assert_ne!(slot.generation(), original.generation());
+    assert_eq!(slot.projection(), original.projection());
+    assert!(
+        slot.cursor().is_ok(),
+        "identity-only instantiation retains the current source judgement"
+    );
+}
+
+#[test]
+fn review_seam_discarded_failure_does_not_cover_the_failed_walk() {
+    use crate::schema::value_validation::{CheckValue, WalkCoverage, visit_discarded};
+    let slot = slot("let input = if true { 'selected' } else { 'discarded' }");
+    let AuthoredCursor::Authored(mut usage) = slot.cursor().unwrap() else {
+        panic!("authored slot")
+    };
+    while usage.form() != AuthoredForm::If {
+        usage = usage.child(usage.child_count() - 1, usage.edge()).unwrap();
+    }
+    let discarded = usage.child(2, EdgeRole::IfBranch).unwrap();
+    let schema = crate::schema::ResourceSchema::new("Test")
+        .attribute(
+            crate::schema::AttributeSchema::optional(
+                "input",
+                crate::schema::AttributeType::string(),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let check = |_: &crate::schema::CompiledAttributeType,
+                 value: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                 _: &crate::schema::LeafPath,
+                 cursor: AuthoredCursor<'_>| {
+        assert!(matches!(value, CheckValue::Discarded));
+        let AuthoredCursor::Authored(usage) = cursor else {
+            panic!("discarded authored child")
+        };
+        if usage.form() == AuthoredForm::Literal {
+            Err(crate::validation::admission::assignment_seam_error(
+                MissingEvidence::new("discarded child correspondence"),
+            ))
+        } else {
+            Ok(Default::default())
+        }
+    };
+    let mut coverage = WalkCoverage::default();
+    let findings = visit_discarded(
+        &schema.as_schema().attributes()["input"].attr_type,
+        schema.as_schema().defs(),
+        &crate::schema::LeafPath::from_segments([]),
+        crate::schema::FieldAncestry::WRITABLE,
+        discarded,
+        &check,
+        &mut coverage,
+    );
+    assert!(
+        findings
+            .unwrap_err()
+            .to_string()
+            .contains("discarded child correspondence")
+    );
+    assert!(coverage.is_empty(), "failed descent must remain unreached");
+}
+
+#[test]
+fn review_seam_composition_computed_values_keep_main_checks() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    for (argument_type, expression) in [
+        ("map(map(Int))", "input['nested']['count']"),
+        ("Int", "input + 1"),
+        ("Int", "input ?? 1"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("child")).unwrap();
+        std::fs::write(directory.path().join("main.crn"), format!(
+            "arguments {{ input: {argument_type} }}\nlet child = use {{ source = './child' }}\nlet output = child {{ input = input }}\n"
+        )).unwrap();
+        std::fs::write(directory.path().join("child/main.crn"), format!(
+            "arguments {{ input: {argument_type} }}\nattributes {{ result: Int = {expression} }}\n"
+        )).unwrap();
+        let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+        let root = crate::config_loader::parse_directory(&path, &catalog).unwrap();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("Sink")
+                .attribute(AttributeSchema::optional("result", AttributeType::string()).build())
+                .validate()
+                .unwrap(),
+        );
+        crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+            let graph = crate::module_resolver::resolve_modules_with_providerless_config(
+                root, &path, session, &schemas,
+            )
+            .unwrap();
+            let configuration =
+                crate::config_loader::load_buffer_configuration(&graph, &schemas, &catalog);
+            let judged = configuration.judged();
+            let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+            let resource = tree
+                .project_resources()
+                .find(|resource| resource.kind() == crate::parser::AnalysisItemKind::Composition)
+                .unwrap();
+            let inputs =
+                crate::validation::admission::attributes::ResourceAttributeInputs::new(resource);
+            let classified = crate::resource::knowledge::collect_classified_attributes(
+                inputs
+                    .values()
+                    .map(|(name, value)| (name.to_owned(), value)),
+                &crate::resource::knowledge::KnowledgeContext::validation(),
+                |_, error| panic!("{error}"),
+            );
+            let bindings =
+                crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+            let findings = crate::validation::admission::attributes::resource_attribute_admissions(
+                resource,
+                judged.file(),
+                schemas
+                    .get("mock", "Sink", crate::schema::SchemaKind::Resource)
+                    .unwrap(),
+                &classified,
+                resource.quoted_string_attrs(),
+                &inputs,
+                &bindings,
+                session,
+                &schemas,
+            );
+            assert!(
+                findings
+                    .errors()
+                    .chain(findings.symbolic_errors().map(|(_, _, error)| error))
+                    .any(|error| error.to_string().contains("expected String, got Int")),
+                "{expression}: {findings:?}"
+            );
+        });
+    }
+}
+
+#[test]
+fn review_seam_prepared_inputs_reject_other_instances_and_stale_generations() {
+    use crate::validation::admission::attributes::{
+        ResourceAttributeInputs, resource_attribute_admissions,
+    };
+    let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        crate::schema::ResourceSchema::new("Test")
+            .attribute(
+                crate::schema::AttributeSchema::optional(
+                    "input",
+                    crate::schema::AttributeType::string(),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let parsed =
+        crate::parser::parse_and_resolve("let one = mock.Test { input = 'same' }").unwrap();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let judged = configuration.judged();
+    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let resource = tree.resources().next().unwrap();
+    let inputs = ResourceAttributeInputs::new(resource);
+    let proofs = crate::resource::knowledge::collect_classified_attributes(
+        inputs
+            .values()
+            .map(|(name, value)| (name.to_owned(), value)),
+        &crate::resource::knowledge::KnowledgeContext::validation(),
+        |_, error| panic!("{error}"),
+    );
+    for instantiate in [false, true] {
+        let mut changed = judged.file().clone();
+        if instantiate {
+            changed.resources[0] = changed.resources[0].instantiate();
+        } else {
+            let values = changed.resources[0].attributes.clone();
+            changed.resources[0]
+                .authored_slots
+                .replace_projections(&values);
+        }
+        let changed_tree = crate::parser::AnalysisTree::try_from_file(&changed).unwrap();
+        let changed_resource = changed_tree.resources().next().unwrap();
+        let bindings =
+            crate::binding_index::BindingIndex::from_parsed(&changed, &schemas, &catalog);
+        crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+            let findings = resource_attribute_admissions(
+                changed_resource,
+                &changed,
+                changed_resource.schema(&schemas).unwrap(),
+                &proofs,
+                changed_resource.quoted_string_attrs(),
+                &inputs,
+                &bindings,
+                session,
+                &schemas,
+            );
+            assert!(
+                findings.errors().any(|error| error
+                    .to_string()
+                    .contains("resource instance/generation pairing")),
+                "{findings:?}"
+            );
+        });
+    }
+}
+
+#[test]
+fn review_seam_producer_materialization_keeps_a_real_projection_pairing() {
+    use crate::validation::admission::attributes::{
+        ResourceAttributeInputs, resource_attribute_admissions_with_coverage,
+    };
+    let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        crate::schema::ResourceSchema::new("Test")
+            .attribute(
+                crate::schema::AttributeSchema::optional(
+                    "input",
+                    crate::schema::AttributeType::string(),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let parsed =
+        crate::parser::parse_and_resolve("let one = mock.Test { input = 'before' }").unwrap();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let judged = configuration.judged();
+    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let resource = tree.resources().next().unwrap();
+    let source = resource.authored_slot("input").unwrap();
+    let mut inputs = ResourceAttributeInputs::new(resource);
+    inputs.materialize(&std::collections::HashMap::from([(
+        "input".into(),
+        Value::Concrete(crate::resource::ConcreteValue::String("after".into())),
+    )]));
+    let proofs = crate::resource::knowledge::collect_classified_attributes(
+        inputs
+            .values()
+            .map(|(name, value)| (name.to_owned(), value)),
+        &crate::resource::knowledge::KnowledgeContext::validation(),
+        |_, error| panic!("{error}"),
+    );
+    let bindings =
+        crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+        let mut coverage = crate::validation::admission::WalkCoverage::default();
+        let findings = resource_attribute_admissions_with_coverage(
+            resource,
+            judged.file(),
+            resource.schema(&schemas).unwrap(),
+            &proofs,
+            resource.quoted_string_attrs(),
+            &inputs,
+            &bindings,
+            session,
+            &schemas,
+            &mut coverage,
+        );
+        assert_eq!(findings.errors().count(), 0, "{findings:?}");
+        let AuthoredCursor::Authored(usage) = source.cursor().unwrap() else {
+            panic!("authored source")
+        };
+        assert_ne!(
+            coverage
+                .current_generation(usage.occurrence(), usage.instance())
+                .unwrap(),
+            source.generation()
+        );
+    });
 }

@@ -532,6 +532,8 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
 
 impl<B: BindingAddress> Candidate<crate::resource::ParserPlaceholder, B> {
     /// Candidate, knowledge and authored cursor are sealed from one slot.
+    /// The classification must borrow this slot's projection allocation;
+    /// an equal value from another slot or generation is not its proof.
     pub fn validation_slot<'a>(
         slot: &'a crate::parser::retained::JudgedSlot<B>,
         proof: crate::resource::knowledge::Classification<
@@ -557,7 +559,10 @@ impl<B: BindingAddress> Candidate<crate::resource::ParserPlaceholder, B> {
             }])
         };
         let value = crate::resource::knowledge::ClassifiedRef::from(&proof).diagnostic_value();
-        if slot.projection() != Some(value) {
+        if !slot
+            .projection()
+            .is_some_and(|projection| std::ptr::eq(projection, value))
+        {
             return Err(mismatch("slot/projection proof pairing"));
         }
         let cursor = slot.cursor().map_err(|error| {
