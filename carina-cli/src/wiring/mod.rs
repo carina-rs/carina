@@ -917,7 +917,10 @@ impl TypeCheckError for AppError {
 }
 impl TypeCheckError for PlanPreparationError {
     fn with_type_check_diagnostics(self, diagnostics: String) -> Self {
-        PlanPreparationError::Provider(HostError::internal(format!("{self}\n{diagnostics}")))
+        PlanPreparationError::TypeCheckDiagnostics(Box::new(crate::error::TypeCheckDiagnostics {
+            error: self,
+            diagnostics,
+        }))
     }
 }
 
@@ -4308,6 +4311,8 @@ impl NonEmptyPlanErrors {
 #[derive(Debug, thiserror::Error)]
 pub enum PlanPreparationError {
     #[error(transparent)]
+    TypeCheckDiagnostics(Box<crate::error::TypeCheckDiagnostics<PlanPreparationError>>),
+    #[error(transparent)]
     ModuleConstraint(#[from] carina_core::executor::ModuleConstraintGateError),
     #[error("plan validation failed")]
     Plan(NonEmptyPlanErrors),
@@ -7131,7 +7136,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                         PlanPreparationError::ModuleConstraint(error) => {
                             return Err(AppError::ModuleConstraint(error));
                         }
-                        error @ PlanPreparationError::Knowledge {..} => {
+                        error @ (PlanPreparationError::Knowledge {..} | PlanPreparationError::TypeCheckDiagnostics(_)) => {
                             return Err(error.into());
                         }
                     };

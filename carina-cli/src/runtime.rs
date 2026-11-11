@@ -15,6 +15,14 @@ use std::sync::{Arc, LazyLock, Mutex};
 type ConfigureBuiltinMock =
     Box<dyn FnOnce() -> Result<ConfiguredBuiltinMock, Arc<CommandInputError>> + Send + Sync>;
 
+type UpstreamSourceCache = HashMap<
+    CanonicalPath,
+    Vec<(
+        carina_core::upstream_exports::UpstreamTypeAuthority,
+        Arc<crate::commands::plan::CachedUpstreamSource>,
+    )>,
+>;
+
 /// Mock-only inputs become usable only after successful builtin selection.
 pub struct BuiltinMockInputs {
     configured:
@@ -61,8 +69,7 @@ pub struct CommandInputs {
 struct InvocationState {
     inputs: CommandInputs,
     warned_upstream: Mutex<HashSet<CanonicalPath>>,
-    upstream_sources:
-        Mutex<HashMap<CanonicalPath, Arc<crate::commands::plan::CachedUpstreamSource>>>,
+    upstream_sources: Mutex<UpstreamSourceCache>,
     #[cfg(any(test, feature = "test-utils"))]
     provider_loads: AtomicUsize,
 }
@@ -95,6 +102,7 @@ impl CommandRuntime {
     pub(crate) fn upstream_source(
         &self,
         path: &ResolvedPath,
+        authority: carina_core::upstream_exports::UpstreamTypeAuthority,
         load: impl FnOnce() -> Result<crate::commands::plan::CachedUpstreamSource, AppError>,
     ) -> Result<Arc<crate::commands::plan::CachedUpstreamSource>, AppError> {
         let mut sources = self
@@ -102,11 +110,12 @@ impl CommandRuntime {
             .upstream_sources
             .lock()
             .expect("upstream source cache");
-        if let Some(source) = sources.get(&path.identity()) {
+        let sources = sources.entry(path.identity()).or_default();
+        if let Some((_, source)) = sources.iter().find(|(existing, _)| existing == &authority) {
             return Ok(Arc::clone(source));
         }
         let source = Arc::new(load()?);
-        sources.insert(path.identity(), Arc::clone(&source));
+        sources.push((authority, Arc::clone(&source)));
         Ok(source)
     }
 

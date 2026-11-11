@@ -972,9 +972,14 @@ async fn verify_upstream_snapshot(
             None,
         )
         .await
-        .map_err(|error| AppError::UpstreamSnapshotChanged {
-            message: upstream_snapshot_drift(source.binding.as_str(), apply_target),
-            error: Box::new(error),
+        .map_err(|error| match error {
+            error @ AppError::UpstreamExportAdmission(_) => AppError::UpstreamSnapshotChanged(
+                Box::new(crate::error::UpstreamSnapshotChangedError {
+                    message: upstream_snapshot_drift(source.binding.as_str(), apply_target),
+                    error,
+                }),
+            ),
+            other => other,
         })?;
         current.extend(loaded);
     }
@@ -1033,6 +1038,41 @@ fn diff_upstream_snapshot(
 mod upstream_snapshot_tests {
     use super::*;
     use carina_core::upstream_exports::remote_bindings_for_test;
+
+    #[tokio::test]
+    async fn round1_5_upstream_backend_read_failure_is_not_drift() {
+        let root = tempfile::tempdir().unwrap();
+        let upstream = root.path().join("upstream");
+        std::fs::create_dir(&upstream).unwrap();
+        std::fs::write(upstream.join("main.crn"), "exports { count: Int = 7 }\n").unwrap();
+        std::fs::write(
+            upstream.join("backend.crn"),
+            "backend local { path = 'carina.state.json' }\n",
+        )
+        .unwrap();
+        std::fs::create_dir(upstream.join("carina.state.json")).unwrap();
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let wiring = crate::wiring::WiringContext::new_for_test(&runtime, vec![], &[]);
+        let sources = [crate::commands::plan::UpstreamSource {
+            binding: carina_core::resource::absolute_binding_address_for_test("orgs"),
+            source: "upstream".into(),
+        }];
+        let error = verify_upstream_snapshot(
+            &wiring,
+            &sources,
+            &HashMap::new(),
+            &ResolvedPath::new(root.path()).unwrap(),
+            ApplyTarget::Project(root.path()),
+        )
+        .await
+        .unwrap_err();
+        let message = crate::error::format_error_with_source_chain(&error);
+        assert!(
+            !message.contains("drifted"),
+            "read failures are not drift: {message}"
+        );
+        assert!(matches!(error, AppError::Backend(_)), "{error:?}");
+    }
 
     fn binding(name: &str, attrs: &[(&str, &str)]) -> (String, HashMap<String, Value>) {
         let map = attrs

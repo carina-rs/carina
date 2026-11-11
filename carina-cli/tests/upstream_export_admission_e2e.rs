@@ -28,7 +28,7 @@ fn assert_success(output: &Output, operation: &str) -> String {
     stdout.into_owned()
 }
 
-fn assert_admission_error(output: &Output, export_key: &str) {
+fn assert_admission_error(output: &Output, export_key: &str, expected: &str, actual_kind: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -36,9 +36,35 @@ fn assert_admission_error(output: &Output, export_key: &str) {
         "plan must reject present invalid upstream export 'orgs.{export_key}'\nstdout:\n{stdout}\nstderr:\n{stderr}",
     );
     assert!(
-        stderr.contains("orgs") && stderr.contains(export_key),
+        stderr.contains(&format!("upstream export 'orgs.{export_key}'")),
         "admission error must name the upstream binding and export key:\n{stderr}",
     );
+    assert!(
+        stderr.contains(&format!("expected {expected}, got {actual_kind}")),
+        "admission error must name the expected type and actual kind:\n{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn round1_10_admission_assertion_rejects_unrelated_failures() {
+    use std::os::unix::process::ExitStatusExt;
+    for message in [
+        "unrelated failure while resolving orgs count",
+        "upstream export 'orgs.count': expected Bool, got string",
+        "upstream export 'orgs.count': expected Int, got bool",
+    ] {
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: vec![],
+            stderr: message.as_bytes().to_vec(),
+        };
+        assert!(
+            std::panic::catch_unwind(|| assert_admission_error(&output, "count", "Int", "string"))
+                .is_err(),
+            "an unrelated error or wrong type/kind must not pass the admission assertion"
+        );
+    }
 }
 
 fn write_fixture(root: &Path) -> (PathBuf, PathBuf) {
@@ -182,7 +208,12 @@ fn upstream_export_violating_declared_type_is_rejected_by_directory_plan() {
         &upstream,
         serde_json::json!({"count": "stale-string", "unused": true}),
     );
-    assert_admission_error(&run_cli(&downstream, &["plan", "."]), "count");
+    assert_admission_error(
+        &run_cli(&downstream, &["plan", "."]),
+        "count",
+        "Int",
+        "string",
+    );
 }
 
 #[test]
@@ -315,7 +346,12 @@ fn directory_plan_admits_inferred_exports_against_the_source_type() {
         "plan inferred export",
     );
     write_exports(&upstream, serde_json::json!({"count": "wrong-type"}));
-    assert_admission_error(&run_cli(&downstream, &["plan", "."]), "count");
+    assert_admission_error(
+        &run_cli(&downstream, &["plan", "."]),
+        "count",
+        "Int",
+        "string",
+    );
 }
 
 #[test]
@@ -326,7 +362,12 @@ fn directory_plan_admits_unused_exports_too() {
         &upstream,
         serde_json::json!({"count": 73, "unused": "wrong-type"}),
     );
-    assert_admission_error(&run_cli(&downstream, &["plan", "."]), "unused");
+    assert_admission_error(
+        &run_cli(&downstream, &["plan", "."]),
+        "unused",
+        "Bool",
+        "string",
+    );
 }
 
 #[test]
@@ -370,18 +411,38 @@ fn directory_plan_uses_downstream_metadata_for_named_upstream_exports() {
     assert_success(&run_cli(&downstream, &["plan", "."]), "plan named export");
     exports["claim"]["$enum"]["api_value"] = serde_json::json!("retired");
     write_exports(&upstream, exports.clone());
-    assert_admission_error(&run_cli(&downstream, &["plan", "."]), "claim");
+    let rejected = run_cli(&downstream, &["plan", "."]);
+    assert_admission_error(
+        &rejected,
+        "claim",
+        "mock.actions.OidcSubject.ClaimKey",
+        "enum",
+    );
+    assert!(
+        !String::from_utf8_lossy(&rejected.stderr).contains("retired"),
+        "enum admission must not disclose the upstream value"
+    );
 
     exports["claim"] = claim.clone();
     exports["claims"][0]["$enum"]["api_value"] = serde_json::json!("retired");
     write_exports(&upstream, exports.clone());
     let nested = run_cli(&downstream, &["plan", "."]);
-    assert_admission_error(&nested, "claims");
+    assert_admission_error(
+        &nested,
+        "claims",
+        "mock.actions.OidcSubject.ClaimKey",
+        "enum",
+    );
     assert!(String::from_utf8_lossy(&nested.stderr).contains("list element 0"));
 
     exports["claims"][0] = claim;
     exports["claim"]["$enum"]["identity"]["provider"] = serde_json::json!("other");
     write_exports(&upstream, exports);
-    assert_admission_error(&run_cli(&downstream, &["plan", "."]), "claim");
+    assert_admission_error(
+        &run_cli(&downstream, &["plan", "."]),
+        "claim",
+        "mock.actions.OidcSubject.ClaimKey",
+        "enum",
+    );
     assert!(!upstream.join(".carina/providers").exists());
 }

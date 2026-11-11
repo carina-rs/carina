@@ -36,7 +36,7 @@ fn finite_published_exports_preserve_signed_zero_when_loading_bindings() {
             carina_core::validation::deferred_types::TypeCheckSession::run(&context, |session| {
                 AdmittedUpstreamExports::decode_and_admit(
                     "upstream",
-                    None,
+                    &carina_core::upstream_exports::SourceSurface::for_test(None),
                     loaded
                         .values()
                         .iter()

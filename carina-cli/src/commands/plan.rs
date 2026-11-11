@@ -6916,7 +6916,7 @@ fn provider_referenced_upstream_states<E>(
 pub(crate) struct CachedUpstreamSource {
     backend: Option<carina_core::parser::BackendConfig>,
     upstream_states: Vec<UpstreamState<carina_core::resource::RelativeBindingName>>,
-    declarations: Option<carina_core::upstream_exports::UpstreamExportEntries>,
+    surface: carina_core::upstream_exports::SourceSurface,
 }
 
 fn resolve_upstream_source(
@@ -6926,53 +6926,37 @@ fn resolve_upstream_source(
     provider_context: &ProviderContext,
     schemas: &carina_core::schema::SchemaRegistry,
 ) -> Result<std::sync::Arc<CachedUpstreamSource>, AppError> {
-    runtime.upstream_source(source, || {
-        let loaded = load_configuration_for_bootstrap(
-            source,
-            provider_context,
-            &carina_core::schema::SchemaRegistry::new(),
-        )
-        .map_err(|error| AppError::Config(format!("upstream_state '{binding}': {error}")))?;
-        let declarations = match loaded.upstream_export_source(provider_context, schemas) {
-            Ok(parsed) => {
-                // Surface discovery supplies optional type authority. Its
-                // unavailable declarations do not add command diagnostics.
-                let result = carina_core::validation::deferred_types::TypeCheckSession::run(
-                    provider_context,
-                    |session| {
-                        carina_core::upstream_exports::resolve_upstream_exports_from_parsed(
-                            parsed,
-                            source,
-                            session,
-                            Some(schemas),
-                            &Default::default(),
-                        )
-                    },
-                )
-                .publish(&mut Vec::new());
-                match result {
-                    Ok(entries) => Some(entries),
-                    Err(carina_core::upstream_exports::UpstreamExportSourceError::Unavailable(
-                        _,
-                    )) => None,
-                    Err(carina_core::upstream_exports::UpstreamExportSourceError::Invariant(
-                        error,
-                    )) => return Err(error.into()),
-                }
-            }
-            Err(_) => None,
-        };
-        Ok(CachedUpstreamSource {
-            backend: loaded
-                .parsed
-                .backend
-                .clone()
-                .map(carina_core::parser::BackendConfig::into_expanded)
-                .transpose()?,
-            upstream_states: loaded.parsed.upstream_states.clone(),
-            declarations,
-        })
-    })
+    runtime.upstream_source(
+        source,
+        carina_core::upstream_exports::UpstreamTypeAuthority::capture(provider_context, schemas),
+        || {
+            let loaded = load_configuration_for_bootstrap(
+                source,
+                provider_context,
+                &carina_core::schema::SchemaRegistry::new(),
+            )
+            .map_err(|error| AppError::Config(format!("upstream_state '{binding}': {error}")))?;
+            let surface = carina_core::validation::deferred_types::TypeCheckSession::run(
+                provider_context,
+                |session| {
+                    carina_core::upstream_exports::resolve_upstream_source_surface(
+                        &loaded, source, session, schemas,
+                    )
+                },
+            )
+            .publish(&mut Vec::new())?;
+            Ok(CachedUpstreamSource {
+                backend: loaded
+                    .parsed
+                    .backend
+                    .clone()
+                    .map(carina_core::parser::BackendConfig::into_expanded)
+                    .transpose()?,
+                upstream_states: loaded.parsed.upstream_states.clone(),
+                surface,
+            })
+        },
+    )
 }
 
 /// Resolve and read each upstream's published exports by parsing its source
@@ -7041,10 +7025,12 @@ pub(crate) async fn load_selected_upstream_states<B: carina_core::resource::Bind
         let backend = backend_result?;
 
         let published_exports = backend.read_published_exports().await.map_err(|error| {
-            AppError::Backend(carina_state::BackendError::UpstreamExportRead {
-                binding: us.binding.to_string(),
-                error: Box::new(error),
-            })
+            AppError::Backend(carina_state::BackendError::UpstreamExportRead(Box::new(
+                carina_state::backend::UpstreamExportReadError {
+                    binding: us.binding.to_string(),
+                    error,
+                },
+            )))
         })?;
         match (published_exports, policy) {
             (Some(exports), _) => {
@@ -7061,7 +7047,7 @@ pub(crate) async fn load_selected_upstream_states<B: carina_core::resource::Bind
                         |session| {
                             AdmittedUpstreamExports::decode_and_admit(
                                 &us.binding.to_string(),
-                                metadata.declarations.as_ref(),
+                                &metadata.surface,
                                 exports
                                     .values()
                                     .iter()
@@ -7124,21 +7110,23 @@ pub(crate) fn admit_saved_upstream_snapshot(
             continue;
         };
         let drift = || crate::commands::apply::upstream_snapshot_drift(&binding, apply_target);
-        let path = base_dir
-            .join(&source.source)
-            .map_err(|_| AppError::Config(drift()))?;
-        let metadata = resolve_upstream_source(runtime, &binding, &path, provider_context, schemas)
-            .map_err(|error| AppError::UpstreamSnapshotChanged {
-                message: drift(),
-                error: Box::new(error),
-            })?;
+        let path =
+            base_dir
+                .join(&source.source)
+                .map_err(|error| AppError::UpstreamSourceResolution {
+                    binding: binding.clone(),
+                    source_path: source.source.clone(),
+                    error,
+                })?;
+        let metadata =
+            resolve_upstream_source(runtime, &binding, &path, provider_context, schemas)?;
         let exports = crate::wiring::settle_type_checks(
             carina_core::validation::deferred_types::TypeCheckSession::run(
                 provider_context,
                 |session| {
                     AdmittedUpstreamExports::admit_snapshot(
                         &binding,
-                        metadata.declarations.as_ref(),
+                        &metadata.surface,
                         values.clone(),
                         session,
                     )
@@ -7147,9 +7135,13 @@ pub(crate) fn admit_saved_upstream_snapshot(
             ),
             AppError::Validation,
         )
-        .map_err(|error| AppError::UpstreamSnapshotChanged {
-            message: drift(),
-            error: Box::new(error),
+        .map_err(|error| {
+            AppError::UpstreamSnapshotChanged(Box::new(
+                crate::error::UpstreamSnapshotChangedError {
+                    message: drift(),
+                    error,
+                },
+            ))
         })?;
         if exports.len() != values.len() {
             return Err(AppError::Config(drift()));
@@ -7487,59 +7479,157 @@ mod load_upstream_states_tests {
         assert!(!loaded.remote_bindings()["mgmt"].contains_key("unrelated"));
     }
 
+    struct EnumMetadataFactory;
+    impl carina_core::provider::ProviderFactory for EnumMetadataFactory {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn display_name(&self) -> &str {
+            "mock enum metadata"
+        }
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
+        }
+        fn validate_config(
+            &self,
+            _: &carina_core::provider::CanonicalProviderConfigAttributes,
+            _: &carina_core::provider::ProviderValidationInputs,
+        ) -> carina_core::provider::ProviderResult<()> {
+            Ok(())
+        }
+        fn create_provider(
+            &self,
+            _: &carina_core::provider::ProviderSession,
+            _: carina_core::provider::InitializeOutcomeMint,
+        ) -> carina_core::provider::BoxFuture<
+            '_,
+            carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
+        > {
+            unreachable!(
+                "upstream admission uses installed metadata without provider initialization"
+            )
+        }
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            vec![
+                carina_provider_mock::unique_list_schema()
+                    .validate()
+                    .unwrap(),
+                carina_core::schema::ResourceSchema::new("test.Upstream")
+                    .attribute(
+                        carina_core::schema::AttributeSchema::provider_populated(
+                            "count",
+                            carina_core::schema::AttributeType::int(),
+                        )
+                        .build(),
+                    )
+                    .validate()
+                    .unwrap(),
+            ]
+        }
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                Default::default(),
+                Default::default(),
+                Vec::new(),
+            )
+            .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn round1_7_empty_schema_load_cannot_poison_loaded_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        write_upstream_admission_source(dir.path(), "claim = producer.count");
+        fs::write(
+            dir.path().join("main.crn"),
+            "provider mock {}\nlet producer = mock.test.Upstream {}\n",
+        )
+        .unwrap();
+        write_state(
+            dir.path(),
+            &[("claim", serde_json::json!("unchecked during bootstrap"))],
+        );
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let empty = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let providers =
+            carina_core::parser::parse_file("provider mock {}", Path::new("providers.crn"), &empty)
+                .unwrap()
+                .providers;
+        let wiring = crate::wiring::WiringContext::new_for_test_with_provider_phase(
+            &runtime,
+            vec![Box::new(EnumMetadataFactory)],
+            &providers,
+        );
+        let context = wiring.upstream_provider_context(&empty);
+        let source = [UpstreamState {
+            binding: absolute_binding("orgs"),
+            source: dir.path().to_path_buf(),
+        }];
+        let base = ResolvedPath::new(dir.path().parent().unwrap()).unwrap();
+        for warm_context in [&empty, &context] {
+            let runtime = crate::test_support::TestCommandRuntime::new();
+            load_selected_upstream_states(
+                &runtime,
+                &source,
+                &base,
+                warm_context,
+                &mut HashSet::new(),
+                &carina_core::schema::SchemaRegistry::new(),
+                UpstreamMissingStatePolicy::Strict,
+                None,
+            )
+            .await
+            .unwrap();
+            let error = load_selected_upstream_states(
+                &runtime,
+                &source,
+                &base,
+                &context,
+                &mut HashSet::new(),
+                wiring.schemas(),
+                UpstreamMissingStatePolicy::Strict,
+                None,
+            )
+            .await
+            .expect_err("unloaded metadata must not bypass a subsequent loaded source-type check");
+            assert!(
+                matches!(error, AppError::UpstreamExportAdmission(_)),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn round1_6_saved_source_join_keeps_io_error_and_is_not_drift() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let error = admit_saved_upstream_snapshot(
+            &runtime,
+            &[UpstreamSource {
+                binding: absolute_binding("orgs"),
+                source: "bad\0source".into(),
+            }],
+            &ResolvedPath::new(root.path()).unwrap(),
+            &context,
+            &carina_core::schema::SchemaRegistry::new(),
+            &HashMap::from([("orgs".into(), HashMap::new())]),
+            crate::commands::apply::ApplyTarget::Project(root.path()),
+        )
+        .unwrap_err();
+        let message = crate::error::format_error_with_source_chain(&error);
+        assert!(!message.contains("drifted"), "{message}");
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .is::<std::io::Error>(),
+            "{error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn review_10_production_loader_keeps_named_enum_validation_cause() {
-        struct EnumMetadataFactory;
-        impl carina_core::provider::ProviderFactory for EnumMetadataFactory {
-            fn name(&self) -> &str {
-                "mock"
-            }
-            fn display_name(&self) -> &str {
-                "mock enum metadata"
-            }
-            fn provider_config_attribute_types(
-                &self,
-            ) -> carina_core::schema::ValidatedConfigSchema {
-                Default::default()
-            }
-            fn validate_config(
-                &self,
-                _: &carina_core::provider::CanonicalProviderConfigAttributes,
-                _: &carina_core::provider::ProviderValidationInputs,
-            ) -> carina_core::provider::ProviderResult<()> {
-                Ok(())
-            }
-            fn create_provider(
-                &self,
-                _: &carina_core::provider::ProviderSession,
-                _: carina_core::provider::InitializeOutcomeMint,
-            ) -> carina_core::provider::BoxFuture<
-                '_,
-                carina_core::provider::ProviderResult<
-                    carina_core::provider::ProviderInitialization,
-                >,
-            > {
-                unreachable!(
-                    "upstream admission uses installed metadata without provider initialization"
-                )
-            }
-            fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
-                vec![
-                    carina_provider_mock::unique_list_schema()
-                        .validate()
-                        .unwrap(),
-                ]
-            }
-            fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
-                carina_core::schema::ValidatedProviderSchemaWitness::new(
-                    self.schemas(),
-                    Default::default(),
-                    Default::default(),
-                    Vec::new(),
-                )
-                .unwrap()
-            }
-        }
         let dir = tempfile::tempdir().unwrap();
         write_upstream_admission_source(
             dir.path(),
@@ -8170,7 +8260,7 @@ mod load_upstream_states_tests {
                 .expect_err(
                     "present invalid upstream export must fail before remote binding installation",
                 );
-            let message = error.to_string();
+            let message = crate::error::format_error_with_source_chain(&error);
             for fragment in std::iter::once("orgs").chain(error_path.iter().copied()) {
                 assert!(
                     message.contains(fragment),

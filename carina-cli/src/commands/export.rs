@@ -63,7 +63,7 @@ pub async fn run_export(
         )
         .await?;
         backend
-            .read_encoded_published_exports()
+            .read_published_exports()
             .await
             .map_err(AppError::Backend)?
             .ok_or_else(|| {

@@ -412,6 +412,7 @@ pub enum TypeExprValueError {
     MissingStructField {
         path: Vec<TypeExprValuePathSegment>,
         field: String,
+        expected: Box<TypeExpr>,
     },
     UnknownStructField {
         path: Vec<TypeExprValuePathSegment>,
@@ -431,6 +432,61 @@ pub enum TypeExprValueError {
 }
 
 impl TypeExprValueError {
+    /// Upstream values are not authored in the consumer directory. Keep the
+    /// checker-produced path/type/kind, discarding value-bearing validator text.
+    pub(crate) fn into_upstream_diagnostic(self) -> Self {
+        match self {
+            Self::Mismatch {
+                path,
+                expected,
+                actual,
+                ..
+            }
+            | Self::CustomTypeValidation {
+                path,
+                expected,
+                actual,
+                ..
+            } => Self::Mismatch {
+                path,
+                expected,
+                actual: Box::new(actual.kind_only()),
+                validator_message: None,
+                hint: None,
+            },
+            Self::UnknownStructField {
+                mut path,
+                expected,
+                actual,
+                field,
+            } => {
+                path.push(TypeExprValuePathSegment::StructField(field));
+                Self::Mismatch {
+                    path,
+                    expected,
+                    actual: Box::new(actual.kind_only()),
+                    validator_message: None,
+                    hint: Some("field is not declared in this struct"),
+                }
+            }
+            Self::MissingStructField {
+                mut path,
+                field,
+                expected,
+            } => {
+                path.push(TypeExprValuePathSegment::StructField(field));
+                Self::Mismatch {
+                    path,
+                    expected,
+                    actual: Box::new(ValueDescription::missing()),
+                    validator_message: None,
+                    hint: None,
+                }
+            }
+            other => other,
+        }
+    }
+
     fn prepend(mut self, segment: TypeExprValuePathSegment) -> Self {
         match &mut self {
             Self::InferredTypeMismatch { path, .. }
@@ -496,7 +552,7 @@ impl fmt::Display for TypeExprValueError {
                 }
                 Ok(())
             }
-            Self::MissingStructField { path, field } => {
+            Self::MissingStructField { path, field, .. } => {
                 write_path(f, path)?;
                 write!(f, "expected struct, missing field '{field}'.")
             }
@@ -1095,6 +1151,7 @@ fn check_constraint_value<'s, P: PlaceholderKind, B: BindingAddress>(
                         None => Mismatch(TypeExprValueError::MissingStructField {
                             path: Vec::new(),
                             field: field.clone(),
+                            expected: Box::new(field_type.clone()),
                         }),
                     }
                 }))
@@ -2693,7 +2750,7 @@ mod tests {
         let error = check(&nested_expected, &nested_missing).unwrap_err();
         assert!(matches!(
             &error,
-            TypeExprValueError::MissingStructField { path, field }
+            TypeExprValueError::MissingStructField { path, field, .. }
                 if path == &[TypeExprValuePathSegment::StructField("config".to_string())]
                     && field == "name"
         ));

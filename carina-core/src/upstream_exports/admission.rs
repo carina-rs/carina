@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use super::{UpstreamExportEntries, UpstreamExportType};
+use super::{SourceSurface, UpstreamExportType};
 use crate::resource::{Value, knowledge::KnowledgeContext};
 use crate::validation::deferred_types::ProviderTypeCheckContext;
 use crate::validation::typecheck::{TypeExprValueError, TypecheckProviderContext};
@@ -35,34 +35,64 @@ pub type AdmittedRemoteBindings = HashMap<String, AdmittedUpstreamExports>;
 ///     let _ = IterableBindings::from_upstream_only(raw);
 /// }
 /// ```
+/// Admission requires resolver-produced surface evidence, even when it is unavailable.
+///
+/// ```compile_fail
+/// use carina_core::{resource::Value, upstream_exports::AdmittedUpstreamExports};
+/// use carina_core::validation::deferred_types::ProviderTypeCheckContext;
+/// fn bypass(session: &dyn ProviderTypeCheckContext) {
+///     let _ = AdmittedUpstreamExports::admit_snapshot("orgs", None, Default::default(), session);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::upstream_exports::AdmittedUpstreamExports;
+/// use carina_core::validation::deferred_types::ProviderTypeCheckContext;
+/// fn bypass(session: &dyn ProviderTypeCheckContext) {
+///     let _ = AdmittedUpstreamExports::decode_and_admit("orgs", None, std::iter::empty(), session);
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdmittedUpstreamExports {
     values: Arc<HashMap<String, Value>>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum UpstreamExportAdmissionError {
-    #[error("upstream export '{binding}.{key}': {error}")]
     InvalidValue {
         binding: String,
         key: String,
-        #[source]
         error: Box<TypeExprValueError>,
     },
-    #[error("upstream export '{binding}.{key}': {error}")]
     UnresolvedValue {
         binding: String,
         key: String,
-        #[source]
         error: crate::resource::knowledge::KnowledgeError,
     },
-    #[error("upstream export '{binding}.{key}': {error}")]
     Decode {
         binding: String,
         key: String,
-        #[source]
         error: PersistedValueDecodeError,
     },
+}
+
+impl std::fmt::Display for UpstreamExportAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::InvalidValue { binding, key, .. }
+        | Self::UnresolvedValue { binding, key, .. }
+        | Self::Decode { binding, key, .. }) = self;
+        write!(f, "upstream export '{binding}.{key}'")
+    }
+}
+
+impl std::error::Error for UpstreamExportAdmissionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(match self {
+            Self::InvalidValue { error, .. } => error.as_ref(),
+            Self::UnresolvedValue { error, .. } => error,
+            Self::Decode { error, .. } => error,
+        })
+    }
 }
 
 impl AdmittedUpstreamExports {
@@ -70,30 +100,24 @@ impl AdmittedUpstreamExports {
     /// without source-type checking. Consumers still check the actual values.
     pub fn admit_snapshot(
         binding: &str,
-        declarations: Option<&UpstreamExportEntries>,
+        surface: &SourceSurface,
         values: HashMap<String, Value>,
         context: &dyn ProviderTypeCheckContext,
     ) -> Result<Self, UpstreamExportAdmissionError> {
-        Self::admit_supplied(
-            binding,
-            declarations,
-            values,
-            |value| Ok(Some(value)),
-            context,
-        )
+        Self::admit_supplied(binding, surface, values, |value| Ok(Some(value)), context)
     }
 
     /// Select source keys before decoding persisted values. Stale keys are never
     /// decoded; top-level null stays absent; installed nested nulls are errors.
     pub fn decode_and_admit<'a>(
         binding: &str,
-        declarations: Option<&UpstreamExportEntries>,
+        surface: &SourceSurface,
         values: impl IntoIterator<Item = (String, &'a PersistedExportValue)>,
         context: &dyn ProviderTypeCheckContext,
     ) -> Result<Self, UpstreamExportAdmissionError> {
         Self::admit_supplied(
             binding,
-            declarations,
+            surface,
             values,
             PersistedExportValue::decode,
             context,
@@ -102,19 +126,19 @@ impl AdmittedUpstreamExports {
 
     fn admit_supplied<S>(
         binding: &str,
-        declarations: Option<&UpstreamExportEntries>,
+        surface: &SourceSurface,
         values: impl IntoIterator<Item = (String, S)>,
         decode: impl Fn(S) -> Result<Option<Value>, PersistedValueDecodeError>,
         context: &dyn ProviderTypeCheckContext,
     ) -> Result<Self, UpstreamExportAdmissionError> {
         let mut admitted = HashMap::new();
         for (key, supplied) in values {
-            let declaration = match declarations {
-                Some(surface) => match surface.get(&key) {
+            let declaration = match &surface.entries {
+                Ok(entries) => match entries.get(&key) {
                     Some(declaration) => Some(declaration),
                     None => continue,
                 },
-                None => None,
+                Err(_) => None,
             };
             let Some(value) =
                 decode(supplied).map_err(|error| UpstreamExportAdmissionError::Decode {
@@ -146,7 +170,7 @@ impl AdmittedUpstreamExports {
                     .map_err(|error| UpstreamExportAdmissionError::InvalidValue {
                         binding: binding.into(),
                         key: key.clone(),
-                        error: Box::new(error),
+                        error: Box::new(error.into_upstream_diagnostic()),
                     })?;
             }
             admitted.insert(key, value);
@@ -179,7 +203,12 @@ pub fn remote_bindings_for_test(
         .map(|(name, values)| {
             let admitted =
                 crate::validation::deferred_types::with_session_for_test(&context, |session| {
-                    AdmittedUpstreamExports::admit_snapshot(&name, None, values, session)
+                    AdmittedUpstreamExports::admit_snapshot(
+                        &name,
+                        &SourceSurface::for_test(None),
+                        values,
+                        session,
+                    )
                 })
                 .expect("remote fixture values are fully resolved");
             (name, admitted)
@@ -192,6 +221,108 @@ mod tests {
     use super::*;
     use crate::parser::{ProviderContext, ResourceTypePath, TypeExpr};
     use crate::resource::ConcreteValue;
+
+    #[test]
+    fn round1_2_admission_never_displays_upstream_scalar_contents() {
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let declarations = HashMap::from([(
+            "tokens".into(),
+            super::super::UpstreamExportEntry {
+                static_type: UpstreamExportType::Static(ConsumerExportStaticType::Declared(
+                    StaticType::Known(ConsumerResolvedType::new(TypeExpr::List(Box::new(
+                        TypeExpr::Int,
+                    )))),
+                )),
+                value: None,
+            },
+        )]);
+        let token = "tok_live_do_not_disclose_4a_987654";
+        let error = crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            AdmittedUpstreamExports::admit_snapshot(
+                "orgs",
+                &SourceSurface::for_test(Some(&declarations)),
+                HashMap::from([(
+                    "tokens".into(),
+                    Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                        ConcreteValue::String(token.into()),
+                    )])),
+                )]),
+                session,
+            )
+        })
+        .unwrap_err();
+        let mut messages = vec![error.to_string()];
+        let mut source = std::error::Error::source(&error);
+        while let Some(cause) = source {
+            messages.push(cause.to_string());
+            source = cause.source();
+        }
+        let message = messages.join("\n");
+        assert!(
+            !message.contains(token),
+            "upstream contents leaked: {message}"
+        );
+        for fragment in [
+            "upstream export 'orgs.tokens'",
+            "list element 0",
+            "expected Int",
+            "got string",
+        ] {
+            assert!(message.contains(fragment), "{message}");
+        }
+    }
+
+    #[test]
+    fn round1_2_struct_errors_name_leaf_expected_type_and_actual_kind() {
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let declarations = HashMap::from([(
+            "object".into(),
+            super::super::UpstreamExportEntry {
+                static_type: UpstreamExportType::Static(ConsumerExportStaticType::Declared(
+                    StaticType::Known(ConsumerResolvedType::new(TypeExpr::Struct {
+                        fields: vec![("count".into(), TypeExpr::Int)],
+                    })),
+                )),
+                value: None,
+            },
+        )]);
+        for (fields, leaf, kind) in [
+            (indexmap::IndexMap::new(), "count", "missing"),
+            (
+                indexmap::IndexMap::from([
+                    ("count".into(), Value::Concrete(ConcreteValue::Int(7))),
+                    (
+                        "extra".into(),
+                        Value::Concrete(ConcreteValue::String("tok_private_extra".into())),
+                    ),
+                ]),
+                "extra",
+                "string",
+            ),
+        ] {
+            let error =
+                crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                    AdmittedUpstreamExports::admit_snapshot(
+                        "orgs",
+                        &SourceSurface::for_test(Some(&declarations)),
+                        HashMap::from([(
+                            "object".into(),
+                            Value::Concrete(ConcreteValue::Map(fields)),
+                        )]),
+                        session,
+                    )
+                })
+                .unwrap_err();
+            let detail = std::error::Error::source(&error).unwrap().to_string();
+            assert!(
+                detail.contains(leaf)
+                    && detail.contains("expected ")
+                    && detail.contains(&format!("got {kind}")),
+                "{detail}"
+            );
+            assert!(!detail.contains("tok_private_extra"), "{detail}");
+        }
+    }
 
     #[test]
     fn review_5_unresolved_export_preserves_knowledge_error_source() {
@@ -212,7 +343,7 @@ mod tests {
         let error = crate::validation::deferred_types::with_session_for_test(&context, |session| {
             AdmittedUpstreamExports::admit_snapshot(
                 "up",
-                Some(&declarations),
+                &SourceSurface::for_test(Some(&declarations)),
                 HashMap::from([(
                     "broken".into(),
                     Value::root_resource_ref("waiting", "id", vec![]),
@@ -259,7 +390,7 @@ mod tests {
             crate::validation::deferred_types::TypeCheckSession::run(&context, |session| {
                 AdmittedUpstreamExports::admit_snapshot(
                     "orgs",
-                    Some(&declarations),
+                    &SourceSurface::for_test(Some(&declarations)),
                     HashMap::from([("number".into(), Value::Concrete(ConcreteValue::Int(73)))]),
                     session,
                 )
@@ -371,7 +502,7 @@ mod tests {
             crate::validation::deferred_types::TypeCheckSession::run(&context, |session| {
                 AdmittedUpstreamExports::admit_snapshot(
                     "orgs",
-                    Some(&declarations),
+                    &SourceSurface::for_test(Some(&declarations)),
                     HashMap::from([(
                         "id".into(),
                         Value::Concrete(ConcreteValue::String("id-123".into())),

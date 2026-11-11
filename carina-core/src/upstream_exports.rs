@@ -67,6 +67,119 @@ pub struct UpstreamExportEntry {
 /// Exports for a single `upstream_state` binding: export name → entry.
 pub type UpstreamExportEntries = HashMap<String, UpstreamExportEntry>;
 
+/// Resolver evidence for admission: either a discovered surface (including an
+/// empty one), or a recorded reason discovery could not establish that surface.
+/// Callers cannot mint an unavailable surface to bypass admission.
+#[derive(Debug, Clone)]
+pub struct SourceSurface {
+    entries: Result<UpstreamExportEntries, String>,
+}
+
+impl SourceSurface {
+    pub fn unavailable_reason(&self) -> Option<&str> {
+        self.entries.as_ref().err().map(String::as_str)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(entries: Option<&UpstreamExportEntries>) -> Self {
+        Self {
+            entries: entries
+                .cloned()
+                .ok_or_else(|| "test fixture has no source surface".into()),
+        }
+    }
+}
+
+/// Discover admission authority from an actual loader-owned source snapshot.
+/// Unavailable declarations preserve the unchecked policy without warnings.
+pub fn resolve_upstream_source_surface(
+    loaded: &crate::config_loader::LoadedConfig,
+    source: &ResolvedPath,
+    context: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    schemas: &crate::schema::SchemaRegistry,
+) -> Result<SourceSurface, crate::parser::AnalysisTreeError> {
+    let entries = match loaded.upstream_export_source(context.catalog(), schemas) {
+        Ok(parsed) => match resolve_upstream_exports_from_parsed(
+            parsed,
+            source,
+            context,
+            Some(schemas),
+            &Default::default(),
+        ) {
+            Ok(entries) => Ok(entries),
+            Err(UpstreamExportSourceError::Unavailable(reason)) => Err(reason),
+            Err(UpstreamExportSourceError::Invariant(error)) => return Err(error),
+        },
+        Err(reason) => Err(reason),
+    };
+    Ok(SourceSurface { entries })
+}
+
+/// Identity of the immutable type evidence used to discover a source surface.
+/// Catalog and schema witnesses are retained so identity cannot be recycled.
+#[derive(Clone)]
+pub struct UpstreamTypeAuthority {
+    catalog: crate::parser::ProviderCustomTypes,
+    resource_types: std::collections::HashSet<(String, String)>,
+    schemas: HashMap<
+        (String, String, bool),
+        (
+            std::sync::Arc<crate::schema::CompiledResourceSchema>,
+            String,
+        ),
+    >,
+}
+
+impl UpstreamTypeAuthority {
+    pub fn capture(
+        context: &crate::parser::ProviderContext,
+        schemas: &crate::schema::SchemaRegistry,
+    ) -> Self {
+        Self {
+            catalog: context.custom_types.clone(),
+            resource_types: context.resource_types.clone(),
+            schemas: schemas
+                .iter()
+                .map(|(provider, name, kind, schema)| {
+                    (
+                        (
+                            provider.into(),
+                            name.into(),
+                            matches!(kind, crate::schema::SchemaKind::DataSource),
+                        ),
+                        (
+                            schema.shared_schema(),
+                            schemas
+                                .get(provider, name, kind)
+                                .expect("iterated schema exists")
+                                .semantic_fingerprint(),
+                        ),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+impl PartialEq for UpstreamTypeAuthority {
+    fn eq(&self, other: &Self) -> bool {
+        self.catalog.same_snapshot(&other.catalog)
+            && self.resource_types == other.resource_types
+            && self.schemas.len() == other.schemas.len()
+            && self.schemas.iter().all(|(key, (schema, fingerprint))| {
+                other
+                    .schemas
+                    .get(key)
+                    .is_some_and(|(other_schema, other_fingerprint)| {
+                        std::sync::Arc::ptr_eq(schema, other_schema)
+                            && fingerprint == other_fingerprint
+                    })
+            })
+    }
+}
+
+impl Eq for UpstreamTypeAuthority {}
+
 /// Exports declared by each `upstream_state` binding: binding name →
 /// per-export entry map. Carrying the literal `Value` alongside the
 /// static-type provenance lets downstream consumers (LSP map-literal-key

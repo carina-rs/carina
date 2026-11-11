@@ -1001,25 +1001,37 @@ impl std::error::Error for AwsCredentialStartupError {}
 
 /// Additional diagnostics retain the concrete primary error in the source chain.
 #[derive(Debug, thiserror::Error)]
-#[error("{error}\n{diagnostics}")]
-pub struct TypeCheckDiagnostics {
+#[error("{diagnostics}")]
+pub struct TypeCheckDiagnostics<E: std::error::Error + 'static> {
+    #[source]
+    pub(crate) error: E,
+    pub(crate) diagnostics: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct UpstreamSnapshotChangedError {
+    pub(crate) message: String,
     #[source]
     pub(crate) error: AppError,
-    pub(crate) diagnostics: String,
 }
 
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    #[error("{message}\n{error}")]
-    UpstreamSnapshotChanged {
-        message: String,
+    #[error(transparent)]
+    UpstreamSnapshotChanged(Box<UpstreamSnapshotChangedError>),
+
+    #[error("upstream_state '{binding}': cannot resolve source '{}'", source_path.display())]
+    UpstreamSourceResolution {
+        binding: String,
+        source_path: std::path::PathBuf,
         #[source]
-        error: Box<AppError>,
+        error: std::io::Error,
     },
 
     #[error(transparent)]
-    TypeCheckDiagnostics(Box<TypeCheckDiagnostics>),
+    TypeCheckDiagnostics(Box<TypeCheckDiagnostics<AppError>>),
 
     #[error(transparent)]
     UpstreamExportAdmission(Box<carina_core::upstream_exports::UpstreamExportAdmissionError>),
@@ -1691,6 +1703,7 @@ impl From<crate::wiring::PlanPreparationError> for AppError {
                 Self::ModuleConstraint(error)
             }
             error @ (crate::wiring::PlanPreparationError::Knowledge { .. }
+            | crate::wiring::PlanPreparationError::TypeCheckDiagnostics(_)
             | crate::wiring::PlanPreparationError::Plan(_)) => {
                 Self::PlanPreparation(Box::new(error))
             }

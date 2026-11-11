@@ -424,17 +424,8 @@ enum DesiredAuthoringBasis<'a> {
 /// Construction validates the persisted namespace and structure. Only admission
 /// decodes installed keys, so corrupt stale values cannot block downstreams.
 /// Managed resource rows are not decoded or checked against the state version.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PublishedExports {
-    values: HashMap<String, PersistedExportValue>,
-}
-
-/// Published JSON retained for export display, including nulls.
-///
-/// This validates the persisted namespace and structure without interpreting
-/// the values as remote bindings. It has no binding-installation API.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EncodedPublishedExports {
+pub struct PublishedExports {
     values: HashMap<String, PersistedExportValue>,
 }
 
@@ -461,26 +452,6 @@ impl PublishedExports {
     /// written before the independent exports version existed are migrated
     /// through the legacy full-state path because their value encoding may
     /// require the v12-v14 migrations.
-    pub fn from_state_bytes(bytes: &[u8]) -> Result<Self, BackendError> {
-        EncodedPublishedExports::from_state_bytes(bytes).map(Self::from)
-    }
-
-    pub fn values(&self) -> &HashMap<String, PersistedExportValue> {
-        &self.values
-    }
-}
-
-impl From<EncodedPublishedExports> for PublishedExports {
-    fn from(encoded: EncodedPublishedExports) -> Self {
-        Self {
-            values: encoded.values,
-        }
-    }
-}
-
-impl EncodedPublishedExports {
-    /// Read export JSON without the full state-format gate or resource rows.
-    /// Legacy encodings retain the same in-memory migration path as full state.
     pub fn from_state_bytes(bytes: &[u8]) -> Result<Self, BackendError> {
         Self::decode_state_bytes(bytes).map(|(exports, _)| exports)
     }

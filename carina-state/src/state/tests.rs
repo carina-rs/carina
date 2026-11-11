@@ -327,7 +327,7 @@ impl PublishedFixtureBindings for PublishedExports {
             carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
                 AdmittedUpstreamExports::decode_and_admit(
                     "upstream",
-                    None,
+                    &carina_core::upstream_exports::SourceSurface::for_test(None),
                     self.values()
                         .iter()
                         .map(|(key, value)| (key.clone(), value)),
@@ -9409,7 +9409,7 @@ fn full_state_load_preserves_nested_null_exports_for_reapply() {
             .into_state();
         assert_eq!(serde_json::to_value(&loaded.exports).unwrap(), exports);
 
-        let displayed = EncodedPublishedExports::from_state_bytes(&bytes)
+        let displayed = PublishedExports::from_state_bytes(&bytes)
             .expect("export display must preserve encoded nulls");
         assert_eq!(serde_json::to_value(displayed.values()).unwrap(), exports);
         let published = PublishedExports::from_state_bytes(&bytes).unwrap();
@@ -9419,7 +9419,7 @@ fn full_state_load_preserves_nested_null_exports_for_reapply() {
             carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
                 AdmittedUpstreamExports::decode_and_admit(
                     "upstream",
-                    None,
+                    &carina_core::upstream_exports::SourceSurface::for_test(None),
                     published
                         .values()
                         .iter()
@@ -9473,7 +9473,7 @@ fn assert_published_export_null_rejected(value: serde_json::Value, error_path: &
         carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
             AdmittedUpstreamExports::decode_and_admit(
                 "upstream",
-                Some(&declarations),
+                &carina_core::upstream_exports::SourceSurface::for_test(Some(&declarations)),
                 published
                     .values()
                     .iter()
@@ -9485,7 +9485,14 @@ fn assert_published_export_null_rejected(value: serde_json::Value, error_path: &
         result.is_err(),
         "a present installed export containing null must fail admission instead of silently dropping data"
     );
-    let message = result.unwrap_err().to_string();
+    let error = result.unwrap_err();
+    let mut messages = vec![error.to_string()];
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        messages.push(cause.to_string());
+        source = cause.source();
+    }
+    let message = messages.join("\n");
     assert!(message.contains("upstream.broken"), "{message}");
     for fragment in error_path {
         assert!(

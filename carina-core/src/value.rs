@@ -607,7 +607,8 @@ impl PersistedExportValue {
             .map(|encoded| Self { encoded })
     }
 
-    pub fn decode(&self) -> Result<Option<Value>, PersistedValueDecodeError> {
+    // Runtime export decoding is reachable only through source admission.
+    pub(crate) fn decode(&self) -> Result<Option<Value>, PersistedValueDecodeError> {
         persisted_json_to_dsl_value(&self.encoded, PersistedPurpose::Export).map(|value| {
             value.map(|snapshot| {
                 snapshot

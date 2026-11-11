@@ -1,6 +1,88 @@
 use super::*;
 
 #[test]
+fn round1_4_chained_upstream_diagnostics_are_rendered_once() {
+    let context =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let declarations = HashMap::from([(
+        "count".into(),
+        carina_core::upstream_exports::UpstreamExportEntry {
+            static_type: carina_core::upstream_exports::UpstreamExportType::Static(
+                carina_core::validation::resolve_export_static_type_for_consumer(
+                    carina_core::static_type::ExportStaticType::Declared(
+                        carina_core::parser::TypeExpr::Int,
+                    ),
+                    &context,
+                ),
+            ),
+            value: None,
+        },
+    )]);
+    let error =
+        carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+            carina_core::upstream_exports::AdmittedUpstreamExports::admit_snapshot(
+                "orgs",
+                &carina_core::upstream_exports::SourceSurface::for_test(Some(&declarations)),
+                HashMap::from([(
+                    "count".into(),
+                    carina_core::resource::Value::Concrete(
+                        carina_core::resource::ConcreteValue::String("bad".into()),
+                    ),
+                )]),
+                session,
+            )
+        })
+        .unwrap_err();
+    let error =
+        AppError::UpstreamSnapshotChanged(Box::new(crate::error::UpstreamSnapshotChangedError {
+            message: "snapshot-marker".into(),
+            error: AppError::UpstreamExportAdmission(Box::new(error))
+                .with_type_check_diagnostics("diagnostic-marker".into()),
+        }));
+    assert!(std::error::Error::source(&error).unwrap().is::<AppError>());
+    let message = crate::error::format_error_with_source_chain(&error);
+    for fragment in [
+        "snapshot-marker",
+        "diagnostic-marker",
+        "upstream export 'orgs.count'",
+        "expected Int",
+    ] {
+        assert_eq!(message.matches(fragment).count(), 1, "{message}");
+    }
+}
+
+#[test]
+fn round1_4_plan_preparation_diagnostics_preserve_user_error() {
+    let value: carina_core::resource::Value =
+        carina_core::resource::Value::Deferred(carina_core::resource::DeferredValue::BindingRef {
+            binding: carina_core::resource::absolute_binding_address_for_test("pending"),
+        });
+    let cause = value
+        .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
+        .and_then(|proof| proof.into_classification().into_known())
+        .unwrap_err();
+    let error = PlanPreparationError::Knowledge {
+        resource: Box::new(ResourceId::with_identity("mock.thing", "item")),
+        attribute: "name".into(),
+        error: cause,
+    }
+    .with_type_check_diagnostics("diagnostic-marker".into());
+    let mut cause: &(dyn std::error::Error + 'static) = &error;
+    loop {
+        if matches!(
+            cause.downcast_ref::<PlanPreparationError>(),
+            Some(PlanPreparationError::Knowledge { .. })
+        ) {
+            break;
+        }
+        cause = cause
+            .source()
+            .expect("the typed preparation failure must survive diagnostics");
+    }
+    assert!(!matches!(error, PlanPreparationError::Provider(_)));
+}
+
+#[test]
 fn review_6_settlement_keeps_typed_admission_error_with_diagnostics() {
     use carina_core::static_type::ExportStaticType;
     use carina_core::upstream_exports::{
@@ -33,7 +115,7 @@ fn review_6_settlement_keeps_typed_admission_error_with_diagnostics() {
             session.record_type(&unavailable, "another declaration");
             AdmittedUpstreamExports::admit_snapshot(
                 "up",
-                Some(&declarations),
+                &carina_core::upstream_exports::SourceSurface::for_test(Some(&declarations)),
                 HashMap::from([(
                     "count".into(),
                     carina_core::resource::Value::Concrete(
@@ -3445,6 +3527,9 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
     .expect_err("normalizer failure must abort plan preprocessing");
 
     match error {
+        error @ PlanPreparationError::TypeCheckDiagnostics(_) => {
+            panic!("unexpected type diagnostics: {error}")
+        }
         PlanPreparationError::Provider(error) => {
             assert_eq!(error.to_string(), "plan normalization failed");
         }
@@ -14702,6 +14787,9 @@ mod resolved_value_constraint_gate {
 
     fn into_plan_errors(error: PlanPreparationError) -> Vec<carina_core::plan::PlanError> {
         match error {
+            error @ PlanPreparationError::TypeCheckDiagnostics(_) => {
+                panic!("unexpected type diagnostics: {error}")
+            }
             PlanPreparationError::Plan(errors) => errors.into_vec(),
             error @ PlanPreparationError::Knowledge { .. } => {
                 panic!("unexpected knowledge error: {error}")

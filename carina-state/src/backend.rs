@@ -8,7 +8,7 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::lock::LockInfo;
-use crate::state::{self, EncodedPublishedExports, LoadedState, PublishedExports, StateFile};
+use crate::state::{self, LoadedState, PublishedExports, StateFile};
 
 /// A persisted resource row whose identity cannot be represented by the
 /// resolved-only state model.
@@ -157,14 +157,21 @@ impl std::error::Error for InvalidCanonicalBindingError {
     }
 }
 
+/// Retain the concrete backend failure as a source, rather than a boxed error
+/// node whose source traversal would skip the original error variant.
+#[derive(Debug, Error)]
+#[error("upstream_state '{binding}': failed to read published exports")]
+pub struct UpstreamExportReadError {
+    pub binding: String,
+    #[source]
+    pub error: BackendError,
+}
+
 /// Errors that can occur when interacting with a state backend
 #[derive(Debug, Error)]
 pub enum BackendError {
-    #[error("upstream_state '{binding}': {error}")]
-    UpstreamExportRead {
-        binding: String,
-        error: Box<BackendError>,
-    },
+    #[error(transparent)]
+    UpstreamExportRead(Box<UpstreamExportReadError>),
     /// The state is locked by another process
     #[error("State is locked by {who} (lock ID: {lock_id}, operation: {operation})")]
     Locked {
@@ -828,19 +835,10 @@ pub trait StateBackend: Send + Sync {
 pub async fn read_published_exports(
     backend: &dyn StateBackend,
 ) -> BackendResult<Option<PublishedExports>> {
-    read_encoded_published_exports(backend)
-        .await
-        .map(|exports| exports.map(PublishedExports::from))
-}
-
-/// Read encoded exports for display without applying remote-binding semantics.
-pub async fn read_encoded_published_exports(
-    backend: &dyn StateBackend,
-) -> BackendResult<Option<EncodedPublishedExports>> {
     let Some(raw_state) = backend.read_state_bytes().await? else {
         return Ok(None);
     };
-    let (exports, migration) = EncodedPublishedExports::decode_state_bytes(raw_state.bytes())
+    let (exports, migration) = PublishedExports::decode_state_bytes(raw_state.bytes())
         .map_err(|error| raw_state.locate_error(error))?;
     if let Some(info) = migration {
         state::log_state_migration(info, &raw_state.display_location());
@@ -859,6 +857,19 @@ mod tests {
     use super::*;
     use crate::backend_config::{BackendConfig, BackendConfigError};
     use crate::lock::LockInfo;
+
+    #[test]
+    fn round1_3_upstream_export_read_retains_typed_backend_cause() {
+        let error = BackendError::UpstreamExportRead(Box::new(UpstreamExportReadError {
+            binding: "orgs".into(),
+            error: BackendError::Io("read-marker".into()),
+        }));
+        let cause =
+            std::error::Error::source(&error).expect("upstream reads must retain their cause");
+        assert!(
+            matches!(cause.downcast_ref::<BackendError>(), Some(BackendError::Io(message)) if message == "read-marker")
+        );
+    }
 
     #[test]
     fn test_backend_error_locked() {
