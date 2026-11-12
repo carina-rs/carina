@@ -1,6 +1,36 @@
 use super::*;
 use tower_lsp::lsp_types::{Position, Range};
 
+fn assert_round4_empty_template(blocks: &str) {
+    let engine = test_engine();
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("arguments.crn"), blocks).unwrap();
+    let path = directory.path().join("guards.crn");
+    let source = "require false, 'guard'\n";
+    std::fs::write(&path, source).unwrap();
+    let document = create_document_at(source, path.clone());
+    for broken in [false, true] {
+        if broken {
+            std::fs::write(directory.path().join("broken.crn"), "let broken = [\n").unwrap();
+        }
+        let findings = engine.analyze(&document, Some(&path));
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+}
+
+#[test]
+fn round4_empty_arguments_keep_lsp_template_scope() {
+    assert_round4_empty_template("arguments {}\n");
+}
+#[test]
+fn round4_empty_attributes_keep_lsp_template_scope() {
+    assert_round4_empty_template("attributes {}\n");
+}
+#[test]
+fn round4_both_empty_blocks_keep_lsp_template_scope() {
+    assert_round4_empty_template("arguments {}\nattributes {}\n");
+}
+
 #[cfg(unix)]
 #[test]
 fn round3_non_utf8_editor_file_keeps_its_authored_path() {

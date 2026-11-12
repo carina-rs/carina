@@ -156,6 +156,41 @@ fn success(output: &Output) {
     assert!(output.status.success(), "{}", output_text(output));
 }
 
+fn assert_round4_empty_template(blocks: &str) {
+    let directory = Directory::new("true");
+    fs::create_dir(directory.project.join("empty")).unwrap();
+    fs::write(directory.project.join("empty/arguments.crn"), blocks).unwrap();
+    fs::write(
+        directory.project.join("empty/guards.crn"),
+        "require false, 'guard'\n",
+    )
+    .unwrap();
+    success(&directory.run(&["validate", "empty"]));
+    success(&directory.run(&["validate", "--json", "empty"]));
+    fs::write(
+        directory.project.join("main.crn"),
+        "let empty = use { source = './empty' }\nlet call = empty {}\n",
+    )
+    .unwrap();
+    rejected(
+        &directory.run(&["validate", "."]),
+        "Module not found: ./empty",
+    );
+}
+
+#[test]
+fn round4_empty_arguments_validate_as_template() {
+    assert_round4_empty_template("arguments {}\n");
+}
+#[test]
+fn round4_empty_attributes_validate_as_template() {
+    assert_round4_empty_template("attributes {}\n");
+}
+#[test]
+fn round4_both_empty_blocks_validate_as_template() {
+    assert_round4_empty_template("arguments {}\nattributes {}\n");
+}
+
 #[test]
 fn round1_validate_standalone_module_directory_keeps_template_scope() {
     let directory = Directory::new("true");

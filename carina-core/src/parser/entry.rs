@@ -1482,6 +1482,7 @@ fn parse_with_seeded_bindings_inner(
         .into_iter()
         .map(crate::resource::RelativeBindingName::new)
         .collect();
+    let module_blocks = syntax.module_declaration_blocks();
     syntax
         .expressions_mut()
         .set_require_scope(super::retained::RequireScope::for_declarations(
@@ -1489,7 +1490,7 @@ fn parse_with_seeded_bindings_inner(
                 .arguments
                 .iter()
                 .map(|argument| argument.name.clone()),
-            !parsed.attribute_params.is_empty(),
+            module_blocks,
         ));
     syntax.expressions_mut().finish_captures();
     parser_binding_metadata.syntax = Box::new(syntax);

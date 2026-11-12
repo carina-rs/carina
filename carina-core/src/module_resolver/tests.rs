@@ -44,6 +44,95 @@ fn resolver_context() -> crate::config_loader::ModuleResolutionContext {
         .module_resolution_context()
 }
 
+fn assert_round4_empty_template(blocks: &str) {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("arguments.crn"), blocks).unwrap();
+    fs::write(
+        directory.path().join("guards.crn"),
+        "require false, 'guard'\n",
+    )
+    .unwrap();
+    let context = LoadedProviderContext::empty_for_test();
+    let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let schemas = crate::schema::SchemaRegistry::new();
+    let loaded =
+        crate::config_loader::load_configuration_with_config(&path, &context, &schemas).unwrap();
+    assert!(matches!(
+        crate::parser::retained::require_scope(loaded.parsed.parsed()),
+        crate::parser::retained::RequireScope::ModuleTemplate { .. }
+    ));
+    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        for template in [false, true] {
+            let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
+            let result = if template {
+                super::resolve_module_template_with_config(parsed, &path, session, &schemas)
+            } else {
+                super::resolve_modules_with_config(parsed, &path, session, &schemas)
+            };
+            assert!(result.is_ok(), "{result:?}");
+            let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
+            let result = if template {
+                super::resolve_module_template_with_providerless_config(
+                    parsed, &path, session, &schemas,
+                )
+            } else {
+                super::resolve_modules_with_providerless_config(parsed, &path, session, &schemas)
+            };
+            assert!(result.is_ok(), "{result:?}");
+        }
+        let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
+        assert!(matches!(
+            super::resolve_modules_with_diagnostics(&parsed, &path, session, &schemas, &[]),
+            super::ModuleResolutionDiagnosticResult::Expanded { .. }
+        ));
+        assert!(matches!(
+            super::resolve_modules_with_providerless_diagnostics(
+                &parsed,
+                &path,
+                session,
+                &schemas,
+                &[]
+            ),
+            super::ModuleResolutionDiagnosticResult::Expanded { .. }
+        ));
+    });
+    let source = "require false, 'guard'\n";
+    let guard = directory.path().join("guards.crn");
+    let parsed = crate::config_loader::ParsedSourceBuffer::parse(source, &guard, &context).unwrap();
+    for broken in [false, true] {
+        if broken {
+            fs::write(directory.path().join("broken.crn"), "let broken = [\n").unwrap();
+        }
+        let snapshot = crate::config_loader::DirectoryBufferSnapshot::capture(
+            &path,
+            parsed.clone(),
+            &Default::default(),
+        )
+        .unwrap();
+        let configuration = crate::config_loader::load_buffer_configuration_in_directory(
+            snapshot, &schemas, &context,
+        );
+        assert!(matches!(
+            crate::parser::retained::require_scope(configuration.parsed()),
+            crate::parser::retained::RequireScope::ModuleTemplate { .. }
+        ));
+        assert!(configuration.judged().report().findings().is_empty());
+    }
+}
+
+#[test]
+fn round4_empty_arguments_are_template_scope() {
+    assert_round4_empty_template("arguments {}\n");
+}
+#[test]
+fn round4_empty_attributes_are_template_scope() {
+    assert_round4_empty_template("attributes {}\n");
+}
+#[test]
+fn round4_both_empty_blocks_are_template_scope() {
+    assert_round4_empty_template("arguments {}\nattributes {}\n");
+}
+
 #[test]
 fn round1_direct_template_scope_in_all_resolver_entry_points() {
     let directory = tempfile::tempdir().unwrap();

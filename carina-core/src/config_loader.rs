@@ -399,40 +399,60 @@ pub type InferredRootDirectory = RootDirectoryParse<crate::parser::InferredExpor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CompleteDirectoryDeclarations(());
 
-fn mark_complete_require_scope<E>(parsed: &mut File<E>) {
-    use crate::parser::retained::{RequireScope, require_scope, set_require_scope};
-    if matches!(require_scope(parsed), RequireScope::Unknown) {
-        let scope = RequireScope::for_declarations(
-            parsed
-                .arguments
-                .iter()
-                .map(|argument| argument.name.clone()),
-            !parsed.attribute_params.is_empty(),
-        );
-        set_require_scope(
-            parsed,
-            match scope {
-                RequireScope::Unknown => {
-                    RequireScope::UnvalidatedDirectory(CompleteDirectoryDeclarations(()))
-                }
-                scope => scope,
-            },
-        );
-    }
-}
-
 fn mark_complete_directory_files(
     files: &mut [(PathBuf, DirectoryResolvedFile)],
     config: &ProviderContext,
 ) {
+    let scope = CompleteDirectoryInventories {
+        inventories: files
+            .iter()
+            .map(|(_, file)| file.parsed.parser_binding_metadata.syntax())
+            .collect(),
+    }
+    .require_scope();
     for (_, file) in files {
-        mark_complete_require_scope(&mut file.parsed);
+        crate::parser::retained::set_require_scope(&mut file.parsed, scope.clone());
         crate::parser::retained::judge_configuration(
             &mut file.parsed,
             &SchemaRegistry::new(),
             config,
         );
     }
+}
+
+/// Constructible only after every member of one sealed source snapshot has
+/// yielded a complete syntax inventory. Both semantic loading and recovery
+/// use this single issuer; recovery need not evaluate sibling values.
+struct CompleteDirectoryInventories<'a> {
+    inventories: Vec<&'a parser::SyntaxInventory>,
+}
+
+impl CompleteDirectoryInventories<'_> {
+    fn require_scope(self) -> crate::parser::retained::RequireScope {
+        use crate::parser::retained::RequireScope;
+        match require_scope_from_inventories(self.inventories) {
+            RequireScope::Unknown => {
+                RequireScope::UnvalidatedDirectory(CompleteDirectoryDeclarations(()))
+            }
+            scope => scope,
+        }
+    }
+}
+
+fn require_scope_from_inventories<'a>(
+    inventories: impl IntoIterator<Item = &'a parser::SyntaxInventory>,
+) -> crate::parser::retained::RequireScope {
+    let mut blocks = parser::ModuleDeclarationBlocks::Absent;
+    let mut arguments = BTreeSet::new();
+    for inventory in inventories {
+        blocks = blocks.union(inventory.module_declaration_blocks());
+        for declaration in inventory.declarations() {
+            if declaration.detail().kind() == DeclarationKind::Argument {
+                arguments.insert(declaration.detail().name().to_owned());
+            }
+        }
+    }
+    crate::parser::retained::RequireScope::for_declarations(arguments.into_iter(), blocks)
 }
 
 impl<E> RootDirectoryParse<E> {
@@ -664,70 +684,149 @@ where
     }
 }
 
-/// Analyze a recovery buffer with declaration evidence from its directory.
-/// Read only syntax inventories, honoring unsaved source overrides. Any
-/// unreadable or malformed sibling leaves scope unknown unless another
-/// inventory proves template scope. Unknown scope retains expression checks
-/// without judging requires. A complete directory without module declarations
-/// enters the same guard evaluator as an ordinary directory load.
-pub fn load_buffer_configuration_in_directory<'a>(
-    parsed: &ParsedFile,
-    schemas: &'a SchemaRegistry,
-    config: &ProviderContext,
-    directory: &ResolvedPath,
-    overrides: &SourceOverrides,
-) -> BufferConfiguration<'a> {
-    let mut parsed = parsed.clone();
-    let scope = recover_directory_require_scope(directory, overrides);
-    // Local arguments already prove template scope even if directory
-    // discovery itself fails. No negative inference is made from that file.
-    if !matches!(scope, crate::parser::retained::RequireScope::Unknown)
-        || !matches!(
-            crate::parser::retained::require_scope(&parsed),
-            crate::parser::retained::RequireScope::ModuleTemplate { .. }
-        )
-    {
-        crate::parser::retained::set_require_scope(&mut parsed, scope);
+/// A parser-minted buffer whose identity, contents and AST cannot be replaced
+/// independently. Clones retain the same parser node identities.
+#[derive(Clone)]
+pub struct ParsedSourceBuffer {
+    file: parser::SourceFileId,
+    text: std::sync::Arc<str>,
+    parsed: std::sync::Arc<ParsedFile>,
+}
+
+impl ParsedSourceBuffer {
+    pub fn parse(
+        text: &str,
+        file: &Path,
+        config: &ProviderContext,
+    ) -> Result<Self, parser::ParseError> {
+        let parsed = parser::parse_file(text, file, config)?;
+        Ok(Self {
+            file: parser::SourceFileId::new(file.to_path_buf()),
+            text: text.into(),
+            parsed: std::sync::Arc::new(parsed),
+        })
     }
-    BufferConfiguration {
-        judged: crate::parser::retained::JudgedFile::new(parsed, schemas, config),
+
+    pub fn parsed(&self) -> &ParsedFile {
+        &self.parsed
     }
 }
 
-fn recover_directory_require_scope(
-    directory: &ResolvedPath,
-    overrides: &SourceOverrides,
-) -> crate::parser::retained::RequireScope {
-    use crate::parser::retained::RequireScope;
-    let Ok(discovered) = DirectoryFiles::discover(directory, overrides) else {
-        return RequireScope::Unknown;
-    };
-    let mut complete = !discovered.paths.is_empty();
-    let mut arguments = BTreeSet::new();
-    let mut has_attributes = false;
-    for path in discovered.paths {
-        let inventory = read_source_with_overrides(&path, overrides)
-            .ok()
-            .and_then(|source| parser::parse_syntax_inventory(&source, &path.source_label()).ok());
-        let Some(inventory) = inventory else {
-            complete = false;
-            continue;
-        };
-        for declaration in inventory.declarations() {
-            match declaration.detail().kind() {
-                DeclarationKind::Argument => {
-                    arguments.insert(declaration.detail().name().to_string());
-                }
-                DeclarationKind::ModuleAttribute => has_attributes = true,
-                _ => {}
+struct SnapshotSource {
+    file: ResolvedPath,
+    text: Option<std::sync::Arc<str>>,
+}
+
+struct SnapshotBufferMember {
+    index: usize,
+    buffer: ParsedSourceBuffer,
+}
+
+/// A discovered directory snapshot sealed with one parsed buffer member.
+/// The member's parser-owned contents override disk and conflicting snapshots;
+/// there is no constructor accepting an unrelated File or mutable source list.
+pub struct DirectoryBufferSnapshot {
+    sources: Vec<SnapshotSource>,
+    member: SnapshotBufferMember,
+}
+
+impl DirectoryBufferSnapshot {
+    pub fn capture(
+        directory: &ResolvedPath,
+        buffer: ParsedSourceBuffer,
+        overrides: &SourceOverrides,
+    ) -> Result<Self, DirectoryParseFailure> {
+        let pinned = ResolvedPath::new(buffer.file.path()).map_err(|error| {
+            DirectoryParseFailure::new(DirectoryParseFailureKind::Discovery(error))
+        })?;
+        if pinned
+            .parent()
+            .is_none_or(|parent| parent.identity() != directory.identity())
+        {
+            return Err(DirectoryParseFailure::new(
+                DirectoryParseFailureKind::Discovery(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "buffer source is not a member of this directory",
+                )),
+            ));
+        }
+        let mut overrides = overrides.clone();
+        overrides.retain(|path, _| {
+            !ResolvedPath::new(path).is_ok_and(|path| path.identity() == pinned.identity())
+        });
+        overrides.insert(buffer.file.path().to_path_buf(), buffer.text.to_string());
+        let files = DirectoryFiles::discover(directory, &overrides).map_err(|error| {
+            DirectoryParseFailure::new(DirectoryParseFailureKind::Discovery(error))
+        })?;
+        let index = files
+            .paths
+            .iter()
+            .position(|file| file.identity() == pinned.identity())
+            .ok_or_else(|| {
+                DirectoryParseFailure::new(DirectoryParseFailureKind::Discovery(
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "buffer source was not discovered in the directory",
+                    ),
+                ))
+            })?;
+        let sources = files
+            .paths
+            .into_iter()
+            .map(|file| {
+                let text = if file.identity() == pinned.identity() {
+                    Some(buffer.text.clone())
+                } else {
+                    read_source_with_overrides(&file, &overrides)
+                        .ok()
+                        .map(std::sync::Arc::from)
+                };
+                SnapshotSource { file, text }
+            })
+            .collect();
+        Ok(Self {
+            sources,
+            member: SnapshotBufferMember { index, buffer },
+        })
+    }
+
+    fn require_scope(&self) -> crate::parser::retained::RequireScope {
+        let inventories = self
+            .sources
+            .iter()
+            .map(|source| {
+                source.text.as_ref().and_then(|text| {
+                    parser::parse_syntax_inventory(text, &source.file.source_label()).ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        if inventories.iter().all(Option::is_some) {
+            CompleteDirectoryInventories {
+                inventories: inventories.iter().filter_map(Option::as_ref).collect(),
             }
+            .require_scope()
+        } else {
+            require_scope_from_inventories(inventories.iter().filter_map(Option::as_ref))
         }
     }
-    match RequireScope::for_declarations(arguments.into_iter(), has_attributes) {
-        RequireScope::Unknown if complete => {
-            RequireScope::UnvalidatedDirectory(CompleteDirectoryDeclarations(()))
-        }
-        scope => scope,
+}
+
+/// Judge the buffer parsed from the exact member text of this sealed snapshot.
+/// Incomplete syntax knowledge retains ordinary expression checks without a
+/// require verdict. A known module block proves template scope; only complete
+/// absence of module blocks admits directory evaluation.
+pub fn load_buffer_configuration_in_directory<'a>(
+    snapshot: DirectoryBufferSnapshot,
+    schemas: &'a SchemaRegistry,
+    config: &ProviderContext,
+) -> BufferConfiguration<'a> {
+    let scope = snapshot.require_scope();
+    let member = &snapshot.sources[snapshot.member.index];
+    debug_assert!(member.text.as_deref() == Some(snapshot.member.buffer.text.as_ref()));
+    let mut parsed = snapshot.member.buffer.parsed().clone();
+    crate::parser::retained::set_require_scope(&mut parsed, scope);
+    BufferConfiguration {
+        judged: crate::parser::retained::JudgedFile::new(parsed, schemas, config),
     }
 }
 
@@ -2156,7 +2255,10 @@ pub(crate) fn parse_directory_files_located_from_root(
             .arguments
             .iter()
             .map(|argument| argument.name.clone()),
-        !merged.attribute_params.is_empty(),
+        merged
+            .parser_binding_metadata
+            .syntax()
+            .module_declaration_blocks(),
     );
     for (_, file) in &mut out {
         crate::parser::retained::set_require_scope(&mut file.parsed, require_scope.clone());

@@ -157,10 +157,15 @@ reference every argument declared by the module. An undeclared name is an
 error during validation, even when one of the declared argument values is
 still unresolved.
 
-At the root of a configuration directory, a `require` condition has no
-arguments in scope. It may use constants and supported constraint functions,
-but cannot reference directory `let` bindings or resources. Root requirements
-are always checked during validation. See [Require Statement](/reference/dsl/syntax/#require-statement).
+In a configuration directory with no `arguments` or `attributes` blocks, a
+`require` condition has no arguments in scope. It may use constants and
+supported constraint functions, but cannot reference directory `let` bindings
+or resources. Root requirements are always checked during validation. See
+[Require Statement](/reference/dsl/syntax/#require-statement).
+
+When validated directly, a directory containing either module declaration
+block keeps its `require` conditions unevaluated as a template, including
+when the block is empty.
 
 ### When Constraints Run
 
@@ -319,8 +324,9 @@ modules/network/
   attributes.crn
 ```
 
-The merged module must declare at least one argument parameter or output
-attribute. Empty `arguments` or `attributes` blocks do not make a directory a module.
+To be called as a module, the merged directory must declare at least one
+argument parameter or output attribute. Empty `arguments` or `attributes`
+blocks alone do not make it callable.
 
 Single-file sources (`use { source = "./modules/network.crn" }`) are **not supported**:
 the loader returns `NotADirectory` for an existing file source. A missing or

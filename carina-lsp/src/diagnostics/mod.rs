@@ -1162,13 +1162,23 @@ impl DiagnosticRun<'_> {
                 }
             }
             let pre_expansion_input = merged.unwrap_or(parsed);
-            let pre_expansion_configuration = if let (None, Some(base)) = (merged, base_path) {
+            let recovery_snapshot = if let (None, Some(base), Some(buffer)) =
+                (merged, base_path, doc.parsed_buffer())
+            {
+                carina_core::config_loader::DirectoryBufferSnapshot::capture(
+                    base,
+                    buffer.clone(),
+                    &overrides,
+                )
+                .ok()
+            } else {
+                None
+            };
+            let pre_expansion_configuration = if let Some(snapshot) = recovery_snapshot {
                 carina_core::config_loader::load_buffer_configuration_in_directory(
-                    pre_expansion_input,
+                    snapshot,
                     &self.schemas,
                     self.provider_context.catalog(),
-                    base,
-                    &overrides,
                 )
             } else {
                 carina_core::config_loader::load_buffer_configuration(

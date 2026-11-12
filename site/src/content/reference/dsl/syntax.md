@@ -441,7 +441,8 @@ require length(subnets) > 0, 'At least one subnet must be specified'
 require cidr_block != '', 'CIDR block cannot be empty'
 ```
 
-At the root of a configuration directory, `require` has no arguments in scope.
+In a configuration directory with no `arguments` or `attributes` blocks,
+`require` has no arguments in scope.
 Its condition must use literals, operators, and supported constraint functions
 (`len` and `length`). Root conditions cannot reference `let` bindings,
 resources, data sources, or module calls, including those in sibling files.
@@ -452,5 +453,10 @@ at the condition's own file and position.
 ```crn
 require length('production') > 0, 'Environment label cannot be empty'
 ```
+
+A directory containing either module declaration block is treated as an
+uninstantiated template when validated directly, even if the block is empty.
+Its `require` conditions are not evaluated. Calling the directory as a module
+still requires at least one declared argument or output attribute.
 
 The condition is a [validate expression](/reference/dsl/expressions/#validate-expressions) that supports comparison operators (`==`, `!=`, `>`, `<`, `>=`, `<=`), integer arithmetic (`+`, `-`, `*`, `/`, `%`), and logical operators (`&&`, `||`, `!`).

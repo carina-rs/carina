@@ -322,10 +322,10 @@ pub(crate) enum RequireScope {
 impl RequireScope {
     pub(crate) fn for_declarations(
         arguments: impl Iterator<Item = String>,
-        has_attributes: bool,
+        blocks: super::ModuleDeclarationBlocks,
     ) -> Self {
         let arguments = arguments.collect::<Vec<_>>();
-        if arguments.is_empty() && !has_attributes {
+        if blocks == super::ModuleDeclarationBlocks::Absent {
             Self::Unknown
         } else {
             Self::ModuleTemplate {
@@ -967,13 +967,17 @@ pub(crate) fn require_scope<E, D, B: BindingAddress>(
 pub(crate) fn admit_require_scope<E, D, B: BindingAddress>(
     file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
 ) {
+    let module_blocks = file
+        .parser_binding_metadata
+        .syntax()
+        .module_declaration_blocks();
     let expressions = file.parser_binding_metadata.syntax.expressions_mut();
     let scope = match expressions.require_scope.as_ref() {
         Some(RequireScope::UnvalidatedDirectory(evidence)) => RequireScope::Directory(*evidence),
         Some(_) => return,
         None => RequireScope::for_declarations(
             file.arguments.iter().map(|argument| argument.name.clone()),
-            !file.attribute_params.is_empty(),
+            module_blocks,
         ),
     };
     expressions.set_require_scope(scope);
@@ -1014,7 +1018,9 @@ pub(crate) fn judge_configuration<
     {
         let scope = RequireScope::for_declarations(
             file.arguments.iter().map(|argument| argument.name.clone()),
-            !file.attribute_params.is_empty(),
+            file.parser_binding_metadata
+                .syntax()
+                .module_declaration_blocks(),
         );
         file.parser_binding_metadata
             .syntax
