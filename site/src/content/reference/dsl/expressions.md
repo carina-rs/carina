@@ -181,6 +181,9 @@ let cert_issued = wait cert {
 | `depends_on` | no | Managed-resource handles that must complete before polling starts |
 | `timeout` | no | A [duration](/reference/dsl/types-and-values/#duration); defaults to the target schema's wait timeout, or 5 minutes |
 
+The comparison value accepts string literals, integers, floats, booleans,
+durations, and enum identifiers.
+
 Strings in a `wait` condition must be literals. Double-quoted interpolation
 (`${...}`) is rejected. Single-quoted `${...}` text and escaped `\${...}` in
 double quotes remain literal text. As in `require` conditions, string escapes

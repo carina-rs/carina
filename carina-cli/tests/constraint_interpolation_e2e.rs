@@ -17,6 +17,67 @@ const CANARY: &str = "CANARY_4386";
 const INTERPOLATION: &str = "${secret('CANARY_4386')}";
 
 #[test]
+fn round2_saved_wait_rejects_alternate_value_shapes_before_apply() {
+    let fixture = Fixture::new(
+        "let w = wait vpc { until = vpc.identifier == 'vpc-id' timeout = 1s }\nmock.test.resource { name = 'consumer' parent = w.identifier }\n",
+        None,
+    );
+    assert!(
+        fixture
+            .run(&["plan", "--out", "plan.bin", "."])
+            .status
+            .success()
+    );
+    fixture.assert_no_written_canary();
+    let path = fixture.project.join("plan.bin");
+    let mut plan: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let index = plan["plan"]["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|e| e.get("Wait").is_some())
+        .unwrap();
+    let state_paths = [
+        fixture.project.join("carina.state.json"),
+        fixture.home.join("mock-state.json"),
+    ];
+    let state_before = state_paths.each_ref().map(|p| fs::read(p).ok());
+    for value in [
+        json!({"Interpolation": [{"Literal": INTERPOLATION}]}),
+        json!({"Map": {"CANARY_4386": {"Interpolation": [{"Literal": INTERPOLATION}]}}}),
+        json!({"CANARY_4386": null}),
+    ] {
+        plan["plan"]["effects"][index]["Wait"]["until"]["value"] = value;
+        fs::write(&path, serde_json::to_vec(&plan).unwrap()).unwrap();
+        let apply = fixture.run(&["apply", "--auto-approve", "--lock=false", "plan.bin"]);
+        assert!(!apply.status.success());
+        assert!(
+            state_paths.each_ref().map(|p| fs::read(p).ok()) == state_before,
+            "rejected wait payload must not execute effects or write state"
+        );
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&apply.stdout),
+            String::from_utf8_lossy(&apply.stderr)
+        );
+        assert!(output.contains("re-run `carina plan --out`"));
+        let result = serde_json::from_value::<carina_cli::commands::plan::PlanFile>(plan.clone());
+        assert!(
+            result.is_err(),
+            "saved wait payload must reject non-parser shapes"
+        );
+        assert!(
+            !format!(
+                "{} {:?}",
+                result.as_ref().unwrap_err(),
+                result.as_ref().unwrap_err()
+            )
+            .contains(CANARY)
+        );
+    }
+}
+
+#[test]
 fn round1_wait_condition_rejects_interpolation() {
     Fixture::new("let w = wait vpc { until = vpc.identifier == \"${secret('CANARY_4386')}\" timeout = 1s }\nmock.test.resource { name = 'consumer' parent = w.identifier }\n", None)
         .assert_rejected("main.crn", "`wait` condition");

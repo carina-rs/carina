@@ -5967,10 +5967,10 @@ impl WaitBinding<AbsoluteBindingAddress> {
         let UntilPredicateAst {
             root,
             attribute_segments: _attribute_segments,
-            rhs,
+            rhs: _rhs,
         } = until_predicate;
         *root = map(root);
-        rhs.map_absolute_bindings(map);
+        // A wait RHS is a closed scalar operand and cannot contain bindings.
         depends_on.map_absolute_bindings(map);
     }
 }
@@ -7297,7 +7297,7 @@ where
                         until_predicate: UntilPredicateAst {
                             root: resolve(root),
                             attribute_segments,
-                            rhs: rhs.resolve_bindings(resolve),
+                            rhs: rhs.rebind(),
                         },
                         timeout_secs,
                         depends_on: depends_on.resolve_bindings(resolve),

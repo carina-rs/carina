@@ -1653,7 +1653,7 @@ fn resolve_wait_binding(
         until_predicate: crate::parser::UntilPredicateAst {
             root: predicate_root,
             attribute_segments: until_predicate.attribute_segments.clone(),
-            rhs: resolver.resolve_wait_rhs(&until_predicate.rhs)?,
+            rhs: until_predicate.rhs.clone().rebind(),
         },
         timeout_secs: *timeout_secs,
         depends_on: resolve_directive_dependencies(depends_on, &Default::default(), resolver)?,
@@ -2100,19 +2100,6 @@ impl ModuleScopeResolver<'_> {
         Ok(value)
     }
 
-    fn resolve_wait_rhs(
-        &self,
-        value: &crate::wait::WaitRhs<RelativeBindingName>,
-    ) -> Result<crate::wait::WaitRhs<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
-        for binding in value.root_bindings() {
-            if !self.local_bindings.contains(&binding) {
-                let diagnostic_source = value.diagnostic_source_for_root_binding(&binding);
-                return Err(self.unknown_binding_at(binding.as_str(), diagnostic_source));
-            }
-        }
-        Ok(value.clone().resolve_module(self.scope))
-    }
-
     fn resolve_structural_argument(
         &self,
         handle: &crate::eval_value::UnexpandedStructuralHandle<RelativeBindingName>,
@@ -2424,13 +2411,6 @@ fn reject_dropped_conditional_references(
                     wait.depends_on
                         .iter()
                         .map(|operand| operand.binding_reference())
-                        .find_map(|binding| selected.dropped.get(&binding))
-                })
-                .or_else(|| {
-                    wait.until_predicate
-                        .rhs
-                        .root_bindings()
-                        .into_iter()
                         .find_map(|binding| selected.dropped.get(&binding))
                 });
             if found.is_some() {

@@ -45,6 +45,7 @@ mod expressions;
 pub use expressions::validate_expr::{ConstraintStringPosition, ValidateStringLiteral};
 mod functions;
 mod grammar;
+pub(crate) use grammar::is_wait_enum_identifier;
 mod let_binding;
 mod resolve;
 pub mod retained;

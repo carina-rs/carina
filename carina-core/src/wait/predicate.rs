@@ -11,8 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::resource::{
-    AbsoluteBindingAddress, BindingAddress, ConcreteValue, DeferredValue, InterpolationPart,
-    NoPlaceholder, Value,
+    AbsoluteBindingAddress, BindingAddress, ConcreteValue, NoPlaceholder, Value,
 };
 use crate::schema::{AttributePathTypeError, ValidatedResourceSchema};
 
@@ -101,6 +100,8 @@ impl TryFrom<AttrPathSerde> for AttrPath {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WaitPredicateError {
+    #[error("invalid wait operand; re-run `carina plan --out`")]
+    UnsupportedOperand,
     #[error("wait string requires a checked literal; re-run `carina plan --out`")]
     UncheckedString,
     #[error("unresolved enum identifier `{identifier}`")]
@@ -120,6 +121,8 @@ impl From<std::convert::Infallible> for WaitPredicateError {
 /// both path spelling and remediation text identical.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WaitResolutionError {
+    #[error("invalid wait operand; re-run `carina plan --out`")]
+    UnsupportedOperand,
     #[error("wait string requires a checked literal; re-run `carina plan --out`")]
     UncheckedString,
     #[error("invalid predicate attribute path: {0}")]
@@ -167,6 +170,7 @@ impl WaitResolutionError {
                 ..
             } => Some(crate::schema::SECRET_VALUE_MASK),
             Self::UncheckedString
+            | Self::UnsupportedOperand
             | Self::InvalidPath(_)
             | Self::UnknownAttribute { .. }
             | Self::UnknownStructField { .. }
@@ -225,20 +229,18 @@ pub fn resolve_wait_predicate<B: BindingAddress>(
                     }
                 }
             })?;
-        if matches!(
-            resolved.value,
-            Value::Concrete(ConcreteValue::EnumIdentifier(_))
-        ) {
+        if matches!(resolved.operand, WaitOperand::Identifier(_)) {
             resolved = WaitRhs::try_from(crate::value::canonicalize_wait_rhs_with_type(
-                resolved.value,
+                resolved.to_value(),
                 &effective_type,
             ))
-            .map_err(|_| WaitResolutionError::UncheckedString)?;
+            .map_err(|_| WaitResolutionError::UnsupportedOperand)?;
         }
     }
 
     WaitPredicate::equals(attr, resolved).map_err(|error| match error {
         WaitPredicateError::UncheckedString => WaitResolutionError::UncheckedString,
+        WaitPredicateError::UnsupportedOperand => WaitResolutionError::UnsupportedOperand,
         WaitPredicateError::UnresolvedEnumIdentifier { identifier } => {
             WaitResolutionError::UnresolvedEnumIdentifier {
                 target: target.to_string(),
@@ -254,191 +256,172 @@ pub fn resolve_wait_predicate<B: BindingAddress>(
 pub(crate) fn validate_wait_predicate<B: BindingAddress>(
     root: &B,
     attribute_segments: &[String],
-    value: &Value<NoPlaceholder, B>,
+    value: &WaitRhs<B>,
     schema: Option<&ValidatedResourceSchema>,
 ) -> Result<(), WaitResolutionError> {
-    let target = root.as_str();
-    let attr =
-        AttrPath::try_new(attribute_segments.to_vec()).map_err(WaitResolutionError::InvalidPath)?;
-    let attribute = attr.segments().join(".");
-
-    if let Some(schema) = schema {
-        let effective_type = schema
-            .effective_type_at_attribute_path(attr.segments())
-            .map_err(|error| match error {
-                AttributePathTypeError::Empty => {
-                    WaitResolutionError::InvalidPath(AttrPathError::Empty)
-                }
-                AttributePathTypeError::UnknownAttribute { attribute } => {
-                    WaitResolutionError::UnknownAttribute {
-                        target: target.to_string(),
-                        attribute,
-                        resource_type: schema.as_schema().resource_type().to_string(),
-                    }
-                }
-                AttributePathTypeError::UnknownStructField {
-                    parent_path,
-                    field,
-                    struct_name,
-                } => WaitResolutionError::UnknownStructField {
-                    target: target.to_string(),
-                    full_path: format!("{parent_path}.{field}"),
-                    struct_name,
-                },
-                AttributePathTypeError::CannotTraverse { path, type_name } => {
-                    WaitResolutionError::CannotTraverse {
-                        target: target.to_string(),
-                        full_path: attribute.clone(),
-                        traversed: path,
-                        type_name,
-                    }
-                }
-            })?;
-        if let Value::Concrete(ConcreteValue::EnumIdentifier(identifier)) = value {
-            let resolved: Value<NoPlaceholder, B> = crate::value::canonicalize_wait_rhs_with_type(
-                Value::Concrete(ConcreteValue::EnumIdentifier(identifier.clone())),
-                &effective_type,
-            );
-            if let Some(identifier) = unresolved_enum_identifier(&resolved) {
-                return Err(WaitResolutionError::UnresolvedEnumIdentifier {
-                    target: target.to_string(),
-                    attribute,
-                    identifier,
-                });
-            }
-            return Ok(());
-        }
-    }
-
-    if let Some(identifier) = unresolved_enum_identifier(value) {
-        return Err(WaitResolutionError::UnresolvedEnumIdentifier {
-            target: target.to_string(),
-            attribute,
-            identifier,
-        });
-    }
-    Ok(())
+    resolve_wait_predicate(root, attribute_segments, value.clone(), schema).map(|_| ())
 }
 
-/// A wait RHS that is safe to persist and evaluate.
-///
-/// The inner value is private so an unresolved [`ConcreteValue::EnumIdentifier`]
-/// cannot reach polling through direct construction or saved-plan
-/// deserialization. Build predicates with [`WaitPredicate::equals`].
+/// A resolved wait operand. Its variants are the scalar results of
+/// `lower_until_rhs` and schema enum resolution, never a general Value tree.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum WaitScalar {
+    String(crate::parser::ValidateStringLiteral),
+    Int(i64),
+    Float(carina_provider_protocol::FiniteF64),
+    Bool(bool),
+    #[serde(with = "crate::resource::duration_secs")]
+    Duration(std::time::Duration),
+    CanonicalEnum(crate::resource::CanonicalEnumValue),
+}
+
+impl WaitScalar {
+    fn to_value<B: BindingAddress>(&self) -> Value<NoPlaceholder, B> {
+        Value::Concrete(match self {
+            Self::String(literal) => ConcreteValue::String(literal.as_str().into()),
+            Self::Int(value) => ConcreteValue::Int(*value),
+            Self::Float(value) => ConcreteValue::Float(*value),
+            Self::Bool(value) => ConcreteValue::Bool(*value),
+            Self::Duration(value) => ConcreteValue::Duration(*value),
+            Self::CanonicalEnum(value) => ConcreteValue::CanonicalEnum(value.clone()),
+        })
+    }
+}
+
+// RawEnumIdentifier is shared with other expression paths and accepts arbitrary
+// text. Wait identifiers must instead be dotted field names from the grammar.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(transparent)]
-pub struct WaitPredicateValue<B: BindingAddress = AbsoluteBindingAddress>(WaitRhs<B>);
+struct WaitEnumIdentifier(crate::resource::RawEnumIdentifier);
 
-/// A wait operand keeps string source proof alongside its runtime value.
-/// Callers cannot replace the value without preserving that proof. Other
-/// operands retain the existing Value serialization and enum-resolution path.
+impl TryFrom<crate::resource::RawEnumIdentifier> for WaitEnumIdentifier {
+    type Error = WaitPredicateError;
+
+    fn try_from(identifier: crate::resource::RawEnumIdentifier) -> Result<Self, Self::Error> {
+        if crate::parser::is_wait_enum_identifier(identifier.as_str()) {
+            Ok(Self(identifier))
+        } else {
+            Err(WaitPredicateError::UnsupportedOperand)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WaitEnumIdentifier {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let identifier = crate::resource::RawEnumIdentifier::deserialize(deserializer)?;
+        Self::try_from(identifier).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum WaitIdentifier {
+    EnumIdentifier(WaitEnumIdentifier),
+}
+
+// Both alternatives are closed enums. There is no general Value serde fallback.
+// Untagged serialization preserves the existing externally tagged scalar bytes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum WaitOperand {
+    Scalar(WaitScalar),
+    Identifier(WaitIdentifier),
+}
+
+const INVALID_WAIT_OPERAND: &str = "invalid wait operand; re-run `carina plan --out`";
+
+/// A resolved scalar wait value, sealed against unresolved enum identifiers,
+/// interpolation, references, secrets, unknowns, and collection values.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct WaitPredicateValue<B: BindingAddress = AbsoluteBindingAddress> {
+    scalar: WaitScalar,
+    #[serde(skip)]
+    binding: std::marker::PhantomData<fn() -> B>,
+}
+
+/// The closed set of wait RHS shapes admitted by the parser and enum resolver.
+/// Binding phases are tracked without storing any binding-bearing Value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WaitRhs<B: BindingAddress = AbsoluteBindingAddress> {
-    value: Value<NoPlaceholder, B>,
-    literal: Option<crate::parser::ValidateStringLiteral>,
+    operand: WaitOperand,
+    binding: std::marker::PhantomData<fn() -> B>,
 }
 
 impl<B: BindingAddress> WaitRhs<B> {
     pub fn literal(literal: crate::parser::ValidateStringLiteral) -> Self {
+        Self::from_operand(WaitOperand::Scalar(WaitScalar::String(literal)))
+    }
+
+    fn from_operand(operand: WaitOperand) -> Self {
         Self {
-            value: Value::Concrete(ConcreteValue::String(literal.as_str().into())),
-            literal: Some(literal),
+            operand,
+            binding: std::marker::PhantomData,
         }
     }
 
-    pub fn as_value(&self) -> &Value<NoPlaceholder, B> {
-        &self.value
+    pub fn to_value(&self) -> Value<NoPlaceholder, B> {
+        match &self.operand {
+            WaitOperand::Scalar(scalar) => scalar.to_value(),
+            WaitOperand::Identifier(WaitIdentifier::EnumIdentifier(identifier)) => {
+                Value::Concrete(ConcreteValue::EnumIdentifier(identifier.0.clone()))
+            }
+        }
+    }
+
+    pub(crate) fn rebind<C: BindingAddress>(self) -> WaitRhs<C> {
+        WaitRhs::from_operand(self.operand)
     }
 }
 
 impl<B: BindingAddress> PartialEq<Value<NoPlaceholder, B>> for WaitRhs<B> {
     fn eq(&self, other: &Value<NoPlaceholder, B>) -> bool {
-        self.value == *other
-    }
-}
-
-impl<B: BindingAddress> std::ops::Deref for WaitRhs<B> {
-    type Target = Value<NoPlaceholder, B>;
-    fn deref(&self) -> &Self::Target {
-        self.as_value()
+        self.to_value() == *other
     }
 }
 
 impl<B: BindingAddress> TryFrom<Value<NoPlaceholder, B>> for WaitRhs<B> {
     type Error = WaitPredicateError;
+
     fn try_from(value: Value<NoPlaceholder, B>) -> Result<Self, Self::Error> {
-        if matches!(value, Value::Concrete(ConcreteValue::String(_))) {
-            return Err(WaitPredicateError::UncheckedString);
-        }
-        Ok(Self {
-            value,
-            literal: None,
-        })
-    }
-}
-
-impl<B: BindingAddress + Serialize> Serialize for WaitRhs<B> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if let Some(literal) = &self.literal {
-            use serde::ser::SerializeMap;
-            let mut map = serializer.serialize_map(Some(1))?;
-            map.serialize_entry("String", literal)?;
-            map.end()
-        } else {
-            self.value.serialize(serializer)
-        }
-    }
-}
-
-impl<'de, B: BindingAddress + Deserialize<'de>> Deserialize<'de> for WaitRhs<B> {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let wire = serde_json::Value::deserialize(deserializer)?;
-        if let Some(object) = wire.as_object()
-            && let Some(source) = object.get("String")
-        {
-            if object.len() != 1 {
-                return Err(serde::de::Error::custom(
-                    "invalid wait string literal; re-run `carina plan --out`",
-                ));
+        let scalar = match value {
+            Value::Concrete(ConcreteValue::String(_)) => {
+                return Err(WaitPredicateError::UncheckedString);
             }
-            let literal = crate::parser::ValidateStringLiteral::deserialize(source.clone())
-                .map_err(serde::de::Error::custom)?;
-            return Ok(Self::literal(literal));
-        }
-        let value =
-            Value::<NoPlaceholder, B>::deserialize(wire).map_err(serde::de::Error::custom)?;
-        Self::try_from(value).map_err(serde::de::Error::custom)
+            Value::Concrete(ConcreteValue::EnumIdentifier(identifier)) => {
+                return Ok(Self::from_operand(WaitOperand::Identifier(
+                    WaitIdentifier::EnumIdentifier(identifier.try_into()?),
+                )));
+            }
+            Value::Concrete(ConcreteValue::Int(value)) => WaitScalar::Int(value),
+            Value::Concrete(ConcreteValue::Float(value)) => WaitScalar::Float(value),
+            Value::Concrete(ConcreteValue::Bool(value)) => WaitScalar::Bool(value),
+            Value::Concrete(ConcreteValue::Duration(value)) => WaitScalar::Duration(value),
+            Value::Concrete(ConcreteValue::CanonicalEnum(value)) => {
+                WaitScalar::CanonicalEnum(value)
+            }
+            _ => return Err(WaitPredicateError::UnsupportedOperand),
+        };
+        Ok(Self::from_operand(WaitOperand::Scalar(scalar)))
     }
 }
 
-impl WaitRhs<crate::resource::RelativeBindingName> {
-    pub(crate) fn resolve_bindings(
-        self,
-        resolve: &mut impl FnMut(crate::resource::RelativeBindingName) -> AbsoluteBindingAddress,
-    ) -> WaitRhs {
-        WaitRhs {
-            value: self.value.resolve_bindings(resolve),
-            literal: self.literal,
-        }
-    }
-
-    pub(crate) fn resolve_module(self, scope: &crate::resource::ModuleInstanceScope) -> WaitRhs {
-        self.resolve_bindings(&mut |binding| scope.resolve(binding))
+impl<B: BindingAddress> Serialize for WaitRhs<B> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.operand.serialize(serializer)
     }
 }
 
-impl WaitRhs {
-    pub(crate) fn map_absolute_bindings(
-        &mut self,
-        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
-    ) {
-        self.value.map_absolute_bindings(map);
+impl<'de, B: BindingAddress> Deserialize<'de> for WaitRhs<B> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        WaitOperand::deserialize(deserializer)
+            .map(Self::from_operand)
+            .map_err(|_| serde::de::Error::custom(INVALID_WAIT_OPERAND))
     }
 }
 
 impl<B: BindingAddress> WaitPredicateValue<B> {
-    pub fn as_value(&self) -> &Value<NoPlaceholder, B> {
-        self.0.as_value()
+    pub fn to_value(&self) -> Value<NoPlaceholder, B> {
+        self.scalar.to_value()
     }
 }
 
@@ -454,80 +437,26 @@ impl<B: BindingAddress> TryFrom<WaitRhs<B>> for WaitPredicateValue<B> {
     type Error = WaitPredicateError;
 
     fn try_from(value: WaitRhs<B>) -> Result<Self, Self::Error> {
-        if let Some(identifier) = unresolved_enum_identifier(value.as_value()) {
-            return Err(WaitPredicateError::UnresolvedEnumIdentifier { identifier });
+        match value.operand {
+            WaitOperand::Scalar(scalar) => Ok(Self {
+                scalar,
+                binding: std::marker::PhantomData,
+            }),
+            WaitOperand::Identifier(WaitIdentifier::EnumIdentifier(identifier)) => {
+                Err(WaitPredicateError::UnresolvedEnumIdentifier {
+                    identifier: crate::resource::SecretDiagnosticError::Public(
+                        identifier.0.as_str().into(),
+                    ),
+                })
+            }
         }
-        Ok(Self(value))
     }
 }
 
-impl<'de, B> Deserialize<'de> for WaitPredicateValue<B>
-where
-    B: BindingAddress + Deserialize<'de>,
-{
+impl<'de, B: BindingAddress> Deserialize<'de> for WaitPredicateValue<B> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = WaitRhs::<B>::deserialize(deserializer)?;
         Self::try_from(value).map_err(serde::de::Error::custom)
-    }
-}
-
-fn unresolved_enum_identifier<B: BindingAddress>(
-    value: &Value<NoPlaceholder, B>,
-) -> Option<crate::resource::SecretDiagnosticError<String>> {
-    match value {
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
-            .values()
-            .into_iter()
-            .find_map(unresolved_enum_identifier),
-        Value::Concrete(ConcreteValue::EnumIdentifier(identifier)) => Some(
-            crate::resource::SecretDiagnosticError::Public(identifier.as_str().into()),
-        ),
-        Value::Concrete(ConcreteValue::List(items)) => {
-            items.iter().find_map(unresolved_enum_identifier)
-        }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            map.values().find_map(unresolved_enum_identifier)
-        }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().find_map(|part| {
-            if let InterpolationPart::Expr(value) = part {
-                unresolved_enum_identifier(value)
-            } else {
-                None
-            }
-        }),
-        Value::Deferred(
-            DeferredValue::FunctionCall { args, .. }
-            | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
-        ) => args
-            .iter()
-            .find_map(|argument| unresolved_enum_identifier(argument.walker_value())),
-        Value::Deferred(DeferredValue::Access(access)) => unresolved_enum_identifier(access.base()),
-        Value::Deferred(DeferredValue::Secret(inner)) => inner
-            .try_inspect(|value| unresolved_enum_identifier(value).map_or(Ok(()), Err))
-            .err(),
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            unresolved_enum_identifier(value).or_else(|| unresolved_enum_identifier(default))
-        }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            unresolved_enum_identifier(expression.lhs())
-                .or_else(|| unresolved_enum_identifier(expression.rhs()))
-        }
-        Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
-        )
-        | Value::Deferred(
-            DeferredValue::ResourceRef { .. }
-            | DeferredValue::BindingRef { .. }
-            | DeferredValue::Unknown(_)
-            | DeferredValue::Placeholder(_),
-        ) => None,
     }
 }
 
@@ -555,9 +484,9 @@ impl<B: BindingAddress> WaitPredicate<B> {
         })
     }
 
-    pub fn value(&self) -> &Value<NoPlaceholder, B> {
+    pub fn value(&self) -> Value<NoPlaceholder, B> {
         match self {
-            Self::Equals { value, .. } => value.as_value(),
+            Self::Equals { value, .. } => value.to_value(),
         }
     }
 
@@ -578,7 +507,7 @@ impl<B: BindingAddress> WaitPredicate<B> {
         match self {
             WaitPredicate::Equals { attr, value } => attr
                 .resolve(attrs)
-                .is_some_and(|observed| wait_values_equal(observed, value.as_value())),
+                .is_some_and(|observed| wait_values_equal(observed, &value.to_value())),
         }
     }
 }
@@ -611,8 +540,145 @@ fn wait_values_equal<B: BindingAddress>(
 mod tests {
     use super::*;
     use crate::resource::ExpandedConcreteValue as ConcreteValue;
+    use crate::resource::{DeferredValue, InterpolationPart};
     type Value = crate::resource::ExpandedValue;
     use std::collections::HashMap;
+
+    #[test]
+    fn round2_wait_decode_accepts_only_authored_scalar_shapes() {
+        let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        for (source, expected_wire) in [
+            ("'ready'", serde_json::json!({"String": "'ready'"})),
+            (
+                r#""line\n\${literal}""#,
+                serde_json::json!({"String": r#""line\n\${literal}""#}),
+            ),
+            ("42", serde_json::json!({"Int": 42})),
+            ("-7", serde_json::json!({"Int": -7})),
+            ("1.25", serde_json::json!({"Float": 1.25})),
+            ("true", serde_json::json!({"Bool": true})),
+            ("false", serde_json::json!({"Bool": false})),
+            ("2min", serde_json::json!({"Duration": 120})),
+            ("ready", serde_json::json!({"EnumIdentifier": "ready"})),
+            (
+                "aws.acm.Certificate.Status.Issued",
+                serde_json::json!({"EnumIdentifier": "aws.acm.Certificate.Status.Issued"}),
+            ),
+        ] {
+            let parsed = crate::parser::parse_file(
+                &format!("let w = wait r {{ until = r.status == {source} }}"),
+                std::path::Path::new("main.crn"),
+                &config,
+            )
+            .unwrap();
+            let rhs = &parsed.wait_bindings[0].until_predicate.rhs;
+            let wire = serde_json::to_string(rhs).unwrap();
+            assert_eq!(wire, serde_json::to_string(&expected_wire).unwrap());
+            let decoded: WaitRhs<crate::resource::RelativeBindingName> =
+                serde_json::from_str(&wire).unwrap();
+            assert_eq!(&decoded, rhs);
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), wire);
+            if !matches!(
+                rhs.to_value(),
+                crate::resource::Value::Concrete(crate::resource::ConcreteValue::EnumIdentifier(_))
+            ) {
+                let predicate = WaitPredicate::equals(AttrPath::single("status"), decoded).unwrap();
+                let observed = rhs.to_value();
+                assert!(predicate.evaluate(&HashMap::from([("status".to_string(), observed)])));
+                let wire = serde_json::to_string(&predicate).unwrap();
+                let decoded: WaitPredicate<crate::resource::RelativeBindingName> =
+                    serde_json::from_str(&wire).unwrap();
+                assert_eq!(serde_json::to_string(&decoded).unwrap(), wire);
+            }
+        }
+        let interpolation =
+            serde_json::json!({"Interpolation": [{"Literal":"${secret('CANARY_4386')}"}]});
+        for wire in [
+            interpolation.clone(),
+            serde_json::json!({"List": [interpolation.clone()]}),
+            serde_json::json!({"Map": {"CANARY_4386": interpolation.clone()}}),
+            serde_json::json!({"StringList": ["${secret('CANARY_4386')}"]}),
+            serde_json::json!({"Secret": {"String": "CANARY_4386"}}),
+            serde_json::json!({"BindingRef": {"binding": "r"}}),
+            serde_json::json!({"Unknown": {"UpstreamBareRef": {"binding": "r"}}}),
+            serde_json::json!({"ResourceRef": {"path": {"binding": "r", "segments": []}}}),
+            serde_json::json!({"CANARY_4386": null}),
+            serde_json::json!({"EnumIdentifier": "${secret('CANARY_4386')}"}),
+        ] {
+            for result in [
+                serde_json::from_value::<WaitRhs>(wire.clone()).map(|_| ()),
+                serde_json::from_value::<WaitPredicateValue>(wire.clone()).map(|_| ()),
+                serde_json::from_value::<WaitPredicate>(serde_json::json!({"kind":"equals","attr":{"segments":["status"]},"value":wire})).map(|_| ()),
+            ] {
+                assert!(result.is_err(), "only closed scalar wait operands may decode");
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains("re-run `carina plan --out`"));
+                assert!(!format!("{error} {error:?}").contains("CANARY_4386"));
+            }
+        }
+        let value = Value::Concrete(ConcreteValue::CanonicalEnum(
+            crate::resource::CanonicalEnumValue::new_for_test(
+                crate::schema::enum_identity("Status", Some("aws.acm.Certificate")),
+                "ISSUED",
+            ),
+        ));
+        let expected_value = serde_json::to_value(&value).unwrap();
+        let predicate = WaitPredicate::equals(AttrPath::single("status"), value).unwrap();
+        let wire = serde_json::to_string(&predicate).unwrap();
+        assert_eq!(
+            serde_json::to_value(&predicate).unwrap()["value"],
+            expected_value
+        );
+        let decoded: WaitPredicate = serde_json::from_str(&wire).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), wire);
+        assert!(predicate.evaluate(&HashMap::from([(
+            "status".to_string(),
+            Value::Concrete(ConcreteValue::String("Issued".into()))
+        )])));
+    }
+
+    #[test]
+    fn round2_wait_constructors_reject_non_parser_values() {
+        let interpolation = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("${secret('CANARY_4386')}".into()),
+        ]));
+        for value in [
+            interpolation.clone(),
+            Value::Concrete(ConcreteValue::List(vec![interpolation.clone()])),
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                "CANARY_4386".into(),
+                interpolation.clone(),
+            )]))),
+            Value::Concrete(ConcreteValue::StringList(vec![
+                "${secret('CANARY_4386')}".into(),
+            ])),
+            Value::Deferred(DeferredValue::Secret(Box::new(interpolation).into())),
+            Value::Deferred(DeferredValue::BindingRef {
+                binding: crate::resource::RootScope::new()
+                    .resolve(crate::resource::RelativeBindingName::new("r")),
+            }),
+            Value::Deferred(DeferredValue::Unknown(
+                crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                    binding: crate::resource::RootScope::new()
+                        .resolve(crate::resource::RelativeBindingName::new("r")),
+                },
+            )),
+        ] {
+            for result in [
+                WaitRhs::try_from(value.clone()).map(|_| ()),
+                WaitPredicateValue::try_from(value.clone()).map(|_| ()),
+                WaitPredicate::equals(AttrPath::single("status"), value).map(|_| ()),
+            ] {
+                assert!(
+                    result.is_err(),
+                    "wait constructors must reject non-parser shapes"
+                );
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains("re-run `carina plan --out`"));
+                assert!(!format!("{error} {error:?}").contains("CANARY_4386"));
+            }
+        }
+    }
 
     #[test]
     fn round1_wait_decode_rejects_unchecked_or_interpolated_string_sources() {
@@ -648,7 +714,7 @@ mod tests {
             let predicate: WaitPredicate = serde_json::from_value(wire.clone()).unwrap();
             let expected = &source[1..source.len() - 1];
             assert_eq!(
-                predicate.value(),
+                &predicate.value(),
                 &Value::Concrete(ConcreteValue::String(expected.into()))
             );
             assert!(predicate.evaluate(&HashMap::from([(

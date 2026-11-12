@@ -350,7 +350,7 @@ fn lower_until_lhs(
     Ok(segments)
 }
 
-/// Extract the literal RHS as a `Value`. Supports string, int, float,
+/// Extract a closed literal RHS. Supports string, int, float,
 /// bool, duration, and namespaced-id enums (e.g.
 /// `aws.acm.Certificate.Status.Issued`).
 fn lower_until_rhs(
@@ -490,7 +490,7 @@ mod tests {
         // resolution to the canonical AWS value happens downstream when
         // `create_plan` resolves the predicate against the target schema.
         assert!(matches!(
-            we.until_predicate.rhs.as_value(),
+            we.until_predicate.rhs.to_value(),
             Value::Concrete(ConcreteValue::EnumIdentifier(raw))
                 if raw.as_str() == "aws.acm.Certificate.Status.Issued"
         ));
@@ -511,7 +511,7 @@ mod tests {
     fn parses_quoted_dotted_string_rhs_as_string() {
         let we = parse_one("wait cert {\n    until = cert.status == 'A.json'\n}");
         assert!(matches!(
-            we.until_predicate.rhs.as_value(),
+            we.until_predicate.rhs.to_value(),
             Value::Concrete(ConcreteValue::String(value))
                 if value.expose_plaintext() == "A.json"
         ));
@@ -521,7 +521,7 @@ mod tests {
     fn parses_bare_identifier_rhs_as_enum_identifier() {
         let we = parse_one("wait job {\n    until = job.state == ready\n}");
         assert!(matches!(
-            we.until_predicate.rhs.as_value(),
+            we.until_predicate.rhs.to_value(),
             Value::Concrete(ConcreteValue::EnumIdentifier(raw)) if raw.as_str() == "ready"
         ));
     }
