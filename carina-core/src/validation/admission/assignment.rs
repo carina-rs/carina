@@ -223,6 +223,20 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> From<&AdmissionContext<'a, P, B>
 }
 
 impl<B: BindingAddress> ReferenceCandidate<B> {
+    pub(super) fn error_with_origin(&self, error: TypeError) -> TypeError {
+        match error {
+            TypeError::TypeMismatch { types } => {
+                reference_error(AdmissionReferenceError::Computed(
+                    crate::validation::DeferredAccessTypeError::reference_mismatch(
+                        crate::binding_index::RefTypeMismatch::direct(types),
+                        self.reference.as_ref(),
+                    ),
+                ))
+            }
+            error => error,
+        }
+    }
+
     /// This entry is available only on reference evidence. Placement still
     /// requires `admit`, which also checks the boundary proof and actual value.
     #[cfg(test)]
@@ -540,7 +554,29 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                     }
                     Ok(findings)
                 };
-            crate::schema::value_validation::validate_authored_value_for_admission(
+            let reference_check =
+                |attr: &CompiledAttributeType,
+                 relative_path: &LeafPath,
+                 source: crate::parser::retained::SourceReference<'_, B>| {
+                    let reference = ReferenceCandidate {
+                        reference: source.into_path(),
+                    };
+                    // judge_at uses context.declaration only when supplied; resource attributes pass None.
+                    reference
+                        .judge_at::<K>(
+                            contract,
+                            attr,
+                            &join(&contract.path, relative_path),
+                            &reference_context,
+                            // The ordinary path already checked this concrete
+                            // value. Recovered source authority adds rejections,
+                            // never new local or schema deferrals.
+                            &mut Default::default(),
+                        )
+                        .map_err(|error| reference.error_with_origin(error))?;
+                    Ok(())
+                };
+            crate::schema::value_validation::validate_authored_value_for_admission_with_references(
                 contract.attr(),
                 proof,
                 contract.defs(),
@@ -550,6 +586,14 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 crate::schema::value_validation::AssignmentCallbacks {
                     ordinary: &check,
                     authored: context.assignment.authored.map(|_| &authored as _),
+                },
+                crate::schema::value_validation::ReferenceCheck {
+                    schema_source: &|binding: &B| {
+                        reference_context.bindings.is_some_and(|bindings| {
+                            bindings.is_schema_attribute_source(binding.as_str())
+                        })
+                    },
+                    check: &reference_check,
                 },
                 &mut context.coverage.borrow_mut(),
             )
