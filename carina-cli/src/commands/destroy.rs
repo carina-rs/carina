@@ -53,9 +53,7 @@ use carina_core::parser::ProviderContext;
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::collect_historical_display_attributes;
-use crate::commands::plan::{
-    ProviderUpstreamScope, UpstreamMissingStatePolicy, load_and_resolve_provider_configs,
-};
+use crate::commands::plan::load_and_resolve_read_only_provider_configs;
 use crate::commands::shared::finalize::{
     LockCommandOutcome, StatePersistence, finalize_after_execute, finish_lock_command,
 };
@@ -77,8 +75,8 @@ use crate::cursor::CursorReveal;
 use crate::display::{format_destroy_plan_with_delete_instances, format_effect};
 use crate::error::{AppError, DestroyDependencyAnalysisError};
 use crate::wiring::{
-    ProviderLoad, ValidatedConfig, get_provider_with_ctx, refresh_loaded_orphan_with_retry,
-    refresh_loaded_resource_with_retry,
+    ProviderLoad, ValidatedConfig, get_read_only_provider_with_ctx,
+    refresh_loaded_orphan_with_retry, refresh_loaded_resource_with_retry,
 };
 
 struct DestroyInFlight<'a, F> {
@@ -156,7 +154,7 @@ pub async fn run_destroy(
         &mut crate::commands::human_provider_notices(runtime.color_mode()),
     )?;
     let validated_config =
-        providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
+        providers.validate_read_only_config(parsed, base_dir, &duplicate_declarations)?;
 
     let verified_backend = verify_for_mutation(
         base_dir,
@@ -230,10 +228,9 @@ pub async fn run_destroy_with_factories_for_test(
     let loaded = load_configuration_with_config(&project, &context, &Default::default())?;
     let providers =
         ProviderLoad::for_test_with_provider_phase(runtime, factories, &loaded.parsed.providers);
-    let validated = providers.validate_evaluated_config(
+    let validated = providers.validate_read_only_config(
         loaded.parsed,
         &project,
-        true,
         &loaded.duplicate_declarations,
     )?;
     let backend: Arc<dyn StateBackend> =
@@ -444,19 +441,17 @@ async fn run_destroy_locked_owned(
     let state_block_claims = &state_blocks.claims;
     let (ctx, parsed) = validated_config.context_and_resources();
 
-    let provider_inputs = load_and_resolve_provider_configs(&runtime,
+    let provider_inputs = load_and_resolve_read_only_provider_configs(&runtime,
         parsed,
         base_dir,
         &ctx.provider_context().with_runtime(provider_context),
         ctx.schemas(),
-        UpstreamMissingStatePolicy::Strict,
-        ProviderUpstreamScope::ProviderReferences,
     )
     .await?;
 
     // Select the initialized provider before address reconciliation so every
     // create-only comparison uses the owning instance's reference scope.
-    let provider = get_provider_with_ctx(ctx,
+    let provider = get_read_only_provider_with_ctx(ctx,
 provider_inputs.configs(),
 ProgressSink::Human,
 validated_config.provider_plan())
@@ -470,11 +465,12 @@ validated_config.provider_plan())
         &state_file,
         ctx.schemas(),
     )?
-    .detect_moves(
+    .detect_moves_for_read_only(
         ctx,
         &provider,
         &parsed.data_sources,
-        provider_inputs.configs().as_provider_configs(),
+        provider_inputs.configs(),
+        &parsed.providers,
         state_block_claims,
     )?;
     let moved_pairs = crate::wiring::resolve_moved_pairs(
@@ -1712,7 +1708,7 @@ async fn run_destroy_locked(
         }
     };
     let parsed = carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed);
-    let validated_config = match providers.validate_evaluated_config(parsed, base_dir, true, &[]) {
+    let validated_config = match providers.validate_read_only_config(parsed, base_dir, &[]) {
         Ok(validated_config) => validated_config,
         Err(error) => {
             return finish_lock_command(
@@ -3239,7 +3235,7 @@ mod tests {
         )
         .expect("mock provider must load");
         let validated_config = providers
-            .validate_evaluated_config(parsed, &base_dir, true, &loaded.duplicate_declarations)
+            .validate_read_only_config(parsed, &base_dir, &loaded.duplicate_declarations)
             .expect("fixture must validate");
         let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(15));
         let backend = fixture.lock_loss_backend_handle();

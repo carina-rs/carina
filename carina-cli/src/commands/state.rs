@@ -48,10 +48,7 @@ use super::{
     BackendLockRequirement, DriftCommand, ReadBackendWarningPolicy, resolve_backend_for_read,
     verify_for_mutation,
 };
-use crate::commands::plan::{
-    ProviderUpstreamScope, ResolvedProviderInputs, UpstreamMissingStatePolicy,
-    load_and_resolve_provider_configs,
-};
+use crate::commands::plan::{ReadOnlyProviderInputs, load_and_resolve_read_only_provider_configs};
 use crate::commands::shared::finalize::release_lock_after_execute;
 use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef};
 use crate::commands::shared::progress::{
@@ -62,7 +59,7 @@ use crate::commands::state_output::{StateShowCurrentKind, StateShowDocument, Sta
 use crate::cursor::CursorReveal;
 use crate::error::AppError;
 use crate::wiring::{
-    MigrationCheckProviderLoad, ProviderLoad, ValidatedConfig, get_provider_with_ctx,
+    MigrationCheckProviderLoad, ProviderLoad, ValidatedConfig, get_read_only_provider_with_ctx,
     prepare_default_provider_ready_config, refresh_loaded_orphan_with_retry,
 };
 use carina_core::hint::ProjectCommand;
@@ -1539,7 +1536,7 @@ async fn run_state_bucket_delete(
         &mut crate::commands::human_provider_notices(runtime.color_mode()),
     )?;
     let validated_config =
-        providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
+        providers.validate_read_only_config(parsed, base_dir, &duplicate_declarations)?;
 
     println!(
         "{}",
@@ -1684,22 +1681,20 @@ async fn load_state_bucket_delete_provider_inputs<E>(
     base_dir: &carina_core::paths::ResolvedPath,
     provider_context: &ProviderContext,
     schemas: &carina_core::schema::SchemaRegistry,
-) -> Result<ResolvedProviderInputs, AppError> {
-    load_and_resolve_provider_configs(
+) -> Result<ReadOnlyProviderInputs, AppError> {
+    load_and_resolve_read_only_provider_configs(
         runtime,
         parsed,
         base_dir,
         provider_context,
         schemas,
-        UpstreamMissingStatePolicy::Strict,
-        ProviderUpstreamScope::ProviderReferences,
     )
     .await
 }
 
 async fn create_state_bucket_delete_provider<R>(
     validated_config: &ValidatedConfig<R>,
-    provider_configs: &carina_core::parser::ResolvedProviderConfigs,
+    provider_configs: &carina_core::parser::ReadOnlyProviderConfigs,
     provider_name: &str,
     plan: &provider_mod::ProviderPlan,
 ) -> Result<carina_core::provider::InitializedProvider, AppError> {
@@ -1744,7 +1739,7 @@ pub async fn run_state_refresh(
         &mut crate::commands::human_provider_notices(runtime.color_mode()),
     )?;
     let validated_config =
-        providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
+        providers.validate_read_only_config(parsed, base_dir, &duplicate_declarations)?;
 
     let verified_backend = verify_for_mutation(
         base_dir,
@@ -1837,14 +1832,12 @@ pub(crate) async fn run_state_refresh_locked(
     let state_blocks = validated_config.reconcile_for_state_refresh(&state_file);
     let (ctx, parsed) = validated_config.context_and_resources();
 
-    let provider_inputs = load_and_resolve_provider_configs(
+    let provider_inputs = load_and_resolve_read_only_provider_configs(
         validated_config.context().runtime(),
         parsed,
         base_dir,
         &ctx.provider_context().with_runtime(provider_context),
         ctx.schemas(),
-        UpstreamMissingStatePolicy::Strict,
-        ProviderUpstreamScope::ProviderReferences,
     )
     .await?;
 
@@ -1858,7 +1851,7 @@ pub(crate) async fn run_state_refresh_locked(
     let sorted_resources = expansion_prelude.sorted_resources();
 
     // Select provider
-    let provider = get_provider_with_ctx(
+    let provider = get_read_only_provider_with_ctx(
         ctx,
         provider_inputs.configs(),
         ProgressSink::Human,
@@ -2012,7 +2005,6 @@ pub(crate) async fn run_state_refresh_locked(
             remote_bindings: &empty_remote_bindings,
             schemas: ctx.schemas(),
             saved_dep_bindings: &saved_dep_bindings,
-            factories: ctx.factories(),
             cancel: Some(&cancel),
         })
         .await?
@@ -2066,7 +2058,6 @@ pub(crate) async fn run_state_refresh_locked(
             schemas: ctx.schemas(),
             wait_aliases: &wait_aliases,
             saved_dep_bindings: &saved_dep_bindings,
-            factories: ctx.factories(),
             cancel: Some(&cancel),
         },
     )
@@ -3561,10 +3552,9 @@ mod tests {
         )
         .unwrap();
         let validated_config = providers
-            .validate_evaluated_config(
+            .validate_read_only_config(
                 carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
                 &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
-                true,
                 &[],
             )
             .unwrap();
@@ -3594,10 +3584,9 @@ mod tests {
         )
         .unwrap();
         let validated_config = providers
-            .validate_evaluated_config(
+            .validate_read_only_config(
                 carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
                 &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
-                true,
                 &[],
             )
             .unwrap();
@@ -3627,10 +3616,9 @@ mod tests {
         )
         .unwrap();
         let validated_config = providers
-            .validate_evaluated_config(
+            .validate_read_only_config(
                 carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
                 &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
-                true,
                 &[],
             )
             .unwrap();
@@ -3670,7 +3658,7 @@ mod tests {
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
-            inputs.configs().as_provider_configs(),
+            &parsed.providers,
         );
         create_state_bucket_delete_provider(
             &ctx,
@@ -3969,7 +3957,7 @@ mod tests {
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
-            inputs.configs().as_provider_configs(),
+            &parsed.providers,
         );
 
         create_state_bucket_delete_provider(
@@ -4036,7 +4024,7 @@ mod tests {
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
-            inputs.configs().as_provider_configs(),
+            &parsed.providers,
         );
 
         create_state_bucket_delete_provider(
@@ -4115,7 +4103,13 @@ mod tests {
             let schema_drafts: Vec<carina_core::schema::ResourceSchema> = vec![
                 ResourceSchema::new("test.resource"),
                 ResourceSchema::new("orphan"),
-                ResourceSchema::new("lookup").as_data_source(),
+                ResourceSchema::new("lookup").as_data_source().attribute(
+                    carina_core::schema::AttributeSchema::optional(
+                        "query",
+                        carina_core::schema::AttributeType::string(),
+                    )
+                    .build(),
+                ),
             ];
             schema_drafts
                 .into_iter()
@@ -4257,7 +4251,13 @@ mod tests {
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
             let schema_drafts: Vec<carina_core::schema::ResourceSchema> = vec![
                 ResourceSchema::new("test.resource"),
-                ResourceSchema::new("lookup").as_data_source(),
+                ResourceSchema::new("lookup").as_data_source().attribute(
+                    carina_core::schema::AttributeSchema::optional(
+                        "query",
+                        carina_core::schema::AttributeType::string(),
+                    )
+                    .build(),
+                ),
             ];
             schema_drafts
                 .into_iter()

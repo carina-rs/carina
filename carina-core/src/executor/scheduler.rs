@@ -580,9 +580,7 @@ impl PreparationNodes {
         let mut nodes = Self {
             schedule_to_runtime: (0..effects.len()).collect(),
             replacement_templates: input_checks
-                .checks
-                .keys()
-                .copied()
+                .preparation_writes()
                 .filter(|&index| matches!(effects[index], Effect::DeferredReplace(_)))
                 .map(|index| {
                     (

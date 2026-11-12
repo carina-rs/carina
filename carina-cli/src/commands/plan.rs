@@ -5808,6 +5808,18 @@ pub async fn run_plan(
     .await
 }
 
+/// The output request is carried through provider resolution: only saveable
+/// output acquires strict configurations. Formatting and file destinations
+/// remain attached to those configurations through both save branches.
+enum PlanOutput<'a, C = ResolvedProviderConfigs> {
+    Preview,
+    Saveable {
+        provider_configs: C,
+        json: bool,
+        file: Option<(&'a Path, ResolvedPath)>,
+    },
+}
+
 /// The full plan command body, with only provider loading supplied by the caller.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_plan_using(
@@ -5837,9 +5849,17 @@ pub(crate) async fn run_plan_using(
     };
     let project = ResolvedPath::new(path).map_err(|error| AppError::Config(error.to_string()))?;
     let pinned_out = out
-        .map(ResolvedPath::new)
+        .map(|path| ResolvedPath::new(path).map(|pinned| (path, pinned)))
         .transpose()
         .map_err(|error| AppError::Config(format!("Failed to locate plan file: {error}")))?;
+    let output_request = match (json, pinned_out) {
+        (false, None) => PlanOutput::Preview,
+        (json, file) => PlanOutput::Saveable {
+            provider_configs: (),
+            json,
+            file,
+        },
+    };
     let loaded = load_configuration_with_config(
         &project,
         provider_context,
@@ -5987,21 +6007,54 @@ pub(crate) async fn run_plan_using(
         progress_sink.blank_line();
     }
 
-    let PreparedPlanIdentityData {
-        state_blocks:
-            crate::wiring::StateBlockResolution {
-                claims: state_block_claims,
-                targets: resolved_state_block_targets,
-            },
-        provider_inputs,
-    } = prepare_plan_identity_and_provider_inputs(
-        &mut validated_config,
-        &mut state_file,
-        base_dir,
-        provider_context,
-        UpstreamMissingStatePolicy::Lenient,
-    )
-    .await?;
+    let crate::wiring::StateBlockResolution {
+        claims: state_block_claims,
+        targets: resolved_state_block_targets,
+    } = validated_config.reconcile_identities_with_state(&state_file);
+    let catalog = validated_config
+        .context()
+        .provider_context()
+        .with_runtime(provider_context);
+    // Resolve the single output decision. Preview resolution has a distinct
+    // result type; the resolved saveable variant carries strict configs.
+    let (provider_inputs, output): (_, PlanOutput<'_>) = match output_request {
+        PlanOutput::Saveable { json, file, .. } => {
+            let ResolvedProviderInputs {
+                configs,
+                remote_bindings,
+            } = load_and_resolve_provider_configs(
+                validated_config.context().runtime(),
+                validated_config.resources().parsed(),
+                base_dir,
+                &catalog,
+                validated_config.context().schemas(),
+                UpstreamMissingStatePolicy::Lenient,
+            )
+            .await?;
+            (
+                ResolvedProviderInputs {
+                    configs: carina_core::parser::PlanPreviewProviderConfigs::from(&configs),
+                    remote_bindings,
+                },
+                PlanOutput::Saveable {
+                    provider_configs: configs,
+                    json,
+                    file,
+                },
+            )
+        }
+        PlanOutput::Preview => (
+            load_and_resolve_plan_preview_provider_configs(
+                validated_config.context().runtime(),
+                validated_config.resources().parsed(),
+                base_dir,
+                &catalog,
+                validated_config.context().schemas(),
+            )
+            .await?,
+            PlanOutput::Preview,
+        ),
+    };
     if !refresh {
         eprintln!(
             "{}",
@@ -6149,7 +6202,12 @@ pub(crate) async fn run_plan_using(
         &ctx.provider,
     )?;
 
-    if json {
+    if let PlanOutput::Saveable {
+        provider_configs,
+        json: true,
+        ..
+    } = &output
+    {
         if let Some(note) = drift_note.as_ref() {
             eprintln!("{}", note.yellow(color_mode));
         }
@@ -6158,7 +6216,7 @@ pub(crate) async fn run_plan_using(
         // instead of a panic backtrace.
         let plan_file = build_plan_file(
             &project,
-            provider_inputs.configs(),
+            provider_configs,
             plan_file_backend_config.clone(),
             &state_file,
             directive_changes.clone(),
@@ -6238,10 +6296,15 @@ pub(crate) async fn run_plan_using(
         ));
     }
 
-    let plan_output = if out.is_some() {
+    let plan_output = if let PlanOutput::Saveable {
+        provider_configs,
+        file: Some((authored, pinned)),
+        ..
+    } = &output
+    {
         let plan_file = build_plan_file(
             &project,
-            provider_inputs.configs(),
+            provider_configs,
             plan_file_backend_config.clone(),
             &state_file,
             directive_changes.clone(),
@@ -6251,7 +6314,7 @@ pub(crate) async fn run_plan_using(
         .map_err(|error| map_plan_save_error(error, "--out"))?;
         let json_out = carina_core::utils::pretty_with_newline(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
-        Some(json_out)
+        Some((pinned, json_out, *authored))
     } else {
         None
     };
@@ -6261,7 +6324,9 @@ pub(crate) async fn run_plan_using(
         serial: state.serial,
     });
     let rendered_inline_image = write_plan_artifacts(
-        pinned_out.as_ref().zip(plan_output.as_deref()),
+        plan_output
+            .as_ref()
+            .map(|(path, contents, _)| (*path, contents.as_str())),
         (image.is_some() || inline_image.is_some()).then_some(PlanImageArtifactRequest {
             file: image,
             inline: inline_image,
@@ -6277,7 +6342,7 @@ pub(crate) async fn run_plan_using(
         }),
     )?;
 
-    if let Some(out_path) = out {
+    if let Some((_, _, out_path)) = plan_output {
         progress_sink.blank_line();
         progress_sink.line(
             format!("Plan saved to {}", out_path.display())
@@ -6340,10 +6405,9 @@ fn write_plan_artifacts(
     Ok(rendered_inline_image)
 }
 
-/// The state-aware identity and provider-input preparation shared by normal
-/// planning and saved-plan secret verification. It is intentionally the only
-/// owner of this ordering: prefix recovery, state-block target resolution,
-/// module/anonymous identity reconciliation, then provider/upstream folding.
+/// Strict identity and provider-input preparation for apply and saved-plan
+/// secret verification. Display planning uses the same identity reconciliation
+/// before selecting its distinct preview configuration route.
 pub(crate) struct PreparedPlanIdentityData {
     pub(crate) state_blocks: crate::wiring::StateBlockResolution,
     pub(crate) provider_inputs: ResolvedProviderInputs,
@@ -6368,7 +6432,6 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs(
             .with_runtime(provider_context),
         validated_config.context().schemas(),
         upstream_policy,
-        ProviderUpstreamScope::All,
     )
     .await?;
 
@@ -6585,42 +6648,40 @@ pub(crate) enum UpstreamMissingStatePolicy {
     Lenient,
 }
 
-/// Which upstream declarations a command needs before provider construction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ProviderUpstreamScope {
-    /// Load every upstream because resource resolution also consumes them.
-    All,
-    /// Load only bindings referenced by construction-time provider attributes.
-    ProviderReferences,
-}
-
-/// Upstream values and the provider configs resolved from the same snapshot.
-///
-/// Commands that need both resource-reference resolution and provider
-/// construction carry this value together so they cannot accidentally load
-/// upstream state for one step and construct providers from raw parser data in
-/// another.
-pub(crate) struct ResolvedProviderInputs {
-    configs: ResolvedProviderConfigs,
+/// Provider configs and upstream values from one admitted snapshot. The config
+/// parameter keeps read/delete results distinct from desired-input results.
+pub(crate) struct ResolvedProviderInputs<C = ResolvedProviderConfigs> {
+    configs: C,
     remote_bindings: AdmittedRemoteBindings,
 }
 
-impl ResolvedProviderInputs {
-    pub(crate) fn configs(&self) -> &ResolvedProviderConfigs {
+pub(crate) type ReadOnlyProviderInputs =
+    ResolvedProviderInputs<carina_core::parser::ReadOnlyProviderConfigs>;
+
+impl<C> ResolvedProviderInputs<C> {
+    pub(crate) fn configs(&self) -> &C {
         &self.configs
     }
-
     pub(crate) fn remote_bindings(&self) -> &AdmittedRemoteBindings {
         &self.remote_bindings
     }
 }
 
-/// Load upstream exports and resolve every provider attribute against them.
-///
-/// This is the sole CLI seam for project-based provider resolution. The
-/// command chooses both missing-state policy and load scope; provider
-/// construction then requires the returned typed configs.
-#[allow(clippy::too_many_arguments)]
+fn provider_config_resolution_error(
+    error: carina_core::parser::ProviderConfigResolutionError,
+) -> AppError {
+    match error {
+        carina_core::parser::ProviderConfigResolutionError::Parse(source) => {
+            AppError::ProviderAttributeResolution(Box::new(source))
+        }
+        carina_core::parser::ProviderConfigResolutionError::Invariant(source) => {
+            AppError::ProviderConfigInvariant(Box::new(source))
+        }
+        source => AppError::ProviderInputResolution(Box::new(source)),
+    }
+}
+
+/// Desired commands load all upstreams and receive configurations carrying tags.
 pub(crate) async fn load_and_resolve_provider_configs<E>(
     runtime: &crate::runtime::CommandRuntime,
     parsed: &carina_core::parser::ExpandedFile<E>,
@@ -6628,53 +6689,105 @@ pub(crate) async fn load_and_resolve_provider_configs<E>(
     provider_context: &ProviderContext,
     schemas: &carina_core::schema::SchemaRegistry,
     policy: UpstreamMissingStatePolicy,
-    scope: ProviderUpstreamScope,
 ) -> Result<ResolvedProviderInputs, AppError> {
     crate::wiring::settle_type_checks(
         carina_core::validation::deferred_types::TypeCheckSession::run_async(
             provider_context,
             async |session| {
-                let mut cycle_guard = seed_cycle_guard(base_dir);
-                let remote_bindings = match scope {
-                    ProviderUpstreamScope::All => {
-                        load_selected_upstream_states(
-                            runtime,
-                            &parsed.upstream_states,
-                            base_dir,
-                            provider_context,
-                            &mut cycle_guard,
-                            schemas,
-                            policy,
-                            None,
-                        )
-                        .await?
-                    }
-                    ProviderUpstreamScope::ProviderReferences => {
-                        load_provider_referenced_upstream_states(
-                            runtime,
-                            parsed,
-                            base_dir,
-                            provider_context,
-                            &mut cycle_guard,
-                            schemas,
-                            policy,
-                        )
-                        .await?
-                    }
-                };
-                let configs = carina_core::parser::resolve_provider_attributes_with_remote(
+                let remote_bindings = load_selected_upstream_states(
+                    runtime,
+                    &parsed.upstream_states,
+                    base_dir,
+                    provider_context,
+                    &mut seed_cycle_guard(base_dir),
+                    schemas,
+                    policy,
+                    None,
+                )
+                .await?;
+                let configs =
+                    ResolvedProviderConfigs::resolve_with_remote(parsed, &remote_bindings, session)
+                        .map_err(provider_config_resolution_error)?;
+                Ok(ResolvedProviderInputs {
+                    configs,
+                    remote_bindings,
+                })
+            },
+        )
+        .await,
+        AppError::Validation,
+    )
+}
+
+/// Display-only resolution has no saved-plan or execution conversion.
+async fn load_and_resolve_plan_preview_provider_configs<E>(
+    runtime: &crate::runtime::CommandRuntime,
+    parsed: &carina_core::parser::ExpandedFile<E>,
+    base_dir: &ResolvedPath,
+    provider_context: &ProviderContext,
+    schemas: &carina_core::schema::SchemaRegistry,
+) -> Result<ResolvedProviderInputs<carina_core::parser::PlanPreviewProviderConfigs>, AppError> {
+    crate::wiring::settle_type_checks(
+        carina_core::validation::deferred_types::TypeCheckSession::run_async(
+            provider_context,
+            async |session| {
+                let remote_bindings = load_selected_upstream_states(
+                    runtime,
+                    &parsed.upstream_states,
+                    base_dir,
+                    provider_context,
+                    &mut seed_cycle_guard(base_dir),
+                    schemas,
+                    UpstreamMissingStatePolicy::Lenient,
+                    None,
+                )
+                .await?;
+                let configs = carina_core::parser::PlanPreviewProviderConfigs::resolve_with_remote(
                     parsed,
                     &remote_bindings,
                     session,
                 )
-                .map_err(|error| match error {
-                    carina_core::parser::ProviderConfigResolutionError::Parse(source) => {
-                        AppError::ProviderAttributeResolution(Box::new(source))
-                    }
-                    carina_core::parser::ProviderConfigResolutionError::Invariant(source) => {
-                        AppError::ProviderConfigInvariant(Box::new(source))
-                    }
-                })?;
+                .map_err(provider_config_resolution_error)?;
+                Ok(ResolvedProviderInputs {
+                    configs,
+                    remote_bindings,
+                })
+            },
+        )
+        .await,
+        AppError::Validation,
+    )
+}
+
+/// Read/delete commands load only construction-attribute upstreams. This entry
+/// cannot return desired configurations or select the plan omission policy.
+pub(crate) async fn load_and_resolve_read_only_provider_configs<E>(
+    runtime: &crate::runtime::CommandRuntime,
+    parsed: &carina_core::parser::ExpandedFile<E>,
+    base_dir: &ResolvedPath,
+    provider_context: &ProviderContext,
+    schemas: &carina_core::schema::SchemaRegistry,
+) -> Result<ReadOnlyProviderInputs, AppError> {
+    crate::wiring::settle_type_checks(
+        carina_core::validation::deferred_types::TypeCheckSession::run_async(
+            provider_context,
+            async |session| {
+                let remote_bindings = load_provider_referenced_upstream_states(
+                    runtime,
+                    parsed,
+                    base_dir,
+                    provider_context,
+                    &mut seed_cycle_guard(base_dir),
+                    schemas,
+                    UpstreamMissingStatePolicy::Strict,
+                )
+                .await?;
+                let configs = carina_core::parser::ReadOnlyProviderConfigs::resolve_with_remote(
+                    parsed,
+                    &remote_bindings,
+                    session,
+                )
+                .map_err(provider_config_resolution_error)?;
                 Ok(ResolvedProviderInputs {
                     configs,
                     remote_bindings,
@@ -6808,7 +6921,11 @@ fn provider_referenced_upstream_states<E>(
         .collect();
     let mut pending = VecDeque::new();
     for provider in &parsed.providers {
-        for (attribute, value) in &provider.attributes {
+        for (attribute, value) in provider
+            .attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), value))
+        {
             enqueue_value(
                 value,
                 &ProviderAttributeRequirement {
@@ -7243,6 +7360,7 @@ fn resolve_file_for_test<E>(
 #[cfg(test)]
 mod load_upstream_states_tests {
     use super::*;
+    use carina_core::parser::{ProviderConfiguration, ProviderConfigurations};
     #[cfg(test)]
     use std::fs;
 
@@ -7540,20 +7658,72 @@ mod load_upstream_states_tests {
             .attributes
             .insert("region", root_resource_ref("mgmt", "region"));
 
-        let loaded = load_and_resolve_provider_configs(
+        let loaded = load_and_resolve_read_only_provider_configs(
             &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &ResolvedPath::new(&downstream).unwrap(),
             &context,
             &schemas,
-            UpstreamMissingStatePolicy::Strict,
-            ProviderUpstreamScope::ProviderReferences,
         )
         .await
         .expect("unrelated invalid exports must not block provider-only commands");
         assert_eq!(loaded.remote_bindings()["mgmt"].len(), 2);
         assert!(loaded.remote_bindings()["mgmt"].contains_key("region"));
         assert!(!loaded.remote_bindings()["mgmt"].contains_key("unrelated"));
+    }
+
+    #[tokio::test]
+    async fn issue_4304_3a_review2_read_only_and_desired_provider_inputs_are_distinct() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+        parsed.providers.push(ProviderConfig {
+            name: "test".into(),
+            attributes: Default::default(),
+            default_tags: [(
+                "Owner",
+                Value::Concrete(ConcreteValue::String("carina".into())),
+            )]
+            .into_iter()
+            .collect(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: Default::default(),
+            binding: None,
+        });
+        let parsed = resolve_file_for_test(parsed, temp.path());
+        let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let schemas = carina_core::schema::SchemaRegistry::new();
+        let base = ResolvedPath::new(temp.path()).unwrap();
+        let desired = load_and_resolve_provider_configs(
+            &crate::test_support::TestCommandRuntime::new(),
+            &parsed,
+            &base,
+            &context,
+            &schemas,
+            UpstreamMissingStatePolicy::Strict,
+        )
+        .await
+        .unwrap();
+        let read_only = load_and_resolve_read_only_provider_configs(
+            &crate::test_support::TestCommandRuntime::new(),
+            &parsed,
+            &base,
+            &context,
+            &schemas,
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            std::any::type_name_of_val(desired.configs()),
+            std::any::type_name_of_val(read_only.configs()),
+            "read/delete configs must not authorize desired inputs",
+        );
+        assert!(
+            desired.configs().as_provider_configs()[0]
+                .default_tags
+                .contains_key("Owner")
+        );
     }
 
     struct EnumMetadataFactory;
@@ -7913,7 +8083,6 @@ mod load_upstream_states_tests {
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
             UpstreamMissingStatePolicy::Strict,
-            ProviderUpstreamScope::All,
         )
         .await
         {
@@ -7963,7 +8132,6 @@ mod load_upstream_states_tests {
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
             UpstreamMissingStatePolicy::Strict,
-            ProviderUpstreamScope::All,
         )
         .await
         {
@@ -7978,7 +8146,7 @@ mod load_upstream_states_tests {
     }
 
     #[tokio::test]
-    async fn provider_reference_scope_excludes_default_tags() {
+    async fn provider_reference_scope_ignores_default_tag_upstream_values() {
         let temp = tempfile::tempdir().unwrap();
         let referenced = temp.path().join("referenced");
         let unrelated = temp.path().join("unrelated");
@@ -8018,25 +8186,16 @@ mod load_upstream_states_tests {
         ]);
         let parsed = resolve_file_for_test(parsed, temp.path());
 
-        let inputs = load_and_resolve_provider_configs(
+        let inputs = load_and_resolve_read_only_provider_configs(
             &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
-            UpstreamMissingStatePolicy::Strict,
-            ProviderUpstreamScope::ProviderReferences,
         )
         .await
-        .expect("default_tags must not cause provider-only upstream loading");
-
-        assert!(matches!(
-            inputs.configs().as_provider_configs()[0]
-                .default_tags
-                .get("Owner"),
-            Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
-        ));
-        assert!(inputs.remote_bindings().is_empty());
+        .expect("read/delete provider construction must not load tag-only upstreams");
+        assert!(!inputs.configs().configurations().is_empty());
     }
 
     #[tokio::test]
@@ -8071,21 +8230,19 @@ mod load_upstream_states_tests {
         parsed.resources.push(relay); // allow: direct — fixture test inspection
         let parsed = resolve_file_for_test(parsed, &downstream);
 
-        let inputs = load_and_resolve_provider_configs(
+        let inputs = load_and_resolve_read_only_provider_configs(
             &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
-            UpstreamMissingStatePolicy::Strict,
-            ProviderUpstreamScope::ProviderReferences,
         )
         .await
         .expect("provider scope must load upstreams reached through resource attributes");
 
         assert_eq!(
-            inputs.configs().as_provider_configs()[0]
-                .attributes
+            inputs.configs().configurations()[0]
+                .attributes()
                 .get("role_arn"),
             Some(&Value::Concrete(ConcreteValue::String(
                 "arn:aws:iam::123456789012:role/upstream".into()
@@ -9102,7 +9259,7 @@ exports { region: String = "ap-northeast-1" }"#,
     }
 
     #[tokio::test]
-    async fn run_plan_allows_missing_upstream_referenced_only_by_default_tags() {
+    async fn run_plain_plan_allows_missing_upstream_referenced_only_by_default_tags() {
         let runtime = crate::test_support::TestCommandRuntime::new();
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
@@ -9138,13 +9295,13 @@ exports { region: String = "ap-northeast-1" }"#,
             DetailLevel::None,
             false,
             false,
-            true,
+            false,
             false,
             false,
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .await
-        .expect("plan must keep unresolved default tags for per-resource normalization");
+        .expect("plain plan must allow a preview that omits missing-upstream defaults");
     }
 }
 

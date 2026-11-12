@@ -748,17 +748,19 @@ fn provider_ready<S: Clone, D: Clone + Default>(
 ) -> crate::provider::ProviderReadyResource {
     let bindings = crate::binding_index::ResolvedBindings::default();
     let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas =
-        crate::test_utils::preparation_schemas(&resource.id, crate::schema::SchemaKind::Resource);
+    let schemas = crate::test_utils::preparation_schemas_with_attributes(
+        &resource.id,
+        crate::schema::SchemaKind::Resource,
+        &resource.attributes,
+    );
     crate::validation::deferred_types::with_session_for_test(
         &crate::parser::LoadedProviderContext::empty_for_test(),
         |type_checks| {
-            let context = crate::executor::ProviderPreparationContext::new(
+            let context = crate::executor::ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],
                 &crate::provider::NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );

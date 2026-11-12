@@ -1,0 +1,7 @@
+provider mock {
+    default_tags = { Owner = "east" }
+}
+
+let west = provider mock {
+    default_tags = { Owner = "invalid-default" }
+}

@@ -596,9 +596,8 @@ impl ReferencePreparation {
     #[allow(clippy::too_many_arguments)]
     pub async fn plan_with_cascades(
         &mut self,
-        desired: &crate::resource::PlanInputDesiredResources<'_>,
+        inputs: &crate::validation::admission::final_input::FinalPlanInputs,
         dependents: &crate::differ::CascadeDependents<'_>,
-        data_sources: &[crate::resource::ResolvedDataSource],
         provider: &ProviderRouter,
         prior: crate::differ::PlanPriorStates<'_>,
         directives: &HashMap<ResourceId, crate::resource::PersistedDirectives>,
@@ -609,6 +608,8 @@ impl ReferencePreparation {
         unknown_imports: &HashSet<crate::effect::OutcomeUnknownImportReplacement>,
     ) -> crate::differ::PlanComparisonResult<PreparedComparison<crate::differ::PendingCascadePlan>>
     {
+        let desired = crate::resource::plan_input_desired_resources(inputs.resources(), registry);
+        let data_sources = inputs.data_sources();
         let current = prior.materialize_current_states(desired.authored(), registry);
         validate_inputs(desired.authored(), &current, registry, saved)?;
         validate_inputs(dependents.managed(), &current, registry, saved)?;
@@ -626,7 +627,7 @@ impl ReferencePreparation {
             },
             |session| {
                 session.result(crate::differ::create_plan_with_cascades(
-                    desired,
+                    &desired,
                     dependents.for_recording_run(),
                     data_sources,
                     provider,

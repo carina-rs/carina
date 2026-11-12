@@ -66,7 +66,7 @@ impl AuthoredExpressionText {
         self.admitted.redactions.iter().next().is_some()
     }
 
-    pub(in crate::parser) fn with_diagnostic_prefix(mut self, prefix: &'static str) -> Self {
+    pub(in crate::parser) fn with_diagnostic_prefix(mut self, prefix: &str) -> Self {
         let admitted = std::sync::Arc::make_mut(&mut self.admitted);
         admitted.text.insert_str(0, prefix);
         self

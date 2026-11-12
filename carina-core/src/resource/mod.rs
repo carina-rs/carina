@@ -10731,6 +10731,7 @@ pub(crate) fn require_known_for_apply<'a>(
 }
 
 /// Narrow structural classifier evidence while preserving serialization diagnostics.
+#[cfg(test)]
 pub(crate) fn require_known_value<'a>(
     value: knowledge::Classification<'a>,
 ) -> Result<knowledge::KnownValue<'a>, crate::value::SerializationError> {

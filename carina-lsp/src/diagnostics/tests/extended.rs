@@ -18176,3 +18176,136 @@ fn widening_member_obligation_has_lsp_validate_and_resolved_value_parity() {
 fn decoded_widening_member_obligation_has_lsp_validate_parity() {
     widening_member_obligation_parity(true);
 }
+
+#[test]
+fn issue_4304_3a_default_tag_knownness_matches_validation_across_files() {
+    let root = tempfile::tempdir().unwrap();
+    let providers = include_str!(
+        "../../../../carina-core/tests/fixtures/issue_4304_3a/unresolved/providers.crn"
+    );
+    let main =
+        include_str!("../../../../carina-core/tests/fixtures/issue_4304_3a/unresolved/main.crn");
+    std::fs::write(root.path().join("providers.crn"), providers).unwrap();
+    std::fs::write(root.path().join("main.crn"), main).unwrap();
+    let path = carina_core::paths::ResolvedPath::new(root.path()).unwrap();
+    let parsed = carina_core::config_loader::parse_directory(
+        &path,
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let expected = carina_core::validation::deferred_types::with_session_for_test(
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        |session| {
+            carina_core::parser::ResolvedProviderConfigs::validate_default_tag_knownness(
+                &parsed.providers,
+                &HashSet::new(),
+                &carina_core::binding_index::ResolvedBindings::for_authored_validation(&parsed),
+                session,
+            )
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    let diagnostics = analyze_with_buffer(&test_engine(), root.path(), "providers.crn", providers);
+    let errors = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("default_tags.Owner"))
+        .collect::<Vec<_>>();
+    assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+    assert_eq!(errors[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(errors[0].message, expected);
+    assert_eq!(errors[0].range.start.line, 1);
+    let sibling = analyze_with_buffer(&test_engine(), root.path(), "main.crn", main);
+    assert!(
+        sibling
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("default_tags.Owner")),
+        "provider-owned error must not be duplicated on main.crn: {sibling:#?}"
+    );
+    std::fs::write(
+        root.path().join("main.crn"),
+        main.replace("Management {}", "Management { owner = \"known\" }"),
+    )
+    .unwrap();
+    let known = analyze_with_buffer(&test_engine(), root.path(), "providers.crn", providers);
+    assert!(
+        known
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("default_tags.Owner")),
+        "an authored resource value is known before apply: {known:#?}"
+    );
+    std::fs::create_dir(root.path().join("metadata")).unwrap();
+    std::fs::write(
+        root.path().join("metadata/main.crn"),
+        "attributes { owner = \"core\" }\n",
+    )
+    .unwrap();
+    let main = std::fs::read_to_string(root.path().join("main.crn")).unwrap();
+    std::fs::write(
+        root.path().join("main.crn"),
+        format!(
+            "{main}\nlet labels = use {{ source = './metadata' }}\nlet metadata = labels {{}}\n"
+        ),
+    )
+    .unwrap();
+    let providers = providers.replace("management.owner", "metadata.owner");
+    let known = analyze_with_buffer(&test_engine(), root.path(), "providers.crn", &providers);
+    assert!(
+        known
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("default_tags.Owner")),
+        "a module's constant export is known before apply: {known:#?}"
+    );
+}
+
+#[test]
+fn issue_4304_3a_cleanup_expanded_provider_locations_use_identity_across_files() {
+    let root = tempfile::tempdir().unwrap();
+    let first = "let first = provider mock {\n  default_tags = { First = management.owner }\n}\n";
+    let second =
+        "let second = provider mock {\n  default_tags = { Second = management.owner }\n}\n";
+    std::fs::write(root.path().join("first.crn"), first).unwrap();
+    std::fs::write(root.path().join("second.crn"), second).unwrap();
+    std::fs::write(
+        root.path().join("main.crn"),
+        "let management = mock.test.Management {}\n",
+    )
+    .unwrap();
+    let catalog = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let parsed = carina_core::config_loader::parse_directory(
+        &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
+        &catalog,
+    )
+    .unwrap();
+    let tree = carina_core::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+    let mut expanded_providers = parsed.providers.clone();
+    expanded_providers.reverse();
+    // An expanded-only provider must not index past the authored source tree.
+    let mut synthetic = expanded_providers[0].clone();
+    synthetic.binding = Some("expanded_only".into());
+    expanded_providers.push(synthetic);
+    let bindings = carina_core::binding_index::ResolvedBindings::for_authored_validation(&parsed);
+    let engine = test_engine();
+    for (file, source, key) in [
+        ("first.crn", first, "First"),
+        ("second.crn", second, "Second"),
+    ] {
+        let doc = create_document_at(source, root.path().join(file));
+        let diagnostics = engine.with_run_for_test(|run| {
+            run.check_provider_default_tags(
+                &doc.for_diagnostics().expect("public fixture"),
+                &tree,
+                &expanded_providers,
+                &bindings,
+            )
+        });
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert!(
+            diagnostics[0]
+                .message
+                .contains(&format!("default_tags.{key}")),
+            "{diagnostics:#?}"
+        );
+        assert_eq!(diagnostics[0].range.start.line, 1);
+    }
+}

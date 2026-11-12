@@ -81,16 +81,16 @@ async fn wire_error_renders_a_top_level_attribute_once() {
                 .with_attribute("unread", duration(u64::MAX));
             let bindings = ResolvedBindings::default();
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
-            let schemas = crate::test_utils::preparation_schemas(
+            let schemas = crate::test_utils::preparation_schemas_with_attributes(
                 &resource.id,
                 crate::schema::SchemaKind::Resource,
+                &resource.attributes,
             );
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],
                 &NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -126,16 +126,16 @@ async fn wire_error_paths_quote_non_identifier_map_keys() {
                     );
                 let bindings = ResolvedBindings::default();
                 let gate = ModuleConstraintGate::from_live_compositions(&[]);
-                let schemas = crate::test_utils::preparation_schemas(
+                let schemas = crate::test_utils::preparation_schemas_with_attributes(
                     &resource.id,
                     crate::schema::SchemaKind::Resource,
+                    &resource.attributes,
                 );
-                let context = ProviderPreparationContext::new(
+                let context = ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &[],
                     &NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -190,11 +190,10 @@ fn schemas() -> SchemaRegistry {
 }
 
 #[tokio::test]
-async fn default_tag_duration_boundary_is_signed_i64_seconds() {
+async fn default_tag_duration_checks_wire_range_then_destination_membership() {
     crate::validation::deferred_types::with_session_for_test_async(
         &crate::parser::LoadedProviderContext::empty_for_test(),
         async |type_checks| {
-            use carina_provider_protocol::types::Value as Wire;
             let max = u64::try_from(i64::MAX).unwrap();
             for seconds in [max, max + 1] {
                 let resource = Resource::with_provider("test", "sqs.Queue", "queue", None);
@@ -202,27 +201,19 @@ async fn default_tag_duration_boundary_is_signed_i64_seconds() {
                 let gate = ModuleConstraintGate::from_live_compositions(&[]);
                 let schemas = schemas();
                 let configs = [config(duration(seconds))];
-                let context = ProviderPreparationContext::new(
+                let context = ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &configs,
                     &NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
                 let result = prepare_create_request(resource, &context).await;
                 if seconds == max {
-                    let request = result.unwrap();
-                    assert_eq!(
-                        request
-                            .resource()
-                            .wire_attributes()
-                            .get("tags")
-                            .unwrap()
-                            .value(),
-                        &Wire::Map(BTreeMap::from([("unrelated".into(), Wire::Int(i64::MAX))]))
-                    );
+                    assert!(matches!(result.unwrap_err(), ProviderPreparationError::FinalInput(
+                        crate::validation::admission::final_input::FinalInputError::Membership { .. }
+                    )), "wire-encodable Duration must still fail a String tag declaration");
                 } else {
                     assert_duration_error(
                         &result.unwrap_err(),
@@ -249,12 +240,11 @@ async fn native_create_rejects_a_non_wire_default_tag_before_dispatch() {
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
             let configs = [config(duration(u64::MAX))];
             let schemas = schemas();
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &configs,
                 &NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -292,12 +282,11 @@ async fn native_update_checks_default_tags_outside_changed_attributes() {
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
             let configs = [config(duration(u64::MAX))];
             let schemas = schemas();
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &configs,
                 &NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -337,12 +326,11 @@ async fn native_update_checks_observed_ignored_leaves_after_patch_substitution()
             let bindings = ResolvedBindings::default();
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
             let schemas = schemas();
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],
                 &NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -363,7 +351,7 @@ async fn native_update_checks_observed_ignored_leaves_after_patch_substitution()
 }
 
 #[test]
-fn native_data_source_checks_even_unschematized_attributes() {
+fn native_data_source_rejects_non_wire_declared_attribute_values() {
     crate::validation::deferred_types::with_session_for_test(
         &crate::parser::LoadedProviderContext::empty_for_test(),
         |type_checks| {
@@ -375,16 +363,16 @@ fn native_data_source_checks_even_unschematized_attributes() {
                 .insert("unread".into(), tags(duration(u64::MAX)));
             let bindings = ResolvedBindings::default();
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
-            let schemas = crate::test_utils::preparation_schemas(
+            let schemas = crate::test_utils::preparation_schemas_with_attributes(
                 &data.id,
                 crate::schema::SchemaKind::DataSource,
+                &data.attributes,
             );
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],
                 &NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -509,13 +497,43 @@ async fn checked_projection_preserves_native_scalars_and_late_secret_provenance(
             )))];
             let bindings = ResolvedBindings::default();
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
-            let schemas = schemas();
-            let context = ProviderPreparationContext::new(
+            let mut schemas = schemas();
+            let schema = crate::schema::PatternResourceSchema::new("sqs.Queue")
+                .attribute(
+                    crate::schema::PatternAttributeSchema::optional(
+                        "tags",
+                        crate::schema::PatternAttributeType::map(
+                            crate::schema::PatternAttributeType::string(),
+                        ),
+                    )
+                    .build(),
+                )
+                .attribute(
+                    crate::schema::PatternAttributeSchema::optional(
+                        "unread",
+                        crate::schema::PatternAttributeType::list(
+                            crate::schema::PatternAttributeType::union(vec![
+                                crate::schema::PatternAttributeType::duration(),
+                                crate::schema::PatternAttributeType::enum_(
+                                    TypeIdentity::bare("Mode"),
+                                    Some(vec!["active".into()]),
+                                    vec![],
+                                    None,
+                                    None,
+                                ),
+                            ]),
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap();
+            schemas.insert("test", schema);
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &configs,
                 &NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -569,12 +587,11 @@ async fn nested_wire_failures_retain_list_indices_and_never_values() {
             let bindings = ResolvedBindings::default();
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
             let schemas = schemas();
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],
                 &NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -656,17 +673,17 @@ async fn review2_f4_dispatch_and_native_normalizer_receive_main_plaintext_shapes
                 );
             let bindings = ResolvedBindings::default();
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
-            let schemas = crate::test_utils::preparation_schemas(
+            let schemas = crate::test_utils::preparation_schemas_with_attributes(
                 &resource.id,
                 crate::schema::SchemaKind::Resource,
+                &resource.attributes,
             );
             let normalizer_boundary = crate::provider::ConfiguredNormalizer::fixture(&MainShapes);
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],
                 &normalizer_boundary,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -712,12 +729,11 @@ async fn review2_f4_secret_tag_maps_receive_main_default_tags() {
             let bindings = ResolvedBindings::default();
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
             let schemas = schemas();
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &configs,
                 &NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );

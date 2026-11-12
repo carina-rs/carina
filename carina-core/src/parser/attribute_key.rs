@@ -131,7 +131,7 @@ impl AttributeKey {
         self.diagnostic.text().cmp(other.diagnostic.text())
     }
 
-    pub(super) fn with_diagnostic_prefix(self, prefix: &'static str) -> Self {
+    pub(super) fn with_diagnostic_prefix(self, prefix: &str) -> Self {
         Self {
             identity: format!("{prefix}{}", self.identity),
             diagnostic: match self.diagnostic {

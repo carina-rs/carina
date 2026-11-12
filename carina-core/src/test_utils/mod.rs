@@ -125,3 +125,316 @@ pub fn preparation_schemas(
     registry.insert(&id.provider, schema.validate().unwrap());
     registry
 }
+
+/// Derive unconstrained fixture shapes through the shared structural walker.
+/// This builds declarations for transport/scheduler fixtures; it does not admit
+/// values, and all declared production constraints remain in the real schemas.
+pub fn fixture_value_type<P: crate::resource::ValueKind, B: crate::resource::BindingAddress>(
+    value: &crate::resource::Value<P, B>,
+) -> crate::schema::PatternAttributeType {
+    if let crate::resource::Value::Concrete(crate::resource::ConcreteValue::CanonicalEnum(value)) =
+        value
+    {
+        return crate::schema::PatternAttributeType::enum_(
+            value.identity().clone(),
+            Some(vec![value.api_value().into()]),
+            vec![],
+            None,
+            None,
+        );
+    }
+    use crate::resource::{BindingAddress, ValueKind};
+    use crate::value_walk::{
+        self, Algebra, At, Children, ExprChildren, Inspect, ScopedLeaf, ScopedScalar, SecretAt,
+        SecretChild, SecretStep, Step,
+    };
+    #[derive(Default)]
+    struct Shape {
+        keys: Vec<String>,
+    }
+    impl Shape {
+        fn key(&mut self, at: &At<'_>) -> usize {
+            let Some(crate::schema::LeafPathSegment::MapKey(key)) =
+                at.public_path().and_then(|path| path.segments().last())
+            else {
+                return usize::MAX;
+            };
+            if key.is_diagnostic_sensitive() {
+                return usize::MAX;
+            }
+            let key = key.expose_plaintext();
+            self.keys
+                .iter()
+                .position(|name| name == key)
+                .unwrap_or_else(|| {
+                    self.keys.push(key.into());
+                    self.keys.len() - 1
+                })
+        }
+    }
+    fn container(parts: Vec<Vec<usize>>, tag: usize, key: usize) -> Vec<usize> {
+        let mut unique = Vec::new();
+        for part in parts {
+            if !unique.contains(&part) {
+                unique.push(part);
+            }
+        }
+        let count = unique.len();
+        let mut tokens = unique.into_iter().flatten().collect::<Vec<_>>();
+        tokens.extend([count, tag, key]);
+        tokens
+    }
+    impl Algebra<Inspect> for Shape {
+        type Output = Vec<usize>;
+        fn scalar<P: ValueKind, B: BindingAddress>(
+            &mut self,
+            at: &At<'_>,
+            value: ScopedScalar<'_, Inspect, P, B>,
+        ) -> Step<Inspect, Self::Output, P, B> {
+            use value_walk::ScalarKind;
+            let tag = match value.kind() {
+                ScalarKind::Bool => 1,
+                ScalarKind::Int => 2,
+                ScalarKind::Float => 3,
+                ScalarKind::Duration => 4,
+                ScalarKind::StringList => 7,
+                _ => 0,
+            };
+            value.finish(vec![tag, self.key(at)])
+        }
+        fn list<P: ValueKind, B: BindingAddress>(
+            &mut self,
+            at: &At<'_>,
+            items: Children<'_, Inspect, P, B>,
+        ) -> Step<Inspect, Self::Output, P, B> {
+            let key = self.key(at);
+            items.inspect(self, |parts| container(parts, 5, key))
+        }
+        fn map<P: ValueKind, B: BindingAddress>(
+            &mut self,
+            at: &At<'_>,
+            items: Children<'_, Inspect, P, B>,
+        ) -> Step<Inspect, Self::Output, P, B> {
+            let key = self.key(at);
+            items.inspect(self, |parts| {
+                let tag = if parts.iter().all(|part| part.last() != Some(&usize::MAX)) {
+                    8
+                } else {
+                    6
+                };
+                container(parts, tag, key)
+            })
+        }
+        fn expression<P: ValueKind, B: BindingAddress>(
+            &mut self,
+            at: &At<'_>,
+            value: ExprChildren<'_, Inspect, P, B>,
+        ) -> Step<Inspect, Self::Output, P, B> {
+            let key = self.key(at);
+            value.inspect(self, |_| vec![0, key])
+        }
+        fn placeholder<P: ValueKind, B: BindingAddress>(
+            &mut self,
+            at: &At<'_>,
+            value: ScopedLeaf<'_, Inspect, P, B>,
+        ) -> Step<Inspect, Self::Output, P, B> {
+            value.finish(vec![0, self.key(at)])
+        }
+        fn secret<P: ValueKind, B: BindingAddress>(
+            &mut self,
+            at: &SecretAt<'_>,
+            value: SecretChild<'_, Inspect, P, B>,
+        ) -> SecretStep<Inspect, Self::Output, P, B> {
+            let key = self.key(at.at());
+            value.inspect(self).map(|mut tokens| {
+                *tokens.last_mut().unwrap() = key;
+                tokens
+            })
+        }
+    }
+    fn declaration(
+        tokens: &mut Vec<usize>,
+        keys: &[String],
+    ) -> (Option<String>, crate::schema::PatternAttributeType) {
+        use crate::schema::{PatternAttributeType as Ty, PatternStructField};
+        let key = tokens.pop().unwrap();
+        let ty = match tokens.pop().unwrap() {
+            0 => Ty::string(),
+            1 => Ty::bool(),
+            2 => Ty::int(),
+            3 => Ty::float(),
+            4 => Ty::duration(),
+            7 => Ty::list(Ty::string()),
+            8 => {
+                let count = tokens.pop().unwrap();
+                let mut fields = (0..count)
+                    .map(|_| {
+                        let (key, ty) = declaration(tokens, keys);
+                        PatternStructField::optional(key.expect("public fixture field"), ty).build()
+                    })
+                    .collect::<Vec<_>>();
+                fields.reverse();
+                Ty::struct_("FixtureObject", fields)
+            }
+            tag @ (5 | 6) => {
+                let count = tokens.pop().unwrap();
+                let mut types = (0..count)
+                    .map(|_| declaration(tokens, keys).1)
+                    .collect::<Vec<_>>();
+                // An anonymous protected map must preserve its wire values.
+                // Avoid the two-arm String/List canonicalization shorthand.
+                if tag == 6 && types.len() > 1 {
+                    types.extend([Ty::bool(), Ty::int()]);
+                }
+                let inner = match types.len() {
+                    0 => Ty::string(),
+                    1 => types.pop().unwrap(),
+                    _ => Ty::union(types),
+                };
+                if tag == 5 {
+                    Ty::list(inner)
+                } else {
+                    Ty::map(inner)
+                }
+            }
+            _ => unreachable!("fixture shape tag"),
+        };
+        ((key != usize::MAX).then(|| keys[key].clone()), ty)
+    }
+    let mut shape = Shape::default();
+    let mut tokens = value_walk::inspect(value_walk::WalkRoot::syntactic(), value, &mut shape)
+        .expect("fixture value walk")
+        .into_output();
+    declaration(&mut tokens, &shape.keys).1
+}
+
+/// Register the fields supplied by a transport fixture before normalization.
+pub fn preparation_schemas_with_attributes<
+    P: crate::resource::ValueKind,
+    B: crate::resource::BindingAddress,
+>(
+    id: &crate::resource::ResourceId,
+    kind: crate::schema::SchemaKind,
+    attributes: &indexmap::IndexMap<String, crate::resource::Value<P, B>>,
+) -> crate::schema::SchemaRegistry {
+    let mut schemas = preparation_schemas(id, kind);
+    complete_fixture_schema(&mut schemas, id, kind, attributes);
+    schemas
+}
+
+/// Preserve existing constraints and add only the fixture's undeclared fields.
+pub fn complete_fixture_schema<
+    P: crate::resource::ValueKind,
+    B: crate::resource::BindingAddress,
+>(
+    schemas: &mut crate::schema::SchemaRegistry,
+    id: &crate::resource::ResourceId,
+    kind: crate::schema::SchemaKind,
+    attributes: &indexmap::IndexMap<String, crate::resource::Value<P, B>>,
+) {
+    let Some(schema) = schemas.get(&id.provider, &id.resource_type, kind) else {
+        return;
+    };
+    let completed = schema.schema().with_fixture_attributes(attributes);
+    schemas.insert(&id.provider, completed);
+}
+
+/// Load fixture declaration authority from the same schema snapshot used by
+/// preparation, including qualified enum/custom-type identities.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn loaded_fixture_snapshot(
+    schemas: crate::schema::SchemaRegistry,
+) -> crate::provider::LoadedProviderSnapshot {
+    struct Factory {
+        name: String,
+        schemas: Vec<crate::schema::ValidatedResourceSchema>,
+        witness: crate::schema::ValidatedProviderSchemaWitness,
+    }
+    impl crate::provider::ProviderFactory for Factory {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn display_name(&self) -> &str {
+            "Schema fixture"
+        }
+        fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
+            self.schemas.clone()
+        }
+        fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+            self.witness.clone()
+        }
+        fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
+            Default::default()
+        }
+        fn validate_config(
+            &self,
+            _: &crate::provider::CanonicalProviderConfigAttributes,
+            _: &crate::provider::ProviderValidationInputs,
+        ) -> crate::provider::ProviderResult<()> {
+            Ok(())
+        }
+        fn create_provider(
+            &self,
+            _: &crate::provider::ProviderSession,
+            _: crate::provider::InitializeOutcomeMint,
+        ) -> crate::provider::BoxFuture<
+            '_,
+            crate::provider::ProviderResult<crate::provider::ProviderInitialization>,
+        > {
+            Box::pin(async {
+                Err(crate::provider::ProviderError::internal(
+                    "schema fixture has no provider instance",
+                ))
+            })
+        }
+    }
+    let mut by_owner = std::collections::BTreeMap::<String, Vec<_>>::new();
+    for (owner, _, _, schema) in schemas.iter() {
+        by_owner
+            .entry(owner.into())
+            .or_default()
+            .push(schema.clone());
+    }
+    let factories: Vec<Box<dyn crate::provider::ProviderFactory>> = by_owner
+        .into_iter()
+        .map(|(name, declarations)| {
+            let first = &declarations[0];
+            let bound = schemas
+                .get(
+                    &name,
+                    first.as_schema().resource_type(),
+                    first.as_schema().kind(),
+                )
+                .unwrap();
+            let witness = crate::schema::ValidatedProviderSchemaWitness::new(
+                declarations.clone(),
+                Default::default(),
+                bound.reference_forms().clone(),
+                bound.assignability_edges().to_vec(),
+            )
+            .expect("fixture schema authority");
+            Box::new(Factory {
+                name,
+                schemas: declarations,
+                witness,
+            }) as Box<dyn crate::provider::ProviderFactory>
+        })
+        .collect();
+    crate::provider::loaded_provider_snapshot_from_factories(
+        std::sync::Arc::new(factories),
+        schemas,
+        crate::EnvironmentSnapshot::empty(),
+    )
+}
+
+/// Build known strict provider inputs for execution fixtures through the same
+/// invariant constructor as live and decoded configurations.
+pub fn resolved_provider_configs(
+    configs: &[crate::parser::ProviderConfig<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    >],
+) -> crate::parser::ResolvedProviderConfigs {
+    crate::parser::ResolvedProviderConfigs::from_test_configs(configs.to_vec())
+        .expect("execution fixture provider configs must be known")
+}

@@ -284,8 +284,7 @@ async fn invalid_default_tag_fails_normalization_without_mutating_resources() {
 
     let rendered = error.to_string();
     assert!(
-        rendered
-            .starts_with("failed to encode default tag: key 'InvalidEnum' of provider 'test': "),
+        rendered.starts_with("failed to encode default tag: provider 'test': default_tags.InvalidEnum could not be encoded: "),
         "{rendered}"
     );
     assert!(rendered.contains("provider 'test'"), "{rendered}");
@@ -1114,12 +1113,11 @@ async fn review_a2_guest_enum_error_is_bound_by_executor_preparation() {
     crate::validation::deferred_types::with_session_for_test_async(
         &crate::parser::LoadedProviderContext::empty_for_test(),
         async |type_checks| {
-            let context = crate::executor::ProviderPreparationContext::new(
+            let context = crate::executor::ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],
                 &normalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -1208,12 +1206,11 @@ async fn round5_dispatch_normalizer_collects_a_late_scalar_secret_before_ingress
     crate::validation::deferred_types::with_session_for_test_async(
         &crate::parser::LoadedProviderContext::empty_for_test(),
         async |checks| {
-            let context = crate::executor::ProviderPreparationContext::new(
+            let context = crate::executor::ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],
                 &normalizer,
-                &[],
                 &schemas,
                 checks,
             );

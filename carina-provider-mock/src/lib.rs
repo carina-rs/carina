@@ -119,6 +119,14 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
         estimated_input_rule_schema(),
         input_rule_schema_for("test.creation_conflicting").with_conflicting_replacement(),
         ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("computed", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "domain_validation_options",
+                    AttributeType::list(AttributeType::string()),
+                )
+                .build(),
+            )
             .attribute(
                 AttributeSchema::required("name", AttributeType::string())
                     .create_only()
@@ -2172,21 +2180,22 @@ mod tests {
         let id = resource.id.clone();
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = fixture_schemas();
-        let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
-            std::sync::Arc::new(Vec::new()),
-            schemas.clone(),
-            carina_core::EnvironmentSnapshot::empty(),
+        let mut schemas = fixture_schemas();
+        carina_core::test_utils::complete_fixture_schema(
+            &mut schemas,
+            &resource.id,
+            carina_core::schema::SchemaKind::Resource,
+            &resource.attributes,
         );
+        let provider_types = carina_core::test_utils::loaded_fixture_snapshot(schemas.clone());
         carina_core::validation::deferred_types::with_session_for_test_async(
             provider_types.provider_context(),
             async |type_checks| {
-                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &module_gate,
                     &[],
                     &carina_core::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -2605,9 +2614,10 @@ mod tests {
                 let bindings = carina_core::binding_index::ResolvedBindings::default();
                 let module_gate =
                     carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-                let schemas = carina_core::test_utils::preparation_schemas(
+                let schemas = carina_core::test_utils::preparation_schemas_with_attributes(
                     &resource.id,
                     carina_core::schema::SchemaKind::Resource,
+                    &resource.attributes,
                 );
                 let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
                     std::sync::Arc::new(Vec::new()),
@@ -2617,15 +2627,15 @@ mod tests {
                 carina_core::validation::deferred_types::with_session_for_test_async(
                     provider_types.provider_context(),
                     async |type_checks| {
-                        let preparation = carina_core::executor::ProviderPreparationContext::new(
-                            &bindings,
-                            &module_gate,
-                            &[],
-                            &carina_core::provider::NoopNormalizer,
-                            &[],
-                            &schemas,
-                            type_checks,
-                        );
+                        let preparation =
+                            carina_core::executor::ProviderPreparationContext::for_test(
+                                &bindings,
+                                &module_gate,
+                                &[],
+                                &carina_core::provider::NoopNormalizer,
+                                &schemas,
+                                type_checks,
+                            );
                         let create_request = carina_core::executor::prepare_create_request(
                             resource.clone(),
                             &preparation,
@@ -3025,6 +3035,7 @@ mod tests {
                 .collect(),
         ));
         let resource = Resource::with_provider("mock", "test.resource", "versioned", None)
+            .with_attribute("name", string_value("versioned"))
             .with_attribute("payload", payload.clone());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -3077,6 +3088,7 @@ mod tests {
             .decode()
             .expect("canonical enum fixture is non-null");
         let resource = Resource::with_provider("mock", "test.resource", "enum", None)
+            .with_attribute("name", string_value("enum"))
             .with_attribute(
                 "mode",
                 canonical
@@ -3194,12 +3206,11 @@ mod tests {
             carina_core::validation::deferred_types::with_session_for_test_async(
                 provider_types.provider_context(),
                 async |type_checks| {
-                    let preparation = carina_core::executor::ProviderPreparationContext::new(
+                    let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                         &bindings,
                         &module_gate,
                         &[],
                         &carina_core::provider::NoopNormalizer,
-                        &[],
                         &schemas,
                         type_checks,
                     );

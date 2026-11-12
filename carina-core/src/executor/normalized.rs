@@ -47,9 +47,9 @@
 //!
 //! ```compile_fail
 //! use carina_core::provider::{ProviderReady, ProviderReadyResource};
-//! use carina_core::resource::{ResolvedResource, Resource};
-//! let resolved = ResolvedResource::new(Resource::new("test", "example"));
-//! let _: ProviderReadyResource = ProviderReady { value: resolved }; // private fields
+//! fn rebind(ready: ProviderReadyResource) -> ProviderReadyResource {
+//!     ProviderReady { admission: ready.admission, ..ready } // private fields
+//! }
 //! ```
 //!
 //! ```compile_fail
@@ -517,21 +517,31 @@ async fn apply_desired_normalization_slice_unprojected<
     >],
     normalizer: &dyn ProviderNormalizer<T>,
     schemas: &SchemaRegistry,
-    mut restored: Option<&mut [RestoredSecrets]>,
+    restored: Option<&mut [RestoredSecrets]>,
 ) -> ProviderResult<(), T> {
+    let dispatch = restored.is_some();
+    let mut plan_protection;
+    let restored = match restored {
+        Some(restored) => restored,
+        None => {
+            plan_protection = (0..resources.len())
+                .map(|_| RestoredSecrets::default())
+                .collect::<Vec<_>>();
+            &mut plan_protection
+        }
+    };
+
     crate::value::canonicalize_resources_with_schemas(resources, schemas)?;
     let mut provider_resources = resources
         .iter()
         .cloned()
         .map(Resource::into_provider_resource)
         .collect::<Vec<_>>();
-    let protected_inputs = restored.as_ref().map(|_| {
-        provider_resources
-            .iter()
-            .map(|resource| resource.attributes.clone())
-            .collect::<Vec<_>>()
-    });
-    if restored.is_some() {
+    let protected_inputs = provider_resources
+        .iter()
+        .map(|resource| resource.attributes.clone())
+        .collect::<Vec<_>>();
+    if dispatch {
         // The sealed host boundary must see annotations before the raw
         // normalizer receives dispatch's usual plaintext input shape.
         normalizer
@@ -542,11 +552,12 @@ async fn apply_desired_normalization_slice_unprojected<
             .normalize_desired(&mut provider_resources)
             .await?;
     }
-    if let (Some(restored), Some(inputs)) = (restored.as_deref_mut(), protected_inputs) {
-        for ((resource, input), restored) in provider_resources.iter_mut().zip(inputs).zip(restored)
-        {
-            restored.restore_attributes(&input, &mut resource.attributes);
-        }
+    for ((resource, input), restored) in provider_resources
+        .iter_mut()
+        .zip(protected_inputs)
+        .zip(restored.iter_mut())
+    {
+        restored.restore_attributes(&input, &mut resource.attributes);
     }
     for (resource, provider_resource) in resources.iter_mut().zip(provider_resources) {
         if resource.id != provider_resource.id {
@@ -559,23 +570,27 @@ async fn apply_desired_normalization_slice_unprojected<
     }
     reject_provider_boundary_block_aliases(resources, schemas)
         .map_err(crate::provider::HostError::host_for_state)?;
-    crate::value::canonicalize_normalized_resources_with_schemas(resources, schemas)?;
+    crate::value::canonicalize_normalized_resources_with_schemas(resources, schemas).map_err(
+        |error| {
+            crate::provider::HostError::invalid_input_caused_by(
+                "provider normalization returned an invalid value",
+                crate::provider_text::HostDiagnostic::capture_host_or_provider(error),
+            )
+            .host_for_state()
+        },
+    )?;
     // Default-tag merging only inspects map shape and diagnoses config values.
     // Give it main's shape, then restore the diagnostic annotations for the
     // fully-resolved, ignore-path and wire gates that follow normalization.
-    if let Some(restored) = restored.as_deref() {
-        for (resource, restored) in resources.iter_mut().zip(restored) {
-            restored.remove(&mut resource.attributes);
-        }
+    for (resource, restored) in resources.iter_mut().zip(restored.iter()) {
+        restored.remove(&mut resource.attributes);
     }
     for config in provider_configs {
         merge_default_tags(config, resources, schemas)
             .map_err(crate::provider::HostError::host_for_state)?;
     }
-    if let Some(restored) = restored.as_deref() {
-        for (resource, restored) in resources.iter_mut().zip(restored) {
-            restored.rewrap(&mut resource.attributes);
-        }
+    for (resource, restored) in resources.iter_mut().zip(restored.iter()) {
+        restored.rewrap(&mut resource.attributes);
     }
     Ok(())
 }

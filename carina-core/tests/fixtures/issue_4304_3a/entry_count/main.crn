@@ -1,0 +1,7 @@
+let applicable = mock.test.Tagged {
+    tags = { Site = "east" }
+}
+
+let overridden = mock.test.Tagged {
+    tags = { Owner = "mine" }
+}

@@ -257,7 +257,13 @@ pub(super) async fn resolve_resource<S: Clone>(
                 }
                 resolved.attributes.insert(key.clone(), resolved_value);
             }
+            let consumed_companions = crate::identifier::consumed_prefix_companions(&target);
             for (key, source_expr) in &source.attributes {
+                // Prefix companions were consumed by host canonicalization.
+                // Their generated destination value is already in the target.
+                if consumed_companions.contains(key) {
+                    continue;
+                }
                 if target.attributes.contains_key(key) {
                     continue;
                 }
@@ -1117,7 +1123,7 @@ async fn prepare_update_request_for_dispatch<S: Clone>(
         &effective_changed,
         resolved_to,
         resolved_desired_attributes,
-        preparation.schemas(),
+        preparation,
     )
 }
 
@@ -2436,5 +2442,52 @@ mod gate_tests {
         for value in crate::resource::known_value_gate_tests::coalesces() {
             assert!(assert_known_attribute(&value, "records", &bindings).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod final_prefix_input_tests {
+    use super::*;
+    #[tokio::test]
+    async fn issue_4304_3a_cleanup_authored_prefix_is_not_reinserted_into_dispatch() {
+        use crate::schema::{
+            PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, SchemaRegistry,
+        };
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            PatternResourceSchema::new("test.Prefix")
+                .attribute(
+                    PatternAttributeSchema::required("name", PatternAttributeType::string())
+                        .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let source = Resource::with_provider("mock", "test.Prefix", "example", None)
+            .with_attribute(
+                "name_prefix",
+                Value::Concrete(crate::resource::ConcreteValue::String("example-".into())),
+            );
+        let mut target = source.clone();
+        target.attributes.shift_remove("name_prefix");
+        target.set_attr(
+            "name",
+            Value::Concrete(crate::resource::ConcreteValue::String(
+                "example-generated".into(),
+            )),
+        );
+        target.prefixes.insert("name".into(), "example-".into());
+        let bindings = ResolvedBindings::default();
+        let gate = super::super::provider_ready::ModuleConstraintGate::from_live_compositions(&[]);
+        crate::validation::deferred_types::with_session_for_test_async(
+            &crate::parser::LoadedProviderContext::empty_for_test(), async |session| {
+                let context = ProviderPreparationContext::for_test(&bindings, &gate, &[],
+                    &crate::provider::NoopNormalizer, &schemas, session);
+                let (ready, _) = resolve_resource(Ok(CheckInput::PlanNormalized { resolved: target.into(), authored: source.into() }), &context)
+                    .await.expect("the canonical name is the provider input; the authored prefix is host metadata");
+                assert!(!ready.attributes.contains_key("name_prefix"));
+                assert_eq!(ready.attributes["name"], Value::Concrete(crate::resource::ConcreteValue::String("example-generated".into())));
+            }).await;
     }
 }

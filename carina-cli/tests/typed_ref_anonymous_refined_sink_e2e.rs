@@ -611,7 +611,7 @@ fn apply_unknown_outputs(attributes: &str, output: Value, port: i64) -> Executio
         managed_current: fixture.managed_current,
         data_source_values: ExecutableDataSourceValues::empty(),
         normalizer: &NoopNormalizer,
-        provider_configs: &[],
+        provider_configs: &carina_core::test_utils::resolved_provider_configs(&[]),
         provider_context: carina_core::parser::ProviderContext::new(
             carina_core::EnvironmentSnapshot::empty(),
         ),

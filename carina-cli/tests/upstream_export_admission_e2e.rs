@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use carina_core::resource::{ConcreteValue, SnapshotValue, Value};
 use carina_state::StateFile;
 
 fn run_cli(dir: &Path, args: &[&str]) -> Output {
@@ -109,6 +110,129 @@ fn write_exports(upstream: &Path, exports: serde_json::Value) {
         serde_json::to_vec_pretty(&state).unwrap(),
     )
     .unwrap();
+}
+
+fn write_default_tag_consumer(downstream: &Path) {
+    fs::write(
+        downstream.join("providers.crn"),
+        "provider mock { default_tags = { Source = \"${orgs.count ?? 901}\" } }\n",
+    )
+    .unwrap();
+    fs::write(
+        downstream.join("main.crn"),
+        "let orgs = upstream_state { source = '../upstream' }\nlet consumer = mock.test.resource { name = 'consumer' }\n",
+    )
+    .unwrap();
+}
+
+fn planned_source_tag(downstream: &Path) -> SnapshotValue {
+    assert_success(
+        &run_cli(downstream, &["plan", "--out", "saved.plan", "."]),
+        "plan default tag from admitted upstream exports",
+    );
+    let plan: carina_cli::commands::plan::PlanFile =
+        serde_json::from_slice(&fs::read(downstream.join("saved.plan")).unwrap()).unwrap();
+    let Some(Value::Concrete(ConcreteValue::Map(tags))) = plan.sorted_resources[0].get_attr("tags")
+    else {
+        panic!("planned resource must contain merged default tags");
+    };
+    tags.get("Source")
+        .expect("default tag must be present")
+        .clone()
+}
+
+#[test]
+fn issue_4304_3a_merge_4a_admits_upstream_values_used_only_by_default_tags() {
+    let root = tempfile::tempdir().unwrap();
+    let (upstream, downstream) = write_fixture(root.path());
+    write_default_tag_consumer(&downstream);
+    write_exports(&upstream, serde_json::json!({"count": 73, "unused": true}));
+    assert_eq!(
+        planned_source_tag(&downstream),
+        Value::Concrete(ConcreteValue::String("73".into()))
+    );
+    assert_success(
+        &run_cli(&downstream, &["apply", "--auto-approve", "saved.plan"]),
+        "apply admitted upstream default tag",
+    );
+
+    // The interpolation accepts a String at the destination, but the source
+    // export still owes its Int declaration before provider resolution.
+    let protected = "upstream-default-tag-contents-must-not-appear";
+    write_exports(
+        &upstream,
+        serde_json::json!({"count": protected, "unused": true}),
+    );
+    let output = run_cli(&downstream, &["plan", "."]);
+    assert_admission_error(&output, "count", "Int", "string");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains(protected),
+        "source admission must not disclose the upstream value"
+    );
+}
+
+#[test]
+fn issue_4304_3a_merge_4a_dropped_upstream_tag_key_uses_known_fallback() {
+    let root = tempfile::tempdir().unwrap();
+    let (upstream, downstream) = write_fixture(root.path());
+    write_default_tag_consumer(&downstream);
+    write_exports(&upstream, serde_json::json!({"count": 73, "unused": true}));
+    assert_eq!(
+        planned_source_tag(&downstream),
+        Value::Concrete(ConcreteValue::String("73".into()))
+    );
+
+    fs::write(
+        upstream.join("exports.crn"),
+        "exports { unused: Bool = true }\n",
+    )
+    .unwrap();
+    // 4a drops stale keys before consuming them. The loaded snapshot remains
+    // complete, allowing coalesce to choose a known provider default.
+    write_exports(
+        &upstream,
+        serde_json::json!({"count": {"stale": "must not be consumed"}, "unused": true}),
+    );
+    assert_eq!(
+        planned_source_tag(&downstream),
+        Value::Concrete(ConcreteValue::String("901".into()))
+    );
+    assert_success(
+        &run_cli(&downstream, &["apply", "--auto-approve", "saved.plan"]),
+        "apply known fallback after source-key filtering",
+    );
+}
+
+#[test]
+fn issue_4304_3a_merge_4a_default_tag_saved_apply_checks_source_drift() {
+    let root = tempfile::tempdir().unwrap();
+    let (upstream, downstream) = write_fixture(root.path());
+    write_default_tag_consumer(&downstream);
+    write_exports(&upstream, serde_json::json!({"count": 73, "unused": true}));
+    assert_eq!(
+        planned_source_tag(&downstream),
+        Value::Concrete(ConcreteValue::String("73".into()))
+    );
+    fs::write(
+        upstream.join("exports.crn"),
+        "exports { count: String = 'changed'\nunused: Bool = true }\n",
+    )
+    .unwrap();
+    let output = run_cli(&downstream, &["apply", "--auto-approve", "saved.plan"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "source drift must reject saved apply"
+    );
+    assert!(
+        stderr.contains("upstream_state 'orgs'")
+            && stderr.contains("drifted since the plan was created"),
+        "default-tag upstream drift must retain its typed diagnostic: {stderr}"
+    );
+    assert!(
+        !downstream.join("carina.state.json").exists(),
+        "source drift must be rejected before provider dispatch and state writeback"
+    );
 }
 
 #[test]

@@ -26,7 +26,6 @@ fn tags<S, D>(
 struct PlanJsonOutput {
     plan: PlanFile,
     json: serde_json::Value,
-    stderr: String,
 }
 
 fn run_cli(dir: &Path, args: &[&str]) -> Output {
@@ -69,7 +68,7 @@ fn plan_json(dir: &Path) -> PlanJsonOutput {
     });
     let plan = serde_json::from_value(json.clone()).expect("decode saved-plan JSON");
 
-    PlanJsonOutput { plan, json, stderr }
+    PlanJsonOutput { plan, json }
 }
 
 #[test]
@@ -369,7 +368,7 @@ fn apply_updates_default_tags_without_persisting_host_metadata() {
 }
 
 #[test]
-fn plan_logs_when_an_unresolved_default_tag_is_skipped() {
+fn issue_4304_3a_review3_plain_plan_warns_when_missing_upstream_default_is_omitted() {
     let root = tempfile::tempdir().expect("create temporary root");
     let project = root.path().join("project");
     let missing = root.path().join("missing");
@@ -399,9 +398,256 @@ mock.test.resource {
     )
     .expect("write project configuration");
 
-    let PlanJsonOutput { stderr, .. } = plan_json(&project);
+    assert_success(&run_cli(&project, &["init", "."]), "init");
+    let output = run_cli(&project, &["plan", "."]);
+    assert_success(&output, "plain plan");
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Skipping default_tag 'Owner'"),
-        "missing skipped-default-tag log message; stderr:\n{stderr}"
+        stderr.contains("WARN"),
+        "expected warning-level omission: {stderr}"
+    );
+    for part in ["mock", "default_tags.Owner", "mgmt"] {
+        assert!(
+            stderr.contains(part),
+            "missing omission context {part}: {stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains("ERROR"),
+        "preview omission is a warning: {stderr}"
+    );
+}
+
+#[test]
+fn issue_4304_3a_review4_default_tag_diagnostics_only_name_referenced_missing_upstream() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    fs::create_dir(&project).unwrap();
+    for upstream in ["used", "unrelated"] {
+        let directory = root.path().join(upstream);
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("main.crn"),
+            "backend local { path = 'carina.state.json' }\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        project.join("providers.crn"),
+        "provider mock { default_tags = { Owner = mgmt.owner } }\n",
+    )
+    .unwrap();
+    fs::write(project.join("main.crn"), "backend local { path = 'carina.state.json' }\nlet mgmt = upstream_state { source = '../used' }\nlet unrelated = upstream_state { source = '../unrelated' }\nmock.test.resource { name = 'tagged' }\n").unwrap();
+    assert_success(&run_cli(&project, &["init", "."]), "init");
+
+    let preview = run_cli(&project, &["plan", "."]);
+    assert_success(&preview, "plain plan");
+    let stderr = String::from_utf8_lossy(&preview.stderr);
+    let warning = stderr
+        .lines()
+        .find(|line| line.contains("omitting default_tags.Owner"))
+        .expect("preview must report the omitted default");
+    assert!(warning.contains("mgmt"), "{warning}");
+    assert!(
+        !warning.contains("unrelated"),
+        "tag warning named an unrelated upstream: {warning}"
+    );
+
+    let saved = run_cli(&project, &["plan", "--out", "plan.json", "."]);
+    assert!(
+        !saved.status.success(),
+        "missing default must prevent saving"
+    );
+    let stderr = String::from_utf8_lossy(&saved.stderr);
+    let diagnostic = stderr
+        .lines()
+        .find(|line| line.contains("default_tags.Owner"))
+        .expect("strict plan must name the unresolved default");
+    assert!(diagnostic.contains("mgmt"), "{diagnostic}");
+    assert!(
+        !diagnostic.contains("unrelated"),
+        "tag error named an unrelated upstream: {diagnostic}"
+    );
+    assert!(!project.join("plan.json").exists());
+}
+
+#[test]
+fn issue_4304_3a_review4_json_and_out_keep_the_same_provider_inputs() {
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("providers.crn"),
+        "provider mock { default_tags = { ManagedBy = 'carina' } }\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("main.crn"),
+        "backend local { path = 'carina.state.json' }\nmock.test.resource { name = 'tagged' }\n",
+    )
+    .unwrap();
+    assert_success(&run_cli(project.path(), &["init", "."]), "init");
+    let output = run_cli(
+        project.path(),
+        &["plan", "--json", "--out", "plan.json", "."],
+    );
+    assert_success(&output, "combined JSON and file output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout_plan: serde_json::Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("saved-plan JSON on stdout")..])
+            .unwrap();
+    let file_plan: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(project.path().join("plan.json")).unwrap())
+            .unwrap();
+    for field in ["provider_configs", "sorted_resources"] {
+        assert_eq!(stdout_plan[field], file_plan[field], "{field}");
+    }
+    assert_eq!(
+        file_plan["provider_configs"][0]["default_tags"]["ManagedBy"],
+        serde_json::json!({"String": "carina"})
+    );
+}
+
+#[test]
+fn issue_4304_3a_validate_and_plan_reject_default_tag_from_same_config_computed_value() {
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("providers.crn"),
+        r#"provider mock {
+  default_tags = { Owner = management.identifier }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("main.crn"),
+        r#"let management = mock.test.resource {
+  name = "management"
+}
+let target = mock.test.resource {
+  name = "target"
+}
+"#,
+    )
+    .unwrap();
+    assert_success(&run_cli(project.path(), &["init", "."]), "init");
+    for operation in ["validate", "plan"] {
+        let output = run_cli(project.path(), &[operation, "."]);
+        assert!(
+            !output.status.success(),
+            "{operation} accepted a tag known only after apply"
+        );
+        let rendered = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            rendered.contains("default_tags.Owner"),
+            "{operation}: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Skipping default_tag"),
+            "local apply-time values cannot use missing-upstream leniency: {rendered}"
+        );
+    }
+    fs::write(
+        project.path().join("providers.crn"),
+        "provider mock { default_tags = { Owner = management.name } }\n",
+    )
+    .unwrap();
+    for operation in ["validate", "plan"] {
+        assert_success(
+            &run_cli(project.path(), &[operation, "."]),
+            "an authored resource attribute is known before apply",
+        );
+    }
+    fs::create_dir(project.path().join("metadata")).unwrap();
+    fs::write(
+        project.path().join("metadata/main.crn"),
+        "attributes { owner = \"core\" }\n",
+    )
+    .unwrap();
+    let main = fs::read_to_string(project.path().join("main.crn")).unwrap();
+    fs::write(
+        project.path().join("main.crn"),
+        format!(
+            "{main}\nlet labels = use {{ source = './metadata' }}\nlet metadata = labels {{}}\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("providers.crn"),
+        "provider mock { default_tags = { Owner = metadata.owner } }\n",
+    )
+    .unwrap();
+    for operation in ["validate", "plan"] {
+        assert_success(
+            &run_cli(project.path(), &[operation, "."]),
+            "a module's constant export is known before apply",
+        );
+    }
+}
+
+#[test]
+fn issue_4304_3a_cleanup_saved_apply_default_tag_diagnostic_requests_replan() {
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("providers.crn"),
+        "provider mock { default_tags = { Owner = \"known\", Team = \"known\" } }\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("main.crn"),
+        "let management = mock.test.resource { name = \"management\" }\n",
+    )
+    .unwrap();
+    let mut json = plan_json(project.path()).json;
+    let reference = Value::<
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::RelativeBindingName,
+    >::resource_ref(
+        carina_core::resource::RelativeBindingName::new("management"),
+        "identifier",
+        vec![],
+    )
+    .resolve_root_for_test();
+    for key in ["Owner", "Team"] {
+        json["provider_configs"][0]["default_tags"][key] =
+            serde_json::to_value(&reference).unwrap();
+    }
+    let plan = project.path().join("deferred.plan.json");
+    fs::write(&plan, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+    let caller = tempfile::tempdir().unwrap();
+    let output = run_cli(
+        caller.path(),
+        &["apply", plan.to_str().unwrap(), "--auto-approve"],
+    );
+    assert!(!output.status.success());
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(diagnostic.contains("default_tags.Owner"), "{diagnostic}");
+    assert!(diagnostic.contains("default_tags.Team"), "{diagnostic}");
+    assert_eq!(diagnostic.matches("Re-run").count(), 1, "{diagnostic}");
+    let hint = diagnostic
+        .lines()
+        .last()
+        .map(|line| line.strip_prefix("Error: ").unwrap_or(line))
+        .filter(|line| line.starts_with("Re-run") && line.contains("carina plan"))
+        .unwrap_or_else(|| {
+            panic!("a terminal recovery hint must name the plan command: {diagnostic}")
+        });
+    assert!(
+        hint.contains(project.path().to_str().unwrap()),
+        "the hint must retain the saved plan's source project: {diagnostic}"
+    );
+    assert!(
+        !diagnostic.to_ascii_lowercase().contains("deserialize"),
+        "{diagnostic}"
+    );
+    assert!(
+        !diagnostic.to_ascii_lowercase().contains("corrupt"),
+        "{diagnostic}"
     );
 }

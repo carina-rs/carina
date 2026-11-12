@@ -340,12 +340,11 @@ async fn round2_initial_create_after_normalization(
         &crate::parser::LoadedProviderContext::empty_for_test(),
         async |session| {
             let host_normalizer = crate::provider::ConfiguredNormalizer::fixture(&normalizer);
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],
                 &host_normalizer,
-                &[],
                 &runtime_schemas,
                 session,
             );
@@ -635,7 +634,7 @@ async fn run_with_configs(
             managed_current: current,
             data_source_values: ExecutableDataSourceValues::empty(),
             normalizer: &crate::provider::ConfiguredNormalizer::fixture(normalizer),
-            provider_configs: configs,
+            provider_configs: &crate::test_utils::resolved_provider_configs(configs),
             factories: &[],
             schemas,
             parallelism: NonZeroUsize::new(8).unwrap(),
@@ -743,7 +742,7 @@ async fn input_discharge_consumes_admitted_rules_instead_of_replacing_them_from_
                 managed_current: HashMap::new(),
                 data_source_values: ExecutableDataSourceValues::empty(),
                 normalizer: &NoopNormalizer,
-                provider_configs: &[],
+                provider_configs: &crate::test_utils::resolved_provider_configs(&[]),
                 factories: &[],
                 schemas: &runtime_schemas,
                 parallelism: NonZeroUsize::new(8).unwrap(),
@@ -1633,7 +1632,7 @@ async fn input_discharge_failed_cohort_preparation_advances_progress() {
                     managed_current: HashMap::new(),
                     data_source_values: ExecutableDataSourceValues::empty(),
                     normalizer: &NoopNormalizer,
-                    provider_configs: &[],
+                    provider_configs: &crate::test_utils::resolved_provider_configs(&[]),
                     factories: &[],
                     schemas: &schemas,
                     parallelism: NonZeroUsize::new(8).unwrap(),
@@ -1676,6 +1675,7 @@ async fn input_discharge_invalid_check_construction_aborts_all_dispatch() {
     let result = crate::validation::deferred_types::with_session_for_test(
         &crate::parser::LoadedProviderContext::empty_for_test(),
         |session| {
+            let provider_configs = crate::test_utils::resolved_provider_configs(&[]);
             let mut input = ExecutionInput {
                 plan: &checked,
                 provider_context: crate::parser::ProviderContext::clone(
@@ -1687,7 +1687,7 @@ async fn input_discharge_invalid_check_construction_aborts_all_dispatch() {
                 managed_current: HashMap::new(),
                 data_source_values: ExecutableDataSourceValues::empty(),
                 normalizer: &NoopNormalizer,
-                provider_configs: &[],
+                provider_configs: &provider_configs,
                 factories: &[],
                 schemas: &schemas,
                 parallelism: NonZeroUsize::new(8).unwrap(),
@@ -1852,7 +1852,7 @@ async fn round1_unbound_rule_bearing_replacement_accepts_deleted_anonymous_child
         managed_current: current,
         data_source_values: ExecutableDataSourceValues::empty(),
         normalizer: &NoopNormalizer,
-        provider_configs: &[],
+        provider_configs: &crate::test_utils::resolved_provider_configs(&[]),
         factories: &[],
         schemas: &schemas,
         parallelism: NonZeroUsize::new(1).unwrap(),
@@ -1984,7 +1984,7 @@ async fn input_discharge_conflicting_child_in_cbd_parent_window_keeps_old_on_rej
             managed_current: current,
             data_source_values: ExecutableDataSourceValues::empty(),
             normalizer: &NoopNormalizer,
-            provider_configs: &[],
+            provider_configs: &crate::test_utils::resolved_provider_configs(&[]),
             factories: &[],
             schemas: &schemas,
             parallelism: NonZeroUsize::new(1).unwrap(),

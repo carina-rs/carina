@@ -1,5 +1,64 @@
 use super::*;
 
+#[tokio::test]
+async fn issue_4304_3a_review2_read_only_validation_preserves_authored_defaults() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("providers.crn"),
+        "provider mock { default_tags = { Owner = 'carina' } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("main.crn"),
+        "let example = mock.test.resource {}\n",
+    )
+    .unwrap();
+    let project = ResolvedPath::new(project.path()).unwrap();
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let context =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let loaded = carina_core::config_loader::load_configuration_with_config(
+        &project,
+        &context,
+        &SchemaRegistry::new(),
+    )
+    .unwrap();
+    let mut notices = ProviderNoticeSink::new(|_| {});
+    let validated = ProviderLoad::load(&runtime, &loaded.parsed.providers, &project, &mut notices)
+        .unwrap()
+        .validate_read_only_config(loaded.parsed, &project, &loaded.duplicate_declarations)
+        .unwrap();
+    let read_only = crate::commands::plan::load_and_resolve_read_only_provider_configs(
+        &runtime,
+        validated.resources(),
+        &project,
+        &context,
+        validated.context().schemas(),
+    )
+    .await
+    .unwrap();
+    let desired = crate::commands::plan::load_and_resolve_provider_configs(
+        &runtime,
+        validated.resources(),
+        &project,
+        &context,
+        validated.context().schemas(),
+        crate::commands::plan::UpstreamMissingStatePolicy::Strict,
+    )
+    .await
+    .unwrap();
+    let authored = &validated.resources().providers[0].default_tags;
+    assert_eq!(
+        authored.get("Owner"),
+        Some(&Value::Concrete(ConcreteValue::String("carina".into())))
+    );
+    assert_eq!(
+        &desired.configs().as_provider_configs()[0].default_tags,
+        authored
+    );
+    assert_eq!(read_only.configs().configurations().len(), 1);
+}
+
 #[test]
 fn round2_1_validate_load_error_precedes_unsettled_checks_with_main_variant() {
     let runtime = crate::test_support::TestCommandRuntime::new();
@@ -2005,6 +2064,7 @@ fn settlement_includes_checks_from_binding_readiness() {
         &carina_core::paths::ResolvedPath::new(".").unwrap(),
         true,
         &[],
+        crate::commands::ConfigNameResolution::EvaluatedOnly,
         |_parsed, catalog| {
             catalog.record(
                 &expected,
@@ -9887,7 +9947,9 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         managed_current: plan_ctx.managed_current,
         data_source_values: executable_data_source_values,
         normalizer: &carina_core::provider::NoopNormalizer,
-        provider_configs: provider_configs.as_provider_configs(),
+        provider_configs: &carina_core::test_utils::resolved_provider_configs(
+            provider_configs.as_provider_configs(),
+        ),
         factories: ctx.factories(),
         schemas: ctx.schemas(),
         parallelism: carina_core::executor::TEST_UNCAPPED,
@@ -10638,6 +10700,13 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
                 "test",
                 carina_core::schema::PatternResourceSchema::new("Lookup")
                     .as_data_source()
+                    .attribute(
+                        carina_core::schema::PatternAttributeSchema::optional(
+                            "filter",
+                            carina_core::schema::PatternAttributeType::string(),
+                        )
+                        .build(),
+                    )
                     .validate()
                     .unwrap(),
             );
@@ -10676,7 +10745,6 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
                             &resource,
                             &bindings,
                             &module_gate,
-                            &[],
                             &schemas,
                             session,
                         )
@@ -10737,7 +10805,6 @@ async fn invalid_data_source_preparation_keeps_complete_typed_diagnostic() {
         &lookup,
         &ResolvedBindings::default(),
         &module_gate,
-        &[],
         &schemas,
         session,
     )
@@ -14763,8 +14830,14 @@ mod resolved_value_constraint_gate {
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
-            let schema_drafts: Vec<carina_core::schema::ResourceSchema> =
-                vec![PatternResourceSchema::new("lookup").as_data_source()];
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> = vec![
+                PatternResourceSchema::new("lookup")
+                    .as_data_source()
+                    .attribute(
+                        PatternAttributeSchema::optional("query", PatternAttributeType::string())
+                            .build(),
+                    ),
+            ];
             schema_drafts
                 .into_iter()
                 .map(|schema| {
@@ -15893,12 +15966,11 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                 let id = resource.id.clone();
                 let bindings = ResolvedBindings::default();
                 let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &[],
                     &carina_core::provider::NoopNormalizer,
-                    &[],
                     ctx.schemas(),
                     session,
                 );
