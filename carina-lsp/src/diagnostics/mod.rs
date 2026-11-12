@@ -1966,8 +1966,8 @@ impl DiagnosticRun<'_> {
                                 && let Some(error) = attr_findings.local_error()
                             {
                                 let tagged = error.clone().with_attribute(attr_name);
-                                if let Some(data) =
-                                    crate::code_action::enum_diagnostic_data_for_error(&tagged)
+                                if crate::code_action::enum_diagnostic_data_for_error(&tagged)
+                                    .is_some()
                                 {
                                     let finding = carina_core::parser::Located::new(
                                         rref.attribute_value_location(
@@ -1977,11 +1977,10 @@ impl DiagnosticRun<'_> {
                                         .clone(),
                                         tagged,
                                     );
-                                    if let Some(diagnostic) = render_local_enum_diagnostic(
+                                    if let Some(diagnostic) = render_schema_diagnostic(
                                         doc,
                                         &finding,
                                         rref.replaceable_attribute_value(attr_name),
-                                        data,
                                     ) {
                                         diagnostics.push(diagnostic);
                                         reported_attribute_diagnostics
@@ -1995,10 +1994,7 @@ impl DiagnosticRun<'_> {
                             }
                             for finding in &symbolic {
                                 let covers_path = finding.covers_path();
-                                if !enum_diagnostic_retains_symbolic(
-                                    handled_enum_diagnostic,
-                                    finding.origin(),
-                                ) {
+                                if handled_enum_diagnostic && covers_path {
                                     continue;
                                 }
                                 let (path, error) = finding.diagnostic();
@@ -2025,7 +2021,7 @@ impl DiagnosticRun<'_> {
                                                     ..
                                                 } => DiagnosticSeverity::WARNING,
                                             },
-                                            error.to_string(),
+                                            finding.diagnostic_message(),
                                         ),
                                         // The reference existence pass owns these same findings.
                                         SecretDiagnosticError::Public(
@@ -2710,24 +2706,6 @@ impl DiagnosticEngine {
     }
 }
 
-fn enum_diagnostic_retains_symbolic(
-    emitted: bool,
-    origin: carina_core::validation::SymbolicFindingOrigin,
-) -> bool {
-    !emitted || !origin.covers_path()
-}
-
-fn render_local_enum_diagnostic(
-    doc: &Document,
-    finding: &carina_core::parser::Located<TypeError>,
-    replaceable: Option<&carina_core::parser::DeclarationLocation>,
-    data: crate::code_action::EnumDiagnosticData,
-) -> Option<Diagnostic> {
-    // A sibling-owned or unmappable enum location still owns the generic
-    // error path; only recovered reference findings may continue rendering.
-    render_schema_diagnostic_with_data(doc, finding, replaceable, Some(data))
-}
-
 /// Build a `Diagnostic` for a failed direct `Enum` attribute validation,
 /// carrying the structured candidate list on `Diagnostic.data` and a
 /// range over the offending value text. Returns `None` when validation
@@ -2861,20 +2839,6 @@ fn render_schema_diagnostic(
     finding: &carina_core::parser::Located<TypeError>,
     replaceable: Option<&carina_core::parser::DeclarationLocation>,
 ) -> Option<Diagnostic> {
-    let data = if replaceable == Some(finding.location()) {
-        crate::code_action::enum_diagnostic_data_for_error(finding.detail())
-    } else {
-        None
-    };
-    render_schema_diagnostic_with_data(doc, finding, replaceable, data)
-}
-
-fn render_schema_diagnostic_with_data(
-    doc: &Document,
-    finding: &carina_core::parser::Located<TypeError>,
-    replaceable: Option<&carina_core::parser::DeclarationLocation>,
-    data: Option<crate::code_action::EnumDiagnosticData>,
-) -> Option<Diagnostic> {
     let severity = if is_duplicate_list_error(finding.detail()) {
         DiagnosticSeverity::ERROR
     } else {
@@ -2882,7 +2846,7 @@ fn render_schema_diagnostic_with_data(
     };
     let mut diagnostic = render_merged(doc, finding, severity, finding.detail().to_string())?;
     if replaceable == Some(finding.location())
-        && let Some(data) = data
+        && let Some(data) = crate::code_action::enum_diagnostic_data_for_error(finding.detail())
     {
         diagnostic.data = Some(serde_json::to_value(data).expect("EnumDiagnosticData serialize"));
     }

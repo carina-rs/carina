@@ -196,114 +196,10 @@ impl<P: ValueKind, B: BindingAddress> Drop for ScopeGuard<'_, '_, P, B> {
     }
 }
 
-pub(super) struct ReferenceInput<'w, 's, P: PlaceholderKind, B: BindingAddress> {
-    walk: &'w AssignmentWalk<'s, P, B>,
-    policy: &'s ReferencePolicy<'s, P, B>,
-    source: crate::parser::retained::SourceReference<'w, B>,
-}
-impl<'w, 's, P: PlaceholderKind, B: BindingAddress> ReferenceInput<'w, 's, P, B> {
-    #[inline(never)]
-    pub(super) fn for_walk(
-        known: bool,
-        assignment: Option<&'w AssignmentWalk<'s, P, B>>,
-    ) -> Option<Self> {
-        if !known {
-            return None;
-        }
-        let walk = assignment?;
-        let OrdinaryCheck::References(policy) = walk.callbacks.ordinary else {
-            return None;
-        };
-        if walk.cursor.is_selection() {
-            return None;
-        }
-        let source = walk.cursor.source_reference()?;
-        let identity = source.identity;
-        // Member trials inherit the enclosing declaration's judgement. They
-        // keep the ordinary memo and never allocate reference state of their own.
-        if policy.scopes.borrow().contains(&identity) || !(policy.schema_source)(source.binding) {
-            return None;
-        }
-        Some(Self {
-            walk,
-            policy,
-            source,
-        })
-    }
-}
-
 #[derive(Default)]
 pub(super) struct ReferenceMemo<'a>(
     std::cell::RefCell<HashMap<CheckedNode<'a>, std::rc::Rc<CheckedValue<'a>>>>,
 );
-
-pub(super) struct AppliedReferenceValue<'a>(std::rc::Rc<CheckedValue<'a>>);
-impl<'a> AppliedReferenceValue<'a> {
-    #[inline(never)]
-    pub(super) fn into_checked(self) -> CheckedValue<'a> {
-        std::rc::Rc::unwrap_or_clone(self.0)
-    }
-}
-
-/// Only this private state can carry an unapplied reference result. It cannot
-/// enter assignment merges; finishing applies it before returning CheckedValue.
-pub(super) struct PendingReferencedValue<'a>(Box<ReferenceResult<'a>>);
-struct ReferenceResult<'a> {
-    value: CheckedValue<'a>,
-    reference: Result<(), TypeError>,
-    identity: UseIdentity,
-    key: Option<CheckedNode<'a>>,
-}
-impl<'a> PendingReferencedValue<'a> {
-    #[inline(never)]
-    pub(super) fn finish(
-        self,
-        path: &FieldPath,
-        memo: &ReferenceMemo<'a>,
-    ) -> AppliedReferenceValue<'a> {
-        let ReferenceResult {
-            mut value,
-            reference,
-            identity,
-            key,
-        } = *self.0;
-        if let Err(error) = reference {
-            use crate::resource::SecretDiagnosticError;
-            use crate::validation::admission::AdmissionReferenceError;
-            value.retain_primary_finding();
-            // Intentionally leaf-only: suppress a direct ordinary duplicate.
-            // Container summaries wrap child errors and keep their own paths;
-            // they are never equated with a recovered source judgement.
-            let same = |ordinary: &TypeError| {
-                ordinary == &error
-                    || matches!((ordinary, &error),
-                        (TypeError::TypeMismatch { types: ordinary }, TypeError::Reference { error, .. })
-                        if matches!(error.as_ref(), SecretDiagnosticError::Public(AdmissionReferenceError::Computed(
-                            crate::validation::DeferredAccessTypeError::TypeMismatch { types, .. }
-                        )) if types == ordinary)
-                    )
-            };
-            if !value
-                .findings
-                .located
-                .iter()
-                .any(|(ordinary_path, ordinary)| ordinary_path == path && same(ordinary))
-                && !value
-                    .findings
-                    .provider
-                    .iter()
-                    .any(|(ordinary_path, ordinary)| ordinary_path == path && same(ordinary))
-            {
-                value.findings.authored.recover(identity, path, error);
-            }
-        }
-        let value = std::rc::Rc::new(value);
-        if let Some(key) = key {
-            memo.0.borrow_mut().insert(key, value.clone());
-        }
-        AppliedReferenceValue(value)
-    }
-}
 
 impl<'a> ValueValidator<'a, '_> {
     #[allow(clippy::too_many_arguments)]
@@ -324,33 +220,31 @@ impl<'a> ValueValidator<'a, '_> {
         assignment: Option<&AssignmentWalk<'w, P, B>>,
         extra: &mut AssignmentProbe,
         wrappers: &mut Vec<AuthoredCursor<'w, B>>,
-    ) -> Option<AppliedReferenceValue<'a>>
+    ) -> Option<std::rc::Rc<CheckedValue<'a>>>
     where
         'a: 'w,
     {
-        let input = ReferenceInput::for_walk(matches!(value, ClassifiedRef::Known(_)), assignment)?;
-        let ReferenceInput {
-            walk,
-            policy,
-            source,
-        } = input;
-        let identity = source.identity;
-        let _scope = policy.enter(identity);
-        let key = match value {
-            ClassifiedRef::Known(value) => Some(CheckedNode::new(
-                attr,
-                value.node_id(),
-                ancestry,
-                visited,
-                Some(walk),
-            )),
-            _ => None,
+        let ClassifiedRef::Known(known) = value else {
+            return None;
         };
-        if let Some(checked) = key
-            .as_ref()
-            .and_then(|key| self.reference_checked.0.borrow().get(key).cloned())
-        {
-            return Some(AppliedReferenceValue(checked));
+        let walk = assignment?;
+        let OrdinaryCheck::References(policy) = walk.callbacks.ordinary else {
+            return None;
+        };
+        if walk.cursor.is_selection() {
+            return None;
+        }
+        let source = walk.cursor.source_reference()?;
+        let identity = source.identity;
+        // Member trials inherit the enclosing declaration's judgement. They
+        // keep the ordinary memo and never allocate reference state of their own.
+        if policy.scopes.borrow().contains(&identity) || !(policy.schema_source)(source.binding) {
+            return None;
+        }
+        let _scope = policy.enter(identity);
+        let key = CheckedNode::new(attr, known.node_id(), ancestry, visited, Some(walk));
+        if let Some(checked) = self.reference_checked.0.borrow().get(&key).cloned() {
+            return Some(checked);
         }
         let mut checked =
             self.walk_value(attr, value, path, ancestry, visited, Some((*walk).clone()));
@@ -370,15 +264,41 @@ impl<'a> ValueValidator<'a, '_> {
                 .map_err(|error| error.into_validation_error())
                 .and_then(|resolved| (policy.reference)(resolved.attr, &path.canonical(), source))
         };
-        Some(
-            PendingReferencedValue(Box::new(ReferenceResult {
-                value: checked,
-                reference,
-                identity,
-                key,
-            }))
-            .finish(path, &self.reference_checked),
-        )
+        if let Err(error) = reference {
+            use crate::resource::SecretDiagnosticError;
+            use crate::validation::admission::AdmissionReferenceError;
+            // Intentionally leaf-only: suppress a direct ordinary duplicate.
+            // Container summaries wrap child errors and keep their own paths;
+            // they are never equated with a recovered source judgement.
+            let same = |ordinary: &TypeError| {
+                ordinary == &error
+                    || matches!((ordinary, &error),
+                        (TypeError::TypeMismatch { types: ordinary }, TypeError::Reference { error, .. })
+                        if matches!(error.as_ref(), SecretDiagnosticError::Public(AdmissionReferenceError::Computed(
+                            crate::validation::DeferredAccessTypeError::TypeMismatch { types, .. }
+                        )) if types == ordinary)
+                    )
+            };
+            if !checked
+                .findings
+                .located
+                .iter()
+                .any(|(ordinary_path, ordinary)| ordinary_path == path && same(ordinary))
+                && !checked
+                    .findings
+                    .provider
+                    .iter()
+                    .any(|(ordinary_path, ordinary)| ordinary_path == path && same(ordinary))
+            {
+                checked.findings.authored.recover(identity, path, error);
+            }
+        }
+        let checked = std::rc::Rc::new(checked);
+        self.reference_checked
+            .0
+            .borrow_mut()
+            .insert(key, checked.clone());
+        Some(checked)
     }
 }
 

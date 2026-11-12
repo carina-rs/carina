@@ -1,14 +1,6 @@
 use super::*;
 use crate::parser::retained::SourceReference;
 
-fn allow_reference(
-    _: &CompiledAttributeType,
-    _: &LeafPath,
-    _: SourceReference<'_, RelativeBindingName>,
-) -> Result<(), TypeError> {
-    Ok(())
-}
-
 fn with_source(
     test: impl FnOnce(AuthoredCursor<'_>, Classification<'_, ParserPlaceholder, RelativeBindingName>),
 ) {
@@ -94,83 +86,66 @@ fn authored_reference_metadata_does_not_clone_a_reference_path() {
 }
 
 #[test]
-fn unsubstituted_reference_uses_no_reference_state_or_allocations() {
+fn unsubstituted_reference_keeps_ordinary_memo_allocations_and_skips_reference_callback() {
     with_files(
         "let source = mock.Source {}\n",
         &[],
         |cursor, knowledge, _| {
-            assert!(!matches!(
-                ClassifiedRef::from(&knowledge),
-                ClassifiedRef::Known(_)
-            ));
+            let attr = CompiledAttributeType::string();
+            let calls = std::cell::Cell::new(0);
             let ordinary = |_: &CompiledAttributeType,
                             _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
                             _: &LeafPath,
                             _: AuthoredCursor<'_>| Ok(Default::default());
+            let reference =
+                |_: &CompiledAttributeType,
+                 _: &LeafPath,
+                 _: SourceReference<'_, RelativeBindingName>| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                };
             let policy = ReferencePolicy::new(
                 &ordinary,
                 ReferenceCheck {
                     schema_source: &|_| true,
-                    check: &allow_reference,
+                    check: &reference,
                 },
             );
             let coverage = Default::default();
-            let mut callbacks = WalkCallbacks::new(AssignmentCallbacks {
-                ordinary: &ordinary,
-                authored: None,
-            });
-            callbacks.ordinary = OrdinaryCheck::References(&policy);
-            let assignment = Some(AssignmentWalk {
+            let direct = AssignmentWalk {
                 cursor,
-                callbacks,
+                callbacks: WalkCallbacks::new(AssignmentCallbacks {
+                    ordinary: &ordinary,
+                    authored: None,
+                }),
                 coverage: &coverage,
-            });
-            let allocations = cursor_allocations::count(|| {
+            };
+            let mut recovered = direct.clone();
+            recovered.callbacks.ordinary = OrdinaryCheck::References(&policy);
+            let validator = ValueValidator::new(empty_defs_for_schema_walks(), None);
+            let check = |walk| {
                 assert!(
-                    ReferenceInput::for_walk(
-                        matches!(ClassifiedRef::from(&knowledge), ClassifiedRef::Known(_)),
-                        assignment.as_ref()
-                    )
-                    .is_none()
+                    validator
+                        .walk_with_assignment(
+                            &attr,
+                            (&knowledge).into(),
+                            &FieldPath::new(),
+                            FieldAncestry::WRITABLE,
+                            &mut Vec::new(),
+                            Some(walk),
+                        )
+                        .accepts()
                 );
-            });
-            assert_eq!(allocations, 0);
-            assert!(assignment.is_some());
+            };
+            check(direct.clone());
+            check(recovered.clone());
+            let expected = cursor_allocations::count(|| check(direct));
+            let actual = cursor_allocations::count(|| check(recovered));
+            assert_eq!(calls.get(), 0);
+            assert!(validator.reference_checked.0.borrow().is_empty());
+            assert_eq!(actual, expected);
         },
     );
-}
-
-#[test]
-fn reference_member_trials_do_not_allocate_reference_state() {
-    with_source(|cursor, _| {
-        let ordinary = |_: &CompiledAttributeType,
-                        _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
-                        _: &LeafPath,
-                        _: AuthoredCursor<'_>| Ok(Default::default());
-        let policy = ReferencePolicy::new(
-            &ordinary,
-            ReferenceCheck {
-                schema_source: &|_| true,
-                check: &allow_reference,
-            },
-        );
-        let _scope = policy.enter(cursor.identity().unwrap());
-        let coverage = Default::default();
-        let mut callbacks = WalkCallbacks::new(AssignmentCallbacks {
-            ordinary: &ordinary,
-            authored: None,
-        });
-        callbacks.ordinary = OrdinaryCheck::References(&policy);
-        let assignment = Some(AssignmentWalk {
-            cursor,
-            callbacks,
-            coverage: &coverage,
-        });
-        let allocations = cursor_allocations::count(|| {
-            assert!(ReferenceInput::for_walk(true, assignment.as_ref()).is_none());
-        });
-        assert_eq!(allocations, 0);
-    });
 }
 
 #[test]
@@ -368,21 +343,57 @@ fn reference_declaration_is_independent_of_union_trial_order() {
     }
 }
 
-#[test]
-fn recovered_stream_survives_merges_without_changing_primary() {
-    with_source(|cursor, _| {
+fn with_rejected_reference(test: impl FnOnce(CheckedValue<'_>, TypeError)) {
+    with_source(|cursor, knowledge| {
         let attr = CompiledAttributeType::string();
         let error = source_mismatch(&cursor);
-        let checked = PendingReferencedValue(Box::new(ReferenceResult {
-            value: CheckedValue::accepted(&attr, FitExactness::EXACT, FitKind::Failed),
-            reference: Err(error),
-            identity: cursor.identity().unwrap(),
-            key: None,
-        }))
-        .finish(&FieldPath::new(), &ReferenceMemo::default())
-        .into_checked();
+        let ordinary = |_: &CompiledAttributeType,
+                        _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                        _: &LeafPath,
+                        _: AuthoredCursor<'_>| Ok(Default::default());
+        let reference =
+            |_: &CompiledAttributeType,
+             _: &LeafPath,
+             _: SourceReference<'_, RelativeBindingName>| Err(error.clone());
+        let policy = ReferencePolicy::new(
+            &ordinary,
+            ReferenceCheck {
+                schema_source: &|_| true,
+                check: &reference,
+            },
+        );
+        let coverage = Default::default();
+        let mut callbacks = WalkCallbacks::new(AssignmentCallbacks {
+            ordinary: &ordinary,
+            authored: None,
+        });
+        callbacks.ordinary = OrdinaryCheck::References(&policy);
+        let validator = ValueValidator::new(empty_defs_for_schema_walks(), None);
+        let checked = validator.walk_with_assignment(
+            &attr,
+            (&knowledge).into(),
+            &FieldPath::new(),
+            FieldAncestry::WRITABLE,
+            &mut Vec::new(),
+            Some(AssignmentWalk {
+                cursor,
+                callbacks,
+                coverage: &coverage,
+            }),
+        );
+        test(checked, error);
+    });
+}
+
+#[test]
+fn recovered_stream_survives_merges_without_changing_primary() {
+    with_rejected_reference(|checked, _| {
         assert!(checked.accepts());
-        let mut parent = CheckedValue::accepted(&attr, FitExactness::EXACT, FitKind::Failed);
+        let mut parent = CheckedValue::accepted(
+            checked.selected.unwrap(),
+            FitExactness::EXACT,
+            FitKind::Failed,
+        );
         parent.findings.authored.extend(checked.findings.authored);
         assert!(parent.accepts());
         let findings = parent.into_findings();
@@ -599,19 +610,7 @@ fn recovered_stream_deduplicates_authored_uses_after_ordinary_selection() {
 
 #[test]
 fn recovered_reference_never_rejects_an_ordinary_value_or_changes_its_fit() {
-    with_source(|cursor, _| {
-        let attr = CompiledAttributeType::string();
-        let path = FieldPath::new();
-        let error = source_mismatch(&cursor);
-        let ordinary = CheckedValue::accepted(&attr, FitExactness::EXACT, FitKind::Failed);
-        let checked = PendingReferencedValue(Box::new(ReferenceResult {
-            value: ordinary,
-            reference: Err(error.clone()),
-            identity: cursor.identity().unwrap(),
-            key: None,
-        }))
-        .finish(&path, &ReferenceMemo::default())
-        .into_checked();
+    with_rejected_reference(|checked, error| {
         assert!(
             checked.accepts(),
             "reference authority must not enter union fitting"
@@ -622,60 +621,11 @@ fn recovered_reference_never_rejects_an_ordinary_value_or_changes_its_fit() {
         let findings = checked.into_findings();
         assert_eq!(
             findings.clone().into_located(),
-            vec![(path.canonical(), error.clone())]
+            vec![(FieldPath::new().canonical(), error.clone())]
         );
         assert_eq!(
             findings.local_errors().cloned().collect::<Vec<_>>(),
             vec![error]
         );
     });
-}
-
-#[test]
-fn reference_policy_keeps_ordinary_callback_layout() {
-    assert_eq!(
-        std::mem::size_of::<OrdinaryCheck<'_, ParserPlaceholder, RelativeBindingName>>(),
-        std::mem::size_of::<AssignmentCheck<'_, ParserPlaceholder, RelativeBindingName>>()
-    );
-}
-
-#[test]
-fn reference_policy_preserves_ordinary_walk_layout() {
-    struct MainCallbacks<'a> {
-        ordinary: AssignmentCheck<'a, ParserPlaceholder, RelativeBindingName>,
-        authored: Option<AuthoredHook<'a, ParserPlaceholder, RelativeBindingName>>,
-    }
-    struct MainWalk<'a> {
-        cursor: AuthoredCursor<'a>,
-        callbacks: MainCallbacks<'a>,
-        coverage: &'a std::cell::RefCell<WalkCoverage>,
-    }
-    use std::mem::{align_of, offset_of, size_of};
-    type NewCallbacks<'a> = WalkCallbacks<'a, ParserPlaceholder, RelativeBindingName>;
-    type NewWalk<'a> = AssignmentWalk<'a, ParserPlaceholder, RelativeBindingName>;
-    assert_eq!(size_of::<MainCallbacks>(), size_of::<NewCallbacks>());
-    assert_eq!(
-        size_of::<Option<MainCallbacks>>(),
-        size_of::<Option<NewCallbacks>>()
-    );
-    assert_eq!(align_of::<MainCallbacks>(), align_of::<NewCallbacks>());
-    assert_eq!(
-        offset_of!(MainCallbacks, ordinary),
-        offset_of!(NewCallbacks, ordinary)
-    );
-    assert_eq!(
-        offset_of!(MainCallbacks, authored),
-        offset_of!(NewCallbacks, authored)
-    );
-    assert_eq!(size_of::<MainWalk>(), size_of::<NewWalk>());
-    assert_eq!(size_of::<Option<MainWalk>>(), size_of::<Option<NewWalk>>());
-    assert_eq!(offset_of!(MainWalk, cursor), offset_of!(NewWalk, cursor));
-    assert_eq!(
-        offset_of!(MainWalk, callbacks),
-        offset_of!(NewWalk, callbacks)
-    );
-    assert_eq!(
-        offset_of!(MainWalk, coverage),
-        offset_of!(NewWalk, coverage)
-    );
 }

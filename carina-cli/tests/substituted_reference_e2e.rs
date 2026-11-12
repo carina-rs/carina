@@ -166,3 +166,41 @@ fn substituted_constrained_identityless_value_keeps_validate_and_plan_acceptance
         }
     }
 }
+
+#[test]
+fn secret_substituted_reference_masks_its_origin_like_unknown_source() {
+    let consumer = "let sink = mock.test.recovery_probe { value = secret(a.name) }\n";
+    let dir = fixture("let a = mock.test.estimated_input {}\n", consumer);
+    for sibling in [false, true] {
+        for source in [
+            "let a = mock.test.estimated_input {}\n",
+            "let a = mock.test.estimated_input { name = 'abc' }\n",
+        ] {
+            std::fs::write(
+                dir.path().join("sources.crn"),
+                if sibling { source } else { "" },
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join("main.crn"),
+                if sibling {
+                    consumer.to_owned()
+                } else {
+                    format!("{source}{consumer}")
+                },
+            )
+            .unwrap();
+            let (output, text) = run(dir.path(), &["validate", "."]);
+            assert!(!output.status.success(), "{text}");
+            assert_eq!(
+                text.lines()
+                    .filter_map(|line| line.strip_prefix("Error: "))
+                    .collect::<Vec<_>>(),
+                [
+                    "mock.test.recovery_probe.sink: cannot assign String to 'value': expected mock.RecoveryProbe, got String (from (secret))"
+                ],
+                "{text}",
+            );
+        }
+    }
+}

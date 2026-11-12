@@ -118,7 +118,54 @@ fn assert_shape(shape: &str, value: &str) {
     let count = if shape == "module" { 3 } else { 1 };
     assert_eq!(unknown.0.len(), count, "unknown {shape}: {unknown:#?}");
     assert_eq!(unknown.1.len(), count, "unknown {shape}: {unknown:#?}");
+    if shape == "secret" {
+        let message = "cannot assign String to 'value': expected mock.RecoveryProbe, got String (from (secret))";
+        assert_eq!(unknown.0, [format!("mock.Sink.sink: {message}")]);
+        assert_eq!(
+            unknown
+                .1
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["Type mismatch: expected mock.RecoveryProbe, got String"]
+        );
+    }
     assert_eq!(run(true), unknown, "substituted {shape}");
+    if shape == "secret" {
+        std::fs::write(fixture.path().join("sources.crn"), "").unwrap();
+        let same_file = |known| {
+            let source = if known {
+                "let a = mock.Source { name = 'abc' }\n"
+            } else {
+                "let a = mock.Source {}\n"
+            };
+            std::fs::write(
+                fixture.path().join("main.crn"),
+                format!("{source}{consumer}"),
+            )
+            .unwrap();
+            let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+            let mut lsp = lsp_diagnostics(&engine, &fixture, "main.crn");
+            lsp.retain(|diagnostic| !diagnostic.message.starts_with("Unused let binding"));
+            (cli, lsp)
+        };
+        let unknown = same_file(false);
+        assert_eq!(
+            unknown.0,
+            [
+                "mock.Sink.sink: cannot assign String to 'value': expected mock.RecoveryProbe, got String (from (secret))"
+            ]
+        );
+        assert_eq!(
+            unknown
+                .1
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["Type mismatch: expected mock.RecoveryProbe, got String"]
+        );
+        assert_eq!(same_file(true), unknown);
+    }
 }
 
 #[test]

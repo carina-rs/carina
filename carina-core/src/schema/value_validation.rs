@@ -357,6 +357,27 @@ impl SymbolicFinding {
     pub fn diagnostic(&self) -> (&LeafPath, &TypeError) {
         (&self.path, &self.error)
     }
+    /// A reference inside secret uses the ordinary protected type diagnostic.
+    /// Execution retains the masked reference origin in the underlying error.
+    pub fn diagnostic_message(&self) -> String {
+        use crate::resource::SecretDiagnosticError;
+        use crate::validation::admission::AdmissionReferenceError;
+        if let TypeError::Reference { error, .. } = &self.error {
+            if self.origin == SymbolicFindingOrigin::RecoveredReference
+                && matches!(self.path.1, super::LeafPathRendering::Redacted)
+                && let SecretDiagnosticError::Public(AdmissionReferenceError::Computed(
+                    crate::validation::DeferredAccessTypeError::TypeMismatch { types, .. },
+                )) = error.as_ref()
+            {
+                return TypeError::TypeMismatch {
+                    types: types.clone(),
+                }
+                .to_string();
+            }
+            return error.to_string();
+        }
+        self.error.to_string()
+    }
     /// Existing symbolic checks retain main's attribute-wide ownership. A
     /// restored reference owns its exact error, preserving other value errors.
     pub fn covers_path(&self) -> bool {
@@ -776,43 +797,6 @@ struct UnionProviderFailure<'a> {
 }
 
 impl<'a> CheckedValue<'a> {
-    #[inline(never)]
-    fn from_union(
-        attr: &'a CompiledAttributeType,
-        result: Result<AdmittedUnion<'a>, Box<UnionFailure<'a>>>,
-    ) -> Self {
-        match result {
-            Ok(admitted) => {
-                let mut checked = CheckedValue::accepted(
-                    attr,
-                    admitted.selected.fit.exactness,
-                    FitKind::Union {
-                        member: admitted.selected.member,
-                        fit: Arc::new(admitted.selected.fit),
-                    },
-                );
-                checked.findings.assignment = admitted.assignment;
-                checked.findings.authored = admitted.authored;
-                checked.selected = Some(admitted.selected.member);
-                checked
-            }
-            Err(failure) => CheckedValue {
-                local: failure.local.map(|selected| {
-                    Fit::with_kind(
-                        selected.fit.exactness,
-                        attr,
-                        FitKind::Union {
-                            member: selected.member,
-                            fit: Arc::new(selected.fit),
-                        },
-                    )
-                }),
-                findings: failure.findings,
-                selected: failure.selected,
-            },
-        }
-    }
-
     fn accepted(
         attr: &'a CompiledAttributeType,
         exactness: FitExactness,
@@ -1230,12 +1214,6 @@ pub(crate) struct AssignmentFindings {
     pub(crate) deferred: Vec<DeferredHook>,
 }
 impl AssignmentFindings {
-    pub(crate) fn from_errors(errors: impl IntoIterator<Item = (LeafPath, TypeError)>) -> Self {
-        Self {
-            errors: errors.into_iter().collect(),
-            ..Default::default()
-        }
-    }
     pub(crate) fn extend(&mut self, other: Self) {
         self.local.extend(other.local);
         self.schema.extend(other.schema);
@@ -1260,7 +1238,11 @@ impl InsideSecret for AssignmentFindings {
                 })
                 .collect(),
             schema: self.schema,
-            errors: self.errors.inside_secret(),
+            errors: self
+                .errors
+                .into_iter()
+                .map(|(path, error)| (path.inside_secret(), error.inside_secret()))
+                .collect(),
         }
     }
 }
@@ -1374,7 +1356,10 @@ impl<'a, P: ValueKind, B: BindingAddress> AuthoredHook<'a, P, B> {
         let path = path.clone();
         let call = move || match callback(attr, value, &path, cursor) {
             Ok(findings) => findings,
-            Err(error) => AssignmentFindings::from_errors([(path, error)]),
+            Err(error) => AssignmentFindings {
+                errors: vec![(path, error)],
+                ..Default::default()
+            },
         };
         match self.execution {
             HookExecution::Immediate => call(),
@@ -2190,7 +2175,7 @@ impl<'a> ValueValidator<'a, '_> {
             &mut extra,
             &mut wrappers,
         ) {
-            return checked.into_checked();
+            return std::rc::Rc::unwrap_or_clone(checked);
         }
         let node = match value {
             ClassifiedRef::Known(value) => Some(CheckedNode::new(
@@ -2251,7 +2236,7 @@ impl<'a> ValueValidator<'a, '_> {
             }
         }
         authored.extend(extra.authored);
-        for (_, error) in extra.ordinary.errors.iter() {
+        for (_, error) in &extra.ordinary.errors {
             checked.reject(path, error.clone());
         }
         authored.extend(std::mem::take(&mut checked.findings.authored));
@@ -2682,7 +2667,7 @@ impl<'a> ValueValidator<'a, '_> {
         if let AttrTypeKind::UnloadedSchemaType(_) = &attr.kind {
             return CheckedValue::rejected(
                 path,
-                TypeError::from(crate::parser::CustomTypeValidationError::ProvidersNotLoaded),
+                crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into(),
             );
         }
         match value {
@@ -2703,17 +2688,43 @@ impl<'a> ValueValidator<'a, '_> {
             );
         }
         if let AttrTypeKind::Union(members) = &attr.kind {
-            return CheckedValue::from_union(
-                attr,
-                self.union_with_assignment(
-                    members.as_raw_slice(),
-                    value,
-                    path,
-                    ancestry,
-                    visited,
-                    assignment,
-                ),
-            );
+            return match self.union_with_assignment(
+                members.as_raw_slice(),
+                value,
+                path,
+                ancestry,
+                visited,
+                assignment,
+            ) {
+                Ok(admitted) => {
+                    let mut checked = CheckedValue::accepted(
+                        attr,
+                        admitted.selected.fit.exactness,
+                        FitKind::Union {
+                            member: admitted.selected.member,
+                            fit: Arc::new(admitted.selected.fit),
+                        },
+                    );
+                    checked.findings.assignment = admitted.assignment;
+                    checked.findings.authored = admitted.authored;
+                    checked.selected = Some(admitted.selected.member);
+                    checked
+                }
+                Err(failure) => CheckedValue {
+                    local: failure.local.map(|selected| {
+                        Fit::with_kind(
+                            selected.fit.exactness,
+                            attr,
+                            FitKind::Union {
+                                member: selected.member,
+                                fit: Arc::new(selected.fit),
+                            },
+                        )
+                    }),
+                    findings: failure.findings,
+                    selected: failure.selected,
+                },
+            };
         }
         let Some(concrete) = value.concrete() else {
             // Arithmetic has a known numeric result shape even while deferred.
@@ -2777,7 +2788,7 @@ impl<'a> ValueValidator<'a, '_> {
                     .collect::<Result<Vec<_>, _>>()
                 {
                     Ok(classified) => classified,
-                    Err(error) => return CheckedValue::rejected(path, TypeError::from(error)),
+                    Err(error) => return CheckedValue::rejected(path, error.into()),
                 };
                 let cached = classified
                     .iter()
@@ -3028,7 +3039,7 @@ impl<'a> ValueValidator<'a, '_> {
                 .map(|proof| proof.into_classification())
             {
                 Ok(proof) => proof,
-                Err(error) => return CheckedValue::rejected(path, TypeError::from(error)),
+                Err(error) => return CheckedValue::rejected(path, error.into()),
             };
             // The already-visited container covers its keys. Assignment
             // and provider callbacks remain disabled for key validation.

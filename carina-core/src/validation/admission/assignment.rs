@@ -525,9 +525,9 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
             let check =
                 |attr: &CompiledAttributeType,
                  checked: crate::schema::value_validation::CheckValue<'_, P, B>,
-                 relative_path: &LeafPath,
+                 path: &LeafPath,
                  cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
-                    let path = join(&contract.path, relative_path);
+                    let path = join(&contract.path, path);
                     let mut findings = Default::default();
                     // Selection parents are policy-only: main's ordinary local
                     // and reference obligations belong to the selected child.

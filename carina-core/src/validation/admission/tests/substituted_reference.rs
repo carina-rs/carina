@@ -345,8 +345,8 @@ fn substituted_reference_deduplicates_a_non_first_ordinary_error() {
     assert_eq!(reference.len(), 1);
     let reference_error = reference[0].1.clone();
     let actual = with_ordinary_check("Source", "a.name", &|_, _, _, _| {
-        Ok(
-            crate::schema::value_validation::AssignmentFindings::from_errors(vec![
+        Ok(crate::schema::value_validation::AssignmentFindings {
+            errors: vec![
                 (
                     LeafPath::from_segments([]),
                     TypeError::ValidationFailed {
@@ -354,8 +354,9 @@ fn substituted_reference_deduplicates_a_non_first_ordinary_error() {
                     },
                 ),
                 (LeafPath::from_segments([]), reference_error.clone()),
-            ]),
-        )
+            ],
+            ..Default::default()
+        })
     });
     assert_eq!(
         actual
