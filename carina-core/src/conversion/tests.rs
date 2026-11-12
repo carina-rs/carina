@@ -10,7 +10,7 @@ use crate::parser::{
     DeferredForPhaseTraversal, ExportParamLike, File, IdentifiedCustomTypeDeclaration,
     OwnedTypeIdentity, ProviderCustomTypes,
 };
-use crate::resource::knowledge::{KnowledgeContext, collect_classified_attributes};
+use crate::resource::knowledge::KnowledgeContext;
 use crate::resource::{AbsoluteBindingAddress, ConcreteValue, ParserPlaceholder, Value};
 use crate::schema::value_validation::WalkCoverage;
 use crate::schema::{
@@ -340,20 +340,23 @@ where
             .filter(|resource| resource.kind() != crate::parser::AnalysisItemKind::Composition)
         {
             let attributes = resource.attributes();
-            let inputs = ResourceAttributeInputs::new(resource);
-            let classified = collect_classified_attributes(
-                inputs
-                    .values()
-                    .map(|(name, value)| (name.to_owned(), value)),
-                &KnowledgeContext::validation(),
-                |_, _| {},
-            );
+            let inputs = ResourceAttributeInputs::for_resource(resource, judged.report())
+                .map_err(|error| error.to_string())?;
+            let classified = inputs.classify(&KnowledgeContext::validation(), |_, _| {});
             let schema = resource
                 .schema(schemas)
                 .ok_or_else(|| format!("missing fixture schema: {:?}", resource.id()))?;
-            let admitted = crate::validation::admission::attributes::resource_attribute_admissions_with_coverage(
-                resource, judged.file(), schema, &classified, resource.quoted_string_attrs(),
-                &inputs, &bindings, session, schemas, &mut coverage,
+            let admitted = crate::validation::admission::attributes::resource_attribute_admissions(
+                resource,
+                judged.file(),
+                schema,
+                &classified,
+                resource.quoted_string_attrs(),
+                &inputs,
+                &bindings,
+                session,
+                schemas,
+                &mut coverage,
             );
             let local = admitted
                 .errors()
