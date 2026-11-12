@@ -5118,7 +5118,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
 }
 
 #[tokio::test]
-async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
+async fn saved_plan_provider_validation_preserves_typed_source_and_replan_hint() {
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let contents = PlanFileContents {
@@ -5195,9 +5195,22 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
         matches!(&error, AppError::SavedProviderConfig { .. }),
         "ProviderConfigInvariantError must remain typed in AppError: {error:?}"
     );
-    let rendered = error.to_string();
+    let rendered = crate::error::format_error_with_source_chain(&error);
     assert_eq!(rendered.matches("mgmt.region").count(), 1, "{rendered}");
-    assert!(std::error::Error::source(&error).is_none());
+    assert!(
+        std::error::Error::source(&error)
+            .and_then(
+                |source| source.downcast_ref::<carina_core::parser::ProviderConfigInvariantError>()
+            )
+            .is_some()
+    );
+    assert!(
+        rendered
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with("Re-run `carina plan")
+    );
 }
 
 #[tokio::test]

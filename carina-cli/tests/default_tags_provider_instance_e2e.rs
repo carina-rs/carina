@@ -592,7 +592,7 @@ fn issue_4304_3a_cleanup_saved_apply_default_tag_diagnostic_requests_replan() {
     let project = tempfile::tempdir().unwrap();
     fs::write(
         project.path().join("providers.crn"),
-        "provider mock { default_tags = { Owner = \"known\" } }\n",
+        "provider mock { default_tags = { Owner = \"known\", Team = \"known\" } }\n",
     )
     .unwrap();
     fs::write(
@@ -610,7 +610,10 @@ fn issue_4304_3a_cleanup_saved_apply_default_tag_diagnostic_requests_replan() {
         vec![],
     )
     .resolve_root_for_test();
-    json["provider_configs"][0]["default_tags"]["Owner"] = serde_json::to_value(reference).unwrap();
+    for key in ["Owner", "Team"] {
+        json["provider_configs"][0]["default_tags"][key] =
+            serde_json::to_value(&reference).unwrap();
+    }
     let plan = project.path().join("deferred.plan.json");
     fs::write(&plan, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
     let caller = tempfile::tempdir().unwrap();
@@ -625,10 +628,16 @@ fn issue_4304_3a_cleanup_saved_apply_default_tag_diagnostic_requests_replan() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(diagnostic.contains("default_tags.Owner"), "{diagnostic}");
+    assert!(diagnostic.contains("default_tags.Team"), "{diagnostic}");
+    assert_eq!(diagnostic.matches("Re-run").count(), 1, "{diagnostic}");
     let hint = diagnostic
         .lines()
-        .find(|line| line.contains("Re-run") && line.contains("carina plan"))
-        .expect("a terminal recovery hint must name the plan command");
+        .last()
+        .map(|line| line.strip_prefix("Error: ").unwrap_or(line))
+        .filter(|line| line.starts_with("Re-run") && line.contains("carina plan"))
+        .unwrap_or_else(|| {
+            panic!("a terminal recovery hint must name the plan command: {diagnostic}")
+        });
     assert!(
         hint.contains(project.path().to_str().unwrap()),
         "the hint must retain the saved plan's source project: {diagnostic}"

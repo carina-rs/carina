@@ -652,7 +652,9 @@ A struct type represents a nested object with typed fields.
   Default tags for desired inputs must be known when provider configurations resolve; validate
   and LSP reject local apply-time references. Desired configurations retain
   all defaults. Plain plan display may instead use `PlanPreviewProviderConfigs`
-  to omit defaults referring only to missing upstream state, with a warning.
+  to omit individual default values authored as map entries that refer only to
+  missing upstream state, with a warning. Whole-map expressions such as
+  `default_tags = mgmt.tags` must resolve to a map during configuration finalization.
   Preview inputs cannot be saved or dispatched; `plan --out` and `plan --json`
   require strict configurations and reject those missing defaults.
   Destroy, state refresh and state bucket deletion use

@@ -1324,11 +1324,10 @@ pub enum AppError {
     },
 
     /// A saved plan attempted to cross the provider boundary with unresolved config.
-    #[error(
-        "Invalid provider config in saved plan: {error}. Re-run `{replan_command}` to create a new plan."
-    )]
+    #[error("Invalid provider config in saved plan")] // error-chain: caller-renders-sources
     SavedProviderConfig {
-        error: Box<carina_core::parser::ProviderConfigInvariantError>,
+        #[source]
+        error: carina_core::parser::ProviderConfigInvariantError,
         replan_command: String,
     },
 
@@ -1688,11 +1687,22 @@ impl AppError {
 /// boundary. Keeping traversal here also lets collected validation errors
 /// retain the same source detail as directly returned command errors.
 pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static)) -> String {
-    let mut messages = vec![error.to_string()];
-    let mut source = error.source();
+    let mut messages = Vec::new();
+    let mut source = Some(error);
+    let mut replan_command = None;
     while let Some(current) = source {
         messages.push(current.to_string());
+        if let Some(AppError::SavedProviderConfig {
+            replan_command: command,
+            ..
+        }) = current.downcast_ref::<AppError>()
+        {
+            replan_command.get_or_insert(command);
+        }
         source = current.source();
+    }
+    if let Some(command) = replan_command {
+        messages.push(format!("Re-run `{command}` to create a new plan."));
     }
     messages.join("\n")
 }
@@ -1781,6 +1791,51 @@ mod tests {
     use super::*;
     use crate::provider_text_fixtures::BindProviderText;
     use carina_core::provider::HostError as ProviderError;
+
+    #[test]
+    fn issue_4304_3a_review5_saved_provider_findings_precede_one_final_replan_hint() {
+        use carina_core::parser::{
+            ProviderConfig, ProviderConfigInvariantError, ResolvedProviderConfigs,
+        };
+        use carina_core::resource::{NoPlaceholder, RelativeBindingName, Value};
+        let reference = |attribute: &str| {
+            Value::<NoPlaceholder, RelativeBindingName>::resource_ref(
+                RelativeBindingName::new("mgmt"),
+                attribute,
+                vec![],
+            )
+            .resolve_root_for_test()
+        };
+        let config = ProviderConfig {
+            name: "mock".into(),
+            attributes: indexmap::IndexMap::from([("region".into(), reference("region"))]),
+            default_tags: indexmap::IndexMap::from([("Owner".into(), reference("owner"))]),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: indexmap::IndexMap::new(),
+            binding: None,
+        };
+        let source = ResolvedProviderConfigs::validate_known(&[config]).unwrap_err();
+        let error = AppError::SavedProviderConfig {
+            error: source,
+            replan_command: "carina plan .".into(),
+        };
+        let rendered = format_error_with_source_chain(&error);
+        assert_eq!(
+            rendered.lines().last(),
+            Some("Re-run `carina plan .` to create a new plan."),
+            "{rendered}"
+        );
+        for finding in ["mgmt.region", "mgmt.owner", "default_tags.Owner"] {
+            assert_eq!(rendered.matches(finding).count(), 1, "{rendered}");
+        }
+        assert_eq!(rendered.matches("Re-run").count(), 1);
+        let source = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<ProviderConfigInvariantError>())
+            .expect("saved-plan errors must retain their typed provider-config source");
+        assert_eq!(source.to_string().lines().count(), 2);
+    }
 
     #[test]
     fn app_errors_stay_within_clippy_large_error_threshold() {

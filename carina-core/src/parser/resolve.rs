@@ -340,8 +340,10 @@ impl PlanProviderConfigurations for ResolvedProviderConfigs {
     }
 }
 
-/// Display-only inputs may omit defaults referring exclusively to missing
-/// upstream state. They cannot be saved or authorize desired-input dispatch.
+/// Display-only inputs may omit individual default values authored as map
+/// entries and referring exclusively to missing upstream state. Whole-map
+/// expressions still require resolution. Preview inputs cannot be saved or
+/// authorize desired-input dispatch.
 ///
 /// ```compile_fail,E0277
 /// use carina_core::parser::{PlanPreviewProviderConfigs, SavedProviderConfigs};
@@ -720,6 +722,39 @@ mod saved_provider_config_secret_tests {
     }
 
     #[test]
+    fn issue_4304_3a_review5_whole_map_wrong_shape_has_a_typed_provider_error() {
+        let mut config = provider("unused");
+        config.attributes.clear();
+        config.default_tags.clear();
+        config.unresolved_attributes.insert(
+            DEFAULT_TAGS_ATTRIBUTE.into(),
+            RuntimeValue::Concrete(GenericConcreteValue::String("private-invalid-map".into())),
+        );
+        let file = crate::parser::ExpandedInferredFile {
+            providers: vec![config],
+            ..Default::default()
+        };
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let error = crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            ResolvedProviderConfigs::resolve_with_remote(
+                &file,
+                &crate::upstream_exports::remote_bindings_for_test(HashMap::new()),
+                session,
+            )
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&error, ProviderConfigResolutionError::Invariant(_)),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "provider mock: default_tags must resolve to a map"
+        );
+        assert!(!format!("{error:?}").contains("private-invalid-map"));
+    }
+
+    #[test]
     fn issue_4304_3a_cleanup_provider_knownness_has_one_error_shape() {
         let mut config = provider("unused");
         config.attributes.clear();
@@ -956,6 +991,9 @@ pub enum ProviderConfigInvariantError {
 
     #[error(transparent)]
     UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
+
+    #[error("provider {provider}: {attribute} must resolve to a map")]
+    ExpectedMap { provider: String, attribute: String },
 
     // Composite leaf: retain the typed knownness error and render it once.
     #[error("provider {provider}: {attribute}: {error}")]
@@ -3032,7 +3070,7 @@ impl ResolvedProviderConfigs {
 }
 
 impl PlanPreviewProviderConfigs {
-    /// Preview may omit defaults whose only dependencies are absent upstreams.
+    /// Preview may omit map entries whose only dependencies are absent upstreams.
     /// The result carries no authority to save or execute a desired input.
     pub fn resolve_with_remote<E, D>(
         parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>,
@@ -3084,12 +3122,9 @@ fn resolve_desired_provider_configs<E, D>(
                         DEFAULT_TAGS_ATTRIBUTE,
                         &value,
                     )?;
-                    return Err(ParseError::InvalidExpression {
-                        line: 0,
-                        message: format!(
-                            "provider {}: {DEFAULT_TAGS_ATTRIBUTE} must resolve to a map",
-                            provider.name
-                        ),
+                    return Err(ProviderConfigInvariantError::ExpectedMap {
+                        provider: provider.name.clone(),
+                        attribute: DEFAULT_TAGS_ATTRIBUTE.into(),
                     }
                     .into());
                 }
