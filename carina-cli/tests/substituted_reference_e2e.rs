@@ -80,7 +80,7 @@ fn substituted_reference_validate_matches_unknown_source_verdicts_and_messages()
             "let r = mock.test.reference { name = 'r' }",
             "let r = mock.test.reference { name = 'r' key = 'k' }",
             "r.key",
-            true,
+            false,
         ),
     ] {
         for sibling in [false, true] {
@@ -113,7 +113,14 @@ fn substituted_reference_validate_matches_unknown_source_verdicts_and_messages()
             if !accepted {
                 let expected: Vec<_> = control_errors
                     .iter()
-                    .map(|message| message.replace("a.computed", reference))
+                    .map(|message| {
+                        let message = message.replace("a.computed", reference);
+                        if reference == "r.key" {
+                            message.replace("String", "mock.keys.Key.Reference")
+                        } else {
+                            message
+                        }
+                    })
                     .collect();
                 assert_eq!(unknown_errors, expected);
             }
@@ -202,5 +209,28 @@ fn secret_substituted_reference_masks_its_origin_like_unknown_source() {
                 "{text}",
             );
         }
+    }
+}
+
+#[test]
+fn issue_4384_reference_to_identified_string_is_rejected_by_validate() {
+    let main = "mock.test.recovery_probe { value = r.key }\n";
+    let dir = fixture("let r = mock.test.reference { name = 'r' }\n", main);
+    for source in [
+        "let r = mock.test.reference { name = 'r' }\n",
+        "let r = mock.test.reference { name = 'r' key = 'k' }\n",
+    ] {
+        std::fs::write(dir.path().join("sources.crn"), source).unwrap();
+        let (output, text) = run(dir.path(), &["validate", "."]);
+        assert!(!output.status.success(), "{source}{main}\n{text}");
+        assert_eq!(
+            text.lines()
+                .filter_map(|line| line.strip_prefix("Error: "))
+                .collect::<Vec<_>>(),
+            [
+                "mock.test.recovery_probe.<pending>: cannot assign mock.keys.Key.Reference to 'value': expected mock.RecoveryProbe, got mock.keys.Key.Reference (from r.key)"
+            ],
+            "{text}"
+        );
     }
 }

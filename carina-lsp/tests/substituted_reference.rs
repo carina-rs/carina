@@ -91,11 +91,7 @@ fn substituted_reference_diagnostics_match_unknown_source_wording_severity_and_r
             };
             write("");
             let unknown = findings();
-            assert_eq!(
-                unknown.len(),
-                usize::from(source_type != "Reference"),
-                "{source_type}: {unknown:#?}"
-            );
+            assert_eq!(unknown.len(), 1, "{source_type}: {unknown:#?}");
             if let Some(diagnostic) = unknown.first() {
                 assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
                 assert_eq!(diagnostic.range.start.line, if sibling { 1 } else { 2 });
