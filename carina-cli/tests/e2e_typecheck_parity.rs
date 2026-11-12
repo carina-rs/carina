@@ -49,6 +49,15 @@ mod seam_round1;
 #[path = "e2e_typecheck_parity/seam_round3.rs"]
 mod seam_round3;
 
+#[path = "e2e_typecheck_parity/substituted_reference.rs"]
+mod substituted_reference;
+
+#[path = "e2e_typecheck_parity/nested_reference.rs"]
+mod nested_reference;
+
+#[path = "e2e_typecheck_parity/recovered_composition.rs"]
+mod recovered_composition;
+
 // ============================================================================
 // Fixture + helpers (mirror carina-lsp/tests/e2e_typecheck.rs)
 // ============================================================================

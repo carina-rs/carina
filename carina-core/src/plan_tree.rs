@@ -719,7 +719,10 @@ mod tests {
             target_id,
             until: WaitPredicate::equals(
                 AttrPath::single("identifier"),
-                Value::Concrete(ConcreteValue::String("ready".into())),
+                serde_json::from_value::<crate::wait::WaitRhs>(
+                    serde_json::json!({"String": "'ready'"}),
+                )
+                .unwrap(),
             )
             .expect("valid wait predicate"),
             until_surface: "actual.identifier == 'ready'".to_string(),
@@ -1240,7 +1243,10 @@ mod tests {
             ),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
-                Value::Concrete(ConcreteValue::String("ready".into())),
+                serde_json::from_value::<crate::wait::WaitRhs>(
+                    serde_json::json!({"String": "'ready'"}),
+                )
+                .unwrap(),
             )
             .unwrap(),
             until_surface: "status == 'ready'".to_string(),

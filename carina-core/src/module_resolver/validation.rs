@@ -318,13 +318,14 @@ pub fn evaluate_module_constraints<P: PlaceholderKind, B: BindingAddress>(
             for argument in arguments {
                 for (ordinal, validation) in argument.validations.iter().enumerate() {
                     definitions.push((
-                        PendingModuleConstraint {
-                            id: ModuleConstraintId::argument_validation(&argument.name, ordinal),
-                            expression: validation.condition.clone(),
-                            message: validation.error_message.clone().unwrap_or_else(|| {
+                        PendingModuleConstraint::argument_validation(
+                            &argument.name,
+                            ordinal,
+                            validation.condition.clone(),
+                            validation.error_message.clone().unwrap_or_else(|| {
                                 format!("validation failed for argument '{}'", argument.name)
                             }),
-                        },
+                        ),
                         ModuleConstraintKind::ArgumentValidation {
                             argument: argument.name.clone(),
                         },
@@ -334,11 +335,11 @@ pub fn evaluate_module_constraints<P: PlaceholderKind, B: BindingAddress>(
             }
             for (ordinal, require) in requires.iter().enumerate() {
                 definitions.push((
-                    PendingModuleConstraint {
-                        id: ModuleConstraintId::require(ordinal),
-                        expression: require.condition.clone(),
-                        message: require.error_message.to_string(),
-                    },
+                    PendingModuleConstraint::require(
+                        ordinal,
+                        require.condition.clone(),
+                        require.error_message.clone(),
+                    ),
                     ModuleConstraintKind::Require,
                     declared_arguments.clone(),
                 ));
@@ -579,16 +580,12 @@ fn evaluate_pending_constraint_views<'a>(
             .pending_constraints()
             .iter()
             .map(|constraint| {
-                Ok(PendingModuleConstraint {
-                    id: constraint.id.clone(),
-                    expression: resolve_bound_constraint_values(
-                        constraint.expression(),
-                        bindings,
-                        &mut resolution_errors,
-                        session,
-                    )?,
-                    message: constraint.message.clone(),
-                })
+                Ok(constraint.with_expression(resolve_bound_constraint_values(
+                    constraint.expression(),
+                    bindings,
+                    &mut resolution_errors,
+                    session,
+                )?))
             })
             .collect::<Result<Vec<_>, crate::resource::UnavailableSecretError>>()
             .map_err(|error| ModuleConstraintResolutionError {
@@ -947,7 +944,7 @@ fn eval_expr<P: PlaceholderKind, B: BindingAddress>(
         ValidateExpr::Int(value) => Ok(value_from(ConcreteValue::Int(*value))),
         ValidateExpr::Float(value) => Ok(value_from(ConcreteValue::Float(*value))),
         ValidateExpr::Duration(value) => Ok(value_from(ConcreteValue::Duration(*value))),
-        ValidateExpr::String(value) => Ok(value_from(ConcreteValue::String(value.clone().into()))),
+        ValidateExpr::String(value) => Ok(value_from(ConcreteValue::String(value.as_str().into()))),
         ValidateExpr::Null => Ok(EvalValue::Null),
         ValidateExpr::Var(name) => arguments
             .get(name)
@@ -1598,7 +1595,9 @@ mod tests {
         let expression = ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::Var("password".to_string())),
             op: CompareOp::Eq,
-            rhs: Box::new(ValidateExpr::String("expected".to_string())),
+            rhs: Box::new(ValidateExpr::String(
+                serde_json::from_value(serde_json::json!("'expected'")).unwrap(),
+            )),
         };
         let arguments = HashMap::from([(
             "password".to_string(),

@@ -345,7 +345,7 @@ fn review_2_saved_apply_allows_known_to_unchecked_admission_change() {
 
     let saved: serde_json::Value =
         serde_json::from_slice(&fs::read(downstream.join("saved.plan")).unwrap()).unwrap();
-    assert_eq!(saved["version"], serde_json::json!(44));
+    assert_eq!(saved["version"], serde_json::json!(45));
     let sources = saved["upstream_sources"].as_array().unwrap();
     assert_eq!(sources.len(), 1);
     assert_eq!(
@@ -356,7 +356,7 @@ fn review_2_saved_apply_allows_known_to_unchecked_admission_change() {
             .map(String::as_str)
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from(["binding", "source"]),
-        "format 44 must not acquire source-type evidence fields",
+        "format 45 must not acquire source-type evidence fields",
     );
 }
 

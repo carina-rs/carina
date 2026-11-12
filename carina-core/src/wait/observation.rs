@@ -130,7 +130,10 @@ mod tests {
     fn equals_predicate(attr: AttrPath, value: &str) -> WaitPredicate {
         WaitPredicate::equals(
             attr,
-            crate::resource::Value::Concrete(ConcreteValue::String(value.into())),
+            serde_json::from_value::<crate::wait::WaitRhs>(
+                serde_json::json!({"String": format!("'{value}'")}),
+            )
+            .unwrap(),
         )
         .unwrap()
     }

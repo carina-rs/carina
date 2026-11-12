@@ -152,7 +152,8 @@ fn target_lookup_reports_missing_when_no_binding_or_identity_matches() {
 fn equals_returns_true_when_attribute_matches() {
     let pred = WaitPredicate::equals(
         AttrPath::single("status"),
-        Value::Concrete(ConcreteValue::String("ISSUED".into())),
+        serde_json::from_value::<crate::wait::WaitRhs>(serde_json::json!({"String": "'ISSUED'"}))
+            .unwrap(),
     )
     .unwrap();
     let mut attrs = HashMap::new();
@@ -167,7 +168,8 @@ fn equals_returns_true_when_attribute_matches() {
 fn equals_returns_false_when_attribute_differs() {
     let pred = WaitPredicate::equals(
         AttrPath::single("status"),
-        Value::Concrete(ConcreteValue::String("ISSUED".into())),
+        serde_json::from_value::<crate::wait::WaitRhs>(serde_json::json!({"String": "'ISSUED'"}))
+            .unwrap(),
     )
     .unwrap();
     let mut attrs = HashMap::new();
@@ -182,7 +184,8 @@ fn equals_returns_false_when_attribute_differs() {
 fn equals_returns_false_when_attribute_absent() {
     let pred = WaitPredicate::equals(
         AttrPath::single("status"),
-        Value::Concrete(ConcreteValue::String("ISSUED".into())),
+        serde_json::from_value::<crate::wait::WaitRhs>(serde_json::json!({"String": "'ISSUED'"}))
+            .unwrap(),
     )
     .unwrap();
     let attrs: HashMap<String, Value> = HashMap::new();

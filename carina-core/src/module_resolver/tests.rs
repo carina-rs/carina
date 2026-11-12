@@ -4755,7 +4755,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
             until_predicate: UntilPredicateAst {
                 root: "vpc".into(),
                 attribute_segments: vec!["state".to_string()],
-                rhs: Value::Concrete(ConcreteValue::String("available".into())),
+                rhs: serde_json::from_value(serde_json::json!({"String": "'available'"})).unwrap(),
             },
             timeout_secs: Some(300),
             depends_on: UnexpandedDependencies::new_for_test(vec![
@@ -5966,7 +5966,7 @@ fn test_argument_validation_with_resource_reference_is_pending() {
             let constraints = &expanded.compositions[0].signature.pending_constraints;
             assert_eq!(constraints.len(), 1);
             assert_eq!(
-                constraints[0].id,
+                constraints[0].id().clone(),
                 crate::resource::ModuleConstraintId::argument_validation("port", 0)
             );
             assert_eq!(
@@ -6028,9 +6028,10 @@ let root = outer { outer_port = producer.port }
                 ),
             )]),
             attributes: IndexMap::new(),
-            pending_constraints: vec![PendingModuleConstraint {
-                id: ModuleConstraintId::argument_validation("port", 0),
-                expression: ValidateExpr::Compare {
+            pending_constraints: vec![PendingModuleConstraint::argument_validation(
+                "port",
+                0,
+                ValidateExpr::Compare {
                     lhs: Box::new(ValidateExpr::FunctionCall {
                         name: "length".to_string(),
                         args: vec![ValidateExpr::Var("port".to_string())],
@@ -6038,8 +6039,8 @@ let root = outer { outer_port = producer.port }
                     op: CompareOp::Gt,
                     rhs: Box::new(ValidateExpr::Int(0)),
                 },
-                message: "port must not be empty".to_string(),
-            }],
+                "port must not be empty".to_string(),
+            )],
         },
         binding: Some("inner".into()),
         dependency_bindings: BTreeSet::new(),
@@ -6121,7 +6122,7 @@ let root = outer { outer_port = producer.port }
             );
             let constraint = &nested.signature.pending_constraints[0];
             assert_eq!(
-                constraint.id,
+                constraint.id().clone(),
                 ModuleConstraintId::argument_validation("port", 0)
             );
             assert_eq!(
@@ -11615,7 +11616,10 @@ let reader = mock.test.Consumer { name = consumer.observed_name }
         target_id: resolved_wait.target_id,
         until: crate::wait::predicate::WaitPredicate::equals(
             crate::wait::predicate::AttrPath::single("status"),
-            Value::Concrete(ConcreteValue::String("ready".to_string().into())),
+            serde_json::from_value::<crate::wait::WaitRhs>(
+                serde_json::json!({"String": "'ready'"}),
+            )
+            .unwrap(),
         )
         .expect("valid wait predicate"),
         until_surface: resolved_wait.until_raw,

@@ -1908,7 +1908,10 @@ mod tests {
                     target_id: managed_wait_target(cert_id.clone()),
                     until: WaitPredicate::equals(
                         AttrPath::single("status"),
-                        Value::Concrete(ConcreteValue::String("ISSUED".into())),
+                        serde_json::from_value::<crate::wait::WaitRhs>(
+                            serde_json::json!({"String": "'ISSUED'"}),
+                        )
+                        .unwrap(),
                     )
                     .unwrap(),
                     until_surface: "cert.status == ISSUED".to_string(),
@@ -2032,7 +2035,10 @@ mod tests {
                     target_id: managed_wait_target(cert_id.clone()),
                     until: WaitPredicate::equals(
                         AttrPath::single("status"),
-                        Value::Concrete(ConcreteValue::String("ISSUED".into())),
+                        serde_json::from_value::<crate::wait::WaitRhs>(
+                            serde_json::json!({"String": "'ISSUED'"}),
+                        )
+                        .unwrap(),
                     )
                     .unwrap(),
                     until_surface: "cert.status == ISSUED".to_string(),
@@ -2051,7 +2057,8 @@ mod tests {
                         until_predicate: crate::parser::UntilPredicateAst {
                             root: absolute("cert"),
                             attribute_segments: vec!["status".to_owned()],
-                            rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
+                            rhs: serde_json::from_value(serde_json::json!({"String": "'ISSUED'"}))
+                                .unwrap(),
                         },
                         timeout_secs: None,
                         depends_on: Default::default(),

@@ -114,7 +114,7 @@ pub(in crate::parser) fn parse_arguments_block(
                                                     let location =
                                                         ctx.declaration_location(&validate_pair);
                                                     rule = Some((
-                                                        parse_validate_expr(validate_pair, ctx)?,
+                                                        parse_validate_expr(validate_pair, ctx, crate::parser::ConstraintStringPosition::ValidationCondition)?,
                                                         source_span,
                                                         location,
                                                     ));

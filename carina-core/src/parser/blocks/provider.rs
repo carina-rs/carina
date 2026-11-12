@@ -232,10 +232,17 @@ pub(in crate::parser) fn parse_require_statement(
     // beginning of a potentially multi-line `require` statement.
     let source_span = crate::parser::SourceSpan::from_pest(&condition_pair, preprocessed_file);
     let location = ctx.declaration_location(&condition_pair);
-    let condition = parse_validate_expr(condition_pair, ctx)?;
+    let condition = parse_validate_expr(
+        condition_pair,
+        ctx,
+        crate::parser::ConstraintStringPosition::RequireCondition,
+    )?;
     let message_pair = next_pair(&mut inner, "string", "require statement")?;
-    let error_message =
-        crate::parser::AuthoredExpressionText::redact(message_pair, None).string_contents();
+    let error_message = crate::parser::expressions::validate_expr::parse_constraint_string(
+        message_pair,
+        ctx,
+        crate::parser::ConstraintStringPosition::RequireMessage,
+    )?;
     Ok(RequireBlock::new_in_source(
         condition,
         error_message,

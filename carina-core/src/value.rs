@@ -2938,7 +2938,8 @@ pub(crate) fn unresolved_effect_contains_redacted_secret(
         UnresolvedSavedEffect::ReleaseListKeys { keys, .. } => keys
             .iter()
             .any(|key| contains_redacted_secret(key.retained_value())),
-        UnresolvedSavedEffect::Wait { until, .. } => contains_redacted_secret(until.value()),
+        // Closed wait scalars cannot contain a secret placeholder.
+        UnresolvedSavedEffect::Wait { .. } => false,
         UnresolvedSavedEffect::DeferredCreate(payload) => {
             deferred_template_contains_redacted_secret(&payload.template)
         }
@@ -3011,12 +3012,12 @@ pub(crate) fn effect_contains_redacted_secret<S, V: crate::resource::PlanValueKi
         Effect::Wait {
             id: _id,
             target_id: _target_id,
-            until,
+            until: _until,
             until_surface: _until_surface,
             timeout: _timeout,
             interval: _interval,
             explicit_dependencies: _explicit_dependencies,
-        } => contains_redacted_secret(until.value()),
+        } => false,
         Effect::DeferredCreate(payload) => {
             deferred_template_contains_redacted_secret(&payload.template)
         }
@@ -4185,13 +4186,11 @@ fn snapshot_constraints(
     constraints
         .iter()
         .map(|constraint| {
-            Ok(crate::resource::PendingModuleConstraint {
-                id: constraint.id.clone(),
-                message: constraint.message.clone(),
-                expression: constraint
+            Ok(constraint.with_expression(
+                constraint
                     .expression
                     .try_map_stage(&mut redact_secrets_in_value)?,
-            })
+            ))
         })
         .collect()
 }
@@ -4325,7 +4324,7 @@ pub fn rehydrate_saved_composition_with_candidate(
                     .signature
                     .pending_constraints
                     .iter()
-                    .find(|candidate| candidate.id == constraint.id)
+                    .find(|candidate| candidate.id() == constraint.id())
             }) {
                 // Operand spelling is diagnostic metadata. Match each
                 // argument's occurrences in authored traversal order.
@@ -4344,16 +4343,12 @@ pub fn rehydrate_saved_composition_with_candidate(
                         format!(
                             "{}.constraints.{}.{operand}",
                             saved.id,
-                            constraint.id.as_str(),
+                            constraint.id().as_str(),
                         ),
                     )
                 },
             )?;
-            Ok(crate::resource::PendingModuleConstraint {
-                id: constraint.id.clone(),
-                message: constraint.message.clone(),
-                expression,
-            })
+            Ok(constraint.with_expression(expression))
         })
         .collect::<Result<_, SecretRehydrationSiteError>>()?;
     Ok(saved

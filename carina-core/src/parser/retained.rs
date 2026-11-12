@@ -61,7 +61,9 @@ pub use cursor::{
     JudgedNodeRef, JudgedSlot, NoAuthoredEvidence, NodeId, ProjectedPhase, ProjectionGeneration,
     SlotDeclarationId, UnreachedSlot, UseId,
 };
-pub(crate) use cursor::{AuthoredForm, AuthoredNavigation, CursorKind, SyntheticSource};
+pub(crate) use cursor::{
+    AuthoredForm, AuthoredNavigation, CursorKind, SourceReference, SyntheticSource,
+};
 
 /// The existing authored walk owns source diagnostics for expressions that
 /// require its policy. This is diagnostic ownership, not an admission proof.

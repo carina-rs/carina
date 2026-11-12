@@ -31,7 +31,6 @@ type RuntimeInterpolationPart =
     crate::resource::InterpolationPart<NoPlaceholder, AbsoluteBindingAddress>;
 type RuntimeInferredExportParam =
     crate::parser::InferredExportParam<NoPlaceholder, AbsoluteBindingAddress>;
-type RelativeRuntimeValue = GenericValue<NoPlaceholder, RelativeBindingName>;
 
 #[test]
 fn round9_admission_locations_use_linear_resource_work() {
@@ -7193,9 +7192,7 @@ fn attribute_param_ref_types_flags_unknown_attribute_through_wait_binding() {
         until_predicate: UntilPredicateAst {
             root: "cert".into(),
             attribute_segments: vec!["status".to_string()],
-            rhs: RelativeRuntimeValue::Concrete(crate::resource::ConcreteValue::String(
-                "issued".into(),
-            )),
+            rhs: serde_json::from_value(serde_json::json!({"String": "'issued'"})).unwrap(),
         },
         timeout_secs: None,
         depends_on: Default::default(),
@@ -8595,9 +8592,7 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
         until_predicate: UntilPredicateAst {
             root: "cert".into(),
             attribute_segments: vec!["status".to_string()],
-            rhs: RelativeRuntimeValue::Concrete(crate::resource::ConcreteValue::String(
-                "issued".into(),
-            )),
+            rhs: serde_json::from_value(serde_json::json!({"String": "'issued'"})).unwrap(),
         },
         timeout_secs: None,
         depends_on: Default::default(),

@@ -683,10 +683,15 @@ A struct type represents a nested object with typed fields.
   identity/member labels; identified leaves show every identity-conjunction
   pattern. Shared provider docgen
   must render both layers too. This change needs no WIT change.
-  Schema fingerprints use v13 and saved plans use format 44; format 43 plans
+  Schema fingerprints use v13 and saved plans use format 45; format 44 plans
   must fail the version gate before decoding the payload. Saved module
-  `pending_constraints` contain `ValidateExpr` values, not retained types;
-  replay reloads refinement layers from fingerprint-checked provider schemas.
+  `pending_constraints` contain `ValidateExpr` values, not retained types.
+  Condition strings, `require` messages, and wait RHS strings retain checked
+  quoted source so decoding can reject interpolation.
+  Core literal and wait-operand decode errors state only the problem; the
+  saved-plan CLI renders recovery commands with `hint::ProjectCommand`, using
+  the recorded project path and supplied plan-file path.
+  Replay reloads refinement layers from fingerprint-checked provider schemas.
   Every typed sink uses the same String/Int identity-admission rule for
   equal identities and allowed widenings (#4349), including annotations,
   exports, module arguments, and function parameters/returns. Resource/data-source

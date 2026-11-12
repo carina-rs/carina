@@ -62,9 +62,55 @@ impl ProviderFactory for ConversionFactory {
                     .build(),
                 )
                 .attribute(AttributeSchema::optional("plain", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::optional(
+                        "config",
+                        AttributeType::struct_(
+                            "Config",
+                            vec![
+                                StructField::optional("converted", name()).build(),
+                                StructField::optional("plain", name()).build(),
+                                StructField::optional(
+                                    "nested",
+                                    AttributeType::struct_(
+                                        "Nested",
+                                        vec![StructField::optional("bad", name()).build()],
+                                    ),
+                                )
+                                .build(),
+                            ],
+                        ),
+                    )
+                    .build(),
+                )
                 .validate()
                 .unwrap(),
             ResourceSchema::new("Source")
+                .attribute(
+                    AttributeSchema::optional(
+                        "name",
+                        AttributeType::refined_string(
+                            Some(TypeIdentity::from_dotted("mock.OtherName")),
+                            None,
+                            Some((Some(1), Some(8))),
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .attribute(
+                    AttributeSchema::optional(
+                        "alternate",
+                        AttributeType::refined_string(
+                            Some(TypeIdentity::from_dotted("mock.OtherName")),
+                            None,
+                            Some((Some(1), Some(8))),
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .attribute(AttributeSchema::optional("number", AttributeType::int()).build())
                 .attribute(
                     AttributeSchema::optional(
                         "output",
@@ -408,4 +454,149 @@ fn round3_parse_rejection_survives_an_ordinary_early_failure() {
         "{}",
         report.json
     );
+}
+
+fn merge_1b_reference_findings(
+    attributes: &str,
+) -> (serde_json::Value, Vec<tower_lsp::lsp_types::Diagnostic>) {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    std::fs::write(
+        directory.path().join("sources.crn"),
+        "let other = mock.Source { name = 'ok' alternate = 'also' number = 42 }\n",
+    )
+    .unwrap();
+    let source = format!("let sink = mock.Sink {{ {attributes} }}\n");
+    let path = directory.path().join("main.crn");
+    std::fs::write(&path, &source).unwrap();
+    let report = carina_cli::commands::validate::validate_diagnostics_with_factories(
+        &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+        carina_cli::wiring::LoadedProviderFactory::for_test(factories()),
+        HashMap::new(),
+    );
+    let loaded = loaded_provider_snapshot_from_factories(
+        Arc::new(factories()),
+        SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
+    );
+    let engine =
+        carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+    let document = carina_lsp::document::Document::new_with_path(
+        source,
+        path.clone(),
+        Arc::new(carina_core::parser::ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
+    );
+    let diagnostics = engine
+        .analyze(&document, Some(&path))
+        .into_iter()
+        .filter(|diagnostic| {
+            matches!(
+                diagnostic.severity,
+                Some(DiagnosticSeverity::ERROR | DiagnosticSeverity::WARNING)
+            ) && !diagnostic.message.starts_with("Unused let binding")
+        })
+        .collect();
+    (report.json, diagnostics)
+}
+
+#[test]
+fn merge_1b_accepted_reference_claim_suppresses_only_its_reference_rule() {
+    for operand in ["other.name", "((other.name))"] {
+        let (json, lsp) = merge_1b_reference_findings(&format!("attr = {operand}"));
+        let ordinary = json["errors"].as_array().unwrap();
+        assert_eq!(ordinary.len(), 1, "{json}");
+        assert_eq!(ordinary[0]["code"], serde_json::Value::Null, "{json}");
+        assert!(
+            ordinary[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("OtherName"),
+            "{json}"
+        );
+        assert_eq!(lsp.len(), 1, "{lsp:?}");
+        assert!(lsp[0].message.contains("OtherName"), "{lsp:?}");
+    }
+    for operand in [
+        "other.name as mock.Name",
+        "((other.name as mock.Name))",
+        "(other.name) as mock.Name",
+    ] {
+        let (json, lsp) = merge_1b_reference_findings(&format!("attr = {operand}"));
+        assert_eq!(json["status"], "ok", "{json}");
+        assert!(
+            json.get("errors")
+                .is_none_or(|errors| errors.as_array().is_some_and(Vec::is_empty)),
+            "{json}"
+        );
+        assert!(lsp.is_empty(), "{lsp:?}");
+    }
+}
+
+#[test]
+fn merge_1b_rejected_reference_claim_has_one_conversion_diagnostic() {
+    for (operand, code) in [
+        ("other.number as mock.Name", "conversion_scalar_kind"),
+        ("((other.name as mock.OtherName))", "conversion_destination"),
+    ] {
+        let (json, lsp) = merge_1b_reference_findings(&format!("attr = {operand}"));
+        let errors = json["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{json}");
+        assert_eq!(errors[0]["code"], code, "{json}");
+        assert_eq!(lsp.len(), 1, "{lsp:?}");
+        assert_eq!(
+            lsp[0].code,
+            Some(tower_lsp::lsp_types::NumberOrString::String(code.into())),
+            "{lsp:?}"
+        );
+    }
+}
+
+#[test]
+fn merge_1b_claim_preserves_sibling_and_nested_reference_judgements() {
+    for (attributes, conversions) in [
+        (
+            "config = { converted = (other.name as mock.Name) plain = other.name nested = { bad = other.alternate } }",
+            0,
+        ),
+        (
+            "config = { converted = (other.number as mock.Name) plain = other.name nested = { bad = other.alternate } }",
+            1,
+        ),
+        (
+            "config = ({ plain = other.name nested = { bad = other.alternate } } as mock.Name)",
+            1,
+        ),
+    ] {
+        let (json, lsp) = merge_1b_reference_findings(attributes);
+        let errors = json["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 2 + conversions, "{json}");
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error["code"]
+                    .as_str()
+                    .is_some_and(|code| code.starts_with("conversion_")))
+                .count(),
+            conversions,
+            "{json}"
+        );
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error["message"].as_str().unwrap().contains("OtherName"))
+                .count(),
+            2,
+            "{json}"
+        );
+        assert_eq!(lsp.len(), 2 + conversions, "{lsp:?}");
+        assert_eq!(
+            lsp.iter()
+                .filter(|diagnostic| diagnostic.message.contains("OtherName"))
+                .count(),
+            2,
+            "{lsp:?}"
+        );
+    }
 }

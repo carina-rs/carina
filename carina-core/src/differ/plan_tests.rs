@@ -4961,7 +4961,7 @@ fn wait_binding_lowers_to_wait_effect() {
         until_predicate: UntilPredicateAst {
             root: absolute_binding("cert"),
             attribute_segments: vec!["status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("ready".into())),
+            rhs: serde_json::from_value(serde_json::json!({"String": "'ready'"})).unwrap(),
         },
         timeout_secs: Some(75 * 60),
         depends_on: Default::default(),
@@ -5014,7 +5014,10 @@ fn wait_binding_lowers_to_wait_effect() {
         until,
         &WaitPredicate::equals(
             AttrPath::single("status"),
-            Value::Concrete(ConcreteValue::String("ready".into())),
+            serde_json::from_value::<crate::wait::WaitRhs>(
+                serde_json::json!({"String": "'ready'"})
+            )
+            .unwrap(),
         )
         .unwrap()
     );
@@ -5039,7 +5042,9 @@ fn unresolved_wait_enum_identifier_is_a_plan_error() {
         until_predicate: UntilPredicateAst {
             root: absolute_binding("job"),
             attribute_segments: vec!["state".to_string()],
-            rhs: Value::Concrete(ConcreteValue::enum_identifier("ready")),
+            rhs: (Value::Concrete(ConcreteValue::enum_identifier("ready")))
+                .try_into()
+                .unwrap(),
         },
         timeout_secs: None,
         depends_on: Default::default(),
@@ -5101,9 +5106,11 @@ fn nested_wait_enum_resolves_and_matches_provider_state() {
         until_predicate: UntilPredicateAst {
             root: absolute_binding("cert"),
             attribute_segments: vec!["renewal_summary".to_string(), "renewal_status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::enum_identifier(
+            rhs: (Value::Concrete(ConcreteValue::enum_identifier(
                 "aws.acm.Certificate.RenewalStatus.success",
-            )),
+            )))
+            .try_into()
+            .unwrap(),
         },
         timeout_secs: None,
         depends_on: Default::default(),
@@ -5190,7 +5197,7 @@ fn quoted_wait_value_traverses_a_string_map_when_planning() {
         until_predicate: UntilPredicateAst {
             root: absolute_binding("job"),
             attribute_segments: vec!["labels".into(), "state".into()],
-            rhs: Value::Concrete(ConcreteValue::String("ready".into())),
+            rhs: serde_json::from_value(serde_json::json!({"String": "'ready'"})).unwrap(),
         },
         timeout_secs: None,
         depends_on: Default::default(),
@@ -5266,7 +5273,9 @@ fn typed_enum_wait_value_traverses_an_enum_map_when_planning() {
         until_predicate: UntilPredicateAst {
             root: absolute_binding("job"),
             attribute_segments: vec!["statuses".into(), "primary".into()],
-            rhs: Value::Concrete(ConcreteValue::enum_identifier("test.job.Job.Status.ready")),
+            rhs: (Value::Concrete(ConcreteValue::enum_identifier("test.job.Job.Status.ready")))
+                .try_into()
+                .unwrap(),
         },
         timeout_secs: None,
         depends_on: Default::default(),
@@ -5390,9 +5399,11 @@ let renewed = wait cert {
         until_predicate: UntilPredicateAst {
             root: absolute_binding("cert"),
             attribute_segments: vec!["renewal_summary".to_string(), "renewal_status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::enum_identifier(
+            rhs: (Value::Concrete(ConcreteValue::enum_identifier(
                 "aws.acm.Certificate.RenewalStatus.bogus",
-            )),
+            )))
+            .try_into()
+            .unwrap(),
         },
         timeout_secs: None,
         depends_on: Default::default(),
@@ -5453,9 +5464,11 @@ fn data_source_wait_is_rejected_at_the_expanded_graph_boundary() {
         until_predicate: UntilPredicateAst {
             root: absolute_binding("lookup"),
             attribute_segments: vec!["status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::enum_identifier(
+            rhs: (Value::Concrete(ConcreteValue::enum_identifier(
                 "test.lookup.Job.Status.found",
-            )),
+            )))
+            .try_into()
+            .unwrap(),
         },
         timeout_secs: None,
         depends_on: Default::default(),
@@ -5507,7 +5520,7 @@ fn create_plan_records_error_for_empty_predicate_attr_path() {
         until_predicate: UntilPredicateAst {
             root: absolute_binding("cert"),
             attribute_segments: Vec::new(),
-            rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            rhs: serde_json::from_value(serde_json::json!({"String": "'ISSUED'"})).unwrap(),
         },
         timeout_secs: None,
         depends_on: Default::default(),
@@ -5656,7 +5669,7 @@ fn wait_user_depends_on_conflict_with_provider_hint_deduplicates() {
         until_predicate: UntilPredicateAst {
             root: absolute_binding("cert"),
             attribute_segments: vec!["status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            rhs: serde_json::from_value(serde_json::json!({"String": "'ISSUED'"})).unwrap(),
         },
         timeout_secs: None,
         depends_on: vec![absolute_binding("something")].into(),
@@ -5743,7 +5756,7 @@ fn wait_uses_schema_default_timeout_when_omitted() {
         until_predicate: UntilPredicateAst {
             root: absolute_binding("cert"),
             attribute_segments: vec!["status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            rhs: serde_json::from_value(serde_json::json!({"String": "'ISSUED'"})).unwrap(),
         },
         timeout_secs: None,
         depends_on: Default::default(),
@@ -5793,7 +5806,9 @@ fn wait_with_unknown_target_is_rejected_at_the_expanded_graph_boundary() {
             // Target lookup must win over predicate sealing even when the
             // parser has correctly typed an unquoted RHS as an enum
             // identifier.
-            rhs: Value::Concrete(ConcreteValue::enum_identifier("ISSUED")),
+            rhs: Value::Concrete(ConcreteValue::enum_identifier("ISSUED"))
+                .try_into()
+                .unwrap(),
         },
         timeout_secs: None,
         depends_on: Default::default(),
@@ -5863,7 +5878,7 @@ fn wait_omitted_when_all_consumers_unchanged() {
         until_predicate: UntilPredicateAst {
             root: absolute_binding("cert"),
             attribute_segments: vec!["status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            rhs: serde_json::from_value(serde_json::json!({"String": "'ISSUED'"})).unwrap(),
         },
         timeout_secs: Some(60),
         depends_on: Default::default(),
@@ -5920,7 +5935,7 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
         until_predicate: UntilPredicateAst {
             root: absolute_binding("cert"),
             attribute_segments: vec!["status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            rhs: serde_json::from_value(serde_json::json!({"String": "'ISSUED'"})).unwrap(),
         },
         timeout_secs: Some(60),
         depends_on: Default::default(),
@@ -6000,9 +6015,11 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
         until_predicate: UntilPredicateAst {
             root: absolute_binding("cert"),
             attribute_segments: vec!["status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::enum_identifier(
+            rhs: (Value::Concrete(ConcreteValue::enum_identifier(
                 "aws.acm.Certificate.Status.issued",
-            )),
+            )))
+            .try_into()
+            .unwrap(),
         },
         timeout_secs: Some(60),
         depends_on: Default::default(),
@@ -6087,7 +6104,7 @@ fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
         until_predicate: UntilPredicateAst {
             root: absolute_binding("cert"),
             attribute_segments: vec!["status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            rhs: serde_json::from_value(serde_json::json!({"String": "'ISSUED'"})).unwrap(),
         },
         timeout_secs: Some(60),
         depends_on: Default::default(),
@@ -6172,7 +6189,7 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
         until_predicate: UntilPredicateAst {
             root: absolute_binding("cert"),
             attribute_segments: vec!["status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            rhs: serde_json::from_value(serde_json::json!({"String": "'ISSUED'"})).unwrap(),
         },
         timeout_secs: Some(60),
         depends_on: Default::default(),

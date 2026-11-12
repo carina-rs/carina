@@ -286,7 +286,10 @@ mod tests {
             ),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
-                Value::Concrete(crate::resource::ConcreteValue::String("ISSUED".into())),
+                serde_json::from_value::<crate::wait::WaitRhs>(
+                    serde_json::json!({"String": "'ISSUED'"}),
+                )
+                .unwrap(),
             )
             .unwrap(),
             until_surface: "cert.status == ISSUED".to_string(),

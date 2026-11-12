@@ -7,7 +7,7 @@ use crate::resource::{
     AuthoredDeferredValue as DeferredValue, AuthoredInterpolationPart as InterpolationPart,
     AuthoredValue as Value, DeferredValue as GenericDeferredValue, DiagnosticSourceSpan,
     ExpandedConcreteValue, ExpandedDeferredValue, ExpandedInterpolationPart, ExpandedResource,
-    ExpandedValue, ForLoopElement, LoopKind, LoopOriginKind, LoopSlot, ModuleSource, NoPlaceholder,
+    ExpandedValue, ForLoopElement, LoopKind, LoopOriginKind, LoopSlot, ModuleSource,
     ParserPlaceholder, PreventDestroy, Resource as GenericResource, RootScope,
     Value as GenericValue,
 };
@@ -15,6 +15,106 @@ use crate::schema::TypeIdentity;
 use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
+
+#[test]
+fn constraint_interpolation_is_rejected_without_retaining_authored_text() {
+    for (source, position) in [
+        (
+            r#"require "${secret('CANARY_4386')}" == 'x', 'bad'"#,
+            "`require` condition",
+        ),
+        (
+            r#"require length("${secret('CANARY_4386')}") > 0, 'bad'"#,
+            "`require` condition",
+        ),
+        (
+            r#"arguments { x: String { validation { condition = x != "${secret('CANARY_4386')}" } } }"#,
+            "validation condition",
+        ),
+        (
+            r#"require false, "${secret('CANARY_4386')}""#,
+            "`require` message",
+        ),
+    ] {
+        let result = parse_file(
+            source,
+            std::path::Path::new("checked/main.crn"),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
+        assert!(
+            result.is_err(),
+            "interpolation in {position} must be rejected"
+        );
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.diagnostic_message(),
+            format!("interpolation is not supported in a {position}")
+        );
+        assert_eq!(
+            error.source_file(),
+            Some(std::path::Path::new("checked/main.crn"))
+        );
+        assert!(error.diagnostic_range().is_some());
+        assert!(!format!("{error:?} {error}").contains("CANARY_4386"));
+    }
+}
+
+#[test]
+fn constraint_literal_values_keep_their_raw_escapes() {
+    for literal in [
+        r#""plain""#,
+        r#"'${secret("literal")}'"#,
+        r#""\${secret('literal')}""#,
+        r#""a\nb\t\"\\""#,
+        r#"'a\'b\\c'"#,
+    ] {
+        let source = format!("require {literal} == {literal}, {literal}");
+        let parsed = parse_file(
+            &source,
+            std::path::Path::new("main.crn"),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let ValidateExpr::Compare { lhs, rhs, .. } = &parsed.requires[0].condition else {
+            panic!("expected comparison")
+        };
+        for expression in [lhs, rhs] {
+            let ValidateExpr::String(value) = expression.as_ref() else {
+                panic!("expected literal")
+            };
+            assert_eq!(
+                value.as_str().as_bytes(),
+                &literal.as_bytes()[1..literal.len() - 1]
+            );
+        }
+        assert_eq!(
+            parsed.requires[0].error_message.as_str().as_bytes(),
+            &literal.as_bytes()[1..literal.len() - 1]
+        );
+    }
+}
+
+#[test]
+fn constraint_interpolation_error_keeps_only_typed_position_and_authored_range() {
+    let source = "let heading = <<-TEXT\n  prefix\nTEXT\nrequire '日本語' == \"before ${secret({ CANARY_4386 = 'value' })} after\", 'bad'\n";
+    let error = parse_file(
+        source,
+        std::path::Path::new("checked/main.crn"),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
+    let finding = error.element_diagnostic().expect("authored finding");
+    assert!(matches!(
+        finding.detail(),
+        ParseError::InterpolationInConstraintString {
+            kind: ConstraintStringPosition::RequireCondition,
+            ..
+        }
+    ));
+    let range = error.diagnostic_range().unwrap();
+    assert_eq!((range.start_line, range.start_column), (4, 26));
+    assert!(!format!("{error:?} {error}").contains("CANARY_4386"));
+}
 
 #[test]
 fn round13_provenance_debug_redacts_secret_keys_without_losing_lookup() {
@@ -1343,9 +1443,7 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
         until_predicate: UntilPredicateAst {
             root: "resource".into(),
             attribute_segments: vec!["status".to_string()],
-            rhs: GenericValue::<NoPlaceholder, RelativeBindingName>::Concrete(
-                crate::resource::ConcreteValue::String("ready".into()),
-            ),
+            rhs: serde_json::from_value(serde_json::json!({"String": "'ready'"})).unwrap(),
         },
         timeout_secs: None,
         depends_on: Default::default(),

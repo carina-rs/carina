@@ -181,6 +181,14 @@ let cert_issued = wait cert {
 | `depends_on` | no | Managed-resource handles that must complete before polling starts |
 | `timeout` | no | A [duration](/reference/dsl/types-and-values/#duration); defaults to the target schema's wait timeout, or 5 minutes |
 
+The comparison value accepts string literals, integers, floats, booleans,
+durations, and enum identifiers.
+
+Strings in a `wait` condition must be literals. Double-quoted interpolation
+(`${...}`) is rejected. Single-quoted `${...}` text and escaped `\${...}` in
+double quotes remain literal text. As in `require` conditions, string escapes
+are compared as authored, without unescaping.
+
 Attributes read through the wait binding (`cert_issued.certificate_arn`) are the target's attributes, but a resource that references them is not created until the wait succeeds. Reference the target directly (`cert.certificate_arn`) to skip the wait. A wait is not stored in state.
 
 `depends_on` accepts local handles and resource-handle module outputs. For
@@ -422,6 +430,13 @@ fn cidr_for_env(env: String): String {
 ## Validate Expressions
 
 Validate expressions are boolean expressions used in `arguments` blocks for input validation and in `require` statements. They support comparison and logical operators.
+
+Strings in these conditions must be literals. Double-quoted interpolation
+(`${...}`) is rejected, including in function arguments. Single-quoted `${...}`
+text and escaped `\${` in double-quoted strings remain literal text. Condition
+strings retain their authored escape sequences without unescaping them.
+The message following a `require` condition must also be a literal without
+interpolation; a message is required.
 
 ### Comparison Operators
 

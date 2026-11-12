@@ -1099,7 +1099,10 @@ mod tests {
     fn equals_status(value: &str) -> WaitPredicate {
         WaitPredicate::equals(
             AttrPath::single("status"),
-            Value::Concrete(ConcreteValue::String(value.to_string().into())),
+            serde_json::from_value::<crate::wait::WaitRhs>(
+                serde_json::json!({"String": format!("'{value}'")}),
+            )
+            .unwrap(),
         )
         .unwrap()
     }

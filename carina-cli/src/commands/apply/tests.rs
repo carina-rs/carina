@@ -10,8 +10,8 @@ use carina_core::provider::{
 };
 use carina_core::resource::{
     DataSource, DeferredValue, LiveComposition, LiveCompositionArgument, LiveCompositionSignature,
-    ModuleConstraintId, PendingModuleConstraint, PlaceholderKind, ResolvedResource, Resource,
-    ResourceId, ResourceIdentity,
+    PendingModuleConstraint, PlaceholderKind, ResolvedResource, Resource, ResourceId,
+    ResourceIdentity,
 };
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use carina_core::schema::{
@@ -1738,19 +1738,23 @@ fn module_composition<P: PlaceholderKind + PartialEq, B: carina_core::resource::
                 saved_composition_argument(argument),
             )]),
             attributes: indexmap::IndexMap::new(),
-            pending_constraints: vec![PendingModuleConstraint {
-                id: ModuleConstraintId::argument_validation(argument_name, 0),
-                expression: carina_core::parser::ValidateExpr::Compare {
+            pending_constraints: vec![PendingModuleConstraint::argument_validation(
+                argument_name,
+                0,
+                carina_core::parser::ValidateExpr::Compare {
                     lhs: Box::new(carina_core::parser::ValidateExpr::Var(
                         argument_name.to_string(),
                     )),
                     op: carina_core::parser::CompareOp::Ne,
                     rhs: Box::new(carina_core::parser::ValidateExpr::String(
-                        rejected.to_string(),
+                        serde_json::from_value(serde_json::json!(
+                            carina_core::parser::display_string_literal(rejected)
+                        ))
+                        .unwrap(),
                     )),
                 },
-                message: format!("value must not be {rejected}"),
-            }],
+                format!("value must not be {rejected}"),
+            )],
         },
         binding: Some(binding.clone()),
         dependency_bindings: Default::default(),
@@ -1975,7 +1979,7 @@ async fn saved_configuration_decode_failure_returns_command_error_without_panick
     let runtime = crate::test_support::TestCommandRuntime::new();
     let temp = tempfile::tempdir().unwrap();
     let mut document: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/module_binding_wire_compat/carina.v44.plan.json"
+        "../../../tests/fixtures/module_binding_wire_compat/carina.v45.plan.json"
     ))
     .unwrap();
     document["sorted_resources"] = serde_json::json!("invalid saved configuration");
@@ -10767,7 +10771,7 @@ mod saved_plan_version_tests {
                 &error,
                 crate::error::AppError::UnsupportedPlanVersion {
                     found: 40,
-                    expected: 44,
+                    expected: 45,
                     ..
                 }
             ),
@@ -10825,7 +10829,7 @@ mod saved_plan_version_tests {
 
     #[test]
     fn replacement_admission_requests_require_current_plan_format() {
-        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 44);
+        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 45);
     }
 
     #[tokio::test]
@@ -10881,7 +10885,7 @@ mod saved_plan_version_tests {
             rejected_saved_plan_message(&plan_path, &json, "format 38 must require replanning")
                 .await;
         assert!(
-            message.contains("Unsupported plan file version: 38 (expected 44)"),
+            message.contains("Unsupported plan file version: 38 (expected 45)"),
             "{message}"
         );
         assert!(!message.contains("corrupted"), "{message}");
@@ -10997,7 +11001,7 @@ mod saved_plan_version_tests {
                 error,
                 crate::error::AppError::UnsupportedPlanVersion {
                     found: 43,
-                    expected: 44,
+                    expected: 45,
                     ..
                 }
             ),
@@ -11011,12 +11015,12 @@ mod saved_plan_version_tests {
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            44,
-            "carina#4348 requires format 44 for retained refinement layers",
+            45,
+            "carina#4386 requires format 45 for checked validation strings",
         );
-        let previous = 43;
+        let previous = 44;
 
-        for older_version in [previous, 42, 41, 40, 39, 38, 37, 36, 35, 34, 33, 32] {
+        for older_version in [previous, 43, 42, 41, 40, 39, 38, 37, 36, 35, 34, 33, 32] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,

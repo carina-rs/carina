@@ -1653,7 +1653,7 @@ fn resolve_wait_binding(
         until_predicate: crate::parser::UntilPredicateAst {
             root: predicate_root,
             attribute_segments: until_predicate.attribute_segments.clone(),
-            rhs: resolver.resolve_wait_rhs(&until_predicate.rhs)?,
+            rhs: until_predicate.rhs.clone().rebind(),
         },
         timeout_secs: *timeout_secs,
         depends_on: resolve_directive_dependencies(depends_on, &Default::default(), resolver)?,
@@ -2100,22 +2100,6 @@ impl ModuleScopeResolver<'_> {
         Ok(value)
     }
 
-    fn resolve_wait_rhs(
-        &self,
-        value: &crate::resource::Value<crate::resource::NoPlaceholder, RelativeBindingName>,
-    ) -> Result<
-        crate::resource::Value<crate::resource::NoPlaceholder, AbsoluteBindingAddress>,
-        ArgumentSubstitutionError,
-    > {
-        for binding in value.root_bindings() {
-            if !self.local_bindings.contains(&binding) {
-                let diagnostic_source = value.diagnostic_source_for_root_binding(&binding);
-                return Err(self.unknown_binding_at(binding.as_str(), diagnostic_source));
-            }
-        }
-        Ok(value.clone().resolve_module(self.scope))
-    }
-
     fn resolve_structural_argument(
         &self,
         handle: &crate::eval_value::UnexpandedStructuralHandle<RelativeBindingName>,
@@ -2428,13 +2412,6 @@ fn reject_dropped_conditional_references(
                         .iter()
                         .map(|operand| operand.binding_reference())
                         .find_map(|binding| selected.dropped.get(&binding))
-                })
-                .or_else(|| {
-                    wait.until_predicate
-                        .rhs
-                        .root_bindings()
-                        .into_iter()
-                        .find_map(|binding| selected.dropped.get(&binding))
                 });
             if found.is_some() {
                 break;
@@ -2619,38 +2596,38 @@ fn bind_module_constraints(
         for (ordinal, validation) in parameter.validations.iter().enumerate() {
             let line = validation.source_span().start_line();
             let source_file = validation.source_file();
-            constraints.push(crate::resource::PendingModuleConstraint {
-                id: crate::resource::ModuleConstraintId::argument_validation(
+            constraints.push(
+                crate::resource::PendingModuleConstraint::argument_validation(
                     &parameter.name,
                     ordinal,
+                    bind_constraint_expression(
+                        &validation.condition,
+                        arguments,
+                        resolved_bindings,
+                        line,
+                        source_file,
+                    )?,
+                    validation.error_message.clone().unwrap_or_else(|| {
+                        format!("validation failed for argument '{}'", parameter.name)
+                    }),
                 ),
-                expression: bind_constraint_expression(
-                    &validation.condition,
-                    arguments,
-                    resolved_bindings,
-                    line,
-                    source_file,
-                )?,
-                message: validation.error_message.clone().unwrap_or_else(|| {
-                    format!("validation failed for argument '{}'", parameter.name)
-                }),
-            });
+            );
         }
     }
     for (ordinal, requirement) in module.requires.iter().enumerate() {
         let line = requirement.source_span().start_line();
         let source_file = requirement.source_file();
-        constraints.push(crate::resource::PendingModuleConstraint {
-            id: crate::resource::ModuleConstraintId::require(ordinal),
-            expression: bind_constraint_expression(
+        constraints.push(crate::resource::PendingModuleConstraint::require(
+            ordinal,
+            bind_constraint_expression(
                 &requirement.condition,
                 arguments,
                 resolved_bindings,
                 line,
                 source_file,
             )?,
-            message: requirement.error_message.to_string(),
-        });
+            requirement.error_message.clone(),
+        ));
     }
     Ok(constraints)
 }
@@ -3467,11 +3444,12 @@ fn expand_module_composition(
     let pending_constraints = pending_constraints
         .iter()
         .map(|constraint| {
-            Ok(crate::resource::PendingModuleConstraint {
-                id: constraint.id.clone(),
-                expression: resolve_module_constraint_expression(&constraint.expression, resolver)?,
-                message: constraint.message.clone(),
-            })
+            Ok(
+                constraint.with_expression(resolve_module_constraint_expression(
+                    &constraint.expression,
+                    resolver,
+                )?),
+            )
         })
         .collect::<Result<Vec<_>, ArgumentSubstitutionError>>()?;
 
