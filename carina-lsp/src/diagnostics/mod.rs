@@ -1961,8 +1961,9 @@ impl DiagnosticRun<'_> {
                                     continue;
                                 }
                             }
-                            let symbolic = attr_findings.symbolic_errors().to_vec();
-                            for (path, error) in &symbolic {
+                            let symbolic = attr_findings.symbolic_findings().to_vec();
+                            for finding in &symbolic {
+                                let (path, error) = finding.diagnostic();
                                 use carina_core::resource::SecretDiagnosticError;
                                 use carina_core::validation::admission::AdmissionReferenceError;
                                 let (location, severity, message) = match error {

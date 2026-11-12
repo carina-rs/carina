@@ -300,6 +300,52 @@ fn value_structure<P: PlaceholderKind, B: BindingAddress, T>(
     }
 }
 
+/// The callback that produced a symbolic diagnostic, preserved independently
+/// of its message, path and diagnostic protection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolicFindingOrigin {
+    Ordinary,
+    AuthoredHook,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SymbolicFinding {
+    origin: SymbolicFindingOrigin,
+    path: LeafPath,
+    error: TypeError,
+}
+impl SymbolicFinding {
+    fn ordinary(path: LeafPath, error: TypeError) -> Self {
+        Self {
+            origin: SymbolicFindingOrigin::Ordinary,
+            path,
+            error,
+        }
+    }
+    fn authored_hook(path: LeafPath, error: TypeError) -> Self {
+        Self {
+            origin: SymbolicFindingOrigin::AuthoredHook,
+            path,
+            error,
+        }
+    }
+    pub fn origin(&self) -> SymbolicFindingOrigin {
+        self.origin
+    }
+    pub fn diagnostic(&self) -> (&LeafPath, &TypeError) {
+        (&self.path, &self.error)
+    }
+}
+impl InsideSecret for SymbolicFinding {
+    fn inside_secret(self) -> Self {
+        Self {
+            origin: self.origin,
+            path: self.path.inside_secret(),
+            error: self.error.inside_secret(),
+        }
+    }
+}
+
 /// Cached findings for one attribute. The primary error retains the CLI's
 /// established nesting; paths retain the LSP's established element locations.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -310,7 +356,7 @@ pub struct ValueValidationFindings {
     local: Vec<(FieldPath, TypeError)>,
     pub(super) located: Vec<(LeafPath, TypeError)>,
     assignment: AssignmentFindings,
-    pub(crate) symbolic: Vec<(LeafPath, TypeError)>,
+    pub(crate) symbolic: Vec<SymbolicFinding>,
     pub(super) provider: Vec<(FieldPath, TypeError)>,
 }
 
@@ -347,7 +393,11 @@ impl ValueValidationFindings {
         self.local
     }
 
-    pub fn symbolic_errors(&self) -> &[(LeafPath, TypeError)] {
+    pub fn symbolic_errors(&self) -> impl Iterator<Item = (&LeafPath, &TypeError)> {
+        self.symbolic.iter().map(SymbolicFinding::diagnostic)
+    }
+
+    pub fn symbolic_findings(&self) -> &[SymbolicFinding] {
         &self.symbolic
     }
 
@@ -385,11 +435,7 @@ impl InsideSecret for ValueValidationFindings {
                 .map(|(path, error)| (path.inside_secret(), error.inside_secret()))
                 .collect(),
             assignment: self.assignment.inside_secret(),
-            symbolic: self
-                .symbolic
-                .into_iter()
-                .map(|(path, error)| (path.inside_secret(), error.inside_secret()))
-                .collect(),
+            symbolic: self.symbolic.inside_secret(),
             provider: self.provider.inside_secret(),
         }
     }
@@ -403,8 +449,8 @@ pub struct ResourceValueValidation {
     pub(super) attributes: HashMap<String, ValueValidationFindings>,
 }
 
-/// Symbolic rendering owns either the destination path or this exact finding.
-/// CLI preserves path ownership; LSP keeps distinct ordinary findings at a path.
+/// CLI preserves main's path ownership. Exact finding ownership is reserved
+/// for diagnostics produced by the authored hook, never ordinary checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolicDiagnosticCoverage {
     Unowned,
@@ -457,15 +503,22 @@ impl ResourceValueValidation {
         ),
     > {
         let mut symbolic = HashMap::<_, Vec<_>>::new();
-        for (name, path, error) in self.symbolic_errors() {
-            symbolic.entry((name, path)).or_default().push(error);
+        for (name, findings) in &self.attributes {
+            for finding in &findings.symbolic {
+                symbolic
+                    .entry((name.as_str(), &finding.path))
+                    .or_default()
+                    .push(finding);
+            }
         }
         self.errors_with_paths().map(move |(error, path)| {
             let coverage = path
                 .and_then(|(name, path)| {
                     symbolic.get(&(name, path)).map(|findings| {
                         if findings.iter().any(|finding| {
-                            error == *finding || *error == (*finding).clone().with_attribute(name)
+                            finding.origin == SymbolicFindingOrigin::AuthoredHook
+                                && (error == &finding.error
+                                    || *error == finding.error.clone().with_attribute(name))
                         }) {
                             SymbolicDiagnosticCoverage::Finding
                         } else {
@@ -555,7 +608,7 @@ impl ResourceValueValidation {
             findings
                 .symbolic
                 .iter()
-                .map(move |(path, error)| (name.as_str(), path, error))
+                .map(move |finding| (name.as_str(), &finding.path, &finding.error))
         })
     }
 
@@ -730,6 +783,17 @@ impl<'a> CheckedValue<'a> {
         }
     }
 
+    fn extend_assignment(&mut self, path: &FieldPath, findings: AssignmentFindings) {
+        for (location, error) in &findings.errors {
+            self.reject(path, error.clone());
+            self.findings.located.push((
+                FieldPath::from_canonical_segments(location.segments().iter().cloned()),
+                error.clone(),
+            ));
+        }
+        self.findings.assignment.extend(findings);
+    }
+
     /// Container context applies equally to every undecided branch's CLI
     /// error. Path-tagged LSP findings keep their precise child locations.
     fn wrap_local_errors(mut self, wrap: impl Fn(TypeError) -> TypeError) -> Self {
@@ -774,6 +838,19 @@ impl<'a> CheckedValue<'a> {
 
     fn into_findings(mut self) -> ValueValidationFindings {
         self.retain_primary_finding();
+        // Preserve callback provenance while the two result streams are still
+        // separate. Admission must never infer it from equal diagnostics.
+        let symbolic =
+            self.findings
+                .assignment
+                .errors
+                .iter()
+                .map(|(path, error)| SymbolicFinding::ordinary(path.clone(), error.clone()))
+                .chain(self.findings.authored.errors.iter().map(|(path, error)| {
+                    SymbolicFinding::authored_hook(path.clone(), error.clone())
+                }))
+                .collect();
+
         for (path, error) in self.findings.authored.errors.clone() {
             let path = FieldPath::from_canonical_segments(path.segments().iter().cloned());
             if self.local.error().is_some() {
@@ -800,7 +877,7 @@ impl<'a> CheckedValue<'a> {
                 .map(|(path, error)| (path.canonical(), error))
                 .collect(),
             assignment: self.findings.assignment,
-            symbolic: Vec::new(),
+            symbolic,
             additional_local_errors: self.findings.additional_local_errors,
             provider: self.findings.provider,
         }
@@ -844,9 +921,10 @@ impl<'a, 'lookup> ValueValidator<'a, 'lookup> {
 pub(crate) fn untyped_symbolic_errors(errors: Vec<TypeError>) -> ValueValidationFindings {
     let mut findings = ValueValidationFindings::default();
     for error in errors {
-        findings
-            .symbolic
-            .push((LeafPath::from_segments([]), error.clone()));
+        findings.symbolic.push(SymbolicFinding::ordinary(
+            LeafPath::from_segments([]),
+            error.clone(),
+        ));
         findings.local.push((FieldPath::new(), error.clone()));
         findings
             .located
@@ -1292,8 +1370,8 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, P, B> {
         defs: &'a BTreeMap<String, CompiledAttributeType>,
         path: &FieldPath,
         ancestry: FieldAncestry,
-    ) -> AssignmentFindings {
-        let mut authored = AssignmentFindings::default();
+    ) -> AssignmentProbe {
+        let mut findings = AssignmentProbe::default();
         if self.callbacks.authored.is_some()
             && !self.cursor.is_projection_only()
             && let CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) = &self.cursor.kind
@@ -1313,12 +1391,12 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, P, B> {
                     )
                 });
                 match result {
-                    Ok(probe) => authored.extend(probe.authored),
-                    Err(error) => authored.errors.push((path.canonical(), error)),
+                    Ok(probe) => findings.extend(probe),
+                    Err(error) => findings.ordinary.errors.push((path.canonical(), error)),
                 }
             }
         }
-        authored
+        findings
     }
 
     fn prepare<'v: 'a, T: StructuralPending<'v, P, B>>(
@@ -2152,7 +2230,9 @@ impl<'a> ValueValidator<'a, '_> {
         }
         let mut authored = parent_authored;
         if let Some(walk) = &assignment {
-            authored.extend(walk.authored_parts(attr, self.defs, path, ancestry));
+            let parts = walk.authored_parts(attr, self.defs, path, ancestry);
+            left.extend_assignment(path, parts.ordinary);
+            authored.extend(parts.authored);
         }
         authored.extend(std::mem::take(&mut left.findings.authored));
         left.findings.authored = authored;
@@ -2247,10 +2327,9 @@ impl<'a> ValueValidator<'a, '_> {
             checked.findings.provider.extend(branch.findings.provider);
         }
         if let Some(walk) = &assignment {
-            checked
-                .findings
-                .authored
-                .extend(walk.authored_parts(attr, self.defs, path, ancestry));
+            let parts = walk.authored_parts(attr, self.defs, path, ancestry);
+            checked.extend_assignment(path, parts.ordinary);
+            checked.findings.authored.extend(parts.authored);
         }
         checked
     }
@@ -2379,7 +2458,9 @@ impl<'a> ValueValidator<'a, '_> {
         checked.findings.assignment.extend(findings);
         let mut authored = authored;
         if !probes && let Some(walk) = &assignment {
-            authored.extend(walk.authored_parts(attr, self.defs, path, ancestry));
+            let parts = walk.authored_parts(attr, self.defs, path, ancestry);
+            checked.extend_assignment(path, parts.ordinary);
+            authored.extend(parts.authored);
         }
         authored.extend(std::mem::take(&mut checked.findings.authored));
         checked.findings.authored = authored;
@@ -3331,7 +3412,7 @@ mod tests {
             attributes: HashMap::from([(
                 "input".into(),
                 ValueValidationFindings {
-                    symbolic: vec![(path, hook)],
+                    symbolic: vec![SymbolicFinding::authored_hook(path, hook)],
                     ..Default::default()
                 },
             )]),
@@ -3355,6 +3436,70 @@ mod tests {
             !coverage[0].owns_finding(),
             "LSP must retain a different ordinary finding"
         );
+    }
+
+    #[test]
+    fn round8_ordinary_and_hook_findings_keep_distinct_origins() {
+        let path = LeafPath::from_segments([]);
+        let error = TypeError::MissingRequired {
+            name: "same finding".into(),
+        };
+        for (finding, expected) in [
+            (
+                SymbolicFinding::ordinary(path.clone(), error.clone()),
+                SymbolicDiagnosticCoverage::Path,
+            ),
+            (
+                SymbolicFinding::authored_hook(path.clone(), error.clone()),
+                SymbolicDiagnosticCoverage::Finding,
+            ),
+        ] {
+            let origin = finding.origin();
+            let report = ResourceValueValidation {
+                errors: vec![error.clone()],
+                error_paths: HashMap::from([(0, ("input".into(), path.clone()))]),
+                attributes: HashMap::from([(
+                    "input".into(),
+                    ValueValidationFindings {
+                        symbolic: vec![finding],
+                        ..Default::default()
+                    },
+                )]),
+            };
+            let (_, _, coverage) = report.diagnostic_errors().next().unwrap();
+            assert_eq!(coverage, expected);
+            assert!(
+                coverage.owns_path(),
+                "CLI path ownership includes both origins"
+            );
+            assert_eq!(
+                coverage.owns_finding(),
+                origin == SymbolicFindingOrigin::AuthoredHook
+            );
+        }
+    }
+
+    #[test]
+    fn round8_symbolic_origin_survives_diagnostic_protection() {
+        let path = LeafPath::from_segments([LeafPathSegment::StructField("private_field".into())]);
+        let error = TypeError::MissingRequired {
+            name: "field".into(),
+        };
+        for finding in [
+            SymbolicFinding::ordinary(path.clone(), error.clone()),
+            SymbolicFinding::authored_hook(path, error),
+        ] {
+            let origin = finding.origin();
+            let protected = finding.inside_secret();
+            assert_eq!(protected.origin(), origin);
+            assert!(
+                !protected
+                    .diagnostic()
+                    .0
+                    .to_string()
+                    .contains("private_field")
+            );
+        }
     }
 
     fn text(value: &str) -> Value {
