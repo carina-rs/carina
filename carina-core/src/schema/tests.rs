@@ -1,5 +1,6 @@
 use crate::resource::InsideSecret;
 
+mod refinement_bounds;
 mod rejected_findings;
 
 #[test]
@@ -552,7 +553,7 @@ fn map_length_max_rejects_eleven_entries() {
     assert!(
         error
             .to_string()
-            .contains("length 11 is outside allowed range [, 10]")
+            .contains("length 11 is outside allowed range unbounded..=10")
     );
     let errors = Schema::flat(map).validate_collect(&value);
     assert_eq!(errors.len(), 1, "{errors:?}");
@@ -5749,7 +5750,7 @@ fn custom_constraint_errors_format_type_and_attribute_context() {
     };
     assert_eq!(
         length.with_attribute("description").to_string(),
-        "Invalid value '' for 'description' (EntityDescription): length 0 is outside allowed range [1, ]"
+        "Invalid value '' for 'description' (EntityDescription): length 0 is outside allowed range 1..unbounded"
     );
 }
 
@@ -7180,10 +7181,10 @@ fn validate_known_values_defers_constraints_until_values_are_concrete() {
     assert!(
         errors.iter().any(|error| matches!(
             error,
-            TypeError::ResourceValidationFailed {
-                message,
+            TypeError::ValueOutOfRange {
                 attribute: Some(name),
-            } if message.to_string().contains("outside allowed range") && name == "range"
+                ..
+            } if name == "range"
         )),
         "missing range error: {errors:?}"
     );
@@ -7677,7 +7678,7 @@ fn secret_length_out_of_range_is_masked_without_pattern_error() {
     let rendered = error.to_string();
     assert_eq!(
         rendered,
-        "Invalid value (secret): length 5 is outside allowed range [8, ]"
+        "Invalid value (secret): length 5 is outside allowed range 8..unbounded"
     );
     assert!(!rendered.contains("'(secret)'"));
     assert!(
@@ -11358,30 +11359,28 @@ fn assignable_plain_float_accepts_identityless_range_sink() {
 
 #[test]
 fn float_range_exact_numeric_int_bounds() {
-    for (integer, range) in [
+    for (integer, range, expected) in [
         (
             9_007_199_254_740_993,
             (None, Some(crate::finite(9_007_199_254_740_992.0))),
+            "Invalid value '9007199254740993': outside allowed range unbounded..=9007199254740992",
         ),
         (
             -9_007_199_254_740_993,
             (Some(crate::finite(-9_007_199_254_740_992.0)), None),
+            "Invalid value '-9007199254740993': outside allowed range -9007199254740992..unbounded",
         ),
     ] {
         let attr_type = AttributeType::refined_float(None, Some(range));
         let error = attr_type
             .validate(&Value::Concrete(ConcreteValue::Int(integer)))
             .unwrap_err();
-        let TypeError::ValidationFailed { message } = error else {
-            panic!("expected range validation error, got {error:?}");
-        };
-        assert_eq!(
-            message.to_string(),
-            format!(
-                "value {integer} is outside allowed range {:?}..={:?}",
-                range.0, range.1
-            )
-        );
+        assert!(matches!(error, TypeError::ValueOutOfRange { .. }));
+        let rendered = error.to_string();
+        assert_eq!(rendered, expected);
+        for forbidden in ["Some(", "None", "[, "] {
+            assert!(!rendered.contains(forbidden), "{rendered}");
+        }
     }
 }
 

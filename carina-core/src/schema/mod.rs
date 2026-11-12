@@ -515,6 +515,7 @@ impl RefinementBinding {
 /// opaque until the provider validation boundary binds their diagnostic.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProviderValidation(Box<ValidationBody>);
+
 #[derive(Clone, Debug, PartialEq)]
 enum ValidationBody {
     Message(DiagnosticText),
@@ -5017,10 +5018,17 @@ fn validate_scalar_refinement<P: crate::resource::ValueKind, B: BindingAddress>(
             .into(),
         });
     }
-    constraints()?;
-    binding
-        .callback()
-        .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
+    let mut result = constraints().and_then(|()| {
+        binding
+            .callback()
+            .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
+    });
+    if let Err(TypeError::ValueOutOfRange { type_name, .. }) = &mut result
+        && type_name.is_none()
+    {
+        *type_name = binding.identity().map(|identity| identity.kind.clone());
+    }
+    result
 }
 
 /// Structural String checks shared by ordinary values and condition literals.
@@ -5113,9 +5121,10 @@ fn validate_int_range(
     if let Some((min, max)) = range
         && (min.is_some_and(|min| value < min) || max.is_some_and(|max| value > max))
     {
-        return Err(TypeError::ValidationFailed {
-            message: format!("value {value} is outside allowed range {min:?}..={max:?}").into(),
-        });
+        return Err(TypeError::value_out_of_range(
+            DiagnosticNumber::Int(value),
+            NumericRangeBounds::Int { min, max },
+        ));
     }
     Ok(())
 }
@@ -5127,7 +5136,10 @@ fn validate_float_range(
     if let Some((min, max)) = range
         && (min.is_some_and(|min| value < min) || max.is_some_and(|max| value > max))
     {
-        return Err(float_range_error(value, min, max));
+        return Err(TypeError::value_out_of_range(
+            DiagnosticNumber::Float(value),
+            NumericRangeBounds::Float { min, max },
+        ));
     }
     Ok(())
 }
@@ -5140,19 +5152,12 @@ fn validate_int_in_float_range(
         && (min.is_some_and(|min| compare_int_float(value, min) == Ordering::Less)
             || max.is_some_and(|max| compare_int_float(value, max) == Ordering::Greater))
     {
-        return Err(float_range_error(value, min, max));
+        return Err(TypeError::value_out_of_range(
+            DiagnosticNumber::Int(value),
+            NumericRangeBounds::Float { min, max },
+        ));
     }
     Ok(())
-}
-
-fn float_range_error(
-    value: impl fmt::Display,
-    min: Option<crate::FiniteF64>,
-    max: Option<crate::FiniteF64>,
-) -> TypeError {
-    TypeError::ValidationFailed {
-        message: format!("value {value} is outside allowed range {min:?}..={max:?}").into(),
-    }
 }
 
 /// Ordered exactness accumulated across an entire value tree.
@@ -7120,25 +7125,6 @@ fn format_pattern_mismatch(
     text.finish()
 }
 
-fn format_length_out_of_range(
-    value: &DiagnosticValue,
-    length: usize,
-    min: Option<u64>,
-    max: Option<u64>,
-    attribute: Option<&str>,
-    type_name: Option<&str>,
-) -> String {
-    let min = min.map(|v| v.to_string()).unwrap_or_default();
-    let max = max.map(|v| v.to_string()).unwrap_or_default();
-    format!(
-        "{}: length {} is outside allowed range [{}, {}]",
-        format_invalid_value_intro(value, attribute, type_name),
-        length,
-        min,
-        max
-    )
-}
-
 /// A DSL-spelled enum value that can be typed in a `.crn` file.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
@@ -7589,6 +7575,46 @@ pub enum DiagnosticValue {
     TypeOnlyString,
 }
 
+/// Numeric diagnostic payload, preserving its representation until rendering.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DiagnosticNumber {
+    Int(i64),
+    Float(crate::FiniteF64),
+    Masked,
+}
+
+impl DiagnosticNumber {
+    fn diagnostic_value(&self) -> DiagnosticValue {
+        match self {
+            Self::Int(value) => DiagnosticValue::Plain(value.to_string()),
+            Self::Float(value) => DiagnosticValue::Plain(value.to_string()),
+            Self::Masked => DiagnosticValue::Masked,
+        }
+    }
+}
+
+/// Inclusive numeric endpoints. An Int value may be checked against Float bounds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NumericRangeBounds {
+    Int {
+        min: Option<i64>,
+        max: Option<i64>,
+    },
+    Float {
+        min: Option<crate::FiniteF64>,
+        max: Option<crate::FiniteF64>,
+    },
+}
+
+impl fmt::Display for NumericRangeBounds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Int { min, max } => f.write_str(&format_refinement_bounds((*min, *max))),
+            Self::Float { min, max } => f.write_str(&format_refinement_bounds((*min, *max))),
+        }
+    }
+}
+
 impl DiagnosticValue {
     pub fn as_plain(&self) -> Option<&str> {
         match self {
@@ -7761,6 +7787,7 @@ fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
         | TypeError::InvalidEnumVariant { .. }
         | TypeError::PatternMismatch { .. }
         | TypeError::LengthOutOfRange { .. }
+        | TypeError::ValueOutOfRange { .. }
         | TypeError::DuplicateListElement {
             value: _,
             index: _,
@@ -7852,13 +7879,31 @@ pub enum TypeError {
 
     #[error(
         "{}",
-        DiagnosticText::new(format_length_out_of_range(value, *length, *min, *max, attribute.as_deref(), type_name.as_deref()))
+        DiagnosticText::new(format!(
+            "{}: length {length} is outside allowed range {}",
+            format_invalid_value_intro(value, attribute.as_deref(), type_name.as_deref()),
+            format_refinement_bounds((*min, *max))
+        ))
     )]
     LengthOutOfRange {
         value: DiagnosticValue,
         length: usize,
         min: Option<u64>,
         max: Option<u64>,
+        attribute: Option<String>,
+        type_name: Option<String>,
+    },
+
+    #[error(
+        "{}",
+        DiagnosticText::new(format!(
+            "{}: outside allowed range {bounds}",
+            format_invalid_value_intro(&value.diagnostic_value(), attribute.as_deref(), type_name.as_deref())
+        ))
+    )]
+    ValueOutOfRange {
+        value: DiagnosticNumber,
+        bounds: NumericRangeBounds,
         attribute: Option<String>,
         type_name: Option<String>,
     },
@@ -8107,6 +8152,15 @@ impl From<crate::parser::CustomTypeValidationError> for TypeError {
 }
 
 impl TypeError {
+    fn value_out_of_range(value: DiagnosticNumber, bounds: NumericRangeBounds) -> Self {
+        Self::ValueOutOfRange {
+            value,
+            bounds,
+            attribute: None,
+            type_name: None,
+        }
+    }
+
     /// Report a concrete value's kind when no second static type is available.
     /// Comparisons of two static types must construct `TypeMismatch` with
     /// [`MismatchTypeNames::for_types`] or [`MismatchTypeNames::for_type_exprs`].
@@ -8245,6 +8299,7 @@ impl TypeError {
             | Self::InvalidEnumVariant { .. }
             | Self::PatternMismatch { .. }
             | Self::LengthOutOfRange { .. }
+            | Self::ValueOutOfRange { .. }
             | Self::DuplicateListElement { .. }
             | Self::MissingRequired { .. }
             | Self::FieldGroupViolation { .. }
@@ -8264,6 +8319,7 @@ impl TypeError {
             TypeError::InvalidEnumVariant { attribute, .. }
             | TypeError::PatternMismatch { attribute, .. }
             | TypeError::LengthOutOfRange { attribute, .. }
+            | TypeError::ValueOutOfRange { attribute, .. }
             | TypeError::DuplicateListElement {
                 attribute,
                 value: _,
@@ -8386,6 +8442,10 @@ impl TypeError {
                         ..
                     }
                     | TypeError::LengthOutOfRange {
+                        attribute: attr_slot,
+                        ..
+                    }
+                    | TypeError::ValueOutOfRange {
                         attribute: attr_slot,
                         ..
                     }
@@ -16671,6 +16731,17 @@ impl crate::resource::InsideSecret for TypeError {
                 length,
                 min,
                 max,
+                attribute,
+                type_name,
+            },
+            TypeError::ValueOutOfRange {
+                bounds,
+                attribute,
+                type_name,
+                ..
+            } => TypeError::ValueOutOfRange {
+                value: DiagnosticNumber::Masked,
+                bounds,
                 attribute,
                 type_name,
             },

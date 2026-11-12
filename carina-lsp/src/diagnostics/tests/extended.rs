@@ -10237,7 +10237,7 @@ fn named_annotation_lsp_literals_keep_the_declared_length_bound() {
     assert!(
         diagnostics.iter().any(|diagnostic| diagnostic
             .message
-            .contains("length 65 is outside allowed range [1, 64]")),
+            .contains("length 65 is outside allowed range 1..=64")),
         "{diagnostics:#?}"
     );
 }
@@ -17624,14 +17624,14 @@ fn map_length_diagnostics_in_directory_configuration() {
             assert!(
                 errors[0]
                     .message
-                    .contains("length 11 is outside allowed range [0, 10]"),
+                    .contains("length 11 is outside allowed range 0..=10"),
                 "{diagnostics:#?}"
             );
             // The duplicate Warning for the same error is carina-rs/carina#4265.
             assert!(
                 diagnostics.iter().all(|diagnostic| diagnostic
                     .message
-                    .contains("length 11 is outside allowed range [0, 10]")),
+                    .contains("length 11 is outside allowed range 0..=10")),
                 "{diagnostics:#?}"
             );
         }
@@ -17705,7 +17705,7 @@ fn map_and_list_length_diagnostics_keep_whole_resource_errors() {
         assert!(
             diagnostics.iter().all(|diagnostic| diagnostic
                 .message
-                .contains(&format!("length {count} is outside allowed range [1, 2]"))),
+                .contains(&format!("length {count} is outside allowed range 1..=2"))),
             "{count}: {diagnostics:#?}"
         );
     }
@@ -17946,7 +17946,7 @@ fn review_r7_skipped_lookup_does_not_suppress_a_list_constraint() {
             |diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR)
                 && diagnostic
                     .message
-                    .contains("length 1 is outside allowed range [2, 4]")
+                    .contains("length 1 is outside allowed range 2..=4")
         ),
         "{diagnostics:#?}"
     );
