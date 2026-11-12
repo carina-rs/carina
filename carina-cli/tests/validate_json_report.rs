@@ -75,6 +75,34 @@ fn round_three_diagnostics(source: &str, path: &Path) -> Vec<tower_lsp::lsp_type
 }
 
 #[test]
+fn issue_4304_3a_merge_validate_json_reports_every_unknown_default_tag() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(
+        fixture.path().join("providers.crn"),
+        "provider mock { default_tags = { Owner = management.id, Team = management.id } }\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.path().join("main.crn"), "let management = mock.test.resource { name = 'management' }\nexports { name = management.name }\n").unwrap();
+    let output = report(&validate(fixture.path(), true), 2, 0);
+    let human = validate(fixture.path(), false);
+    assert_eq!(human.status.code(), Some(1));
+    let human = String::from_utf8(human.stderr).unwrap();
+    for slot in ["default_tags.Owner", "default_tags.Team"] {
+        let findings = output["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| finding["message"].as_str().unwrap().contains(slot))
+            .collect::<Vec<_>>();
+        assert_eq!(findings.len(), 1, "{output}");
+        let message = findings[0]["message"].as_str().unwrap();
+        assert!(message.contains("provider mock"), "{output}");
+        assert!(message.contains("management.id"), "{output}");
+        assert!(human.contains(message), "{human}");
+    }
+}
+
+#[test]
 fn round13_protected_ast_evaluation_is_content_free_on_all_surfaces() {
     let fixture = tempfile::tempdir().unwrap();
     let path = fixture.path().join("main.crn");

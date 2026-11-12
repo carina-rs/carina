@@ -5101,16 +5101,16 @@ pub(super) mod tests {
                 let wit_id = wasm_convert::core_to_wit_resource_id(&id);
                 let bindings = carina_core::binding_index::ResolvedBindings::default();
                 let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-                let schemas = carina_core::test_utils::preparation_schemas(
+                let schemas = carina_core::test_utils::preparation_schemas_with_attributes(
                     &resource.id,
                     carina_core::schema::SchemaKind::Resource,
+                    &resource.attributes,
                 );
-                let context = carina_core::executor::ProviderPreparationContext::new(
+                let context = carina_core::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &[],
                     &carina_core::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -5361,7 +5361,7 @@ pub(super) mod tests {
 
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = carina_core::test_utils::preparation_schemas(
+        let mut schemas = carina_core::test_utils::preparation_schemas(
             &id,
             carina_core::schema::SchemaKind::Resource,
         );
@@ -5370,15 +5370,20 @@ pub(super) mod tests {
         });
         let mut resource = Resource::from_id(id);
         resource.set_attr("name", test_string_value("example"));
+        carina_core::test_utils::complete_fixture_schema(
+            &mut schemas,
+            &resource.id,
+            carina_core::schema::SchemaKind::Resource,
+            &resource.attributes,
+        );
         carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
             |type_checks| {
-                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &[],
                     &carina_core::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -5425,9 +5430,10 @@ pub(super) mod tests {
         resource.set_attr("name", test_string_value("example"));
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = carina_core::test_utils::preparation_schemas(
+        let schemas = carina_core::test_utils::preparation_schemas_with_attributes(
             &resource.id,
             carina_core::schema::SchemaKind::Resource,
+            &resource.attributes,
         );
         let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
             Arc::new(Vec::new()),
@@ -5437,12 +5443,11 @@ pub(super) mod tests {
         carina_core::validation::deferred_types::with_session_for_test_async(
             provider_types.provider_context(),
             async |type_checks| {
-                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &module_gate,
                     &[],
                     &carina_core::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -5562,10 +5567,10 @@ pub(super) mod tests {
         let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let provider_configs = [];
         let normalizer = carina_core::provider::NoopNormalizer;
-        let factories = [];
-        let schemas = carina_core::test_utils::preparation_schemas(
+        let schemas = carina_core::test_utils::preparation_schemas_with_attributes(
             &resource.id,
             carina_core::schema::SchemaKind::Resource,
+            &resource.attributes,
         );
         let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
             Arc::new(Vec::new()),
@@ -5575,12 +5580,11 @@ pub(super) mod tests {
         carina_core::validation::deferred_types::with_session_for_test_async(
             provider_types.provider_context(),
             async |type_checks| {
-                let context = carina_core::executor::ProviderPreparationContext::new(
+                let context = carina_core::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &provider_configs,
                     &normalizer,
-                    &factories,
                     &schemas,
                     type_checks,
                 );

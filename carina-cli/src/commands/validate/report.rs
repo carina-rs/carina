@@ -187,6 +187,20 @@ impl Diagnostic {
 /// their own message authorities; the fallback uses the terminal's safe chain.
 fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
     let diagnostic = match error {
+        AppError::ProviderConfigInvariant(error) => {
+            return error
+                .findings()
+                .iter()
+                .map(|finding| Diagnostic::new(format_error_with_source_chain(finding), "error"))
+                .collect();
+        }
+        AppError::FinalProviderInput(error) => {
+            return error
+                .findings()
+                .iter()
+                .map(|finding| Diagnostic::new(format_error_with_source_chain(finding), "error"))
+                .collect();
+        }
         AppError::LockConstraint(carina_provider_resolver::LockConstraintError::LockFile(
             carina_provider_resolver::LockFileError::Parse { path, .. },
         )) => Diagnostic {
@@ -907,6 +921,64 @@ pub(super) fn test_inventory(report: ValidateReport) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_4304_3a_merge_provider_config_findings_are_individual_json_diagnostics() {
+        use carina_core::parser::{
+            ProviderConfig, ProviderConfigInvariantError, ResolvedProviderConfigs,
+        };
+        use carina_core::resource::{NoPlaceholder, RelativeBindingName, Value};
+        let reference = Value::<NoPlaceholder, RelativeBindingName>::resource_ref(
+            RelativeBindingName::new("management"),
+            "id",
+            vec![],
+        )
+        .resolve_root_for_test();
+        let config = ProviderConfig {
+            name: "mock".into(),
+            attributes: Default::default(),
+            default_tags: [("Owner", reference.clone()), ("Team", reference)]
+                .into_iter()
+                .collect(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: Default::default(),
+            binding: None,
+        };
+        let errors = ResolvedProviderConfigs::validate_known(&[config]).unwrap_err();
+        let cases = [
+            (errors, vec!["default_tags.Owner", "default_tags.Team"]),
+            (
+                ProviderConfigInvariantError::ExpectedMap {
+                    provider: "mock".into(),
+                    attribute: carina_core::parser::DEFAULT_TAGS_ATTRIBUTE.into(),
+                },
+                vec!["default_tags"],
+            ),
+        ];
+        for (error, slots) in cases {
+            let report =
+                ValidateReport::failure(AppError::ProviderConfigInvariant(Box::new(error)));
+            let output = json(&report);
+            let diagnostics = output["errors"].as_array().unwrap();
+            assert_eq!(diagnostics.len(), slots.len(), "{output}");
+            assert_eq!(report.exit_code(), 1);
+            assert_eq!(output["status"], "error");
+            assert_eq!(output["resource_count"], 0);
+            assert_eq!(output["resources"], serde_json::json!([]));
+            for (diagnostic, slot) in diagnostics.iter().zip(slots) {
+                let message = diagnostic["message"].as_str().unwrap();
+                assert!(message.contains("provider mock"), "{output}");
+                assert!(message.contains(slot), "{output}");
+                assert!(
+                    !message.contains('\n'),
+                    "each finding must be a separate diagnostic: {output}"
+                );
+                assert_eq!(diagnostic["severity"], "error");
+            }
+        }
+    }
 
     #[test]
     fn recovered_type_resolution_errors_keep_the_original_located_display() {

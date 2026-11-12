@@ -43,16 +43,15 @@ use carina_state::{BackendLock, LockInfo, RowBasis, StateBackend, StateFile};
 #[cfg(test)]
 use carina_core::parser::ProviderConfig;
 use carina_core::parser::{
-    ExpandedProviderConfig, ExpandedUpstreamState, LoadedProviderContext, ProviderContext,
-    ResolvedProviderConfigs,
+    ExpandedUpstreamState, LoadedProviderContext, ProviderContext, ResolvedProviderConfigs,
 };
 
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::{
     CheckExportsPreApplyInput, LivePlanFileValues, PlanFile, PlanFileDecodeError,
-    PreparedPlanIdentityData, ProviderUpstreamScope, ReloadedPlanFile, ResolvedProviderInputs,
-    SavedDataSourceValue, UpstreamMissingStatePolicy, collect_historical_display_attributes,
+    PreparedPlanIdentityData, ReloadedPlanFile, ResolvedProviderInputs, SavedDataSourceValue,
+    UpstreamMissingStatePolicy, collect_historical_display_attributes,
     load_and_resolve_provider_configs, prepare_plan_identity_and_provider_inputs,
 };
 use crate::commands::shared::effect_execution::{
@@ -224,7 +223,6 @@ struct BootstrapCreateContext<'a> {
     parsed: &'a carina_core::parser::ExpandedInferredFile,
     provider_configs: &'a ResolvedProviderConfigs,
     normalizer: &'a dyn HostNormalizer,
-    factories: &'a [Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &'a carina_core::schema::SchemaRegistry,
 }
 
@@ -280,9 +278,8 @@ async fn prepare_bootstrap_creation(
     let preparation = carina_core::executor::ProviderPreparationContext::new(
         &bindings,
         &module_gate,
-        context.provider_configs.as_provider_configs(),
+        context.provider_configs,
         context.normalizer,
-        context.factories,
         context.schemas,
         session,
     );
@@ -328,7 +325,6 @@ async fn create_checked_bootstrap_resource(
                     parsed: _,
                     provider_configs: _,
                     normalizer: _,
-                    factories: _,
                     schemas,
                 } = context;
                 let resolved = request.resource().as_inner().clone();
@@ -468,7 +464,6 @@ async fn create_checked_bootstrap_resource_for_test(
         parsed,
         provider_configs,
         normalizer,
-        factories,
         schemas: _schemas,
     } = context;
     let mut parsed = parsed.clone();
@@ -490,7 +485,6 @@ async fn create_checked_bootstrap_resource_for_test(
             parsed: &parsed,
             provider_configs,
             normalizer,
-            factories,
             schemas: &schemas,
         },
     )
@@ -792,7 +786,7 @@ fn saved_plan_replan_command(plan_path: &Path, source_path: &Path) -> String {
 struct ApplyExecutionContext<'a, S = ModuleSource> {
     provider: &'a ProviderRouter,
     normalizer: &'a dyn HostNormalizer,
-    provider_configs: &'a [ExpandedProviderConfig],
+    provider_configs: &'a ResolvedProviderConfigs,
     factories: &'a [Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &'a carina_core::schema::SchemaRegistry,
     cancel: ShutdownToken,
@@ -2060,7 +2054,6 @@ async fn run_apply_with_observer_factory(
                         parsed: validated_config.resources().parsed(),
                         provider_configs: bootstrap_provider_inputs.configs(),
                         normalizer: bucket_normalizer.as_ref(),
-                        factories: validated_config.context().factories(),
                         schemas: validated_config.context().schemas(),
                     },
                 )
@@ -2275,7 +2268,6 @@ async fn load_apply_provider_inputs<E>(
         provider_context,
         schemas,
         UpstreamMissingStatePolicy::Strict,
-        ProviderUpstreamScope::All,
     )
     .await
 }
@@ -2590,7 +2582,6 @@ async fn run_apply_locked_owned(
                     remote_bindings,
                     schemas: ctx.schemas(),
                     saved_dep_bindings: &saved_dep_bindings,
-                    factories: ctx.factories(),
                     cancel: Some(&cancel),
                 })
                 .await?;
@@ -2941,7 +2932,7 @@ async fn run_apply_locked_owned(
                 ApplyExecutionContext {
                     provider: provider.as_ref(),
                     normalizer: provider.as_ref(),
-                    provider_configs: raw_provider_configs,
+                    provider_configs,
                     factories: ctx.factories(),
                     schemas: ctx.schemas(),
                     cancel: cancel.clone(),
@@ -4161,7 +4152,10 @@ async fn run_apply_from_plan_locked_owned(
 
             let resolved_provider_configs =
                 ResolvedProviderConfigs::try_from(validated_plan.provider_configs().clone())
-                    .map_err(|source| AppError::SavedProviderConfig(Box::new(source)))?;
+                    .map_err(|error| AppError::SavedProviderConfig {
+                        error,
+                        replan_command: apply_target.replan_command().to_string(),
+                    })?;
             let raw_provider_configs = resolved_provider_configs.as_provider_configs();
 
             // Secret-bearing plans initialize once while reproducing the
@@ -4521,7 +4515,7 @@ async fn run_apply_from_plan_locked_owned(
                 ApplyExecutionContext {
                     provider: provider.as_ref(),
                     normalizer: provider.as_ref(),
-                    provider_configs: raw_provider_configs,
+                    provider_configs: &resolved_provider_configs,
                     factories: wiring.factories(),
                     schemas: wiring.schemas(),
                     cancel: cancel.clone(),

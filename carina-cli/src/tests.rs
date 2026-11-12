@@ -571,7 +571,7 @@ async fn ignored_write_only_parent_is_not_in_sent_attributes_and_writeback_keeps
             managed_current: HashMap::new(),
             data_source_values: ExecutableDataSourceValues::empty(),
             normalizer: &NoopNormalizer,
-            provider_configs: &[],
+            provider_configs: &carina_core::test_utils::resolved_provider_configs(&[]),
             factories: &[],
             schemas: &schemas,
             parallelism: std::num::NonZeroUsize::new(1).expect("one is non-zero"),

@@ -195,26 +195,6 @@ pub fn admit_plan_attributes<K: RechecksResolved>(
         )
 }
 
-/// Every selected writable attribute declared by the schema passed apply admission.
-/// The `KnownWritableOnly` walk skips keys absent from the schema.
-#[derive(Debug, Clone)]
-pub(crate) struct AdmittedAttributes<K: RechecksResolved> {
-    kind: PhantomData<K>,
-    selection: crate::input_rules::InputSelectionAuthority,
-}
-// Authority is transient evidence, not part of a prepared payload's semantics.
-impl<K: RechecksResolved> PartialEq for AdmittedAttributes<K> {
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
-}
-impl<K: RechecksResolved> Eq for AdmittedAttributes<K> {}
-impl<K: RechecksResolved> AdmittedAttributes<K> {
-    pub(crate) fn selection_authority(&self) -> &crate::input_rules::InputSelectionAuthority {
-        &self.selection
-    }
-}
-
 pub(crate) enum ApplyAdmissionErrors {
     Admission(AdmissionErrors),
     Constraints(crate::schema::ResourceValueValidation),
@@ -240,7 +220,7 @@ pub(crate) fn admit_apply_resource<S, D>(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     bindings: &ResolvedBindings,
     session: &dyn ProviderTypeCheckContext,
-) -> Result<AdmittedAttributes<kind::ResourceAttribute>, ApplyAdmissionErrors> {
+) -> Result<(), ApplyAdmissionErrors> {
     admit_apply_attributes::<kind::ResourceAttribute>(
         &resource.id,
         &resource.attributes,
@@ -261,7 +241,7 @@ pub(crate) fn admit_apply_data_source<S, D>(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     bindings: &ResolvedBindings,
     session: &dyn ProviderTypeCheckContext,
-) -> Result<AdmittedAttributes<kind::DataSourceAttribute>, ApplyAdmissionErrors> {
+) -> Result<(), ApplyAdmissionErrors> {
     admit_apply_attributes::<kind::DataSourceAttribute>(
         &resource.id,
         &resource.attributes,
@@ -285,7 +265,7 @@ fn admit_apply_attributes<K: RechecksResolved>(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     bindings: &ResolvedBindings,
     session: &dyn ProviderTypeCheckContext,
-) -> Result<AdmittedAttributes<K>, ApplyAdmissionErrors> {
+) -> Result<(), ApplyAdmissionErrors> {
     use std::cell::RefCell;
     let mut projected = std::collections::HashMap::new();
     let mut projection_errors = Vec::new();
@@ -367,10 +347,7 @@ fn admit_apply_attributes<K: RechecksResolved>(
     if report.errors().next().is_some() {
         return Err(ApplyAdmissionErrors::Constraints(report));
     }
-    Ok(AdmittedAttributes {
-        kind: PhantomData,
-        selection: crate::input_rules::InputSelectionAuthority::in_catalog(session.catalog()),
-    })
+    Ok(())
 }
 
 /// The retained expression check used by the authored attribute walk.

@@ -1,0 +1,3 @@
+let management = mock.test.Management {}
+
+let target = mock.test.Tagged {}

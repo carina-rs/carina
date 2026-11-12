@@ -130,7 +130,7 @@ async fn execute(
         managed_current: current,
         data_source_values: ExecutableDataSourceValues::empty(),
         normalizer: &NoopNormalizer,
-        provider_configs: &[],
+        provider_configs: &carina_core::test_utils::resolved_provider_configs(&[]),
         provider_context: ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         factories: &[],
         schemas: &schemas,
