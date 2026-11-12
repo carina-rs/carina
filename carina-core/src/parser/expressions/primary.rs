@@ -318,7 +318,7 @@ fn with_access_provenance(
                 }
             };
             if path.reference_locations().is_none() && stamp_missing {
-                if let crate::parser::AccessLocations::Reference(locations) = locations() {
+                if let Some(locations) = locations().into_reference() {
                     path.set_reference_locations(locations);
                 }
             } else if extend && let Some(reference) = path.reference_locations() {

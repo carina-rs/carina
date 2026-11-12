@@ -1,0 +1,246 @@
+{
+  "_provenance": {
+    "revision": "ea66ae7a157bd6e28f374f80286a29eb8d77a557",
+    "method": "Recorded CLI validate and LSP diagnostics for each input on an isolated origin/main source snapshot, without seam mutations. Only the temporary directory prefix is normalized; array order is unchanged."
+  },
+  "argument_valid": {
+    "cli": [],
+    "lsp": []
+  },
+  "argument_mismatch": {
+    "cli": [
+      "child: test.Probe.<pending>: cannot assign String to 'value': expected Int, got String (from input)",
+      "<fixture>/child/main.crn at line 2\nType mismatch: expected Int, got String (from input)",
+      "<fixture>/child/main.crn at line 2\n<fixture>/child/main.crn: Type mismatch: expected Int, got String (from input) at line 2\n<fixture>/child/main.crn at line 2\nType mismatch: expected Int, got String (from input)"
+    ],
+    "lsp": [
+      {
+        "message": "Type mismatch: expected Int, got String (from input)",
+        "range": {
+          "end": {
+            "character": 26,
+            "line": 1
+          },
+          "start": {
+            "character": 21,
+            "line": 1
+          }
+        },
+        "severity": 1,
+        "source": "carina"
+      }
+    ]
+  },
+  "function_valid": {
+    "cli": [],
+    "lsp": []
+  },
+  "function_mismatch": {
+    "cli": [
+      "<fixture>/main.crn at line 2\nexpected Int, got String"
+    ],
+    "lsp": [
+      {
+        "message": "expected Int, got String",
+        "range": {
+          "end": {
+            "character": 35,
+            "line": 1
+          },
+          "start": {
+            "character": 21,
+            "line": 1
+          }
+        },
+        "severity": 1,
+        "source": "carina"
+      },
+      {
+        "message": "Type mismatch: expected Int, got string 'text'.",
+        "range": {
+          "end": {
+            "character": 18,
+            "line": 1
+          },
+          "start": {
+            "character": 13,
+            "line": 1
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      }
+    ]
+  },
+  "for_function_valid": {
+    "cli": [],
+    "lsp": []
+  },
+  "for_function_mismatch": {
+    "cli": [
+      "<fixture>/main.crn at line 2\nexpected Int, got String",
+      "<fixture>/main.crn at line 2\nexpected Int, got String"
+    ],
+    "lsp": [
+      {
+        "message": "expected Int, got String",
+        "range": {
+          "end": {
+            "character": 75,
+            "line": 1
+          },
+          "start": {
+            "character": 63,
+            "line": 1
+          }
+        },
+        "severity": 1,
+        "source": "carina"
+      },
+      {
+        "message": "expected Int, got String",
+        "range": {
+          "end": {
+            "character": 77,
+            "line": 1
+          },
+          "start": {
+            "character": 42,
+            "line": 1
+          }
+        },
+        "severity": 1,
+        "source": "carina"
+      },
+      {
+        "message": "Type mismatch: expected Int, got string 'one'.",
+        "range": {
+          "end": {
+            "character": 60,
+            "line": 1
+          },
+          "start": {
+            "character": 55,
+            "line": 1
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Type mismatch: expected Int, got string 'two'.",
+        "range": {
+          "end": {
+            "character": 60,
+            "line": 1
+          },
+          "start": {
+            "character": 55,
+            "line": 1
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      }
+    ]
+  },
+  "for_argument_valid": {
+    "cli": [],
+    "lsp": []
+  },
+  "for_argument_mismatch": {
+    "cli": [
+      "child: test.Probe.probes[0]: cannot assign String to 'value': expected Int, got String (from input)",
+      "child: test.Probe.probes[1]: cannot assign String to 'value': expected Int, got String (from input)",
+      "<fixture>/child/main.crn at line 2\nType mismatch: expected Int, got String (from input)",
+      "<fixture>/child/main.crn at line 2\n<fixture>/child/main.crn: Type mismatch: expected Int, got String (from input) at line 2\n<fixture>/child/main.crn at line 2\nType mismatch: expected Int, got String (from input)"
+    ],
+    "lsp": [
+      {
+        "message": "Type mismatch: expected Int, got String (from input)",
+        "range": {
+          "end": {
+            "character": 65,
+            "line": 1
+          },
+          "start": {
+            "character": 60,
+            "line": 1
+          }
+        },
+        "severity": 1,
+        "source": "carina"
+      }
+    ]
+  },
+  "module_argument_valid": {
+    "cli": [],
+    "lsp": []
+  },
+  "module_argument_mismatch": {
+    "cli": [
+      "child: test.Probe.<pending>: cannot assign String to 'value': expected Int, got String (from input)",
+      "<fixture>/child/main.crn at line 2\nType mismatch: expected Int, got String (from input)",
+      "<fixture>/child/main.crn at line 2\n<fixture>/child/main.crn: Type mismatch: expected Int, got String (from input) at line 2\n<fixture>/child/main.crn at line 2\nType mismatch: expected Int, got String (from input)"
+    ],
+    "lsp": [
+      {
+        "message": "<fixture>/child/main.crn: Type mismatch: expected Int, got String (from input) at line 2",
+        "range": {
+          "end": {
+            "character": 36,
+            "line": 1
+          },
+          "start": {
+            "character": 12,
+            "line": 1
+          }
+        },
+        "severity": 1,
+        "source": "carina"
+      },
+      {
+        "message": "<fixture>/child/main.crn: Type mismatch: expected Int, got String (from input) at line 2",
+        "range": {
+          "end": {
+            "character": 37,
+            "line": 2
+          },
+          "start": {
+            "character": 13,
+            "line": 2
+          }
+        },
+        "severity": 1,
+        "source": "carina"
+      }
+    ]
+  },
+  "module_function_loop_valid": {
+    "cli": [],
+    "lsp": []
+  },
+  "module_function_loop_mismatch": {
+    "cli": [
+      "<fixture>/child/main.crn at line 3\nexpected Int, got String",
+      "<fixture>/child/main.crn at line 3\nexpected Int, got String"
+    ],
+    "lsp": [
+      {
+        "message": "Parse error: child/main.crn:3:61: Invalid expression at line 3: expected Int, got String",
+        "range": {
+          "end": {
+            "character": 17,
+            "line": 1
+          },
+          "start": {
+            "character": 12,
+            "line": 1
+          }
+        },
+        "severity": 1,
+        "source": "carina"
+      }
+    ]
+  }
+}

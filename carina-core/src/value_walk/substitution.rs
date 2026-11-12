@@ -14,7 +14,8 @@ pub(crate) use functions::{substitute_function_call_argument, substitute_functio
 #[cfg(test)]
 pub(crate) use modules::select_authored_module_ifs;
 pub(crate) use modules::{
-    evaluate_expanded_module_functions, select_expanded_module_ifs, substitute_module_arguments,
+    evaluate_expanded_module_functions, select_expanded_module_ifs_with_conditions,
+    substitute_module_arguments,
 };
 
 #[derive(Clone, Copy)]
@@ -86,6 +87,7 @@ pub(super) trait ParserRewrite<B: BindingAddress> {
     ) -> Result<Option<usize>, Self::Error> {
         Ok(None)
     }
+    fn selected_condition(&mut self, _: Option<crate::parser::retained::NodeId>, _: bool) {}
     fn condition_error(&mut self, error: Self::Error, _: &std::path::Path) -> Self::Error {
         error
     }
@@ -309,6 +311,7 @@ impl<'a, B: BindingAddress, R: ParserRewrite<B>> ParserTransform<'a, R, R::Error
                         source_file,
                         source_line,
                         source_expression,
+                        node_id,
                     } = condition;
                     let first = self
                         .operand(value, at.operand(ExpressionEdge::Condition))
@@ -325,12 +328,14 @@ impl<'a, B: BindingAddress, R: ParserRewrite<B>> ParserTransform<'a, R, R::Error
                     );
                     match self.record(selection)? {
                         Some(1) => {
+                            self.policy.selected_condition(node_id, true);
                             let value =
                                 self.operand(then_value, at.operand(ExpressionEdge::Then))?;
                             self.retained(else_value, at.operand(ExpressionEdge::Else))?;
                             (value.value, true)
                         }
                         Some(2) => {
+                            self.policy.selected_condition(node_id, false);
                             self.retained(then_value, at.operand(ExpressionEdge::Then))?;
                             let value =
                                 self.operand(else_value, at.operand(ExpressionEdge::Else))?;
@@ -347,7 +352,7 @@ impl<'a, B: BindingAddress, R: ParserRewrite<B>> ParserTransform<'a, R, R::Error
                             crate::parser::DeferredValueIf::new(
                                 crate::parser::DeferredIfCondition::new_with_source_expression(
                                     first.value, source_file, source_line, source_expression,
-                                ), then_value.value, else_value.value,
+                                ).with_node_id(node_id), then_value.value, else_value.value,
                             ),
                         ))), changed)
                         }

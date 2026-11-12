@@ -14470,6 +14470,7 @@ mod tests {
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
             quoted_string_attrs: HashSet::new(),
+            authored_slots: Default::default(),
             declaration: Default::default(),
         }
     }

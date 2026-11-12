@@ -962,7 +962,8 @@ fn parse_with_seeded_bindings_inner(
 ) -> Result<ParsedFile, super::resolve::RootInputFailure> {
     let preprocessed_file = Arc::new(super::preprocess_file(input)?);
     let pairs = preprocessed_file.parse()?;
-    let syntax = super::SyntaxInventory::from_pairs(pairs.clone(), &preprocessed_file, source_file);
+    let mut syntax =
+        super::SyntaxInventory::from_pairs(pairs.clone(), &preprocessed_file, source_file);
     // Bootstrap passes use provisional sibling names and exist only to
     // classify declarations. The final pass both emits source warnings and
     // evaluates static conditions against the now-typed seed table.
@@ -973,6 +974,7 @@ fn parse_with_seeded_bindings_inner(
     };
 
     let mut ctx = ParseContext::new(config, source_file, Arc::clone(&preprocessed_file));
+    ctx.set_authored_nodes(syntax.expressions().captured_nodes());
     ctx.defer_provisional_static_conditions = !bindings_fully_classified;
     ctx.extend_warnings(single_quote_warnings);
     seed_bindings(&mut ctx, seeds);
@@ -1464,6 +1466,7 @@ fn parse_with_seeded_bindings_inner(
         .into_iter()
         .map(crate::resource::RelativeBindingName::new)
         .collect();
+    syntax.expressions_mut().finish_captures();
     parser_binding_metadata.syntax = Box::new(syntax);
     parser_binding_metadata
         .syntax
@@ -1656,8 +1659,11 @@ pub(crate) fn parse_expression_eval(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
 ) -> Result<EvalValue, ParseError> {
+    let syntax = pair.clone();
     let inner = first_inner(pair, "expression body", "expression")?;
-    parse_coalesce_expr(inner, ctx)
+    let value = parse_coalesce_expr(inner, ctx)?;
+    ctx.record_retained_eval(&syntax, &value);
+    Ok(value)
 }
 
 pub(crate) fn parse_expression_eval_with_mode(
@@ -1665,8 +1671,11 @@ pub(crate) fn parse_expression_eval_with_mode(
     ctx: &ParseContext,
     mode: &ExpressionMode<'_>,
 ) -> Result<EvalValue, ParseError> {
+    let syntax = pair.clone();
     let inner = first_inner(pair, "expression body", "expression")?;
-    parse_coalesce_expr_with_mode(inner, ctx, mode)
+    let value = parse_coalesce_expr_with_mode(inner, ctx, mode)?;
+    ctx.record_retained_eval(&syntax, &value);
+    Ok(value)
 }
 
 /// Parse a .crn file and resolve resource references.

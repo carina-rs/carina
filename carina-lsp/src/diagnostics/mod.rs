@@ -32,7 +32,56 @@ use carina_core::validation::admission::attributes::uses_resource_attribute_admi
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
-use carina_core::resource::knowledge::collect_classified_attributes;
+fn authored_validation_resources<'t, 'a>(
+    tree: &'t carina_core::parser::AnalysisTree<'a>,
+) -> HashMap<
+    carina_core::parser::AuthoredResourceInstanceKey<'a>,
+    &'t carina_core::parser::AnalysisResourceRef<'a>,
+> {
+    tree.project_resources()
+        .filter_map(|resource| resource.authored_instance_key().map(|key| (key, resource)))
+        .collect()
+}
+
+fn select_admission_inputs<'r, 'a>(
+    resource: &'r carina_core::parser::AnalysisResourceRef<'a>,
+    authored_resources: Option<
+        &HashMap<
+            carina_core::parser::AuthoredResourceInstanceKey<'a>,
+            &'r carina_core::parser::AnalysisResourceRef<'a>,
+        >,
+    >,
+    values: &HashMap<String, Value>,
+    report: &carina_core::parser::retained::ExpressionReport,
+) -> (
+    &'r carina_core::parser::AnalysisResourceRef<'a>,
+    carina_core::validation::admission::attributes::ResourceAttributeInputs<RelativeBindingName>,
+) {
+    use carina_core::validation::admission::attributes::ResourceAttributeInputs;
+    let authored = resource
+        .authored_instance_key()
+        .and_then(|key| authored_resources?.get(&key).copied());
+    match authored.and_then(|source| {
+        ResourceAttributeInputs::from_resolved(source, values, report)
+            .ok()
+            .map(|inputs| (source, inputs))
+    }) {
+        Some(authored) => authored,
+        // Main checks the expanded owner against its resolved values. Only
+        // unchecked-slot metadata comes from the matched source tree.
+        None => (
+            resource,
+            ResourceAttributeInputs::from_report_with_evidence(
+                resource,
+                values,
+                report,
+                carina_core::parser::retained::NoAuthoredEvidence::for_resource(
+                    authored.unwrap_or(resource),
+                ),
+            ),
+        ),
+    }
+}
 
 type ExpandedAnalysis<'a> = carina_core::parser::AnalysisTree<
     'a,
@@ -340,22 +389,26 @@ type ExpandedConfiguration<'a> = carina_core::parser::retained::JudgedFile<
 struct ExpandedDiagnosticValidationInputs<'a> {
     configuration: &'a ExpandedConfiguration<'a>,
     resources: HashMap<&'a carina_core::resource::ResourceId, &'a ExpandedResource<'a>>,
+    coverage: carina_core::validation::admission::WalkCoverage,
     binding_index: carina_core::binding_index::BindingIndex<'a, AbsoluteBindingAddress>,
 }
 
 impl ExpandedDiagnosticValidationInputs<'_> {
     fn resource_admissions(
-        &self,
+        &mut self,
         resource_id: &carina_core::resource::ResourceId,
         session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Option<carina_core::schema::ResourceValueValidation> {
-        use carina_core::validation::admission::attributes::resource_attribute_admissions;
         let resource = *self.resources.get(resource_id)?;
         let schemas = self.configuration.schemas();
         let schema = resource.schema(schemas)?;
-        let attributes = resource.attributes();
-        let mut classified = collect_classified_attributes(
-            attributes.iter().map(|(name, value)| (name.clone(), value)),
+        let inputs =
+            carina_core::validation::admission::attributes::ResourceAttributeInputs::for_resource(
+                resource,
+                self.configuration.report(),
+            )
+            .ok()?;
+        let mut classified = inputs.classify(
             &carina_core::resource::knowledge::KnowledgeContext::validation(),
             |_, _| {},
         );
@@ -363,27 +416,31 @@ impl ExpandedDiagnosticValidationInputs<'_> {
             .iter()
             .filter_map(|(name, proof)| {
                 carina_core::parser::evaluate_expanded_value_for_validation(proof, session)
-                    .filter(|value| value != &attributes[name])
+                    .filter(|value| inputs.value(name).is_some_and(|source| source != value))
                     .map(|value| (name.clone(), value))
             })
             .collect::<HashMap<_, _>>();
-        classified.extend(collect_classified_attributes(
-            evaluated.iter().map(|(name, value)| (name.clone(), value)),
+        let mut evaluated_inputs = inputs.clone();
+        let (evaluated_inputs, updated) = evaluated_inputs.materialize_and_classify(
+            &evaluated,
             &carina_core::resource::knowledge::KnowledgeContext::validation(),
             |_, _| {},
-        ));
-        let report = self.configuration.report().for_resource(resource_id).ok()?;
-        Some(resource_attribute_admissions(
-            resource,
-            self.configuration.file(),
-            schema,
-            &classified,
-            resource.quoted_string_attrs(),
-            report,
-            &self.binding_index,
-            session,
-            schemas,
-        ))
+        );
+        classified.extend(updated);
+        Some(
+            carina_core::validation::admission::attributes::resource_attribute_admissions(
+                resource,
+                self.configuration.file(),
+                schema,
+                &classified,
+                resource.quoted_string_attrs(),
+                evaluated_inputs,
+                &self.binding_index,
+                session,
+                schemas,
+                &mut self.coverage,
+            ),
+        )
     }
 }
 
@@ -1175,7 +1232,7 @@ impl DiagnosticRun<'_> {
                     carina_core::parser::AnalysisTree::try_from_file(configuration.judged().file())
                         .ok()
                 });
-            let expanded_validation_inputs = expanded_configuration.as_ref().and_then(|configuration| {
+            let mut expanded_validation_inputs = expanded_configuration.as_ref().and_then(|configuration| {
                 let configuration = configuration.judged();
                 let graph = configuration.file();
                 let tree = expanded_validation_tree.as_ref()?;
@@ -1186,6 +1243,7 @@ impl DiagnosticRun<'_> {
                 Some(ExpandedDiagnosticValidationInputs {
                     configuration,
                     resources,
+                    coverage: Default::default(),
                     binding_index:
                         carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
                             graph, &self.schemas, Some(&expanded_upstream_exports), &module_signatures, self.provider_context,
@@ -1449,7 +1507,7 @@ impl DiagnosticRun<'_> {
                     );
                 }
             }
-            if let Some(inputs) = expanded_validation_inputs.as_ref() {
+            if let Some(inputs) = expanded_validation_inputs.as_mut() {
                 // A rejected call already owns the diagnostic. Do not add a
                 // downstream resource consequence of that same rejection.
                 let rejected_calls: Vec<_> = diagnostics
@@ -1461,7 +1519,8 @@ impl DiagnosticRun<'_> {
                     .project_resources()
                     .map(|resource| resource.id().clone())
                     .collect();
-                for resource in &inputs.configuration.file().resources {
+                let configuration = inputs.configuration;
+                for resource in &configuration.file().resources {
                     if authored_ids.contains(&resource.id) {
                         continue;
                     }
@@ -1494,6 +1553,15 @@ impl DiagnosticRun<'_> {
                     }
                 }
             }
+            // Admission reads the sealed slots and projections owned by the
+            // judged directory. Source locations still anchor each diagnostic.
+            // Authored inventory is optional on main's buffer path. Its
+            // absence selects report-based admission, not a new diagnostic.
+            let authored_tree = carina_core::parser::AnalysisTree::try_from_file(
+                pre_expansion_configuration.judged().file(),
+            )
+            .ok();
+            let authored_resources = authored_tree.as_ref().map(authored_validation_resources);
             // The document AST intentionally preserves function calls for
             // source-oriented checks. Build a parallel, same-order view with
             // locally resolvable calls evaluated so schema diagnostics see
@@ -1520,6 +1588,7 @@ impl DiagnosticRun<'_> {
                 .map(|resolved| resolved.iter_all_resources().collect::<Vec<_>>());
             // Every schema finding is anchored by the sealed parser view,
             // including the semantic per-file fallback after a buffer parse fails.
+            let mut authored_coverage = carina_core::validation::admission::WalkCoverage::default();
             for (resource_index, rref) in tree.project_resources().enumerate() {
                 let resource_id = rref.id();
                 let resource_attributes = rref.attributes();
@@ -1622,6 +1691,12 @@ impl DiagnosticRun<'_> {
                         .as_ref()
                         .map(carina_core::resource::attrs_to_hashmap)
                         .unwrap_or_else(|| rref.resolved_attributes());
+                    let (admission_resource, inputs) = select_admission_inputs(
+                        rref,
+                        authored_resources.as_ref(),
+                        &resolved_attrs,
+                        expression_report,
+                    );
                     let knowledge_context =
                         carina_core::resource::knowledge::KnowledgeContext::validation();
                     let mut classification_error =
@@ -1644,13 +1719,8 @@ impl DiagnosticRun<'_> {
                                 finding.detail().clone(),
                             ));
                         };
-                    let mut classified_attrs = collect_classified_attributes(
-                        resolved_attrs
-                            .iter()
-                            .map(|(name, value)| (name.clone(), value)),
-                        &knowledge_context,
-                        &mut classification_error,
-                    );
+                    let mut classified_attrs =
+                        inputs.classify(&knowledge_context, &mut classification_error);
                     // Reuse each authored classification. Fully known inputs
                     // already contain their value; only a newly evaluated
                     // candidate needs its own classification.
@@ -1667,17 +1737,19 @@ impl DiagnosticRun<'_> {
                                 knowledge,
                                 self.provider_context.catalog(),
                             )
-                            .filter(|value| value != &resolved_attrs[name])
+                            .filter(|value| {
+                                inputs.value(name).is_some_and(|source| source != value)
+                            })
                             .map(|value| (name.clone(), value))
                         })
                         .collect::<HashMap<_, _>>();
-                    classified_attrs.extend(collect_classified_attributes(
-                        evaluated_attrs
-                            .iter()
-                            .map(|(name, value)| (name.clone(), value)),
+                    let mut evaluated_inputs = inputs.clone();
+                    let (evaluated_inputs, updated) = evaluated_inputs.materialize_and_classify(
+                        &evaluated_attrs,
                         &knowledge_context,
                         classification_error,
-                    ));
+                    );
+                    classified_attrs.extend(updated);
                     // Expansion supplies the binding authority for composition
                     // exports. Select that input before admitting attributes;
                     // the authored tree below supplies only rendering locations.
@@ -1688,12 +1760,18 @@ impl DiagnosticRun<'_> {
                             })
                         })
                     });
-                    let mut value_validation = expanded_validation_inputs.as_ref()
+                    let mut value_validation = expanded_validation_inputs.as_mut()
                         .filter(|_| uses_composition_output)
                         .and_then(|inputs| inputs.resource_admissions(resource_id, self.provider_context))
                         .unwrap_or_else(|| carina_core::validation::admission::attributes::resource_attribute_admissions(
-                            rref, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, expression_report, &binding_index, self.provider_context, &self.schemas,
+                            admission_resource, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, evaluated_inputs, &binding_index, self.provider_context, &self.schemas, &mut authored_coverage,
                         ));
+                    // Attribute rendering consumes its report entries. Preserve
+                    // core's diagnostic ownership before taking those entries.
+                    let resource_diagnostic_errors = value_validation
+                        .diagnostic_errors()
+                        .map(|(error, _, coverage)| (error.clone(), coverage))
+                        .collect::<Vec<_>>();
                     let mut reported_attribute_diagnostics = HashSet::new();
                     let retained_failures = resource_attributes
                         .keys()
@@ -1883,8 +1961,9 @@ impl DiagnosticRun<'_> {
                                     continue;
                                 }
                             }
-                            let symbolic = attr_findings.symbolic_errors().to_vec();
-                            for (path, error) in &symbolic {
+                            let symbolic = attr_findings.symbolic_findings().to_vec();
+                            for finding in &symbolic {
+                                let (path, error) = finding.diagnostic();
                                 use carina_core::resource::SecretDiagnosticError;
                                 use carina_core::validation::admission::AdmissionReferenceError;
                                 let (location, severity, message) = match error {
@@ -2079,7 +2158,7 @@ impl DiagnosticRun<'_> {
 
                     // Render the report produced by the single owner-bound walk.
                     {
-                        for error in value_validation.errors() {
+                        for (error, symbolic_coverage) in resource_diagnostic_errors {
                             if error
                                 .attribute_name()
                                 .is_some_and(|name| retained_failures.contains(name))
@@ -2088,7 +2167,7 @@ impl DiagnosticRun<'_> {
                             }
                             // Existence checks render lookup failures at their
                             // reference tokens, even when admission emits none.
-                            if let TypeError::Reference { error, .. } = error
+                            if let TypeError::Reference { error, .. } = &error
                                 && let carina_core::resource::SecretDiagnosticError::Public(error) = error.as_ref()
                                 && match error {
                                     carina_core::validation::admission::AdmissionReferenceError::UnknownBinding { .. }
@@ -2101,7 +2180,6 @@ impl DiagnosticRun<'_> {
                             {
                                 continue;
                             }
-                            let error = error.clone();
                             if let carina_core::schema::TypeError::MissingRequired { name } = &error
                                 && pending_resource_sinks.iter().any(
                                     |(pending_resource, authored_name)| {
@@ -2169,9 +2247,10 @@ impl DiagnosticRun<'_> {
                             }) {
                                 continue;
                             }
-                            if error
-                                .attribute_name()
-                                .is_some_and(|name| reported_attribute_diagnostics.contains(name))
+                            if symbolic_coverage.owns_finding()
+                                || error.attribute_name().is_some_and(|name| {
+                                    reported_attribute_diagnostics.contains(name)
+                                })
                             {
                                 continue;
                             }

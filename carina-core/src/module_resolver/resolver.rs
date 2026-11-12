@@ -509,7 +509,8 @@ impl ResidualModuleResolutionError {
                 | ParseError::InsideSecret { .. }
                 | ParseError::SecretInConstraint { .. }
                 | ParseError::ValueWalk(_)
-                | ParseError::UserFunctionError(_) => false,
+                | ParseError::UserFunctionError(_)
+                | ParseError::RetainedEvidence(_) => false,
             },
             ModuleError::ParseInFile { path, error } => {
                 crate::validation::type_resolution_parser_error_is_covered(

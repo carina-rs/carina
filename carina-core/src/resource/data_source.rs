@@ -68,6 +68,9 @@ pub struct DataSource<
     pub id: ResourceId,
     /// Source-order preserving map of attribute name → expression.
     pub attributes: IndexMap<String, Value<P, B>>,
+    /// Complete retained attribute inputs; never serialized into runtime state.
+    #[serde(skip)]
+    pub authored_slots: crate::parser::retained::AuthoredSlots<B>,
     /// `directives` meta-argument block — `depends_on` and
     /// `provider_instance` are meaningful for data sources too.
     #[serde(default)]
@@ -114,6 +117,7 @@ impl<P: ValueKind, B: BindingAddress, D> From<DataSource<ModuleSource, P, B, D>>
             dependencies,
             module_source,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         } = data_source;
         Self {
@@ -124,6 +128,7 @@ impl<P: ValueKind, B: BindingAddress, D> From<DataSource<ModuleSource, P, B, D>>
             dependencies,
             module_source: module_source.as_ref().map(SavedModuleSource::from),
             quoted_string_attrs,
+            authored_slots,
             declaration,
         }
     }
@@ -142,6 +147,7 @@ impl<P: ValueKind, B: BindingAddress>
             dependencies: Default::default(),
             module_source: None,
             quoted_string_attrs: HashSet::new(),
+            authored_slots: Default::default(),
             declaration: Default::default(),
         }
     }
@@ -156,6 +162,7 @@ impl<P: ValueKind, B: BindingAddress>
             dependencies: Default::default(),
             module_source: None,
             quoted_string_attrs: HashSet::new(),
+            authored_slots: Default::default(),
             declaration: Default::default(),
         }
     }
@@ -189,6 +196,7 @@ impl<P: ValueKind, B: BindingAddress>
             dependencies: Default::default(),
             module_source: None,
             quoted_string_attrs: HashSet::new(),
+            authored_slots: Default::default(),
             declaration: Default::default(),
         }
     }
@@ -207,6 +215,7 @@ impl<P: ValueKind, B: BindingAddress>
             dependencies: Default::default(),
             module_source: None,
             quoted_string_attrs: HashSet::new(),
+            authored_slots: Default::default(),
             declaration: Default::default(),
         }
     }
@@ -216,12 +225,14 @@ impl<S: Clone, P: ValueKind, B: BindingAddress, D: Clone> DataSource<S, P, B, D>
     pub(crate) fn instantiate(&self) -> Self {
         let mut data_source = self.clone();
         data_source.id = self.id.instantiate_pending();
+        data_source.authored_slots.reinstance();
         data_source
     }
 
     pub(crate) fn instantiate_with_identity(&self, identity: ResourceIdentity) -> Self {
         let mut data_source = self.clone();
         data_source.id = self.id.instantiate_with_identity(identity);
+        data_source.authored_slots.reinstance();
         data_source
     }
 }
@@ -239,6 +250,7 @@ impl<S, B: BindingAddress, D> DataSource<S, ParserPlaceholder, B, D> {
             dependencies,
             module_source,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         } = self;
         let directives = directives.resolve(
@@ -258,6 +270,7 @@ impl<S, B: BindingAddress, D> DataSource<S, ParserPlaceholder, B, D> {
             dependencies,
             module_source,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         })
     }
@@ -274,6 +287,7 @@ impl<S, D> DataSource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
             dependencies: _,
             module_source: _,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         } = self;
         ProviderDataSource {
@@ -284,6 +298,7 @@ impl<S, D> DataSource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
             dependencies: (),
             module_source: None,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         }
     }
@@ -322,6 +337,7 @@ impl<S, P: ValueKind> DataSource<S, P, RelativeBindingName> {
             dependencies,
             module_source,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         } = self;
         DataSource {
@@ -335,6 +351,7 @@ impl<S, P: ValueKind> DataSource<S, P, RelativeBindingName> {
             dependencies: dependencies.resolve_bindings(resolve),
             module_source,
             quoted_string_attrs,
+            authored_slots: authored_slots.map_bindings(resolve),
             declaration,
         }
     }
@@ -353,6 +370,7 @@ impl<P: ValueKind> DataSource<ModuleSource, P, AbsoluteBindingAddress> {
             dependencies,
             module_source,
             quoted_string_attrs: _quoted_string_attrs,
+            authored_slots: _authored_slots,
             declaration: _declaration,
         } = self;
         for value in attributes.values_mut() {
@@ -384,6 +402,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> DataSource<S, P, B, D> {
             dependencies: _,
             module_source,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         } = self;
         DataSource {
@@ -394,6 +413,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> DataSource<S, P, B, D> {
             dependencies,
             module_source,
             quoted_string_attrs,
+            authored_slots,
             declaration,
         }
     }
@@ -519,6 +539,7 @@ impl<S, P: ValueKind> ResolvedDataSource<S, P> {
                 dependencies: (),
                 module_source: None,
                 quoted_string_attrs: HashSet::new(),
+                authored_slots: Default::default(),
                 declaration: Default::default(),
             },
             value_dependencies,

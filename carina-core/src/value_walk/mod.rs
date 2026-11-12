@@ -35,9 +35,9 @@ pub(crate) use substitution::select_authored_module_ifs;
 #[cfg(test)]
 use substitution::{ParserRewrite, rewrite_parser_value};
 pub(crate) use substitution::{
-    RewritePosition, evaluate_expanded_module_functions, select_expanded_module_ifs,
-    substitute_function_call_argument, substitute_function_parameters, substitute_module_arguments,
-    value_argument,
+    RewritePosition, evaluate_expanded_module_functions,
+    select_expanded_module_ifs_with_conditions, substitute_function_call_argument,
+    substitute_function_parameters, substitute_module_arguments, value_argument,
 };
 mod unavailable;
 pub(crate) use unavailable::{

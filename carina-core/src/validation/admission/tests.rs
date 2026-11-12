@@ -6,6 +6,9 @@ use crate::schema::{
 use crate::validation::deferred_types::with_session_for_test;
 use std::collections::HashMap;
 
+#[path = "tests/seam_round4.rs"]
+mod seam_round4;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct AdmissionWork {
     candidates: usize,
@@ -221,15 +224,10 @@ fn retained_reference_boundaries_are_built_per_attribute_not_per_leaf() {
                 .find(|resource| resource.id().resource_type == "Sink")
                 .unwrap();
             let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
-            let resource_attributes = resource.attributes();
-            let attributes = crate::resource::knowledge::collect_classified_attributes(
-                resource_attributes
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value)),
-                &KnowledgeContext::validation(),
-                |_, error| panic!("classification: {error:?}"),
-            );
-            let report = judged.report().for_resource(resource.id()).unwrap();
+            let inputs = attributes::ResourceAttributeInputs::new(resource);
+            let attributes = inputs.classify(&KnowledgeContext::validation(), |_, error| {
+                panic!("classification: {error:?}")
+            });
             with_session_for_test(&catalog, |session| {
                 let (findings, work) = count_admission_work(|| {
                     attributes::resource_attribute_admissions(
@@ -238,10 +236,11 @@ fn retained_reference_boundaries_are_built_per_attribute_not_per_leaf() {
                         resource.schema(&schemas).unwrap(),
                         &attributes,
                         resource.quoted_string_attrs(),
-                        report,
+                        &inputs,
                         &bindings,
                         session,
                         &schemas,
+                        &mut Default::default(),
                     )
                 });
                 assert_eq!(findings.errors().count(), 0, "{leaf}: {findings:?}");
@@ -484,7 +483,16 @@ fn needs_local_without_pending_sites_remains_pending() {
                     None,
                     session,
                 );
-                let local_check = |_: &CompiledAttributeType, _: &Value, path: &LeafPath| {
+                let local_check = |_: &CompiledAttributeType,
+                                   _: &crate::resource::Value<
+                    crate::resource::NoPlaceholder,
+                    AbsoluteBindingAddress,
+                >,
+                                   path: &LeafPath,
+                                   _: crate::parser::retained::AuthoredCursor<
+                    '_,
+                    AbsoluteBindingAddress,
+                >| {
                     Ok(crate::schema::value_validation::AssignmentFindings {
                         local: vec![assignment::LocalPath::for_recheck(
                             kind::ResourceAttribute,
@@ -493,7 +501,7 @@ fn needs_local_without_pending_sites_remains_pending() {
                         ..Default::default()
                     })
                 };
-                context.assignment = Some(&local_check);
+                context.assignment.ordinary = Some(&local_check);
                 assert!(context.sites().is_empty());
                 assert!(matches!(
                     assignment::judge_with_findings(destination, &candidate, &context)
@@ -2841,4 +2849,371 @@ fn round13_cross_owner_same_identity_defers_in_reference_and_declared_admission(
             });
         }
     }
+}
+
+#[test]
+fn round2_plain_reference_skips_expression_callback() {
+    use crate::parser::ProviderContext;
+    use crate::resource::RelativeBindingName;
+    use crate::resource::knowledge::{KnowledgeContext, collect_classified_attributes};
+    use crate::validation::admission::{attributes, kind};
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut schemas = crate::schema::SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Source")
+            .attribute(AttributeSchema::optional("output", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(AttributeSchema::optional("input", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let parsed = crate::parser::parse_and_resolve(
+        "let source = mock.Source {}\nlet sink = mock.Sink { input = source.output }",
+    )
+    .unwrap();
+    let judged = crate::parser::retained::JudgedFile::new(parsed, &schemas, &config);
+    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let resource = tree
+        .project_resources()
+        .find(|resource| resource.id().resource_type == "Sink")
+        .unwrap();
+    let bindings =
+        crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &config);
+    let values = resource.attributes();
+    let classified = collect_classified_attributes(
+        values.iter().map(|(name, value)| (name.clone(), value)),
+        &KnowledgeContext::validation(),
+        |_, error| panic!("{error}"),
+    );
+    let actual: Vec<String> =
+        crate::validation::deferred_types::with_session_for_test(&config, |session| {
+            let check =
+                |_: &str,
+                 _: &crate::schema::CompiledAttributeType,
+                 _: &crate::resource::Value<
+                    crate::resource::ParserPlaceholder,
+                    RelativeBindingName,
+                >,
+                 _: &crate::schema::LeafPath,
+                 _: &crate::validation::admission::DestinationContract,
+                 _: &crate::validation::admission::assignment::ReferenceContext<
+                    '_,
+                    RelativeBindingName,
+                >,
+                 _cursor: crate::parser::retained::AuthoredCursor<'_>| {
+                    Err(crate::schema::TypeError::MissingRequired {
+                        name: "expression-only callback".into(),
+                    })
+                };
+            let result = attributes::admit_validation_attributes::<kind::ResourceAttribute, _, _>(
+                resource.schema(&schemas).unwrap(),
+                resource.id(),
+                &classified,
+                resource.quoted_string_attrs(),
+                Some(&bindings),
+                session,
+                Some(&check),
+                None,
+            );
+            result
+                .errors()
+                .chain(result.symbolic_errors().map(|(_, _, error)| error))
+                .map(ToString::to_string)
+                .collect()
+        });
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "../../parser/retained/judgement/round2_main.json"
+    ))
+    .unwrap();
+    let actual = serde_json::json!(actual);
+    assert_eq!(actual, expected["plain_reference"]);
+}
+
+#[derive(Debug)]
+struct Round3HookVisit {
+    edge: crate::parser::retained::EdgeRole,
+    discarded: bool,
+    covered: bool,
+    selection: bool,
+}
+
+fn round3_admission_hook(source: &str, declaration: AttributeType) -> Vec<Round3HookVisit> {
+    use crate::parser::retained::{AuthoredCursor, CursorKind};
+    use crate::resource::{ParserPlaceholder, RelativeBindingName};
+    use crate::schema::value_validation::CheckValue;
+
+    let catalog = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Source")
+            .attribute(AttributeSchema::optional("output", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(AttributeSchema::optional("input", declaration).build())
+            .validate()
+            .unwrap(),
+    );
+    let parsed =
+        crate::parser::parse_file(source, std::path::Path::new("round3-hook.crn"), &catalog)
+            .unwrap();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let judged = configuration.judged();
+    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let resource = tree
+        .resources()
+        .find(|resource| resource.id().resource_type == "Sink")
+        .unwrap();
+    let slot = resource.authored_slot("input").unwrap();
+    let proof = slot
+        .projection()
+        .unwrap()
+        .knowledge(&KnowledgeContext::validation())
+        .unwrap()
+        .into_classification();
+    let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+    let destination = schemas
+        .resource_attribute_destination(resource.id(), "input", &catalog)
+        .unwrap();
+    let visits = std::cell::RefCell::new(Vec::new());
+    let seen = std::cell::RefCell::new(std::collections::HashSet::new());
+    with_session_for_test(&catalog, |session| {
+        let hook = |_: &crate::schema::CompiledAttributeType,
+                    value: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                    _: &crate::schema::LeafPath,
+                    cursor: AuthoredCursor<'_>| {
+            let selection = cursor.is_selection();
+            let (usage, covered) = match cursor.kind {
+                CursorKind::Authored(usage) => (usage, false),
+                CursorKind::CoveredBy(usage) => (usage, true),
+                CursorKind::Projected(_) => panic!("authored slot lost its cursor"),
+            };
+            let discarded = matches!(value, CheckValue::Discarded);
+            assert!(
+                seen.borrow_mut().insert((
+                    usage.node().node_id(),
+                    usage.occurrence(),
+                    discarded,
+                    selection,
+                )),
+                "hook called twice for one authored position"
+            );
+            visits.borrow_mut().push(Round3HookVisit {
+                edge: usage.edge(),
+                discarded,
+                covered,
+                selection,
+            });
+            Ok(Default::default())
+        };
+        let ordinary = |_: &crate::schema::CompiledAttributeType,
+                        value: &crate::resource::Value<ParserPlaceholder, RelativeBindingName>,
+                        _: &crate::schema::LeafPath,
+                        cursor: AuthoredCursor<'_>| {
+            assert!(matches!(
+                assignment::CandidateOrigin::of(value),
+                assignment::CandidateOrigin::Expression
+            ));
+            assert!(!cursor.is_selection());
+            let (node, usage, _, _) = cursor.identity().unwrap();
+            assert!(
+                seen.borrow().contains(&(node, usage, false, false)),
+                "the authored hook must precede ordinary checks"
+            );
+            Ok(Default::default())
+        };
+        let untyped = Vec::new;
+        let (candidate, context) =
+            Candidate::validation_slot(slot, proof, Some(&bindings), session).unwrap();
+        let context = context.with_checks(
+            AssignmentChecks {
+                authored: Some(&hook),
+                ordinary: Some(&ordinary),
+            },
+            &untyped,
+        );
+        let result = admit(&destination, candidate, &context);
+        assert!(result.is_ok(), "main accepts this no-as input: {result:?}");
+    });
+    visits.into_inner()
+}
+
+#[test]
+fn round3_admission_hook_receives_authored_literals_in_containers() {
+    use crate::parser::retained::EdgeRole;
+    for (expression, declaration, edge) in [
+        ("'value'", AttributeType::string(), EdgeRole::SlotRoot),
+        (
+            "['value']",
+            AttributeType::list(AttributeType::string()),
+            EdgeRole::ListItem,
+        ),
+        (
+            "{ key = 'value' }",
+            AttributeType::map(AttributeType::string()),
+            EdgeRole::MapValue,
+        ),
+        (
+            "{ field = 'value' }",
+            AttributeType::struct_(
+                "Entry",
+                vec![StructField::required("field", AttributeType::string()).build()],
+            ),
+            EdgeRole::StructField,
+        ),
+    ] {
+        let visits = round3_admission_hook(
+            &format!("mock.Sink {{ input = {expression} }}"),
+            declaration,
+        );
+        assert!(
+            visits.iter().any(|visit| visit.edge == edge
+                && !visit.covered
+                && !visit.discarded
+                && !visit.selection),
+            "{visits:?}"
+        );
+    }
+}
+
+#[test]
+fn round3_admission_hook_receives_reference_origins() {
+    let visits = round3_admission_hook(
+        "let source = mock.Source {}\nmock.Sink { input = source.output }",
+        AttributeType::string(),
+    );
+    assert_eq!(visits.len(), 1, "{visits:?}");
+    assert_eq!(visits[0].edge, crate::parser::retained::EdgeRole::SlotRoot);
+    assert!(!visits[0].covered);
+}
+
+fn round3_assert_alternatives(expression: &str, edge: crate::parser::retained::EdgeRole) {
+    let visits = round3_admission_hook(
+        &format!("mock.Sink {{ input = {expression} }}"),
+        AttributeType::string(),
+    );
+    assert!(visits.iter().any(|visit| visit.selection), "{visits:?}");
+    for discarded in [false, true] {
+        assert!(
+            visits
+                .iter()
+                .any(|visit| visit.edge == edge && visit.discarded == discarded && !visit.covered),
+            "{visits:?}"
+        );
+    }
+}
+
+#[test]
+fn round3_admission_hook_receives_discarded_if_alternative() {
+    round3_assert_alternatives(
+        "if true { 'live' } else { 'dead' }",
+        crate::parser::retained::EdgeRole::IfBranch,
+    );
+}
+
+#[test]
+fn round3_admission_hook_receives_discarded_coalesce_alternative() {
+    round3_assert_alternatives(
+        "'live' ?? 'dead'",
+        crate::parser::retained::EdgeRole::CoalesceOperand,
+    );
+}
+
+#[test]
+fn round3_admission_hook_receives_covered_positions() {
+    let visits = round3_admission_hook("mock.Sink { input = 1 + 2 }", AttributeType::int());
+    assert!(visits.iter().any(|visit| visit.covered), "{visits:?}");
+}
+
+#[test]
+fn round7_hook_error_without_attribute_has_one_diagnostic_owner() {
+    use crate::resource::{ParserPlaceholder, RelativeBindingName};
+    use crate::schema::value_validation::{AttributeAdmission, CheckValue};
+    let catalog = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(AttributeSchema::optional("input", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let parsed = crate::parser::parse_and_resolve("mock.Sink { input = 'value' }").unwrap();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let judged = configuration.judged();
+    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let resource = tree.resources().next().unwrap();
+    let slot = resource.authored_slot("input").unwrap();
+    let proof = slot
+        .projection()
+        .unwrap()
+        .knowledge(&KnowledgeContext::validation())
+        .unwrap()
+        .into_classification();
+    let attributes = HashMap::from([("input".into(), proof)]);
+    let destination = schemas
+        .resource_attribute_destination(resource.id(), "input", &catalog)
+        .unwrap();
+    let report = with_session_for_test(&catalog, |session| {
+        let hook = |_: &crate::schema::CompiledAttributeType,
+                    _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                    _: &crate::schema::LeafPath,
+                    _: crate::parser::retained::AuthoredCursor<'_>| {
+            Err(crate::schema::TypeError::MissingRequired {
+                name: "hook finding".into(),
+            })
+        };
+        resource
+            .schema(&schemas)
+            .unwrap()
+            .schema()
+            .as_schema()
+            .validate_admission_report(
+                &attributes,
+                &|_| false,
+                &AttributeAdmission {
+                    known: &|_, _, proof| {
+                        let (candidate, context) =
+                            Candidate::validation_slot(slot, proof.clone(), None, session).unwrap();
+                        let untyped = Vec::new;
+                        let context = context.with_checks(
+                            AssignmentChecks {
+                                authored: Some(&hook),
+                                ordinary: None,
+                            },
+                            &untyped,
+                        );
+                        let mut error = admit(&destination, candidate, &context).unwrap_err();
+                        error.take_findings().unwrap()
+                    },
+                    unknown: None,
+                },
+            )
+    });
+    assert_eq!(report.symbolic_errors().count(), 1);
+    let errors = report.diagnostic_errors().collect::<Vec<_>>();
+    assert_eq!(errors.len(), 1);
+    let (error, path, coverage) = errors[0];
+    assert!(
+        error.attribute_name().is_none(),
+        "owner cannot be inferred from error text"
+    );
+    assert_eq!(path.unwrap().0, "input");
+    assert!(coverage.owns_path(), "CLI already suppresses this echo");
+    assert!(
+        coverage.owns_finding(),
+        "LSP must suppress the same hook finding"
+    );
 }

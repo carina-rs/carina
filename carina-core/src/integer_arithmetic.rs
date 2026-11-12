@@ -110,17 +110,30 @@ fn zero_divisor_error(op: IntegerOp) -> Option<IntegerArithmeticError> {
 #[derive(Debug, Clone)]
 pub struct IntegerOperatorSpan {
     location: Option<crate::parser::DeclarationLocation>,
+    node: Option<crate::parser::retained::NodeId>,
 }
 
 impl IntegerOperatorSpan {
     pub fn authored(location: crate::parser::DeclarationLocation) -> Self {
         Self {
             location: Some(location),
+            node: None,
         }
     }
 
     pub const fn synthetic() -> Self {
-        Self { location: None }
+        Self {
+            location: None,
+            node: None,
+        }
+    }
+
+    pub(crate) fn with_node(mut self, node: Option<crate::parser::retained::NodeId>) -> Self {
+        self.node = node;
+        self
+    }
+    pub(crate) fn node_id(&self) -> Option<crate::parser::retained::NodeId> {
+        self.node
     }
 
     pub fn location(&self) -> Option<&crate::parser::DeclarationLocation> {

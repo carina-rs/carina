@@ -133,6 +133,9 @@ pub(crate) fn parse_float_literal(text: &str, line: usize) -> Result<crate::Fini
 /// ```
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
+    /// A live parser inventory lost a required authored correspondence.
+    #[error(transparent)]
+    RetainedEvidence(#[from] super::retained::MissingEvidence),
     /// Failures crossing an intrinsic secret boundary retain only their location.
     #[error(
         "Invalid expression at line {line}: {}",

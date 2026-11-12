@@ -18,13 +18,75 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+thread_local! {
+    static PROJECTION_COPY_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn count_projection_copy_work<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    PROJECTION_COPY_WORK.set(0);
+    let result = run();
+    (result, PROJECTION_COPY_WORK.get())
+}
+
+#[cfg(test)]
+fn record_projection_copy(value: &Value<ParserPlaceholder, RelativeBindingName>) {
+    fn size(value: &Value<ParserPlaceholder, RelativeBindingName>) -> usize {
+        1 + match value {
+            Value::Concrete(crate::resource::ConcreteValue::List(values)) => {
+                values.iter().map(size).sum()
+            }
+            Value::Concrete(crate::resource::ConcreteValue::Map(values)) => {
+                values.values().map(size).sum()
+            }
+            Value::Concrete(_) | Value::Deferred(_) => 0,
+        }
+    }
+    PROJECTION_COPY_WORK.update(|work| work + size(value));
+}
+
+mod cursor;
+pub use cursor::{
+    AuthoredCursor, AuthoredSlots, AuthoredUse, CompletenessReport, EdgeRole, ExpansionInstanceId,
+    JudgedNodeRef, JudgedSlot, NoAuthoredEvidence, NodeId, ProjectedPhase, ProjectionGeneration,
+    SlotDeclarationId, UnreachedSlot, UseId,
+};
+pub(crate) use cursor::{AuthoredForm, AuthoredNavigation, CursorKind, SyntheticSource};
+
 /// The expansion scope is part of expression identity, even when two module
 /// instances originate at the same authored source location.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default)]
 pub(crate) enum ExpressionInstance {
     #[default]
     Root,
-    Module(Arc<str>),
+    Module(Arc<ExpressionEnvironment>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ExpressionEnvironmentId(u64);
+
+pub(crate) struct ExpressionEnvironment {
+    id: ExpressionEnvironmentId,
+    scope: Arc<str>,
+}
+
+impl std::fmt::Debug for ExpressionEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.scope.fmt(f)
+    }
+}
+
+impl PartialEq for ExpressionInstance {
+    fn eq(&self, other: &Self) -> bool {
+        self.id() == other.id()
+    }
+}
+impl Eq for ExpressionInstance {}
+impl std::hash::Hash for ExpressionInstance {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id().hash(state);
+    }
 }
 
 /// A failed evidence lookup is an invariant error, never deferred authority.
@@ -46,17 +108,122 @@ impl MissingEvidence {
 
 impl ExpressionInstance {
     pub(crate) fn for_scope(scope: &crate::resource::ModuleInstanceScope) -> Self {
-        Self::Module(Arc::from(scope.key()))
+        #[derive(Default)]
+        struct Environments {
+            scopes: HashMap<Arc<str>, std::sync::Weak<ExpressionEnvironment>>,
+            next_cleanup: usize,
+        }
+        static ENVIRONMENTS: std::sync::OnceLock<std::sync::Mutex<Environments>> =
+            std::sync::OnceLock::new();
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let mut environments = ENVIRONMENTS
+            .get_or_init(Default::default)
+            .lock()
+            .expect("expression environments lock");
+        if let Some(environment) = environments
+            .scopes
+            .get(scope.key())
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return Self::Module(environment);
+        }
+        if environments.scopes.len() >= environments.next_cleanup {
+            environments
+                .scopes
+                .retain(|_, environment| environment.strong_count() != 0);
+            environments.next_cleanup = environments.scopes.len().saturating_mul(2).max(64);
+        }
+        let environment = Arc::new(ExpressionEnvironment {
+            id: ExpressionEnvironmentId(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+            scope: Arc::from(scope.key()),
+        });
+        environments
+            .scopes
+            .insert(environment.scope.clone(), Arc::downgrade(&environment));
+        Self::Module(environment)
+    }
+
+    pub(crate) fn id(&self) -> ExpressionEnvironmentId {
+        match self {
+            Self::Root => ExpressionEnvironmentId(0),
+            Self::Module(environment) => environment.id,
+        }
+    }
+}
+
+/// Parser decisions are versioned independently of provisional Values. Each
+/// slot takes a constant-size view of this shared history, so later loop
+/// iterations cannot change the branch that produced an earlier projection.
+#[derive(Debug, Default)]
+struct ConditionHistory {
+    version: usize,
+    values: HashMap<NodeId, Vec<(usize, bool)>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct ConditionSnapshot {
+    history: Arc<std::sync::RwLock<ConditionHistory>>,
+    version: usize,
+    previous: Option<Arc<ConditionSnapshot>>,
+}
+
+impl ConditionSnapshot {
+    fn get(&self, id: NodeId) -> Option<bool> {
+        let selected = {
+            let history = self.history.read().expect("retained conditions lock");
+            history.values.get(&id).and_then(|values| {
+                let index = values.partition_point(|(version, _)| *version <= self.version);
+                index.checked_sub(1).map(|index| values[index].1)
+            })
+        };
+        selected.or_else(|| self.previous.as_ref()?.get(id))
+    }
+
+    fn over(&self, previous: &Self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.previous = Some(Arc::new(previous.clone()));
+        snapshot
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ConditionRecorder(Arc<std::sync::RwLock<ConditionHistory>>);
+
+impl ConditionRecorder {
+    pub(crate) fn extend(&self, decisions: impl IntoIterator<Item = (NodeId, bool)>) {
+        let mut history = self.0.write().expect("retained conditions lock");
+        for (id, selected) in decisions {
+            history.version += 1;
+            let version = history.version;
+            history
+                .values
+                .entry(id)
+                .or_default()
+                .push((version, selected));
+        }
+    }
+
+    fn snapshot(&self) -> ConditionSnapshot {
+        ConditionSnapshot {
+            history: self.0.clone(),
+            version: self.0.read().expect("retained conditions lock").version,
+            previous: None,
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ExpressionLocation {
+/// A diagnostic range. Never use this value as authored admission identity.
+pub struct ExpressionLocation {
     instance: ExpressionInstance,
     authored: DeclarationLocation,
 }
 
 impl ExpressionLocation {
+    pub fn declaration(&self) -> &DeclarationLocation {
+        &self.authored
+    }
+
     fn new(instance: ExpressionInstance, authored: &DeclarationLocation) -> Self {
         Self {
             instance,
@@ -91,11 +258,35 @@ enum Projection<P: ValueKind, B: BindingAddress> {
     Value(Value<P, B>),
 }
 
-#[derive(Clone, PartialEq)]
+impl<P: ValueKind, B: BindingAddress> Projection<P, B> {
+    fn map_bindings<C: BindingAddress>(self, map: &mut impl FnMut(B) -> C) -> Projection<P, C> {
+        match self {
+            Self::Pending => Projection::Pending,
+            Self::Value(value) => Projection::Value(value.map_bindings(map)),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct AuthoredExpr<P: ValueKind, B: BindingAddress> {
+    id: NodeId,
+    definition_use: UseId,
     location: ExpressionLocation,
     kind: ExprKind<B>,
     children: Vec<ExprValue<P, B>>,
+}
+
+type AuthoredNodes<B> =
+    HashMap<(ExpressionInstance, NodeId), Arc<AuthoredExpr<ParserPlaceholder, B>>>;
+
+// Syntax equality predates identity. Keep its existing semantics for callers
+// comparing parser output; admission uses NodeId explicitly.
+impl<P: ValueKind, B: BindingAddress> PartialEq for AuthoredExpr<P, B> {
+    fn eq(&self, other: &Self) -> bool {
+        self.location == other.location
+            && self.kind == other.kind
+            && self.children == other.children
+    }
 }
 
 impl<P: ValueKind, B: BindingAddress> std::fmt::Debug for AuthoredExpr<P, B> {
@@ -147,6 +338,8 @@ enum ExprKind<B: BindingAddress> {
         location: DeclarationLocation,
     },
     Alias,
+    Parens,
+    Definition,
     Element,
     Iterable,
     Resource {
@@ -174,6 +367,10 @@ struct FunctionSignature {
 }
 
 impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
+    pub fn node_id(&self) -> NodeId {
+        self.authored.id
+    }
+
     pub fn projection(&self) -> Option<&Value<P, B>> {
         match &self.payload {
             Projection::Value(value) => Some(value),
@@ -228,6 +425,8 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
             ExprKind::Access(step) => ExprKind::Access(step),
             ExprKind::Integer { op, location } => ExprKind::Integer { op, location },
             ExprKind::Alias => ExprKind::Alias,
+            ExprKind::Parens => ExprKind::Parens,
+            ExprKind::Definition => ExprKind::Definition,
             ExprKind::Element => ExprKind::Element,
             ExprKind::Iterable => ExprKind::Iterable,
             ExprKind::Resource {
@@ -252,6 +451,8 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
             ExprKind::Unsupported(rule) => ExprKind::Unsupported(rule),
         };
         let authored = Arc::new(AuthoredExpr {
+            id: authored.id,
+            definition_use: authored.definition_use,
             location: authored.location,
             kind,
             children: authored
@@ -286,10 +487,25 @@ pub(in crate::parser) fn evaluate(
     pair: Pair<'_, Rule>,
     file: &PreprocessedFile,
     source: &Path,
+    captures: &CapturedNodes,
     reduce: impl FnOnce() -> Result<super::ParsedValue, super::ParseError>,
 ) -> Result<ExprValue, super::ParseError> {
-    let mut expression = compile(pair, file, source, &HashMap::new());
-    expression.payload = Projection::Value(reduce()?);
+    let pair_for_record = pair.clone();
+    let mut expression = captures
+        .get(&ParseNodeKey::of(&pair))
+        .cloned()
+        .unwrap_or_else(|| {
+            compile(
+                pair,
+                file,
+                source,
+                &HashMap::new(),
+                &mut CapturedNodes::default(),
+            )
+        });
+    let value = reduce()?;
+    captures.record(&pair_for_record, value.clone());
+    expression.payload = Projection::Value(value);
     Ok(expression)
 }
 
@@ -297,17 +513,85 @@ pub(in crate::parser) fn evaluate_sink(
     pair: Pair<'_, Rule>,
     file: &PreprocessedFile,
     source: &Path,
+    captures: &CapturedNodes,
     reduce: impl FnOnce() -> Result<crate::eval_value::ParsedSinkValue, super::ParseError>,
 ) -> Result<SinkExpression, super::ParseError> {
-    let mut expression = compile(pair, file, source, &HashMap::new());
+    let pair_for_record = pair.clone();
+    let mut expression = match captures.get(&ParseNodeKey::of(&pair)) {
+        Some(expression) => expression.clone(),
+        None if !captures.inventory => compile(
+            pair,
+            file,
+            source,
+            &HashMap::new(),
+            &mut CapturedNodes::default(),
+        ),
+        None => return Err(MissingEvidence::new("live sink parser identity").into()),
+    };
     let payload = reduce()?;
     if let crate::eval_value::ParsedSinkValue::Ready(value) = &payload {
+        captures.record(&pair_for_record, value.clone());
         expression.payload = Projection::Value(value.clone());
     }
     Ok(SinkExpression {
         expression,
         payload,
     })
+}
+
+pub(in crate::parser) fn resource_slots(
+    pair: &Pair<'_, Rule>,
+    captures: &CapturedNodes,
+    sinks: &HashMap<String, SinkExpression>,
+    values: &IndexMap<String, Value<ParserPlaceholder, RelativeBindingName>>,
+    kind: crate::schema::SchemaKind,
+) -> Result<AuthoredSlots, super::ParseError> {
+    let Some(root) = captures.get(&ParseNodeKey::of(pair)) else {
+        if captures.inventory {
+            return Err(MissingEvidence::new("live resource parser identity").into());
+        }
+        // Standalone expression parser helpers have no configuration inventory.
+        return Ok(AuthoredSlots::default());
+    };
+    let instance = ExpansionInstanceId::fresh();
+    let mut slots = AuthoredSlots::default();
+    slots.set_declaration(
+        captures
+            .resource_declarations
+            .get(&root.node_id())
+            .ok_or_else(|| MissingEvidence::new("resource storage declaration"))?
+            .clone(),
+    );
+    for child in &root.authored.children {
+        let ExprKind::Sink(name) = &child.authored.kind else {
+            continue;
+        };
+        if let Some(sink) = sinks.get(name) {
+            let conditions = captures.condition_snapshot();
+            slots.insert(
+                name.clone(),
+                sink.expression.clone(),
+                kind,
+                instance,
+                conditions,
+            );
+        } else {
+            // Grouped blocks have explicit compiler-owned container handles,
+            // including when a pending child prevents a provisional Value.
+            let mut expression = child.authored.children[0].clone();
+            if let Some(value) = values.get(name) {
+                expression.payload = Projection::Value(value.clone());
+            }
+            slots.insert(
+                name.clone(),
+                expression,
+                kind,
+                instance,
+                captures.condition_snapshot(),
+            );
+        }
+    }
+    Ok(slots)
 }
 
 /// Parser-owned expression inventory. Merging and binding expansion preserve
@@ -324,13 +608,36 @@ pub(in crate::parser) fn evaluate_sink(
 /// let signatures = ResolvedModuleSignatures::default();
 /// let unchecked = ValidationTypeContext::new_providerless(&raw, &config, &signatures);
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone)]
 pub struct Expressions<B: BindingAddress = RelativeBindingName> {
     roots: Vec<ExprValue<ParserPlaceholder, B>>,
     definitions: IndexMap<B, ExprValue<ParserPlaceholder, B>>,
     report: Arc<ExpressionReport<B>>,
     arguments: HashMap<B, TypeExpr>,
     instance: ExpressionInstance,
+    captures: Arc<CapturedNodes>,
+    projections: Arc<HashMap<(ExpressionInstance, NodeId), Value<ParserPlaceholder, B>>>,
+}
+
+impl<B: BindingAddress> PartialEq for Expressions<B> {
+    fn eq(&self, other: &Self) -> bool {
+        self.roots == other.roots
+            && self.definitions == other.definitions
+            && self.report == other.report
+            && self.arguments == other.arguments
+            && self.instance == other.instance
+    }
+}
+
+impl<B: BindingAddress> std::fmt::Debug for Expressions<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Expressions")
+            .field("roots", &self.roots)
+            .field("definitions", &self.definitions)
+            .field("report", &self.report)
+            .field("instance", &self.instance)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<B: BindingAddress> Default for Expressions<B> {
@@ -341,6 +648,8 @@ impl<B: BindingAddress> Default for Expressions<B> {
             report: Arc::new(ExpressionReport::empty()),
             arguments: HashMap::new(),
             instance: ExpressionInstance::Root,
+            captures: Arc::default(),
+            projections: Arc::default(),
         }
     }
 }
@@ -349,6 +658,10 @@ impl<B: BindingAddress> Expressions<B> {
     pub fn binding(&self, name: &B) -> Option<&ExprValue<ParserPlaceholder, B>> {
         self.definitions.get(name)
     }
+    pub(in crate::parser) fn captured_nodes(&self) -> Arc<CapturedNodes> {
+        self.captures.clone()
+    }
+
     pub fn roots(&self) -> &[ExprValue<ParserPlaceholder, B>] {
         &self.roots
     }
@@ -357,6 +670,7 @@ impl<B: BindingAddress> Expressions<B> {
         self.roots.extend(other.roots);
         self.definitions.extend(other.definitions);
         self.arguments.extend(other.arguments);
+        Arc::make_mut(&mut self.projections).extend(Arc::unwrap_or_clone(other.projections));
         Arc::make_mut(&mut self.report).extend(Arc::unwrap_or_clone(other.report));
     }
 
@@ -366,6 +680,13 @@ impl<B: BindingAddress> Expressions<B> {
     ) -> Expressions<C> {
         let mut memo = HashMap::new();
         Expressions {
+            captures: Arc::default(),
+            projections: Arc::new(
+                self.projections
+                    .iter()
+                    .map(|(id, value)| (id.clone(), value.clone().map_bindings(map)))
+                    .collect(),
+            ),
             instance: self.instance,
             arguments: self
                 .arguments
@@ -397,12 +718,42 @@ impl<B: BindingAddress> Expressions<B> {
         }
     }
 
+    pub(crate) fn substitute_projections(
+        &mut self,
+        arguments: crate::module_resolver::expander::ArgumentSubstitutions<'_, B>,
+    ) {
+        let projections = self
+            .projections
+            .iter()
+            .filter_map(|(id, value)| {
+                // These are archived operands, including structural declarations.
+                // Unprojectable handles invalidate their old payload instead of
+                // adding a new rejection to the live value path.
+                crate::value_walk::substitute_module_arguments(
+                    value,
+                    arguments,
+                    crate::value_walk::RewritePosition::Value,
+                )
+                .ok()
+                .map(|value| (id.clone(), value))
+            })
+            .collect();
+        self.projections = Arc::new(projections);
+        self.report = Arc::new(ExpressionReport::empty());
+    }
+
     pub(crate) fn bind_arguments(
         &mut self,
         scope: &crate::resource::ModuleInstanceScope,
         arguments: impl IntoIterator<Item = (B, TypeExpr)>,
     ) {
         self.instance = ExpressionInstance::for_scope(scope);
+        self.projections = Arc::new(
+            self.projections
+                .iter()
+                .map(|((_, id), value)| ((self.instance.clone(), *id), value.clone()))
+                .collect(),
+        );
         fn qualify<P: ValueKind, B: BindingAddress>(
             expression: &mut ExprValue<P, B>,
             instance: &ExpressionInstance,
@@ -494,6 +845,7 @@ pub(crate) fn judge_configuration<
 ) where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
+    prepare_slots(file, schemas);
     let mut report = judge_expressions(file, schemas, config);
     for parameter in &file.export_params {
         if let (Some(sink), Some(location)) =
@@ -513,23 +865,112 @@ pub(crate) fn judge_configuration<
     for parameter in &mut file.attribute_params {
         parameter.attach_judgement(&report);
     }
-    file.parser_binding_metadata.syntax.expressions_mut().report = Arc::new(report);
+    let report = Arc::new(report);
+    attach_slot_reports(file, &report);
+    file.parser_binding_metadata.syntax.expressions_mut().report = report;
 }
 
 pub(crate) fn attach_report<E, D, B: BindingAddress>(
     file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     report: ExpressionReport<B>,
-) {
-    file.parser_binding_metadata.syntax.expressions_mut().report = Arc::new(report);
+) where
+    D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    let report = Arc::new(report);
+    attach_slot_reports(file, &report);
+    file.parser_binding_metadata.syntax.expressions_mut().report = report;
+}
+
+fn prepare_slots<E, D, B: BindingAddress>(
+    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    schemas: &crate::schema::SchemaRegistry,
+) where
+    D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    for resource in file.iter_all_resources_mut() {
+        match resource {
+            super::ResourceMut::Resource(resource) => {
+                if let Some(schema) = schemas.get_for(resource) {
+                    resource
+                        .authored_slots
+                        .bind_schema(schema.schema().as_schema());
+                }
+                resource.authored_slots.synchronize(&resource.attributes);
+            }
+            super::ResourceMut::DataSource(source) => {
+                if let Some(schema) = schemas.get_for_data_source(source) {
+                    source
+                        .authored_slots
+                        .bind_schema(schema.schema().as_schema());
+                }
+                source.authored_slots.synchronize(&source.attributes);
+            }
+            super::ResourceMut::Deferred { .. } | super::ResourceMut::LiveComposition(_) => {}
+        }
+    }
+    for (id, slots) in file.deferred_for_phase.authored_slots_mut() {
+        if let Some(kind) = slots.selected_schema_kind()
+            && let Some(schema) = schemas.get(&id.provider, &id.resource_type, kind)
+        {
+            slots.bind_schema(schema.schema().as_schema());
+        }
+    }
+}
+
+fn attach_slot_reports<E, D, B: BindingAddress>(
+    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    report: &Arc<ExpressionReport<B>>,
+) where
+    D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    for (id, slots) in file.deferred_for_phase.authored_slots_mut() {
+        slots.attach_snapshot(report.shared_for_resource(id));
+    }
+    for resource in file.iter_all_resources_mut() {
+        match resource {
+            super::ResourceMut::Resource(resource) => {
+                resource
+                    .authored_slots
+                    .attach_snapshot(report.shared_for_resource(&resource.id));
+            }
+            super::ResourceMut::DataSource(resource) => {
+                resource
+                    .authored_slots
+                    .attach_snapshot(report.shared_for_resource(&resource.id));
+            }
+            super::ResourceMut::Deferred { .. } => {}
+            super::ResourceMut::LiveComposition(_) => {}
+        }
+    }
 }
 
 impl Expressions {
+    pub(in crate::parser) fn finish_captures(&mut self) {
+        self.projections = Arc::new(
+            self.captures
+                .values
+                .read()
+                .expect("retained projections lock")
+                .iter()
+                .map(|(id, value)| {
+                    #[cfg(test)]
+                    record_projection_copy(value);
+                    ((self.instance.clone(), *id), value.clone())
+                })
+                .collect(),
+        );
+    }
+
     pub(in crate::parser) fn from_pairs(
         pairs: Pairs<'_, Rule>,
         file: &PreprocessedFile,
         source: &Path,
     ) -> Self {
         let mut out = Self::default();
+        let mut captures = CapturedNodes {
+            inventory: true,
+            ..Default::default()
+        };
         for statement in pairs
             .flat_map(|pair| pair.into_inner())
             .filter(|pair| pair.as_rule() == Rule::statement)
@@ -539,7 +980,7 @@ impl Expressions {
                 let mut parts = pair.clone().into_inner();
                 let name = parts.next().expect("let binding name").as_str();
                 if let Some(rhs) = parts.find(|part| part.as_rule() == Rule::expression) {
-                    let expression = compile(rhs, file, source, &HashMap::new());
+                    let expression = compile(rhs, file, source, &HashMap::new(), &mut captures);
                     if name != "_" {
                         out.definitions
                             .insert(RelativeBindingName::new(name), expression.clone());
@@ -548,8 +989,10 @@ impl Expressions {
                     continue;
                 }
             }
-            out.roots.push(compile(pair, file, source, &HashMap::new()));
+            out.roots
+                .push(compile(pair, file, source, &HashMap::new(), &mut captures));
         }
+        out.captures = Arc::new(captures);
         out
     }
 }
@@ -563,6 +1006,8 @@ fn node(
 ) -> ExprValue {
     ExprValue {
         authored: Arc::new(AuthoredExpr {
+            id: NodeId::fresh(),
+            definition_use: UseId::fresh(),
             location: ExpressionLocation::new(
                 ExpressionInstance::Root,
                 &DeclarationLocation::expression_node(pair, file, source),
@@ -593,6 +1038,8 @@ fn lower_blocks(children: Vec<ExprValue>) -> Vec<ExprValue> {
         .map(|(name, records)| {
             let value = ExprValue {
                 authored: Arc::new(AuthoredExpr {
+                    id: NodeId::fresh(),
+                    definition_use: UseId::fresh(),
                     location: ExpressionLocation::new(ExpressionInstance::Root, &headers[&name]),
                     kind: ExprKind::List,
                     children: records,
@@ -608,6 +1055,8 @@ fn lower_blocks(children: Vec<ExprValue>) -> Vec<ExprValue> {
             if let ExprKind::NestedBlock { name, header } = &child.authored.kind {
                 ExprValue {
                     authored: Arc::new(AuthoredExpr {
+                        id: NodeId::fresh(),
+                        definition_use: UseId::fresh(),
                         location: ExpressionLocation::new(ExpressionInstance::Root, header),
                         kind: ExprKind::Sink(name.clone()),
                         children: vec![groups[name].clone()],
@@ -621,11 +1070,122 @@ fn lower_blocks(children: Vec<ExprValue>) -> Vec<ExprValue> {
         .collect()
 }
 
+/// Exact parser-token identity while one parse is alive. Pest's Hash input
+/// encodes its token queue, input allocation and token ordinal. Retaining those
+/// bytes avoids hash collisions and never uses diagnostic locations as identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(in crate::parser) struct ParseNodeKey(Vec<u8>);
+impl ParseNodeKey {
+    fn of(pair: &Pair<'_, Rule>) -> Self {
+        use std::hash::{Hash, Hasher};
+        #[derive(Default)]
+        struct IdentityBytes(Vec<u8>);
+        impl Hasher for IdentityBytes {
+            fn write(&mut self, bytes: &[u8]) {
+                self.0.extend_from_slice(bytes);
+            }
+            fn finish(&self) -> u64 {
+                unreachable!("identity bytes are never hashed to a digest")
+            }
+        }
+        let mut identity = IdentityBytes::default();
+        pair.hash(&mut identity);
+        Self(identity.0)
+    }
+}
+
+#[derive(Default)]
+pub(in crate::parser) struct CapturedNodes {
+    inventory: bool,
+    nodes: HashMap<ParseNodeKey, ExprValue>,
+    resource_declarations: HashMap<NodeId, SlotDeclarationId>,
+    values: std::sync::RwLock<HashMap<NodeId, Value<ParserPlaceholder, RelativeBindingName>>>,
+    conditions: ConditionRecorder,
+}
+impl std::fmt::Debug for CapturedNodes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CapturedNodes(..)")
+    }
+}
+impl CapturedNodes {
+    fn condition_snapshot(&self) -> ConditionSnapshot {
+        self.conditions.snapshot()
+    }
+    pub(in crate::parser) fn record_selected_condition(
+        &self,
+        pair: &Pair<'_, Rule>,
+        selected: bool,
+    ) {
+        if let Some(id) = self.node_id(pair) {
+            self.conditions.extend([(id, selected)]);
+        }
+        self.record(
+            pair,
+            Value::Concrete(crate::resource::ConcreteValue::Bool(selected)),
+        );
+    }
+    fn get(&self, key: &ParseNodeKey) -> Option<&ExprValue> {
+        self.nodes.get(key)
+    }
+    pub(in crate::parser) fn node_id(&self, pair: &Pair<'_, Rule>) -> Option<NodeId> {
+        self.get(&ParseNodeKey::of(pair)).map(ExprValue::node_id)
+    }
+    fn insert(&mut self, key: ParseNodeKey, value: ExprValue) {
+        if matches!(value.authored.kind, ExprKind::Resource { .. })
+            && !self.resource_declarations.contains_key(&value.node_id())
+        {
+            let address = SlotDeclarationId::new(
+                value.authored.location.authored.file(),
+                self.resource_declarations.len(),
+            );
+            self.resource_declarations.insert(value.node_id(), address);
+        }
+        self.nodes.insert(key, value);
+    }
+    pub(in crate::parser) fn record(
+        &self,
+        pair: &Pair<'_, Rule>,
+        value: Value<ParserPlaceholder, RelativeBindingName>,
+    ) {
+        let Some(mut expression) = self.get(&ParseNodeKey::of(pair)) else {
+            return;
+        };
+        let mut values = self.values.write().expect("retained projections lock");
+        loop {
+            values.insert(expression.node_id(), value.clone());
+            if matches!(expression.authored.kind, ExprKind::Alias | ExprKind::Parens)
+                && let [child] = expression.authored.children.as_slice()
+            {
+                expression = child;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 fn compile(
     pair: Pair<'_, Rule>,
     file: &PreprocessedFile,
     source: &Path,
     scope: &HashMap<String, ExprValue>,
+    captures: &mut CapturedNodes,
+) -> ExprValue {
+    let key = ParseNodeKey::of(&pair);
+    if let Some(expression) = captures.get(&key) {
+        return expression.clone();
+    }
+    let expression = compile_form_entry(pair, file, source, scope, captures);
+    captures.insert(key, expression.clone());
+    expression
+}
+
+fn compile_form_entry(
+    pair: Pair<'_, Rule>,
+    file: &PreprocessedFile,
+    source: &Path,
+    scope: &HashMap<String, ExprValue>,
+    captures: &mut CapturedNodes,
 ) -> ExprValue {
     // Keep pass-through grammar levels off the large form compiler's stack.
     // Each still receives its authored location and its own checked evidence.
@@ -654,11 +1214,17 @@ fn compile(
         if let Some(child) = parts.next()
             && parts.next().is_none()
         {
-            let child = compile(child, file, source, scope);
-            return node(&pair, ExprKind::Alias, vec![child], file, source);
+            let child = compile(child, file, source, scope, captures);
+            let kind =
+                if pair.as_rule() == Rule::primary && pair.as_str().trim_start().starts_with('(') {
+                    ExprKind::Parens
+                } else {
+                    ExprKind::Alias
+                };
+            return node(&pair, kind, vec![child], file, source);
         }
     }
-    compile_form(pair, file, source, scope)
+    compile_form(pair, file, source, scope, captures)
 }
 
 /// Authored diagnostic source is retained only when its parsed graph contains
@@ -688,7 +1254,13 @@ pub(super) fn diagnostic_source_text(
         matches!(expression.authored.kind, ExprKind::Secret)
             || expression.authored.children.iter().any(contains_secret)
     }
-    let expression = compile(pair.clone(), file, source_file, &HashMap::new());
+    let expression = compile(
+        pair.clone(),
+        file,
+        source_file,
+        &HashMap::new(),
+        &mut CapturedNodes::default(),
+    );
     if contains_secret(&expression) {
         return DiagnosticSourceText(None);
     }
@@ -766,8 +1338,9 @@ fn compile_form(
     file: &PreprocessedFile,
     source: &Path,
     scope: &HashMap<String, ExprValue>,
+    captures: &mut CapturedNodes,
 ) -> ExprValue {
-    let children = || {
+    let mut children = || {
         let mut scope = scope.clone();
         let mut children = Vec::new();
         for child in pair.clone().into_inner().flat_map(|child| {
@@ -791,12 +1364,12 @@ fn compile_form(
                     .as_str()
                     .to_string();
                 if let Some(rhs) = parts.find(|part| part.as_rule() == Rule::expression) {
-                    let expression = compile(rhs, file, source, &scope);
+                    let expression = compile(rhs, file, source, &scope, captures);
                     scope.insert(name, expression.clone());
                     children.push(expression);
                 }
             } else {
-                children.push(compile(child, file, source, &scope));
+                children.push(compile(child, file, source, &scope, captures));
             }
         }
         lower_blocks(children)
@@ -820,9 +1393,15 @@ fn compile_form(
         }
         Rule::pipe_expr => {
             let mut parts = pair.clone().into_inner();
-            let mut value = compile(parts.next().expect("pipe operand"), file, source, scope);
+            let mut value = compile(
+                parts.next().expect("pipe operand"),
+                file,
+                source,
+                scope,
+                captures,
+            );
             for function in parts {
-                let mut call = compile(function, file, source, scope);
+                let mut call = compile(function, file, source, scope, captures);
                 let authored = Arc::make_mut(&mut call.authored);
                 if matches!(authored.kind, ExprKind::Secret) {
                     // The piped input is part of the intrinsic's protected subtree.
@@ -841,7 +1420,13 @@ fn compile_form(
         | Rule::validate_additive_expr
         | Rule::validate_multiplicative_expr => {
             let mut parts = pair.clone().into_inner();
-            let mut value = compile(parts.next().expect("integer operand"), file, source, scope);
+            let mut value = compile(
+                parts.next().expect("integer operand"),
+                file,
+                source,
+                scope,
+                captures,
+            );
             while let Some(operator) = parts.next() {
                 use crate::integer_arithmetic::IntegerOp;
                 let op = match operator.as_str() {
@@ -858,6 +1443,7 @@ fn compile_form(
                     file,
                     source,
                     scope,
+                    captures,
                 );
                 value = node(
                     &pair,
@@ -866,6 +1452,7 @@ fn compile_form(
                     file,
                     source,
                 );
+                captures.insert(ParseNodeKey::of(&operator), value.clone());
             }
             value
         }
@@ -874,7 +1461,7 @@ fn compile_form(
                 .clone()
                 .into_inner()
                 .filter(|child| !matches!(child.as_rule(), Rule::add_op | Rule::multiplicative_op))
-                .map(|child| compile(child, file, source, scope))
+                .map(|child| compile(child, file, source, scope, captures))
                 .collect::<Vec<_>>();
             if parts.len() == 1 {
                 parts.into_iter().next().unwrap()
@@ -884,13 +1471,19 @@ fn compile_form(
         }
         Rule::postfix_expr | Rule::subscripted_id | Rule::for_iterable => {
             let mut parts = pair.clone().into_inner();
-            let mut value = compile(parts.next().expect("access base"), file, source, scope);
+            let mut value = compile(
+                parts.next().expect("access base"),
+                file,
+                source,
+                scope,
+                captures,
+            );
             for step in parts {
                 let operand = step
                     .clone()
                     .into_inner()
                     .find(|child| child.as_rule() == Rule::expression)
-                    .map(|child| compile(child, file, source, scope));
+                    .map(|child| compile(child, file, source, scope, captures));
                 let kind = access_step(step)
                     .map(ExprKind::Access)
                     .unwrap_or(ExprKind::DynamicAccess);
@@ -935,7 +1528,7 @@ fn compile_form(
                         .clone()
                         .into_inner()
                         .find(|child| child.as_rule() == Rule::expression)
-                        .map(|child| compile(child, file, source, scope));
+                        .map(|child| compile(child, file, source, scope, captures));
                     let kind = access_step(step)
                         .map(ExprKind::Access)
                         .unwrap_or(ExprKind::DynamicAccess);
@@ -948,7 +1541,7 @@ fn compile_form(
             let mut value = match scope.get(name.as_str()) {
                 Some(definition) => node(
                     &name,
-                    ExprKind::Alias,
+                    ExprKind::Definition,
                     vec![definition.clone()],
                     file,
                     source,
@@ -966,7 +1559,7 @@ fn compile_form(
                     .clone()
                     .into_inner()
                     .find(|child| child.as_rule() == Rule::expression)
-                    .map(|child| compile(child, file, source, scope));
+                    .map(|child| compile(child, file, source, scope, captures));
                 let kind = access_step(step)
                     .map(ExprKind::Access)
                     .unwrap_or(ExprKind::DynamicAccess);
@@ -988,7 +1581,7 @@ fn compile_form(
             if let Some(definition) = scope.get(binding.as_str()) {
                 let mut value = node(
                     &pair,
-                    ExprKind::Alias,
+                    ExprKind::Definition,
                     vec![definition.clone()],
                     file,
                     source,
@@ -1054,7 +1647,7 @@ fn compile_form(
                         Some(expression) => {
                             reference_parts +=
                                 usize::from(reference_form(expression.clone()).is_some());
-                            compile(expression, file, source, scope)
+                            compile(expression, file, source, scope, captures)
                         }
                         None => node(&part, ExprKind::EmptyInterpolation, vec![], file, source),
                     }
@@ -1085,19 +1678,19 @@ fn compile_form(
                         if entry.as_rule() == Rule::map_entry {
                             let mut parts = entry.clone().into_inner();
                             let key = parts.next().expect("map key");
-                            let name = if key.as_rule() == Rule::string {
-                                super::expressions::string_literal::parse_string_literal(
-                                    key.clone(),
-                                )
-                                .unwrap_or_else(|_| key.as_str().to_string())
-                            } else {
-                                key.as_str().to_string()
-                            };
-                            let value =
-                                compile(parts.next().expect("map value"), file, source, scope);
+                            // Keys must have the exact spelling used by the
+                            // value parser, including its escape handling.
+                            let name = super::context::extract_key_string(key).unwrap_or_default();
+                            let value = compile(
+                                parts.next().expect("map value"),
+                                file,
+                                source,
+                                scope,
+                                captures,
+                            );
                             node(&entry, ExprKind::Sink(name), vec![value], file, source)
                         } else {
-                            compile(entry, file, source, scope)
+                            compile(entry, file, source, scope, captures)
                         }
                     })
                     .collect(),
@@ -1158,7 +1751,7 @@ fn compile_form(
                 .clone()
                 .into_inner()
                 .filter(|part| part.as_rule() == Rule::fn_body)
-                .map(|body| compile(body, file, source, &scope))
+                .map(|body| compile(body, file, source, &scope, captures))
                 .collect();
             node(
                 &pair,
@@ -1183,7 +1776,13 @@ fn compile_form(
         Rule::for_expr => {
             let mut parts = pair.clone().into_inner();
             let binding = parts.next().expect("loop binding");
-            let iterable = compile(parts.next().expect("loop iterable"), file, source, scope);
+            let iterable = compile(
+                parts.next().expect("loop iterable"),
+                file,
+                source,
+                scope,
+                captures,
+            );
             let mut scope = scope.clone();
             let pattern = binding.into_inner().next().expect("loop pattern");
             let names = pattern.clone().into_inner().collect::<Vec<_>>();
@@ -1201,7 +1800,13 @@ fn compile_form(
                     node(name, kind, vec![iterable.clone()], file, source),
                 );
             }
-            let body = compile(parts.next().expect("loop body"), file, source, &scope);
+            let body = compile(
+                parts.next().expect("loop body"),
+                file,
+                source,
+                &scope,
+                captures,
+            );
             node(&pair, ExprKind::For, vec![iterable, body], file, source)
         }
         Rule::function_call | Rule::validate_function_call => {
@@ -1214,7 +1819,7 @@ fn compile_form(
                     _ => ExprKind::Call(name),
                 },
                 parts
-                    .map(|child| compile(child, file, source, scope))
+                    .map(|child| compile(child, file, source, scope, captures))
                     .collect(),
                 file,
                 source,
@@ -1246,12 +1851,14 @@ fn compile_form(
         Rule::attribute => {
             let mut parts = pair.clone().into_inner();
             let name = parts.next().expect("attribute name");
-            let name = if name.as_rule() == Rule::string {
-                super::expressions::string_literal::parse_string_literal(name).unwrap_or_default()
-            } else {
-                name.as_str().to_string()
-            };
-            let value = compile(parts.next().expect("attribute value"), file, source, scope);
+            let name = super::context::extract_key_string(name).unwrap_or_default();
+            let value = compile(
+                parts.next().expect("attribute value"),
+                file,
+                source,
+                scope,
+                captures,
+            );
             node(&pair, ExprKind::Sink(name), vec![value], file, source)
         }
         Rule::if_expr => node(&pair, ExprKind::If, children(), file, source),
@@ -1268,7 +1875,7 @@ fn compile_form(
                 )
             });
             let mut operands = vec![target];
-            operands.extend(parts.map(|part| compile(part, file, source, scope)));
+            operands.extend(parts.map(|part| compile(part, file, source, scope, captures)));
             node(&pair, ExprKind::Wait, operands, file, source)
         }
         Rule::validate_expr | Rule::validate_primary => {
@@ -1282,7 +1889,7 @@ fn compile_form(
                 .clone()
                 .into_inner()
                 .filter(|part| part.as_rule() != Rule::compare_op)
-                .map(|part| compile(part, file, source, scope))
+                .map(|part| compile(part, file, source, scope, captures))
                 .collect::<Vec<_>>();
             let kind = if values.len() == 1 && !pair.as_str().trim_start().starts_with('!') {
                 ExprKind::Alias
@@ -1304,7 +1911,7 @@ fn compile_form(
                 .clone()
                 .into_inner()
                 .filter(|part| part.as_rule() == Rule::expression)
-                .map(|part| compile(part, file, source, scope))
+                .map(|part| compile(part, file, source, scope, captures))
                 .collect();
             let kind = if values.is_empty() {
                 ExprKind::Declaration
@@ -1455,6 +2062,9 @@ pub(crate) fn value_dependent_judgement_for_test() -> JudgedExpr {
 // Constructors for judgement evidence are confined to this module. In
 // particular, the syntax compiler and provisional evaluators cannot mint it.
 mod judgement {
+    #[cfg(test)]
+    mod round2_tests;
+
     use super::*;
     use crate::static_type::{InferenceError, InferenceIssue, NotInferableReason};
     use crate::validation::inference::{self, InferenceBinding, InferenceBindings};
@@ -2571,25 +3181,86 @@ mod judgement {
         }
     }
 
-    #[derive(Debug, Clone, PartialEq)]
+    #[derive(Clone)]
     pub struct ExpressionReport<B: BindingAddress = RelativeBindingName> {
         bindings: Arc<HashMap<B, JudgedExpr>>,
         expressions: Arc<HashMap<ExpressionLocation, JudgedExpr>>,
+        pub(super) nodes: Arc<HashMap<(ExpressionInstance, NodeId), JudgedExpr>>,
+        pub(super) syntax_nodes: Arc<AuthoredNodes<B>>,
+        pub(super) use_roots: Arc<Vec<cursor::UseRoot<B>>>,
+        pub(super) use_interner: Arc<cursor::UseInterner>,
+        pub(super) definitions: Arc<IndexMap<B, ExprValue<ParserPlaceholder, B>>>,
+        pub(super) projections:
+            Arc<HashMap<(ExpressionInstance, NodeId), Value<ParserPlaceholder, B>>>,
         findings: Arc<Vec<Located<InferenceError>>>,
         function_errors: Arc<Vec<Located<InferenceError>>>,
         operands: Arc<HashMap<ExpressionLocation, [JudgedExpr; 2]>>,
         module_attributes: Arc<HashMap<(B, String), JudgedExpr>>,
         resource_reports: Arc<HashMap<crate::resource::ResourceId, Arc<ExpressionReport<B>>>>,
         parameters: Arc<HashMap<String, JudgedExpr>>,
-        instance: ExpressionInstance,
+        pub(super) instance: ExpressionInstance,
         authored: bool,
     }
 
+    // Node/use identities and projection caches are transient authority, not
+    // part of the pre-existing syntax/report equality contract.
+    impl<B: BindingAddress> PartialEq for ExpressionReport<B> {
+        fn eq(&self, other: &Self) -> bool {
+            self.bindings == other.bindings
+                && self.expressions == other.expressions
+                && self.findings == other.findings
+                && self.function_errors == other.function_errors
+                && self.operands == other.operands
+                && self.module_attributes == other.module_attributes
+                && self.resource_reports == other.resource_reports
+                && self.parameters == other.parameters
+                && self.instance == other.instance
+                && self.authored == other.authored
+        }
+    }
+
+    impl<B: BindingAddress> std::fmt::Debug for ExpressionReport<B> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ExpressionReport")
+                .field("findings", &self.findings)
+                .finish_non_exhaustive()
+        }
+    }
+
     impl<B: BindingAddress> ExpressionReport<B> {
+        pub(super) fn node(
+            &self,
+            instance: &ExpressionInstance,
+            id: NodeId,
+        ) -> Option<&JudgedExpr> {
+            self.nodes.get(&(instance.clone(), id))
+        }
+        pub(super) fn syntax_node(
+            &self,
+            instance: &ExpressionInstance,
+            id: NodeId,
+        ) -> Option<&Arc<AuthoredExpr<ParserPlaceholder, B>>> {
+            self.syntax_nodes.get(&(instance.clone(), id))
+        }
+        pub(super) fn shared_for_resource(
+            &self,
+            id: &crate::resource::ResourceId,
+        ) -> Result<Arc<Self>, MissingEvidence> {
+            self.resource_reports
+                .get(id)
+                .cloned()
+                .ok_or_else(|| MissingEvidence::for_resource(id))
+        }
         pub(super) fn empty() -> Self {
             Self {
                 bindings: Arc::default(),
                 expressions: Arc::default(),
+                nodes: Arc::default(),
+                syntax_nodes: Arc::default(),
+                use_roots: Arc::default(),
+                use_interner: Arc::default(),
+                definitions: Arc::default(),
+                projections: Arc::default(),
                 findings: Arc::default(),
                 function_errors: Arc::default(),
                 operands: Arc::default(),
@@ -2603,6 +3274,11 @@ mod judgement {
         pub(super) fn extend(&mut self, other: Self) {
             Arc::make_mut(&mut self.bindings).extend(Arc::unwrap_or_clone(other.bindings));
             Arc::make_mut(&mut self.expressions).extend(Arc::unwrap_or_clone(other.expressions));
+            Arc::make_mut(&mut self.nodes).extend(Arc::unwrap_or_clone(other.nodes));
+            Arc::make_mut(&mut self.syntax_nodes).extend(Arc::unwrap_or_clone(other.syntax_nodes));
+            Arc::make_mut(&mut self.use_roots).extend(Arc::unwrap_or_clone(other.use_roots));
+            Arc::make_mut(&mut self.definitions).extend(Arc::unwrap_or_clone(other.definitions));
+            Arc::make_mut(&mut self.projections).extend(Arc::unwrap_or_clone(other.projections));
             Arc::make_mut(&mut self.findings).extend(Arc::unwrap_or_clone(other.findings));
             Arc::make_mut(&mut self.function_errors)
                 .extend(Arc::unwrap_or_clone(other.function_errors));
@@ -2640,6 +3316,56 @@ mod judgement {
                     .collect::<HashMap<_, _>>()
                     .into(),
                 expressions: self.expressions.clone(),
+                nodes: self.nodes.clone(),
+                use_roots: {
+                    let mut memo = HashMap::new();
+                    Arc::new(
+                        self.use_roots
+                            .iter()
+                            .map(|root| root.map_bindings(map, &mut memo))
+                            .collect(),
+                    )
+                },
+                use_interner: Arc::default(),
+                syntax_nodes: {
+                    let mut memo = HashMap::new();
+                    Arc::new(
+                        self.syntax_nodes
+                            .iter()
+                            .map(|(id, node)| {
+                                (
+                                    id.clone(),
+                                    ExprValue {
+                                        authored: node.clone(),
+                                        payload: Projection::Pending,
+                                    }
+                                    .map_bindings(map, &mut memo)
+                                    .authored,
+                                )
+                            })
+                            .collect(),
+                    )
+                },
+                definitions: {
+                    let mut memo = HashMap::new();
+                    Arc::new(
+                        self.definitions
+                            .iter()
+                            .map(|(name, value)| {
+                                (
+                                    map(name.clone()),
+                                    value.clone().map_bindings(map, &mut memo),
+                                )
+                            })
+                            .collect(),
+                    )
+                },
+                projections: Arc::new(
+                    self.projections
+                        .iter()
+                        .map(|(id, value)| (id.clone(), value.clone().map_bindings(map)))
+                        .collect(),
+                ),
                 findings: self.findings.clone(),
                 function_errors: self.function_errors.clone(),
                 operands: self.operands.clone(),
@@ -2967,6 +3693,8 @@ mod judgement {
             memo: HashMap::new(),
             scope: DiagnosticScope::Public,
             by_location: HashMap::new(),
+            by_node: HashMap::new(),
+            syntax_nodes: HashMap::new(),
             visiting: Vec::new(),
             findings: Vec::new(),
             function_errors: Vec::new(),
@@ -2994,6 +3722,12 @@ mod judgement {
             authored: true,
             bindings: Arc::new(judged_bindings),
             expressions: Arc::new(judge.by_location),
+            nodes: Arc::new(judge.by_node),
+            syntax_nodes: Arc::new(judge.syntax_nodes),
+            use_roots: Arc::default(),
+            use_interner: Arc::default(),
+            definitions: Arc::new(expressions.definitions.clone()),
+            projections: expressions.projections.clone(),
             findings: Arc::new(judge.findings),
             function_errors: Arc::new(judge.function_errors),
             operands: Arc::new(judge.operands),
@@ -3024,6 +3758,53 @@ mod judgement {
                 });
             Arc::make_mut(&mut report.resource_reports).insert(id.clone(), snapshot.clone());
         }
+        let instance = ExpansionInstanceId::fresh();
+        let generation = ProjectionGeneration::fresh();
+        let definitions: std::collections::HashSet<_> = expressions
+            .definitions
+            .values()
+            .map(ExprValue::node_id)
+            .collect();
+        let roots = Arc::make_mut(&mut report.use_roots);
+        roots.extend(expressions.roots.iter().map(|expression| cursor::UseRoot {
+            node: expression.authored.clone(),
+            occurrence: expression.authored.definition_use,
+            instance,
+            generation,
+            definition: definitions.contains(&expression.node_id()),
+            environment: expression.authored.location.instance.clone(),
+            conditions: ConditionSnapshot::default(),
+        }));
+        let mut resources = std::collections::HashSet::new();
+        for resource in file
+            .iter_all_resources()
+            .chain(file.deferred_for_phase.analysis_resource_refs())
+        {
+            if !resources.insert(resource.id().clone()) {
+                continue;
+            }
+            let (slots, source) = match resource {
+                super::super::ResourceRef::Resource(resource) => {
+                    (&resource.authored_slots, resource.module_source.as_ref())
+                }
+                super::super::ResourceRef::DataSource(source) => {
+                    (&source.authored_slots, source.module_source.as_ref())
+                }
+                super::super::ResourceRef::Deferred { resource, .. } => (
+                    &resource.as_resource().authored_slots,
+                    resource.as_resource().module_source.as_ref(),
+                ),
+                super::super::ResourceRef::LiveComposition(_) => continue,
+            };
+            let environment = source
+                .and_then(crate::resource::ModuleSource::identity_scope)
+                .map(|scope| ExpressionInstance::for_scope(&scope))
+                .unwrap_or_else(|| expressions.instance.clone());
+            roots.extend(slots.use_roots().map(|mut root| {
+                root.environment = environment.clone();
+                root
+            }));
+        }
         report.record_instance(file, None);
         report
     }
@@ -3039,6 +3820,8 @@ mod judgement {
         memo: HashMap<(usize, DiagnosticScope), JudgedExpr>,
         scope: DiagnosticScope,
         by_location: HashMap<ExpressionLocation, JudgedExpr>,
+        by_node: HashMap<(ExpressionInstance, NodeId), JudgedExpr>,
+        syntax_nodes: AuthoredNodes<B>,
         visiting: Vec<usize>,
         findings: Vec<Located<InferenceError>>,
         function_errors: Vec<Located<InferenceError>>,
@@ -3048,8 +3831,10 @@ mod judgement {
 
     impl<B: BindingAddress> Judge<'_, B> {
         fn is_list_literal(mut expression: &ExprValue<ParserPlaceholder, B>) -> bool {
-            while matches!(expression.authored.kind, ExprKind::Alias)
-                && let [inner] = expression.authored.children.as_slice()
+            while matches!(
+                expression.authored.kind,
+                ExprKind::Alias | ExprKind::Parens | ExprKind::Definition
+            ) && let [inner] = expression.authored.children.as_slice()
             {
                 expression = inner;
             }
@@ -3194,6 +3979,10 @@ mod judgement {
             self.memo.insert((id, scope), result.clone());
             self.by_location
                 .insert(root.location.clone(), result.clone());
+            self.by_node
+                .insert((root.location.instance.clone(), root.id), result.clone());
+            self.syntax_nodes
+                .insert((root.location.instance.clone(), root.id), root.clone());
             result
         }
 
@@ -3774,7 +4563,11 @@ mod judgement {
                             ExprKind::Binding(binding) | ExprKind::Reference { binding, .. } => {
                                 Some(binding)
                             }
-                            ExprKind::Alias | ExprKind::Access(_) | ExprKind::DynamicAccess => {
+                            ExprKind::Alias
+                            | ExprKind::Parens
+                            | ExprKind::Definition
+                            | ExprKind::Access(_)
+                            | ExprKind::DynamicAccess => {
                                 expression.authored.children.first().and_then(root_binding)
                             }
                             _ => None,
@@ -3800,9 +4593,11 @@ mod judgement {
                         .cloned()
                         .unwrap_or_else(|| incomplete("iterable operand"))
                 }
-                ExprKind::Alias | ExprKind::Wait | ExprKind::Sink(_) => {
-                    authored_child(children.first())
-                }
+                ExprKind::Alias
+                | ExprKind::Parens
+                | ExprKind::Definition
+                | ExprKind::Wait
+                | ExprKind::Sink(_) => authored_child(children.first()),
                 ExprKind::Element => {
                     let collection = &children[0];
                     if collection.is_value_dependent() {
