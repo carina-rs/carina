@@ -8546,9 +8546,12 @@ async fn finish_expanded_refresh_state<
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
+pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<
+    E: Clone,
+    C: carina_core::parser::PlanProviderConfigurations,
+>(
     validated: ValidatedConfig<CanonicalResourcePair<E>>,
-    provider_configs: &ResolvedProviderConfigs,
+    provider_configs: &C,
     state_file: &Option<StateFile>,
     refresh: bool,
     progress_sink: ProgressSink,
@@ -8592,10 +8595,13 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
+async fn create_plan_from_parsed_with_upstream_with_ctx_inner<
+    E: Clone,
+    C: carina_core::parser::PlanProviderConfigurations,
+>(
     ctx: &WiringContext,
     canonical_resources: CanonicalResourcePair<E>,
-    provider_configs: &ResolvedProviderConfigs,
+    provider_configs: &C,
     provider_plan: &provider_mod::ProviderPlan,
     state_file: &Option<StateFile>,
     refresh: bool,
@@ -8607,7 +8613,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
 ) -> Result<ExpandedPlanContext<E>, AppError> {
     let color_mode = ctx.runtime().color_mode();
     let parsed = canonical_resources.parsed();
-    let raw_provider_configs = provider_configs.as_provider_configs();
+    let raw_provider_configs = provider_configs.plan_provider_configs();
     // Mutable: a same-config deferred-for loop is expanded into concrete
     // resources *after* refresh (carina#3132) and the augmented set is
     // re-sorted in place below. Every use up to that point sees the
@@ -8622,7 +8628,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     // Initialize the exact provider routes before automatic move detection;
     // create-only matching needs each owning instance's comparison scope.
     let provider =
-        get_provider_with_ctx(ctx, provider_configs, progress_sink, provider_plan).await?;
+        build_provider_router(ctx, provider_configs, progress_sink, provider_plan).await?;
     let expansion_prelude = DeferredForExpansionPrelude::new(
         &canonical_resources,
         &resolved_state_block_targets.removed_from,
@@ -9873,22 +9879,18 @@ pub async fn read_data_source_with_retry(
     resource: &carina_core::resource::DataSource,
     bindings: &ResolvedBindings,
     module_gate: &carina_core::executor::ModuleConstraintGate,
-    factories: &[Box<dyn carina_core::provider::ProviderFactory>],
+    _factories: &[Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &carina_core::schema::SchemaRegistry,
     session: &ValidationProviderCatalog<'_>,
 ) -> Result<State, AppError> {
-    let preparation = carina_core::executor::ProviderPreparationContext::new(
+    let preparation = carina_core::executor::DataSourcePreparationContext::new(
         bindings,
         module_gate,
-        &[],
-        &carina_core::provider::NoopNormalizer,
-        factories,
         schemas,
         session,
     );
-    let ready =
-        carina_core::executor::prepare_provider_ready_data_source(resource.clone(), &preparation)
-            .map_err(|source| AppError::from_resource_preparation(resource.id.clone(), source))?;
+    let ready = carina_core::executor::prepare_data_source_query(resource.clone(), &preparation)
+        .map_err(|source| AppError::from_resource_preparation(resource.id.clone(), source))?;
     carina_core::executor::read_data_source_with_retry(provider, &ready)
         .await
         .map_err(AppError::Provider)

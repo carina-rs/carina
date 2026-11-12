@@ -86,7 +86,7 @@ async fn wire_error_renders_a_top_level_attribute_once() {
                 crate::schema::SchemaKind::Resource,
                 &resource.attributes,
             );
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],
@@ -132,7 +132,7 @@ async fn wire_error_paths_quote_non_identifier_map_keys() {
                     crate::schema::SchemaKind::Resource,
                     &resource.attributes,
                 );
-                let context = ProviderPreparationContext::new(
+                let context = ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &[],
@@ -202,7 +202,7 @@ async fn default_tag_duration_checks_wire_range_then_destination_membership() {
                 let gate = ModuleConstraintGate::from_live_compositions(&[]);
                 let schemas = schemas();
                 let configs = [config(duration(seconds))];
-                let context = ProviderPreparationContext::new(
+                let context = ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &configs,
@@ -242,7 +242,7 @@ async fn native_create_rejects_a_non_wire_default_tag_before_dispatch() {
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
             let configs = [config(duration(u64::MAX))];
             let schemas = schemas();
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &configs,
@@ -285,7 +285,7 @@ async fn native_update_checks_default_tags_outside_changed_attributes() {
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
             let configs = [config(duration(u64::MAX))];
             let schemas = schemas();
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &configs,
@@ -330,7 +330,7 @@ async fn native_update_checks_observed_ignored_leaves_after_patch_substitution()
             let bindings = ResolvedBindings::default();
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
             let schemas = schemas();
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],
@@ -373,7 +373,7 @@ fn native_data_source_rejects_non_wire_declared_attribute_values() {
                 crate::schema::SchemaKind::DataSource,
                 &data.attributes,
             );
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],
@@ -535,7 +535,7 @@ async fn checked_projection_preserves_native_scalars_and_late_secret_provenance(
                 .validate()
                 .unwrap();
             schemas.insert("test", schema);
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &configs,
@@ -594,7 +594,7 @@ async fn nested_wire_failures_retain_list_indices_and_never_values() {
             let bindings = ResolvedBindings::default();
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
             let schemas = schemas();
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],
@@ -687,7 +687,7 @@ async fn review2_f4_dispatch_and_native_normalizer_receive_main_plaintext_shapes
                 &resource.attributes,
             );
             let normalizer_boundary = crate::provider::ConfiguredNormalizer::fixture(&MainShapes);
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],
@@ -738,7 +738,7 @@ async fn review2_f4_secret_tag_maps_receive_main_default_tags() {
             let bindings = ResolvedBindings::default();
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
             let schemas = schemas();
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &configs,

@@ -81,6 +81,39 @@ impl ProviderWireError {
         self.error.as_ref()
     }
 
+    /// Restore diagnostic protection after preparation removes annotations.
+    /// Follow only the failing path, using the existing leaf lookup; never
+    /// project the protected source a second time.
+    pub(crate) fn with_diagnostic_source(mut self, source: &Value) -> Self {
+        use crate::resource::InsideSecret;
+        use crate::schema::{LeafPath, LeafPathSegment};
+
+        let mut value = source;
+        for index in 0..=self.path.len() {
+            if matches!(value, Value::Deferred(DeferredValue::Secret(_))) {
+                self.path.truncate(index);
+                self.path.push(WirePathSegment::Secret);
+                self.error = Box::new(self.error.inside_secret().into_leaf_error());
+                break;
+            }
+            let Some(segment) = self.path.get(index) else {
+                break;
+            };
+            let segment = match segment {
+                WirePathSegment::Key(key) => LeafPathSegment::MapKey(key.lookup_key().into()),
+                WirePathSegment::Index(index) => LeafPathSegment::ListIndex(*index),
+                WirePathSegment::Secret => break,
+            };
+            let Some(child) =
+                crate::resource::value_at_leaf(value, &LeafPath::from_segments([segment]))
+            else {
+                break;
+            };
+            value = child;
+        }
+        self
+    }
+
     pub fn attribute_path(&self) -> crate::provider_text::DiagnosticText {
         fn append_key(path: &mut String, key: &str) {
             let mut chars = key.chars();
@@ -252,8 +285,22 @@ pub struct WireReady<T: ProviderWirePayload> {
     wire: T::Projection,
 }
 
+#[cfg(test)]
+thread_local! {
+    static PROJECTION_COUNTS: std::cell::RefCell<std::collections::HashMap<ResourceId, usize>> = Default::default();
+}
+#[cfg(test)]
+pub(crate) fn projection_count_for_test(id: &ResourceId) -> usize {
+    PROJECTION_COUNTS.with(|counts| counts.borrow().get(id).copied().unwrap_or(0))
+}
+
 impl<T: ProviderWirePayload> WireReady<T> {
     pub(crate) fn try_new(value: T, target: ProviderWireTarget) -> Result<Self, ProviderWireError> {
+        #[cfg(test)]
+        if let ProviderWireTarget::Resource(id) = &target {
+            PROJECTION_COUNTS
+                .with(|counts| *counts.borrow_mut().entry(id.clone()).or_default() += 1);
+        }
         let wire = value.project(&target, sealed::ProjectionToken::new())?;
         Ok(Self { value, wire })
     }

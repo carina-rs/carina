@@ -9926,7 +9926,9 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         managed_current: plan_ctx.managed_current,
         data_source_values: executable_data_source_values,
         normalizer: &carina_core::provider::NoopNormalizer,
-        provider_configs: provider_configs.as_provider_configs(),
+        provider_configs: &carina_core::test_utils::resolved_provider_configs(
+            provider_configs.as_provider_configs(),
+        ),
         factories: ctx.factories(),
         schemas: ctx.schemas(),
         parallelism: carina_core::executor::TEST_UNCAPPED,
@@ -15931,7 +15933,7 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                 let id = resource.id.clone();
                 let bindings = ResolvedBindings::default();
                 let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &[],

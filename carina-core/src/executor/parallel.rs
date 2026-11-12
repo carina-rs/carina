@@ -682,7 +682,7 @@ pub(super) async fn execute_effects_sequential<
                 ordinary_old: &ordinary_old,
                 requirements: &materialization_requirements,
                 identity_inputs: super::deferred_dispatch::DeferredIdentityInputs {
-                    provider_configs: input.provider_configs,
+                    provider_configs: input.provider_configs.as_provider_configs(),
                     factories: input.factories,
                     schemas: input.schemas,
                     type_checks,
@@ -1937,6 +1937,7 @@ mod tests {
                     plan.effects().iter().map(Effect::resource_id),
                 );
                 let checked_plan = crate::executor::tests::checked_fixture_plan(&plan);
+                let provider_configs = crate::test_utils::resolved_provider_configs(&[]);
                 let mut input: RuntimeExecutionInput = ExecutionInput {
                     provider_context: crate::parser::ProviderContext::clone(
                         &crate::parser::LoadedProviderContext::empty_for_test(),
@@ -1952,7 +1953,7 @@ mod tests {
                     data_source_values: crate::data_source_value::ExecutableDataSourceValues::empty(
                     ),
                     normalizer: &NoopNormalizer,
-                    provider_configs: &[],
+                    provider_configs: &provider_configs,
                     factories: &[],
                     schemas: &schemas,
                     parallelism: std::num::NonZeroUsize::new(2).unwrap(),
@@ -2104,6 +2105,7 @@ mod tests {
                     plan.effects().iter().map(Effect::resource_id),
                 );
                 let checked_plan = crate::executor::tests::checked_fixture_plan(&plan);
+                let provider_configs = crate::test_utils::resolved_provider_configs(&[]);
                 let mut input: RuntimeExecutionInput = ExecutionInput {
                     provider_context: crate::parser::ProviderContext::clone(
                         &crate::parser::LoadedProviderContext::empty_for_test(),
@@ -2119,7 +2121,7 @@ mod tests {
                     data_source_values: crate::data_source_value::ExecutableDataSourceValues::empty(
                     ),
                     normalizer: &NoopNormalizer,
-                    provider_configs: &[],
+                    provider_configs: &provider_configs,
                     factories: &[],
                     schemas: &schemas,
                     parallelism: std::num::NonZeroUsize::new(2).unwrap(),

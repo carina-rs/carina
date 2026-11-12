@@ -1113,7 +1113,7 @@ async fn review_a2_guest_enum_error_is_bound_by_executor_preparation() {
     crate::validation::deferred_types::with_session_for_test_async(
         &crate::parser::LoadedProviderContext::empty_for_test(),
         async |type_checks| {
-            let context = crate::executor::ProviderPreparationContext::new(
+            let context = crate::executor::ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],
@@ -1207,7 +1207,7 @@ async fn round5_dispatch_normalizer_collects_a_late_scalar_secret_before_ingress
     crate::validation::deferred_types::with_session_for_test_async(
         &crate::parser::LoadedProviderContext::empty_for_test(),
         async |checks| {
-            let context = crate::executor::ProviderPreparationContext::new(
+            let context = crate::executor::ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],

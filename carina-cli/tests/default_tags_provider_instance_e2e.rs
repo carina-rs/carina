@@ -26,7 +26,6 @@ fn tags<S, D>(
 struct PlanJsonOutput {
     plan: PlanFile,
     json: serde_json::Value,
-    stderr: String,
 }
 
 fn run_cli(dir: &Path, args: &[&str]) -> Output {
@@ -69,7 +68,7 @@ fn plan_json(dir: &Path) -> PlanJsonOutput {
     });
     let plan = serde_json::from_value(json.clone()).expect("decode saved-plan JSON");
 
-    PlanJsonOutput { plan, json, stderr }
+    PlanJsonOutput { plan, json }
 }
 
 #[test]
@@ -369,7 +368,7 @@ fn apply_updates_default_tags_without_persisting_host_metadata() {
 }
 
 #[test]
-fn plan_logs_when_an_unresolved_default_tag_is_skipped() {
+fn issue_4304_3a_review3_plain_plan_warns_when_missing_upstream_default_is_omitted() {
     let root = tempfile::tempdir().expect("create temporary root");
     let project = root.path().join("project");
     let missing = root.path().join("missing");
@@ -399,10 +398,23 @@ mock.test.resource {
     )
     .expect("write project configuration");
 
-    let PlanJsonOutput { stderr, .. } = plan_json(&project);
+    assert_success(&run_cli(&project, &["init", "."]), "init");
+    let output = run_cli(&project, &["plan", "."]);
+    assert_success(&output, "plain plan");
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Skipping default_tag 'Owner'"),
-        "missing skipped-default-tag log message; stderr:\n{stderr}"
+        stderr.contains("WARN"),
+        "expected warning-level omission: {stderr}"
+    );
+    for part in ["mock", "default_tags.Owner", "mgmt"] {
+        assert!(
+            stderr.contains(part),
+            "missing omission context {part}: {stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains("ERROR"),
+        "preview omission is a warning: {stderr}"
     );
 }
 

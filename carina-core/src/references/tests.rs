@@ -2337,7 +2337,7 @@ async fn apply_concrete_plan_reference_reresolves_without_widening_equivalent_pa
                 managed_current: HashMap::new(),
                 data_source_values: crate::data_source_value::ExecutableDataSourceValues::empty(),
                 normalizer: &NoopNormalizer,
-                provider_configs: &[],
+                provider_configs: &crate::test_utils::resolved_provider_configs(&[]),
                 factories: &[],
                 schemas: &fixture.registry,
                 parallelism: std::num::NonZeroUsize::new(1).unwrap(),

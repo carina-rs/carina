@@ -42,11 +42,12 @@ pub use wait::StartMarker;
 pub use crate::data_source_value::UnresolvedDataSourceInput;
 pub use crate::effect::deps::UnresolvedResource;
 pub use provider_ready::{
-    ModuleConstraintFailure, ModuleConstraintGate, ModuleConstraintGateError,
-    ModuleConstraintViolations, ProviderConfigPreparationError, ProviderConfigValidationError,
-    ProviderPreparationContext, ProviderPreparationError, ProviderReadyConfig,
-    ProviderValueConstraintErrors, prepare_create_request, prepare_provider_ready_config,
-    prepare_provider_ready_data_source, prepare_provider_ready_resource, prepare_update_request,
+    DataSourcePreparationContext, ModuleConstraintFailure, ModuleConstraintGate,
+    ModuleConstraintGateError, ModuleConstraintViolations, ProviderConfigPreparationError,
+    ProviderConfigValidationError, ProviderPreparationContext, ProviderPreparationError,
+    ProviderReadyConfig, ProviderValueConstraintErrors, prepare_create_request,
+    prepare_data_source_query, prepare_provider_ready_config, prepare_provider_ready_data_source,
+    prepare_provider_ready_resource, prepare_update_request,
 };
 /// Phase of an executor scheduler endpoint after deferred replacements have
 /// been expanded.
@@ -132,7 +133,7 @@ use std::time::Duration;
 
 use crate::binding_index::{ResolvedBindings, SecretPreservingAttributes};
 use crate::effect::{DeletedInstanceKey, Effect};
-use crate::parser::ProviderConfig;
+use crate::parser::ResolvedProviderConfigs;
 use crate::provider::{
     AppliedIdentifier, CreateRequest, HostCreateFailure, HostCreateFailureKind, HostCreateOutcome,
     HostError, HostIdentifiedCreate, HostNormalizer, HostPartialReadDiagnostic, HostProvider,
@@ -597,10 +598,7 @@ pub struct LiveExecutionInput<'a> {
     pub normalizer: &'a dyn HostNormalizer,
     /// Provider configs whose default_tags participate in desired-side
     /// normalization before provider patch construction.
-    pub provider_configs: &'a [ProviderConfig<
-        crate::resource::NoPlaceholder,
-        crate::resource::AbsoluteBindingAddress,
-    >],
+    pub provider_configs: &'a ResolvedProviderConfigs,
     /// Provider factories used for provider-defined custom type validation at
     /// the apply boundary. Enum resolution uses the schema registry below and
     /// never delegates spelling conversion to a factory.
@@ -639,10 +637,7 @@ pub struct SavedExecutionInput<'a> {
     pub managed_current: HashMap<ResourceId, Current>,
     pub data_source_values: crate::data_source_value::ExecutableDataSourceValues<SavedModuleSource>,
     pub normalizer: &'a dyn HostNormalizer,
-    pub provider_configs: &'a [ProviderConfig<
-        crate::resource::NoPlaceholder,
-        crate::resource::AbsoluteBindingAddress,
-    >],
+    pub provider_configs: &'a ResolvedProviderConfigs,
     pub provider_context: crate::parser::ProviderContext,
     pub factories: &'a [Box<dyn crate::provider::ProviderFactory>],
     pub schemas: &'a crate::schema::SchemaRegistry,
@@ -677,10 +672,7 @@ pub(super) struct RuntimeExecutionInput<'a, S = ModuleSource> {
     pub(super) managed_current: HashMap<ResourceId, Current>,
     pub(super) data_source_values: crate::data_source_value::ExecutableDataSourceValues<S>,
     pub(super) normalizer: &'a dyn HostNormalizer,
-    pub(super) provider_configs: &'a [ProviderConfig<
-        crate::resource::NoPlaceholder,
-        crate::resource::AbsoluteBindingAddress,
-    >],
+    pub(super) provider_configs: &'a ResolvedProviderConfigs,
     pub(super) type_checks: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     pub(super) factories: &'a [Box<dyn crate::provider::ProviderFactory>],
     pub(super) schemas: &'a crate::schema::SchemaRegistry,

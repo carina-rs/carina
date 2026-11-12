@@ -756,7 +756,7 @@ fn provider_ready<S: Clone, D: Clone + Default>(
     crate::validation::deferred_types::with_session_for_test(
         &crate::parser::LoadedProviderContext::empty_for_test(),
         |type_checks| {
-            let context = crate::executor::ProviderPreparationContext::new(
+            let context = crate::executor::ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],

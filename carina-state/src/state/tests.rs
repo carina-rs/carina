@@ -302,7 +302,7 @@ fn create_attempt_for_test(id: ResourceId) -> carina_core::provider::CreateAttem
     carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
         |type_checks| {
-            let preparation = carina_core::executor::ProviderPreparationContext::new(
+            let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],

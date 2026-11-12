@@ -5089,7 +5089,7 @@ pub(super) mod tests {
                     carina_core::schema::SchemaKind::Resource,
                     &resource.attributes,
                 );
-                let context = carina_core::executor::ProviderPreparationContext::new(
+                let context = carina_core::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &[],
@@ -5363,7 +5363,7 @@ pub(super) mod tests {
         carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
             |type_checks| {
-                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &[],
@@ -5428,7 +5428,7 @@ pub(super) mod tests {
         carina_core::validation::deferred_types::with_session_for_test_async(
             provider_types.provider_context(),
             async |type_checks| {
-                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &module_gate,
                     &[],
@@ -5567,7 +5567,7 @@ pub(super) mod tests {
         carina_core::validation::deferred_types::with_session_for_test_async(
             provider_types.provider_context(),
             async |type_checks| {
-                let context = carina_core::executor::ProviderPreparationContext::new(
+                let context = carina_core::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &provider_configs,

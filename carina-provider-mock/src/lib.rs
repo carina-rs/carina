@@ -2191,7 +2191,7 @@ mod tests {
         carina_core::validation::deferred_types::with_session_for_test_async(
             provider_types.provider_context(),
             async |type_checks| {
-                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &module_gate,
                     &[],
@@ -2628,15 +2628,16 @@ mod tests {
                 carina_core::validation::deferred_types::with_session_for_test_async(
                     provider_types.provider_context(),
                     async |type_checks| {
-                        let preparation = carina_core::executor::ProviderPreparationContext::new(
-                            &bindings,
-                            &module_gate,
-                            &[],
-                            &carina_core::provider::NoopNormalizer,
-                            &[],
-                            &schemas,
-                            type_checks,
-                        );
+                        let preparation =
+                            carina_core::executor::ProviderPreparationContext::for_test(
+                                &bindings,
+                                &module_gate,
+                                &[],
+                                &carina_core::provider::NoopNormalizer,
+                                &[],
+                                &schemas,
+                                type_checks,
+                            );
                         let create_request = carina_core::executor::prepare_create_request(
                             resource.clone(),
                             &preparation,
@@ -3207,7 +3208,7 @@ mod tests {
             carina_core::validation::deferred_types::with_session_for_test_async(
                 provider_types.provider_context(),
                 async |type_checks| {
-                    let preparation = carina_core::executor::ProviderPreparationContext::new(
+                    let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                         &bindings,
                         &module_gate,
                         &[],

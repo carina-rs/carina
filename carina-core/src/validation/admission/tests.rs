@@ -1860,7 +1860,7 @@ fn provider_apply_and_discharge_use_catalog_when_factory_arguments_differ() {
                 let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
                 // The retained catalog owns validation even when a caller's
                 // compatibility factory argument is empty or from elsewhere.
-                let context = crate::executor::ProviderPreparationContext::new(
+                let context = crate::executor::ProviderPreparationContext::for_test(
                     &resolved,
                     &gate,
                     &[],

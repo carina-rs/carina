@@ -467,7 +467,7 @@ async fn execute_mock_http_plan(
             managed_current,
             data_source_values: carina_core::data_source_value::ExecutableDataSourceValues::empty(),
             normalizer: &NoopNormalizer,
-            provider_configs: &[],
+            provider_configs: &carina_core::test_utils::resolved_provider_configs(&[]),
             factories,
             schemas,
             parallelism: std::num::NonZeroUsize::new(1).expect("one is non-zero"),
@@ -5201,119 +5201,73 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
 }
 
 #[tokio::test]
-async fn missing_upstream_default_tags_are_omitted_before_saved_plan_apply() {
+async fn issue_4304_3a_review3_plan_out_refuses_missing_upstream_default_tags() {
     let fixture = ApplyCancellationFixture::new();
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let (_provider_temp, downstream, _) =
-        crate::provider_upstream_test_support::provider_upstream_fixture();
-    let upstream_state_path = downstream
-        .parent()
-        .unwrap()
-        .join("upstream")
-        .join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
-    std::fs::remove_file(&upstream_state_path).expect("remove upstream state");
+    let root = tempfile::tempdir().unwrap();
+    let upstream = root.path().join("missing");
+    std::fs::create_dir(&upstream).unwrap();
     std::fs::write(
-        downstream.join("providers.crn"),
+        upstream.join("main.crn"),
+        "backend local { path = 'carina.state.json' }\nexports { owner: String = 'owner' }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("providers.crn"),
         "provider mock { default_tags = { Owner = mgmt.owner } }\n",
     )
-    .expect("write provider config");
-    let parsed = carina_core::config_loader::load_configuration_with_config(
-        &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
-        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-        &SchemaRegistry::new(),
+    .unwrap();
+    std::fs::write(root.path().join("main.crn"), "let mgmt = upstream_state { source = './missing' }\nmock.test.resource { name = 'tagged' }\n").unwrap();
+    let path = carina_core::paths::ResolvedPath::new(root.path()).unwrap();
+    crate::commands::ensure_backend_lock(
+        &path,
+        None::<&carina_core::parser::ExpandedBackendConfig>,
     )
-    .expect("load plan fixture")
-    .parsed;
-    let parsed = carina_core::validation::deferred_types::with_session_for_test(
-        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-        |session| {
-            carina_core::module_resolver::resolve_modules_with_providerless_config(
-                parsed,
-                &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
-                session,
-                &SchemaRegistry::new(),
-            )
-            .expect("test fixture crosses module resolution")
-        },
-    )
-    .into_expanded(
-        &carina_core::schema::SchemaRegistry::new(),
-        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-    )
-    .expect("saved-plan provider fixture has no parser placeholders");
-    let plan_inputs = load_and_resolve_provider_configs(
-        fixture.runtime(),
-        &parsed,
-        &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
-        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-        &carina_core::schema::SchemaRegistry::new(),
-        UpstreamMissingStatePolicy::Lenient,
-    )
-    .await
-    .expect("lenient planning must omit only defaults whose upstream state is missing");
+    .unwrap();
+    let output = root.path().join("plan.json");
+    let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    for (out, json) in [(Some(output.as_path()), false), (None, true)] {
+        let result = crate::commands::plan::run_plan(
+            fixture.runtime(),
+            root.path(),
+            out,
+            None,
+            None,
+            DetailLevel::None,
+            false,
+            false,
+            json,
+            false,
+            false,
+            &context,
+        )
+        .await;
+        let error =
+            result.expect_err("saved-plan output must never persist an omitted default tag");
+        let message = crate::error::format_error_with_source_chain(&error);
+        for part in ["mock", "default_tags.Owner", "mgmt"] {
+            assert!(message.contains(part), "{message}");
+        }
+    }
     assert!(
-        plan_inputs.configs().as_provider_configs()[0]
-            .default_tags
-            .get("Owner")
-            .is_none()
+        !output.exists(),
+        "failed plan must not publish a saved-plan file"
     );
-    let contents = PlanFileContents {
-        version: PlanFile::CURRENT_VERSION,
-        carina_version: "test".to_string(),
-        timestamp: "2026-10-14T00:00:00Z".to_string(),
-        source_path: carina_core::paths::PersistedPath::new(fixture.config_path()).unwrap(),
-        source_identity: carina_core::paths::CanonicalPath::new(fixture.config_path()).unwrap(),
-        state_lineage: None,
-        state_serial: None,
-        provider_configs: carina_core::parser::SavedProviderConfigs::from(plan_inputs.configs()),
-        backend_config: None,
-        plan: carina_core::plan::SnapshotPlan::default(),
-        sorted_resources: Vec::new(),
-        unresolved_resources: Vec::new(),
-        compositions: Vec::new(),
-        data_sources: Vec::new(),
-        data_source_origins: Vec::new(),
-        data_source_values: Vec::new(),
-        current_states: Vec::new(),
-        upstream_snapshot: HashMap::new(),
-        upstream_sources: Vec::new(),
-        wait_bindings: Vec::new(),
-
-        sorted_value_destroy_dependencies: Vec::new(),
-        sorted_explicit_destroy_dependencies: Vec::new(),
-        legacy_dependency_classification: None,
-    };
-    let plan_file = record_with_test_context(contents);
-    let plan_path = tmp.path().join("deferred-default-tags.plan.json");
-    std::fs::write(
-        &plan_path,
-        carina_core::utils::pretty_with_newline(&plan_file).unwrap(),
-    )
-    .expect("write saved plan");
-    let plan_file: PlanFile = serde_json::from_slice(
-        &std::fs::read(&plan_path).expect("read saved plan after serialization"),
-    )
-    .expect("saved plan must round-trip through its on-disk representation");
-    let observer_factory = fixture.observer_factory();
-
-    run_apply_from_plan_locked(
+    crate::commands::plan::run_plan(
         fixture.runtime(),
-        inspected_saved_plan(plan_file),
-        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-        true,
-        fixture.backend_handle(),
-        StateLock::disabled_for_test(),
-        ApplyTarget::SavedPlan {
-            plan_file: &plan_path,
-            source_dir: tmp.path(),
-        },
-        fixture.cancel_token(),
-        &observer_factory,
-        NonZeroUsize::new(1).unwrap(),
+        root.path(),
+        None,
+        None,
+        None,
+        DetailLevel::None,
         false,
+        false,
+        false,
+        false,
+        false,
+        &context,
     )
     .await
-    .expect("apply --plan must accept deferred default_tags");
+    .expect("plain plan must retain lenient preview behavior");
 }
 
 #[tokio::test]
@@ -12547,7 +12501,7 @@ async fn round2_bootstrap_rejects_unknown_dependency_before_dispatch() {
         carina_core::validation::deferred_types::with_session_for_test_async(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
             async |session| {
-                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &[],

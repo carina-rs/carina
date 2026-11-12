@@ -13005,7 +13005,7 @@ mod tests {
         crate::validation::deferred_types::with_session_for_test(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             |type_checks| {
-                let context = crate::executor::ProviderPreparationContext::new(
+                let context = crate::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &[],
@@ -13033,7 +13033,7 @@ mod tests {
         crate::validation::deferred_types::with_session_for_test(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             |type_checks| {
-                let context = crate::executor::ProviderPreparationContext::new(
+                let context = crate::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &[],
@@ -14988,7 +14988,7 @@ mod tests {
         crate::validation::deferred_types::with_session_for_test(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             |type_checks| {
-                let context = crate::executor::ProviderPreparationContext::new(
+                let context = crate::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &[],
@@ -15583,7 +15583,7 @@ mod tests {
         let request = crate::validation::deferred_types::with_session_for_test_async(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             async |session| {
-                let context = crate::executor::ProviderPreparationContext::new(
+                let context = crate::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &[],

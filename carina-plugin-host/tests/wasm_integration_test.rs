@@ -228,7 +228,7 @@ async fn wire_boundary_default_tag_fails_before_native_and_guest_crud() {
                 &carina_core::provider::NoopNormalizer
                     as &dyn carina_core::provider::HostNormalizer,
             ] {
-                let context = ProviderPreparationContext::new(
+                let context = ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &configs,
@@ -289,7 +289,7 @@ async fn wire_boundary_default_tag_fails_before_native_and_guest_crud() {
                     i64::MAX as u64,
                 ))),
             );
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &configs,
@@ -306,7 +306,7 @@ async fn wire_boundary_default_tag_fails_before_native_and_guest_crud() {
                 "unrelated".into(),
                 Value::Concrete(ConcreteValue::String("valid".into())),
             );
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &configs,
@@ -480,7 +480,7 @@ async fn create_request_for_test(mut resource: Resource) -> CreateRequest {
     carina_core::validation::deferred_types::with_session_for_test_async(
         provider_types.provider_context(),
         async |type_checks| {
-            let preparation = carina_core::executor::ProviderPreparationContext::new(
+            let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                 &bindings,
                 &module_gate,
                 &[],
@@ -579,7 +579,7 @@ async fn update_request_for_test<P: StateValueLeaf>(
     carina_core::validation::deferred_types::with_session_for_test_async(
         provider_types.provider_context(),
         async |type_checks| {
-            let preparation = carina_core::executor::ProviderPreparationContext::new(
+            let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                 &bindings,
                 &module_gate,
                 &[],
@@ -975,7 +975,7 @@ fn aws_credential_probe_data_source() -> carina_core::provider::ProviderReadyDat
     carina_core::validation::deferred_types::with_session_for_test(
         provider_types.provider_context(),
         |type_checks| {
-            let preparation = carina_core::executor::ProviderPreparationContext::new(
+            let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                 &bindings,
                 &module_gate,
                 &[],
@@ -5665,7 +5665,7 @@ async fn issue_4304_3a_wasm_normalization_reenters_final_input_admission() {
             let plan_error =
                 FinalPlanInputs::admit(vec![planned], vec![], &schemas, &bindings, session)
                     .expect_err("WASM normalization output must be admitted before planning");
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],
@@ -7260,7 +7260,7 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     carina_core::validation::deferred_types::with_session_for_test_async(
         provider_types.provider_context(),
         async |type_checks| {
-            let preparation = carina_core::executor::ProviderPreparationContext::new(
+            let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                 &bindings,
                 &module_gate,
                 &[],
@@ -7508,7 +7508,7 @@ async fn raw_data_source_floats_retain_resource_operation_and_constructor_source
         carina_core::validation::deferred_types::with_session_for_test_async(
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             async |type_checks| {
-                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &[],

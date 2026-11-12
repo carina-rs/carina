@@ -58,10 +58,8 @@ pub trait ProviderConfigurations: provider_configuration_sealed::Collection + Se
     fn provider_or_implicit(&self, name: &str) -> Cow<'_, Self::Configuration>;
 }
 
-/// Closed desired-input policy. The plan exception derives missing bindings
-/// from the declared upstreams and their admitted snapshot, never a caller predicate.
-#[derive(Clone, Copy, Debug)]
-pub enum DefaultTagResolutionPolicy {
+/// The omission rule is private and cannot mint desired-input authority.
+enum DefaultTagResolutionPolicy {
     RequireKnown,
     PlanWithMissingUpstream,
 }
@@ -280,7 +278,7 @@ impl ResolvedProviderConfigs {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn from_test_configs(
         configs: Vec<RuntimeProviderConfig>,
     ) -> Result<Self, ProviderConfigInvariantError> {
@@ -327,6 +325,103 @@ impl ProviderConfigurations for ResolvedProviderConfigs {
     }
     fn provider_or_implicit(&self, name: &str) -> Cow<'_, Self::Configuration> {
         self.provider_or_implicit(name)
+    }
+}
+
+/// Provider inputs usable for display/diff. This sealed view authorizes no
+/// saved-plan serialization or desired-input dispatch.
+pub trait PlanProviderConfigurations: ProviderConfigurations {
+    fn plan_provider_configs(&self) -> &[RuntimeProviderConfig];
+}
+
+impl PlanProviderConfigurations for ResolvedProviderConfigs {
+    fn plan_provider_configs(&self) -> &[RuntimeProviderConfig] {
+        self.as_provider_configs()
+    }
+}
+
+/// Display-only inputs may omit defaults referring exclusively to missing
+/// upstream state. They cannot be saved or authorize desired-input dispatch.
+///
+/// ```compile_fail,E0277
+/// use carina_core::parser::{PlanPreviewProviderConfigs, SavedProviderConfigs};
+/// fn save(preview: &PlanPreviewProviderConfigs) -> SavedProviderConfigs {
+///     SavedProviderConfigs::from(preview)
+/// }
+/// ```
+/// ```compile_fail,E0308
+/// use carina_core::{executor::LiveExecutionInput, parser::PlanPreviewProviderConfigs};
+/// fn dispatch<'a>(input: &mut LiveExecutionInput<'a>, preview: &'a PlanPreviewProviderConfigs) {
+///     input.provider_configs = preview;
+/// }
+/// ```
+/// ```compile_fail,E0277
+/// use carina_core::parser::{PlanPreviewProviderConfigs, ResolvedProviderConfigs};
+/// fn promote(preview: PlanPreviewProviderConfigs) -> ResolvedProviderConfigs {
+///     preview.into()
+/// }
+/// ```
+/// ```compile_fail,E0308
+/// use carina_core::{executor::ProviderPreparationContext, parser::PlanPreviewProviderConfigs,
+///     binding_index::ResolvedBindings, executor::ModuleConstraintGate,
+///     provider::NoopNormalizer, schema::SchemaRegistry,
+///     validation::deferred_types::ProviderTypeCheckContext};
+/// fn prepare(preview: &PlanPreviewProviderConfigs, bindings: &ResolvedBindings,
+///     gate: &ModuleConstraintGate, schemas: &SchemaRegistry, session: &dyn ProviderTypeCheckContext) {
+///     let _ = ProviderPreparationContext::new(bindings, gate, preview, &NoopNormalizer, &[], schemas, session);
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanPreviewProviderConfigs {
+    construction: ReadOnlyProviderConfigs,
+    provider_configs: Vec<RuntimeProviderConfig>,
+}
+
+impl PlanPreviewProviderConfigs {
+    fn from_preview(
+        configs: Vec<RuntimeProviderConfig>,
+    ) -> Result<Self, ProviderConfigInvariantError> {
+        ResolvedProviderConfigs::validate_known(&configs)?;
+        Ok(Self::with_configs(configs))
+    }
+
+    fn with_configs(configs: Vec<RuntimeProviderConfig>) -> Self {
+        let construction = ReadOnlyProviderConfigs {
+            configs: configs
+                .iter()
+                .map(|config| ReadOnlyProviderConfig {
+                    name: config.name.clone(),
+                    attributes: config.attributes.clone(),
+                    source: config.source.clone(),
+                    binding: config.binding.clone(),
+                })
+                .collect(),
+        };
+        Self {
+            construction,
+            provider_configs: configs,
+        }
+    }
+}
+
+impl From<&ResolvedProviderConfigs> for PlanPreviewProviderConfigs {
+    fn from(configs: &ResolvedProviderConfigs) -> Self {
+        Self::with_configs(configs.provider_configs.clone())
+    }
+}
+impl provider_configuration_sealed::Collection for PlanPreviewProviderConfigs {}
+impl ProviderConfigurations for PlanPreviewProviderConfigs {
+    type Configuration = ReadOnlyProviderConfig;
+    fn configurations(&self) -> &[Self::Configuration] {
+        self.construction.configurations()
+    }
+    fn provider_or_implicit(&self, name: &str) -> Cow<'_, Self::Configuration> {
+        self.construction.provider_or_implicit(name)
+    }
+}
+impl PlanProviderConfigurations for PlanPreviewProviderConfigs {
+    fn plan_provider_configs(&self) -> &[RuntimeProviderConfig] {
+        &self.provider_configs
     }
 }
 
@@ -2816,12 +2911,7 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
     remote_bindings: &crate::upstream_exports::AdmittedRemoteBindings,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<ResolvedProviderConfigs, ProviderConfigResolutionError> {
-    ResolvedProviderConfigs::resolve_with_remote(
-        parsed,
-        remote_bindings,
-        config,
-        DefaultTagResolutionPolicy::RequireKnown,
-    )
+    ResolvedProviderConfigs::resolve_with_remote(parsed, remote_bindings, config)
 }
 
 /// One binding snapshot serves both typed provider-configuration routes.
@@ -2915,66 +3005,115 @@ impl ProviderAttributeBindings {
 }
 
 impl ResolvedProviderConfigs {
-    /// Desired-input resolution always retains defaults, except the closed
-    /// plan-only policy for values referencing exclusively missing upstreams.
-    /// Read/delete construction has a different result type and entry point.
+    /// Strict desired-input resolution retains and resolves every default.
     pub fn resolve_with_remote<E, D>(
         parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>,
         remote: &crate::upstream_exports::AdmittedRemoteBindings,
         session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-        policy: DefaultTagResolutionPolicy,
     ) -> Result<Self, ProviderConfigResolutionError> {
-        let bindings = ProviderAttributeBindings::new(parsed, remote);
-        let missing = match policy {
-            DefaultTagResolutionPolicy::RequireKnown => HashSet::new(),
-            DefaultTagResolutionPolicy::PlanWithMissingUpstream => parsed
-                .upstream_states
-                .iter()
-                .filter(|upstream| !remote.contains_key(upstream.binding.as_str()))
-                .map(|upstream| upstream.binding.as_str().to_owned())
-                .collect(),
-        };
-        let mut providers = Vec::with_capacity(parsed.providers.len());
-        for original in &parsed.providers {
-            let mut provider = original.clone();
-            provider.attributes = bindings.attributes(&original.attributes, session)?;
-            // Read-only validation retains the authored default map. A later
-            // desired consumer must resolve it, never silently ignore it.
-            if let Some(expr) = provider
-                .unresolved_attributes
-                .shift_remove(DEFAULT_TAGS_ATTRIBUTE)
-            {
-                let value = bindings.resolve(&expr, session)?;
-                provider.default_tags = match value {
-                    GenericValue::Concrete(GenericConcreteValue::Map(tags)) => tags,
-                    value => {
-                        Self::check_value(&provider.name, DEFAULT_TAGS_ATTRIBUTE, &value)?;
-                        return Err(ParseError::InvalidExpression {
-                            line: 0,
-                            message: format!(
-                                "provider {}: {DEFAULT_TAGS_ATTRIBUTE} must resolve to a map",
-                                provider.name
-                            ),
-                        }
-                        .into());
-                    }
-                };
-            }
-            let mut tags = IndexMap::new();
-            for (key, value) in &provider.default_tags {
-                if Self::references_only(value, &missing) {
-                    log::error!(
-                        "Skipping default_tag '{key}' with unresolvable value: upstream state is missing"
-                    );
-                } else {
-                    tags.insert(key.clone(), bindings.resolve(value, session)?);
-                }
-            }
-            provider.default_tags = tags;
-            providers.push(provider);
-        }
+        let providers = resolve_desired_provider_configs(
+            parsed,
+            remote,
+            session,
+            DefaultTagResolutionPolicy::RequireKnown,
+        )?;
         Self::from_resolved(providers).map_err(Into::into)
     }
+}
+
+impl PlanPreviewProviderConfigs {
+    /// Preview may omit defaults whose only dependencies are absent upstreams.
+    /// The result carries no authority to save or execute a desired input.
+    pub fn resolve_with_remote<E, D>(
+        parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>,
+        remote: &crate::upstream_exports::AdmittedRemoteBindings,
+        session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Result<Self, ProviderConfigResolutionError> {
+        let providers = resolve_desired_provider_configs(
+            parsed,
+            remote,
+            session,
+            DefaultTagResolutionPolicy::PlanWithMissingUpstream,
+        )?;
+        Self::from_preview(providers).map_err(Into::into)
+    }
+}
+
+fn resolve_desired_provider_configs<E, D>(
+    parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>,
+    remote: &crate::upstream_exports::AdmittedRemoteBindings,
+    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    policy: DefaultTagResolutionPolicy,
+) -> Result<Vec<RuntimeProviderConfig>, ProviderConfigResolutionError> {
+    let bindings = ProviderAttributeBindings::new(parsed, remote);
+    let missing = match policy {
+        DefaultTagResolutionPolicy::RequireKnown => HashSet::new(),
+        DefaultTagResolutionPolicy::PlanWithMissingUpstream => parsed
+            .upstream_states
+            .iter()
+            .filter(|upstream| !remote.contains_key(upstream.binding.as_str()))
+            .map(|upstream| upstream.binding.as_str().to_owned())
+            .collect(),
+    };
+    let mut providers = Vec::with_capacity(parsed.providers.len());
+    for original in &parsed.providers {
+        let mut provider = original.clone();
+        provider.attributes = bindings.attributes(&original.attributes, session)?;
+        // Read-only validation retains the authored default map. A later
+        // desired consumer must resolve it, never silently ignore it.
+        if let Some(expr) = provider
+            .unresolved_attributes
+            .shift_remove(DEFAULT_TAGS_ATTRIBUTE)
+        {
+            let value = bindings.resolve(&expr, session)?;
+            provider.default_tags = match value {
+                GenericValue::Concrete(GenericConcreteValue::Map(tags)) => tags,
+                value => {
+                    ResolvedProviderConfigs::check_value(
+                        &provider.name,
+                        DEFAULT_TAGS_ATTRIBUTE,
+                        &value,
+                    )?;
+                    return Err(ParseError::InvalidExpression {
+                        line: 0,
+                        message: format!(
+                            "provider {}: {DEFAULT_TAGS_ATTRIBUTE} must resolve to a map",
+                            provider.name
+                        ),
+                    }
+                    .into());
+                }
+            };
+        }
+        let mut tags = IndexMap::new();
+        for (key, value) in &provider.default_tags {
+            if ResolvedProviderConfigs::references_only(value, &missing) {
+                log::warn!(
+                    "provider {}: omitting {} from plan preview because upstream state is missing ({})",
+                    crate::provider_text::DiagnosticText::new(
+                        provider.binding.as_deref().unwrap_or(&provider.name)
+                    ),
+                    crate::provider_text::DiagnosticText::new(
+                        ResolvedProviderConfigs::default_tag_attribute(key)
+                    ),
+                    crate::provider_text::DiagnosticText::new(
+                        missing
+                            .iter()
+                            .cloned()
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+            } else {
+                tags.insert(key.clone(), bindings.resolve(value, session)?);
+            }
+        }
+        provider.default_tags = tags;
+        providers.push(provider);
+    }
+    Ok(providers)
 }
 
 impl ReadOnlyProviderConfigs {

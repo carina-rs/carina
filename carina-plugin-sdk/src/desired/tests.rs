@@ -977,7 +977,7 @@ async fn provider_ready_inputs_are_infallible_and_preserve_checked_scalar_and_se
         let configs = [config];
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let gate = ModuleConstraintGate::from_live_compositions(&[]);
-        let context = ProviderPreparationContext::new(
+        let context = ProviderPreparationContext::for_test(
             &bindings,
             &gate,
             &configs,
@@ -1066,7 +1066,7 @@ async fn provider_ready_inputs_preserve_env_string_diagnostic_sensitivity() {
             carina_core::schema::SchemaKind::Resource,
             &resource.attributes,
         );
-        let context = ProviderPreparationContext::new(
+        let context = ProviderPreparationContext::for_test(
             &bindings,
             &gate,
             &[],
@@ -1154,7 +1154,7 @@ async fn native_and_wasm_views_share_sorted_order_for_unsorted_authored_maps() {
         &resource.attributes,
     );
     let request = with_type_checks(async |type_checks| {
-        let context = ProviderPreparationContext::new(
+        let context = ProviderPreparationContext::for_test(
             &bindings,
             &gate,
             &[],

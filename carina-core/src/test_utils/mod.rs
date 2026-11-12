@@ -426,3 +426,15 @@ pub fn loaded_fixture_snapshot(
         crate::EnvironmentSnapshot::empty(),
     )
 }
+
+/// Build known strict provider inputs for execution fixtures through the same
+/// invariant constructor as live and decoded configurations.
+pub fn resolved_provider_configs(
+    configs: &[crate::parser::ProviderConfig<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    >],
+) -> crate::parser::ResolvedProviderConfigs {
+    crate::parser::ResolvedProviderConfigs::from_test_configs(configs.to_vec())
+        .expect("execution fixture provider configs must be known")
+}

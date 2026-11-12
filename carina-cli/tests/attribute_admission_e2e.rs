@@ -230,7 +230,7 @@ fn timing_matrix(name: &str) {
         let bindings = ResolvedBindings::default();
         let gate = ModuleConstraintGate::from_live_compositions(&pending.compositions);
         let native_factories = factories();
-        let context = ProviderPreparationContext::new(&bindings, &gate, &[], &carina_core::provider::NoopNormalizer, &native_factories, &pending.schemas, session);
+        let context = ProviderPreparationContext::for_test(&bindings, &gate, &[], &carina_core::provider::NoopNormalizer, &native_factories, &pending.schemas, session);
         let saved: SavedResource = sink.clone().into();
         let live = prepare_provider_ready_resource(sink.clone(), &context).await;
         let saved = prepare_provider_ready_resource(saved, &context).await;
@@ -317,7 +317,7 @@ fn timing_matrix(name: &str) {
                     );
                     let gate = ModuleConstraintGate::from_live_compositions(&pending.compositions);
                     let native_factories = factories();
-                    let context = ProviderPreparationContext::new(
+                    let context = ProviderPreparationContext::for_test(
                         &bindings,
                         &gate,
                         &[],
@@ -465,7 +465,7 @@ fn executor_timing_matrix(name: &str) {
                     managed_current: fixture.managed_current,
                     data_source_values: ExecutableDataSourceValues::empty(),
                     normalizer: &carina_core::provider::NoopNormalizer,
-                    provider_configs: &[],
+                    provider_configs: &carina_core::test_utils::resolved_provider_configs(&[]),
                     provider_context: carina_core::parser::ProviderContext::clone(
                         loaded.provider_context(),
                     ),

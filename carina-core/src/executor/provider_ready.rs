@@ -236,7 +236,12 @@ impl<T: ResourceWirePayload> DispatchPayload<T> {
     pub(crate) fn into_wire(self) -> Result<DispatchPayload<WireReady<T>>, ProviderWireError> {
         let target = ProviderWireTarget::Resource(self.payload.resource_id().clone());
         Ok(DispatchPayload {
-            payload: WireReady::try_new(self.payload, target)?,
+            payload: WireReady::try_new(self.payload, target).map_err(|error| {
+                match self.diagnostic_attributes.get(error.attribute()) {
+                    Some(source) => error.with_diagnostic_source(source),
+                    None => error,
+                }
+            })?,
             diagnostic_attributes: self.diagnostic_attributes,
         })
     }
@@ -426,17 +431,52 @@ impl<'a> ProviderPreparationContext<'a> {
     pub fn new(
         bindings: &'a ResolvedBindings,
         module_gate: &'a ModuleConstraintGate,
-        provider_configs: &'a [ProviderConfig<
-            crate::resource::NoPlaceholder,
-            crate::resource::AbsoluteBindingAddress,
-        >],
+        provider_configs: &'a crate::parser::ResolvedProviderConfigs,
         normalizer: &'a dyn HostNormalizer,
         _factories: &'a [Box<dyn ProviderFactory>],
         schemas: &'a SchemaRegistry,
         type_checks: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Self {
-        // Keep the public constructor's factory argument for compatibility.
-        // Admission uses the resolver retained by the session's catalog.
+        Self::with_configs(
+            bindings,
+            module_gate,
+            provider_configs.as_provider_configs(),
+            normalizer,
+            schemas,
+            type_checks,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(
+        bindings: &'a ResolvedBindings,
+        module_gate: &'a ModuleConstraintGate,
+        provider_configs: &'a [ProviderConfig<NoPlaceholder, AbsoluteBindingAddress>],
+        normalizer: &'a dyn HostNormalizer,
+        _factories: &'a [Box<dyn ProviderFactory>],
+        schemas: &'a SchemaRegistry,
+        type_checks: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Self {
+        crate::parser::ResolvedProviderConfigs::from_test_configs(provider_configs.to_vec())
+            .expect("provider preparation fixtures must be known");
+        Self::with_configs(
+            bindings,
+            module_gate,
+            provider_configs,
+            normalizer,
+            schemas,
+            type_checks,
+        )
+    }
+
+    fn with_configs(
+        bindings: &'a ResolvedBindings,
+        module_gate: &'a ModuleConstraintGate,
+        provider_configs: &'a [ProviderConfig<NoPlaceholder, AbsoluteBindingAddress>],
+        normalizer: &'a dyn HostNormalizer,
+        schemas: &'a SchemaRegistry,
+        type_checks: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Self {
         Self {
             bindings,
             module_gate,
@@ -485,15 +525,43 @@ impl<'a> ProviderPreparationContext<'a> {
             schema,
             self.bindings,
             self.type_checks,
-        )
-        .map_err(|error| match error {
-            crate::validation::admission::final_input::FinalInputError::Wire(error) => {
-                ProviderPreparationError::Wire(Box::new(error))
-            }
-            error => ProviderPreparationError::FinalInput(error),
-        })?;
+        )?;
         settle_preparation(self.type_checks.pending(admitted))
     }
+}
+
+/// Query-only preparation does not consume defaults and cannot prepare a
+/// managed create or update. Preview planning and read-only commands use this
+/// route for data-source refreshes.
+pub struct DataSourcePreparationContext<'a> {
+    inner: ProviderPreparationContext<'a>,
+}
+
+impl<'a> DataSourcePreparationContext<'a> {
+    pub fn new(
+        bindings: &'a ResolvedBindings,
+        module_gate: &'a ModuleConstraintGate,
+        schemas: &'a SchemaRegistry,
+        type_checks: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Self {
+        Self {
+            inner: ProviderPreparationContext::with_configs(
+                bindings,
+                module_gate,
+                &[],
+                &crate::provider::NoopNormalizer,
+                schemas,
+                type_checks,
+            ),
+        }
+    }
+}
+
+pub fn prepare_data_source_query(
+    resource: DataSource,
+    context: &DataSourcePreparationContext<'_>,
+) -> Result<ProviderReadyDataSource, ProviderPreparationError> {
+    prepare_provider_ready_data_source(resource, &context.inner)
 }
 
 /// Whether a provider-bound value is still in its authored form or came from
@@ -1257,12 +1325,7 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
     )?;
     let resource =
         ResolvedResource::resolve_with_schemas(resource.into_provider_resource(), context.schemas)?;
-    // Conversion diagnostics still use the protected tree. Remove only the
-    // annotations restored around normalizer output once all host checks pass.
-    WireReady::try_new(
-        resource.clone(),
-        ProviderWireTarget::Resource(resource.id.clone()),
-    )?;
+    // The final projection uses the bound protected source for diagnostics.
     let input = DispatchPayload::resource(resource, &restored, context.schemas)?;
     let resource = input.payload();
     let directives = context.schemas.resolve_directives(
@@ -1367,10 +1430,6 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
             .and_then(crate::resource::require_known_for_apply)?;
     }
     let value = ResolvedDataSource::new(value.into_provider_data_source());
-    WireReady::try_new(
-        value.clone(),
-        ProviderWireTarget::Resource(value.id.clone()),
-    )?;
     let input = DispatchPayload::data_source(value);
     let value = input.payload();
     let directives = context.schemas.resolve_directives(
@@ -1473,6 +1532,221 @@ mod provider_config_tests {
         CompiledAttributeType as AttributeType, RootlessType, TypeIdentity, legacy_validator,
     };
 
+    fn assert_final_wire_shape<T: ResourceWirePayload>(
+        input: DispatchPayload<T>,
+        schema: crate::schema::OwnerBoundResourceSchema<'_>,
+        session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) {
+        let result = admit_dispatch(input, None, schema, &ResolvedBindings::default(), session);
+        let error = result.expect_err("out-of-range duration must fail wire projection");
+        assert!(
+            matches!(error, ProviderPreparationError::Wire(_)),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn issue_4304_3a_review3_final_create_wire_failure_has_transport_shape() {
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                let resource: Resource =
+                    Resource::with_provider("test", "review3", "wire-create", None).with_attribute(
+                        "oversized",
+                        Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+                            u64::MAX,
+                        ))),
+                    );
+                let schemas = crate::test_utils::preparation_schemas_with_attributes(
+                    &resource.id,
+                    SchemaKind::Resource,
+                    &resource.attributes,
+                );
+                let schema = schemas.get_for(&resource).unwrap();
+                let diagnostic_attributes = resource.attributes.clone();
+                let payload = ResolvedResource::resolve_with_schemas(
+                    resource.into_provider_resource(),
+                    &schemas,
+                )
+                .unwrap();
+                assert_final_wire_shape(
+                    DispatchPayload {
+                        payload,
+                        diagnostic_attributes,
+                    },
+                    schema,
+                    session,
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn issue_4304_3a_review3_final_data_source_wire_failure_has_transport_shape() {
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                let mut resource: DataSource =
+                    DataSource::pending_with_provider("test", "review3", None);
+                resource.id =
+                    ResourceId::with_provider_identity("test", "review3", "wire-ds", None);
+                resource.attributes.insert(
+                    "oversized".into(),
+                    Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+                        u64::MAX,
+                    ))),
+                );
+                let schemas = crate::test_utils::preparation_schemas_with_attributes(
+                    &resource.id,
+                    SchemaKind::DataSource,
+                    &resource.attributes,
+                );
+                let schema = schemas.get_for_data_source(&resource).unwrap();
+                let input = DispatchPayload::data_source(ResolvedDataSource::new(
+                    resource.into_provider_data_source(),
+                ));
+                assert_final_wire_shape(input, schema, session);
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_4304_3a_review3_create_projects_the_final_payload_once() {
+        crate::validation::deferred_types::with_session_for_test_async(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            async |session| {
+                let resource: Resource =
+                    Resource::with_provider("test", "review3", "project-create", None)
+                        .with_attribute("value", Value::Concrete(ConcreteValue::Bool(true)));
+                let id = resource.id.clone();
+                let before = crate::provider_wire::projection_count_for_test(&id);
+                let schemas = crate::test_utils::preparation_schemas_with_attributes(
+                    &id,
+                    SchemaKind::Resource,
+                    &resource.attributes,
+                );
+                let bindings = ResolvedBindings::default();
+                let gate = ModuleConstraintGate::from_live_compositions(&[]);
+                let context = ProviderPreparationContext::for_test(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &crate::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    session,
+                );
+                prepare_create_request(resource, &context).await.unwrap();
+                assert_eq!(
+                    crate::provider_wire::projection_count_for_test(&id) - before,
+                    1
+                );
+            },
+        )
+        .await;
+    }
+
+    #[test]
+    fn issue_4304_3a_review3_data_source_projects_the_final_payload_once() {
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                let mut resource: DataSource =
+                    DataSource::pending_with_provider("test", "project-ds", None);
+                resource.id =
+                    ResourceId::with_provider_identity("test", "project-ds", "project-ds", None);
+                resource
+                    .attributes
+                    .insert("value".into(), Value::Concrete(ConcreteValue::Bool(true)));
+                let id = resource.id.clone();
+                let before = crate::provider_wire::projection_count_for_test(&id);
+                let schemas = crate::test_utils::preparation_schemas_with_attributes(
+                    &id,
+                    SchemaKind::DataSource,
+                    &resource.attributes,
+                );
+                let bindings = ResolvedBindings::default();
+                let gate = ModuleConstraintGate::from_live_compositions(&[]);
+                let context = ProviderPreparationContext::for_test(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &crate::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    session,
+                );
+                prepare_provider_ready_data_source(resource, &context).unwrap();
+                assert_eq!(
+                    crate::provider_wire::projection_count_for_test(&id) - before,
+                    1
+                );
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_4304_3a_review3_single_projection_preserves_secret_wire_diagnostics() {
+        crate::validation::deferred_types::with_session_for_test_async(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            async |session| {
+                let resource = Resource::with_provider("test", "review3", "secret-wire", None)
+                    .with_attribute(
+                        "config",
+                        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                            "public".into(),
+                            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                                "private-wire-key".into(),
+                                Value::Concrete(ConcreteValue::Duration(
+                                    std::time::Duration::from_secs(u64::MAX),
+                                )),
+                            )])))
+                            .into_secret(),
+                        )]))),
+                    );
+                let schemas = crate::test_utils::preparation_schemas_with_attributes(
+                    &resource.id,
+                    SchemaKind::Resource,
+                    &resource.attributes,
+                );
+                let bindings = ResolvedBindings::default();
+                let gate = ModuleConstraintGate::from_live_compositions(&[]);
+                let context = ProviderPreparationContext::for_test(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &crate::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    session,
+                );
+                let error = prepare_create_request(resource, &context)
+                    .await
+                    .unwrap_err();
+                let ProviderPreparationError::Wire(error) = error else {
+                    panic!("{error}")
+                };
+                assert_eq!(
+                    error.path(),
+                    &[
+                        crate::protocol_convert::WirePathSegment::Key("public".into()),
+                        crate::protocol_convert::WirePathSegment::Secret,
+                    ]
+                );
+                assert!(matches!(
+                    error.conversion_error(),
+                    crate::protocol_convert::ProtocolConvertError::DurationOutOfRange
+                ));
+                let message = format!("{error:?}: {error}");
+                assert!(message.contains("config.public"), "{message}");
+                for private in ["private-wire-key", &u64::MAX.to_string()] {
+                    assert!(!message.contains(private), "{message}");
+                }
+            },
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn secret_origin_4275_round2_dispatch_masks_still_deferred_secret() {
         let resource = Resource::with_provider("test", "widget", "example", None).with_attribute(
@@ -1487,7 +1761,7 @@ mod provider_config_tests {
         crate::validation::deferred_types::with_session_for_test_async(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             async |type_checks| {
-                let context = ProviderPreparationContext::new(
+                let context = ProviderPreparationContext::for_test(
                     &bindings,
                     &module_gate,
                     &[],
@@ -1540,7 +1814,7 @@ mod provider_config_tests {
         crate::validation::deferred_types::with_session_for_test_async(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             async |type_checks| {
-                let context = ProviderPreparationContext::new(
+                let context = ProviderPreparationContext::for_test(
                     &bindings,
                     &module_gate,
                     &[],
@@ -1578,7 +1852,7 @@ mod provider_config_tests {
         crate::validation::deferred_types::with_session_for_test_async(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             async |type_checks| {
-                let context = ProviderPreparationContext::new(
+                let context = ProviderPreparationContext::for_test(
                     &bindings,
                     &module_gate,
                     &[],
@@ -1609,7 +1883,7 @@ mod provider_config_tests {
         crate::validation::deferred_types::with_session_for_test_async(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             async |type_checks| {
-                let context = ProviderPreparationContext::new(
+                let context = ProviderPreparationContext::for_test(
                     &bindings,
                     &module_gate,
                     &[],
@@ -1884,7 +2158,7 @@ mod provider_config_tests {
         crate::validation::deferred_types::with_session_for_test_async(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             async |type_checks| {
-                let context = ProviderPreparationContext::new(
+                let context = ProviderPreparationContext::for_test(
                     &bindings,
                     &module_gate,
                     &[],
@@ -1970,7 +2244,7 @@ mod provider_config_tests {
             async |type_checks| {
                 let normalizer_boundary =
                     crate::provider::ConfiguredNormalizer::fixture(&DefaultingNormalizer);
-                let context = ProviderPreparationContext::new(
+                let context = ProviderPreparationContext::for_test(
                     &bindings,
                     &module_gate,
                     &[],
@@ -2097,7 +2371,7 @@ mod provider_config_tests {
                             Some(invalid),
                             if unknown { "undeclared" } else { "value" },
                         ));
-                    let context = ProviderPreparationContext::new(
+                    let context = ProviderPreparationContext::for_test(
                         &bindings,
                         &gate,
                         &[],
@@ -2269,7 +2543,7 @@ mod provider_config_tests {
             let ready = crate::validation::deferred_types::with_session_for_test_async(
                 &crate::parser::LoadedProviderContext::empty_for_test(),
                 async |session| {
-                    let context = ProviderPreparationContext::new(
+                    let context = ProviderPreparationContext::for_test(
                         &bindings,
                         &gate,
                         &[],
@@ -2298,7 +2572,7 @@ mod provider_config_tests {
                         let expected = crate::parser::parse_type_expr_str(name, &catalog).unwrap();
                         session.record_type(&expected, label);
                     }
-                    let context = ProviderPreparationContext::new(
+                    let context = ProviderPreparationContext::for_test(
                         &bindings,
                         &gate,
                         &[],
@@ -2384,7 +2658,7 @@ mod provider_config_tests {
             crate::validation::deferred_types::with_session_for_test_async(
                 &crate::parser::LoadedProviderContext::empty_for_test(),
                 async |session| {
-                    let context = ProviderPreparationContext::new(
+                    let context = ProviderPreparationContext::for_test(
                         &bindings,
                         &gate,
                         &[],
@@ -2525,7 +2799,7 @@ mod provider_config_tests {
                     let normalizer = crate::provider::ConfiguredNormalizer::fixture(
                         ReplacingNormalizer(Some(normalized), "value"),
                     );
-                    let context = ProviderPreparationContext::new(
+                    let context = ProviderPreparationContext::for_test(
                         &bindings,
                         &module_gate,
                         &[],
@@ -2602,7 +2876,7 @@ mod provider_config_tests {
                     let normalizer = crate::provider::ConfiguredNormalizer::fixture(
                         ReplacingNormalizer(normalized, "value"),
                     );
-                    let context = ProviderPreparationContext::new(
+                    let context = ProviderPreparationContext::for_test(
                         &bindings,
                         &gate,
                         &[],
@@ -2736,7 +3010,7 @@ mod provider_config_tests {
             crate::validation::deferred_types::with_session_for_test_async(
                 &crate::parser::LoadedProviderContext::empty_for_test(),
                 async |session| {
-                    let context = ProviderPreparationContext::new(
+                    let context = ProviderPreparationContext::for_test(
                         &bindings,
                         &module_gate,
                         &file.providers,
@@ -2871,7 +3145,7 @@ mod provider_config_tests {
             crate::validation::deferred_types::with_session_for_test_async(
                 &crate::parser::LoadedProviderContext::empty_for_test(),
                 async |session| {
-                    let context = ProviderPreparationContext::new(
+                    let context = ProviderPreparationContext::for_test(
                         &bindings,
                         &gate,
                         &file.providers,
@@ -2951,7 +3225,7 @@ mod provider_config_tests {
             crate::validation::deferred_types::with_session_for_test_async(
                 &crate::parser::LoadedProviderContext::empty_for_test(),
                 async |session| {
-                    let context = ProviderPreparationContext::new(
+                    let context = ProviderPreparationContext::for_test(
                         &bindings, &gate, &file.providers, &normalizer, &[], &schemas, session,
                     );
                     for entry in [Entry::Plan, Entry::Dispatch] {
@@ -2984,7 +3258,7 @@ mod provider_config_tests {
             crate::validation::deferred_types::with_session_for_test_async(
                 &crate::parser::LoadedProviderContext::empty_for_test(),
                 async |session| {
-                    let context = ProviderPreparationContext::new(
+                    let context = ProviderPreparationContext::for_test(
                         &bindings,
                         &module_gate,
                         &[],
@@ -4431,7 +4705,7 @@ mod provider_config_tests {
         crate::validation::deferred_types::with_session_for_test(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             |type_checks| {
-                let context = ProviderPreparationContext::new(
+                let context = ProviderPreparationContext::for_test(
                     &bindings,
                     &module_gate,
                     &[],
@@ -4470,7 +4744,7 @@ mod provider_config_tests {
         crate::validation::deferred_types::with_session_for_test_async(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             async |type_checks| {
-                let context = ProviderPreparationContext::new(
+                let context = ProviderPreparationContext::for_test(
                     &bindings, &module_gate, &[], &crate::provider::NoopNormalizer,
                     &[], &schemas, type_checks,
                 );

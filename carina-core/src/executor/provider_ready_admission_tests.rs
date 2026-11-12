@@ -69,7 +69,7 @@ async fn check_apply_errors(attr: AttributeType, authored: Value) {
     crate::validation::deferred_types::with_session_for_test_async(
         &crate::parser::LoadedProviderContext::empty_for_test(),
         async |session| {
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &module_gate,
                 &[],

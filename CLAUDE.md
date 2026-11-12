@@ -572,6 +572,8 @@ A struct type represents a nested object with typed fields.
   constructor for complete desired resources, data sources, final update
   patches and provider configuration. It caches the checked projection after
   host rewrites, including default tags and observed ignored patch leaves.
+  Each final payload is projected once. Wire failures remain
+  `ProviderPreparationError::Wire`, with protected diagnostic paths retained.
   Native and WASM dispatch share this proof; WASM only adapts the cached wire
   values to WIT. Native create validators use infallible
   `DesiredInputs::from_provider_ready`. Updates expose desired values only
@@ -649,8 +651,11 @@ A struct type represents a nested object with typed fields.
   Authored tag overrides win; overridden defaults do not participate in membership.
   Default tags for desired inputs must be known when provider configurations resolve; validate
   and LSP reject local apply-time references. Desired configurations retain
-  defaults except for the closed plan policy that omits defaults referring only
-  to missing upstream state. Destroy, state refresh and state bucket deletion use
+  all defaults. Plain plan display may instead use `PlanPreviewProviderConfigs`
+  to omit defaults referring only to missing upstream state, with a warning.
+  Preview inputs cannot be saved or dispatched; `plan --out` and `plan --json`
+  require strict configurations and reject those missing defaults.
+  Destroy, state refresh and state bucket deletion use
   `ReadOnlyProviderConfigs`, which has no default tags or projection into desired
   inputs. Their validation retains authored defaults without demanding them;
   only the typed read/delete provider path excludes those inputs.

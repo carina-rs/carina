@@ -470,7 +470,7 @@ fn dispatch_fixture_create(
     carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
         |type_checks| {
-            let preparation = carina_core::executor::ProviderPreparationContext::new(
+            let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                 &bindings,
                 &module_gate,
                 &[],
@@ -563,7 +563,7 @@ pub(crate) fn fixture_repend_in_flight_create(
     carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
         |type_checks| {
-            let preparation = carina_core::executor::ProviderPreparationContext::new(
+            let preparation = carina_core::executor::ProviderPreparationContext::for_test(
                 &bindings,
                 &module_gate,
                 &[],

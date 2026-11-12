@@ -390,7 +390,7 @@ fn create_request_for(id: ResourceId) -> CreateRequest {
                     &id,
                     crate::schema::SchemaKind::Resource,
                 );
-                let context = crate::executor::ProviderPreparationContext::new(
+                let context = crate::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &[],
@@ -523,7 +523,7 @@ impl BindProviderText for UpdateOutcome {
                             .validate()
                             .unwrap(),
                     );
-                    let request_context = crate::executor::ProviderPreparationContext::new(
+                    let request_context = crate::executor::ProviderPreparationContext::for_test(
                         &bindings,
                         &gate,
                         &[],

@@ -1903,7 +1903,7 @@ mod tests {
                             .validate()
                             .unwrap(),
                     );
-                    let context = ProviderPreparationContext::new(
+                    let context = ProviderPreparationContext::for_test(
                         &bindings,
                         &gate,
                         &[],

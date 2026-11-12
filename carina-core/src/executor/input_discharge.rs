@@ -843,7 +843,7 @@ mod tests {
         let bindings = crate::binding_index::ResolvedBindings::default();
         let gate = super::super::ModuleConstraintGate::from_live_compositions(&[]);
         crate::validation::deferred_types::with_session_for_test(&catalog, |type_checks| {
-            let context = ProviderPreparationContext::new(
+            let context = ProviderPreparationContext::for_test(
                 &bindings,
                 &gate,
                 &[],
@@ -958,7 +958,7 @@ mod tests {
         crate::validation::deferred_types::with_session_for_test(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             |type_checks| {
-                let context = ProviderPreparationContext::new(
+                let context = ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &[],
@@ -1142,7 +1142,7 @@ mod tests {
             crate::validation::deferred_types::with_session_for_test(
                 &crate::parser::LoadedProviderContext::empty_for_test(),
                 |type_checks| {
-                    let context = ProviderPreparationContext::new(
+                    let context = ProviderPreparationContext::for_test(
                         &bindings,
                         &gate,
                         &[],

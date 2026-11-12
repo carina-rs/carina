@@ -43,8 +43,7 @@ use carina_state::{BackendLock, LockInfo, RowBasis, StateBackend, StateFile};
 #[cfg(test)]
 use carina_core::parser::ProviderConfig;
 use carina_core::parser::{
-    ExpandedProviderConfig, ExpandedUpstreamState, LoadedProviderContext, ProviderContext,
-    ResolvedProviderConfigs,
+    ExpandedUpstreamState, LoadedProviderContext, ProviderContext, ResolvedProviderConfigs,
 };
 
 use super::{DriftCommand, verify_for_mutation};
@@ -280,7 +279,7 @@ async fn prepare_bootstrap_creation(
     let preparation = carina_core::executor::ProviderPreparationContext::new(
         &bindings,
         &module_gate,
-        context.provider_configs.as_provider_configs(),
+        context.provider_configs,
         context.normalizer,
         context.factories,
         context.schemas,
@@ -792,7 +791,7 @@ fn saved_plan_replan_command(plan_path: &Path, source_path: &Path) -> String {
 struct ApplyExecutionContext<'a, S = ModuleSource> {
     provider: &'a ProviderRouter,
     normalizer: &'a dyn HostNormalizer,
-    provider_configs: &'a [ExpandedProviderConfig],
+    provider_configs: &'a ResolvedProviderConfigs,
     factories: &'a [Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &'a carina_core::schema::SchemaRegistry,
     cancel: ShutdownToken,
@@ -2935,7 +2934,7 @@ async fn run_apply_locked_owned(
                 ApplyExecutionContext {
                     provider: provider.as_ref(),
                     normalizer: provider.as_ref(),
-                    provider_configs: raw_provider_configs,
+                    provider_configs,
                     factories: ctx.factories(),
                     schemas: ctx.schemas(),
                     cancel: cancel.clone(),
@@ -4512,7 +4511,7 @@ async fn run_apply_from_plan_locked_owned(
                 ApplyExecutionContext {
                     provider: provider.as_ref(),
                     normalizer: provider.as_ref(),
-                    provider_configs: raw_provider_configs,
+                    provider_configs: &resolved_provider_configs,
                     factories: wiring.factories(),
                     schemas: wiring.schemas(),
                     cancel: cancel.clone(),

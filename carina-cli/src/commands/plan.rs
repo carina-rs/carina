@@ -5982,21 +5982,49 @@ pub(crate) async fn run_plan_using(
         progress_sink.blank_line();
     }
 
-    let PreparedPlanIdentityData {
-        state_blocks:
-            crate::wiring::StateBlockResolution {
-                claims: state_block_claims,
-                targets: resolved_state_block_targets,
+    let crate::wiring::StateBlockResolution {
+        claims: state_block_claims,
+        targets: resolved_state_block_targets,
+    } = validated_config.reconcile_identities_with_state(&state_file);
+    let catalog = validated_config
+        .context()
+        .provider_context()
+        .with_runtime(provider_context);
+    // Both --out and --json emit applicable saved plans. Only human display
+    // may receive the preview type that omits missing-upstream defaults.
+    let (provider_inputs, saved_provider_configs) = if out.is_some() || json {
+        let ResolvedProviderInputs {
+            configs,
+            remote_bindings,
+        } = load_and_resolve_provider_configs(
+            validated_config.context().runtime(),
+            validated_config.resources().parsed(),
+            base_dir,
+            &catalog,
+            validated_config.context().schemas(),
+            UpstreamMissingStatePolicy::Lenient,
+        )
+        .await?;
+        (
+            ResolvedProviderInputs {
+                configs: carina_core::parser::PlanPreviewProviderConfigs::from(&configs),
+                remote_bindings,
             },
-        provider_inputs,
-    } = prepare_plan_identity_and_provider_inputs(
-        &mut validated_config,
-        &mut state_file,
-        base_dir,
-        provider_context,
-        UpstreamMissingStatePolicy::Lenient,
-    )
-    .await?;
+            Some(configs),
+        )
+    } else {
+        (
+            load_and_resolve_plan_preview_provider_configs(
+                validated_config.context().runtime(),
+                validated_config.resources().parsed(),
+                base_dir,
+                &catalog,
+                validated_config.context().schemas(),
+            )
+            .await?,
+            None,
+        )
+    };
     if !refresh {
         eprintln!(
             "{}",
@@ -6153,7 +6181,9 @@ pub(crate) async fn run_plan_using(
         // instead of a panic backtrace.
         let plan_file = build_plan_file(
             &project,
-            provider_inputs.configs(),
+            saved_provider_configs
+                .as_ref()
+                .expect("saved-plan output requires strict provider configs"),
             plan_file_backend_config.clone(),
             &state_file,
             directive_changes.clone(),
@@ -6236,7 +6266,9 @@ pub(crate) async fn run_plan_using(
     let plan_output = if out.is_some() {
         let plan_file = build_plan_file(
             &project,
-            provider_inputs.configs(),
+            saved_provider_configs
+                .as_ref()
+                .expect("saved-plan output requires strict provider configs"),
             plan_file_backend_config.clone(),
             &state_file,
             directive_changes.clone(),
@@ -6335,10 +6367,9 @@ fn write_plan_artifacts(
     Ok(rendered_inline_image)
 }
 
-/// The state-aware identity and provider-input preparation shared by normal
-/// planning and saved-plan secret verification. It is intentionally the only
-/// owner of this ordering: prefix recovery, state-block target resolution,
-/// module/anonymous identity reconciliation, then provider/upstream folding.
+/// Strict identity and provider-input preparation for apply and saved-plan
+/// secret verification. Display planning uses the same identity reconciliation
+/// before selecting its distinct preview configuration route.
 pub(crate) struct PreparedPlanIdentityData {
     pub(crate) state_blocks: crate::wiring::StateBlockResolution,
     pub(crate) provider_inputs: ResolvedProviderInputs,
@@ -6636,19 +6667,47 @@ pub(crate) async fn load_and_resolve_provider_configs<E>(
                     None,
                 )
                 .await?;
-                let policy = match policy {
-                    UpstreamMissingStatePolicy::Strict => {
-                        carina_core::parser::DefaultTagResolutionPolicy::RequireKnown
-                    }
-                    UpstreamMissingStatePolicy::Lenient => {
-                        carina_core::parser::DefaultTagResolutionPolicy::PlanWithMissingUpstream
-                    }
-                };
-                let configs = ResolvedProviderConfigs::resolve_with_remote(
+                let configs =
+                    ResolvedProviderConfigs::resolve_with_remote(parsed, &remote_bindings, session)
+                        .map_err(provider_config_resolution_error)?;
+                Ok(ResolvedProviderInputs {
+                    configs,
+                    remote_bindings,
+                })
+            },
+        )
+        .await,
+        AppError::Validation,
+    )
+}
+
+/// Display-only resolution has no saved-plan or execution conversion.
+async fn load_and_resolve_plan_preview_provider_configs<E>(
+    runtime: &crate::runtime::CommandRuntime,
+    parsed: &carina_core::parser::ExpandedFile<E>,
+    base_dir: &ResolvedPath,
+    provider_context: &ProviderContext,
+    schemas: &carina_core::schema::SchemaRegistry,
+) -> Result<ResolvedProviderInputs<carina_core::parser::PlanPreviewProviderConfigs>, AppError> {
+    crate::wiring::settle_type_checks(
+        carina_core::validation::deferred_types::TypeCheckSession::run_async(
+            provider_context,
+            async |session| {
+                let remote_bindings = load_selected_upstream_states(
+                    runtime,
+                    &parsed.upstream_states,
+                    base_dir,
+                    provider_context,
+                    &mut seed_cycle_guard(base_dir),
+                    schemas,
+                    UpstreamMissingStatePolicy::Lenient,
+                    None,
+                )
+                .await?;
+                let configs = carina_core::parser::PlanPreviewProviderConfigs::resolve_with_remote(
                     parsed,
                     &remote_bindings,
                     session,
-                    policy,
                 )
                 .map_err(provider_config_resolution_error)?;
                 Ok(ResolvedProviderInputs {
@@ -9155,7 +9214,7 @@ exports { region: String = "ap-northeast-1" }"#,
     }
 
     #[tokio::test]
-    async fn run_plan_allows_missing_upstream_referenced_only_by_default_tags() {
+    async fn run_plain_plan_allows_missing_upstream_referenced_only_by_default_tags() {
         let runtime = crate::test_support::TestCommandRuntime::new();
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
@@ -9191,13 +9250,13 @@ exports { region: String = "ap-northeast-1" }"#,
             DetailLevel::None,
             false,
             false,
-            true,
+            false,
             false,
             false,
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .await
-        .expect("plan must keep unresolved default tags for per-resource normalization");
+        .expect("plain plan must allow a preview that omits missing-upstream defaults");
     }
 }
 

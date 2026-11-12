@@ -88,8 +88,6 @@ pub enum FinalInputError {
     },
     #[error(transparent)]
     Findings(FinalInputErrors),
-    #[error(transparent)]
-    Wire(#[from] crate::provider::ProviderWireError),
 }
 
 /// A terminal collection retains every typed membership failure. Each finding
@@ -350,19 +348,20 @@ pub(crate) fn admit_dispatch<T: ResourceWirePayload>(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     bindings: &ResolvedBindings,
     session: &dyn ProviderTypeCheckContext,
-) -> Result<FinalInput<DispatchPayload<WireReady<T>>>, FinalInputError> {
+) -> Result<FinalInput<DispatchPayload<WireReady<T>>>, crate::executor::ProviderPreparationError> {
+    // Preserve transport-error precedence with a single cached projection,
+    // then admit the exact payload retained by that projection.
+    let input = input.into_wire()?;
     check(
-        input.payload().resource_id(),
-        input.payload().attributes(),
+        input.payload().as_inner().resource_id(),
+        input.payload().as_inner().attributes(),
         input.diagnostic_attributes(),
         defaults,
         schema,
         Stage::Apply(bindings, FinalInputOrigin::ProviderNormalization),
         session,
     )?;
-    Ok(FinalInput {
-        payload: input.into_wire()?,
-    })
+    Ok(FinalInput { payload: input })
 }
 
 /// Patch construction may graft ignored observed leaves after resource
@@ -373,7 +372,10 @@ pub(crate) fn admit_update_patch(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     bindings: &ResolvedBindings,
     session: &dyn ProviderTypeCheckContext,
-) -> Result<FinalInput<WireReady<crate::provider::UpdatePatch>>, FinalInputError> {
+) -> Result<
+    FinalInput<WireReady<crate::provider::UpdatePatch>>,
+    crate::executor::ProviderPreparationError,
+> {
     let patch = WireReady::try_new(
         patch,
         crate::provider::ProviderWireTarget::Resource(resource.id.clone()),
