@@ -1,6 +1,58 @@
 use super::*;
 use tower_lsp::lsp_types::{Position, Range};
 
+fn assert_round1_buffer_guard(condition: &str, broken_sibling: bool) {
+    let engine = test_engine();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("guards.crn");
+    let source = format!("// valid buffer\nrequire {condition}, 'guard'\n");
+    std::fs::write(&path, &source).unwrap();
+    if broken_sibling {
+        std::fs::write(directory.path().join("broken.crn"), "let broken = [\n").unwrap();
+    }
+    let expected = if condition == "false" {
+        "require failed: guard"
+    } else {
+        "require failed: guard; error evaluating constraint: left operand of + must be int, got float"
+    };
+    let diagnostics = engine.analyze(
+        &create_document_at(&source, path.clone()),
+        broken_sibling.then_some(path.as_path()),
+    );
+    let matching: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.message == expected)
+        .collect();
+    assert_eq!(matching.len(), 1, "{diagnostics:?}");
+    assert_eq!(
+        matching[0].range,
+        Range::new(
+            Position::new(1, 8),
+            Position::new(1, 8 + condition.len() as u32)
+        )
+    );
+}
+
+#[test]
+fn round1_broken_sibling_fallback_reports_false_require() {
+    assert_round1_buffer_guard("false", true);
+}
+
+#[test]
+fn round1_broken_sibling_fallback_reports_require_arithmetic_error() {
+    assert_round1_buffer_guard("1.5 + 1 == 2", true);
+}
+
+#[test]
+fn round1_no_directory_buffer_reports_false_require() {
+    assert_round1_buffer_guard("false", false);
+}
+
+#[test]
+fn round1_no_directory_buffer_reports_require_arithmetic_error() {
+    assert_round1_buffer_guard("1.5 + 1 == 2", false);
+}
+
 #[test]
 fn root_require_directory_diagnostics_follow_authored_sibling() {
     let providers = loaded_providers_from_factories(vec![Box::new(

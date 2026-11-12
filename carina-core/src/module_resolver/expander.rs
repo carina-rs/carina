@@ -29,9 +29,8 @@ use super::resolver::{
     ResolvedModuleConstraintOutcome, ResolvedModuleConstraintStatus, TypeResolutionPolicy,
 };
 use super::validation::{
-    ConstraintDiagnostic, ConstraintEvaluation, ConstraintScopeOwner, EvaluatedModuleConstraint,
-    ModuleConstraintKind, ModuleConstraints, collect_constraint_declarations,
-    evaluate_module_constraints,
+    ConstraintEvaluation, EvaluatedModuleConstraint, ModuleConstraintKind, ModuleConstraints,
+    collect_constraint_declarations, evaluate_module_constraints,
 };
 
 type ModuleResolvedValue = crate::resource::Value<ParserPlaceholder, AbsoluteBindingAddress>;
@@ -2601,7 +2600,7 @@ pub(super) enum ConstraintScope<'a> {
     },
 }
 
-fn evaluate_constraint_scope(
+pub(super) fn evaluate_constraint_scope(
     scope: ConstraintScope<'_>,
 ) -> Result<
     Vec<crate::parser::Located<EvaluatedModuleConstraint<ParserPlaceholder>>>,
@@ -2649,33 +2648,51 @@ fn evaluate_constraint_scope(
 }
 
 impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
-    pub(super) fn evaluate_directory_constraints(
+    pub(super) fn evaluate_directory_constraints<E>(
         &self,
-        requires: &[crate::parser::RequireBlock<ParserPlaceholder, RelativeBindingName>],
+        parsed: &crate::parser::File<E>,
     ) -> Result<(), ModuleError> {
-        let evaluated = evaluate_constraint_scope(ConstraintScope::Directory(requires))
-            .expect("authored directory constraints contain no bound arguments");
-        let mut failures = Vec::new();
-        for evaluated in evaluated {
-            // There are no bound or deferred operands in directory scope:
-            // literal expressions decide now, and every name is an error.
-            assert!(
-                !matches!(
-                    evaluated.detail().evaluation(),
-                    ConstraintEvaluation::Pending
-                ),
-                "a directory require cannot be pending"
-            );
-            if let Some(ConstraintDiagnostic::Directory(diagnostic)) = evaluated
-                .detail()
-                .diagnostic(ConstraintScopeOwner::Directory)
-            {
-                failures.push(crate::parser::Located::new(
-                    evaluated.location().clone(),
-                    diagnostic,
-                ));
+        use crate::parser::retained::RequireScope;
+        let failures = match crate::parser::retained::require_scope(parsed) {
+            RequireScope::ModuleTemplate { .. } | RequireScope::ModuleCall => return Ok(()),
+            RequireScope::Directory | RequireScope::UnvalidatedDirectory => {
+                if crate::parser::retained::has_retained_requires(parsed) {
+                    parsed
+                        .expression_report()
+                        .findings()
+                        .iter()
+                        .filter_map(|finding| {
+                            if let crate::static_type::InferenceError::DirectoryConstraint(
+                                diagnostic,
+                            ) = finding.detail()
+                            {
+                                Some(crate::parser::Located::new(
+                                    finding.location().clone(),
+                                    (**diagnostic).clone(),
+                                ))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    parsed
+                        .requires
+                        .iter()
+                        .filter_map(|require| {
+                            crate::module_resolver::evaluate_directory_require(require).map(
+                                |diagnostic| {
+                                    crate::parser::Located::new(
+                                        require.condition_location().clone(),
+                                        diagnostic,
+                                    )
+                                },
+                            )
+                        })
+                        .collect()
+                }
             }
-        }
+        };
         if self.records_constraint_reports() {
             self.record_directory_constraint_report(failures);
             Ok(())

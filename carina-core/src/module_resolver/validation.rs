@@ -12,8 +12,8 @@ use crate::parser::{
 use crate::resolver::ResolutionError;
 use crate::resource::{
     AbsoluteBindingAddress, AccessMissPolicy, BindingAddress, ConcreteValue, DeferredValue,
-    LiveComposition, ModuleConstraintId, NoPlaceholder, PendingModuleConstraint, PlaceholderKind,
-    ResourceId, Value, apply_value_path_segment,
+    LiveComposition, ModuleConstraintId, NoPlaceholder, ParserPlaceholder, PendingModuleConstraint,
+    PlaceholderKind, RelativeBindingName, ResourceId, Value, apply_value_path_segment,
 };
 
 use super::ModuleError;
@@ -35,6 +35,37 @@ pub enum ConstraintScopeOwner<'a> {
 pub struct DirectoryConstraintDiagnostic {
     message: String,
     detail: Option<String>,
+}
+
+impl std::error::Error for DirectoryConstraintDiagnostic {}
+
+/// Evaluate a directory declaration through the same collector and condition
+/// evaluator as module declarations, with the only possible root binding:
+/// an empty argument environment. No value or builtin can defer in this scope.
+pub(crate) fn evaluate_directory_require(
+    declaration: &RequireBlock<ParserPlaceholder, RelativeBindingName>,
+) -> Option<DirectoryConstraintDiagnostic> {
+    let evaluated = super::expander::evaluate_constraint_scope(
+        super::expander::ConstraintScope::Directory(std::slice::from_ref(declaration)),
+    )
+    .expect("authored directory constraints contain no bound arguments")
+    .pop()
+    .expect("one require declaration");
+    assert!(
+        !matches!(
+            evaluated.detail().evaluation(),
+            ConstraintEvaluation::Pending
+        ),
+        "a directory require cannot be pending"
+    );
+    match evaluated
+        .detail()
+        .diagnostic(ConstraintScopeOwner::Directory)
+    {
+        Some(ConstraintDiagnostic::Directory(diagnostic)) => Some(diagnostic),
+        None => None,
+        Some(ConstraintDiagnostic::ModuleCall(_)) => unreachable!("directory owner"),
+    }
 }
 
 impl fmt::Display for DirectoryConstraintDiagnostic {

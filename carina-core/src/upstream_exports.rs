@@ -466,15 +466,25 @@ pub struct UpstreamResolveError {
     pub reason: String,
 }
 
-impl std::fmt::Display for UpstreamResolveError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl UpstreamResolveError {
+    fn fmt_reason(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        reason: &dyn std::fmt::Display,
+    ) -> std::fmt::Result {
         write!(
             f,
             "upstream_state `{}`: failed to parse source `{}`: {}",
             self.binding,
             self.source.display(),
-            self.reason
+            reason
         )
+    }
+}
+
+impl std::fmt::Display for UpstreamResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.fmt_reason(f, &self.reason)
     }
 }
 
@@ -550,7 +560,7 @@ impl UpstreamResolveFailure {
             legacy: UpstreamResolveError {
                 binding,
                 source,
-                reason: error.to_string(),
+                reason: String::new(),
             },
             cause: UpstreamResolveCause::Module {
                 base,
@@ -578,16 +588,34 @@ impl UpstreamResolveFailure {
             _ => None,
         }
     }
-    fn into_legacy(self) -> UpstreamResolveError {
+    fn into_legacy(mut self) -> UpstreamResolveError {
+        // Only the explicit compatibility API requests a location-free String
+        // container. Diagnostic callers retain the typed source chain below.
+        if let UpstreamResolveCause::Module { error, .. } = &self.cause {
+            self.legacy.reason = error.to_string();
+        }
         self.legacy
     }
 }
 impl std::fmt::Display for UpstreamResolveFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.legacy.fmt(formatter)
+        match &self.cause {
+            UpstreamResolveCause::Module { error, .. } => {
+                self.legacy.fmt_reason(formatter, error.as_ref())
+            }
+            _ => self.legacy.fmt(formatter),
+        }
     }
 }
-impl std::error::Error for UpstreamResolveFailure {}
+impl std::error::Error for UpstreamResolveFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.cause {
+            UpstreamResolveCause::Module { error, .. } => Some(error.as_ref()),
+            UpstreamResolveCause::Parse(error) => Some(error.as_ref()),
+            UpstreamResolveCause::Message | UpstreamResolveCause::Boundaries(_) => None,
+        }
+    }
+}
 
 /// A reference in the downstream project whose field isn't declared by the
 /// upstream's `exports { }` block.
@@ -907,6 +935,7 @@ pub enum UpstreamExportSourceError {
     #[error("{error}")]
     Module {
         base: std::path::PathBuf,
+        #[source]
         error: Box<crate::module_resolver::ModuleError>,
     },
     #[error("{}", .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"))]

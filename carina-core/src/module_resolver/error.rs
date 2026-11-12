@@ -200,9 +200,9 @@ pub enum ModuleError {
     #[error(transparent)]
     Constraint(Box<ModuleConstraintDiagnostic>),
 
-    #[error("{}", .0.detail())]
+    #[error("{0}")]
     DirectoryConstraint(
-        Box<crate::parser::Located<super::validation::DirectoryConstraintDiagnostic>>,
+        #[source] Box<crate::parser::Located<super::validation::DirectoryConstraintDiagnostic>>,
     ),
 
     #[error(

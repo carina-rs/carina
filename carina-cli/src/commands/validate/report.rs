@@ -358,6 +358,12 @@ fn module_error_diagnostics(
                 ModuleErrorCallSource::Unavailable => None,
             };
             let mut diagnostics = match finding.error {
+                ModuleError::DirectoryConstraint(finding) => {
+                    vec![Diagnostic::located(
+                        finding.detail().to_string(),
+                        finding.location(),
+                    )]
+                }
                 ModuleError::Parse(error) => vec![parse_diagnostic(error, error.source_file())],
                 ModuleError::ParseInFile { path, error } => {
                     vec![parse_diagnostic(error, Some(path))]

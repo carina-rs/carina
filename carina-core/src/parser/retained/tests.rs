@@ -11,6 +11,60 @@ fn config() -> ProviderContext {
 }
 
 #[test]
+fn round1_retained_require_cannot_lose_its_evaluation_obligation() {
+    let mut parsed = crate::parser::parse_file(
+        "require false, 'retained guard'\n",
+        std::path::Path::new("guards.crn"),
+        &config(),
+    )
+    .unwrap();
+    parsed.requires.clear();
+    let schemas = SchemaRegistry::new();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config());
+    let findings = configuration.judged().report().findings();
+    assert_eq!(
+        findings.len(),
+        1,
+        "removing the public AST list must not erase the retained obligation"
+    );
+    assert_eq!(
+        findings[0].detail().to_string(),
+        "require failed: retained guard"
+    );
+    assert!(findings[0].location().file().path().ends_with("guards.crn"));
+}
+
+#[test]
+fn round1_strict_require_error_retains_location_and_source_chain() {
+    use std::error::Error;
+    let parsed = crate::parser::parse_file(
+        "require false, 'chain guard'\n",
+        std::path::Path::new("upstream/guards.crn"),
+        &config(),
+    )
+    .unwrap();
+    let require = &parsed.requires[0];
+    let diagnostic = crate::module_resolver::evaluate_directory_require(require).unwrap();
+    let error = crate::module_resolver::ModuleError::DirectoryConstraint(Box::new(
+        crate::parser::Located::new(require.condition_location().clone(), diagnostic),
+    ));
+    assert!(error.to_string().contains("upstream/guards.crn:1:9"));
+    let located = error
+        .source()
+        .expect("the located error remains in the chain");
+    assert!(located.source().is_some());
+    let upstream = crate::upstream_exports::UpstreamExportSourceError::Module {
+        base: std::path::PathBuf::from("upstream"),
+        error: Box::new(error),
+    };
+    assert!(
+        upstream.source().is_some(),
+        "upstream discovery must retain its typed module cause"
+    );
+}
+
+#[test]
 fn heterogeneous_record_keeps_its_field_constraint_checks() {
     let parsed =
         crate::parser::parse_and_resolve("let value = { label = 'x' inner = { leaf = 'bad' } }")

@@ -1952,7 +1952,20 @@ pub(crate) fn parse_directory_files_located_from_root(
         .iter_names()
         .map(str::to_string)
         .collect::<BTreeSet<_>>();
+    let require_scope = crate::parser::retained::RequireScope::for_declarations(
+        merged
+            .arguments
+            .iter()
+            .map(|argument| argument.name.clone()),
+        !merged.attribute_params.is_empty(),
+    );
     for (_, file) in &mut out {
+        crate::parser::retained::set_require_scope(&mut file.parsed, require_scope.clone());
+        crate::parser::retained::judge_configuration(
+            &mut file.parsed,
+            &SchemaRegistry::new(),
+            config,
+        );
         file.parsed.set_loop_binding_scope(binding_scope.clone());
     }
     Ok(out)

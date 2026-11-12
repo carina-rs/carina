@@ -311,6 +311,17 @@ fn render_module_call_findings(
 ) -> Vec<Diagnostic> {
     findings
         .iter()
+        // Directory declarations publish through their retained expression
+        // report on both directory and buffer-only paths. This renderer owns
+        // the module-call carrier of constraint outcomes.
+        .filter(|finding| {
+            !matches!(
+                finding.message(),
+                carina_core::validation::ModuleCallFindingMessage::Constraint(
+                    carina_core::module_resolver::ConstraintDiagnostic::Directory(_)
+                )
+            )
+        })
         .flat_map(|finding| finding.diagnostics())
         .filter_map(|finding| {
             let mut diagnostic = render_merged(

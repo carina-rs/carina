@@ -44,6 +44,67 @@ fn resolver_context() -> crate::config_loader::ModuleResolutionContext {
         .module_resolution_context()
 }
 
+#[test]
+fn round1_direct_template_scope_in_all_resolver_entry_points() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("arguments.crn"),
+        "arguments { n: Int }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("guards.crn"),
+        "require n > 0, 'positive'\nrequire false, 'template guard is not evaluated'\n",
+    )
+    .unwrap();
+    let context = LoadedProviderContext::empty_for_test();
+    let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let schemas = crate::schema::SchemaRegistry::new();
+    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        for template_api in [false, true] {
+            let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
+            let result = if template_api {
+                super::resolve_module_template_with_providerless_config(
+                    parsed, &path, session, &schemas,
+                )
+            } else {
+                super::resolve_modules_with_providerless_config(parsed, &path, session, &schemas)
+            };
+            assert!(
+                result.is_ok(),
+                "providerless template_api={template_api}: {:?}",
+                result.err()
+            );
+            let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
+            let result = if template_api {
+                super::resolve_module_template_with_config(parsed, &path, session, &schemas)
+            } else {
+                super::resolve_modules_with_config(parsed, &path, session, &schemas)
+            };
+            assert!(
+                result.is_ok(),
+                "loaded template_api={template_api}: {:?}",
+                result.err()
+            );
+        }
+        let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
+        assert!(matches!(
+            super::resolve_modules_with_providerless_diagnostics(
+                &parsed,
+                &path,
+                session,
+                &schemas,
+                &[]
+            ),
+            super::ModuleResolutionDiagnosticResult::Expanded { .. }
+        ));
+        assert!(matches!(
+            super::resolve_modules_with_diagnostics(&parsed, &path, session, &schemas, &[]),
+            super::ModuleResolutionDiagnosticResult::Expanded { .. }
+        ));
+    });
+}
+
 fn known(type_expr: TypeExpr) -> TypeExpr {
     type_expr
 }

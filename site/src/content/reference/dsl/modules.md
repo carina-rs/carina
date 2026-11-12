@@ -179,10 +179,13 @@ Pending constraints remain attached to the module call and are checked again
 at later resolution boundaries. This matters when an update or replacement
 publishes a value that differs from the value available during planning.
 
-Saving a plan requires successful validation of root requirements. Applying a
-saved plan uses that validated snapshot without rereading source files or
-replaying root requirements. Plans with an unsupported format version must
-be regenerated.
+Saving a plan requires successful validation of root requirements. Saved-plan
+apply reloads current source to check backend drift. Plans that need secret
+verification also validate the current configuration, so both directory and
+module requirements must still pass. Plans without secrets apply the saved
+snapshot without rechecking the current source's requirements. Pending module
+constraints in that snapshot are still checked when their inputs resolve.
+Plans with an unsupported format version must be regenerated.
 
 Resource schema value constraints follow the same value-time rule. Carina
 checks authored literal values first, then re-checks reference values against

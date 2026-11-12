@@ -156,6 +156,139 @@ fn success(output: &Output) {
     assert!(output.status.success(), "{}", output_text(output));
 }
 
+#[test]
+fn round1_validate_standalone_module_directory_keeps_template_scope() {
+    let directory = Directory::new("true");
+    fs::write(
+        directory.project.join("checked/guards.crn"),
+        "require n > 0, 'positive'\n",
+    )
+    .unwrap();
+    for args in [
+        &["validate", "checked"][..],
+        &["validate", "--json", "checked"],
+    ] {
+        success(&directory.run(args));
+    }
+}
+
+fn assert_round1_upstream_guard(condition: &str) {
+    let directory = Directory::new("true");
+    let upstream = directory.project.join("upstream");
+    fs::create_dir(&upstream).unwrap();
+    fs::write(
+        upstream.join("providers.crn"),
+        "backend local { path = 'carina.state.json' }\n",
+    )
+    .unwrap();
+    fs::write(
+        upstream.join("exports.crn"),
+        "exports { value: String = 'published' }\n",
+    )
+    .unwrap();
+    fs::write(
+        upstream.join("guards.crn"),
+        format!("// upstream guard\nrequire {condition}, 'upstream guard'\n"),
+    )
+    .unwrap();
+    fs::write(directory.project.join("main.crn"), "let upstream = upstream_state { source = './upstream' }\nlet r = mock.test.resource { name = 'root' comment = upstream.value }\n").unwrap();
+    let output = directory.run(&["validate", "--json", "."]);
+    assert!(!output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let error = report["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| {
+            e["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("require failed: upstream guard"))
+        })
+        .unwrap();
+    let file = error["location"]["file"]
+        .as_str()
+        .expect("upstream require must retain its authored file");
+    assert!(file.ends_with("upstream/guards.crn"), "{report}");
+    assert_eq!(
+        error["location"]["range"],
+        json!({
+            "start": {"line": 2, "column": 9},
+            "end": {"line": 2, "column": 9 + condition.len()}
+        })
+    );
+    let human = directory.run(&["validate", "."]);
+    let text = output_text(&human);
+    assert!(text.contains("upstream/guards.crn:2:9"), "{text}");
+}
+
+#[test]
+fn round1_upstream_false_require_keeps_location() {
+    assert_round1_upstream_guard("false");
+}
+
+#[test]
+fn round1_upstream_unknown_require_keeps_location() {
+    assert_round1_upstream_guard("missing == 1");
+}
+
+#[test]
+fn round1_zero_module_calls_and_data_source_only_guards() {
+    for main in [
+        "let r = mock.test.resource { name = 'root' }\n",
+        "let r = read mock.test.resource { name = 'root' }\n",
+    ] {
+        let directory = Directory::new("false");
+        fs::write(directory.project.join("main.crn"), main).unwrap();
+        rejected(
+            &directory.run(&["validate", "."]),
+            "require failed: root guard",
+        );
+        rejected(&directory.run(&["plan", "."]), "require failed: root guard");
+    }
+}
+
+#[test]
+fn round1_saved_plan_secret_verification_matches_module_policy() {
+    for has_secret in [false, true] {
+        for root_guard in [false, true] {
+            let directory = Directory::new("true");
+            let comment = if has_secret {
+                "comment = secret('ROUND1_SECRET_VALUE')"
+            } else {
+                ""
+            };
+            fs::write(directory.project.join("main.crn"), format!(
+                "let r = mock.test.resource {{ name = 'root' {comment} }}\nlet checked = use {{ source = './checked' }}\nlet control = checked {{ n = 2 }}\n"
+            )).unwrap();
+            success(&directory.run(&["plan", "--out", "saved.plan", "."]));
+            let message = if root_guard {
+                directory.guard("false");
+                "require failed: root guard"
+            } else {
+                fs::write(
+                    directory.project.join("checked/guards.crn"),
+                    "require n > 2, 'module guard'\n",
+                )
+                .unwrap();
+                "module 'checked' (call 'control'): arguments 'n': module guard (got n = 2)"
+            };
+            let output = directory.run(&["apply", "--auto-approve", "saved.plan"]);
+            if has_secret {
+                assert!(
+                    !output.status.success(),
+                    "{message}: {}",
+                    output_text(&output)
+                );
+                assert!(output_text(&output).contains("Saved-plan secret verification failed"));
+                assert!(!directory.project.join("carina.state.json").exists());
+            } else {
+                success(&output);
+            }
+            assert!(!output_text(&output).contains("ROUND1_SECRET_VALUE"));
+        }
+    }
+}
+
 fn rejected(output: &Output, message: &str) {
     let text = output_text(output);
     assert!(!output.status.success(), "unexpected success: {text}");
@@ -231,7 +364,7 @@ fn root_require_true_paths_and_saved_plan_contract() {
     let plan: Value = serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
     assert_eq!(plan["version"], 45);
     assert!(!plan.to_string().contains("root guard"));
-    // Saved apply consumes the validated snapshot and does not reread guards.
+    // This secret-free plan reloads backend syntax without rechecking guards.
     directory.guard("false");
     let mut old = plan.clone();
     old["version"] = json!(44);

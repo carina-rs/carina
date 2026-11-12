@@ -1482,6 +1482,15 @@ fn parse_with_seeded_bindings_inner(
         .into_iter()
         .map(crate::resource::RelativeBindingName::new)
         .collect();
+    syntax
+        .expressions_mut()
+        .set_require_scope(super::retained::RequireScope::for_declarations(
+            parsed
+                .arguments
+                .iter()
+                .map(|argument| argument.name.clone()),
+            !parsed.attribute_params.is_empty(),
+        ));
     syntax.expressions_mut().finish_captures();
     parser_binding_metadata.syntax = Box::new(syntax);
     parser_binding_metadata

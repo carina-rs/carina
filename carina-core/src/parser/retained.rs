@@ -302,9 +302,56 @@ impl<P: ValueKind, B: BindingAddress> std::fmt::Debug for AuthoredExpr<P, B> {
     }
 }
 
+/// The declaration environment is selected at source/directory admission,
+/// retained with every require node, and reused by all resolver entry points.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum RequireScope {
+    /// Bootstrap/backend parsing retains syntax without entering guard validation.
+    #[default]
+    UnvalidatedDirectory,
+    Directory,
+    ModuleTemplate {
+        arguments: Arc<[String]>,
+    },
+    ModuleCall,
+}
+
+impl RequireScope {
+    pub(crate) fn for_declarations(
+        arguments: impl Iterator<Item = String>,
+        has_attributes: bool,
+    ) -> Self {
+        let arguments = arguments.collect::<Vec<_>>();
+        if arguments.is_empty() && !has_attributes {
+            Self::UnvalidatedDirectory
+        } else {
+            Self::ModuleTemplate {
+                arguments: arguments.into(),
+            }
+        }
+    }
+}
+
+/// Parser-minted declaration identity and its immutable authored obligation.
+/// The exact value that suppresses ordinary value inference evaluates the
+/// condition; a public File.requires edit cannot remove that obligation.
+#[derive(Debug, Clone)]
+struct RetainedRequireCondition {
+    id: NodeId,
+    scope: RequireScope,
+    declaration: super::RequireBlock<ParserPlaceholder, RelativeBindingName>,
+}
+
+impl PartialEq for RetainedRequireCondition {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.scope == other.scope
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum ExprKind<B: BindingAddress> {
     Scalar(TypeExpr),
+    RequireCondition(Arc<RetainedRequireCondition>),
     Parameter(TypeExpr),
     LoopSlot(TypeExpr),
     UntypedParameter,
@@ -407,6 +454,7 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
                 segments,
             },
             ExprKind::Scalar(ty) => ExprKind::Scalar(ty),
+            ExprKind::RequireCondition(declaration) => ExprKind::RequireCondition(declaration),
             ExprKind::Parameter(ty) => ExprKind::Parameter(ty),
             ExprKind::LoopSlot(ty) => ExprKind::LoopSlot(ty),
             ExprKind::UntypedParameter => ExprKind::UntypedParameter,
@@ -615,6 +663,7 @@ pub struct Expressions<B: BindingAddress = RelativeBindingName> {
     report: Arc<ExpressionReport<B>>,
     arguments: HashMap<B, TypeExpr>,
     instance: ExpressionInstance,
+    require_scope: Option<RequireScope>,
     captures: Arc<CapturedNodes>,
     projections: Arc<HashMap<(ExpressionInstance, NodeId), Value<ParserPlaceholder, B>>>,
 }
@@ -648,13 +697,61 @@ impl<B: BindingAddress> Default for Expressions<B> {
             report: Arc::new(ExpressionReport::empty()),
             arguments: HashMap::new(),
             instance: ExpressionInstance::Root,
+            require_scope: None,
             captures: Arc::default(),
             projections: Arc::default(),
         }
     }
 }
 
+fn retain_require_nodes<P: ValueKind, B: BindingAddress>(
+    expression: &mut ExprValue<P, B>,
+    memo: &mut HashMap<usize, Arc<AuthoredExpr<P, B>>>,
+    transform: &mut impl FnMut(
+        NodeId,
+        Option<RetainedRequireCondition>,
+    ) -> Option<RetainedRequireCondition>,
+) {
+    let address = Arc::as_ptr(&expression.authored) as usize;
+    if let Some(node) = memo.get(&address) {
+        expression.authored = node.clone();
+        return;
+    }
+    let mut node = (*expression.authored).clone();
+    let current = match &node.kind {
+        ExprKind::RequireCondition(require) => Some((**require).clone()),
+        _ => None,
+    };
+    if let Some(require) = transform(node.id, current) {
+        node.kind = ExprKind::RequireCondition(Arc::new(require));
+    }
+    for child in &mut node.children {
+        retain_require_nodes(child, memo, transform);
+    }
+    let node = Arc::new(node);
+    memo.insert(address, node.clone());
+    expression.authored = node;
+}
+
 impl<B: BindingAddress> Expressions<B> {
+    pub(in crate::parser) fn set_require_scope(&mut self, scope: RequireScope) {
+        self.require_scope = Some(scope.clone());
+        let mut memo = HashMap::new();
+        let mut transform = |_: NodeId, current: Option<RetainedRequireCondition>| {
+            current.map(|mut require| {
+                require.scope = scope.clone();
+                require
+            })
+        };
+        for root in &mut self.roots {
+            retain_require_nodes(root, &mut memo, &mut transform);
+        }
+        for root in self.definitions.values_mut() {
+            retain_require_nodes(root, &mut memo, &mut transform);
+        }
+        self.report = Arc::new(ExpressionReport::empty());
+    }
+
     pub fn binding(&self, name: &B) -> Option<&ExprValue<ParserPlaceholder, B>> {
         self.definitions.get(name)
     }
@@ -670,6 +767,9 @@ impl<B: BindingAddress> Expressions<B> {
         self.roots.extend(other.roots);
         self.definitions.extend(other.definitions);
         self.arguments.extend(other.arguments);
+        if self.require_scope.is_none() {
+            self.require_scope = other.require_scope;
+        }
         Arc::make_mut(&mut self.projections).extend(Arc::unwrap_or_clone(other.projections));
         Arc::make_mut(&mut self.report).extend(Arc::unwrap_or_clone(other.report));
     }
@@ -688,6 +788,7 @@ impl<B: BindingAddress> Expressions<B> {
                     .collect(),
             ),
             instance: self.instance,
+            require_scope: self.require_scope,
             arguments: self
                 .arguments
                 .into_iter()
@@ -747,6 +848,7 @@ impl<B: BindingAddress> Expressions<B> {
         scope: &crate::resource::ModuleInstanceScope,
         arguments: impl IntoIterator<Item = (B, TypeExpr)>,
     ) {
+        self.set_require_scope(RequireScope::ModuleCall);
         self.instance = ExpressionInstance::for_scope(scope);
         self.projections = Arc::new(
             self.projections
@@ -819,6 +921,7 @@ where
         schemas: &'a crate::schema::SchemaRegistry,
         config: &super::ProviderContext,
     ) -> Self {
+        admit_require_scope(&mut file);
         judge_configuration(&mut file, schemas, config);
         Self { file, schemas }
     }
@@ -834,6 +937,62 @@ impl<E, D, B: BindingAddress> super::File<E, ParserPlaceholder, ParserPlaceholde
     }
 }
 
+pub(crate) fn set_require_scope<E, D, B: BindingAddress>(
+    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    scope: RequireScope,
+) {
+    file.parser_binding_metadata
+        .syntax
+        .expressions_mut()
+        .set_require_scope(scope);
+}
+
+pub(crate) fn require_scope<E, D, B: BindingAddress>(
+    file: &super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+) -> RequireScope {
+    file.parser_binding_metadata
+        .syntax()
+        .expressions()
+        .require_scope
+        .clone()
+        .unwrap_or_default()
+}
+
+/// Full analysis acquires the directory obligation together with its
+/// inference exemption. Bootstrap/backend-only syntax never receives it.
+pub(crate) fn admit_require_scope<E, D, B: BindingAddress>(
+    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+) {
+    let expressions = file.parser_binding_metadata.syntax.expressions_mut();
+    let scope = match expressions.require_scope.as_ref() {
+        Some(RequireScope::UnvalidatedDirectory) => RequireScope::Directory,
+        Some(_) => return,
+        None => match RequireScope::for_declarations(
+            file.arguments.iter().map(|argument| argument.name.clone()),
+            !file.attribute_params.is_empty(),
+        ) {
+            RequireScope::UnvalidatedDirectory => RequireScope::Directory,
+            scope => scope,
+        },
+    };
+    expressions.set_require_scope(scope);
+}
+
+pub(crate) fn has_retained_requires<E, D, B: BindingAddress>(
+    file: &super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+) -> bool {
+    fn contains<P: ValueKind, B: BindingAddress>(root: &ExprValue<P, B>) -> bool {
+        matches!(root.authored.kind, ExprKind::RequireCondition(_))
+            || root.authored.children.iter().any(contains)
+    }
+    file.parser_binding_metadata
+        .syntax()
+        .expressions()
+        .roots
+        .iter()
+        .any(contains)
+}
+
 pub(crate) fn judge_configuration<
     E: super::ExportParamLike<ParserPlaceholder, B>,
     D,
@@ -845,6 +1004,22 @@ pub(crate) fn judge_configuration<
 ) where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
+    if file
+        .parser_binding_metadata
+        .syntax()
+        .expressions()
+        .require_scope
+        .is_none()
+    {
+        let scope = RequireScope::for_declarations(
+            file.arguments.iter().map(|argument| argument.name.clone()),
+            !file.attribute_params.is_empty(),
+        );
+        file.parser_binding_metadata
+            .syntax
+            .expressions_mut()
+            .set_require_scope(scope);
+    }
     prepare_slots(file, schemas);
     let mut report = judge_expressions(file, schemas, config);
     for parameter in &file.export_params {
@@ -946,6 +1121,26 @@ fn attach_slot_reports<E, D, B: BindingAddress>(
 
 impl Expressions {
     pub(in crate::parser) fn finish_captures(&mut self) {
+        let declarations = self
+            .captures
+            .requires
+            .read()
+            .expect("retained require declarations")
+            .clone();
+        let scope = self.require_scope.clone().unwrap_or_default();
+        let mut memo = HashMap::new();
+        for root in &mut self.roots {
+            retain_require_nodes(root, &mut memo, &mut |id, current| {
+                declarations
+                    .get(&id)
+                    .map(|declaration| RetainedRequireCondition {
+                        id,
+                        scope: scope.clone(),
+                        declaration: declaration.clone(),
+                    })
+                    .or(current)
+            });
+        }
         self.projections = Arc::new(
             self.captures
                 .values
@@ -1098,6 +1293,9 @@ impl ParseNodeKey {
 pub(in crate::parser) struct CapturedNodes {
     inventory: bool,
     nodes: HashMap<ParseNodeKey, ExprValue>,
+    requires: std::sync::RwLock<
+        HashMap<NodeId, super::RequireBlock<ParserPlaceholder, RelativeBindingName>>,
+    >,
     resource_declarations: HashMap<NodeId, SlotDeclarationId>,
     values: std::sync::RwLock<HashMap<NodeId, Value<ParserPlaceholder, RelativeBindingName>>>,
     conditions: ConditionRecorder,
@@ -1108,6 +1306,17 @@ impl std::fmt::Debug for CapturedNodes {
     }
 }
 impl CapturedNodes {
+    pub(in crate::parser) fn retain_require(
+        &self,
+        id: NodeId,
+        declaration: super::RequireBlock<ParserPlaceholder, RelativeBindingName>,
+    ) {
+        self.requires
+            .write()
+            .expect("retained require declarations")
+            .insert(id, declaration);
+    }
+
     fn condition_snapshot(&self) -> ConditionSnapshot {
         self.conditions.snapshot()
     }
@@ -3624,13 +3833,16 @@ mod judgement {
     }
 
     fn first_error(findings: &[Located<InferenceError>]) -> Option<super::super::ParseError> {
-        findings.first().map(|finding| {
-            super::super::ParseError::InvalidExpression {
-                line: finding.location().span().start_line(),
-                message: finding.detail().to_string(),
-            }
-            .at(finding.location())
-        })
+        findings
+            .iter()
+            .find(|finding| !matches!(finding.detail(), InferenceError::DirectoryConstraint(_)))
+            .map(|finding| {
+                super::super::ParseError::InvalidExpression {
+                    line: finding.location().span().start_line(),
+                    message: finding.detail().to_string(),
+                }
+                .at(finding.location())
+            })
     }
 
     pub fn judge_expressions<E, D, B: BindingAddress>(
@@ -3691,14 +3903,6 @@ mod judgement {
             authored,
             expressions,
             bindings: &bindings,
-            directory_requires: if crate::validation::is_module_definition(file) {
-                Default::default()
-            } else {
-                file.requires
-                    .iter()
-                    .map(|require| require.condition_location().clone())
-                    .collect()
-            },
             functions,
             schemas,
             config,
@@ -3826,7 +4030,6 @@ mod judgement {
         authored: HashMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
         expressions: &'a Expressions<B>,
         bindings: &'a InferenceBindings<ParserPlaceholder, B>,
-        directory_requires: std::collections::HashSet<DeclarationLocation>,
         functions: HashMap<(ExpressionInstance, String), Arc<FunctionSignature>>,
         schemas: &'a crate::schema::SchemaRegistry,
         config: &'a super::super::ProviderContext,
@@ -3879,15 +4082,13 @@ mod judgement {
             let outer_scope = self.scope;
             self.scope = scope;
             self.visiting.push(id);
-            // A directory require has no value-expression environment. The
-            // shared constraint evaluator owns its entire declaration, so
-            // directory lets and general builtin signatures cannot preempt
-            // its scope checks. Reusable modules retain their existing static
-            // diagnostics before the same evaluator checks each instance.
-            let directory_require = self.directory_requires.contains(&root.location.authored);
-            // Other expressions still visit every child, even for length(),
-            // selected access, interpolation, and concrete-left coalescing.
-            let mut children = if directory_require {
+            let directory_require = match &root.kind {
+                ExprKind::RequireCondition(require) if require.scope == RequireScope::Directory => {
+                    Some(require.clone())
+                }
+                _ => None,
+            };
+            let mut children = if directory_require.is_some() {
                 Vec::new()
             } else {
                 root.children
@@ -3928,7 +4129,15 @@ mod judgement {
                     owner: FailureOwner::Boundary,
                 };
             }
-            let mut result = if directory_require {
+            let mut result = if let Some(require) = directory_require {
+                if let Some(diagnostic) =
+                    crate::module_resolver::evaluate_directory_require(&require.declaration)
+                {
+                    self.push_finding(
+                        root.location.authored.clone(),
+                        InferenceError::DirectoryConstraint(Box::new(diagnostic)),
+                    );
+                }
                 declaration()
             } else {
                 self.infer(expression, &children)
@@ -4516,6 +4725,7 @@ mod judgement {
                     }
                     declaration()
                 }
+                ExprKind::RequireCondition(_) => authored_child(children.first()),
                 ExprKind::Sequence => authored_child(children.last()),
                 ExprKind::Secret => {
                     builtin_result(crate::builtins::Builtin::Secret.result_typing(), children)

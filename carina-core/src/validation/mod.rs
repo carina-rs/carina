@@ -2997,7 +2997,8 @@ fn check_inferred_assignment<P: PlaceholderKind, B: BindingAddress>(
             });
         }
         Err(crate::static_type::InferenceIssue::Failed(
-            error @ (inference::InferenceError::InsideSecret { .. }
+            error @ (inference::InferenceError::DirectoryConstraint(_)
+            | inference::InferenceError::InsideSecret { .. }
             | inference::InferenceError::SecretAssignmentMismatch { .. }
             | inference::InferenceError::InvalidIntegerArithmeticOperand { .. }
             | inference::InferenceError::HeterogeneousCollection { .. }
@@ -6241,7 +6242,8 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
     let inferred = match deferred_iterable_shape_for_phase(&judged) {
         Ok(inferred) => Some(inferred),
         Err(crate::static_type::InferenceIssue::Failed(
-            error @ (inference::InferenceError::InsideSecret { .. }
+            error @ (inference::InferenceError::DirectoryConstraint(_)
+            | inference::InferenceError::InsideSecret { .. }
             | inference::InferenceError::SecretAssignmentMismatch { .. }
             | inference::InferenceError::MissingEvidence(_)
             | inference::InferenceError::IncompatibleCoalesceTypes { .. }

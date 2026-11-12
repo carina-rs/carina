@@ -32,6 +32,7 @@ pub(crate) mod loader;
 mod resolver;
 mod signature;
 mod validation;
+pub(crate) use validation::evaluate_directory_require;
 
 pub use error::{ModuleError, ModuleErrorCallSource, ModuleErrorDiagnostic};
 pub use expander::{instance_prefix_for_call, reconcile_anonymous_module_instances};
