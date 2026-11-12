@@ -42,7 +42,7 @@ pub trait ProviderConfiguration:
     provider_configuration_sealed::Configuration + Send + Sync
 {
     fn name(&self) -> &str;
-    fn attributes(&self) -> &IndexMap<String, RuntimeValue>;
+    fn attributes(&self) -> &super::ConfigurationAttributes<RuntimeValue>;
     fn source(&self) -> Option<&crate::provider_source::ProviderSource>;
     fn binding(&self) -> Option<&str>;
     fn is_default(&self) -> bool {
@@ -88,9 +88,9 @@ impl AnalysisResolutionError {
 }
 
 fn provider_analysis_failure(
-    locations: &[HashMap<String, super::DeclarationLocation>],
+    locations: &[HashMap<super::AttributeKey, super::DeclarationLocation>],
     index: usize,
-    key: &str,
+    key: &super::AttributeKey,
     error: ParseError,
 ) -> AnalysisResolutionError {
     if let ParseError::AtElement(finding) = error {
@@ -187,12 +187,12 @@ impl ResolvedProviderConfig {
         Self {
             config: ProviderConfig {
                 name: name.into(),
-                attributes: IndexMap::new(),
-                default_tags: IndexMap::new(),
+                attributes: crate::parser::ConfigurationAttributes::new(),
+                default_tags: crate::parser::ConfigurationAttributes::new(),
                 source: None,
                 version: None,
                 revision: None,
-                unresolved_attributes: IndexMap::new(),
+                unresolved_attributes: crate::parser::ConfigurationAttributes::new(),
                 binding: None,
             },
         }
@@ -202,7 +202,7 @@ impl ResolvedProviderConfig {
         &self.config.name
     }
 
-    pub fn attributes(&self) -> &IndexMap<String, RuntimeValue> {
+    pub fn attributes(&self) -> &super::ConfigurationAttributes<RuntimeValue> {
         &self.config.attributes
     }
 
@@ -231,7 +231,7 @@ impl ProviderConfiguration for ResolvedProviderConfig {
     fn name(&self) -> &str {
         self.name()
     }
-    fn attributes(&self) -> &IndexMap<String, RuntimeValue> {
+    fn attributes(&self) -> &super::ConfigurationAttributes<RuntimeValue> {
         self.attributes()
     }
     fn source(&self) -> Option<&crate::provider_source::ProviderSource> {
@@ -448,7 +448,7 @@ impl PlanProviderConfigurations for PlanPreviewProviderConfigs {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadOnlyProviderConfig {
     name: String,
-    attributes: IndexMap<String, RuntimeValue>,
+    attributes: super::ConfigurationAttributes<RuntimeValue>,
     source: Option<crate::provider_source::ProviderSource>,
     binding: Option<String>,
 }
@@ -457,7 +457,7 @@ impl ReadOnlyProviderConfig {
     fn implicit(name: &str) -> Self {
         Self {
             name: name.into(),
-            attributes: IndexMap::new(),
+            attributes: super::ConfigurationAttributes::new(),
             source: None,
             binding: None,
         }
@@ -468,7 +468,7 @@ impl ProviderConfiguration for ReadOnlyProviderConfig {
     fn name(&self) -> &str {
         &self.name
     }
-    fn attributes(&self) -> &IndexMap<String, RuntimeValue> {
+    fn attributes(&self) -> &super::ConfigurationAttributes<RuntimeValue> {
         &self.attributes
     }
     fn source(&self) -> Option<&crate::provider_source::ProviderSource> {
@@ -546,7 +546,7 @@ const PROVIDER_CONFIG_SECTIONS: [ProviderConfigSection; 2] = [
 fn provider_config_section<P: crate::resource::ValueKind>(
     config: &ProviderConfig<P, AbsoluteBindingAddress>,
     section: ProviderConfigSection,
-) -> &IndexMap<String, GenericValue<P>> {
+) -> &super::ConfigurationAttributes<GenericValue<P>> {
     match section {
         ProviderConfigSection::Attribute => &config.attributes,
         ProviderConfigSection::DefaultTag => &config.default_tags,
@@ -556,7 +556,7 @@ fn provider_config_section<P: crate::resource::ValueKind>(
 fn provider_config_section_mut<P: crate::resource::ValueKind>(
     config: &mut ProviderConfig<P, AbsoluteBindingAddress>,
     section: ProviderConfigSection,
-) -> &mut IndexMap<String, GenericValue<P>> {
+) -> &mut super::ConfigurationAttributes<GenericValue<P>> {
     match section {
         ProviderConfigSection::Attribute => &mut config.attributes,
         ProviderConfigSection::DefaultTag => &mut config.default_tags,
@@ -566,7 +566,7 @@ fn provider_config_section_mut<P: crate::resource::ValueKind>(
 fn provider_config_secret_location<P: crate::resource::ValueKind>(
     config: &ProviderConfig<P, AbsoluteBindingAddress>,
     section: ProviderConfigSection,
-    key: &str,
+    key: &super::AttributeKey,
 ) -> String {
     match section {
         ProviderConfigSection::Attribute => {
@@ -711,12 +711,14 @@ mod saved_provider_config_secret_tests {
     fn provider(token: &str) -> RuntimeProviderConfig {
         ProviderConfig {
             name: "mock".to_string(),
-            attributes: IndexMap::from([("token".to_string(), secret(token))]),
-            default_tags: IndexMap::from([("Token".to_string(), secret(token))]),
+            attributes: (IndexMap::<String, _>::from([("token".to_string(), secret(token))]))
+                .into(),
+            default_tags: (IndexMap::<String, _>::from([("Token".to_string(), secret(token))]))
+                .into(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: crate::parser::ConfigurationAttributes::new(),
             binding: Some("secondary".to_string()),
         }
     }
@@ -727,7 +729,7 @@ mod saved_provider_config_secret_tests {
         config.attributes.clear();
         config.default_tags.clear();
         config.unresolved_attributes.insert(
-            DEFAULT_TAGS_ATTRIBUTE.into(),
+            DEFAULT_TAGS_ATTRIBUTE,
             RuntimeValue::Concrete(GenericConcreteValue::String("private-invalid-map".into())),
         );
         let file = crate::parser::ExpandedInferredFile {
@@ -758,10 +760,12 @@ mod saved_provider_config_secret_tests {
     fn issue_4304_3a_cleanup_provider_knownness_has_one_error_shape() {
         let mut config = provider("unused");
         config.attributes.clear();
-        config.default_tags = IndexMap::from([(
-            "Owner".into(),
+        config.default_tags = [(
+            "Owner",
             RuntimeValue::root_resource_ref("management", "owner", vec![]),
-        )]);
+        )]
+        .into_iter()
+        .collect();
         let live = ResolvedProviderConfigs::from_resolved(vec![config.clone()]).unwrap_err();
         let editor = ResolvedProviderConfigs::validate_known(&[config]).unwrap_err();
         assert_eq!(live.to_string(), editor.to_string());
@@ -779,10 +783,12 @@ mod saved_provider_config_secret_tests {
             .map(|binding| {
                 let mut config = provider("unused");
                 config.binding = binding.map(str::to_owned);
-                config.attributes =
-                    IndexMap::from([("token".into(), unknown()), ("region".into(), unknown())]);
-                config.default_tags =
-                    IndexMap::from([("Owner".into(), unknown()), ("Team".into(), unknown())]);
+                config.attributes = [("token", unknown()), ("region", unknown())]
+                    .into_iter()
+                    .collect();
+                config.default_tags = [("Owner", unknown()), ("Team", unknown())]
+                    .into_iter()
+                    .collect();
                 config
             })
             .collect::<Vec<_>>();
@@ -850,10 +856,11 @@ mod saved_provider_config_secret_tests {
     fn provider_config_gate_rejects_coalesce_with_known_collection_children() {
         for value in crate::resource::known_value_gate_tests::coalesces() {
             let mut config = provider("unused");
-            config.attributes = IndexMap::from([("token".into(), value)]);
+            config.attributes = [("token", value)].into_iter().collect();
             assert!(matches!(
                 ResolvedProviderConfigs::validate_known(&[config]),
-                Err(ProviderConfigInvariantError::UnresolvedAttribute { .. })
+                Err(ProviderConfigInvariantError::UnresolvedAttribute { error, .. })
+                    if matches!(*error, ProviderConfigValueError::Deferred { .. })
             ));
         }
     }
@@ -993,13 +1000,16 @@ pub enum ProviderConfigInvariantError {
     UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
 
     #[error("provider {provider}: {attribute} must resolve to a map")]
-    ExpectedMap { provider: String, attribute: String },
+    ExpectedMap {
+        provider: String,
+        attribute: super::AttributeKey,
+    },
 
     // Composite leaf: retain the typed knownness error and render it once.
     #[error("provider {provider}: {attribute}: {error}")]
     UnresolvedAttribute {
         provider: String,
-        attribute: String,
+        attribute: super::AttributeKey,
         error: Box<ProviderConfigValueError>,
     },
 
@@ -1007,7 +1017,7 @@ pub enum ProviderConfigInvariantError {
     #[error("provider {provider}: {attribute}: {error}", attribute = ResolvedProviderConfigs::default_tag_attribute(.key))]
     DefaultTagResolution {
         provider: String,
-        key: String,
+        key: super::AttributeKey,
         error: Box<crate::resolver::ResolutionError>,
     },
 }
@@ -1044,12 +1054,21 @@ impl ProviderConfigInvariantError {
             error => vec![error],
         }
     }
+
+    /// Borrow each typed finding for structured diagnostic transports.
+    pub fn findings(&self) -> &[Self] {
+        match self {
+            Self::Findings(errors) => &errors.0,
+            error => std::slice::from_ref(error),
+        }
+    }
 }
 
 impl ResolvedProviderConfigs {
     /// Canonical diagnostic slot for a provider default.
-    pub fn default_tag_attribute(key: &str) -> String {
-        format!("{DEFAULT_TAGS_ATTRIBUTE}.{key}")
+    pub fn default_tag_attribute(key: &super::AttributeKey) -> super::AttributeKey {
+        key.clone()
+            .with_diagnostic_prefix(&format!("{DEFAULT_TAGS_ATTRIBUTE}."))
     }
 
     /// Shared upstream-only exception; mixed local/apply references are not exempt.
@@ -1118,13 +1137,13 @@ impl ResolvedProviderConfigs {
 
     fn check_value<P: crate::resource::PlaceholderKind, B: BindingAddress>(
         provider: &str,
-        attribute: &str,
+        attribute: &super::AttributeKey,
         value: &GenericValue<P, B>,
     ) -> Result<(), ProviderConfigInvariantError> {
         require_provider_config_known(value).map_err(|error| {
             ProviderConfigInvariantError::UnresolvedAttribute {
                 provider: provider.into(),
-                attribute: attribute.into(),
+                attribute: attribute.clone(),
                 error: Box::new(error),
             }
         })
@@ -2862,7 +2881,7 @@ where
 fn resolve_provider_unresolved_attributes_mapped<E, B: ProviderAttributeBindingPhase, D, Failure>(
     parsed: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &ProviderContext,
-    mut map_error: impl FnMut(usize, &str, ParseError) -> Failure,
+    mut map_error: impl FnMut(usize, &super::AttributeKey, ParseError) -> Failure,
 ) -> Result<(), Failure>
 where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -2880,7 +2899,11 @@ fn resolve_provider_unresolved_attributes_reporting<
 >(
     parsed: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &ProviderContext,
-    mut report_error: impl FnMut(usize, &str, ParseError) -> std::ops::ControlFlow<Failure>,
+    mut report_error: impl FnMut(
+        usize,
+        &super::AttributeKey,
+        ParseError,
+    ) -> std::ops::ControlFlow<Failure>,
 ) -> Result<(), Failure>
 where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -2930,7 +2953,7 @@ where
             };
             resolved.insert(key.clone(), r);
         }
-        provider.unresolved_attributes = resolved;
+        provider.unresolved_attributes = resolved.into();
     }
     Ok(())
 }
@@ -3039,16 +3062,10 @@ impl ProviderAttributeBindings {
 
     fn attributes(
         &self,
-        attributes: &IndexMap<String, RuntimeValue>,
+        attributes: &super::ConfigurationAttributes<RuntimeValue>,
         session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-    ) -> Result<IndexMap<String, RuntimeValue>, ProviderConfigResolutionError> {
-        attributes
-            .iter()
-            .map(|(key, value)| {
-                self.resolve(value, session)
-                    .map(|value| (key.clone(), value))
-            })
-            .collect()
+    ) -> Result<super::ConfigurationAttributes<RuntimeValue>, ProviderConfigResolutionError> {
+        attributes.try_map(|value| self.resolve(value, session))
     }
 }
 
@@ -3115,11 +3132,13 @@ fn resolve_desired_provider_configs<E, D>(
         {
             let value = bindings.resolve(&expr, session)?;
             provider.default_tags = match value {
-                GenericValue::Concrete(GenericConcreteValue::Map(tags)) => tags,
+                GenericValue::Concrete(GenericConcreteValue::Map(tags)) => {
+                    super::ConfigurationAttributes::from_literal_map(tags)
+                }
                 value => {
                     ResolvedProviderConfigs::check_value(
                         &provider.name,
-                        DEFAULT_TAGS_ATTRIBUTE,
+                        &DEFAULT_TAGS_ATTRIBUTE.into(),
                         &value,
                     )?;
                     return Err(ProviderConfigInvariantError::ExpectedMap {
@@ -3130,7 +3149,7 @@ fn resolve_desired_provider_configs<E, D>(
                 }
             };
         }
-        let mut tags = IndexMap::new();
+        let mut tags = super::ConfigurationAttributes::new();
         for (key, value) in &provider.default_tags {
             if let Some(references) = ResolvedProviderConfigs::references_within(value, &missing) {
                 log::warn!(
@@ -3139,7 +3158,7 @@ fn resolve_desired_provider_configs<E, D>(
                         provider.binding.as_deref().unwrap_or(&provider.name)
                     ),
                     crate::provider_text::DiagnosticText::new(
-                        ResolvedProviderConfigs::default_tag_attribute(key)
+                        ResolvedProviderConfigs::default_tag_attribute(key).to_string()
                     ),
                     crate::provider_text::DiagnosticText::new(
                         references
@@ -3223,16 +3242,18 @@ fn finalize_provider_configs_mapped<E, B: BindingAddress, D, Failure>(
         D,
         B,
     >,
-    mut map_error: impl FnMut(usize, &str, ParseError) -> Failure,
+    mut map_error: impl FnMut(usize, &super::AttributeKey, ParseError) -> Failure,
 ) -> Result<(), Failure> {
     for (index, provider) in parsed.providers.iter_mut().enumerate() {
         if let Some(value) = provider
             .unresolved_attributes
             .shift_remove(DEFAULT_TAGS_ATTRIBUTE)
         {
-            provider.default_tags = provider_default_tags_map(&provider.name, &value)
-                .map_err(|error| map_error(index, DEFAULT_TAGS_ATTRIBUTE, error))?
-                .clone();
+            provider.default_tags = super::ConfigurationAttributes::from_literal_map(
+                provider_default_tags_map(&provider.name, &value)
+                    .map_err(|error| map_error(index, &DEFAULT_TAGS_ATTRIBUTE.into(), error))?
+                    .clone(),
+            );
         }
         debug_assert!(
             provider.unresolved_attributes.is_empty(),
@@ -3310,12 +3331,15 @@ where
             .shift_remove(DEFAULT_TAGS_ATTRIBUTE)
         {
             match provider_default_tags_map(&provider.name, &value) {
-                Ok(tags) => provider.default_tags = tags.clone(),
+                Ok(tags) => {
+                    provider.default_tags =
+                        super::ConfigurationAttributes::from_literal_map(tags.clone())
+                }
                 Err(_error) => {
                     statuses[index] = ProviderInputStatus::Failed;
                     provider
                         .unresolved_attributes
-                        .insert(DEFAULT_TAGS_ATTRIBUTE.into(), value);
+                        .insert(DEFAULT_TAGS_ATTRIBUTE, value);
                 }
             }
         }

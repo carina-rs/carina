@@ -23,7 +23,8 @@ async fn issue_4304_3a_review2_read_only_validation_preserves_authored_defaults(
         &SchemaRegistry::new(),
     )
     .unwrap();
-    let validated = ProviderLoad::load(&runtime, &loaded.parsed.providers, &project)
+    let mut notices = ProviderNoticeSink::new(|_| {});
+    let validated = ProviderLoad::load(&runtime, &loaded.parsed.providers, &project, &mut notices)
         .unwrap()
         .validate_read_only_config(loaded.parsed, &project, &loaded.duplicate_declarations)
         .unwrap();
@@ -1946,10 +1947,10 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
                 ),
                 version: None,
                 revision: None,
-                unresolved_attributes: IndexMap::new(),
+                unresolved_attributes: Default::default(),
                 binding: None,
-                attributes: IndexMap::new(),
-                default_tags: IndexMap::new(),
+                attributes: Default::default(),
+                default_tags: Default::default(),
             })
             .collect::<Vec<_>>()
     };
@@ -2144,10 +2145,10 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
         source: Some("file:///definitely-missing/broken.wasm".parse().unwrap()),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
     };
     let providers = ProviderLoad::for_test_with_load_errors(
         &crate::test_support::TestCommandRuntime::new(),
@@ -2354,15 +2355,16 @@ fn hard_reporting_load_returns_schema_only_diagnostics() {
         source: Some("file:///definitely-missing/mock.wasm".parse().unwrap()),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
     };
     let (providers, hard_error) = ProviderLoad::load_reporting(
         &user_dirs,
         &[provider.clone(), provider],
         &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
+        &mut crate::commands::human_provider_notices(user_dirs.color_mode()),
     )
     .expect("test mock inputs must be valid");
     assert!(
@@ -2401,16 +2403,16 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
         source: Some(format!("file://{}", source_path.display()).parse().unwrap()),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
     };
 
     let invalid = TrustedLocalGrantInputs::new(Vec::new(), Some("not-a-grant".into()));
     let loader_called = Arc::new(AtomicBool::new(false));
     let called = Arc::clone(&loader_called);
-    let (factories, errors) = build_factories_from_providers_impl_using(
+    let (factories, errors) = build_factories_from_providers_impl_using_for_test(
         &user_dirs,
         &[] as &[carina_core::parser::ExpandedProviderConfig],
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
@@ -2424,6 +2426,7 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
                 ))
             }
         },
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     )
     .unwrap();
     assert!(factories.is_empty());
@@ -2431,7 +2434,7 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
     assert!(invalid.parsed.get().is_none());
 
     let called = Arc::clone(&loader_called);
-    let result = build_factories_from_providers_impl_using(
+    let result = build_factories_from_providers_impl_using_for_test(
         &user_dirs,
         std::slice::from_ref(&config),
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
@@ -2445,6 +2448,7 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
                 ))
             }
         },
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     );
     let Err(error) = result else {
         panic!("invalid grants must fail when the first provider load begins")
@@ -2460,7 +2464,7 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
     let valid = TrustedLocalGrantInputs::new(vec![format!("{}=aws", source_path.display())], None);
     let saw_aws = Arc::new(AtomicBool::new(false));
     let observed = Arc::clone(&saw_aws);
-    let (factories, errors) = build_factories_from_providers_impl_using(
+    let (factories, errors) = build_factories_from_providers_impl_using_for_test(
         &user_dirs,
         &[config],
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
@@ -2478,6 +2482,7 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
                 ))
             }
         },
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     )
     .unwrap();
 
@@ -2507,17 +2512,17 @@ async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
         source: Some(format!("file://{}", source_path.display()).parse().unwrap()),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
     };
     let configs = [config.clone(), config];
     let inputs = TrustedLocalGrantInputs::new(Vec::new(), None);
     let hard_loads = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&hard_loads);
 
-    let result = build_factories_from_providers_impl_using(
+    let result = build_factories_from_providers_impl_using_for_test(
         &user_dirs,
         &configs,
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
@@ -2531,6 +2536,7 @@ async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
                 ))
             }
         },
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     );
     let Err(error) = result else {
         panic!("duplicate sourced defaults must be a hard validation error")
@@ -2544,7 +2550,7 @@ async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
 
     let formatting_loads = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&formatting_loads);
-    let (factories, errors) = build_factories_from_providers_impl_using(
+    let (factories, errors) = build_factories_from_providers_impl_using_for_test(
         &user_dirs,
         &configs,
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
@@ -2558,6 +2564,7 @@ async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
                 ))
             }
         },
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     )
     .expect("formatting must retain duplicate-provider failure as a diagnostic");
 
@@ -2587,13 +2594,13 @@ async fn aws_credential_load_error_maps_to_typed_startup_error() {
         source: Some(format!("file://{}", source_path.display()).parse().unwrap()),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
     };
     let grants = TrustedLocalGrantInputs::new(vec![format!("{}=aws", source_path.display())], None);
-    let result = build_factories_from_providers_impl_using(
+    let result = build_factories_from_providers_impl_using_for_test(
         &user_dirs,
         &[config],
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
@@ -2612,6 +2619,7 @@ async fn aws_credential_load_error_maps_to_typed_startup_error() {
                 ))
             }
         },
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     );
 
     let Err(AppError::AwsCredentials(error)) = result else {
@@ -2979,12 +2987,13 @@ async fn shared_desired_pipeline_runs_host_default_tag_normalization() {
     ));
     let provider_config: carina_core::parser::ExpandedProviderConfig = ProviderConfig {
         name: BUILTIN_PROVIDER_NAME.to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::from([("SecretTag".to_string(), secret.clone())]),
+        attributes: Default::default(),
+        default_tags: (IndexMap::<String, _>::from([("SecretTag".to_string(), secret.clone())]))
+            .into(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     };
     let provider_configs = vec![provider_config];
@@ -3177,14 +3186,15 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
         source: Some(source.clone()),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
     };
     let installed = carina_provider_resolver::find_file_provider_source(
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         &config,
+        &mut |_| {},
     )
     .unwrap();
 
@@ -3209,9 +3219,12 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     )
     .unwrap();
     let identity_mismatch = installed
-        .load_with(user_dirs.user_dirs(), &grants, |_verified| async {
-            Ok::<_, carina_plugin_host::WasmProviderLoadError>(())
-        })
+        .load_with(
+            user_dirs.user_dirs(),
+            &grants,
+            &mut |_| {},
+            |_verified| async { Ok::<_, carina_plugin_host::WasmProviderLoadError>(()) },
+        )
         .await
         .unwrap_err();
     let identity = source_provider_kind_mismatch_from_load_error(&source, &identity_mismatch)
@@ -3229,7 +3242,7 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
     std::fs::write(&installed_path, b"fixture").unwrap();
     let inputs = TrustedLocalGrantInputs::new(Vec::new(), None);
-    let result = build_factories_from_providers_impl_using(
+    let result = build_factories_from_providers_impl_using_for_test(
         &user_dirs,
         std::slice::from_ref(&config),
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
@@ -3243,6 +3256,7 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
                 },
             )
         },
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     );
     let Err(error) = result else {
         panic!("artifact-reported provider kind mismatch must be fatal")
@@ -3251,13 +3265,14 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
 
     let trusted_inputs =
         TrustedLocalGrantInputs::new(vec![format!("{}=aws", wasm_path.display())], None);
-    let result = build_factories_from_providers_impl_using(
+    let result = build_factories_from_providers_impl_using_for_test(
         &user_dirs,
         std::slice::from_ref(&config),
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         true,
         &trusted_inputs,
         |_verified| async { panic!("trusted identity mismatch must fail before the WASM loader") },
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     );
     let Err(error) = result else {
         panic!("trusted provider kind mismatch must be fatal")
@@ -3267,7 +3282,7 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
         AppError::SourceProviderTrustMismatch { .. }
     ));
 
-    let (factories, errors) = build_factories_from_providers_impl_using(
+    let (factories, errors) = build_factories_from_providers_impl_using_for_test(
         &user_dirs,
         std::slice::from_ref(&config),
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
@@ -3281,6 +3296,7 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
                 },
             )
         },
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     )
     .unwrap();
     assert!(factories.is_empty());
@@ -3341,16 +3357,16 @@ async fn unverified_official_factory_load_case() {
         source: Some(provider_source),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
     };
     let loader_called = Arc::new(AtomicBool::new(false));
     let called = Arc::clone(&loader_called);
     let inputs = TrustedLocalGrantInputs::new(Vec::new(), None);
 
-    let result = build_factories_from_providers_impl_using(
+    let result = build_factories_from_providers_impl_using_for_test(
         &user_dirs,
         std::slice::from_ref(&config),
         &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
@@ -3364,6 +3380,7 @@ async fn unverified_official_factory_load_case() {
                 ))
             }
         },
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     );
 
     assert!(!loader_called.load(Ordering::SeqCst));
@@ -3471,6 +3488,7 @@ where
         &user_dirs,
         provider_configs.as_provider_configs(),
         &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     )?;
     factories.extend(LoadedProviderFactory::for_test(fixture_factories));
     let wiring = ValidatedWiring::for_test_with_provider_phase(
@@ -4109,12 +4127,12 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
     );
     let config = ProviderConfig {
         name: "failing".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     };
     let configs = validated_provider_configs(vec![config]);
@@ -4150,12 +4168,12 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
 fn named_provider_reports_unavailable_sourced_default() {
     let configs = validated_provider_configs(vec![ProviderConfig {
         name: "missing".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: Some("named".to_string()),
     }]);
     let source: ProviderSource = "file:///missing.wasm".parse().unwrap();
@@ -4244,12 +4262,12 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
     );
     let configs = validated_provider_configs(vec![ProviderConfig {
         name: "ordering".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     }]);
     let mut router = ProviderRouter::new();
@@ -4282,15 +4300,16 @@ async fn provider_progress_uses_schema_region() {
     let configs = validated_provider_configs(vec![
         ProviderConfig {
             name: "test".to_string(),
-            attributes: IndexMap::from([(
+            attributes: (IndexMap::<String, _>::from([(
                 "region".to_string(),
                 Value::Concrete(ConcreteValue::String("us-west-2".into())),
-            )]),
-            default_tags: IndexMap::new(),
+            )]))
+            .into(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         },
         region_provider_config("aws.Region.ap_northeast_1"),
@@ -4392,12 +4411,12 @@ async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
     );
     let configs = validated_provider_configs(vec![ProviderConfig {
         name: "aws".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: Some("file:///provider.wasm".parse().unwrap()),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     }]);
     let mut router = ProviderRouter::new();
@@ -4521,12 +4540,12 @@ async fn sourced_default_provider_executes_the_factory_retained_by_wiring_contex
     std::fs::write(&source_path, b"artifact loaded into the context").unwrap();
     let config = ProviderConfig {
         name: "test".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: Some(format!("file://{}", source_path.display()).parse().unwrap()),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     };
     let configs = validated_provider_configs(vec![config]);
@@ -5468,15 +5487,16 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
     let received_region = Arc::new(Mutex::new(None));
     let raw_configs = vec![ProviderConfig {
         name: "block-in-place".to_string(),
-        attributes: IndexMap::from([(
+        attributes: (IndexMap::<String, _>::from([(
             "region".to_string(),
             Value::Concrete(ConcreteValue::String("resolved-region".into())),
-        )]),
-        default_tags: IndexMap::new(),
+        )]))
+        .into(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     }];
     let provider_configs = validated_provider_configs(raw_configs);
@@ -5597,15 +5617,16 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
 
     let config = |region: &str, binding: Option<&str>| ProviderConfig {
         name: "capture".to_string(),
-        attributes: IndexMap::from([(
+        attributes: (IndexMap::<String, _>::from([(
             "region".to_string(),
             Value::Concrete(ConcreteValue::String(region.to_string().into())),
-        )]),
-        default_tags: IndexMap::new(),
+        )]))
+        .into(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: binding.map(str::to_string),
     };
 
@@ -5744,12 +5765,12 @@ fn test_merge_default_tags_prevents_false_diff() {
     // After host merging, desired resource gains the default tags → no diff.
     let config = ProviderConfig {
         name: "awscc".to_string(),
-        attributes: IndexMap::new(),
-        default_tags,
+        attributes: Default::default(),
+        default_tags: (default_tags).into(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     };
     let mut resources_with = vec![resource];
@@ -11399,14 +11420,17 @@ fn region_identity_ctx() -> WiringContext {
 fn region_provider_config(raw_region: &str) -> carina_core::parser::ExpandedProviderConfig {
     ProviderConfig {
         name: "awscc".to_string(),
-        attributes: indexmap::indexmap! {
-            "region".to_string() => Value::Concrete(ConcreteValue::enum_identifier(raw_region)),
+        attributes: {
+            let attributes: indexmap::IndexMap<String, Value> = indexmap::indexmap! {
+                "region".to_string() => Value::Concrete(ConcreteValue::enum_identifier(raw_region)),
+            };
+            attributes.into()
         },
-        default_tags: IndexMap::new(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     }
 }
@@ -13888,17 +13912,16 @@ mod using_line_format_tests {
 mod kind_default_source_tests {
     use super::super::kind_default_source;
     use carina_core::parser::{ExpandedProviderConfig, ResolvedProviderConfigs};
-    use indexmap::IndexMap;
 
     fn config(name: &str, binding: Option<&str>, source: Option<&str>) -> ExpandedProviderConfig {
         ExpandedProviderConfig {
             name: name.to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: source.map(|source| source.parse().unwrap()),
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: binding.map(str::to_string),
         }
     }
@@ -14088,16 +14111,16 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
         source: Some(source.parse().unwrap()),
         version: None,
         revision: Some(revision.into()),
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
     };
     let cache = tempfile::tempdir().unwrap();
     let cache_path = cache.path().to_path_buf();
     let inputs = TrustedLocalGrantInputs::new(Vec::new(), None);
 
-    let (factories, errors) = build_factories_from_providers_impl_using(
+    let (factories, errors) = build_factories_from_providers_impl_using_for_test(
         &user_dirs,
         &[config],
         &carina_core::paths::ResolvedPath::new(base).unwrap(),
@@ -14109,10 +14132,12 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
                 carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(
                     verified,
                     &cache_path,
+                    &mut carina_plugin_host::WasmLoadNoticeSink::new(move |_| {}),
                 )
                 .await
             }
         },
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     )
     .unwrap();
     assert!(factories.is_empty());
@@ -14161,16 +14186,17 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
         source: Some(source.parse().unwrap()),
         version: None,
         revision: Some(revision.into()),
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
     };
 
     let (factories, errors) = build_factories_from_providers(
         &user_dirs,
         &[config],
         &carina_core::paths::ResolvedPath::new(base).unwrap(),
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     )
     .unwrap();
     let rendered = errors
@@ -14230,16 +14256,17 @@ async fn registry_source_reaches_cli_artifact_loader() {
         source: Some(provider_source),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
     };
 
     let (factories, errors) = build_factories_from_providers(
         &user_dirs,
         &[config],
         &carina_core::paths::ResolvedPath::new(base).unwrap(),
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     )
     .unwrap();
     let rendered = errors
@@ -14291,15 +14318,16 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
         source: Some(provider_source),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
     };
     let (factories, errors) = build_factories_from_providers(
         &user_dirs,
         std::slice::from_ref(&config),
         &carina_core::paths::ResolvedPath::new(base).unwrap(),
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     )
     .expect("registry source must reach the single factory-load boundary");
     let load_error = errors
@@ -14335,14 +14363,15 @@ fn runtime_instantiation_error_retains_installed_artifact_provenance() {
         source: Some(format!("file://{}", wasm_path.display()).parse().unwrap()),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
     };
     let installed = carina_provider_resolver::find_file_provider_source(
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         &config,
+        &mut |_| {},
     )
     .unwrap();
 
@@ -14394,16 +14423,17 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
         source: Some(source.parse().unwrap()),
         version: Some(carina_core::version_constraint::VersionConstraint::parse("^2.0.0").unwrap()),
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
     };
 
     let (factories, load_errors) = build_factories_from_providers_for_formatting(
         &user_dirs,
         &[config],
         &carina_core::paths::ResolvedPath::new(base).unwrap(),
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     )
     .unwrap();
 
@@ -14442,16 +14472,17 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         ),
         version: None,
         revision: Some("main".into()),
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
     };
 
     let runtime_error = match build_factories_from_providers(
         &user_dirs,
         std::slice::from_ref(&config),
         &carina_core::paths::ResolvedPath::new(base).unwrap(),
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     ) {
         Err(error) => error,
         Ok(_) => panic!("unversioned provider lock must be returned as an error"),
@@ -14487,6 +14518,7 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         &user_dirs,
         &[config],
         &carina_core::paths::ResolvedPath::new(base).unwrap(),
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     )
     .unwrap();
     assert!(factories.is_empty());
@@ -14549,16 +14581,17 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
         source: Some(source.parse().unwrap()),
         version: Some(carina_core::version_constraint::VersionConstraint::parse("^2.0.0").unwrap()),
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
     };
 
     let result = build_factories_from_providers(
         &user_dirs,
         &[config],
         &carina_core::paths::ResolvedPath::new(base).unwrap(),
+        &mut crate::wiring::ProviderNoticeSink::new(move |_| {}),
     );
     let error = match result {
         Err(error) => error,
@@ -15391,12 +15424,12 @@ exports { team_prefix: String = "x" }"#,
 
         let provider_config: carina_core::parser::ExpandedProviderConfig = ProviderConfig {
             name: "test".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         };
         let target = Value::Deferred(DeferredValue::Interpolation(vec![
@@ -15500,12 +15533,12 @@ exports { team_prefix: String = "x" }"#,
                 .with_attribute("query", text("literal"));
         let provider_config: carina_core::parser::ExpandedProviderConfig = ProviderConfig {
             name: "test".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         };
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
@@ -15715,6 +15748,7 @@ fn settlement_loaded_validation_report_cannot_hide_pending_evidence() {
         crate::commands::ConfigurationValidation {
             result: Ok(Default::default()),
             authored_inputs: authored.authored_inputs().unwrap().clone(),
+            warnings: Vec::new(),
         }
     });
     let schemas = SchemaRegistry::new();
@@ -15893,6 +15927,7 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                     &runtime,
                     resolved.as_provider_configs(),
                     &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+                    &mut crate::commands::human_provider_notices(runtime.color_mode()),
                 )
                 .unwrap()
                 .into_complete()

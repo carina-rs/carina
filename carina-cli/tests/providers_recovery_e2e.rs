@@ -10,7 +10,6 @@ use carina_provider_resolver::{
     FixtureRegistryHttp, LockMode, ProviderInstallLock, resolve_all,
     resolve_all_with_fixture_registry, sha256_file,
 };
-use indexmap::IndexMap;
 
 const PROVIDER: &str = "registry.carina-rs.dev/carina-rs/aws";
 const HOST: &str = "registry.carina-rs.dev";
@@ -235,10 +234,10 @@ fn registry_provider_config() -> ProviderConfig {
         source: Some("carina-rs/aws".parse().unwrap()),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
     }
 }
 
@@ -340,6 +339,7 @@ fn resolve_with_fixture(base_dir: &Path, user_dirs: &UserDirs, http: &FixtureReg
         &[registry_provider_config()],
         LockMode::Normal,
         http,
+        &mut |_| {},
     )
     .unwrap();
 }
@@ -563,6 +563,7 @@ fn v2_lock_migration_keeps_all_recovery_commands_reachable_without_authorizing_d
                 &install_lock,
                 &[registry_provider_config()],
                 LockMode::Normal,
+                &mut |_| {},
             )
             .expect_err("provider-level recovery must not authorize discovery migration");
             assert!(
@@ -815,6 +816,7 @@ fn declining_migrated_discovery_repin_preserves_pin_and_resolution_block() {
         &install_lock,
         &[registry_provider_config()],
         LockMode::Normal,
+        &mut |_| {},
     )
     .expect_err("declining must leave migrated discovery resolution blocked");
     assert!(

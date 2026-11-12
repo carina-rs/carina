@@ -337,11 +337,11 @@ pub type ProviderReadyDataSource =
 /// checks and provider semantic validation before returning the value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CanonicalProviderConfigAttributes {
-    attributes: WireReady<IndexMap<String, Value>>,
+    attributes: WireReady<crate::parser::ConfigurationAttributes<Value>>,
 }
 
 impl CanonicalProviderConfigAttributes {
-    pub fn attributes(&self) -> &IndexMap<String, Value> {
+    pub fn attributes(&self) -> &crate::parser::ConfigurationAttributes<Value> {
         self.attributes.as_inner()
     }
 
@@ -351,7 +351,7 @@ impl CanonicalProviderConfigAttributes {
 }
 
 impl Deref for CanonicalProviderConfigAttributes {
-    type Target = IndexMap<String, Value>;
+    type Target = crate::parser::ConfigurationAttributes<Value>;
 
     fn deref(&self) -> &Self::Target {
         self.attributes()
@@ -365,22 +365,21 @@ impl Deref for CanonicalProviderConfigAttributes {
 /// deserialization path; [`prepare_provider_ready_config`] is the sole
 /// constructor.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// use carina_core::provider::ProviderReadyConfig;
-/// use indexmap::IndexMap;
 ///
-/// let _ready = ProviderReadyConfig { attributes: IndexMap::new() };
+/// let _ready = ProviderReadyConfig { inner: todo!() };
 /// ```
 ///
 /// A raw attribute map cannot cross the provider construction boundary.
 ///
-/// ```compile_fail
-/// use carina_core::provider::ProviderFactory;
+/// ```compile_fail,E0308
+/// use carina_core::parser::ConfigurationAttributes;
+/// use carina_core::provider::{ProviderBoundary, ProviderFactory};
 /// use carina_core::resource::Value;
-/// use indexmap::IndexMap;
 ///
-/// fn bypass(factory: &dyn ProviderFactory, attributes: &IndexMap<String, Value>) {
-///     let _ = factory.create_initialized_provider(None, attributes);
+/// fn bypass(factory: &dyn ProviderFactory, attributes: &ConfigurationAttributes<Value>) {
+///     let _ = ProviderBoundary::initialize(factory, attributes);
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq)]
@@ -396,7 +395,7 @@ struct ProviderReadyConfigInner {
 
 impl ProviderReadyConfig {
     /// Borrow the checked provider configuration attributes.
-    pub fn attributes(&self) -> &IndexMap<String, Value> {
+    pub fn attributes(&self) -> &crate::parser::ConfigurationAttributes<Value> {
         self.inner.attributes.attributes()
     }
 
@@ -910,7 +909,7 @@ pub enum ProviderConfigPreparationError {
     #[error("provider {provider}: {attribute}: {error}")]
     InvalidAttribute {
         provider: String,
-        attribute: String,
+        attribute: crate::parser::AttributeKey,
         error: ProviderValueConstraintErrors,
     },
     /// The provider rejected cross-attribute or provider-specific semantics.
@@ -938,7 +937,7 @@ impl From<ProviderConfigPreparationError> for crate::provider::HostError {
 
 impl ProviderConfigPreparationError {
     /// Attribute responsible for a host-side type/canonicalization failure.
-    pub fn attribute(&self) -> Option<&str> {
+    pub fn attribute(&self) -> Option<&crate::parser::AttributeKey> {
         match self {
             Self::Wire(error) => Some(error.attribute()),
             Self::InvalidAttribute { attribute, .. } => Some(attribute),
@@ -958,9 +957,9 @@ impl ProviderConfigPreparationError {
 
 fn canonicalize_provider_config_attributes<P: PlaceholderKind, B: BindingAddress>(
     provider_name: &str,
-    attributes: &IndexMap<String, Value<P, B>>,
+    attributes: &crate::parser::ConfigurationAttributes<Value<P, B>>,
     attr_types: &crate::schema::ValidatedConfigSchema,
-) -> Result<IndexMap<String, Value<P, B>>, ProviderConfigPreparationError> {
+) -> Result<crate::parser::ConfigurationAttributes<Value<P, B>>, ProviderConfigPreparationError> {
     let attributes = crate::value::canonicalize_provider_config_attributes_with_types(
         provider_name,
         attributes,
@@ -980,7 +979,7 @@ fn canonicalize_provider_config_attributes<P: PlaceholderKind, B: BindingAddress
 fn validate_canonical_provider_config(
     factory: &dyn ProviderFactory,
     provider_name: &str,
-    attributes: IndexMap<String, Value>,
+    attributes: crate::parser::ConfigurationAttributes<Value>,
 ) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
     let attributes = WireReady::try_new(
         attributes,
@@ -1022,7 +1021,7 @@ fn validate_canonical_provider_config(
 pub fn validate_and_canonicalize_provider_config(
     factory: &dyn ProviderFactory,
     provider_name: &str,
-    attributes: &IndexMap<String, Value>,
+    attributes: &crate::parser::ConfigurationAttributes<Value>,
     config_schema: &ValidatedConfigSchema,
 ) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
     let canonical =
@@ -1043,7 +1042,9 @@ pub fn validate_and_canonicalize_provider_config(
 pub fn validate_parser_provider_config(
     factory: &dyn ProviderFactory,
     provider_name: &str,
-    attributes: &IndexMap<String, Value<ParserPlaceholder, RelativeBindingName>>,
+    attributes: &crate::parser::ConfigurationAttributes<
+        Value<ParserPlaceholder, RelativeBindingName>,
+    >,
 ) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
     let config_schema = factory.provider_config_attribute_types();
     let canonical =
@@ -1115,14 +1116,14 @@ pub fn prepare_provider_ready_config(
 fn validate_provider_config_attributes<P: PlaceholderKind, B: BindingAddress>(
     factory: &dyn ProviderFactory,
     provider_name: &str,
-    attributes: &IndexMap<String, Value<P, B>>,
+    attributes: &crate::parser::ConfigurationAttributes<Value<P, B>>,
     attr_types: &crate::schema::ValidatedConfigSchema,
 ) -> Result<(), ProviderConfigPreparationError> {
     let inputs =
         crate::provider::ProviderValidationInputs::collect(provider_name, attributes.values());
     let lookup = crate::parser::custom_type_lookup_for_factory(factory, &inputs);
     for (attribute, value) in attributes {
-        if let Some(attr_type) = attr_types.rootless_type(attribute) {
+        if let Some(attr_type) = attribute.schema_type(attr_types) {
             attr_type
                 .validate_with_lookup(value, &lookup)
                 .map_err(|errors| ProviderConfigPreparationError::InvalidAttribute {
@@ -3178,9 +3179,7 @@ mod provider_config_tests {
         #[tokio::test]
         async fn issue_4304_3a_normalized_tag_keeps_its_origin_beside_valid_defaults() {
             let (mut file, schemas) = tag_fixture("value_length", value_bounded_tags());
-            file.providers[0]
-                .default_tags
-                .insert("Owner".into(), text("core"));
+            file.providers[0].default_tags.insert("Owner", text("core"));
             let resource = file
                 .resources
                 .iter()
@@ -3969,15 +3968,20 @@ mod provider_config_tests {
                 Value::Concrete(ConcreteValue::String("bad".into())),
             ])),
         )]);
-        let error = validate_provider_config_attributes(&factory, "owner", &attributes, &schema)
-            .unwrap_err();
+        let error = validate_provider_config_attributes(
+            &factory,
+            "owner",
+            &((attributes.clone()).into()),
+            &schema,
+        )
+        .unwrap_err();
         assert!(matches!(
             error,
             ProviderConfigPreparationError::InvalidAttribute { .. }
         ));
         assert_eq!(
             error.to_string(),
-            "provider owner: values: List item at index 0: Invalid Short value 'abcd': length 4 is outside allowed range [, 3]"
+            "provider owner: values: List item at index 0: Invalid Short value 'abcd': length 4 is outside allowed range unbounded..=3"
         );
     }
 
@@ -4250,8 +4254,13 @@ mod provider_config_tests {
         )]);
 
         let config_schema = factory.provider_config_attribute_types();
-        validate_and_canonicalize_provider_config(&factory, "owner", &attributes, &config_schema)
-            .expect("the owning factory must validate its decoded refined config type");
+        validate_and_canonicalize_provider_config(
+            &factory,
+            "owner",
+            &((attributes.clone()).into()),
+            &config_schema,
+        )
+        .expect("the owning factory must validate its decoded refined config type");
 
         assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 1);
     }
@@ -4270,7 +4279,7 @@ mod provider_config_tests {
         validate_and_canonicalize_provider_config(
             &factory,
             "display-alias",
-            &attributes,
+            &((attributes.clone()).into()),
             &config_schema,
         )
         .expect("the already-selected factory is the provider-config routing authority");
@@ -4372,12 +4381,12 @@ mod provider_config_tests {
     fn resolved_configs(attributes: IndexMap<String, Value>) -> ResolvedProviderConfigs {
         ResolvedProviderConfigs::from_test_configs(vec![crate::parser::ProviderConfig {
             name: "test".to_string(),
-            attributes,
-            default_tags: IndexMap::new(),
+            attributes: (attributes).into(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         }])
         .expect("test provider attributes must satisfy the resolved-config invariant")
@@ -4539,8 +4548,9 @@ mod provider_config_tests {
             )),
         )]);
 
-        let canonical = validate_parser_provider_config(&factory, "test", &attributes)
-            .expect("placeholder leaves are unknown during parser-stage validation");
+        let canonical =
+            validate_parser_provider_config(&factory, "test", &((attributes.clone()).into()))
+                .expect("placeholder leaves are unknown during parser-stage validation");
 
         assert!(canonical.attributes().is_empty());
         assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 1);

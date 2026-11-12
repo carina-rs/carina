@@ -965,7 +965,7 @@ async fn provider_ready_inputs_are_infallible_and_preserve_checked_scalar_and_se
         let config = carina_core::parser::ExpandedProviderConfig {
             name: "test".into(),
             attributes: Default::default(),
-            default_tags: [("unread_secret".into(), secret("private-late-tag"))]
+            default_tags: [("unread_secret", secret("private-late-tag"))]
                 .into_iter()
                 .collect(),
             source: None,

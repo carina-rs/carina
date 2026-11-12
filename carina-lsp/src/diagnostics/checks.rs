@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-use crate::document::Document;
+use crate::document::DiagnosticDocument as Document;
 use carina_core::binding_index::{
     BindingIndex, RefTargetKind, RefTypeError, ResolvedBindings as GenericResolvedBindings,
 };
@@ -802,8 +802,10 @@ impl DiagnosticRun<'_> {
                 }) {
                     continue;
                 }
-                let location =
-                    tree.provider_attribute_location(index, error.attribute().unwrap_or("region"));
+                let location = error
+                    .attribute()
+                    .map(|key| tree.provider_attribute_location(index, key))
+                    .unwrap_or_else(|| tree.provider_attribute_location(index, "region"));
                 let finding = carina_core::parser::Located::new(location.clone(), error);
                 diagnostics.extend(render_merged(
                     doc,
@@ -1327,10 +1329,7 @@ impl DiagnosticRun<'_> {
                     doc,
                     finding,
                     DiagnosticSeverity::WARNING,
-                    format!(
-                        "Unused let binding '{}'. Consider using an anonymous resource instead.",
-                        finding.detail()
-                    ),
+                    carina_core::validation::unused_binding_message(finding.detail()),
                 )
             })
             .collect()

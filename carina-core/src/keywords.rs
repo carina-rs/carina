@@ -80,7 +80,10 @@ mod tests {
 
     #[test]
     fn pest_grammar_contains_every_keyword() {
-        let pest_grammar = include_str!("parser/carina.pest");
+        let pest_grammar = concat!(
+            include_str!("parser/carina.pest"),
+            include_str!("parser/lexical.pest")
+        );
         for (name, _) in KEYWORDS {
             let literal = format!("\"{}\"", name);
             assert!(

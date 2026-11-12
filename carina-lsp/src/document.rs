@@ -8,6 +8,7 @@ use carina_core::parser::{ParseError, ParsedFile, ProviderContext, parse_file};
 
 pub struct Document {
     content: Rope,
+    source_text: String,
     parsed: Option<ParsedFile>,
     parse_error: Option<ParseError>,
     provider_context: Arc<ProviderContext>,
@@ -28,6 +29,7 @@ impl Document {
     ) -> Self {
         let mut doc = Self {
             content: Rope::from_str(&content),
+            source_text: content,
             parsed: None,
             parse_error: None,
             provider_context,
@@ -62,8 +64,8 @@ impl Document {
     }
 
     fn reparse(&mut self) {
-        let text = self.content.to_string();
-        match parse_file(&text, &self.source_file, &self.provider_context) {
+        self.source_text = self.content.to_string();
+        match parse_file(&self.source_text, &self.source_file, &self.provider_context) {
             Ok(parsed) => {
                 self.parsed = Some(parsed);
                 self.parse_error = None;
@@ -86,7 +88,7 @@ impl Document {
     }
 
     pub fn text(&self) -> String {
-        self.content.to_string()
+        self.source_text.clone()
     }
 
     #[allow(dead_code)]
@@ -116,6 +118,56 @@ impl Document {
             Some(self.content.line(line_idx).to_string())
         } else {
             None
+        }
+    }
+
+    /// Ropey maintains these scalar/UTF-16 counts in its text index. Reuse
+    /// them for diagnostics instead of copying and recounting line prefixes.
+    pub(crate) fn scalar_utf16_column(&self, line: u32, column: usize) -> Option<u32> {
+        #[cfg(test)]
+        carina_core::test_work::record(carina_core::test_work::Operation::LintPositionBytes, 1);
+        if line as usize >= self.content.len_lines() {
+            return None;
+        }
+        let line = self.content.line(line as usize);
+        let clamped = column.min(line.len_chars());
+        Some((column + line.char_to_utf16_cu(clamped) - clamped) as u32)
+    }
+
+    pub(crate) fn line_scalar_len(&self, line: u32) -> Option<usize> {
+        ((line as usize) < self.content.len_lines())
+            .then(|| self.content.line(line as usize).len_chars())
+    }
+
+    pub(crate) fn for_diagnostics(
+        &self,
+    ) -> Result<DiagnosticDocument<'_>, ProtectedDocumentDiagnostic> {
+        let source = carina_core::parser::DiagnosticFileText::new(&self.source_text);
+        if source.is_protected_failure() {
+            let failure = self
+                .parse_error()
+                .and_then(ParseError::protected_failure)
+                .expect("failed syntax/preprocessing is admitted through FailedFileText")
+                .clone();
+            let span = failure.range();
+            let position = |line: usize, column: usize| {
+                let line = (line - 1) as u32;
+                Position::new(
+                    line,
+                    self.scalar_utf16_column(line, column - 1)
+                        .unwrap_or((column - 1) as u32),
+                )
+            };
+            let range = tower_lsp::lsp_types::Range::new(
+                position(span.start_line, span.start_column),
+                position(span.end_line, span.end_column),
+            );
+            Err(ProtectedDocumentDiagnostic { failure, range })
+        } else {
+            Ok(DiagnosticDocument {
+                document: self,
+                source,
+            })
         }
     }
 
@@ -149,6 +201,29 @@ impl Document {
     }
 }
 
+/// Only the file-text gate can construct this capability. Its immutable borrow
+/// prevents the underlying document changing after the public decision.
+pub(crate) struct DiagnosticDocument<'a> {
+    document: &'a Document,
+    source: carina_core::parser::DiagnosticFileText<'a>,
+}
+impl DiagnosticDocument<'_> {
+    pub(crate) fn source(&self) -> &carina_core::parser::DiagnosticFileText<'_> {
+        &self.source
+    }
+}
+impl std::ops::Deref for DiagnosticDocument<'_> {
+    type Target = Document;
+    fn deref(&self) -> &Document {
+        self.document
+    }
+}
+#[derive(Debug)]
+pub(crate) struct ProtectedDocumentDiagnostic {
+    pub(crate) failure: carina_core::parser::ProtectedParseFailure,
+    pub(crate) range: tower_lsp::lsp_types::Range,
+}
+
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '.'
 }
@@ -156,6 +231,36 @@ fn is_word_char(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn round11_indexed_parser_columns_match_main_for_all_line_breaks() {
+        for source in [
+            "😀é a\r\n日本 é\n",
+            "a\rb\u{85}c\u{2028}😀d\u{2029}",
+            "",
+            "\n",
+        ] {
+            let doc = Document::new(
+                source.to_owned(),
+                Arc::new(ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                )),
+            );
+            for line in 0..doc.content.len_lines() as u32 + 1 {
+                let text = doc.line_at(line);
+                for column in 0..text.as_ref().map_or(3, |line| line.chars().count() + 3) {
+                    let expected = text
+                        .as_ref()
+                        .map(|line| crate::position::char_offset_to_utf16_offset(line, column));
+                    assert_eq!(
+                        doc.scalar_utf16_column(line, column),
+                        expected,
+                        "{source:?}, {line}:{column}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn analysis_invariant_is_one_diagnostic_and_does_not_panic() {

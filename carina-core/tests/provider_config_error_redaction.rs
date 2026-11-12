@@ -38,7 +38,7 @@ fn assert_config_redaction_with_retryability(
         .with_host_cause(marker);
     let kind = error.kind();
     let wire_before = NativeWireFixture::to_wire(&error);
-    let attributes = IndexMap::from([(
+    let attributes = IndexMap::<String, _>::from([(
         "token".into(),
         Value::Deferred(DeferredValue::Secret(
             Box::new(Value::Concrete(ConcreteValue::String(
@@ -50,7 +50,7 @@ fn assert_config_redaction_with_retryability(
     let failure = carina_core::executor::provider_ready::validate_and_canonicalize_provider_config(
         &support::NativeConfigErrorFactory(error),
         "mock",
-        &attributes,
+        &((attributes.clone()).into()),
         &Default::default(),
     )
     .unwrap_err();

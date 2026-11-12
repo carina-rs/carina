@@ -1661,7 +1661,7 @@ fn possible_default_tags_keep_authored_absence_conditions_pending() {
     )
     .unwrap();
     file.providers[0].default_tags.insert(
-        "app".into(),
+        "app",
         Value::resource_ref(
             crate::resource::RelativeBindingName::new("producer"),
             "value",
@@ -1688,10 +1688,11 @@ fn possible_default_tags_keep_plan_absence_conditions_pending() {
     let config = crate::parser::ProviderConfig {
         name: "mock".into(),
         attributes: Default::default(),
-        default_tags: IndexMap::from([(
+        default_tags: (IndexMap::<String, _>::from([(
             "app".into(),
             Value::root_resource_ref("producer", "value", vec![]),
-        )]),
+        )]))
+        .into(),
         source: None,
         version: None,
         revision: None,
@@ -1738,10 +1739,11 @@ fn default_tag_membership_is_shared_by_presence_predicates_and_conditions() {
         let config = crate::parser::ProviderConfig {
             name: "mock".into(),
             attributes: Default::default(),
-            default_tags: IndexMap::from([(
+            default_tags: (IndexMap::<String, _>::from([(
                 "app".into(),
                 Value::root_resource_ref("producer", "value", vec![]),
-            )]),
+            )]))
+            .into(),
             source: None,
             version: None,
             revision: None,

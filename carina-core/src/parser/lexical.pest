@@ -1,0 +1,22 @@
+// Canonical lexical primitives shared by parser productions.
+identifier_continue = _{ ASCII_ALPHANUMERIC | "_" }
+binding_keyword = _{ "let" }
+iteration_keyword = _{ "for" }
+require_keyword = _{ "require" }
+conditional_keyword = _{ "if" }
+iterable_keyword = _{ "in" }
+call_open = _{ identifier ~ paren_open }
+pipe_step = _{ pipe_token ~ function_call }
+paren_open = _{ "(" }
+paren_close = _{ ")" }
+pipe_token = _{ "|>" }
+single_quote = _{ "'" }
+double_quote = _{ "\"" }
+escape_start = _{ "\\" }
+interpolation_open = _{ "${" }
+interpolation_close = _{ "}" }
+block_comment_open = _{ "/*" }
+block_comment_close = _{ "*/" }
+block_comment_content = _{ block_comment | (!block_comment_close ~ ANY) }
+
+line_comment_open = _{ "//" | "#" }

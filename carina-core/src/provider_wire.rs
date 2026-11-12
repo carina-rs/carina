@@ -1,6 +1,5 @@
 //! The immutable proof that a complete provider input has a wire representation.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -39,7 +38,7 @@ impl fmt::Display for ProviderWireTarget {
 /// Accessors retain the typed reason and path without exposing input values.
 pub struct ProviderWireError {
     target: Box<ProviderWireTarget>,
-    attribute: String,
+    attribute: crate::parser::AttributeKey,
     path: Vec<WirePathSegment>,
     error: Box<ProtocolConvertError>,
 }
@@ -58,11 +57,15 @@ impl fmt::Debug for ProviderWireError {
 }
 
 impl ProviderWireError {
-    fn new(target: &ProviderWireTarget, attribute: &str, error: ProtocolConvertError) -> Self {
+    fn new(
+        target: &ProviderWireTarget,
+        attribute: &crate::parser::AttributeKey,
+        error: ProtocolConvertError,
+    ) -> Self {
         let path = error.value_path();
         Self {
             target: Box::new(target.clone()),
-            attribute: attribute.into(),
+            attribute: attribute.clone(),
             path,
             error: Box::new(error.into_leaf_error()),
         }
@@ -71,7 +74,7 @@ impl ProviderWireError {
     pub fn target(&self) -> &ProviderWireTarget {
         &self.target
     }
-    pub fn attribute(&self) -> &str {
+    pub fn attribute(&self) -> &crate::parser::AttributeKey {
         &self.attribute
     }
     pub fn path(&self) -> &[WirePathSegment] {
@@ -135,7 +138,7 @@ impl ProviderWireError {
             }
         }
         let mut path = String::new();
-        append_key(&mut path, &self.attribute);
+        append_key(&mut path, &self.attribute.to_string());
         for segment in &self.path {
             use std::fmt::Write;
             match segment {
@@ -190,11 +193,16 @@ impl fmt::Debug for WireValue {
 
 /// Checked attributes. Neither entries nor projected values can be replaced.
 #[derive(Debug, Clone)]
-pub struct WireAttributes(Arc<BTreeMap<String, WireValue>>);
+pub struct WireAttributes(Arc<crate::parser::ConfigurationAttributes<WireValue>>);
 
 impl WireAttributes {
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &WireValue)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&crate::parser::AttributeKey, &WireValue)> {
         self.0.iter()
+    }
+    pub fn transport_iter(&self) -> impl Iterator<Item = (&str, &WireValue)> {
+        self.0
+            .iter()
+            .map(|(key, value)| (key.transport_identity(), value))
     }
     pub fn get(&self, attribute: &str) -> Option<&WireValue> {
         self.0.get(attribute)
@@ -363,8 +371,13 @@ fn project_value(
     target: &ProviderWireTarget,
     attribute: &str,
 ) -> Result<WireValue, ProviderWireError> {
-    let projected = project_plaintext(value)
-        .map_err(|error| ProviderWireError::new(target, attribute, error))?;
+    let projected = project_plaintext(value).map_err(|error| {
+        ProviderWireError::new(
+            target,
+            &crate::parser::AttributeKey::literal(attribute.to_owned()),
+            error,
+        )
+    })?;
     Ok(WireValue {
         value: projected,
         secret: matches!(value, Value::Deferred(DeferredValue::Secret(_))),
@@ -377,9 +390,17 @@ fn project_attributes(
 ) -> Result<WireAttributes, ProviderWireError> {
     attributes
         .iter()
-        .map(|(key, value)| project_value(value, target, key).map(|value| (key.clone(), value)))
+        .map(|(key, value)| {
+            project_value(value, target, key)
+                .map(|value| (crate::parser::AttributeKey::literal(key.clone()), value))
+        })
         .collect::<Result<_, _>>()
-        .map(|attributes| WireAttributes(Arc::new(attributes)))
+        .map(
+            |mut attributes: crate::parser::ConfigurationAttributes<_>| {
+                attributes.sort_keys();
+                WireAttributes(Arc::new(attributes))
+            },
+        )
 }
 
 impl sealed::Sealed for ResolvedResource<ProviderModuleSource> {}
@@ -419,6 +440,36 @@ impl ResourceWirePayload for ResolvedDataSource<ProviderModuleSource> {
     }
     fn attributes(&self) -> &IndexMap<String, Value> {
         &self.as_inner().attributes
+    }
+}
+
+impl sealed::Sealed for crate::parser::ConfigurationAttributes<Value> {}
+impl ProviderWirePayload for crate::parser::ConfigurationAttributes<Value> {
+    type Projection = WireAttributes;
+    fn project(
+        &self,
+        target: &ProviderWireTarget,
+        _token: sealed::ProjectionToken,
+    ) -> Result<Self::Projection, ProviderWireError> {
+        self.iter()
+            .map(|(key, value)| {
+                let projected = project_plaintext(value)
+                    .map_err(|error| ProviderWireError::new(target, key, error))?;
+                Ok((
+                    key.clone(),
+                    WireValue {
+                        value: projected,
+                        secret: matches!(value, Value::Deferred(DeferredValue::Secret(_))),
+                    },
+                ))
+            })
+            .collect::<Result<_, _>>()
+            .map(
+                |mut attributes: crate::parser::ConfigurationAttributes<_>| {
+                    attributes.sort_keys();
+                    WireAttributes(Arc::new(attributes))
+                },
+            )
     }
 }
 
@@ -467,6 +518,43 @@ impl ProviderWirePayload for UpdatePatch {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn round7_wire_error_display_and_debug_keep_typed_source_key() {
+        let parsed = crate::parser::parse_file(
+            r#"provider test { "${secret('CANARY')}" = 1 }"#,
+            std::path::Path::new("main.crn"),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let key = parsed.providers[0]
+            .attributes
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let values = crate::parser::ConfigurationAttributes::from_literal_map(std::iter::empty::<(
+            String,
+            crate::resource::Value,
+        )>());
+        let mut values = values;
+        values.insert(
+            key,
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::Duration(
+                std::time::Duration::from_secs(u64::MAX),
+            )),
+        );
+        let error = super::WireReady::try_new(
+            values,
+            super::ProviderWireTarget::Configuration {
+                provider: "test".into(),
+            },
+        )
+        .unwrap_err();
+        for text in [error.to_string(), format!("{error:?}")] {
+            assert!(!text.contains("CANARY"), "{text}");
+            assert!(text.contains("secret(<redacted>)"), "{text}");
+        }
+    }
     use super::*;
 
     #[test]
@@ -476,7 +564,7 @@ mod tests {
                 &ProviderWireTarget::Configuration {
                     provider: "test".into(),
                 },
-                &raw,
+                &((raw.clone()).into()),
                 ProtocolConvertError::DurationOutOfRange,
             );
             let path = error.attribute_path();

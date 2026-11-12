@@ -152,6 +152,7 @@ fn cross_file_duplicate_upstream_state_binding_is_one_error() {
             "let shared = upstream_state { source = \"./upstream\" }\n",
         ),
     ]);
+    std::fs::create_dir(fixture.path().join("upstream")).expect("upstream source dir");
 
     let diagnostics = validate(&fixture);
 

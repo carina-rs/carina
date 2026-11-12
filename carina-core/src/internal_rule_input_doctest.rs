@@ -21,6 +21,10 @@ pub use value_description::ValueDescription;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub mod test_work;
+
 pub mod binding_index;
 #[cfg(test)]
 mod binding_index_split_tests;
@@ -47,6 +51,8 @@ pub mod integer_arithmetic;
 pub mod json_field_order;
 pub mod keywords;
 pub mod lint;
+#[doc(hidden)]
+pub mod lint_text;
 pub mod module;
 pub mod module_resolver;
 pub mod name_override;

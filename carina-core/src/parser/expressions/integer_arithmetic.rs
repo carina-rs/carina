@@ -53,20 +53,25 @@ fn parse_integer_expression_layer<'i>(
         &ExpressionMode<'_>,
     ) -> Result<EvalValue, ParseError>,
 ) -> Result<EvalValue, ParseError> {
-    let mut inner = pair.into_inner();
-    let first = next_pair(&mut inner, child_name, context)?;
-    let has_operator = inner.clone().next().is_some();
-    let operand_mode = has_operator.then(|| mode.for_integer_operand());
-    let operand_mode = operand_mode.as_ref().unwrap_or(mode);
-    let mut value = parse_child(first, ctx, operand_mode)?;
+    let evaluation = ctx.evaluation_site(&pair);
+    evaluation
+        .evaluate(|| {
+            let mut inner = pair.into_inner();
+            let first = next_pair(&mut inner, child_name, context)?;
+            let has_operator = inner.clone().next().is_some();
+            let operand_mode = has_operator.then(|| mode.for_integer_operand());
+            let operand_mode = operand_mode.as_ref().unwrap_or(mode);
+            let mut value = parse_child(first, ctx, operand_mode)?;
 
-    while let Some(operator) = inner.next() {
-        let rhs = next_pair(&mut inner, child_name, &format!("{context} rhs"))?;
-        let (op, span) = parse_integer_operator(operator, ctx)?;
-        let rhs = parse_child(rhs, ctx, operand_mode)?;
-        value = combine_integer_operands(value, op, rhs, span)?;
-    }
-    Ok(value)
+            while let Some(operator) = inner.next() {
+                let rhs = next_pair(&mut inner, child_name, &format!("{context} rhs"))?;
+                let (op, span) = parse_integer_operator(operator, ctx)?;
+                let rhs = parse_child(rhs, ctx, operand_mode)?;
+                value = combine_integer_operands(value, op, rhs, span, ctx)?;
+            }
+            Ok(value)
+        })
+        .map_err(Into::into)
 }
 
 pub(crate) fn parse_integer_operator(
@@ -110,6 +115,23 @@ pub(crate) fn parse_integer_operator(
 }
 
 pub(crate) fn combine_integer_operands(
+    lhs: EvalValue,
+    op: IntegerOp,
+    rhs: EvalValue,
+    span: IntegerOperatorSpan,
+    ctx: &ParseContext,
+) -> Result<EvalValue, ParseError> {
+    let site = ctx.evaluation_site_at(
+        span.location()
+            .expect("parser operator has an authored location"),
+    );
+    let evaluation = ctx.resume_evaluation(&site);
+    evaluation
+        .evaluate(|| combine_integer_operands_inner(lhs, op, rhs, span))
+        .map_err(Into::into)
+}
+
+fn combine_integer_operands_inner(
     lhs: EvalValue,
     op: IntegerOp,
     rhs: EvalValue,

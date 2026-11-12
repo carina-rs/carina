@@ -158,7 +158,8 @@ fn config(default_tag: Value) -> ExpandedProviderConfig {
     ExpandedProviderConfig {
         name: "test".into(),
         attributes: Default::default(),
-        default_tags: indexmap::IndexMap::from([("unrelated".into(), default_tag)]),
+        default_tags: (indexmap::IndexMap::<String, _>::from([("unrelated".into(), default_tag)]))
+            .into(),
         source: None,
         version: None,
         revision: None,
@@ -434,7 +435,7 @@ fn native_factory_rejects_non_wire_config_before_semantic_validation() {
     let factory = ConfigFactory(AtomicUsize::new(0));
     let mut config = config(duration(1));
     config.attributes.insert(
-        "extra".into(),
+        "extra",
         tags(Value::Concrete(ConcreteValue::Duration(
             std::time::Duration::from_secs(u64::MAX),
         ))),

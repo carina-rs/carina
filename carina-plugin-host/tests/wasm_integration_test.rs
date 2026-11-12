@@ -208,10 +208,11 @@ async fn wire_boundary_default_tag_fails_before_native_and_guest_crud() {
             let mut configs = [carina_core::parser::ExpandedProviderConfig {
                 name: "mock".into(),
                 attributes: Default::default(),
-                default_tags: indexmap::IndexMap::from([(
+                default_tags: (indexmap::IndexMap::<String, _>::from([(
                     "unrelated".into(),
                     Value::Concrete(ConcreteValue::Duration(Duration::from_secs(u64::MAX))),
-                )]),
+                )]))
+                .into(),
                 source: None,
                 version: None,
                 revision: None,
@@ -283,7 +284,7 @@ async fn wire_boundary_default_tag_fails_before_native_and_guest_crud() {
                 1
             );
             configs[0].default_tags.insert(
-                "unrelated".into(),
+                "unrelated",
                 Value::Concrete(ConcreteValue::Duration(Duration::from_secs(
                     i64::MAX as u64,
                 ))),
@@ -301,7 +302,7 @@ async fn wire_boundary_default_tag_fails_before_native_and_guest_crud() {
                 .expect_err("wire-encodable Duration still violates the tags declaration");
             assert!(request.to_string().contains("provider default_tags"));
             configs[0].default_tags.insert(
-                "unrelated".into(),
+                "unrelated",
                 Value::Concrete(ConcreteValue::String("valid".into())),
             );
             let context = ProviderPreparationContext::for_test(
@@ -846,6 +847,7 @@ async fn load_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile:
         &compiled_cache_dir(cache.path()),
         locked_egress.as_ref(),
         &aws,
+        &mut carina_plugin_host::WasmLoadNoticeSink::new(move |_| {}),
     )
     .await
     .expect("Failed to load WASM provider");
@@ -866,6 +868,7 @@ async fn load_aws_http_factory(
         &compiled_cache_dir(cache.path()),
         locked_egress.as_ref(),
         &aws,
+        &mut carina_plugin_host::WasmLoadNoticeSink::new(move |_| {}),
     )
     .await
     .expect("Failed to load AWS HTTP probe WASM provider");
@@ -898,6 +901,7 @@ async fn load_http_factory_with_name_and_class(
         &compiled_cache_dir(cache.path()),
         locked_egress.as_ref(),
         &aws,
+        &mut carina_plugin_host::WasmLoadNoticeSink::new(move |_| {}),
     )
     .await
     .expect("Failed to load HTTP probe WASM provider");
@@ -947,6 +951,7 @@ async fn load_schema_http_factory(
     let factory = WasmProviderFactory::from_bytes_with_cache_dir(
         mock_http_load(&wasm_bytes),
         &compiled_cache_dir(cache.path()),
+        &mut carina_plugin_host::WasmLoadNoticeSink::new(move |_| {}),
     )
     .await
     .expect("Failed to load HTTP probe WASM provider");
@@ -1352,12 +1357,12 @@ fn resolved_provider_config(
     let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = vec![carina_core::parser::ProviderConfig {
         name: name.to_string(),
-        attributes,
-        default_tags: indexmap::IndexMap::new(),
+        attributes: (attributes).into(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: indexmap::IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     }];
     carina_core::validation::deferred_types::with_session_for_test(
@@ -1521,6 +1526,7 @@ async fn schema_only_loads_an_aws_world_without_a_credential_source() {
     let factory = WasmProviderFactory::from_bytes_with_cache_dir(
         mock_http_aws_load_with_class(&wasm_bytes, ProviderTrustClass::Aws),
         &compiled_cache_dir(cache.path()),
+        &mut carina_plugin_host::WasmLoadNoticeSink::new(move |_| {}),
     )
     .await
     .expect("schema-only loading must link the failing credential import");
@@ -1543,6 +1549,7 @@ async fn schema_only_metadata_factory_links_aws_credentials_without_a_credential
     let factory = SchemaOnlyWasmProviderFactory::from_bytes(
         mock_http_aws_load_with_class(&wasm_bytes, ProviderTrustClass::Aws),
         &user_dirs,
+        &mut carina_plugin_host::WasmLoadNoticeSink::new(move |_| {}),
     )
     .await
     .expect("metadata-only loading must link the AWS credential import without a source");
@@ -1577,6 +1584,7 @@ async fn aws_kind_runtime_rejects_an_http_world_before_provisioning_credentials(
         &compiled_cache_dir(cache.path()),
         locked_egress.as_ref(),
         &aws,
+        &mut carina_plugin_host::WasmLoadNoticeSink::new(move |_| {}),
     )
     .await;
     let error = match result {
@@ -1612,6 +1620,7 @@ async fn aws_world_without_credential_calls_loads_as_aws_kind_at_runtime() {
         &compiled_cache_dir(cache.path()),
         locked_egress.as_ref(),
         &aws,
+        &mut carina_plugin_host::WasmLoadNoticeSink::new(move |_| {}),
     )
     .await
     .expect("the AWS world must retain its credential import even when guest code never calls it");
@@ -1635,6 +1644,7 @@ async fn aws_world_provision_failure_remains_a_typed_load_error() {
         &compiled_cache_dir(cache.path()),
         locked_egress.as_ref(),
         &aws,
+        &mut carina_plugin_host::WasmLoadNoticeSink::new(move |_| {}),
     )
     .await;
 
@@ -1664,6 +1674,7 @@ async fn non_aws_kinds_never_provision_and_cannot_instantiate_an_aws_world() {
             &compiled_cache_dir(cache.path()),
             locked_egress.as_ref(),
             &aws,
+            &mut carina_plugin_host::WasmLoadNoticeSink::new(move |_| {}),
         )
         .await;
         let error = match result {
@@ -4750,6 +4761,46 @@ async fn test_wasm_repeated_validation_timeout_survives_interleaved_successes() 
             ))
         ));
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_validation_recovery_uses_the_typed_notice_sink() {
+    let path = skip_if_no_wasm!();
+    let cache = tempfile::tempdir().unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = Arc::clone(&notices);
+    let factory = WasmProviderFactory::from_bytes_with_cache_dir(
+        mock_load(&bytes),
+        &compiled_cache_dir(cache.path()),
+        &mut carina_plugin_host::WasmLoadNoticeSink::new(move |notice| {
+            captured.lock().unwrap().push(notice.to_string())
+        }),
+    )
+    .await
+    .unwrap();
+    let trap = resolved_provider_config(
+        factory.name(),
+        indexmap::IndexMap::from([(
+            "__mock_validate_config_trap__".to_string(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        )]),
+    );
+    carina_core::executor::prepare_provider_ready_config(&factory, &trap)
+        .expect_err("poison the instance");
+    let clean = resolved_provider_config(factory.name(), indexmap::IndexMap::new());
+    carina_core::executor::prepare_provider_ready_config(&factory, &clean).unwrap();
+    let notices = notices.lock().unwrap();
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|notice| notice.starts_with(
+                "rebuilt poisoned WASM provider validation instance; previous poison reason:"
+            ))
+            .count(),
+        1,
+        "{notices:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

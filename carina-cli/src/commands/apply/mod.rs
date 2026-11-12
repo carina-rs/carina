@@ -1951,7 +1951,12 @@ async fn run_apply_with_observer_factory(
     let backend_file = loaded.backend_file;
 
     let base_dir = project;
-    let providers = ProviderLoad::load(runtime, &parsed.providers, base_dir)?;
+    let providers = ProviderLoad::load(
+        runtime,
+        &parsed.providers,
+        base_dir,
+        &mut crate::commands::human_provider_notices(runtime.color_mode()),
+    )?;
     let mut validated_config = providers.validate_config_pair(
         parsed,
         loaded.unresolved_parsed,
@@ -3868,7 +3873,13 @@ async fn run_apply_from_plan_with_observer_factory(
         .iter()
         .map(carina_core::parser::ProviderConfig::loading_projection)
         .collect::<Vec<_>>();
-    let providers = ProviderLoad::load(runtime, &loading_configs, base_dir)?.into_complete()?;
+    let providers = ProviderLoad::load(
+        runtime,
+        &loading_configs,
+        base_dir,
+        &mut crate::commands::human_provider_notices(runtime.color_mode()),
+    )?
+    .into_complete()?;
     // Backend drift remains a mutation-safety gate even when the saved plan
     // has no secrets. Loading the syntax tree is deliberately separate from
     // validation and provider-config resolution: placeholder-free plans may
@@ -4669,9 +4680,14 @@ async fn run_apply_from_plan_locked(
         .iter()
         .map(carina_core::parser::ProviderConfig::loading_projection)
         .collect::<Vec<_>>();
-    let inspected_plan = match ProviderLoad::load(runtime, &loading_configs, &source)
-        .and_then(ProviderLoad::into_complete)
-        .and_then(|providers| ProviderBoundPlanFile::for_test(inspected_plan, providers, &source))
+    let inspected_plan = match ProviderLoad::load(
+        runtime,
+        &loading_configs,
+        &source,
+        &mut crate::commands::human_provider_notices(runtime.color_mode()),
+    )
+    .and_then(ProviderLoad::into_complete)
+    .and_then(|providers| ProviderBoundPlanFile::for_test(inspected_plan, providers, &source))
     {
         Ok(inspected_plan) => inspected_plan,
         Err(error) => {

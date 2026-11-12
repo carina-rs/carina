@@ -3,6 +3,10 @@
 //! This module provides functions for static analysis of `.crn` source files,
 //! such as detecting list literal syntax where block syntax is preferred.
 
+#[cfg(test)]
+#[path = "lint_main_reference.rs"]
+mod round11_main_reference;
+
 use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::fs;
@@ -17,26 +21,52 @@ use crate::schema::CompiledResourceSchema as ResourceSchema;
 /// Find list literal syntax (`attr = [...]`) for the given attribute names.
 /// Returns attribute name and 1-indexed line number for each occurrence.
 pub fn find_list_literal_attrs(source: &str, attr_names: &HashSet<String>) -> Vec<(String, usize)> {
+    find_list_literal_attrs_in_source(&crate::parser::DiagnosticFileText::new(source), attr_names)
+}
+
+pub fn find_list_literal_attrs_in_source(
+    source: &crate::parser::DiagnosticFileText<'_>,
+    attr_names: &HashSet<String>,
+) -> Vec<(String, usize)> {
+    let Some(admitted) = crate::parser::LintSource::new(source) else {
+        return Vec::new();
+    };
+    let source = admitted.original_text();
     let mut results = Vec::new();
+    let names = crate::lint_text::PrefixNames::new(attr_names.iter().map(String::as_str));
+    #[cfg(any(test, feature = "test-utils"))]
+    crate::test_work::record(crate::test_work::Operation::LintScanBytes, source.len());
 
     for (line_idx, line) in source.lines().enumerate() {
         let trimmed = line.trim_start();
-        for attr_name in attr_names {
-            if !trimmed.starts_with(attr_name.as_str()) {
+        let matches = names.matches(trimmed);
+        if matches.is_empty() {
+            continue;
+        }
+        // Index whitespace once too: overlapping schema prefixes must not
+        // repeatedly trim the same remaining suffix.
+        let mut next_non_whitespace = vec![trimmed.len(); trimmed.len() + 1];
+        let mut next = trimmed.len();
+        for (byte, ch) in trimmed.char_indices().rev() {
+            if !ch.is_whitespace() {
+                next = byte;
+            }
+            next_non_whitespace[byte] = next;
+        }
+        #[cfg(any(test, feature = "test-utils"))]
+        crate::test_work::record(crate::test_work::Operation::LintScanBytes, trimmed.len());
+        for attr_name in matches {
+            let end = attr_name.len();
+            if !matches!(trimmed.as_bytes().get(end), Some(b' ' | b'=')) {
                 continue;
             }
-            let after = &trimmed[attr_name.len()..];
-            // Must be followed by whitespace or '=' (not part of a longer identifier)
-            if !after.starts_with(' ') && !after.starts_with('=') {
+            let equal = next_non_whitespace[end];
+            if trimmed.as_bytes().get(equal) != Some(&b'=') {
                 continue;
             }
-            // Check for `= [` pattern (list literal)
-            let after_trimmed = after.trim_start();
-            if let Some(rest) = after_trimmed.strip_prefix('=') {
-                let rest_trimmed = rest.trim_start();
-                if rest_trimmed.starts_with('[') {
-                    results.push((attr_name.clone(), line_idx + 1)); // 1-indexed line
-                }
+            let value = next_non_whitespace[equal + 1];
+            if trimmed.as_bytes().get(value) == Some(&b'[') {
+                results.push((attr_name.to_owned(), line_idx + 1));
             }
         }
     }
@@ -88,13 +118,64 @@ pub struct PipePreferredWarning {
     pub line: usize,
 }
 
+/// A lint and its admitted source range. Construction is confined to the
+/// production collectors; legacy wrappers can discard positions purely.
+#[derive(Debug)]
+pub struct LintFinding<T> {
+    detail: T,
+    span: crate::parser::ParseWarningSpan,
+    editor: (usize, usize, usize),
+}
+
+impl<T> LintFinding<T> {
+    pub fn detail(&self) -> &T {
+        &self.detail
+    }
+    pub fn span(&self) -> &crate::parser::ParseWarningSpan {
+        &self.span
+    }
+    /// Zero-based editor presentation, preserving legacy public positions.
+    pub fn editor_range(&self) -> (u32, u32, u32) {
+        (
+            self.editor.0 as u32,
+            self.editor.1 as u32,
+            self.editor.2 as u32,
+        )
+    }
+    pub fn into_detail(self) -> T {
+        self.detail
+    }
+}
+
 /// Find direct calls to pipe-preferred transformation functions.
 ///
 /// Detects patterns like `join("-", parts)` where the pipe form
 /// `parts |> join("-")` is recommended. Only warns when the function
 /// call is NOT preceded by `|>` on the same line.
 pub fn find_pipe_preferred_direct_calls(source: &str) -> Vec<PipePreferredWarning> {
+    pipe_preferred_direct_call_findings(source)
+        .into_iter()
+        .map(LintFinding::into_detail)
+        .collect()
+}
+
+/// Collect pipe hints with source ownership and admitted editor positions.
+pub fn pipe_preferred_direct_call_findings(source: &str) -> Vec<LintFinding<PipePreferredWarning>> {
+    pipe_preferred_direct_call_findings_in_source(&crate::parser::DiagnosticFileText::new(source))
+}
+
+pub fn pipe_preferred_direct_call_findings_in_source(
+    source: &crate::parser::DiagnosticFileText<'_>,
+) -> Vec<LintFinding<PipePreferredWarning>> {
+    let Some(admitted) = crate::parser::LintSource::new(source) else {
+        return Vec::new();
+    };
+    let source = admitted.original_text();
     let mut warnings = Vec::new();
+    let patterns = PIPE_PREFERRED_FUNCTIONS
+        .iter()
+        .map(|name| format!("{name}("))
+        .collect::<Vec<_>>();
 
     for (line_idx, line) in source.lines().enumerate() {
         let trimmed = line.trim();
@@ -104,45 +185,53 @@ pub fn find_pipe_preferred_direct_calls(source: &str) -> Vec<PipePreferredWarnin
             continue;
         }
 
-        for &func_name in PIPE_PREFERRED_FUNCTIONS {
-            let pattern = format!("{}(", func_name);
-            // Search for all occurrences of the pattern on this line
-            let mut search_from = 0;
-            while let Some(rel_pos) = trimmed[search_from..].find(&pattern) {
-                let pos = search_from + rel_pos;
-                search_from = pos + pattern.len();
-
-                // Check that this is not part of a longer identifier
-                // (e.g., "my_join(" should not match "join(")
-                if pos > 0 {
-                    let prev_char = trimmed.as_bytes()[pos - 1];
-                    if prev_char.is_ascii_alphanumeric() || prev_char == b'_' {
-                        continue;
+        // Scan once, preserving the existing heuristic: any raw pipe marker
+        // stops hints for the rest of the line, even inside a quoted string,
+        // and every double quote toggles string state (including escaped ones).
+        // Buckets retain the legacy per-function ordering on each line.
+        let mut calls: [Vec<usize>; PIPE_PREFERRED_FUNCTIONS.len()] =
+            std::array::from_fn(|_| Vec::new());
+        let mut in_string = false;
+        let mut previous_non_whitespace = None;
+        for (pos, ch) in trimmed.char_indices() {
+            #[cfg(any(test, feature = "test-utils"))]
+            crate::test_work::record(crate::test_work::Operation::PipeHintCharacter, 1);
+            let rest = &trimmed[pos..];
+            if rest.starts_with("|>") {
+                break;
+            }
+            let previous_identifier = pos > 0 && {
+                let previous = trimmed.as_bytes()[pos - 1];
+                previous.is_ascii_alphanumeric() || previous == b'_'
+            };
+            if !in_string && !previous_identifier && previous_non_whitespace != Some(':') {
+                for (index, pattern) in patterns.iter().enumerate() {
+                    if rest.starts_with(pattern) {
+                        calls[index].push(pos);
                     }
                 }
-
-                // Check if this is a pipe call (|> before the function on this line)
-                let before = &trimmed[..pos];
-                if before.contains("|>") {
-                    continue;
-                }
-
-                // Rough check: skip if inside a string literal
-                if is_inside_string(trimmed, pos) {
-                    continue;
-                }
-
-                // Skip if this is a type annotation position: `name: map(...)`
-                // A ':' followed only by whitespace before the function name means
-                // we're in a type position, not a function call.
-                let before_trimmed = before.trim_end();
-                if before_trimmed.ends_with(':') {
-                    continue;
-                }
-
-                warnings.push(PipePreferredWarning {
-                    name: func_name.to_string(),
-                    line: line_idx + 1,
+            }
+            if ch == '"' {
+                in_string = !in_string;
+            }
+            if !ch.is_whitespace() {
+                previous_non_whitespace = Some(ch);
+            }
+        }
+        for ((&func_name, pattern), calls) in
+            PIPE_PREFERRED_FUNCTIONS.iter().zip(&patterns).zip(calls)
+        {
+            for pos in calls {
+                let start = trimmed.as_ptr() as usize - source.as_ptr() as usize + pos;
+                let (span, editor) =
+                    admitted.lint_ranges(start..start + func_name.len(), pattern, func_name.len());
+                warnings.push(LintFinding {
+                    detail: PipePreferredWarning {
+                        name: func_name.to_string(),
+                        line: line_idx + 1,
+                    },
+                    span,
+                    editor,
                 });
             }
         }
@@ -186,12 +275,13 @@ fn is_snake_case(name: &str) -> bool {
 /// The name is delimited by whitespace or `=`. Returns `None` if the name is
 /// empty or starts with `_`. `for` lines use `extract_for_binding_names`
 /// instead because they can carry two names (map form).
-fn extract_binding_name(after_keyword: &str) -> Option<String> {
+fn extract_binding_name(after_keyword: &str) -> Option<&str> {
     let trimmed = after_keyword.trim_start();
-    let name: String = trimmed
-        .chars()
-        .take_while(|c| !c.is_whitespace() && *c != '=')
-        .collect();
+    let end = trimmed
+        .char_indices()
+        .find_map(|(byte, ch)| (ch.is_whitespace() || ch == '=').then_some(byte))
+        .unwrap_or(trimmed.len());
+    let name = &trimmed[..end];
 
     if name.is_empty() || name.starts_with('_') {
         return None;
@@ -208,11 +298,11 @@ fn extract_binding_name(after_keyword: &str) -> Option<String> {
 ///
 /// The "header" is the portion before ` in `. Names beginning with `_` are
 /// dropped (discard/unused markers are not subject to the naming check).
-fn extract_for_binding_names(after_for: &str) -> Vec<String> {
+fn extract_for_binding_names(after_for: &str) -> Vec<&str> {
     let header = after_for.split(" in ").next().unwrap_or("");
     header
         .split(',')
-        .map(|part| part.trim().to_string())
+        .map(str::trim)
         .filter(|part| !part.is_empty() && !part.starts_with('_'))
         .collect()
 }
@@ -222,7 +312,27 @@ fn extract_for_binding_names(after_for: &str) -> Vec<String> {
 /// Scans lines for `let <name> =` patterns and checks if `<name>` follows
 /// snake_case convention. Bindings starting with `_` are skipped (internal/synthetic).
 pub fn find_non_snake_case_bindings(source: &str) -> Vec<NamingWarning> {
-    let mut warnings = Vec::new();
+    non_snake_case_binding_findings(source)
+        .into_iter()
+        .map(LintFinding::into_detail)
+        .collect()
+}
+
+/// Collect naming findings without losing the admitted occurrence's range.
+pub fn non_snake_case_binding_findings(source: &str) -> Vec<LintFinding<NamingWarning>> {
+    non_snake_case_binding_findings_in_source(&crate::parser::DiagnosticFileText::new(source))
+}
+
+pub fn non_snake_case_binding_findings_in_source(
+    source: &crate::parser::DiagnosticFileText<'_>,
+) -> Vec<LintFinding<NamingWarning>> {
+    let Some(admitted) = crate::parser::LintSource::new(source) else {
+        return Vec::new();
+    };
+    let source = admitted.text();
+    let mut candidates = Vec::new();
+    #[cfg(any(test, feature = "test-utils"))]
+    crate::test_work::record(crate::test_work::Operation::LintScanBytes, source.len());
 
     for (line_idx, line) in source.lines().enumerate() {
         let trimmed = line.trim_start();
@@ -235,7 +345,7 @@ pub fn find_non_snake_case_bindings(source: &str) -> Vec<NamingWarning> {
         // Extract binding name(s) from `let`, `for`, or `import` patterns.
         // `for` may have two names (map-form: `for k, v in m`); every other
         // form has at most one.
-        let names: Vec<String> = if let Some(rest) = trimmed.strip_prefix("let ") {
+        let names: Vec<&str> = if let Some(rest) = trimmed.strip_prefix("let ") {
             extract_binding_name(rest).into_iter().collect()
         } else if let Some(rest) = trimmed.strip_prefix("for ") {
             extract_for_binding_names(rest)
@@ -244,16 +354,22 @@ pub fn find_non_snake_case_bindings(source: &str) -> Vec<NamingWarning> {
         };
 
         for name in names {
-            if !is_snake_case(&name) {
-                warnings.push(NamingWarning {
-                    name,
-                    line: line_idx + 1,
-                });
+            if !is_snake_case(name) {
+                let name_start = name.as_ptr() as usize - source.as_ptr() as usize;
+                let range = admitted.first_public_occurrence(name_start..name_start + name.len());
+                candidates.push((range, line_idx + 1));
             }
         }
     }
 
-    warnings
+    admitted.collect_names(candidates, |name, line, range| {
+        let (span, editor) = admitted.lint_ranges(range, &name, name.len());
+        LintFinding {
+            detail: NamingWarning { name, line },
+            span,
+            editor,
+        }
+    })
 }
 
 /// Casing style for a tag key.
@@ -318,7 +434,17 @@ fn classify_tag_key_style(name: &str) -> TagKeyStyle {
 /// Returns entries with key name, detected style, line, and character column.
 /// Does not judge consistency — call `find_mixed_tag_key_styles` on the aggregated entries.
 pub fn collect_tag_keys(source: &str) -> Vec<TagKeyEntry> {
-    let mut entries = Vec::new();
+    collect_tag_keys_in_source(&crate::parser::DiagnosticFileText::new(source))
+}
+
+pub fn collect_tag_keys_in_source(
+    source: &crate::parser::DiagnosticFileText<'_>,
+) -> Vec<TagKeyEntry> {
+    let Some(admitted) = crate::parser::LintSource::new(source) else {
+        return Vec::new();
+    };
+    let source = admitted.text();
+    let mut candidates = Vec::new();
     let mut in_tags_block = false;
     let mut brace_depth: usize = 0;
 
@@ -369,19 +495,24 @@ pub fn collect_tag_keys(source: &str) -> Vec<TagKeyEntry> {
                 if !key.is_empty() && key.chars().all(|c| c.is_alphanumeric() || c == '_') {
                     let key_start_in_trimmed = key_segment.len() - key_segment.trim_start().len();
                     let key_start_byte = trimmed_start_byte + key_start_in_trimmed;
-                    entries.push(TagKeyEntry {
-                        key: key.to_string(),
-                        style: classify_tag_key_style(key),
-                        line: line_number,
-                        column: line[..key_start_byte].chars().count(),
-                        file: None,
-                    });
+                    let line_start = line.as_ptr() as usize - source.as_ptr() as usize;
+                    let start = line_start + key_start_byte;
+                    candidates.push((
+                        start..start + key.len(),
+                        (line_number, admitted.position(start).1 - 1),
+                    ));
                 }
             }
         }
     }
 
-    entries
+    admitted.collect_names(candidates, |key, (line, column), _| TagKeyEntry {
+        style: classify_tag_key_style(&key),
+        column,
+        key,
+        line,
+        file: None,
+    })
 }
 
 /// Collect tag keys from one source file and attach its path to every entry.
@@ -534,13 +665,21 @@ where
 {
     use crate::parser::AttributePathSegment;
     let warnings = find_mixed_tag_key_styles(entries);
+    let mut by_key = HashMap::new();
+    for warning in &warnings {
+        #[cfg(any(test, feature = "test-utils"))]
+        crate::test_work::record(crate::test_work::Operation::LintWarningMatch, 1);
+        by_key
+            .entry((warning.file.as_deref(), warning.line, warning.column))
+            .or_insert(warning);
+    }
     tree.resources()
         .flat_map(|resource| resource.attribute_keys())
         .chain(tree.syntax().attribute_keys())
         .filter_map(|key| {
             let [
                 AttributePathSegment::Attribute(attribute),
-                AttributePathSegment::Key(name),
+                AttributePathSegment::Key(_),
             ] = key.path()
             else {
                 return None;
@@ -548,13 +687,17 @@ where
             if attribute != "tags" {
                 return None;
             }
-            warnings
-                .iter()
-                .find(|warning| {
-                    warning.key == *name
-                        && warning.file.as_deref() == Some(key.location().file().path())
+            #[cfg(any(test, feature = "test-utils"))]
+            crate::test_work::record(crate::test_work::Operation::LintWarningMatch, 1);
+            by_key
+                .get(&(
+                    Some(key.location().file().path()),
+                    key.location().span().start_line(),
+                    key.location().span().start_column() - 1,
+                ))
+                .map(|warning| {
+                    crate::parser::Located::new(key.location().clone(), (*warning).clone())
                 })
-                .map(|warning| crate::parser::Located::new(key.location().clone(), warning.clone()))
         })
         .collect()
 }
@@ -574,25 +717,27 @@ pub fn mixed_tag_key_style_message(warning: &TagKeyWarning) -> String {
     )
 }
 
-/// Rough heuristic to check if a byte position is inside a string literal.
-fn is_inside_string(line: &str, pos: usize) -> bool {
-    let mut in_string = false;
-    for (i, ch) in line.char_indices() {
-        if i >= pos {
-            break;
-        }
-        if ch == '"' {
-            in_string = !in_string;
+/// The lint discards a secret key before constructing a diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DuplicateAttrName {
+    Public(String),
+    InsideSecret,
+}
+
+impl std::fmt::Display for DuplicateAttrName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Public(name) => f.write_str(name),
+            Self::InsideSecret => f.write_str("<redacted>"),
         }
     }
-    in_string
 }
 
 /// A duplicate attribute warning with its source position and first occurrence line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DuplicateAttr {
     /// The attribute name that is duplicated
-    pub name: String,
+    name: DuplicateAttrName,
     /// 1-indexed line number of the duplicate occurrence
     pub line: usize,
     /// 1-indexed character column of the duplicate occurrence
@@ -614,7 +759,17 @@ pub struct DuplicateAttr {
 /// their name collisions as hard duplicate-declaration errors. Emitting a
 /// second warning that says the last value wins would contradict that error.
 pub fn find_duplicate_attrs(source: &str) -> Vec<DuplicateAttr> {
-    let Ok(preprocessed_file) = preprocess_file(source) else {
+    find_duplicate_attrs_in_source(&crate::parser::DiagnosticFileText::new(source))
+}
+
+pub fn find_duplicate_attrs_in_source(
+    source: &crate::parser::DiagnosticFileText<'_>,
+) -> Vec<DuplicateAttr> {
+    let Some(text) = source.public_text() else {
+        return Vec::new();
+    };
+
+    let Ok(preprocessed_file) = preprocess_file(text) else {
         return Vec::new();
     };
     let Ok(pairs) = preprocessed_file.parse() else {
@@ -622,16 +777,126 @@ pub fn find_duplicate_attrs(source: &str) -> Vec<DuplicateAttr> {
     };
 
     let mut results = Vec::new();
+    let source = crate::parser::LintSource::new(source).expect("public source was admitted");
     for pair in pairs {
-        find_duplicate_attrs_in_pair(pair, &preprocessed_file, &mut results);
+        find_duplicate_attrs_in_pair(pair, &preprocessed_file, &source, &mut results);
     }
     results.sort_by_key(|duplicate| (duplicate.line, duplicate.column));
     results
 }
 
+impl DuplicateAttr {
+    pub fn name(&self) -> &DuplicateAttrName {
+        &self.name
+    }
+
+    /// Location-free wording shared by diagnostic clients.
+    pub fn message(&self) -> String {
+        self.format_message(false)
+    }
+
+    /// Legacy validate wording, including the duplicate occurrence line.
+    pub fn message_with_location(&self) -> String {
+        self.format_message(true)
+    }
+
+    fn format_message(&self, include_location: bool) -> String {
+        let occurrence = if include_location {
+            format!(" at line {}", self.line)
+        } else {
+            String::new()
+        };
+        format!(
+            "Duplicate attribute '{}'{occurrence} (first defined on line {}). The last value will be used.",
+            self.name, self.first_line
+        )
+    }
+}
+
+#[cfg(test)]
+mod secret_duplicate_tests {
+    use super::*;
+
+    #[test]
+    fn constraint_secret_calls_own_duplicate_names_and_locations() {
+        let source = "require secret(x[{ 'private-key' = 1 'private-key' = 2 }]), 'no'";
+        let findings = find_duplicate_attrs(source);
+        assert_eq!(findings.len(), 1);
+        assert!(matches!(
+            findings[0].name(),
+            DuplicateAttrName::InsideSecret
+        ));
+        assert!(!format!("{:?}", findings[0]).contains("private-key"));
+        assert_eq!(findings[0].column, source.find("secret").unwrap() + 1);
+        assert_eq!(findings[0].end_column, findings[0].column + 6);
+    }
+
+    #[test]
+    fn duplicate_attribute_name_is_typed_before_rendering() {
+        let secret =
+            find_duplicate_attrs("let hidden = secret({ 'private-key' = 1 'private-key' = 2 })");
+        assert!(matches!(secret[0].name(), DuplicateAttrName::InsideSecret));
+        assert!(!format!("{:?}", secret[0]).contains("private-key"));
+        assert_eq!(
+            secret[0].message(),
+            "Duplicate attribute '<redacted>' (first defined on line 1). The last value will be used."
+        );
+        assert_eq!(
+            secret[0].message_with_location(),
+            "Duplicate attribute '<redacted>' at line 1 (first defined on line 1). The last value will be used."
+        );
+        // Identical display text must not turn a public authored key into a secret.
+        let public = find_duplicate_attrs("let value = { '<redacted>' = 1 '<redacted>' = 2 }");
+        assert!(matches!(public[0].name(), DuplicateAttrName::Public(_)));
+        assert_eq!(public[0].name().to_string(), "<redacted>");
+    }
+
+    #[test]
+    fn duplicate_keys_inside_secrets_never_retain_private_names_or_spans() {
+        for expression in [
+            "secret({ 'private-key' = 'a' 'private-key' = 'b' })",
+            "secret([{ nested = { 'private-key' = 'a' 'private-key' = 'b' } }])",
+            "secret(secret({ 'private-key' = 'a' 'private-key' = 'b' }))",
+            "secret({\n 'private-key' = 'a'\n 'private-key' = 'b'\n})",
+        ] {
+            let source = format!("exports {{ hidden = {expression} }}");
+            let findings = find_duplicate_attrs(&source);
+            assert_eq!(findings.len(), 1);
+            let finding = &findings[0];
+            assert_eq!(finding.name.to_string(), "<redacted>");
+            assert!(!finding.message().contains("private-key"));
+            assert_eq!(finding.column, source.find("secret").unwrap() + 1);
+            assert_eq!(finding.end_column, finding.column + 6);
+            assert_eq!(finding.first_line, 1);
+        }
+    }
+
+    #[test]
+    fn piped_secrets_own_the_duplicates_in_their_input() {
+        let source = "let hidden = { 'private-key' = 'a' 'private-key' = 'b' } |> secret()";
+        let findings = find_duplicate_attrs(source);
+        assert_eq!(findings.len(), 1);
+        let finding = &findings[0];
+        assert_eq!(finding.name.to_string(), "<redacted>");
+        assert_eq!(finding.column, source.find("secret").unwrap() + 1);
+        assert_eq!(finding.end_column, finding.column + 6);
+    }
+
+    #[test]
+    fn pipeline_arguments_after_secret_keep_their_public_locations() {
+        let source = "let hidden = { 'private-key' = 'a' 'private-key' = 'b' } |> secret() |> passthrough({ public = 1 public = 2 })";
+        let findings = find_duplicate_attrs(source);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].name.to_string(), "<redacted>");
+        assert_eq!(findings[1].name.to_string(), "public");
+        assert_eq!(findings[1].column, source.rfind("public").unwrap() + 1);
+    }
+}
+
 fn find_duplicate_attrs_in_pair<'source>(
     pair: Pair<'source, Rule>,
     preprocessed_file: &PreprocessedFile,
+    source: &crate::parser::LintSource<'_>,
     results: &mut Vec<DuplicateAttr>,
 ) {
     let children: Vec<_> = pair.into_inner().collect();
@@ -643,20 +908,30 @@ fn find_duplicate_attrs_in_pair<'source>(
         };
 
         if let Some(first_span) = first_spans.get(&name) {
-            // Position lookup scans the source in pest, so defer it until a
-            // duplicate actually needs a diagnostic. Heredoc preprocessing
-            // only changes text from `<<` to the end of its line; a valid
-            // marker cannot have a later key on that line, so key columns are
-            // unchanged even though only line numbers need remapping here.
-            let start = preprocessed_file.original_position(key_span.start());
-            let end = preprocessed_file.original_position(key_span.end());
-            let first = preprocessed_file.original_position(first_span.start());
-            results.push(DuplicateAttr {
+            // Map byte ownership first; LintSource's shared position index
+            // supplies scalar/editor coordinates without recounting the line.
+            let key = source.admit_key(
                 name,
-                line: start.line(),
-                column: start.column(),
-                end_column: end.column(),
-                first_line: first.line(),
+                preprocessed_file.original_byte(key_span.start())
+                    ..preprocessed_file.original_byte(key_span.end()),
+                preprocessed_file.original_byte(first_span.start()),
+            );
+            let start = source.position(key.range.start);
+            let end = source.position(key.range.end);
+            let first = source.position(key.first);
+            results.push(DuplicateAttr {
+                name: match key.name {
+                    crate::parser::AdmittedLintName::Public(name) => {
+                        DuplicateAttrName::Public(name)
+                    }
+                    crate::parser::AdmittedLintName::InsideSecret => {
+                        DuplicateAttrName::InsideSecret
+                    }
+                },
+                line: start.0,
+                column: start.1,
+                end_column: end.1,
+                first_line: first.0,
             });
         } else {
             first_spans.insert(name, key_span);
@@ -664,7 +939,7 @@ fn find_duplicate_attrs_in_pair<'source>(
     }
 
     for child in children {
-        find_duplicate_attrs_in_pair(child, preprocessed_file, results);
+        find_duplicate_attrs_in_pair(child, preprocessed_file, source, results);
     }
 }
 
@@ -729,7 +1004,91 @@ fn fixed_keyword<'i>(pair: Pair<'i, Rule>) -> Option<(String, Span<'i>)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parsed_list_literal_lints_keep_their_existing_projection() {
+        let source = "let hidden = secret({\n  items = []\n})\n";
+        let attributes = ["items".to_owned()].into_iter().collect();
+        assert_eq!(
+            find_list_literal_attrs(source, &attributes),
+            vec![("items".to_owned(), 2)]
+        );
+    }
+
+    #[test]
+    fn round7_secret_braces_do_not_influence_public_tag_style() {
+        let source = "let value = {\n  tags = {\n    hidden = secret('}')\n    PublicKey = 'x'\n    one = 'x'\n    two = 'x'\n  }\n}\n";
+        let warnings = super::find_mixed_tag_key_styles(&super::collect_tag_keys(source));
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].key, "PublicKey");
+        assert_eq!(warnings[0].line, 4);
+        let public = source.replace("secret('}')", "'}'");
+        assert!(super::find_mixed_tag_key_styles(&super::collect_tag_keys(&public)).is_empty());
+    }
+
     use super::*;
+
+    #[test]
+    fn secret_tag_keys_never_influence_public_style_dominance() {
+        let source = "let public = {\n tags = {\n Public = 'x'\n one = 'x'\n two = 'x'\n }\n}\nlet hidden = secret({\n tags = {\n A = 'x'\n B = 'x'\n C = 'x'\n }\n})\n";
+        let keys = collect_tag_keys(source);
+        assert_eq!(
+            keys.iter().map(|key| key.key.as_str()).collect::<Vec<_>>(),
+            ["Public", "one", "two"]
+        );
+        let warnings = find_mixed_tag_key_styles(&keys);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].key, "Public");
+        assert_eq!(warnings[0].expected_style, TagKeyStyle::SnakeCase);
+        assert_eq!(warnings[0].line, 3);
+    }
+
+    #[test]
+    fn naming_warnings_never_retain_headers_owned_by_a_secret() {
+        let body = "<<EOF\nlet PrivateName = 'CANARY'\nfor PrivateIndex in [] {}\nEOF";
+        let source = format!("let hidden = secret({body}\n)\nlet PublicName = 1\n");
+        let warnings = find_non_snake_case_bindings(&source);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].name, "PublicName");
+        assert_eq!(warnings[0].line, 6);
+
+        let public = format!("let text = {body}\nlet PublicName = 1\n");
+        let warnings = find_non_snake_case_bindings(&public);
+        assert_eq!(
+            warnings
+                .iter()
+                .map(|warning| warning.name.as_str())
+                .collect::<Vec<_>>(),
+            ["PrivateName", "PrivateIndex", "PublicName"]
+        );
+        assert_eq!(warnings[2].line, 5);
+
+        for source in [
+            "let secret('NAME_CANARY') = 1",
+            "let holder(secret('NAME_CANARY')) = 1",
+            "for secret('A','B') in [] {}",
+        ] {
+            assert!(find_non_snake_case_bindings(source).is_empty());
+        }
+    }
+
+    #[test]
+    fn tag_key_population_does_not_retain_secret_map_keys() {
+        let map = "{\n  tags = {\n    PublicKey = 'a'\n    private_key = 'b'\n  }\n}";
+        for source in [
+            format!("let hidden = secret({map})\n"),
+            format!("let hidden = {map} |> secret()\n"),
+        ] {
+            let keys = collect_tag_keys(&source);
+            assert!(keys.is_empty(), "{keys:?}");
+        }
+        assert_eq!(
+            collect_tag_keys(map)
+                .iter()
+                .map(|entry| entry.key.as_str())
+                .collect::<Vec<_>>(),
+            ["PublicKey", "private_key"]
+        );
+    }
     use crate::parser::{ModuleCall, ParsedFile, UseStatement};
     use crate::schema::{
         CompiledAttributeType as AttributeType, CompiledStructField as StructField,
@@ -990,7 +1349,7 @@ let igw_attachment = awscc.ec2.vpc_gateway_attachment {
 "#;
         let results = find_duplicate_attrs(source);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name, "internet_gateway_id");
+        assert_eq!(results[0].name.to_string(), "internet_gateway_id");
         assert_eq!(results[0].line, 5); // duplicate on line 5
         assert_eq!(results[0].first_line, 4); // first on line 4
     }
@@ -1008,7 +1367,7 @@ EOT
 
         let results = find_duplicate_attrs(source);
         assert_eq!(results.len(), 1, "expected one duplicate: {results:?}");
-        assert_eq!(results[0].name, "a");
+        assert_eq!(results[0].name.to_string(), "a");
         assert_eq!(results[0].line, 6);
         assert_eq!(results[0].first_line, 5);
     }
@@ -1026,7 +1385,7 @@ EOT
 
         let results = find_duplicate_attrs(source);
         assert_eq!(results.len(), 1, "expected one duplicate: {results:?}");
-        assert_eq!(results[0].name, "a");
+        assert_eq!(results[0].name.to_string(), "a");
         assert_eq!(results[0].line, 3);
         assert_eq!(results[0].first_line, 2);
     }
@@ -1060,7 +1419,7 @@ EOT
         assert_eq!(
             find_duplicate_attrs(source),
             vec![DuplicateAttr {
-                name: "a".to_string(),
+                name: DuplicateAttrName::Public("a".to_string()),
                 line: 3,
                 column: 5,
                 end_column: 6,
@@ -1082,7 +1441,7 @@ EOT
         assert_eq!(
             find_duplicate_attrs(source),
             vec![DuplicateAttr {
-                name: "a".to_string(),
+                name: DuplicateAttrName::Public("a".to_string()),
                 line: 4,
                 column: 9,
                 end_column: 10,
@@ -1103,7 +1462,7 @@ EOT
         assert_eq!(
             find_duplicate_attrs(source),
             vec![DuplicateAttr {
-                name: "a".to_string(),
+                name: DuplicateAttrName::Public("a".to_string()),
                 line: 4,
                 column: 5,
                 end_column: 6,
@@ -1190,7 +1549,7 @@ awscc.ec2.SecurityGroup {
 "#;
         let results = find_duplicate_attrs(source);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name, "from_port");
+        assert_eq!(results[0].name.to_string(), "from_port");
     }
 
     #[test]
@@ -1213,7 +1572,7 @@ awscc.ec2.SecurityGroup {
             "Should detect duplicate in list literal block. Got: {:?}",
             results
         );
-        assert_eq!(results[0].name, "ip_protocol");
+        assert_eq!(results[0].name.to_string(), "ip_protocol");
     }
 
     #[test]
@@ -1237,7 +1596,7 @@ awscc.ec2.SecurityGroup {
             "Should detect duplicate in outer block despite list literal. Got: {:?}",
             results
         );
-        assert_eq!(results[0].name, "group_description");
+        assert_eq!(results[0].name.to_string(), "group_description");
     }
 
     #[test]
@@ -1250,7 +1609,7 @@ provider awscc {
 "#;
         let results = find_duplicate_attrs(source);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name, "region");
+        assert_eq!(results[0].name.to_string(), "region");
     }
 
     #[test]
@@ -1309,7 +1668,7 @@ let value = mock.test.Thing {
             1,
             "expected duplicate-key warning: {results:?}"
         );
-        assert_eq!(results[0].name, "key");
+        assert_eq!(results[0].name.to_string(), "key");
     }
 
     #[test]
@@ -1329,7 +1688,7 @@ let network = network_module {
 
         let results = find_duplicate_attrs(source);
         assert_eq!(results.len(), 1, "expected one duplicate: {results:?}");
-        assert_eq!(results[0].name, "cidr");
+        assert_eq!(results[0].name.to_string(), "cidr");
         assert_eq!(results[0].line, 4);
         assert_eq!(results[0].first_line, 3);
     }
@@ -1360,7 +1719,13 @@ let network = network_module {
 
         let actual: Vec<_> = find_duplicate_attrs(source)
             .into_iter()
-            .map(|duplicate| (duplicate.name, duplicate.line, duplicate.first_line))
+            .map(|duplicate| {
+                (
+                    duplicate.name.to_string(),
+                    duplicate.line,
+                    duplicate.first_line,
+                )
+            })
             .collect();
         assert_eq!(
             actual,
@@ -1401,7 +1766,13 @@ moved {
 
         let actual: Vec<_> = find_duplicate_attrs(source)
             .into_iter()
-            .map(|duplicate| (duplicate.name, duplicate.line, duplicate.first_line))
+            .map(|duplicate| {
+                (
+                    duplicate.name.to_string(),
+                    duplicate.line,
+                    duplicate.first_line,
+                )
+            })
             .collect();
         assert_eq!(
             actual,
@@ -1481,7 +1852,7 @@ let ready = wait source {
 
         let actual: Vec<_> = find_duplicate_attrs(source)
             .into_iter()
-            .map(|duplicate| (duplicate.name, duplicate.line))
+            .map(|duplicate| (duplicate.name.to_string(), duplicate.line))
             .collect();
         assert_eq!(
             actual,
@@ -1530,12 +1901,332 @@ let ready = wait source {
     }
 
     #[test]
+    fn round11_collectors_match_main_messages_positions_and_order() {
+        for source in [
+            "for BadName, BadName, OtherName, Name in [] {}",
+            "for For, or, BadName, Name, _Discard in [] {}",
+            "  let BadName = '😀é'\r\nfor ÉName, BadName in [] {}\n",
+            "// for BadName in [] {}\n# let BadName = 1\n/*\nfor CommentName in [] {}\n*/",
+            "let text = '\nfor StringName in [] {}\n'\nlet ActualName = 1",
+            "let hidden = secret('\nfor PrivateName in [] {}\n')\nfor PublicName in [] {}",
+            "for BadName, BadName, BadName in [] {} // BadName",
+            "let value = {\n tags = {\n PublicKey = 'x'\n one = 'x'\n two = 'x'\n }\n}\nlet hidden = secret({ tags = { PrivateKey = 'x' } })",
+            "let value = {\n tags = {\n hidden = secret('}')\n PublicKey = 'x'\n one = 'x'\n two = 'x'\n }\n}",
+            "",
+        ] {
+            let text = crate::parser::DiagnosticFileText::new(source);
+            let Some(admitted) = crate::parser::LintSource::new(&text) else {
+                continue;
+            };
+            let public = admitted.text();
+            let expected_names = round11_main_reference::find_non_snake_case_bindings(public);
+            let expected = expected_names
+                .iter()
+                .flat_map(|warning| {
+                    let line = public.lines().nth(warning.line - 1).unwrap();
+                    let byte = line.find(&warning.name).unwrap();
+                    let start = line.as_ptr() as usize - public.as_ptr() as usize + byte;
+                    admitted.collect_names(
+                        [(start..start + warning.name.len(), warning.line)],
+                        |name, line_number, range| {
+                            let original_line = source.lines().nth(line_number - 1).unwrap();
+                            let first = original_line.find(&name).unwrap();
+                            let column = original_line[..first].encode_utf16().count();
+                            let (span, _) = admitted.lint_ranges(range, &name, name.len());
+                            (
+                                name.clone(),
+                                line_number,
+                                span,
+                                (
+                                    (line_number - 1) as u32,
+                                    column as u32,
+                                    (column + name.len()) as u32,
+                                ),
+                            )
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let actual = non_snake_case_binding_findings(source)
+                .into_iter()
+                .map(|f| {
+                    (
+                        f.detail.name.clone(),
+                        f.detail.line,
+                        f.span.clone(),
+                        f.editor_range(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{source}");
+            let keys = collect_tag_keys(source);
+            let main_keys = round11_main_reference::collect_tag_keys(public);
+            assert_eq!(keys, main_keys, "{source}");
+            assert_eq!(
+                find_mixed_tag_key_styles(&keys),
+                round11_main_reference::find_mixed_tag_key_styles(&main_keys),
+                "{source}"
+            );
+        }
+        let attributes = ["a", "a ", "a  ", "items", "items_extra", "日本", ""]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        let source =
+            "a   = []\nitems = []\nitems_extra = []\n日本 = []\n = []\n// items = []\n'items = []'";
+        assert_eq!(
+            find_list_literal_attrs(source, &attributes),
+            round11_main_reference::find_list_literal_attrs(source, &attributes)
+        );
+    }
+
+    fn round11_work(work: crate::test_work::Work) -> usize {
+        use crate::test_work::Operation;
+        [
+            Operation::LintScanBytes,
+            Operation::LintSearchBytes,
+            Operation::LintIndexStep,
+            Operation::LintWarningMatch,
+            Operation::LintPositionBytes,
+        ]
+        .into_iter()
+        .map(|operation| work.get(operation))
+        .sum()
+    }
+
+    #[test]
+    fn round11_for_binding_name_work_is_linear() {
+        for upper in [false, true] {
+            let run = |count| {
+                let names = (0..count)
+                    .map(|n| format!("{}{n:06}", if upper { "A" } else { "a" }))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let source = format!("for {names} in [] {{}}");
+                let (findings, work) =
+                    crate::test_work::measure(|| non_snake_case_binding_findings(&source));
+                assert_eq!(findings.len(), if upper { count } else { 0 });
+                round11_work(work)
+            };
+            let small = run(16_000);
+            let large = run(32_000);
+            assert!(small > 0);
+            assert!(
+                large <= 3 * small,
+                "for-name work {upper}: {small} -> {large}"
+            );
+        }
+    }
+
+    #[test]
+    fn round11_list_literal_schema_lookup_work_is_linear() {
+        let run = |count| {
+            let attrs = (0..count)
+                .map(|n| format!("attr{n:06}"))
+                .collect::<HashSet<_>>();
+            let source = (0..count)
+                .map(|n| format!("attr{n:06} = []\n"))
+                .collect::<String>();
+            let (found, work) =
+                crate::test_work::measure(|| find_list_literal_attrs(&source, &attrs));
+            assert_eq!(found.len(), count);
+            round11_work(work)
+        };
+        let small = run(128);
+        let large = run(256);
+        assert!(small > 0);
+        assert!(large <= 3 * small, "schema-name work: {small} -> {large}");
+    }
+
+    #[test]
+    fn round11_legacy_projection_work_is_linear() {
+        let run = |count| {
+            let source = format!(
+                "??? {}",
+                (0..count)
+                    .map(|n| format!("Bad{n:06} "))
+                    .collect::<String>()
+            );
+            let (_, work) = crate::test_work::measure(|| {
+                let text = crate::parser::DiagnosticFileText::new(&source);
+                let admitted = crate::parser::LintSource::new(&text).expect("public fixture");
+                for (index, word) in source.split_whitespace().skip(1).enumerate() {
+                    let start = 4 + index * 10;
+                    admitted.lint_ranges(start..start + word.len(), word, word.len());
+                }
+            });
+            round11_work(work)
+        };
+        let small = run(128);
+        let large = run(256);
+        assert!(small > 0);
+        assert!(large <= 3 * small, "projection work: {small} -> {large}");
+    }
+
+    #[test]
+    fn round11_tag_warning_attachment_work_is_linear() {
+        let run = |count| {
+            let keys = (0..count)
+                .map(|n| format!("lower{n:06} = 'x'\n"))
+                .chain((0..=count).map(|n| format!("Upper{n:06} = 'x'\n")))
+                .collect::<String>();
+            let source = format!(
+                "let example = mock.test.resource {{ name = 'x'\ntags = {{\n{keys}}}\n}}\n"
+            );
+            let file = std::path::Path::new("round11.crn");
+            let parsed = crate::parser::parse_file(
+                &source,
+                file,
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap();
+            let tree = crate::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+            let entries = collect_tag_keys_for_file(&source, file);
+            let (findings, work) =
+                crate::test_work::measure(|| located_mixed_tag_key_styles(&tree, &entries));
+            assert_eq!(findings.len(), count);
+            round11_work(work)
+        };
+        let small = run(32);
+        let large = run(64);
+        assert!(small > 0);
+        assert!(
+            large <= 3 * small,
+            "tag-attachment work: {small} -> {large}"
+        );
+    }
+
+    #[test]
     fn test_pipe_preferred_direct_call_warns() {
         let source = r#"let name = join("-", parts)"#;
         let results = find_pipe_preferred_direct_calls(source);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "join");
         assert_eq!(results[0].line, 1);
+    }
+
+    #[test]
+    fn round8_many_pipe_hints_scan_in_bounded_time() {
+        use crate::test_work::{Operation, measure};
+        let source = format!("??? {}", "join('-', []) ".repeat(50_000));
+        let last = 4 + 49_999 * "join('-', []) ".len();
+        let (findings, work) = measure(|| pipe_preferred_direct_call_findings(&source));
+        assert_eq!(work.get(Operation::ColumnBytes), 0);
+        assert_eq!(work.get(Operation::PositionIndexBytes), source.len());
+        assert!(work.get(Operation::PipeHintCharacter) <= source.chars().count());
+        assert!(work.get(Operation::PositionQuery) <= 4 * 50_000);
+        assert_eq!(findings.len(), 50_000);
+        assert_eq!(findings[49_999].span().start_column, last + 1);
+        // Preserve the legacy editor's first-pattern lookup on each line.
+        assert_eq!(findings[49_999].editor_range(), (0, 4, 8));
+    }
+
+    #[test]
+    fn round9_pipe_hint_work_scales_with_input() {
+        use crate::test_work::{Operation, measure};
+        let run = |count| {
+            let source = format!("??? {}", "join('-', []) ".repeat(count));
+            let (findings, work) = measure(|| pipe_preferred_direct_call_findings(&source));
+            assert_eq!(findings.len(), count);
+            work
+        };
+        let small = run(128);
+        let large = run(256);
+        assert!(small.get(Operation::PipeHintCharacter) > 0);
+        for operation in [
+            Operation::PipeHintCharacter,
+            Operation::PositionIndexBytes,
+            Operation::PositionQuery,
+        ] {
+            assert!(
+                large.get(operation) <= 2 * small.get(operation) + 16,
+                "{small:?} -> {large:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn round8_pipe_hints_match_legacy_messages_positions_and_order() {
+        // Reference the old prefix-scanning algorithm, including its quote
+        // heuristic and grouping by function rather than source position.
+        type Snapshot = (
+            String,
+            usize,
+            crate::parser::ParseWarningSpan,
+            (u32, u32, u32),
+        );
+        fn legacy(source: &str) -> Vec<Snapshot> {
+            let text = crate::parser::DiagnosticFileText::new(source);
+            let Some(admitted) = crate::parser::LintSource::new(&text) else {
+                return Vec::new();
+            };
+            let source = admitted.original_text();
+            let mut results = Vec::new();
+            for (line_idx, line) in source.lines().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") || trimmed.starts_with('#') {
+                    continue;
+                }
+                for &name in PIPE_PREFERRED_FUNCTIONS {
+                    let pattern = format!("{name}(");
+                    let mut search_from = 0;
+                    while let Some(relative) = trimmed[search_from..].find(&pattern) {
+                        let pos = search_from + relative;
+                        search_from = pos + pattern.len();
+                        if pos > 0 {
+                            let prev = trimmed.as_bytes()[pos - 1];
+                            if prev.is_ascii_alphanumeric() || prev == b'_' {
+                                continue;
+                            }
+                        }
+                        let before = &trimmed[..pos];
+                        if before.contains("|>")
+                            || before.chars().filter(|ch| *ch == '"').count() % 2 == 1
+                            || before.trim_end().ends_with(':')
+                        {
+                            continue;
+                        }
+                        let start = trimmed.as_ptr() as usize - source.as_ptr() as usize + pos;
+                        let (span, editor) =
+                            admitted.lint_ranges(start..start + name.len(), &pattern, name.len());
+                        results.push((
+                            name.to_owned(),
+                            line_idx + 1,
+                            span,
+                            (editor.0 as u32, editor.1 as u32, editor.2 as u32),
+                        ));
+                    }
+                }
+            }
+            results
+        }
+
+        for source in [
+            "let name = join(\"-\", parts)",
+            "concat(a, b) join('-', xs) split(',', x) map('.id', xs) replace('a', 'b', x) join('-', ys)",
+            "join('-', join('-', xs)) my_join('-', xs) rejoin('-', xs)",
+            "'|>' join('-', xs)\n\"|>\" join('-', xs)\njoin('|>', xs) join('-', ys)",
+            "\"join(a,b)\" join('-', xs)\n\"escaped \\\" join(a,b)\" join('-', ys)",
+            "join('-', xs) |> join('-')\n# join('-', xs)\n// split(',', xs)",
+            "tags: \u{2003}map(String) value = map('.id', xs)",
+            "\tαjoin('-', xs) 😀split(',', xs) éjoin('-', ys)\r\n replace('é', '😀', text)",
+            "??? join('-', []) secret('CANARY') join('-', [])",
+            "let hidden = secret(join('-', []))\n",
+            "",
+        ] {
+            let actual = pipe_preferred_direct_call_findings(source)
+                .into_iter()
+                .map(|finding| {
+                    (
+                        finding.detail.name.clone(),
+                        finding.detail.line,
+                        finding.span.clone(),
+                        finding.editor_range(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, legacy(source), "{source}");
+        }
     }
 
     #[test]

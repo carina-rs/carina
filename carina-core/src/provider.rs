@@ -6846,7 +6846,7 @@ pub(crate) fn assert_default_tag_value_encodable<P: crate::resource::Placeholder
 
 #[derive(Debug)]
 struct DefaultTagEncodingError {
-    key: String,
+    key: crate::parser::AttributeKey,
     provider_name: String,
     source: SerializationError,
 }
@@ -6858,7 +6858,7 @@ impl std::fmt::Display for DefaultTagEncodingError {
             "provider '{}': {}.{} could not be encoded",
             DiagnosticText::new(&self.provider_name),
             crate::parser::DEFAULT_TAGS_ATTRIBUTE,
-            DiagnosticText::new(&self.key)
+            DiagnosticText::new(self.key.to_string())
         )
     }
 }
@@ -6966,6 +6966,14 @@ pub(crate) fn merge_default_tags_with_placeholders<S, D, P: crate::resource::Pla
         return Ok(());
     }
 
+    let default_tags = crate::parser::ConfigurationAttributes::from(default_tags)
+        .public_value_map()
+        .map_err(|error| {
+            HostError::invalid_input_caused_by(
+                "invalid default tag key",
+                crate::provider_text::HostDiagnostic::capture_host_or_provider(error),
+            )
+        })?;
     let route = ProviderInstanceKey::from(config);
     for resource in resources.iter_mut() {
         if !route.matches(&resource.id) {
@@ -8536,13 +8544,13 @@ pub trait ProviderFactory: Send + Sync {
     ///
     /// A raw attribute map cannot be passed to this boundary:
     ///
-    /// ```compile_fail
-    /// use carina_core::provider::ProviderFactory;
+    /// ```compile_fail,E0308
+    /// use carina_core::parser::ConfigurationAttributes;
+    /// use carina_core::provider::{ProviderFactory, ProviderValidationInputs};
     /// use carina_core::resource::Value;
-    /// use indexmap::IndexMap;
     ///
-    /// fn bypass(factory: &dyn ProviderFactory, raw: &IndexMap<String, Value>) {
-    ///     factory.validate_config(raw).unwrap();
+    /// fn bypass(factory: &dyn ProviderFactory, raw: &ConfigurationAttributes<Value>, session: &ProviderValidationInputs) {
+    ///     factory.validate_config(raw, session).unwrap();
     /// }
     /// ```
     fn validate_config(
@@ -8562,15 +8570,16 @@ pub trait ProviderFactory: Send + Sync {
     /// splitting a flat name string. Raw DSL text cannot be passed to this
     /// boundary:
     ///
-    /// ```compile_fail
-    /// use carina_core::provider::ProviderFactory;
+    /// ```compile_fail,E0308
+    /// use carina_core::provider::{ProviderFactory, ProviderValidationInputs};
     /// use carina_core::schema::TypeIdentity;
     ///
-    /// fn bypass(factory: &dyn ProviderFactory) {
+    /// fn bypass(factory: &dyn ProviderFactory, session: &ProviderValidationInputs) {
     ///     factory
     ///         .validate_custom_type(
     ///             &TypeIdentity::bare("Mode"),
     ///             "raw.dsl.text",
+    ///             session,
     ///         )
     ///         .unwrap();
     /// }
@@ -12335,6 +12344,78 @@ mod tests {
     }
 
     #[test]
+    fn round13_programmatic_default_tag_keys_are_literal_data() {
+        let names = ["app-secret", "secret", "x-secret-y", "secret("];
+        let tags: IndexMap<String, Value> = names
+            .iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    Value::Concrete(ConcreteValue::String("x".into())),
+                )
+            })
+            .collect();
+        let config = ProviderConfig {
+            name: "aws".into(),
+            default_tags: tags.clone().into(),
+            attributes: Default::default(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: Default::default(),
+            binding: None,
+        };
+        let mut resources: Vec<Resource> = vec![Resource::with_provider(
+            "aws",
+            "service.Widget",
+            "example",
+            None,
+        )];
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "aws",
+            PatternResourceSchema::new("service.Widget")
+                .attribute(
+                    PatternAttributeSchema::optional(
+                        "tags",
+                        PatternAttributeType::map(PatternAttributeType::string()),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        merge_default_tags(&config, &mut resources, &registry).unwrap();
+        assert_eq!(
+            resources[0].get_attr("tags"),
+            Some(&Value::Concrete(ConcreteValue::Map(tags)))
+        );
+        let sent = crate::provider_wire::project_plaintext(resources[0].get_attr("tags").unwrap())
+            .unwrap();
+        let carina_provider_protocol::types::Value::Map(sent) = sent else {
+            panic!("merged tags must cross the provider wire as a map");
+        };
+        let expected_sent = names
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_owned(),
+                    carina_provider_protocol::types::Value::String("x".into()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(sent, expected_sent);
+        let encoded = serde_json::to_string(&config.default_tags).unwrap();
+        let decoded: crate::parser::ConfigurationAttributes<Value> =
+            serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            decoded.keys().map(ToString::to_string).collect::<Vec<_>>(),
+            names
+        );
+        assert!(decoded.public_value_map().is_ok());
+    }
+
+    #[test]
     fn default_tag_encoding_requires_classified_input() {
         let value: Value = Value::Concrete(ConcreteValue::Int(7));
         let proof = value
@@ -12355,12 +12436,13 @@ mod tests {
         let protected = Value::Deferred(DeferredValue::Secret(Box::new(unavailable).into()));
         let config = ProviderConfig {
             name: "aws".into(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::from([("Protected".into(), protected.clone())]),
+            attributes: Default::default(),
+            default_tags: (IndexMap::<String, _>::from([("Protected".into(), protected.clone())]))
+                .into(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         };
         let mut resources: Vec<Resource> = vec![Resource::with_provider(
@@ -12414,8 +12496,8 @@ mod tests {
     fn merge_default_tags_rejects_unresolved_values() {
         let config = ProviderConfig {
             name: "aws".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::from([
+            attributes: Default::default(),
+            default_tags: (IndexMap::<String, _>::from([
                 (
                     "ManagedBy".to_string(),
                     Value::Concrete(ConcreteValue::String("carina".into())),
@@ -12434,11 +12516,12 @@ mod tests {
                     )
                     .expect("deferred integer fixture must be structurally valid"),
                 ),
-            ]),
+            ]))
+            .into(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         };
         let resource: Resource = Resource::with_provider("aws", "service.Widget", "example", None);
@@ -12552,15 +12635,16 @@ mod tests {
     fn merge_default_tags_remerge_is_idempotent_and_never_removes_existing_tags() {
         let mut config = ProviderConfig {
             name: "aws".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::from([(
+            attributes: Default::default(),
+            default_tags: (IndexMap::<String, _>::from([(
                 "ManagedBy".to_string(),
                 Value::Concrete(ConcreteValue::String("carina".into())),
-            )]),
+            )]))
+            .into(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         };
         let resource: Resource = Resource::with_provider("aws", "service.Widget", "example", None)
@@ -12623,7 +12707,7 @@ mod tests {
             "failed remerge must be atomic"
         );
         config.default_tags.insert(
-            "ManagedBy".into(),
+            "ManagedBy",
             Value::Concrete(ConcreteValue::String("new-default".into())),
         );
         merge_default_tags(&config, &mut resources, &registry).unwrap();
@@ -15720,12 +15804,12 @@ mod tests {
             crate::resource::RelativeBindingName,
         > = ProviderConfig {
             name: "mock".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: Some("us".to_string()),
         };
         router.add_provider_config(&named_config, initialized(TaggedProvider { tag: "us" }));

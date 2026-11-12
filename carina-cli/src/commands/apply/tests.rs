@@ -319,6 +319,7 @@ fn mock_http_test_egress(
     carina_provider_resolver::load_locked_egress(
         &carina_core::paths::ResolvedPath::new(lock_dir).unwrap(),
         load,
+        &mut |_| {},
     )
     .expect("load mock HTTP egress consent")
     .expect("mock HTTP egress consent must match the fixture")
@@ -391,12 +392,12 @@ fn mock_http_ready_config(
     let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers.push(carina_core::parser::ProviderConfig {
         name: factory.name().to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     });
     let resolved = carina_core::validation::deferred_types::with_session_for_test(
@@ -511,6 +512,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
             cache.path(),
             Some(&locked_egress),
             &UnusedAwsCredentialProvisioner,
+            &mut carina_plugin_host::WasmLoadNoticeSink::new(move |_| {}),
         )
         .await
         .expect("load mock HTTP WASM provider")
@@ -590,6 +592,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
             cache.path(),
             Some(&locked_egress),
             &UnusedAwsCredentialProvisioner,
+            &mut carina_plugin_host::WasmLoadNoticeSink::new(move |_| {}),
         )
         .await
         .expect("load replacement mock HTTP WASM provider")
@@ -1170,12 +1173,12 @@ for account_id in orgs.accounts {
         state_serial: None,
         provider_configs: saved_provider_configs(vec![ProviderConfig {
             name: "mock".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         }]),
         backend_config: None,
@@ -1305,12 +1308,12 @@ async fn run_saved_plan_schema_fingerprint_case(
         state_serial: None,
         provider_configs: saved_provider_configs(vec![ProviderConfig {
             name: "mock".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         }]),
         backend_config: None,
@@ -1577,12 +1580,12 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
         state_serial: None,
         provider_configs: saved_provider_configs(vec![ProviderConfig {
             name: "mock".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         }]),
         backend_config: None,
@@ -2188,12 +2191,12 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         state_serial: Some(7),
         provider_configs: saved_provider_configs(vec![ProviderConfig {
             name: "mock".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         }]),
         backend_config: None,
@@ -2354,12 +2357,12 @@ async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write
         state_serial: Some(9),
         provider_configs: saved_provider_configs(vec![ProviderConfig {
             name: "mock".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         }]),
         backend_config: None,
@@ -2532,12 +2535,12 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
     std::fs::write(&installed_path, b"not a wasm component").unwrap();
     let provider_config: carina_core::parser::ExpandedProviderConfig = ProviderConfig {
         name: "mock".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: Some(format!("file://{}", source_path.display()).parse().unwrap()),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     };
     let planning_context = ValidatedConfig::from_factories_for_test_with_provider_phase(
@@ -2633,12 +2636,12 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
     .unwrap();
     let provider_config: carina_core::parser::ExpandedProviderConfig = ProviderConfig {
         name: "mock".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: Some(source),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     };
     let provider_configs = vec![provider_config.clone(), provider_config];
@@ -2933,6 +2936,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
         &user_dirs,
         &parsed.providers,
         &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
+        &mut crate::commands::human_provider_notices(user_dirs.color_mode()),
     )
     .unwrap();
     let unresolved_parsed = loaded.unresolved_parsed;
@@ -3045,6 +3049,7 @@ inner { x = a }
         &user_dirs,
         &loaded.parsed.providers,
         &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        &mut crate::commands::human_provider_notices(user_dirs.color_mode()),
     )
     .unwrap();
     let wiring = ValidatedWiring::from_load_for_test(providers);
@@ -3137,6 +3142,7 @@ fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
             &user_dirs,
             &loaded.parsed.providers,
             &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            &mut crate::commands::human_provider_notices(user_dirs.color_mode()),
         )
         .unwrap();
         let wiring = ValidatedWiring::from_load_for_test(providers);
@@ -4774,12 +4780,12 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
 
     let provider_configs = saved_provider_configs(vec![ProviderConfig {
         name: "mock".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     }]);
     let contents = PlanFileContents {
@@ -4959,12 +4965,12 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         state_serial: None,
         provider_configs: saved_provider_configs(vec![ProviderConfig {
             name: "mock".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         }]),
         backend_config: None,
@@ -5131,15 +5137,16 @@ async fn saved_plan_provider_validation_preserves_typed_source_and_replan_hint()
         state_serial: None,
         provider_configs: deserialize_saved_provider_configs(vec![ProviderConfig {
             name: "mock".to_string(),
-            attributes: IndexMap::from([(
+            attributes: (IndexMap::<String, _>::from([(
                 "region".to_string(),
                 root_resource_ref("mgmt", "region"),
-            )]),
-            default_tags: IndexMap::new(),
+            )]))
+            .into(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         }]),
         backend_config: None,
@@ -5586,6 +5593,7 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
         fixture.runtime(),
         &parsed.providers,
         &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
+        &mut crate::commands::human_provider_notices(fixture.runtime().color_mode()),
     )
     .expect("mock provider must load");
     let validated_config = providers
@@ -5662,12 +5670,12 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
         state_serial: None,
         provider_configs: saved_provider_configs(vec![ProviderConfig {
             name: "mock".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         }]),
         backend_config: None,
@@ -7283,8 +7291,8 @@ fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::Expande
     );
     carina_core::parser::BackendConfig {
         backend_type: "s3".to_string(),
-        attributes,
-        attribute_spans: HashMap::new(),
+        attributes: (attributes).into(),
+        attribute_spans: Default::default(),
     }
 }
 
@@ -12406,15 +12414,16 @@ async fn round3_bootstrap_default_tag_keys_are_plan_diagnostics() {
     let mut parsed = carina_core::parser::InferredFile::default();
     parsed.providers.push(ProviderConfig {
         name: "mock".into(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::from([(
+        attributes: Default::default(),
+        default_tags: (IndexMap::<String, _>::from([(
             "AWS:reserved".into(),
             Value::Concrete(ConcreteValue::String("value".into())),
-        )]),
+        )]))
+        .into(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     });
     let provider_configs = resolved_provider_configs(&parsed);

@@ -4383,12 +4383,12 @@ mod tests {
             .with_attribute("tags", Value::Concrete(ConcreteValue::Map(explicit_tags)));
         let config = ProviderConfig {
             name: "test".to_string(),
-            attributes: IndexMap::new(),
-            default_tags,
+            attributes: Default::default(),
+            default_tags: (default_tags).into(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         };
         let mut registry = SchemaRegistry::new();
@@ -4472,15 +4472,16 @@ mod tests {
             );
         let config = ProviderConfig {
             name: "aws".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::from([(
+            attributes: Default::default(),
+            default_tags: (IndexMap::<String, _>::from([(
                 "ManagedBy".to_string(),
                 Value::Concrete(ConcreteValue::String("carina".into())),
-            )]),
+            )]))
+            .into(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         };
         let mut registry = SchemaRegistry::new();

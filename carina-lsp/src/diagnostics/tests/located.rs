@@ -182,7 +182,9 @@ fn substituted_integer_operator_keeps_its_file_when_coordinates_coincide() {
     assert_eq!(&source[span.start_byte()..span.end_byte()], "+");
     assert!(
         render_merged(
-            &create_document_at(source, main),
+            &create_document_at(source, main)
+                .for_diagnostics()
+                .expect("public fixture"),
             finding,
             DiagnosticSeverity::ERROR,
             finding.detail().to_string()
@@ -190,7 +192,9 @@ fn substituted_integer_operator_keeps_its_file_when_coordinates_coincide() {
         .is_none()
     );
     let rendered = render_merged(
-        &create_document_at(source, sibling),
+        &create_document_at(source, sibling)
+            .for_diagnostics()
+            .expect("public fixture"),
         finding,
         DiagnosticSeverity::ERROR,
         finding.detail().to_string(),
@@ -239,7 +243,13 @@ fn authored_config_label_does_not_render_in_unrelated_buffers() {
         Vec::new()
     });
     let doc = create_document_at(source, "/project/sibling.crn".into());
-    assert!(DiagnosticEngine::publish_type_diagnostics(terminal, &doc).is_empty());
+    assert!(
+        DiagnosticEngine::publish_type_diagnostics(
+            terminal,
+            &doc.for_diagnostics().expect("public fixture")
+        )
+        .is_empty()
+    );
 }
 
 #[test]
@@ -499,7 +509,9 @@ fn type_resolution_invariant_renders_in_each_directory_buffer() {
         let path = directory.root.path().join(name);
         let source = std::fs::read_to_string(&path).unwrap();
         let doc = create_document_at(&source, path);
-        let diagnostic = render_analysis_invariant(&doc, &error).unwrap();
+        let diagnostic =
+            render_analysis_invariant(&doc.for_diagnostics().expect("public fixture"), &error)
+                .unwrap();
         assert_eq!(diagnostic.range, Range::default());
         assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
         assert!(
@@ -625,8 +637,11 @@ fn expanded_provider_invariant_is_rendered() {
     for name in ["main.crn", "sibling.crn"] {
         let source = std::fs::read_to_string(directory.root.path().join(name)).unwrap();
         let doc = create_document_at(&source, directory.root.path().join(name));
-        let diagnostic = render_analysis_resolution_error(&doc, &error)
-            .expect("surface the directory invariant");
+        let diagnostic = render_analysis_resolution_error(
+            &doc.for_diagnostics().expect("public fixture"),
+            &error,
+        )
+        .expect("surface the directory invariant");
         assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
         assert!(diagnostic.message.contains("provider aws declaration"));
     }
@@ -666,7 +681,7 @@ fn unmappable_span_drops_only_that_finding() -> Result<(), carina_core::parser::
         .into_iter()
         .filter_map(|finding| {
             render_merged(
-                &document,
+                &document.for_diagnostics().expect("public fixture"),
                 finding,
                 DiagnosticSeverity::ERROR,
                 "test finding".to_string(),
@@ -700,7 +715,7 @@ fn module_reload_uses_the_unsaved_buffer() {
     let merged = test_engine()
         .with_run_for_test(|run| {
             run.parse_and_resolve_merged_with_buffer(
-                &document,
+                &document.for_diagnostics().expect("public fixture"),
                 Some("main.crn"),
                 &carina_core::paths::ResolvedPath::new(directory.root.path()).unwrap(),
             )
@@ -1111,7 +1126,7 @@ fn expanded_module_diagnostic_keeps_its_authored_file()
     let merged = engine
         .with_run_for_test(|run| {
             run.parse_and_resolve_merged_with_buffer(
-                &document,
+                &document.for_diagnostics().expect("public fixture"),
                 Some("main.crn"),
                 &carina_core::paths::ResolvedPath::new(directory.root.path()).unwrap(),
             )

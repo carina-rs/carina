@@ -17,6 +17,133 @@ use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
 #[test]
+fn round13_provenance_debug_redacts_secret_keys_without_losing_lookup() {
+    let source = "let x = mock.test.resource { name = secret({ CANARY = 1 }) }";
+    let parsed = parse_file(
+        source,
+        std::path::Path::new("main.crn"),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    assert!(!format!("{parsed:?}").contains("CANARY"));
+    let declaration = &parsed.resources[0].declaration;
+    let key = declaration.elements().keys().iter().find(|key| matches!(key.path().last(), Some(AttributePathSegment::ProtectedKey { key, .. }) if key.matches("CANARY"))).expect("secret key identity is retained");
+    let span = key.location().span();
+    assert_eq!(&source[span.start_byte()..span.end_byte()], "CANARY");
+    let semantic: ConfigurationAttributes<_> = declaration
+        .elements()
+        .keys()
+        .iter()
+        .filter_map(|key| {
+            key.path()
+                .last()
+                .and_then(AttributePathSegment::semantic_key)
+                .map(|name| (name, key.location().clone()))
+        })
+        .collect();
+    assert_eq!(semantic.get("CANARY").unwrap(), key.location());
+    assert!(!format!("{semantic:?}").contains("CANARY"));
+    assert!(!format!("{declaration:?}").contains("CANARY"));
+    assert!(!format!("{:?}", declaration.elements().diagnostic_index()).contains("CANARY"));
+}
+
+#[test]
+fn round10_source_span_index_debug_hides_secret_names() {
+    let source = "let x = mock.test.resource { name = secret({ 'CANARY' = 1 }) }";
+    let index = SourceSpanIndex::parse(source).unwrap();
+    assert!(!format!("{index:?}").contains("CANARY"));
+    assert!(!format!("{index:#?}").contains("CANARY"));
+    let binding = index.let_binding_spans().get("x").unwrap();
+    assert_eq!(binding.name.start_column(), 5);
+    let value = index
+        .attribute_value_source_spans("name", &crate::schema::FieldPath::new(), None)
+        .unwrap()
+        .value;
+    assert_eq!(
+        &source[value.start_byte()..value.end_byte()],
+        "secret({ 'CANARY' = 1 })"
+    );
+}
+
+#[test]
+fn round8_deferred_header_keeps_parsed_secret_identifiers_public() {
+    for (iterable, binding, expected) in [
+        (
+            "cert.domain_validation_options",
+            "secret",
+            "for secret in cert.domain_validation_options",
+        ),
+        (
+            "secret(cert.domain_validation_options)",
+            "item",
+            "for item in secret(<redacted>)",
+        ),
+    ] {
+        let source = format!(
+            "let cert = aws.acm.Certificate {{ domain_name = 'example.com' }}\n\
+             let records = for {binding} in {iterable} {{\n\
+               read aws.route53.RecordSet {{ name = {binding} }}\n\
+             }}\n"
+        );
+        let parsed = parse(
+            &source,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let [deferred] = parsed.parsed_deferred_for_expressions() else {
+            panic!("expected one deferred loop");
+        };
+        let error = deferred
+            .clone()
+            .resolve_bindings(&mut |binding| RootScope::new().resolve(binding))
+            .into_resource_expression(&[])
+            .unwrap_err();
+        let super::ast::DeferredForResourceExpressionError::Unsupported { error, .. } = error
+        else {
+            panic!("expected the deferred read-body diagnostic");
+        };
+        let text = format!("{error}");
+        assert!(text.contains(&format!("`{expected}`")), "{text}");
+        if binding == "secret" {
+            assert!(!text.contains("<redacted>"), "{text}");
+        } else {
+            assert!(!format!("{error:?}").contains("cert.domain_validation_options"));
+        }
+    }
+}
+
+#[test]
+fn round8_expression_fixture_does_not_acquire_failed_file_classification() {
+    let text: super::retained::DiagnosticSourceText = "secret".into();
+    assert_eq!(text.into_text().unwrap().as_ref(), "secret");
+}
+
+#[test]
+fn round8_require_fixture_message_keeps_its_literal_context() {
+    let message = "secret('PUBLIC') is literal message text";
+    let block: RequireBlock = RequireBlock::dummy(ValidateExpr::Bool(false), message.to_owned());
+    assert_eq!(block.error_message, message);
+}
+
+#[test]
+fn round8_deferred_template_error_keeps_parsed_header() {
+    let error = parse(
+        "let cert = aws.acm.Certificate { domain_name = 'example.com' }\n\
+         let records = for secret in cert.domain_validation_options {\n\
+           read aws.route53.RecordSet { '_invalid' = secret }\n\
+         }\n",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
+    let text = error.to_string();
+    assert!(
+        text.contains("`for secret in cert.domain_validation_options`"),
+        "{text}"
+    );
+    assert!(!text.contains("<redacted>"), "{text}");
+}
+
+#[test]
 fn review3_secret_deferred_iterable_diagnostics_mask_roots() {
     let parsed = parse(
         "for item in secret(private_iterable.names) { mock.test.Resource { name = item } }",
@@ -1148,18 +1275,18 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
 
     file.providers.push(ProviderConfig {
         name: "mock".to_string(),
-        attributes: IndexMap::from([("region".to_string(), empty())]),
-        default_tags: IndexMap::new(),
+        attributes: (IndexMap::<String, _>::from([("region".to_string(), empty())])).into(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     });
     file.backend = Some(BackendConfig {
         backend_type: "local".to_string(),
-        attributes: HashMap::from([("path".to_string(), empty())]),
-        attribute_spans: HashMap::new(),
+        attributes: (HashMap::<String, _>::from([("path".to_string(), empty())])).into(),
+        attribute_spans: Default::default(),
     });
     file.variables.insert("greeting".to_string(), empty());
 
@@ -1250,7 +1377,9 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
                 Some("loops.crn".to_string()),
                 1,
                 SourceSpan::dummy(),
-                "for item in pending.items".to_string(),
+                crate::parser::AuthoredExpressionText::test_for_header(
+                    "let rows = for item in pending.items { mock.test.resource {} }",
+                ),
             ),
             target,
             empty(),
@@ -1331,7 +1460,9 @@ fn expansion_boundary_checks_canonical_deferred_template_resource_attributes() {
                 Some("loops.crn".to_string()),
                 1,
                 SourceSpan::dummy(),
-                "for item in pending.items".to_string(),
+                crate::parser::AuthoredExpressionText::test_for_header(
+                    "let rows = for item in pending.items { mock.test.resource {} }",
+                ),
             ),
             target,
             Value::Deferred(DeferredValue::BindingRef {
@@ -5666,16 +5797,15 @@ fn saved_plan_provider_configs_accept_fully_resolved_attributes() {
 #[test]
 fn provider_config_carries_unresolved_attributes_field() {
     use crate::parser::ast::ProviderConfig;
-    use indexmap::IndexMap;
 
     let pc: ProviderConfig<ParserPlaceholder, RelativeBindingName> = ProviderConfig {
         name: "awscc".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     };
     assert!(pc.unresolved_attributes.is_empty());
@@ -16317,7 +16447,7 @@ fn provider_config_default_tags_preserve_insertion_order() {
         .providers
         .first()
         .expect("expected one provider config");
-    let keys: Vec<&str> = pc.default_tags.keys().map(String::as_str).collect();
+    let keys: Vec<_> = pc.default_tags.keys().collect();
     assert_eq!(
         keys,
         vec!["z_team", "a_env", "m_owner"],
@@ -16349,7 +16479,7 @@ fn provider_config_attributes_preserve_insertion_order() {
         .providers
         .first()
         .expect("expected one provider config");
-    let keys: Vec<&str> = pc.attributes.keys().map(String::as_str).collect();
+    let keys: Vec<_> = pc.attributes.keys().collect();
     // `source` and `version` are stripped from `attributes` (extracted
     // separately into ProviderConfig fields), so the surviving keys
     // are the user-authored order minus those two.
@@ -18633,13 +18763,13 @@ fn provider_config_named_instance_serde_round_trip() {
                 "region".to_string(),
                 Value::Concrete(ConcreteValue::String("us-east-1".into())),
             );
-            m
+            (m).into()
         },
-        default_tags: IndexMap::new(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: Some("us".to_string()),
     };
     let json = serde_json::to_string(&original).expect("serialize");
@@ -18686,12 +18816,12 @@ fn provider_config_default_instance_serde_round_trip() {
     use crate::parser::ast::ProviderConfig;
     let original: ProviderConfig<ParserPlaceholder, RelativeBindingName> = ProviderConfig {
         name: "aws".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: Some("github.com/x/y".parse().unwrap()),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     };
     let json = serde_json::to_string(&original).expect("serialize");
@@ -21616,4 +21746,66 @@ fn module_iterable_loop_directives_wait_for_argument_substitution() {
             .unwrap()
             .is_empty()
     );
+}
+#[test]
+fn round6_interpolated_attribute_keys_keep_authored_identity() {
+    let keys = [r#""${secret('A')}""#, r#""${secret('B')}""#];
+    let parsed = parse(
+        r#"provider mock { "${secret('A')}" = 1 "${secret('B')}" = 2 }"#,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    assert_eq!(
+        parsed.providers[0].attributes.keys().collect::<Vec<_>>(),
+        keys
+    );
+    for (key, expected) in keys.iter().zip([1, 2]) {
+        assert!(
+            matches!(parsed.providers[0].attributes.get(*key), Some(Value::Concrete(ConcreteValue::Int(value))) if *value == expected)
+        );
+    }
+    let diagnostic_keys = &parsed.parser_binding_metadata.syntax().providers()[0].attributes;
+    assert_eq!(
+        diagnostic_keys
+            .iter()
+            .map(|key| key.detail())
+            .collect::<HashSet<_>>()
+            .len(),
+        2
+    );
+    assert_eq!(
+        diagnostic_keys
+            .iter()
+            .map(|key| key.detail().to_string())
+            .collect::<Vec<_>>(),
+        ["\"${secret(<redacted>)}\"", "\"${secret(<redacted>)}\""]
+    );
+    let backend = parse(
+        r#"backend local { "${secret('A')}" = 1 "${secret('B')}" = 2 }"#,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap()
+    .backend
+    .unwrap();
+    assert_eq!(backend.attributes.len(), 2);
+    assert!(keys.iter().all(|key| backend.attributes.contains_key(*key)));
+    let error = parse(
+        r#"let child = use { "${secret('CANARY')}" = 1 }"#,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("secret(<redacted>)"));
+    assert!(!error.to_string().contains("CANARY"));
+}
+#[test]
+fn round7_backend_and_provider_keys_never_expose_identity_in_debug() {
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let backend = parse(
+        r#"backend local { "${secret('CANARY')}" = secret('VALUE_CANARY') }"#,
+        &context,
+    )
+    .unwrap();
+    assert!(!format!("{:?}", backend.backend).contains("CANARY"));
+    let provider = parse(r#"provider mock { "${secret('CANARY')}" = 1 }"#, &context).unwrap();
+    assert!(!format!("{:?}", provider.providers).contains("CANARY"));
 }

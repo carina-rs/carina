@@ -27,7 +27,6 @@ use carina_core::parser::BackendConfig;
 #[cfg(test)]
 use carina_core::parser::ProviderContext;
 use carina_core::resource::{BindingAddress, PlaceholderKind};
-use carina_core::upstream_exports::UpstreamRefDiagnostic;
 #[cfg(test)]
 use carina_state::BackendError;
 use carina_state::{
@@ -46,12 +45,12 @@ use crate::wiring::{
     ValidationProviderCatalogExt, WiringContext,
     compute_anonymous_identifiers_with_policy_with_ctx,
     compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx, resolve_file_names_with_ctx,
-    validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
+    validate_deferred_populate_refs_with_ctx,
     validate_module_attribute_refs_after_expansion_failure, validate_module_internal_ref_types,
     validate_no_backend_in_modules, validate_no_exports_in_modules,
     validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
     validate_no_upstream_states_in_modules, validate_provider_region_with_ctx,
-    validate_resource_admissions_with_ctx, validate_wait_bindings_with_ctx,
+    validate_wait_bindings_with_ctx,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -320,6 +319,24 @@ pub fn validate_and_resolve_with_config(
         .map_err(|errors| collapse_errors(errors.into_vec()))
 }
 
+/// Human commands explicitly select this output policy for provider events.
+pub(crate) fn human_provider_notices(
+    color: crate::output_style::ColorMode,
+) -> crate::wiring::ProviderNoticeSink {
+    crate::wiring::ProviderNoticeSink::new(move |notice| {
+        if matches!(
+            notice,
+            crate::wiring::ProviderLoadEvent::Cache(
+                carina_plugin_host::WasmLoadNotice::ValidationRebuilt(_)
+            )
+        ) {
+            log::warn!(target: "carina_plugin_host::wasm_factory", "{}", notice.render_human(color));
+        } else {
+            eprintln!("{}", notice.render_human(color));
+        }
+    })
+}
+
 /// Test-support entry point that exercises the real command-scoped provider loader.
 #[cfg(any(test, feature = "test-utils"))]
 pub fn validate_and_resolve_with_provider_load_for_test(
@@ -329,8 +346,12 @@ pub fn validate_and_resolve_with_provider_load_for_test(
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
 ) -> Result<carina_core::parser::ModuleResolvedInferredFile, AppError> {
-    let (providers, load_error) =
-        ProviderLoad::load_reporting(runtime, &parsed.providers, base_dir)?;
+    let (providers, load_error) = ProviderLoad::load_reporting(
+        runtime,
+        &parsed.providers,
+        base_dir,
+        &mut crate::commands::human_provider_notices(runtime.color_mode()),
+    )?;
     if let Some(error) = load_error {
         return Err(error);
     }
@@ -459,26 +480,17 @@ fn extend_module_call_errors(
 
 fn extend_module_resolution_errors(
     errors: &mut Vec<AppError>,
-    residuals: &[carina_core::module_resolver::ResidualModuleResolutionError],
+    residuals: Vec<carina_core::module_resolver::ResidualModuleResolutionError>,
     base_dir: &ResolvedPath,
 ) {
-    let base_dir = base_dir.clone();
-    let base_label = base_dir.source_label();
-    let base_dir = base_label.as_path();
     for residual in residuals {
         if let Some(error) = residual.analysis_invariant() {
             errors.push(AppError::AnalysisInvariant(error.clone()));
             continue;
         }
-        let message = if residual.is_constraint() {
-            residual.display_relative_to(base_dir)
-        } else {
-            format!(
-                "Module resolution error: {}",
-                residual.display_relative_to(base_dir)
-            )
-        };
-        errors.push(AppError::Config(message));
+        errors.push(AppError::ModuleResolution(Box::new(
+            crate::error::ModuleResolutionFailure::new(residual, base_dir.clone()),
+        )));
     }
 }
 
@@ -517,9 +529,18 @@ fn extend_expanded_binding_use_errors<P: carina_core::resource::PlaceholderKind>
 
 /// Validation retains its complete authored authority even when ordinary
 /// diagnostics prevent producing an execution-ready configuration.
+pub(crate) enum ConfigurationWarning {
+    Dependency(
+        carina_core::parser::Located<carina_core::validation::depends_on::DependsOnDiagnostic>,
+    ),
+    Provider(carina_core::parser::ParseWarning),
+    Parser(carina_core::parser::ParseWarning),
+}
+
 pub(crate) struct ConfigurationValidation<T> {
     pub(crate) result: Result<T, NonEmptyValidationErrors>,
     pub(crate) authored_inputs: carina_core::input_rules::AuthoredInputs,
+    pub(crate) warnings: Vec<ConfigurationWarning>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -534,7 +555,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
     duplicate_declarations: &[DuplicateDeclaration],
     name_resolution: ConfigNameResolution,
 ) -> Result<ResolvedConfig, NonEmptyValidationErrors> {
-    validate_and_resolve_report_inner(
+    let report = validate_and_resolve_report_inner(
         access,
         parsed,
         base_dir,
@@ -544,8 +565,17 @@ pub(crate) fn validate_and_resolve_errors_inner(
         skip_resource_validation,
         duplicate_declarations,
         name_resolution,
-    )
-    .result
+    );
+    for warning in report.warnings {
+        match warning {
+            ConfigurationWarning::Dependency(warning) => eprintln!("warning: {warning}"),
+            ConfigurationWarning::Provider(warning) => {
+                crate::commands::validate::print_provider_type_warning(&warning)
+            }
+            ConfigurationWarning::Parser(_) => {}
+        }
+    }
+    report.result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -560,6 +590,7 @@ pub(crate) fn validate_and_resolve_report_inner(
     duplicate_declarations: &[DuplicateDeclaration],
     name_resolution: ConfigNameResolution,
 ) -> ConfigurationValidation<ResolvedConfig> {
+    let mut warnings = Vec::new();
     let mut authored_inputs = carina_core::input_rules::AuthoredInputs::for_directory_in_session(
         &parsed,
         enriched_context,
@@ -575,10 +606,12 @@ pub(crate) fn validate_and_resolve_report_inner(
         duplicate_declarations,
         name_resolution,
         &mut authored_inputs,
+        &mut warnings,
     );
     ConfigurationValidation {
         result,
         authored_inputs,
+        warnings,
     }
 }
 
@@ -594,7 +627,9 @@ fn validate_and_resolve_configuration(
     duplicate_declarations: &[DuplicateDeclaration],
     name_resolution: ConfigNameResolution,
     authored_inputs: &mut carina_core::input_rules::AuthoredInputs,
+    warnings: &mut Vec<ConfigurationWarning>,
 ) -> Result<ResolvedConfig, NonEmptyValidationErrors> {
+    let initial_warning_count = parsed.warnings.len();
     let resolved_base = base_dir.clone();
     let base_dir = &resolved_base;
     // Binding-use validation is a production-readiness invariant, not a
@@ -613,7 +648,7 @@ fn validate_and_resolve_configuration(
         errors.extend(
             carina_core::parser::check_identifier_scope(parsed.parsed())
                 .into_iter()
-                .map(|error| AppError::Config(error.to_string())),
+                .map(|error| AppError::Parse(Box::new(error))),
         );
     }
     if !skip_resource_validation {
@@ -711,14 +746,21 @@ fn validate_and_resolve_configuration(
             .map(|finding| AppError::ExpressionType(Box::new(finding))),
     );
     if let Err(error) = parsed.resolve_resource_refs_in_session(enriched_context) {
-        errors.push(AppError::Config(error.to_string()));
+        errors.push(AppError::AnalysisResolution(Box::new(error)));
     }
     if !skip_resource_validation {
+        let mut module_warnings = Vec::new();
         errors.extend(validate_module_internal_ref_types(
             ctx,
             &module_walk,
             enriched_context,
+            &mut module_warnings,
         ));
+        warnings.extend(
+            module_warnings
+                .into_iter()
+                .map(ConfigurationWarning::Provider),
+        );
     }
 
     // Load root module signatures once. The core module-call checker consumes
@@ -823,10 +865,21 @@ fn validate_and_resolve_configuration(
             // Resolution mutated the authored input. Seal this stage only on
             // the early-error path; success uses the shared expanded tree.
             match carina_core::parser::AnalysisTree::try_from_file(parsed.parsed()) {
-                Ok(tree) => errors.extend(validate_depends_on_with_ctx(
-                    &tree,
-                    &resolved_argument_types,
-                )),
+                Ok(tree) => {
+                    for finding in carina_core::validation::depends_on::validate_depends_on(
+                        &tree,
+                        &resolved_argument_types,
+                    ) {
+                        match finding.severity {
+                            carina_core::validation::depends_on::Severity::Error => {
+                                errors.push(AppError::DependsOn(Box::new(finding)))
+                            }
+                            carina_core::validation::depends_on::Severity::Warning => {
+                                warnings.push(ConfigurationWarning::Dependency(finding))
+                            }
+                        }
+                    }
+                }
                 Err(error) => errors.push(AppError::AnalysisInvariant(error)),
             }
         }
@@ -872,7 +925,7 @@ fn validate_and_resolve_configuration(
                     enriched_context,
                 ));
             }
-            extend_module_resolution_errors(&mut errors, &residuals, base_dir);
+            extend_module_resolution_errors(&mut errors, residuals, base_dir);
             return Err(non_empty_validation_failure(errors));
         }
         module_resolver::ModuleResolutionDiagnosticResult::Unowned { errors: residuals } => {
@@ -886,10 +939,19 @@ fn validate_and_resolve_configuration(
                     enriched_context,
                 ));
             }
-            extend_module_resolution_errors(&mut errors, &residuals, base_dir);
+            extend_module_resolution_errors(&mut errors, residuals, base_dir);
             return Err(non_empty_validation_failure(errors));
         }
     };
+
+    warnings.extend(
+        parsed
+            .warnings
+            .iter()
+            .skip(initial_warning_count)
+            .cloned()
+            .map(ConfigurationWarning::Parser),
+    );
 
     // Module expansion produces composition resources for module-call
     // bindings (`carina-core/src/module_resolver/expander.rs`). Resolve
@@ -1035,7 +1097,7 @@ fn validate_and_resolve_configuration(
         None
     };
     let (upstream_exports, upstream_resolve_errors) = if let Some(analysis) = &expanded_analysis {
-        match carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
+        match carina_core::upstream_exports::resolve_upstream_exports_report(
             base_dir,
             analysis,
             enriched_context,
@@ -1066,21 +1128,31 @@ fn validate_and_resolve_configuration(
     }
 
     if let Some(analysis) = &expanded_analysis {
-        errors.extend(validate_depends_on_with_ctx(
+        for finding in carina_core::validation::depends_on::validate_depends_on(
             analysis,
             &resolved_argument_types,
-        ));
+        ) {
+            match finding.severity {
+                carina_core::validation::depends_on::Severity::Error => {
+                    errors.push(AppError::DependsOn(Box::new(finding)))
+                }
+                carina_core::validation::depends_on::Severity::Warning => {
+                    warnings.push(ConfigurationWarning::Dependency(finding))
+                }
+            }
+        }
         errors.extend(validate_wait_bindings_with_ctx(ctx, analysis));
         errors.extend(validate_deferred_populate_refs_with_ctx(ctx, analysis));
         errors.extend(
             upstream_resolve_errors
                 .iter()
-                .map(|error| AppError::Validation(error.to_string())),
+                .cloned()
+                .map(|error| AppError::UpstreamResolution(Box::new(error))),
         );
 
         let export_value_bindings =
             carina_core::binding_index::ResolvedBindings::for_expanded_validation(parsed);
-        let checked_export_values = carina_core::validation::check_export_values_pre_apply(
+        let checked_export_values = carina_core::validation::check_export_values_pre_apply_report(
             &parsed.export_params,
             &export_value_bindings,
             enriched_context,
@@ -1102,27 +1174,49 @@ fn validate_and_resolve_configuration(
             ctx.schemas(),
             enriched_context.catalog(),
         );
-        errors.extend(validate_resource_admissions_with_ctx(
-            ctx,
-            configuration.judged(),
-            &bindings,
-        ));
-        if let Err(message) =
-            carina_core::validation::validate_attribute_param_ref_types_with_bindings(
+        let (admission_errors, admission_warnings) =
+            crate::wiring::resource_admission_report_with_ctx(
+                ctx,
+                configuration.judged(),
+                &bindings,
+            );
+        errors.extend(admission_errors);
+        warnings.extend(
+            admission_warnings
+                .into_iter()
+                .map(ConfigurationWarning::Provider),
+        );
+        errors.extend(
+            carina_core::validation::attribute_param_ref_findings(
                 &parsed.attribute_params,
                 &bindings,
             )
-        {
-            errors.extend(split_validation_message(&message));
-        }
-        if let Err(message) = carina_core::validation::validate_attribute_params_with_context(
-            &parsed.attribute_params,
-            enriched_context,
-        ) {
-            errors.extend(split_validation_message(&message));
-        }
-        if let Err(msg) = checked_export_values {
-            errors.extend(split_validation_message(&msg));
+            .into_iter()
+            .map(|finding| AppError::ParameterReference {
+                prefix: None,
+                finding: Box::new(finding),
+            }),
+        );
+        errors.extend(
+            carina_core::validation::attribute_value_findings(
+                &parsed.attribute_params,
+                enriched_context,
+            )
+            .into_iter()
+            .map(|finding| AppError::ParameterValue {
+                prefix: None,
+                finding: Box::new(finding),
+            }),
+        );
+        if let Err(findings) = checked_export_values {
+            errors.extend(
+                findings
+                    .into_iter()
+                    .map(|finding| AppError::ParameterValue {
+                        prefix: None,
+                        finding: Box::new(finding),
+                    }),
+            );
         }
         if !errors.is_empty() {
             return Err(non_empty_validation_failure(errors));
@@ -1199,28 +1293,27 @@ fn validate_and_resolve_configuration(
             &analysis,
             &upstream_exports,
         );
-        // The four upstream-ref shape/existence checks return distinct concrete types
-        // but share `UpstreamRefDiagnostic`. Chain them through the
-        // trait (`Display` supertrait gives the canonical
-        // `"location: message"` form — the per-type `Display` impl is
-        // the single source of truth) so adding another check is one
-        // extra `chain(...)`.
+        use crate::error::UpstreamReferenceFailure;
         errors.extend(
             field_errors
-                .iter()
-                .map(|e| e as &dyn UpstreamRefDiagnostic)
-                .chain(shape_errors.iter().map(|e| e as &dyn UpstreamRefDiagnostic))
+                .into_iter()
+                .map(UpstreamReferenceFailure::Field)
+                .chain(
+                    shape_errors
+                        .into_iter()
+                        .map(UpstreamReferenceFailure::Iterable),
+                )
                 .chain(
                     attribute_access_errors
-                        .iter()
-                        .map(|e| e as &dyn UpstreamRefDiagnostic),
+                        .into_iter()
+                        .map(UpstreamReferenceFailure::Attribute),
                 )
                 .chain(
                     subscript_errors
-                        .iter()
-                        .map(|e| e as &dyn UpstreamRefDiagnostic),
+                        .into_iter()
+                        .map(UpstreamReferenceFailure::Subscript),
                 )
-                .map(|e| AppError::Validation(e.to_string())),
+                .map(|error| AppError::UpstreamReference(Box::new(error))),
         );
     }
 
@@ -1289,8 +1382,8 @@ mod tests {
         );
         BackendConfig {
             backend_type: "s3".to_string(),
-            attributes,
-            attribute_spans: HashMap::new(),
+            attributes: (attributes).into(),
+            attribute_spans: Default::default(),
         }
     }
 
@@ -1302,8 +1395,8 @@ mod tests {
         );
         BackendConfig {
             backend_type: "local".to_string(),
-            attributes,
-            attribute_spans: HashMap::new(),
+            attributes: (attributes).into(),
+            attribute_spans: Default::default(),
         }
     }
 
@@ -1503,6 +1596,7 @@ mod tests {
             &runtime,
             &parsed.providers,
             &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
+            &mut crate::commands::human_provider_notices(runtime.color_mode()),
         )
         .unwrap();
 
@@ -1546,11 +1640,11 @@ mod tests {
         parsed.providers.push(ProviderConfig {
             name: "fakeprovider".to_string(),
             source: Some(format!("file://{}", source_path.display()).parse().unwrap()),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         });
 
@@ -1558,6 +1652,7 @@ mod tests {
             &runtime,
             &parsed.providers,
             &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
+            &mut crate::commands::human_provider_notices(runtime.color_mode()),
         )
         .unwrap();
         let parsed =
@@ -1595,11 +1690,11 @@ mod tests {
         parsed.providers.push(ProviderConfig {
             name: "awscc".to_string(),
             source: None,
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         });
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
@@ -1607,6 +1702,7 @@ mod tests {
             &runtime,
             &parsed.providers,
             &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
+            &mut crate::commands::human_provider_notices(runtime.color_mode()),
         )
         .unwrap();
         let parsed =
@@ -1669,6 +1765,7 @@ exports {
             &runtime,
             &parsed.providers,
             &carina_core::paths::ResolvedPath::new(&base).unwrap(),
+            &mut crate::commands::human_provider_notices(runtime.color_mode()),
         )
         .unwrap();
 
@@ -1720,6 +1817,7 @@ exports {
             &runtime,
             &parsed.providers,
             &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
+            &mut crate::commands::human_provider_notices(runtime.color_mode()),
         )
         .expect("providers");
 
@@ -1776,6 +1874,7 @@ attributes { loaded: Bool = true }
             &runtime,
             &loaded.parsed.providers,
             &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            &mut crate::commands::human_provider_notices(runtime.color_mode()),
         )
         .unwrap();
 
@@ -1898,6 +1997,7 @@ child { values = [source] }
             &runtime,
             &parsed.providers,
             &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
+            &mut crate::commands::human_provider_notices(runtime.color_mode()),
         )
         .unwrap();
 

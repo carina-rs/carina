@@ -1421,7 +1421,7 @@ fn estimator_default_tags_are_checked_through_the_host_merge_for_unknown_maps() 
         let config = crate::parser::ProviderConfig {
             name: "mock".into(),
             attributes: Default::default(),
-            default_tags: IndexMap::from([(key.into(), value)]),
+            default_tags: (IndexMap::<String, _>::from([(key.into(), value)])).into(),
             source: None,
             version: None,
             revision: None,

@@ -439,17 +439,16 @@ mod recorded_provider_artifact_tests {
 mod provider_scope_evidence_tests {
     use super::*;
     use carina_core::provider::{ProviderInstanceKey, ProviderRouter, ReferenceScope};
-    use indexmap::IndexMap;
 
     fn provider_config(binding: &str) -> carina_core::parser::ExpandedProviderConfig {
         ProviderConfig {
             name: "test".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: Some(binding.to_string()),
         }
     }
@@ -2958,7 +2957,6 @@ impl PlanSchemaFingerprints {
 mod schema_fingerprint_tests {
     use super::*;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
-    use indexmap::IndexMap;
 
     fn reference(provider: &str, resource_type: &str) -> PlanSchemaReference {
         PlanSchemaReference {
@@ -2998,12 +2996,12 @@ mod schema_fingerprint_tests {
     ) -> carina_core::parser::ExpandedProviderConfig {
         ProviderConfig {
             name: name.to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: binding.map(ToString::to_string),
         }
     }
@@ -5798,7 +5796,14 @@ pub async fn run_plan(
         check_iam,
         strict_iam,
         provider_context,
-        ProviderLoad::load,
+        |runtime, providers, directory| {
+            ProviderLoad::load(
+                runtime,
+                providers,
+                directory,
+                &mut crate::commands::human_provider_notices(runtime.color_mode()),
+            )
+        },
     )
     .await
 }
@@ -6797,7 +6802,7 @@ pub(crate) async fn load_and_resolve_read_only_provider_configs<E>(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProviderAttributeRequirement {
     provider: String,
-    attribute: String,
+    attribute: carina_core::parser::AttributeKey,
     diagnostic_path: Option<carina_core::resource::DiagnosticPath>,
 }
 
@@ -7651,7 +7656,7 @@ mod load_upstream_states_tests {
         let mut parsed = parsed.into_expanded(&schemas, &context).unwrap();
         parsed.providers[0]
             .attributes
-            .insert("region".into(), root_resource_ref("mgmt", "region"));
+            .insert("region", root_resource_ref("mgmt", "region"));
 
         let loaded = load_and_resolve_read_only_provider_configs(
             &crate::test_support::TestCommandRuntime::new(),
@@ -7673,15 +7678,17 @@ mod load_upstream_states_tests {
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(ProviderConfig {
             name: "test".into(),
-            attributes: indexmap::IndexMap::new(),
-            default_tags: indexmap::IndexMap::from([(
-                "Owner".into(),
+            attributes: Default::default(),
+            default_tags: [(
+                "Owner",
                 Value::Concrete(ConcreteValue::String("carina".into())),
-            )]),
+            )]
+            .into_iter()
+            .collect(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: indexmap::IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         });
         let parsed = resolve_file_for_test(parsed, temp.path());
@@ -8003,12 +8010,13 @@ mod load_upstream_states_tests {
         });
         parsed.providers.push(ProviderConfig {
             name: "test".into(),
-            attributes: indexmap::IndexMap::from([(
+            attributes: (indexmap::IndexMap::<String, _>::from([(
                 "region".into(),
                 Value::Deferred(DeferredValue::Secret(
                     Box::new(root_resource_ref("private_upstream", "value")).into(),
                 )),
-            )]),
+            )]))
+            .into(),
             default_tags: Default::default(),
             source: None,
             version: None,
@@ -8050,19 +8058,20 @@ mod load_upstream_states_tests {
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(ProviderConfig {
             name: "test".to_string(),
-            attributes: indexmap::IndexMap::from([(
+            attributes: (indexmap::IndexMap::<String, _>::from([(
                 "region".to_string(),
                 Value::Deferred(DeferredValue::FunctionCall {
                     name: carina_core::builtins::BuiltinFunction::upper,
                     args: Vec::new(),
                     source_line: 0.into(),
                 }),
-            )]),
-            default_tags: indexmap::IndexMap::new(),
+            )]))
+            .into(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: indexmap::IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         });
         let parsed = resolve_file_for_test(parsed, dir.path());
@@ -8102,15 +8111,16 @@ mod load_upstream_states_tests {
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(ProviderConfig {
             name: "test".to_string(),
-            attributes: indexmap::IndexMap::from([(
+            attributes: (indexmap::IndexMap::<String, _>::from([(
                 "region".to_string(),
                 root_resource_ref("missing", "region"),
-            )]),
-            default_tags: indexmap::IndexMap::new(),
+            )]))
+            .into(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: indexmap::IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         });
         let parsed = resolve_file_for_test(parsed, dir.path());
@@ -8152,15 +8162,16 @@ mod load_upstream_states_tests {
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(ProviderConfig {
             name: "test".to_string(),
-            attributes: indexmap::IndexMap::new(),
-            default_tags: indexmap::IndexMap::from([(
+            attributes: Default::default(),
+            default_tags: (indexmap::IndexMap::<String, _>::from([(
                 "Owner".to_string(),
                 root_resource_ref("mgmt", "owner"),
-            )]),
+            )]))
+            .into(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: indexmap::IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         });
         parsed.upstream_states.extend([
@@ -8244,15 +8255,16 @@ mod load_upstream_states_tests {
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(ProviderConfig {
             name: "test".to_string(),
-            attributes: indexmap::IndexMap::from([(
+            attributes: (indexmap::IndexMap::<String, _>::from([(
                 "value".to_string(),
                 root_resource_ref("a", "value"),
-            )]),
-            default_tags: indexmap::IndexMap::new(),
+            )]))
+            .into(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: indexmap::IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         });
         for (binding, target) in [("a", "b"), ("b", "a")] {
@@ -10161,12 +10173,12 @@ mod run_plan_out_tests {
         fs::write(&path, "provider aws {}\n").expect("write source configuration");
         let configured = ProviderConfig {
             name: "aws".to_string(),
-            attributes: indexmap::IndexMap::new(),
-            default_tags: indexmap::IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: Some("file:///missing/aws.wasm".parse().unwrap()),
             version: None,
             revision: None,
-            unresolved_attributes: indexmap::IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         };
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();

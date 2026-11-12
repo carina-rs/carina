@@ -12,7 +12,6 @@ use crate::parser::expressions::string_literal::parse_string_literal;
 use crate::parser::grammar::PreprocessedFile;
 use crate::parser::parse_expression;
 use crate::parser::util::unwrap_to_primary;
-use std::collections::HashMap;
 
 pub(in crate::parser) fn parse_backend_block(
     pair: pest::iterators::Pair<Rule>,
@@ -24,14 +23,14 @@ pub(in crate::parser) fn parse_backend_block(
         .as_str()
         .to_string();
 
-    let mut attributes = HashMap::new();
-    let mut attribute_spans = HashMap::new();
+    let mut attributes = crate::parser::ConfigurationAttributes::new();
+    let mut attribute_spans = crate::parser::ConfigurationAttributes::new();
     for attr_pair in inner {
         if attr_pair.as_rule() == Rule::attribute {
             let mut attr_inner = attr_pair.into_inner();
             let key_pair = next_pair(&mut attr_inner, "attribute name", "backend block")?;
             let key_span = SourceSpan::from_pest(&key_pair, preprocessed_file);
-            let key = key_pair.as_str().to_string();
+            let key = ctx.authored_key(key_pair);
             let value = parse_expression(
                 next_pair(&mut attr_inner, "attribute value", "backend block")?,
                 ctx,
@@ -58,6 +57,7 @@ pub(in crate::parser) fn parse_backend_block(
 pub(in crate::parser) fn parse_upstream_state_expr(
     pair: pest::iterators::Pair<Rule>,
     binding_name: &str,
+    ctx: &ParseContext,
 ) -> Result<UpstreamState, ParseError> {
     let (block_line, _) = pair.as_span().start_pos().line_col();
     let inner = pair.into_inner();
@@ -69,35 +69,29 @@ pub(in crate::parser) fn parse_upstream_state_expr(
         }
         let (attr_line, _) = attr_pair.as_span().start_pos().line_col();
         let mut attr_inner = attr_pair.into_inner();
-        let key = next_pair(
+        let key = ctx.authored_key(next_pair(
             &mut attr_inner,
             "attribute name",
             "upstream_state expression",
-        )?
-        .as_str()
-        .to_string();
+        )?);
         let value_pair = next_pair(
             &mut attr_inner,
             "attribute value",
             "upstream_state expression",
         )?;
-        match key.as_str() {
-            "source" => {
-                let value_text = value_pair.as_str().to_string();
-                let invalid_source = |without_interpolation: bool| {
-                    let requirement = if without_interpolation {
-                        "a string literal without interpolation"
-                    } else {
-                        "a string literal"
-                    };
-                    ParseError::InvalidExpression {
+        match key {
+            key if key.matches("source") => {
+                let value_text =
+                    crate::parser::AuthoredExpressionText::redact(value_pair.clone(), None);
+                let invalid_source =
+                    |without_interpolation: bool| ParseError::InvalidAuthoredExpression {
                         line: attr_line,
-                        message: format!(
-                            "upstream_state '{}': 'source' must be {}, got: {}",
-                            binding_name, requirement, value_text
+                        diagnostic: crate::parser::AuthoredExpressionDiagnostic::upstream_source(
+                            value_text.clone(),
+                            binding_name,
+                            without_interpolation,
                         ),
-                    }
-                };
+                    };
                 let primary = unwrap_to_primary(value_pair).ok_or_else(|| invalid_source(false))?;
                 let value = first_inner(primary, "string literal", "upstream_state source")?;
                 if value.as_rule() != Rule::string {

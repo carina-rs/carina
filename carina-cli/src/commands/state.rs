@@ -478,6 +478,7 @@ async fn run_state_migration_check(
         &parsed.providers,
         base_dir,
         &provider_schema_overrides,
+        &mut crate::commands::human_provider_notices(runtime.color_mode()),
     )?;
     let validated =
         providers.validate_evaluated_config(parsed, base_dir, &duplicate_declarations)?;
@@ -1528,7 +1529,12 @@ async fn run_state_bucket_delete(
     // that command wiring before asking the operator to confirm deletion; the
     // resolved provider values needed for construction can wait until after
     // confirmation.
-    let providers = ProviderLoad::load(runtime, &parsed.providers, base_dir)?;
+    let providers = ProviderLoad::load(
+        runtime,
+        &parsed.providers,
+        base_dir,
+        &mut crate::commands::human_provider_notices(runtime.color_mode()),
+    )?;
     let validated_config =
         providers.validate_read_only_config(parsed, base_dir, &duplicate_declarations)?;
 
@@ -1726,7 +1732,12 @@ pub async fn run_state_refresh(
 
     super::apply::symlink_retarget_test_barrier("CARINA_TEST_STATE_REFRESH_CONFIG_HANDSHAKE_DIR")
         .await;
-    let providers = ProviderLoad::load(runtime, &parsed.providers, base_dir)?;
+    let providers = ProviderLoad::load(
+        runtime,
+        &parsed.providers,
+        base_dir,
+        &mut crate::commands::human_provider_notices(runtime.color_mode()),
+    )?;
     let validated_config =
         providers.validate_read_only_config(parsed, base_dir, &duplicate_declarations)?;
 
@@ -3537,6 +3548,7 @@ mod tests {
             &runtime,
             &parsed.providers,
             &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
+            &mut crate::commands::human_provider_notices(runtime.color_mode()),
         )
         .unwrap();
         let validated_config = providers
@@ -3568,6 +3580,7 @@ mod tests {
             &runtime,
             &parsed.providers,
             &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
+            &mut crate::commands::human_provider_notices(runtime.color_mode()),
         )
         .unwrap();
         let validated_config = providers
@@ -3599,6 +3612,7 @@ mod tests {
             &runtime,
             &parsed.providers,
             &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
+            &mut crate::commands::human_provider_notices(runtime.color_mode()),
         )
         .unwrap();
         let validated_config = providers
@@ -3724,11 +3738,12 @@ mod tests {
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.backend = Some(carina_core::parser::ExpandedBackendConfig {
             backend_type: "s3".into(),
-            attributes: HashMap::from([(
+            attributes: (HashMap::<String, _>::from([(
                 "bucket".into(),
                 Value::Concrete(ConcreteValue::String(name.into())),
-            )]),
-            attribute_spans: HashMap::new(),
+            )]))
+            .into(),
+            attribute_spans: Default::default(),
         });
         parsed
     }
@@ -4341,12 +4356,12 @@ mod tests {
     async fn state_refresh_stops_dispatching_data_sources_after_cancellation() {
         let provider_config = carina_core::parser::ProviderConfig {
             name: "test".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         };
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
@@ -4435,12 +4450,12 @@ mod tests {
             );
         let provider_config = carina_core::parser::ProviderConfig {
             name: "test".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         };
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
@@ -4521,12 +4536,12 @@ mod tests {
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(carina_core::parser::ProviderConfig {
             name: "test".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         });
         parsed.compositions.push(composition);
