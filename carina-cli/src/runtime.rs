@@ -4,9 +4,12 @@ use crate::error::{AppError, CommandInputError};
 use crate::output_style::ColorMode;
 use crate::wiring::TrustedLocalGrantInputs;
 use carina_core::paths::{CanonicalPath, ResolvedPath};
+use carina_core::upstream_exports::{
+    ResolvedUpstreamSource, UpstreamSourceIdentity, UpstreamTypeAuthority,
+};
 use carina_core::{EnvironmentSnapshot, UserDirs};
 use carina_provider_mock::ConfiguredBuiltinMock;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 #[cfg(any(test, feature = "test-utils"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,6 +17,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 type ConfigureBuiltinMock =
     Box<dyn FnOnce() -> Result<ConfiguredBuiltinMock, Arc<CommandInputError>> + Send + Sync>;
+
+type UpstreamSourceCache =
+    HashMap<(CanonicalPath, String), Vec<(UpstreamTypeAuthority, Arc<ResolvedUpstreamSource>)>>;
 
 /// Mock-only inputs become usable only after successful builtin selection.
 pub struct BuiltinMockInputs {
@@ -61,6 +67,7 @@ pub struct CommandInputs {
 struct InvocationState {
     inputs: CommandInputs,
     warned_upstream: Mutex<HashSet<CanonicalPath>>,
+    upstream_sources: Mutex<UpstreamSourceCache>,
     #[cfg(any(test, feature = "test-utils"))]
     provider_loads: AtomicUsize,
 }
@@ -80,6 +87,7 @@ impl CommandRuntime {
             state: Arc::new(InvocationState {
                 inputs,
                 warned_upstream: Mutex::new(HashSet::new()),
+                upstream_sources: Mutex::new(HashMap::new()),
                 #[cfg(any(test, feature = "test-utils"))]
                 provider_loads: AtomicUsize::new(0),
             }),
@@ -87,6 +95,38 @@ impl CommandRuntime {
             directory_owner: None,
         }
     }
+    /// Source metadata is immutable for one command; state bytes are never
+    /// cached. Holding this lock only covers synchronous parse/expansion.
+    pub(crate) fn upstream_source(
+        &self,
+        identity: &UpstreamSourceIdentity,
+        context: &carina_core::parser::ProviderContext,
+        schemas: &carina_core::schema::SchemaRegistry,
+    ) -> Result<Arc<ResolvedUpstreamSource>, AppError> {
+        let authority = UpstreamTypeAuthority::capture(context, schemas);
+        let mut sources = self
+            .state
+            .upstream_sources
+            .lock()
+            .expect("upstream source cache");
+        let sources = sources
+            .entry((identity.source().identity(), identity.binding().into()))
+            .or_default();
+        if let Some((_, source)) = sources.iter().find(|(existing, _)| existing == &authority) {
+            return Ok(Arc::clone(source));
+        }
+        let bootstrap =
+            carina_core::upstream_exports::UpstreamBootstrapContext::from_runtime(context);
+        let source = Arc::new(
+            carina_core::validation::deferred_types::TypeCheckSession::run(context, |session| {
+                identity.load(&bootstrap, session, schemas)
+            })
+            .publish(&mut Vec::new())?,
+        );
+        sources.push((authority, Arc::clone(&source)));
+        Ok(source)
+    }
+
     pub fn user_dirs(&self) -> &UserDirs {
         &self.user_dirs
     }

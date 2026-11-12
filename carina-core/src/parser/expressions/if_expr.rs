@@ -234,12 +234,7 @@ pub(crate) fn parse_if_expr(
     let decision = decide_if_condition(&condition_value, ctx.config)
         .map_err(|error| error.into_parse_error(condition_line))?;
     if let Some(selected) = decision {
-        ctx.record_retained_eval(
-            &condition_token,
-            &EvalValue::from_value(Value::Concrete(crate::resource::ConcreteValue::Bool(
-                selected,
-            ))),
-        );
+        ctx.record_selected_condition(&condition_token, selected);
     }
     let if_body = classify_if_body(next_pair(&mut inner, "if body", "if expression")?)?;
     let else_body = inner
@@ -517,12 +512,7 @@ pub(crate) fn parse_if_value_expr_with_mode(
     let decision = decide_if_condition(&condition_value, ctx.config)
         .map_err(|error| error.into_parse_error(condition_line))?;
     if let Some(selected) = decision {
-        ctx.record_retained_eval(
-            &condition_token,
-            &EvalValue::from_value(Value::Concrete(crate::resource::ConcreteValue::Bool(
-                selected,
-            ))),
-        );
+        ctx.record_selected_condition(&condition_token, selected);
     }
 
     let if_body = classify_if_body(next_pair(&mut inner, "if body", "if value expression")?)?;

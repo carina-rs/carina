@@ -41,7 +41,7 @@ fn review_seam_invalid_judged_tree_becomes_a_diagnostic() {
     parsed.resources[0].declaration = Default::default();
     let doc = create_document("mock.Test { input = 'x' }");
     let mut diagnostics = Vec::new();
-    assert!(authored_validation_tree(&doc, &parsed, &mut diagnostics).is_none());
+    assert!(analysis_tree(&doc, &parsed, &mut diagnostics).is_none());
     assert_eq!(diagnostics.len(), 1);
     assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
     assert!(
@@ -84,7 +84,7 @@ fn review_seam_expanded_admission_retains_instantiated_judgements() {
         let judged = configuration.judged();
         let instances = judged.file().clone();
         let tree = carina_core::parser::AnalysisTree::try_from_file(&instances).unwrap();
-        let inputs = ExpandedDiagnosticValidationInputs {
+        let mut inputs = ExpandedDiagnosticValidationInputs {
             configuration: judged,
             resources: tree
                 .resources()

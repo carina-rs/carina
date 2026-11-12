@@ -429,6 +429,7 @@ fn verdict<K: DestinationKind>(
         local: paths,
         schema,
         errors: _,
+        deferred: _,
     } = findings;
     match K::local(destination, paths, schema) {
         Ok(obligation) => AssignmentVerdict::NeedsLocal(obligation),
@@ -497,23 +498,28 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
     let mut checked = match &context.proof {
         AdmissionProof::Validation(proof) => {
             let reference_context = ReferenceContext::from(context);
+            let authored =
+                |attr: &CompiledAttributeType,
+                 checked: crate::schema::value_validation::CheckValue<'_, P, B>,
+                 path: &LeafPath,
+                 cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
+                    match context.assignment.authored {
+                        Some(hook) => hook(attr, checked, &join(&contract.path, path), cursor),
+                        None => Ok(Default::default()),
+                    }
+                };
             let check =
                 |attr: &CompiledAttributeType,
                  checked: crate::schema::value_validation::CheckValue<'_, P, B>,
                  path: &LeafPath,
                  cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
                     let path = join(&contract.path, path);
-                    // B1's authored policy belongs here, before lowered-origin
-                    // dispatch, and receives this exact declaration and cursor.
+                    let mut findings = Default::default();
                     // Selection parents are policy-only: main's ordinary local
                     // and reference obligations belong to the selected child.
                     if cursor.is_selection() {
-                        return Ok(Default::default());
+                        return Ok(findings);
                     }
-                    let mut findings = match context.assignment {
-                        Some(check) => check(attr, checked, &path, cursor)?,
-                        None => crate::schema::value_validation::AssignmentFindings::default(),
-                    };
                     let crate::schema::value_validation::CheckValue::Current(value) = checked
                     else {
                         return Ok(findings);
@@ -526,7 +532,11 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                             &reference_context,
                             &mut findings,
                         )?,
-                        CandidateOrigin::Expression => {}
+                        CandidateOrigin::Expression => {
+                            if let Some(check) = context.assignment.ordinary {
+                                findings.extend(check(attr, value, &path, cursor)?);
+                            }
+                        }
                     }
                     Ok(findings)
                 };
@@ -537,7 +547,10 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 contract.ancestry,
                 &lookup,
                 context.cursor.clone(),
-                &check,
+                crate::schema::value_validation::AssignmentCallbacks {
+                    ordinary: &check,
+                    authored: context.assignment.authored.map(|_| &authored as _),
+                },
                 &mut context.coverage.borrow_mut(),
             )
         }
@@ -549,7 +562,10 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 contract.ancestry,
                 &lookup,
                 context.cursor.clone(),
-                &|_, _, _, _| Ok(Default::default()),
+                crate::schema::value_validation::AssignmentCallbacks {
+                    ordinary: &|_, _, _, _| Ok(Default::default()),
+                    authored: None,
+                },
                 &mut context.coverage.borrow_mut(),
             )
         }
@@ -561,7 +577,10 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 contract.ancestry,
                 &lookup,
                 context.cursor.clone(),
-                &|_, _, _, _| Ok(Default::default()),
+                crate::schema::value_validation::AssignmentCallbacks {
+                    ordinary: &|_, _, _, _| Ok(Default::default()),
+                    authored: None,
+                },
                 &mut context.coverage.borrow_mut(),
             )
         }
@@ -575,7 +594,6 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
             .schema
             .extend(candidate.obligations.schema.clone());
     }
-    checked.symbolic = std::mem::take(&mut assignment.errors);
     let mut errors = Vec::new();
     for (path, error) in checked.clone().into_located() {
         errors.push(AdmissionFinding {

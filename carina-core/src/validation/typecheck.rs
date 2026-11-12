@@ -16,6 +16,7 @@ use crate::resource::{BindingAddress, ConcreteValue, DeferredValue, PlaceholderK
 enum ValueCheckEvidence<'a> {
     Authored(&'a JudgedExpr),
     Resolved,
+    UpstreamExport,
 }
 
 impl<'a> ValueCheckEvidence<'a> {
@@ -25,7 +26,7 @@ impl<'a> ValueCheckEvidence<'a> {
     ) -> Result<Self, MissingEvidence> {
         match self {
             Self::Authored(expression) => f(expression).map(Self::Authored),
-            Self::Resolved => Ok(self),
+            Self::Resolved | Self::UpstreamExport => Ok(self),
         }
     }
 }
@@ -180,12 +181,31 @@ impl<'a> TypecheckProviderContext<'a> {
         expected: &TypeExpr,
         value: &crate::resource::knowledge::KnownValue<'_, P, B>,
     ) -> TypeExprValueCheck<'a> {
+        self.check_known_constraints(expected, value, ValueCheckEvidence::Resolved)
+    }
+
+    /// Persisted enum tags establish identity, but do not prove membership in
+    /// the downstream's currently installed schema declaration.
+    pub(crate) fn check_upstream_export_constraints<P: PlaceholderKind, B: BindingAddress>(
+        self,
+        expected: &TypeExpr,
+        value: &crate::resource::knowledge::KnownValue<'_, P, B>,
+    ) -> TypeExprValueCheck<'a> {
+        self.check_known_constraints(expected, value, ValueCheckEvidence::UpstreamExport)
+    }
+
+    fn check_known_constraints<P: PlaceholderKind, B: BindingAddress>(
+        self,
+        expected: &TypeExpr,
+        value: &crate::resource::knowledge::KnownValue<'_, P, B>,
+        evidence: ValueCheckEvidence<'_>,
+    ) -> TypeExprValueCheck<'a> {
         let resolved_value = value.to_value();
         check_type_expr_value_inner_with_mode(
             expected,
             &resolved_value,
             self.as_provider_context(),
-            ValueCheckEvidence::Resolved,
+            evidence,
             if self.requires_provider_schemas() {
                 ProviderCustomTypeValidation::Loaded
             } else {
@@ -392,6 +412,7 @@ pub enum TypeExprValueError {
     MissingStructField {
         path: Vec<TypeExprValuePathSegment>,
         field: String,
+        expected: Box<TypeExpr>,
     },
     UnknownStructField {
         path: Vec<TypeExprValuePathSegment>,
@@ -411,6 +432,61 @@ pub enum TypeExprValueError {
 }
 
 impl TypeExprValueError {
+    /// Upstream values are not authored in the consumer directory. Keep the
+    /// checker-produced path/type/kind, discarding value-bearing validator text.
+    pub(crate) fn into_upstream_diagnostic(self) -> Self {
+        match self {
+            Self::Mismatch {
+                path,
+                expected,
+                actual,
+                ..
+            }
+            | Self::CustomTypeValidation {
+                path,
+                expected,
+                actual,
+                ..
+            } => Self::Mismatch {
+                path,
+                expected,
+                actual: Box::new(actual.kind_only()),
+                validator_message: None,
+                hint: None,
+            },
+            Self::UnknownStructField {
+                mut path,
+                expected,
+                actual,
+                field,
+            } => {
+                path.push(TypeExprValuePathSegment::StructField(field));
+                Self::Mismatch {
+                    path,
+                    expected,
+                    actual: Box::new(actual.kind_only()),
+                    validator_message: None,
+                    hint: Some("field is not declared in this struct"),
+                }
+            }
+            Self::MissingStructField {
+                mut path,
+                field,
+                expected,
+            } => {
+                path.push(TypeExprValuePathSegment::StructField(field));
+                Self::Mismatch {
+                    path,
+                    expected,
+                    actual: Box::new(ValueDescription::missing()),
+                    validator_message: None,
+                    hint: None,
+                }
+            }
+            other => other,
+        }
+    }
+
     fn prepend(mut self, segment: TypeExprValuePathSegment) -> Self {
         match &mut self {
             Self::InferredTypeMismatch { path, .. }
@@ -423,6 +499,9 @@ impl TypeExprValueError {
         self
     }
 }
+
+// Display is the complete legacy diagnostic, including any nested cause.
+impl std::error::Error for TypeExprValueError {}
 
 fn write_path(f: &mut fmt::Formatter<'_>, path: &[TypeExprValuePathSegment]) -> fmt::Result {
     if path.is_empty() {
@@ -466,7 +545,7 @@ impl fmt::Display for TypeExprValueError {
                 }
                 Ok(())
             }
-            Self::MissingStructField { path, field } => {
+            Self::MissingStructField { path, field, .. } => {
                 write_path(f, path)?;
                 write!(f, "expected struct, missing field '{field}'.")
             }
@@ -828,7 +907,9 @@ fn check_constraint_value<'s, P: PlaceholderKind, B: BindingAddress>(
             // Static admission already consumed all authored operands and branches.
             return match inference {
                 ValueCheckEvidence::Authored(_) => Assignable,
-                ValueCheckEvidence::Resolved => Mismatch(mismatch(expected, value)),
+                ValueCheckEvidence::Resolved | ValueCheckEvidence::UpstreamExport => {
+                    Mismatch(mismatch(expected, value))
+                }
             };
         }
         Value::Deferred(DeferredValue::BindingRef { .. }) => return Assignable,
@@ -961,6 +1042,19 @@ fn check_constraint_value<'s, P: PlaceholderKind, B: BindingAddress>(
             if !supported {
                 return Mismatch(mismatch(expected, value));
             }
+            if matches!(inference, ValueCheckEvidence::UpstreamExport)
+                && let Value::Concrete(ConcreteValue::CanonicalEnum(canonical)) = value
+                && let Err(error) = revalidate_upstream_enum(owned, canonical, config)
+            {
+                return if matches!(
+                    error,
+                    crate::parser::CustomTypeValidationError::ProvidersNotLoaded
+                ) {
+                    deferred_provider_check(expected, value)
+                } else {
+                    Mismatch(custom_type_validation_mismatch(expected, value, error))
+                };
+            }
             match provider_custom_types {
                 ProviderCustomTypeValidation::Loaded => {
                     match match value
@@ -1050,6 +1144,7 @@ fn check_constraint_value<'s, P: PlaceholderKind, B: BindingAddress>(
                         None => Mismatch(TypeExprValueError::MissingStructField {
                             path: Vec::new(),
                             field: field.clone(),
+                            expected: Box::new(field_type.clone()),
                         }),
                     }
                 }))
@@ -1169,6 +1264,41 @@ fn validation_mismatch<P: PlaceholderKind, B: BindingAddress>(
     }
 }
 
+fn revalidate_upstream_enum(
+    expected: &crate::parser::ResolvedSchemaType,
+    value: &crate::resource::CanonicalEnumValue,
+    config: &ProviderContext,
+) -> Result<(), crate::parser::CustomTypeValidationError> {
+    let enumeration = match expected.resolve_projection(config)? {
+        Some(declaration)
+            if matches!(
+                declaration.raw_shape(),
+                crate::schema::RawShape::Enum { .. }
+            ) =>
+        {
+            Some(declaration)
+        }
+        Some(_) => None,
+        None => config.enum_declaration(expected)?,
+    };
+    if let Some(enumeration) = enumeration {
+        crate::resource::EnumValueResolver::new(&enumeration)
+            .resolve_state_text(value.api_value())
+            .map_err(
+                |error| crate::parser::CustomTypeValidationError::InvalidDeclarationValue {
+                    owner: expected
+                        .provider_names()
+                        .next()
+                        .expect("nonempty owners")
+                        .into(),
+                    identity: expected.identity().clone(),
+                    error: Box::new(error),
+                },
+            )?;
+    }
+    Ok(())
+}
+
 fn custom_type_validation_mismatch<P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
     value: &Value<P, B>,
@@ -1236,6 +1366,47 @@ fn inferred_type_fits(expected: &TypeExpr, actual: &TypeExpr) -> bool {
 /// Directional compatibility for a declared source flowing into a declared sink.
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn round2_2_embedded_causes_do_not_repeat_in_source_chains() {
+        use super::*;
+        let value: crate::resource::Value = crate::resource::Value::Concrete(
+            crate::resource::ConcreteValue::String("fixture".into()),
+        );
+        let cause = crate::parser::CustomTypeValidationError::ProvidersNotLoaded;
+        let custom_cause = cause.to_string();
+        for (error, cause_text) in [
+            (
+                TypeExprValueError::InvalidAccess {
+                    error: crate::static_type::InferenceError::UnknownType {
+                        reason: "access-cause-marker".into(),
+                    },
+                },
+                "access-cause-marker".into(),
+            ),
+            (
+                TypeExprValueError::CustomTypeValidation {
+                    path: vec![],
+                    expected: Box::new(TypeExpr::String),
+                    actual: Box::new(crate::ValueDescription::of(&value)),
+                    error: Box::new(cause),
+                },
+                custom_cause,
+            ),
+        ] {
+            let display = error.to_string();
+            let mut rendered = display.clone();
+            let mut source = std::error::Error::source(&error);
+            while let Some(cause) = source {
+                rendered.push_str(&format!("\n{cause}"));
+                source = cause.source();
+            }
+            assert_eq!(rendered.matches(&cause_text).count(), 1, "{rendered}");
+            assert_eq!(
+                rendered, display,
+                "existing Display is the complete main diagnostic"
+            );
+        }
+    }
     use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
 
     use indexmap::IndexMap;
@@ -2613,7 +2784,7 @@ mod tests {
         let error = check(&nested_expected, &nested_missing).unwrap_err();
         assert!(matches!(
             &error,
-            TypeExprValueError::MissingStructField { path, field }
+            TypeExprValueError::MissingStructField { path, field, .. }
                 if path == &[TypeExprValuePathSegment::StructField("config".to_string())]
                     && field == "name"
         ));

@@ -62,7 +62,6 @@
 use std::collections::HashMap;
 
 use crate::parser::ProviderConfig;
-use crate::parser::retained::{ProjectedPhase, SyntheticSource};
 use crate::provider::{
     HostNormalizer, HostResult, ProviderFailure, ProviderNormalizer, ProviderResult,
     merge_default_tags,
@@ -101,40 +100,6 @@ impl<S, D> NormalizedResource<S, D> {
     {
         self.0
     }
-}
-
-/// Only this producer module can seal completion of its merge_default_tags
-/// call. Stage 2 transports the proof with the merged subtree; display-only
-/// default_tag_keys cannot reconstruct it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(
-    dead_code,
-    reason = "default-tag source transport is connected in Stage 2"
-)]
-pub(crate) struct DefaultTagsMergeSource(());
-
-/// Sealed by the normalization producer using its completed pipeline proof.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct ProviderNormalizationSource(());
-
-#[allow(
-    dead_code,
-    reason = "default-tag source transport is connected in Stage 2"
-)]
-pub(crate) fn projected_default_tags_merge(proof: DefaultTagsMergeSource) -> ProjectedPhase {
-    ProjectedPhase::synthetic(SyntheticSource::DefaultTagsMerge(proof))
-}
-
-#[allow(
-    dead_code,
-    reason = "normalization source transport is connected in Stage 2"
-)]
-pub(crate) fn projected_provider_normalization<S, D>(
-    _proof: &NormalizedResource<S, D>,
-) -> ProjectedPhase {
-    ProjectedPhase::synthetic(SyntheticSource::ProviderNormalization(
-        ProviderNormalizationSource(()),
-    ))
 }
 
 /// Normalize one desired resource and return the typestate proof consumed by

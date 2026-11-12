@@ -15,6 +15,12 @@
 //! surface can share the same logic without duplicating traversal code.
 
 use crate::paths::ResolvedPath;
+mod admission;
+#[cfg(any(test, feature = "test-utils"))]
+pub use admission::remote_bindings_for_test;
+pub use admission::{
+    AdmittedRemoteBindings, AdmittedUpstreamExports, UpstreamExportAdmissionError,
+};
 use std::collections::HashMap;
 #[cfg(test)]
 use std::path::Path;
@@ -60,6 +66,273 @@ pub struct UpstreamExportEntry {
 
 /// Exports for a single `upstream_state` binding: export name → entry.
 pub type UpstreamExportEntries = HashMap<String, UpstreamExportEntry>;
+
+/// Backend loading and cycle discovery have bootstrap authority only. Copy the
+/// command's runtime hooks, never its installed provider catalog; admission
+/// resolves source types separately against the downstream's loaded metadata.
+pub struct UpstreamBootstrapContext(crate::parser::ProviderContext);
+
+impl UpstreamBootstrapContext {
+    pub fn from_runtime(context: &crate::parser::ProviderContext) -> Self {
+        let mut bootstrap = crate::parser::ProviderContext::new(context.environment.clone());
+        bootstrap.decryptor = context.decryptor.clone();
+        Self(bootstrap)
+    }
+
+    fn load_source(
+        &self,
+        source: &ResolvedPath,
+    ) -> Result<crate::config_loader::LoadedConfig, String> {
+        crate::config_loader::load_configuration_for_bootstrap(
+            source,
+            &self.0,
+            &crate::schema::SchemaRegistry::new(),
+        )
+    }
+
+    /// Discover transitive upstream declarations without consuming their
+    /// backend or values. A loaded provider catalog cannot enter this parse.
+    pub fn load_metadata(
+        &self,
+        source: &ResolvedPath,
+    ) -> Result<crate::config_loader::LoadedConfig, String> {
+        crate::config_loader::load_configuration_for_metadata(
+            source,
+            &self.0,
+            &crate::schema::SchemaRegistry::new(),
+        )
+    }
+}
+
+/// Static export discovery preserves the typecheck/validate/LSP caller's
+/// catalog and schemas, including providerless fallback authority. It cannot
+/// accept the bootstrap context used by backend loading and cycle discovery.
+struct UpstreamDiscoveryContext<'a> {
+    context: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    schemas: Option<&'a crate::schema::SchemaRegistry>,
+}
+
+impl UpstreamDiscoveryContext<'_> {
+    fn parse_source(
+        &self,
+        source: &ResolvedPath,
+        overrides: &HashMap<String, String>,
+    ) -> Result<crate::config_loader::ParsedRootDirectory, String> {
+        crate::config_loader::parse_directory_for_metadata(
+            source,
+            self.context.catalog(),
+            overrides,
+            self.schemas
+                .unwrap_or(&crate::schema::SchemaRegistry::new()),
+        )
+    }
+}
+
+/// A binding and its pinned source directory, resolved together from one
+/// upstream declaration. Loading cannot substitute an unrelated directory.
+#[derive(Debug, Clone)]
+pub struct UpstreamSourceIdentity {
+    binding: String,
+    source: ResolvedPath,
+}
+
+impl UpstreamSourceIdentity {
+    pub fn resolve<B: BindingAddress>(
+        upstream: &UpstreamState<B>,
+        base: &ResolvedPath,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            binding: upstream.binding.to_string(),
+            source: base.join_display(&base.persisted_path().display().join(&upstream.source))?,
+        })
+    }
+
+    pub fn binding(&self) -> &str {
+        &self.binding
+    }
+    pub fn source(&self) -> &ResolvedPath {
+        &self.source
+    }
+
+    /// Backend parsing requires bootstrap authority; source admission receives
+    /// the downstream type authority separately.
+    pub fn load(
+        &self,
+        bootstrap: &UpstreamBootstrapContext,
+        context: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+        schemas: &crate::schema::SchemaRegistry,
+    ) -> Result<ResolvedUpstreamSource, UpstreamSourceLoadError> {
+        let loaded = bootstrap.load_source(&self.source).map_err(|message| {
+            UpstreamSourceLoadError::Configuration {
+                binding: self.binding.clone(),
+                message,
+            }
+        })?;
+        let surface = resolve_upstream_source_surface(&loaded, &self.source, context, schemas)?;
+        Ok(ResolvedUpstreamSource {
+            identity: self.clone(),
+            backend: loaded
+                .parsed
+                .backend
+                .clone()
+                .map(crate::parser::BackendConfig::into_expanded)
+                .transpose()?,
+            upstream_states: loaded.parsed.upstream_states.clone(),
+            surface,
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UpstreamSourceLoadError {
+    #[error("upstream_state '{binding}': {message}")]
+    Configuration { binding: String, message: String },
+    #[error(transparent)]
+    Invariant(#[from] crate::parser::AnalysisTreeError),
+    #[error(transparent)]
+    Expansion(#[from] crate::resource::LeftoverPlaceholder),
+}
+
+/// Identity, backend metadata, and admission surface from the same pinned source.
+/// Admission is a method on this object; neither the binding nor surface can be
+/// supplied independently at the value boundary.
+#[derive(Debug, Clone)]
+pub struct ResolvedUpstreamSource {
+    identity: UpstreamSourceIdentity,
+    backend: Option<crate::parser::BackendConfig>,
+    upstream_states: Vec<UpstreamState<RelativeBindingName>>,
+    surface: SourceSurface,
+}
+
+impl ResolvedUpstreamSource {
+    pub fn binding(&self) -> &str {
+        self.identity.binding()
+    }
+    pub fn source(&self) -> &ResolvedPath {
+        self.identity.source()
+    }
+    pub fn backend(&self) -> Option<&crate::parser::BackendConfig> {
+        self.backend.as_ref()
+    }
+    pub fn upstream_states(&self) -> &[UpstreamState<RelativeBindingName>] {
+        &self.upstream_states
+    }
+    pub fn unavailable_reason(&self) -> Option<&str> {
+        self.surface.entries.as_ref().err().map(String::as_str)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(binding: impl Into<String>, entries: Option<&UpstreamExportEntries>) -> Self {
+        Self {
+            identity: UpstreamSourceIdentity {
+                binding: binding.into(),
+                source: ResolvedPath::new(".").expect("fixture directory exists"),
+            },
+            backend: None,
+            upstream_states: vec![],
+            surface: SourceSurface {
+                entries: entries
+                    .cloned()
+                    .ok_or_else(|| "test fixture has no source surface".into()),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SourceSurface {
+    entries: Result<UpstreamExportEntries, String>,
+}
+
+/// Discover admission authority from an actual loader-owned source snapshot.
+/// Unavailable declarations preserve the unchecked policy without warnings.
+fn resolve_upstream_source_surface(
+    loaded: &crate::config_loader::LoadedConfig,
+    source: &ResolvedPath,
+    context: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    schemas: &crate::schema::SchemaRegistry,
+) -> Result<SourceSurface, crate::parser::AnalysisTreeError> {
+    let entries = match loaded.upstream_export_source(context.catalog(), schemas) {
+        Ok(parsed) => match resolve_upstream_exports_from_parsed(
+            parsed,
+            source,
+            context,
+            Some(schemas),
+            &Default::default(),
+        ) {
+            Ok(entries) => Ok(entries),
+            Err(UpstreamExportSourceError::Unavailable(reason)) => Err(reason),
+            Err(UpstreamExportSourceError::Invariant(error)) => return Err(error),
+        },
+        Err(reason) => Err(reason),
+    };
+    Ok(SourceSurface { entries })
+}
+
+/// Identity of the immutable type evidence used to discover a source surface.
+/// Catalog and schema witnesses are retained so identity cannot be recycled.
+#[derive(Clone)]
+pub struct UpstreamTypeAuthority {
+    catalog: crate::parser::ProviderCustomTypes,
+    resource_types: std::collections::HashSet<(String, String)>,
+    schemas: HashMap<
+        (String, String, bool),
+        (
+            std::sync::Arc<crate::schema::CompiledResourceSchema>,
+            String,
+        ),
+    >,
+}
+
+impl UpstreamTypeAuthority {
+    pub fn capture(
+        context: &crate::parser::ProviderContext,
+        schemas: &crate::schema::SchemaRegistry,
+    ) -> Self {
+        Self {
+            catalog: context.custom_types.clone(),
+            resource_types: context.resource_types.clone(),
+            schemas: schemas
+                .iter()
+                .map(|(provider, name, kind, schema)| {
+                    (
+                        (
+                            provider.into(),
+                            name.into(),
+                            matches!(kind, crate::schema::SchemaKind::DataSource),
+                        ),
+                        (
+                            schema.shared_schema(),
+                            schemas
+                                .get(provider, name, kind)
+                                .expect("iterated schema exists")
+                                .semantic_fingerprint(),
+                        ),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+impl PartialEq for UpstreamTypeAuthority {
+    fn eq(&self, other: &Self) -> bool {
+        self.catalog.same_snapshot(&other.catalog)
+            && self.resource_types == other.resource_types
+            && self.schemas.len() == other.schemas.len()
+            && self.schemas.iter().all(|(key, (schema, fingerprint))| {
+                other
+                    .schemas
+                    .get(key)
+                    .is_some_and(|(other_schema, other_fingerprint)| {
+                        std::sync::Arc::ptr_eq(schema, other_schema)
+                            && fingerprint == other_fingerprint
+                    })
+            })
+    }
+}
+
+impl Eq for UpstreamTypeAuthority {}
 
 /// Exports declared by each `upstream_state` binding: binding name →
 /// per-export entry map. Carrying the literal `Value` alongside the
@@ -393,10 +666,12 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
     schemas: Option<&crate::schema::SchemaRegistry>,
     overrides: &crate::config_loader::SourceOverrides,
 ) -> Result<(UpstreamExports<B>, Vec<UpstreamResolveError>), crate::parser::AnalysisTreeError> {
-    let provider_context =
-        crate::validation::typecheck::TypecheckProviderContext::for_session(config);
     let mut out: UpstreamExports<B> = HashMap::new();
     let mut errors: Vec<UpstreamResolveError> = Vec::new();
+    let discovery = UpstreamDiscoveryContext {
+        context: config,
+        schemas,
+    };
     for us in upstream_states {
         let source_abs = match base_dir.join(&us.source) {
             Ok(source) => source,
@@ -416,180 +691,29 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
             out.insert(us.binding.clone(), HashMap::new());
             continue;
         }
-        match crate::config_loader::parse_directory_for_metadata(
+        match discovery.parse_source(
             &source_abs,
-            config.catalog(),
             &crate::config_loader::directory_source_overrides(&source_abs, overrides),
-            schemas.unwrap_or(&crate::schema::SchemaRegistry::new()),
         ) {
-            Ok(parsed) => {
-                let parsed = parsed.try_update(|parsed| {
-                    crate::validation::resolve_file_type_exprs_best_effort(parsed, config)
-                })?;
-                // Normalize every consumer-visible declaration before module
-                // expansion and export inference. Inference compares the
-                // structural TypeExpr values it receives, so leaving one
-                // declaration as DottedUnresolved while an equivalent schema
-                // projection is already SchemaType creates a false mismatch.
-
-                // Expand module calls before inference so that
-                // `attributes { ... }`-typed `Virtual` resources land in
-                // `parsed.resources` (#2493). Without this the inferer
-                // sees module-call bindings as known-but-non-inferable
-                // and any `exports` value referencing
-                // `<module_call_binding>.<attr>` (e.g.
-                // `oidc_provider_arn = bs.oidc_provider_arn` at
-                // `infra/registry/dev/bootstrap/exports.crn`) remains
-                // unchecked even when the type is fully derivable.
-                // `resolve_modules_with_config` is the same expansion
-                // pass `load_configuration` runs, so the inference reach
-                // here matches what the CLI sees post-expansion.
-                let empty_schemas = crate::schema::SchemaRegistry::new();
-                let expansion_schemas = schemas.unwrap_or(&empty_schemas);
-                let module_resolution = match provider_context.loaded_context() {
-                    Some(_loaded) => crate::module_resolver::resolve_upstream_modules_with_config(
-                        parsed,
-                        &source_abs,
-                        config,
-                        expansion_schemas,
-                        overrides,
-                    ),
-                    None => {
-                        crate::module_resolver::resolve_upstream_modules_with_providerless_config(
-                            parsed,
-                            &source_abs,
-                            config,
-                            expansion_schemas,
-                            overrides,
-                        )
-                    }
-                };
-                let parsed = match module_resolution {
-                    Ok(parsed) => parsed,
-                    Err(reason) => {
-                        if let crate::module_resolver::ModuleError::AnalysisInvariant(error) =
-                            reason.root_cause()
-                        {
-                            return Err(error.clone());
-                        }
-                        errors.push(UpstreamResolveError {
-                            binding: us.binding.to_string(),
-                            source: us.source.clone(),
-                            reason: reason.to_string(),
-                        });
-                        continue;
-                    }
-                };
-                // Declarations were resolved before expansion so inference
-                // compares canonical identities. Resolve once more afterward
-                // to classify newly inferred names that the consumer cannot
-                // name, preserving that distinction from inference failure.
-                if schemas.is_none() {
-                    // Even the providerless discovery API is a state-boundary
-                    // loader. Handle RHSs and declared Ref types are
-                    // inferable without schemas and must never be advertised
-                    // as value-shaped upstream exports.
-                    let inferred = crate::validation::inference::infer_export_params(
-                        crate::config_loader::load_buffer_configuration(
-                            &parsed,
-                            &empty_schemas,
-                            config.catalog(),
-                        )
-                        .judged(),
-                    );
-                    if let Err(boundary_errors) =
-                        crate::validation::validate_export_handle_boundaries(inferred.parameters())
-                    {
-                        errors.push(UpstreamResolveError {
-                            binding: us.binding.to_string(),
-                            source: us.source.clone(),
-                            reason: boundary_errors
-                                .into_iter()
-                                .map(|error| error.to_string())
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        });
-                        continue;
-                    }
+            Ok(parsed) => match resolve_upstream_exports_from_parsed(
+                parsed,
+                &source_abs,
+                config,
+                schemas,
+                overrides,
+            ) {
+                Ok(entries) => {
+                    out.insert(us.binding.clone(), entries);
                 }
-                let entries: UpstreamExportEntries = match schemas {
-                    Some(s) => {
-                        let inferred = crate::validation::inference::apply_inference(
-                            parsed,
-                            s,
-                            config.catalog(),
-                        );
-                        if let Err(boundary_errors) =
-                            crate::validation::validate_export_handle_boundaries(
-                                &inferred.export_params,
-                            )
-                        {
-                            errors.push(UpstreamResolveError {
-                                binding: us.binding.to_string(),
-                                source: us.source.clone(),
-                                reason: boundary_errors
-                                    .into_iter()
-                                    .map(|error| error.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join("\n"),
-                            });
-                            continue;
-                        }
-                        inferred
-                            .export_params
-                            .into_iter()
-                            .map(|e| {
-                                (
-                                    e.name,
-                                    UpstreamExportEntry {
-                                        static_type: UpstreamExportType::Static(
-                                            crate::validation::resolve_export_static_type_for_consumer(
-                                                e.static_type,
-                                                config.catalog(),
-                                            ),
-                                        ),
-                                        value: e.value,
-                                    },
-                                )
-                            })
-                            .collect()
-                    }
-                    // `schemas` is None (legacy entry point) — forward
-                    // the declared type unchanged. Note that without
-                    // schemas there is no way to run inference, so
-                    // unannotated exports are marked `InferenceNotRun`.
-                    None => parsed
-                        .export_params
-                        .into_iter()
-                        .map(|e| {
-                            let static_type = match e.static_type {
-                                Some(static_type) => {
-                                    UpstreamExportType::Static(ConsumerExportStaticType::Declared(
-                                        crate::validation::resolve_consumer_static_type(
-                                            &static_type,
-                                            config.catalog(),
-                                        ),
-                                    ))
-                                }
-                                None => UpstreamExportType::InferenceNotRun,
-                            };
-                            (
-                                e.name,
-                                UpstreamExportEntry {
-                                    static_type,
-                                    value: e.value.and_then(|expression| match expression {
-                                        crate::parser::BoundaryExpression::Value(value) => {
-                                            Some(value)
-                                        }
-                                        crate::parser::BoundaryExpression::Handle(_handle) => None,
-                                    }),
-                                },
-                            )
-                        })
-                        .collect(),
-                };
-                out.insert(us.binding.clone(), entries);
-            }
+                Err(UpstreamExportSourceError::Invariant(error)) => return Err(error),
+                Err(UpstreamExportSourceError::Unavailable(reason)) => {
+                    errors.push(UpstreamResolveError {
+                        binding: us.binding.to_string(),
+                        source: us.source.clone(),
+                        reason,
+                    })
+                }
+            },
             Err(reason) => {
                 errors.push(UpstreamResolveError {
                     binding: us.binding.to_string(),
@@ -600,6 +724,174 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
         }
     }
     Ok((out, errors))
+}
+
+/// Failure to compute a source surface is distinct from an analysis invariant.
+#[derive(Debug, thiserror::Error)]
+pub enum UpstreamExportSourceError {
+    #[error(transparent)]
+    Invariant(#[from] crate::parser::AnalysisTreeError),
+    #[error("{0}")]
+    Unavailable(String),
+}
+
+/// Reuse a loader-owned source parse for export discovery. This performs the
+/// same normalization, module expansion and inference as directory discovery.
+pub fn resolve_upstream_exports_from_parsed(
+    parsed: crate::config_loader::ParsedRootDirectory,
+    source_abs: &ResolvedPath,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    schemas: Option<&crate::schema::SchemaRegistry>,
+    overrides: &crate::config_loader::SourceOverrides,
+) -> Result<UpstreamExportEntries, UpstreamExportSourceError> {
+    let provider_context =
+        crate::validation::typecheck::TypecheckProviderContext::for_session(config);
+    let parsed = parsed.try_update(|parsed| {
+        crate::validation::resolve_file_type_exprs_best_effort(parsed, config)
+    })?;
+    // Normalize every consumer-visible declaration before module
+    // expansion and export inference. Inference compares the
+    // structural TypeExpr values it receives, so leaving one
+    // declaration as DottedUnresolved while an equivalent schema
+    // projection is already SchemaType creates a false mismatch.
+
+    // Expand module calls before inference so that
+    // `attributes { ... }`-typed `Virtual` resources land in
+    // `parsed.resources` (#2493). Without this the inferer
+    // sees module-call bindings as known-but-non-inferable
+    // and any `exports` value referencing
+    // `<module_call_binding>.<attr>` (e.g.
+    // `oidc_provider_arn = bs.oidc_provider_arn` at
+    // `infra/registry/dev/bootstrap/exports.crn`) remains
+    // unchecked even when the type is fully derivable.
+    // `resolve_modules_with_config` is the same expansion
+    // pass `load_configuration` runs, so the inference reach
+    // here matches what the CLI sees post-expansion.
+    let empty_schemas = crate::schema::SchemaRegistry::new();
+    let expansion_schemas = schemas.unwrap_or(&empty_schemas);
+    let module_resolution = match provider_context.loaded_context() {
+        Some(_loaded) => crate::module_resolver::resolve_upstream_modules_with_config(
+            parsed,
+            source_abs,
+            config,
+            expansion_schemas,
+            overrides,
+        ),
+        None => crate::module_resolver::resolve_upstream_modules_with_providerless_config(
+            parsed,
+            source_abs,
+            config,
+            expansion_schemas,
+            overrides,
+        ),
+    };
+    let parsed = match module_resolution {
+        Ok(parsed) => parsed,
+        Err(reason) => {
+            if let crate::module_resolver::ModuleError::AnalysisInvariant(error) =
+                reason.root_cause()
+            {
+                return Err(UpstreamExportSourceError::Invariant(error.clone()));
+            }
+            return Err(UpstreamExportSourceError::Unavailable(reason.to_string()));
+        }
+    };
+    // Declarations were resolved before expansion so inference
+    // compares canonical identities. Resolve once more afterward
+    // to classify newly inferred names that the consumer cannot
+    // name, preserving that distinction from inference failure.
+    if schemas.is_none() {
+        // Even the providerless discovery API is a state-boundary
+        // loader. Handle RHSs and declared Ref types are
+        // inferable without schemas and must never be advertised
+        // as value-shaped upstream exports.
+        let inferred = crate::validation::inference::infer_export_params(
+            crate::config_loader::load_buffer_configuration(
+                &parsed,
+                &empty_schemas,
+                config.catalog(),
+            )
+            .judged(),
+        );
+        if let Err(boundary_errors) =
+            crate::validation::validate_export_handle_boundaries(inferred.parameters())
+        {
+            return Err(UpstreamExportSourceError::Unavailable(
+                boundary_errors
+                    .into_iter()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ));
+        }
+    }
+    let entries: UpstreamExportEntries = match schemas {
+        Some(s) => {
+            let inferred =
+                crate::validation::inference::apply_inference(parsed, s, config.catalog());
+            if let Err(boundary_errors) =
+                crate::validation::validate_export_handle_boundaries(&inferred.export_params)
+            {
+                return Err(UpstreamExportSourceError::Unavailable(
+                    boundary_errors
+                        .into_iter()
+                        .map(|error| error.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ));
+            }
+            inferred
+                .export_params
+                .into_iter()
+                .map(|e| {
+                    (
+                        e.name,
+                        UpstreamExportEntry {
+                            static_type: UpstreamExportType::Static(
+                                crate::validation::resolve_export_static_type_for_consumer(
+                                    e.static_type,
+                                    config.catalog(),
+                                ),
+                            ),
+                            value: e.value,
+                        },
+                    )
+                })
+                .collect()
+        }
+        // `schemas` is None (legacy entry point) — forward
+        // the declared type unchanged. Note that without
+        // schemas there is no way to run inference, so
+        // unannotated exports are marked `InferenceNotRun`.
+        None => parsed
+            .export_params
+            .into_iter()
+            .map(|e| {
+                let static_type = match e.static_type {
+                    Some(static_type) => {
+                        UpstreamExportType::Static(ConsumerExportStaticType::Declared(
+                            crate::validation::resolve_consumer_static_type(
+                                &static_type,
+                                config.catalog(),
+                            ),
+                        ))
+                    }
+                    None => UpstreamExportType::InferenceNotRun,
+                };
+                (
+                    e.name,
+                    UpstreamExportEntry {
+                        static_type,
+                        value: e.value.and_then(|expression| match expression {
+                            crate::parser::BoundaryExpression::Value(value) => Some(value),
+                            crate::parser::BoundaryExpression::Handle(_handle) => None,
+                        }),
+                    },
+                )
+            })
+            .collect(),
+    };
+    Ok(entries)
 }
 
 /// Walk a parsed project and return an error for every reference whose root
@@ -1403,6 +1695,183 @@ mod tests {
 
     fn ctx() -> LoadedProviderContext {
         LoadedProviderContext::empty_for_test()
+    }
+
+    fn round4_discovery_authority() -> (LoadedProviderContext, SchemaRegistry) {
+        let identity = crate::schema::TypeIdentity::from_schema_type("test", "types", "Identifier");
+        let owned = crate::parser::OwnedTypeIdentity::provider(
+            "test",
+            identity,
+            crate::schema::RefinedScalarKind::String,
+        );
+        let mut catalog = ProviderContext::new(crate::EnvironmentSnapshot::new([(
+            "ROUND4_VALUE".into(),
+            "captured-value".into(),
+        )]));
+        catalog.decryptor = Some(std::sync::Arc::new(|_, _| Ok("decrypted-value".into())));
+        catalog.custom_types = crate::parser::ProviderCustomTypes::loaded(
+            std::collections::HashSet::from([owned.clone()]),
+            Box::new(|_target, _value| Ok(())),
+        );
+        catalog
+            .resource_types
+            .insert(("test".into(), "Item".into()));
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "test",
+            PatternResourceSchema::new("Item")
+                .attribute(
+                    PatternAttributeSchema::provider_populated(
+                        "identifier",
+                        PatternAttributeType::refined_string(
+                            Some(owned.identity().clone()),
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        (LoadedProviderContext::for_test(catalog), schemas)
+    }
+
+    fn round4_directory(source: &str) -> (tempfile::TempDir, ResolvedPath) {
+        let directory = tempfile::tempdir().unwrap();
+        let upstream = directory.path().join("upstream");
+        let downstream = directory.path().join("downstream");
+        fs::create_dir(&upstream).unwrap();
+        fs::create_dir(&downstream).unwrap();
+        write_crn(&upstream, "exports.crn", source);
+        write_crn(
+            &downstream,
+            "main.crn",
+            "let ups = upstream_state { source = '../upstream' }\n",
+        );
+        let base = ResolvedPath::new(downstream).unwrap();
+        (directory, base)
+    }
+
+    fn round4_directory_discovery(
+        source: &str,
+        context: &LoadedProviderContext,
+        schemas: &SchemaRegistry,
+    ) -> (UpstreamExports, Vec<Located<UpstreamResolveError>>) {
+        let (_directory, base) = round4_directory(source);
+        let parsed = crate::config_loader::parse_directory_for_metadata(
+            &base,
+            context,
+            &Default::default(),
+            schemas,
+        )
+        .unwrap();
+        let tree = AnalysisTree::try_from_file(parsed.parsed()).unwrap();
+        crate::validation::deferred_types::with_session_for_test(context, |session| {
+            super::resolve_upstream_exports_with_schemas(&base, &tree, session, Some(schemas))
+                .unwrap()
+        })
+    }
+
+    #[test]
+    fn round4_discovery_preserves_known_schema_export_types() {
+        let (context, schemas) = round4_discovery_authority();
+        let (exports, errors) = round4_directory_discovery(
+            "let item = test.Item {}\nexports { declared: test.types.Identifier = item.identifier\ninferred = item.identifier }\n",
+            &context,
+            &schemas,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        for key in ["declared", "inferred"] {
+            let UpstreamExportType::Static(static_type) = &exports["ups"][key].static_type else {
+                panic!("source inference must run for {key}");
+            };
+            assert_eq!(
+                static_type.known().map(ToString::to_string).as_deref(),
+                Some("test.types.Identifier"),
+                "{key}: {static_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn round4_discovery_reports_unknown_source_type_as_on_main() {
+        let (context, schemas) = round4_discovery_authority();
+        let (exports, errors) = round4_directory_discovery(
+            "exports { value: Foo = 'upstream-only' }\n",
+            &context,
+            &schemas,
+        );
+        assert!(!exports.contains_key("ups"), "{exports:?}");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let error = &errors[0];
+        assert_eq!(error.binding, "ups");
+        assert_eq!(error.source, PathBuf::from("../upstream"));
+        assert!(
+            error
+                .reason
+                .ends_with("exports.crn: Invalid expression at line 1: unknown custom type 'Foo'"),
+            "{error}"
+        );
+        assert!(
+            error
+                .detail()
+                .to_string()
+                .starts_with("upstream_state `ups`: failed to parse source `../upstream`: ")
+        );
+    }
+
+    #[test]
+    fn round4_discovery_registers_resource_type_argument_in_upstream_root() {
+        let (context, schemas) = round4_discovery_authority();
+        let source = "arguments { item: test.Item }\nexports { identifier = item.identifier }\n";
+        let (_directory, base) = round4_directory(source);
+        crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            let discovery = UpstreamDiscoveryContext {
+                context: session,
+                schemas: Some(&schemas),
+            };
+            let parsed = discovery
+                .parse_source(&base.join("../upstream").unwrap(), &Default::default())
+                .unwrap();
+            assert!(
+                parsed
+                    .parser_binding_metadata
+                    .structural_handles()
+                    .contains_key("item"),
+                "the resource argument must register as a structural handle"
+            );
+        });
+        let (exports, errors) = round4_directory_discovery(source, &context, &schemas);
+        assert!(errors.is_empty(), "{errors:?}");
+        let UpstreamExportType::Static(ExportStaticType::Inferred(StaticType::Known(known))) =
+            &exports["ups"]["identifier"].static_type
+        else {
+            panic!("resource argument member must be inferable: {exports:?}");
+        };
+        assert_eq!(known.type_expr().to_string(), "test.types.Identifier");
+    }
+
+    #[test]
+    fn round4_bootstrap_from_loaded_catalog_retains_only_runtime_hooks() {
+        let (catalog, _schemas) = round4_discovery_authority();
+        assert!(catalog.custom_types_loaded());
+        assert!(!catalog.known_custom_types().is_empty());
+        assert!(!catalog.resource_types.is_empty());
+
+        let bootstrap = UpstreamBootstrapContext::from_runtime(&catalog);
+        assert!(!bootstrap.0.custom_types_loaded());
+        assert!(bootstrap.0.known_custom_types().is_empty());
+        assert!(bootstrap.0.resource_types.is_empty());
+        assert_eq!(
+            bootstrap.0.environment.get("ROUND4_VALUE"),
+            catalog.environment.get("ROUND4_VALUE"),
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            bootstrap.0.decryptor.as_ref().unwrap(),
+            catalog.decryptor.as_ref().unwrap(),
+        ));
     }
 
     fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType {

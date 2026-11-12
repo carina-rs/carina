@@ -43,6 +43,12 @@ mod round4;
 #[path = "e2e_typecheck_parity/error_composition.rs"]
 mod error_composition;
 
+#[path = "e2e_typecheck_parity/seam_round1.rs"]
+mod seam_round1;
+
+#[path = "e2e_typecheck_parity/seam_round3.rs"]
+mod seam_round3;
+
 // ============================================================================
 // Fixture + helpers (mirror carina-lsp/tests/e2e_typecheck.rs)
 // ============================================================================

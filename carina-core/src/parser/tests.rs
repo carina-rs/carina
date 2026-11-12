@@ -240,24 +240,26 @@ fn attribute_value_source_span_ignores_names_in_earlier_nested_maps() {
 
 fn resolve_remote_bindings(
     remote: HashMap<String, HashMap<String, Value>>,
-) -> HashMap<String, HashMap<String, ExpandedValue>> {
+) -> crate::upstream_exports::AdmittedRemoteBindings {
     let scope = RootScope::new();
-    remote
-        .into_iter()
-        .map(|(binding, attributes)| {
-            let attributes = attributes
-                .into_iter()
-                .map(|(name, value)| {
-                    let value = value
-                        .resolve_root(&scope)
-                        .into_expanded()
-                        .expect("remote test binding contains no parser placeholder");
-                    (name, value)
-                })
-                .collect();
-            (binding, attributes)
-        })
-        .collect()
+    crate::upstream_exports::remote_bindings_for_test(
+        remote
+            .into_iter()
+            .map(|(binding, attributes)| {
+                let attributes = attributes
+                    .into_iter()
+                    .map(|(name, value)| {
+                        let value = value
+                            .resolve_root(&scope)
+                            .into_expanded()
+                            .expect("remote test binding contains no parser placeholder");
+                        (name, value)
+                    })
+                    .collect();
+                (binding, attributes)
+            })
+            .collect(),
+    )
 }
 
 fn parsed_int_binding(source: &str, name: &str) -> i64 {
@@ -5352,7 +5354,13 @@ fn resolve_provider_attributes_with_remote_substitutes_upstream_refs() {
         .expect("provider config must contain no parser placeholders");
     let resolved = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        |session| resolve_provider_attributes_with_remote(&expanded, &remote, session),
+        |session| {
+            resolve_provider_attributes_with_remote(
+                &expanded,
+                &crate::upstream_exports::remote_bindings_for_test(remote.clone()),
+                session,
+            )
+        },
     )
     .expect("resolve must succeed");
 
@@ -5438,7 +5446,13 @@ fn resolve_provider_attributes_with_remote_rejects_unknown_refs() {
 
     let error = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        |session| resolve_provider_attributes_with_remote(&parsed, &empty, session),
+        |session| {
+            resolve_provider_attributes_with_remote(
+                &parsed,
+                &crate::upstream_exports::remote_bindings_for_test(empty.clone()),
+                session,
+            )
+        },
     )
     .expect_err("resolved provider configs must reject a missing binding");
 
@@ -5574,7 +5588,13 @@ fn provider_default_tags_remain_deferred_and_saved_plan_validation_accepts_them(
         .expect("provider config must contain no parser placeholders");
     let resolved = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        |session| resolve_provider_attributes_with_remote(&parsed, &remote, session),
+        |session| {
+            resolve_provider_attributes_with_remote(
+                &parsed,
+                &crate::upstream_exports::remote_bindings_for_test(remote.clone()),
+                session,
+            )
+        },
     )
     .expect("default_tags do not participate in the provider-ready invariant");
     let saved = SavedProviderConfigs::from(&resolved);
@@ -14858,7 +14878,9 @@ fn expand_deferred_for_no_remote_data_stays_deferred() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             parsed.expand_deferred_for_expressions(
-                &IterableBindings::from_upstream_only(remote_bindings),
+                &IterableBindings::from_upstream_only(
+                    crate::upstream_exports::remote_bindings_for_test(remote_bindings),
+                ),
                 session,
             )
         },

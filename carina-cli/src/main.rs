@@ -844,6 +844,63 @@ mod error_format_tests {
     use super::*;
     use crate::provider_text_fixtures::*;
 
+    #[test]
+    fn terminal_upstream_errors_render_every_detail_once() {
+        let backend = error::AppError::Backend(carina_state::BackendError::UpstreamExportRead(
+            Box::new(carina_state::backend::UpstreamExportReadError {
+                binding: "orgs".into(),
+                error: carina_state::BackendError::Io("permission denied".into()),
+            }),
+        ));
+        let rendered = render_app_error(carina_cli::output_style::ColorMode::Plain, &backend);
+        assert_eq!(rendered.exit_code, 1);
+        assert_eq!(
+            rendered.stderr,
+            "Error: upstream_state 'orgs': failed to read published exports\nError: I/O error: permission denied\n"
+        );
+        assert!(std::error::Error::source(&backend).is_none());
+
+        let context = carina_core::parser::LoadedProviderContext::empty_for_test();
+        let declarations = std::collections::HashMap::from([(
+            "count".into(),
+            carina_core::upstream_exports::UpstreamExportEntry {
+                static_type: carina_core::upstream_exports::UpstreamExportType::Static(
+                    carina_core::validation::resolve_export_static_type_for_consumer(
+                        carina_core::static_type::ExportStaticType::Declared(
+                            carina_core::parser::TypeExpr::Int,
+                        ),
+                        &context,
+                    ),
+                ),
+                value: None,
+            },
+        )]);
+        let admission =
+            carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+                carina_core::upstream_exports::ResolvedUpstreamSource::for_test(
+                    "orgs",
+                    Some(&declarations),
+                )
+                .admit_snapshot(
+                    std::collections::HashMap::from([(
+                        "count".into(),
+                        carina_core::resource::Value::Concrete(
+                            carina_core::resource::ConcreteValue::String("upstream-value".into()),
+                        ),
+                    )]),
+                    session,
+                )
+            })
+            .unwrap_err();
+        let admission = error::AppError::UpstreamExportAdmission(Box::new(admission));
+        let rendered = render_app_error(carina_cli::output_style::ColorMode::Plain, &admission);
+        assert_eq!(rendered.exit_code, 1);
+        assert_eq!(
+            rendered.stderr,
+            "Error: upstream export 'orgs.count'\nError: expected Int, got string\n"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn apply_input_symlink_retarget_keeps_classified_project_pinned() {

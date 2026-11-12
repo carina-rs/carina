@@ -160,7 +160,7 @@ impl IntMemberConstraints {
     }
 }
 
-/// The only input accepted by identity consistency, signatures and built-ins.
+/// Primitive identity metadata accepted by consistency checks and built-ins.
 /// Every variant excludes declaration-local member constraints.
 #[derive(Clone, Copy)]
 pub(crate) enum ScalarIdentityParts<'a> {
@@ -171,6 +171,221 @@ pub(crate) enum ScalarIdentityParts<'a> {
         range: Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
         validate: Option<&'a CustomValidator>,
     },
+}
+
+/// The walk's classification determines declaration kind, scalar bridge kind and agreement.
+pub(super) enum IdentityDefinition<'a, R: PatternForm = Compiled> {
+    Scalar(ScalarIdentityParts<'a>),
+    Reference(StringIdentityParts<'a>),
+    /// Enum definitions and canonical spellings agree through the provider's
+    /// enum resolution checks, independently of scalar identity layers.
+    Enum {
+        base: &'a PatternAttributeType<R>,
+        values: Option<&'a [String]>,
+        dsl_aliases: &'a [(String, String)],
+        to_dsl: Option<&'a DslTransform>,
+    },
+}
+
+/// An identified schema leaf with its definition and bridge classification.
+pub(crate) struct IdentifiedDeclaration<'a, R: PatternForm = Compiled> {
+    identity: &'a TypeIdentity,
+    attribute_type: &'a PatternAttributeType<R>,
+    definition: IdentityDefinition<'a, R>,
+}
+
+impl<'a, R: PatternForm> IdentifiedDeclaration<'a, R> {
+    pub(crate) fn identity(&self) -> &'a TypeIdentity {
+        self.identity
+    }
+
+    pub(crate) fn attribute_type(&self) -> &'a PatternAttributeType<R> {
+        self.attribute_type
+    }
+
+    pub(super) fn definition(&self) -> &IdentityDefinition<'a, R> {
+        &self.definition
+    }
+
+    pub(crate) fn kind(&self) -> IdentifiedDeclarationKind {
+        match &self.definition {
+            IdentityDefinition::Scalar(ScalarIdentityParts::String(_)) => {
+                IdentifiedDeclarationKind::String
+            }
+            IdentityDefinition::Scalar(ScalarIdentityParts::Int(_)) => {
+                IdentifiedDeclarationKind::Int
+            }
+            IdentityDefinition::Scalar(ScalarIdentityParts::Float { .. }) => {
+                IdentifiedDeclarationKind::Float
+            }
+            IdentityDefinition::Reference(_) => IdentifiedDeclarationKind::Reference,
+            IdentityDefinition::Enum {
+                base: _,
+                values: _,
+                dsl_aliases: _,
+                to_dsl: _,
+            } => IdentifiedDeclarationKind::Enum,
+        }
+    }
+
+    pub(crate) fn scalar_kind(&self) -> Option<RefinedScalarKind> {
+        scalar_kind_for_identified_leaf(self.attribute_type.raw_shape())
+    }
+}
+
+/// A zero-sized location skips all diagnostic path allocation during admission.
+pub(super) trait DeclarationLocation: Sized {
+    fn with_suffix(&self, suffix: impl fmt::Display) -> Self;
+}
+
+impl DeclarationLocation for () {
+    fn with_suffix(&self, _suffix: impl fmt::Display) -> Self {}
+}
+
+impl DeclarationLocation for SchemaValidationIssueLocation {
+    fn with_suffix(&self, suffix: impl fmt::Display) -> Self {
+        SchemaValidationIssueLocation::with_suffix(self, suffix)
+    }
+}
+
+pub(super) fn visit_identified_declarations<'a, R: PatternForm, L: DeclarationLocation>(
+    attribute_type: &'a PatternAttributeType<R>,
+    location: L,
+    visitor: &mut dyn FnMut(IdentifiedDeclaration<'a, R>, L),
+) {
+    let (identity, definition) = match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => return,
+        RawShape::Reference {
+            identity,
+            pattern,
+            length,
+        } => (
+            identity,
+            IdentityDefinition::Reference(StringIdentityParts {
+                identity: Some(identity),
+                pattern,
+                length,
+                validate: None,
+                to_dsl: None,
+            }),
+        ),
+        RawShape::String {
+            identity_layer:
+                parts @ StringIdentityParts {
+                    identity: Some(identity),
+                    ..
+                },
+            member_layer: _,
+        } => (
+            identity,
+            IdentityDefinition::Scalar(ScalarIdentityParts::String(parts)),
+        ),
+        RawShape::Int {
+            identity_layer:
+                parts @ IntIdentityParts {
+                    identity: Some(identity),
+                    ..
+                },
+            member_layer: _,
+        } => (
+            identity,
+            IdentityDefinition::Scalar(ScalarIdentityParts::Int(parts)),
+        ),
+        RawShape::Float {
+            identity: Some(identity),
+            range,
+            validate,
+        } => (
+            identity,
+            IdentityDefinition::Scalar(ScalarIdentityParts::Float {
+                identity: Some(identity),
+                range,
+                validate,
+            }),
+        ),
+        RawShape::Enum {
+            identity,
+            base,
+            values,
+            dsl_aliases,
+            validate: _validate,
+            to_dsl,
+        } => (
+            identity,
+            IdentityDefinition::Enum {
+                base,
+                values,
+                dsl_aliases,
+                to_dsl,
+            },
+        ),
+        RawShape::List {
+            element_type,
+            ordered: _,
+            constraints: _constraints,
+        } => {
+            visit_identified_declarations(element_type, location.with_suffix(".element"), visitor);
+            return;
+        }
+        RawShape::Map {
+            key,
+            value,
+            constraints: _,
+        } => {
+            visit_identified_declarations(key, location.with_suffix(".key"), visitor);
+            visit_identified_declarations(value, location.with_suffix(".value"), visitor);
+            return;
+        }
+        RawShape::Struct {
+            name: _,
+            fields,
+            field_groups: _,
+            input_rules: _,
+        } => {
+            for field in fields {
+                visit_identified_declarations(
+                    &field.field_type,
+                    location.with_suffix(format_args!(".{}", field.name)),
+                    visitor,
+                );
+            }
+            return;
+        }
+        RawShape::Union(members) => {
+            for (index, member) in members.iter().enumerate() {
+                visit_identified_declarations(
+                    member,
+                    location.with_suffix(format_args!("[{index}]")),
+                    visitor,
+                );
+            }
+            return;
+        }
+        RawShape::String {
+            identity_layer: StringIdentityParts { identity: None, .. },
+            member_layer: _,
+        }
+        | RawShape::Int {
+            identity_layer: IntIdentityParts { identity: None, .. },
+            member_layer: _,
+        }
+        | RawShape::Float {
+            identity: None,
+            range: _,
+            validate: _,
+        }
+        | RawShape::Bool
+        | RawShape::Duration
+        | RawShape::Ref(_) => return,
+    };
+    visitor(
+        IdentifiedDeclaration {
+            identity,
+            attribute_type,
+            definition,
+        },
+        location,
+    );
 }
 
 impl<'a> ScalarIdentityParts<'a> {
@@ -231,13 +446,11 @@ impl<'a> ScalarIdentityParts<'a> {
                     validate: _,
                 },
             ) => left == right && left_range == right_range,
-            _ => false,
+            // A new primitive definition must choose an agreement policy here.
+            (Self::String(_), Self::Int(_) | Self::Float { .. })
+            | (Self::Int(_), Self::String(_) | Self::Float { .. })
+            | (Self::Float { .. }, Self::String(_) | Self::Int(_)) => false,
         }
-    }
-
-    /// Built-in and aggregate admission compare the same identity metadata.
-    pub(crate) fn same_definition(self, other: Self) -> bool {
-        self.agrees_with(other)
     }
 }
 
@@ -305,23 +518,6 @@ impl<R: PatternForm> PatternAttributeType<R> {
             _ => self.clone(),
         }
     }
-
-    pub(crate) fn scalar_identity_parts(&self) -> Option<ScalarIdentityParts<'_>> {
-        match &self.kind {
-            AttrTypeKind::String { identity_layer, .. } => {
-                Some(ScalarIdentityParts::String(identity_layer.parts()))
-            }
-            AttrTypeKind::Int { identity_layer, .. } => {
-                Some(ScalarIdentityParts::Int(identity_layer.parts()))
-            }
-            AttrTypeKind::Float { binding, range } => Some(ScalarIdentityParts::Float {
-                identity: binding.identity(),
-                range: *range,
-                validate: binding.callback(),
-            }),
-            _ => None,
-        }
-    }
 }
 
 pub(crate) fn bounds_are_empty<T: Copy + Ord>(bounds: Option<(Option<T>, Option<T>)>) -> bool {
@@ -378,12 +574,6 @@ mod tests {
         .unwrap();
         let first = &schema.parts()["first"];
         let second = &schema.parts()["second"];
-        assert!(
-            first
-                .scalar_identity_parts()
-                .unwrap()
-                .same_definition(second.scalar_identity_parts().unwrap())
-        );
         assert_ne!(
             first.declaration_fingerprint(),
             second.declaration_fingerprint()
@@ -417,5 +607,207 @@ mod tests {
             ValidatedProviderSchemaWitness::new(vec![resource], config, BTreeMap::new(), vec![]),
             Err(ProviderSchemaValidationError::ConflictingIdentityDeclarations { .. })
         ));
+    }
+
+    fn reference(pattern: &str, min: u64, max: u64) -> AttributeType {
+        AttributeType::reference(
+            TypeIdentity::bare("KeyReference"),
+            Some(PatternSpec::new(pattern, PatternMatch::Full)),
+            Some((Some(min), Some(max))),
+        )
+    }
+
+    fn admit_across_roots(
+        resource_type: AttributeType,
+        config_type: AttributeType,
+    ) -> Result<ValidatedProviderSchemaWitness, ProviderSchemaValidationError> {
+        let resource = ResourceSchema::new("Keys")
+            .attribute(AttributeSchema::optional("key", resource_type).build())
+            .validate()
+            .unwrap();
+        let config =
+            ValidatedConfigSchema::validate(BTreeMap::from([("key".into(), config_type)])).unwrap();
+        ValidatedProviderSchemaWitness::new(vec![resource], config, BTreeMap::new(), vec![])
+    }
+
+    #[test]
+    fn aggregate_admission_reference_rejects_different_lengths() {
+        assert!(matches!(
+            admit_across_roots(reference("[a-z]+", 1, 2048), reference("[a-z]+", 0, 256)),
+            Err(ProviderSchemaValidationError::ConflictingIdentityDeclarations { identity })
+                if identity == TypeIdentity::bare("KeyReference")
+        ));
+    }
+
+    #[test]
+    fn aggregate_admission_reference_rejects_different_patterns() {
+        for different in [
+            reference("[A-Z]+", 1, 2048),
+            AttributeType::reference(
+                TypeIdentity::bare("KeyReference"),
+                Some(PatternSpec::new(
+                    "[a-z]+",
+                    PatternMatch::Substring {
+                        reason: PatternReason::new("Test references may appear in a larger string")
+                            .unwrap(),
+                    },
+                )),
+                Some((Some(1), Some(2048))),
+            ),
+        ] {
+            assert!(matches!(
+                admit_across_roots(reference("[a-z]+", 1, 2048), different),
+                Err(ProviderSchemaValidationError::ConflictingIdentityDeclarations { identity })
+                    if identity == TypeIdentity::bare("KeyReference")
+            ));
+        }
+    }
+
+    #[test]
+    fn aggregate_admission_reference_rejects_missing_pattern_or_length() {
+        for (pattern, length) in [
+            (None, Some((Some(1), Some(2048)))),
+            (Some(PatternSpec::new("[a-z]+", PatternMatch::Full)), None),
+            (None, None),
+        ] {
+            let unconstrained =
+                AttributeType::reference(TypeIdentity::bare("KeyReference"), pattern, length);
+            let constrained = reference("[a-z]+", 1, 2048);
+            for (first, second) in [
+                (constrained.clone(), unconstrained.clone()),
+                (unconstrained, constrained),
+            ] {
+                assert!(matches!(
+                    admit_across_roots(first, second),
+                    Err(ProviderSchemaValidationError::ConflictingIdentityDeclarations { identity })
+                        if identity == TypeIdentity::bare("KeyReference")
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn single_schema_admission_rejects_conflicting_reference_definitions() {
+        for different in [
+            reference("[A-Z]+", 1, 2048),
+            reference("[a-z]+", 1, 256),
+            AttributeType::reference(TypeIdentity::bare("KeyReference"), None, None),
+            AttributeType::refined_string(
+                Some(TypeIdentity::bare("KeyReference")),
+                Some(PatternSpec::new("[A-Z]+", PatternMatch::Full)),
+                Some((Some(1), Some(2048))),
+                None,
+            ),
+        ] {
+            let matching = reference("[a-z]+", 1, 2048);
+            for (first, second) in [(matching.clone(), different.clone()), (different, matching)] {
+                let resource_error = ResourceSchema::new("Keys")
+                    .attribute(AttributeSchema::optional("key", first.clone()).build())
+                    .with_def("OtherKey", AttributeType::list(second.clone()))
+                    .validate()
+                    .expect_err("resource definitions must agree with attribute declarations");
+                assert_eq!(
+                    resource_error.to_string(),
+                    "resource schema `Keys` is invalid: defs.OtherKey.element: custom type `KeyReference` has conflicting identity-layer constraints at key and defs.OtherKey.element"
+                );
+
+                let config_error = ValidatedConfigSchema::validate(BTreeMap::from([
+                    ("first".into(), first),
+                    ("second".into(), AttributeType::list(second)),
+                ]))
+                .expect_err("config declarations must agree within one schema");
+                assert_eq!(
+                    config_error.to_string(),
+                    "provider config schema is invalid: second.element: custom type `KeyReference` has conflicting identity-layer constraints at first and second.element"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aggregate_admission_reference_accepts_identical_definitions() {
+        assert!(
+            admit_across_roots(reference("[a-z]+", 1, 2048), reference("[a-z]+", 1, 2048)).is_ok()
+        );
+    }
+
+    #[test]
+    fn aggregate_admission_mixed_string_reference_accepts_matching_identity_layers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let string = AttributeType::string_member(
+            StringIdentityLayer::new(
+                Some(TypeIdentity::bare("KeyReference")),
+                Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                Some((Some(1), Some(2048))),
+                None,
+            ),
+            StringMemberConstraints::new(
+                Some(PatternSpec::new("a.*", PatternMatch::Full)),
+                Some((Some(2), Some(16))),
+            ),
+        );
+        let reference = reference("[a-z]+", 1, 2048);
+        assert!(admit_across_roots(string.clone(), reference.clone()).is_ok());
+        assert!(admit_across_roots(reference.clone(), string).is_ok());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = calls.clone();
+        let identity = TypeIdentity::bare("KeyReference");
+        let string = AttributeType::refined_string_with_validator(
+            identity.clone(),
+            Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+            Some((Some(1), Some(2048))),
+            legacy_validator(move |_| {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+            None,
+        );
+        for (index, (first, second)) in [(string.clone(), reference.clone()), (reference, string)]
+            .into_iter()
+            .enumerate()
+        {
+            let witness = admit_across_roots(first, second).unwrap();
+            let dispatch = crate::provider::CustomTypeDispatchTable::from_provider_schema(&witness);
+            dispatch.dispatch(&identity, "ab").unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), index + 1);
+        }
+    }
+
+    #[test]
+    fn aggregate_admission_mixed_string_reference_rejects_differing_identity_layers() {
+        let pattern = Some(PatternSpec::new("[a-z]+", PatternMatch::Full));
+        let length = Some((Some(1), Some(2048)));
+        for (case, pattern, length, to_dsl) in [
+            (
+                "pattern",
+                Some(PatternSpec::new("[A-Z]+", PatternMatch::Full)),
+                length,
+                None,
+            ),
+            ("length", pattern.clone(), Some((Some(0), Some(256))), None),
+            ("missing pattern", None, length, None),
+            ("missing length", pattern.clone(), None, None),
+            ("transform", pattern, length, Some(DslTransform::Identity)),
+        ] {
+            let string = AttributeType::refined_string(
+                Some(TypeIdentity::bare("KeyReference")),
+                pattern,
+                length,
+                to_dsl,
+            );
+            let reference = reference("[a-z]+", 1, 2048);
+            for (first, second) in [(string.clone(), reference.clone()), (reference, string)] {
+                assert!(
+                    matches!(
+                        admit_across_roots(first, second),
+                        Err(ProviderSchemaValidationError::ConflictingIdentityDeclarations { identity })
+                            if identity == TypeIdentity::bare("KeyReference")
+                    ),
+                    "mixed declarations must agree on {case} in either traversal order"
+                );
+            }
+        }
     }
 }

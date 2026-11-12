@@ -1271,6 +1271,36 @@ fn upstream_resolve_owns_each_recorded_source() {
 }
 
 #[test]
+fn round4_upstream_unknown_type_uses_loaded_discovery_diagnostic() {
+    let directory = Directory::new(&[
+        (
+            "upstream/exports.crn",
+            "exports { value: Foo = 'upstream-only' }\n",
+        ),
+        (
+            "downstream/main.crn",
+            "provider aws {}\nlet ups = upstream_state { source = '../upstream' }\n",
+        ),
+    ]);
+    directory.assert_ranges(
+        &test_engine_with_wait_target(),
+        "downstream/main.crn",
+        "upstream_state `ups`: failed to parse source `../upstream`:",
+        &[("'../upstream'", 0)],
+    );
+    let path = directory.root.path().join("downstream/main.crn");
+    let source = std::fs::read_to_string(&path).unwrap();
+    let diagnostics = test_engine_with_wait_target()
+        .analyze(&create_document_at(&source, path.clone()), Some(&path));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.message.ends_with("unknown custom type 'Foo'") }),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
 fn upstream_field_owns_repeated_occurrences_after_unicode_heredoc() {
     let directory = Directory::new(&[
         (

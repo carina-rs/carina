@@ -92,6 +92,11 @@ pub(crate) fn provider_upstream_fixture() -> (tempfile::TempDir, PathBuf, Inferr
         "backend local { path = \"carina.state.json\" }\n",
     )
     .unwrap();
+    std::fs::write(
+        upstream.join("exports.crn"),
+        "exports { role_arn: String = 'fixture' }\n",
+    )
+    .unwrap();
     let mut upstream_state = StateFile::new();
     upstream_state.insert_export_json_for_test(
         "role_arn".to_string(),

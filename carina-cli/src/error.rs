@@ -999,9 +999,81 @@ impl std::fmt::Display for AwsCredentialStartupError {
 // CLI hint. The typed source remains available through `credential_error()`.
 impl std::error::Error for AwsCredentialStartupError {}
 
+/// Additional diagnostics retain the typed primary error and embed its complete
+/// rendering in this terminal diagnostic.
+#[derive(Debug, thiserror::Error)]
+#[error("{diagnostics}\n{}", format_error_with_source_chain(.error))]
+pub struct TypeCheckDiagnostics {
+    pub(crate) error: AppError,
+    pub(crate) diagnostics: String,
+}
+
+/// Keep admission failures distinct from read/configuration failures until the
+/// command chooses whether a saved snapshot makes that failure drift.
+#[derive(Debug)]
+pub(crate) enum UpstreamLoadFailure {
+    Admission {
+        error: Box<carina_core::upstream_exports::UpstreamExportAdmissionError>,
+        diagnostics: Vec<String>,
+    },
+    DroppedSavedKeys,
+    Other(Box<AppError>),
+}
+
+impl From<AppError> for UpstreamLoadFailure {
+    fn from(error: AppError) -> Self {
+        Self::Other(Box::new(error))
+    }
+}
+
+impl From<UpstreamLoadFailure> for AppError {
+    fn from(failure: UpstreamLoadFailure) -> Self {
+        match failure {
+            UpstreamLoadFailure::Admission { error, diagnostics } => {
+                let error = Self::UpstreamExportAdmission(error);
+                if diagnostics.is_empty() {
+                    error
+                } else {
+                    Self::TypeCheckDiagnostics(Box::new(TypeCheckDiagnostics {
+                        error,
+                        diagnostics: diagnostics.join("\n"),
+                    }))
+                }
+            }
+            UpstreamLoadFailure::DroppedSavedKeys => {
+                Self::Config("saved upstream export key is no longer declared".into())
+            }
+            UpstreamLoadFailure::Other(error) => *error,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}\n{}", format_error_with_source_chain(.error))]
+pub struct UpstreamSnapshotChangedError {
+    pub(crate) message: String,
+    pub(crate) error: AppError,
+}
+
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error(transparent)]
+    UpstreamSnapshotChanged(Box<UpstreamSnapshotChangedError>),
+
+    #[error("upstream_state '{binding}': cannot resolve source '{}'\n{error}", source_path.display())]
+    UpstreamSourceResolution {
+        binding: String,
+        source_path: std::path::PathBuf,
+        error: std::io::Error,
+    },
+
+    #[error(transparent)]
+    TypeCheckDiagnostics(Box<TypeCheckDiagnostics>),
+
+    #[error(transparent)]
+    UpstreamExportAdmission(Box<carina_core::upstream_exports::UpstreamExportAdmissionError>),
+
     #[error(transparent)]
     PlanPreparation(Box<crate::wiring::PlanPreparationError>),
 
@@ -1671,6 +1743,22 @@ impl From<crate::wiring::PlanPreparationError> for AppError {
             error @ (crate::wiring::PlanPreparationError::Knowledge { .. }
             | crate::wiring::PlanPreparationError::Plan(_)) => {
                 Self::PlanPreparation(Box::new(error))
+            }
+        }
+    }
+}
+
+impl From<carina_core::upstream_exports::UpstreamSourceLoadError> for AppError {
+    fn from(error: carina_core::upstream_exports::UpstreamSourceLoadError) -> Self {
+        match error {
+            error @ carina_core::upstream_exports::UpstreamSourceLoadError::Configuration {
+                ..
+            } => Self::Config(error.to_string()),
+            carina_core::upstream_exports::UpstreamSourceLoadError::Invariant(error) => {
+                error.into()
+            }
+            carina_core::upstream_exports::UpstreamSourceLoadError::Expansion(error) => {
+                error.into()
             }
         }
     }

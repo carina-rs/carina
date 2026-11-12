@@ -140,7 +140,13 @@ fn provider_attributes_resolve_upstream_state_refs_post_load() {
         .expect("provider fixture has no parser placeholders");
     let resolved = carina_core::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-        |session| resolve_provider_attributes_with_remote(&expanded, &remote, session),
+        |session| {
+            resolve_provider_attributes_with_remote(
+                &expanded,
+                &carina_core::upstream_exports::remote_bindings_for_test(remote.clone()),
+                session,
+            )
+        },
     )
     .expect("resolve must succeed");
 

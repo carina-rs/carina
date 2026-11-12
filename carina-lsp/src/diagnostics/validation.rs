@@ -55,9 +55,10 @@ pub(super) fn reference_mismatch_message(
 pub(super) fn covered_by_symbolic_findings(
     path: &FieldPath,
     error: &TypeError,
-    symbolic: &[(LeafPath, TypeError)],
+    symbolic: &[carina_core::validation::SymbolicFinding],
 ) -> bool {
-    if symbolic.iter().any(|(symbolic_path, symbolic_error)| {
+    if symbolic.iter().any(|finding| {
+        let (symbolic_path, symbolic_error) = finding.diagnostic();
         error == symbolic_error
             && path.steps().len() == symbolic_path.segments().len()
             && path

@@ -157,9 +157,20 @@ impl std::error::Error for InvalidCanonicalBindingError {
     }
 }
 
+/// Keep the concrete backend failure available for classification while
+/// rendering the upstream context and inner diagnostic as one terminal error.
+#[derive(Debug, Error)]
+#[error("upstream_state '{binding}': failed to read published exports\n{error}")]
+pub struct UpstreamExportReadError {
+    pub binding: String,
+    pub error: BackendError,
+}
+
 /// Errors that can occur when interacting with a state backend
 #[derive(Debug, Error)]
 pub enum BackendError {
+    #[error(transparent)]
+    UpstreamExportRead(Box<UpstreamExportReadError>),
     /// The state is locked by another process
     #[error("State is locked by {who} (lock ID: {lock_id}, operation: {operation})")]
     Locked {
@@ -625,10 +636,11 @@ impl BackendError {
         }
     }
 
-    /// Return the typed legacy-row error when this is one.
+    /// Return the typed legacy-row error, including through upstream read context.
     pub fn invalid_resource_identity(&self) -> Option<&InvalidResourceIdentityError> {
         match self {
             Self::InvalidResourceIdentity(error) => Some(error),
+            Self::UpstreamExportRead(error) => error.error.invalid_resource_identity(),
             _ => None,
         }
     }
@@ -845,6 +857,46 @@ mod tests {
     use super::*;
     use crate::backend_config::{BackendConfig, BackendConfigError};
     use crate::lock::LockInfo;
+
+    #[test]
+    fn round3_upstream_read_preserves_legacy_identity_classification() {
+        let error = BackendError::UpstreamExportRead(Box::new(UpstreamExportReadError {
+            binding: "orgs".into(),
+            error: BackendError::InvalidResourceIdentity(InvalidResourceIdentityError::new(
+                0,
+                "mock".into(),
+                "test.resource".into(),
+                None,
+                ResourceIdentityError::Empty,
+            )),
+        }));
+        let identity = error
+            .invalid_resource_identity()
+            .expect("upstream reads retain the typed legacy-state recovery classifier");
+        assert_eq!(identity.identity_error(), &ResourceIdentityError::Empty);
+        assert!(
+            identity
+                .render_with_plan_command("carina plan downstream")
+                .contains("Run `carina plan downstream`")
+        );
+    }
+
+    #[test]
+    fn round1_3_upstream_export_read_retains_typed_backend_error_with_terminal_display() {
+        let error = BackendError::UpstreamExportRead(Box::new(UpstreamExportReadError {
+            binding: "orgs".into(),
+            error: BackendError::Io("read-marker".into()),
+        }));
+        assert!(std::error::Error::source(&error).is_none());
+        assert_eq!(
+            error.to_string(),
+            "upstream_state 'orgs': failed to read published exports\nI/O error: read-marker"
+        );
+        let BackendError::UpstreamExportRead(read) = error else {
+            panic!("upstream read context must remain typed");
+        };
+        assert!(matches!(read.error, BackendError::Io(message) if message == "read-marker"));
+    }
 
     #[test]
     fn test_backend_error_locked() {

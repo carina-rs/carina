@@ -430,7 +430,9 @@ type ValidationCandidateFactory<'a, P, B> =
 /// source must supply its cursor factory; association failure is never projected.
 enum ValidationInput<'a, P: PlaceholderKind, B: BindingAddress> {
     Classified,
-    Authored {
+    // Producer-owned inputs preserve pairing even on the report-only path.
+    // AttributeInput, not analysis kind, selects the cursor authority.
+    Resource {
         candidate: ValidationCandidateFactory<'a, P, B>,
         coverage: &'a std::cell::RefCell<crate::schema::value_validation::WalkCoverage>,
     },
@@ -466,7 +468,7 @@ fn admit_validation_attributes_with_input<
             ValidationInput::Classified => {
                 Candidate::validation_classified(proof.clone(), bindings, session)
             }
-            ValidationInput::Authored { candidate, .. } => match candidate(name, proof.clone()) {
+            ValidationInput::Resource { candidate, .. } => match candidate(name, proof.clone()) {
                 Ok(input) => input,
                 Err(error) => return admission_findings(&mut Err::<Admission<K, P, B>, _>(error)),
             },
@@ -483,12 +485,9 @@ fn admit_validation_attributes_with_input<
         };
         let assignment = destination.contract.as_deref().map(|contract| {
             move |attr: &CompiledAttributeType,
-                  value: crate::schema::value_validation::CheckValue<'_, P, B>,
+                  value: &Value<P, B>,
                   path: &LeafPath,
                   cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
-                let crate::schema::value_validation::CheckValue::Current(value) = value else {
-                    return Ok(Default::default());
-                };
                 match check {
                     Some(check) => check(
                         name,
@@ -534,9 +533,15 @@ fn admit_validation_attributes_with_input<
             })
             .collect()
         };
-        let boundary = boundary.with_checks(assignment.as_ref().map(|check| check as &_), &untyped);
+        let boundary = boundary.with_checks(
+            super::AssignmentChecks {
+                authored: None,
+                ordinary: assignment.as_ref().map(|check| check as &_),
+            },
+            &untyped,
+        );
         let findings = admission_findings(&mut admit(destination, candidate, &boundary));
-        if let ValidationInput::Authored { coverage, .. } = &input {
+        if let ValidationInput::Resource { coverage, .. } = &input {
             coverage.borrow_mut().extend(boundary.coverage.take());
         }
         if proof.failure().is_some() {
@@ -611,58 +616,11 @@ pub fn resource_attribute_admissions<
     bindings: &BindingIndex<'_, B>,
     session: &dyn ProviderTypeCheckContext,
     schemas: &SchemaRegistry,
-) -> crate::schema::ResourceValueValidation {
-    resource_attribute_admissions_with_coverage(
-        resource,
-        parsed,
-        schema,
-        attributes,
-        quoted,
-        inputs,
-        bindings,
-        session,
-        schemas,
-        &mut WalkCoverage::default(),
-    )
-}
-
-/// Admit every analysis item using the same destination-kind policy.
-#[allow(clippy::too_many_arguments)]
-pub fn resource_attribute_admissions_with_coverage<
-    B: BindingAddress,
-    D: crate::parser::DeferredForPhaseTraversal<
-            crate::resource::ParserPlaceholder,
-            crate::resource::ParserPlaceholder,
-            B,
-        >,
-    E,
->(
-    resource: &crate::parser::AnalysisResourceRef<
-        '_,
-        crate::resource::ParserPlaceholder,
-        crate::resource::ParserPlaceholder,
-        D,
-        B,
-    >,
-    parsed: &crate::parser::File<
-        E,
-        crate::resource::ParserPlaceholder,
-        crate::resource::ParserPlaceholder,
-        D,
-        B,
-    >,
-    schema: crate::schema::OwnerBoundResourceSchema<'_>,
-    attributes: &std::collections::HashMap<
-        String,
-        crate::resource::knowledge::Classification<'_, crate::resource::ParserPlaceholder, B>,
-    >,
-    quoted: &std::collections::HashSet<String>,
-    inputs: &ResourceAttributeInputs<B>,
-    bindings: &BindingIndex<'_, B>,
-    session: &dyn ProviderTypeCheckContext,
-    schemas: &SchemaRegistry,
     coverage: &mut WalkCoverage,
 ) -> crate::schema::ResourceValueValidation {
+    if let Err(missing) = inputs.authored_evidence() {
+        coverage.no_authored_evidence(missing);
+    }
     let visits = std::cell::RefCell::new(std::mem::take(coverage));
     let findings = if uses_resource_attribute_admission(resource.kind()) {
         typed_resource_attribute_admissions::<kind::ResourceAttribute, _, _, _>(
@@ -718,38 +676,30 @@ fn typed_resource_attribute_admissions<
     coverage: &std::cell::RefCell<crate::schema::value_validation::WalkCoverage>,
 ) -> crate::schema::ResourceValueValidation {
     use crate::resource::{DeferredValue, ParserPlaceholder};
+    let report = inputs.report(parsed.expression_report());
+    let mut declaration_errors = std::collections::HashMap::new();
     let declarations = attributes
         .iter()
         .map(|(name, proof)| {
-            let source = inputs
+            let expression = match inputs
                 .input(resource, name)
-                .map_err(|error| (name, error))?;
-            let cursor = match source {
-                AttributeInput::Authored { slot, .. } => {
-                    Some(slot.cursor().map_err(|error| (name, error))?)
-                }
-                AttributeInput::Composition(_) => None,
+                .map_err(|error| (name, error))?
+            {
+                AttributeInput::Authored { slot } => slot
+                    .cursor()
+                    .map_err(|error| (name, error))?
+                    .node()
+                    .judgement(),
+                AttributeInput::Reported => match report.expression(
+                    resource.attribute_value_location(name, &crate::schema::FieldPath::new()),
+                ) {
+                    Ok(expression) => expression,
+                    // Main's report path treats absent declaration recovery as
+                    // no lexical declaration. Ordinary expression checks below
+                    // still own their original lookup errors.
+                    Err(_) => return Ok(None),
+                },
                 AttributeInput::Projected { .. } => return Ok(None),
-                AttributeInput::Unavailable { error, .. } => return Err((name, error.clone())),
-            };
-            let expression = match &cursor {
-                Some(
-                    crate::parser::retained::AuthoredCursor::Authored(usage)
-                    | crate::parser::retained::AuthoredCursor::CoveredBy(usage),
-                ) => usage.node().judgement(),
-                Some(crate::parser::retained::AuthoredCursor::Projected(_)) => {
-                    unreachable!("authored slot")
-                }
-                None => parsed
-                    .expression_report()
-                    .for_resource(resource.id())
-                    .and_then(|report| {
-                        report.expression(
-                            resource
-                                .attribute_value_location(name, &crate::schema::FieldPath::new()),
-                        )
-                    })
-                    .map_err(|error| (name, error))?,
             };
             let value = expression.assignment_value(
                 crate::resource::knowledge::ClassifiedRef::from(proof).diagnostic_value(),
@@ -763,15 +713,14 @@ fn typed_resource_attribute_admissions<
             )
             .map(|(source_name, source)| (name.clone(), (source_name.to_owned(), source))))
         })
-        .collect::<Result<Vec<_>, _>>();
-    let declarations = match declarations {
-        Ok(declarations) => declarations.into_iter().flatten().collect(),
-        Err((name, error)) => {
-            let mut findings = crate::schema::ResourceValueValidation::default();
-            findings.push_attribute_error(name, assignment_seam_error(error));
-            return findings;
-        }
-    };
+        .filter_map(|prepared| match prepared {
+            Ok(declaration) => declaration,
+            Err((name, error)) => {
+                declaration_errors.insert(name.clone(), error);
+                None
+            }
+        })
+        .collect();
     let check = |name: &str,
                  attr: &CompiledAttributeType,
                  value: &Value<ParserPlaceholder, B>,
@@ -779,6 +728,9 @@ fn typed_resource_attribute_admissions<
                  contract: &DestinationContract,
                  boundary: &assignment::ReferenceContext<'_, B>,
                  cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
+        if let Some(error) = declaration_errors.get(name) {
+            return Err(assignment_seam_error(error.clone()));
+        }
         match value {
             Value::Deferred(
                 DeferredValue::Interpolation(_)
@@ -800,48 +752,41 @@ fn typed_resource_attribute_admissions<
                 | DeferredValue::Placeholder(_),
             ) => return Ok(Default::default()),
         }
-        let authored = match &cursor {
-            crate::parser::retained::AuthoredCursor::Authored(usage)
-            | crate::parser::retained::AuthoredCursor::CoveredBy(usage) => Some(usage.node()),
-            crate::parser::retained::AuthoredCursor::Projected(_)
-                if resource.kind() == crate::parser::AnalysisItemKind::Composition =>
-            {
-                None
+        enum Evidence<'a, B: BindingAddress> {
+            Node(crate::parser::retained::JudgedNodeRef<'a, B>),
+            Report(&'a crate::parser::retained::ExpressionReport<B>),
+        }
+        let evidence = match &cursor.kind {
+            crate::parser::retained::CursorKind::Authored(usage)
+            | crate::parser::retained::CursorKind::CoveredBy(usage) => {
+                Evidence::Node(usage.node().clone())
             }
-            crate::parser::retained::AuthoredCursor::Projected(_) => return Ok(Default::default()),
+            crate::parser::retained::CursorKind::Projected(_) if inputs.is_reported(name) => {
+                Evidence::Report(report)
+            }
+            crate::parser::retained::CursorKind::Projected(_) => return Ok(Default::default()),
         };
-        // Compositions have no resource slot in 1b. Retain main's scoped
-        // report path until their producer captures authored slots as well.
-        let compatibility_report = if authored.is_none() {
-            Some(
-                parsed
-                    .expression_report()
-                    .for_resource(resource.id())
-                    .map_err(assignment_seam_error)?,
-            )
-        } else {
-            None
-        };
-        let expression = if let Some(authored) = authored {
-            authored.judgement()
-        } else {
-            let relative = _path.segments().iter().skip(1).fold(
-                crate::schema::FieldPath::new(),
-                |path, step| match step {
-                    LeafPathSegment::StructField(name) => path.push_field(name),
-                    LeafPathSegment::ListIndex(index) => path.push_index(*index),
-                    LeafPathSegment::MapKey(key) => path.push_map_key(key.expose_plaintext()),
-                },
-            );
-            let report = compatibility_report.expect("composition report");
-            report
-                .expression(resource.attribute_value_location(name, &relative))
-                .or_else(|_| {
-                    report.expression(
-                        resource.attribute_value_location(name, &crate::schema::FieldPath::new()),
-                    )
-                })
-                .map_err(assignment_seam_error)?
+        let expression = match &evidence {
+            Evidence::Node(node) => node.judgement(),
+            Evidence::Report(report) => {
+                let relative = _path.segments().iter().skip(1).fold(
+                    crate::schema::FieldPath::new(),
+                    |path, step| match step {
+                        LeafPathSegment::StructField(name) => path.push_field(name),
+                        LeafPathSegment::ListIndex(index) => path.push_index(*index),
+                        LeafPathSegment::MapKey(key) => path.push_map_key(key.expose_plaintext()),
+                    },
+                );
+                report
+                    .expression(resource.attribute_value_location(name, &relative))
+                    .or_else(|_| {
+                        report.expression(
+                            resource
+                                .attribute_value_location(name, &crate::schema::FieldPath::new()),
+                        )
+                    })
+                    .map_err(assignment_seam_error)?
+            }
         };
         let sink = attr
             .in_schema(schema.schema().as_schema().defs())
@@ -902,8 +847,8 @@ fn typed_resource_attribute_admissions<
                     };
                     let expression = match access {
                         Value::Deferred(DeferredValue::Access(access)) => {
-                            let evidence = if let Some(authored) = authored {
-                                access
+                            let access_evidence = match &evidence {
+                                Evidence::Node(authored) => access
                                     .access_locations()
                                     .ok_or_else(|| {
                                         crate::parser::retained::MissingEvidence::new(
@@ -912,13 +857,10 @@ fn typed_resource_attribute_admissions<
                                     })
                                     .and_then(|locations| locations.node_id())
                                     .and_then(|id| authored.retained_node(id))
-                                    .map(|node| node.judgement())
-                            } else {
-                                compatibility_report
-                                    .expect("composition report")
-                                    .access(access)
+                                    .map(|node| node.judgement()),
+                                Evidence::Report(report) => report.access(access),
                             };
-                            match evidence {
+                            match access_evidence {
                                 Ok(expression) => expression,
                                 Err(error) => {
                                     return vec![
@@ -985,9 +927,9 @@ fn typed_resource_attribute_admissions<
                 })?;
             }
             Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
-                let operands: &dyn crate::validation::IntegerOperandEvidence<B> = match authored {
-                    Some(node) => node,
-                    None => compatibility_report.expect("composition report"),
+                let operands: &dyn crate::validation::IntegerOperandEvidence<B> = match &evidence {
+                    Evidence::Node(node) => node,
+                    Evidence::Report(report) => *report,
                 };
                 if let Some(finding) = crate::validation::check_integer_arithmetic_types_with_sink(
                     value,
@@ -1032,13 +974,10 @@ fn typed_resource_attribute_admissions<
         Ok(Default::default())
     };
     let candidate = |name: &str, proof| {
-        let mismatch = |error| {
-            constraints(vec![AdmissionFinding {
-                path: LeafPath::from_segments([]),
-                error: assignment_seam_error(error),
-            }])
-        };
-        match inputs.input(resource, name).map_err(mismatch)? {
+        if let Some(error) = declaration_errors.get(name) {
+            return Err(seam_constraint(error.clone()));
+        }
+        match inputs.input(resource, name).map_err(seam_constraint)? {
             AttributeInput::Authored { slot, .. } => {
                 Candidate::validation_slot(slot, proof, Some(bindings), session)
             }
@@ -1046,23 +985,18 @@ fn typed_resource_attribute_admissions<
                 proof,
                 Some(bindings),
                 session,
-                *phase,
+                phase,
             )),
-            AttributeInput::Composition(_) => Ok(Candidate::validation_classified(
+            AttributeInput::Reported => Ok(Candidate::validation_classified(
                 proof,
                 Some(bindings),
                 session,
             )),
-            AttributeInput::Unavailable { error, .. } => Err(mismatch(error.clone())),
         }
     };
-    let input = if resource.kind() == crate::parser::AnalysisItemKind::Composition {
-        ValidationInput::Classified
-    } else {
-        ValidationInput::Authored {
-            candidate: &candidate,
-            coverage,
-        }
+    let input = ValidationInput::Resource {
+        candidate: &candidate,
+        coverage,
     };
     admit_validation_attributes_with_input::<K, _, _>(
         schema,

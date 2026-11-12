@@ -56,6 +56,21 @@ fn email_with_altered_identity_constraints_still_collides() {
     ));
 }
 
+#[test]
+fn reference_with_exact_email_identity_constraints_still_collides() {
+    let email = types::email();
+    let parts = email.string_identity_layer().unwrap().parts();
+    let reference = AttributeType::reference(
+        parts.identity.unwrap().clone(),
+        parts.pattern.cloned(),
+        parts.length,
+    );
+    assert!(matches!(
+        provider(reference),
+        Err(ProviderSchemaValidationError::BuiltinTypeCollision { .. })
+    ));
+}
+
 fn text(value: &str) -> carina_core::resource::Value {
     carina_core::resource::Value::Concrete(carina_core::resource::ConcreteValue::String(
         value.into(),

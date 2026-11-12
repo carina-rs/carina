@@ -1,6 +1,9 @@
 //! Validation utilities for resources and modules
 
 use crate::resource::{DiagnosticPath, DiagnosticScope, InsideSecret, SecretDiagnosticError};
+pub use crate::schema::value_validation::{
+    SymbolicDiagnosticCoverage, SymbolicFinding, SymbolicFindingOrigin,
+};
 pub mod admission;
 pub mod deferred_populate;
 pub mod deferred_types;
@@ -2988,8 +2991,8 @@ impl<B: BindingAddress> IntegerOperandEvidence<B>
         };
         node.children()
             .nth(index)
+            .ok_or_else(|| crate::parser::retained::MissingEvidence::new("integer operand child"))?
             .map(|node| node.judgement())
-            .ok_or_else(|| crate::parser::retained::MissingEvidence::new("integer operand child"))
     }
 }
 
@@ -5107,16 +5110,11 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
                 );
                 &checked
             };
-            let symbolic = values
-                .symbolic_errors()
-                .map(|(name, path, _)| (name, path))
-                .collect::<HashSet<_>>();
-            for (error, path) in values.errors_with_paths() {
+            for (error, path, symbolic) in values.diagnostic_errors() {
                 if path.is_some_and(|(name, _)| values.is_retained_failure(name)) {
                     continue;
                 }
-                let rendered_symbolically =
-                    context.admissions.is_some() && path.is_some_and(|key| symbolic.contains(&key));
+                let rendered_symbolically = context.admissions.is_some() && symbolic.owns_path();
                 if !rendered_symbolically {
                     context.all_errors.push(format!("{id}: {error}"));
                 }
@@ -5486,15 +5484,21 @@ fn resource_admission_report<
                         continue;
                     };
                     let attrs = resource.attributes();
-                    let inputs = admission::attributes::ResourceAttributeInputs::new(resource);
-                    let classified = crate::resource::knowledge::collect_classified_attributes(
-                        inputs
-                            .values()
-                            .map(|(name, value)| (name.to_owned(), value)),
+                    let inputs = match admission::attributes::ResourceAttributeInputs::for_resource(
+                        resource,
+                        judged.report(),
+                    ) {
+                        Ok(inputs) => inputs,
+                        Err(error) => {
+                            all_errors.push(error.to_string());
+                            continue;
+                        }
+                    };
+                    let classified = inputs.classify(
                         &crate::resource::knowledge::KnowledgeContext::validation(),
                         |_, _| {},
                     );
-                    let values = admission::attributes::resource_attribute_admissions_with_coverage(
+                    let values = admission::attributes::resource_attribute_admissions(
                         resource,
                         parsed,
                         schema,

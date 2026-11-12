@@ -2274,7 +2274,7 @@ pub struct LivePreApplyInputs<'a, D = crate::resource::UnexpandedDependencyField
     pub compositions: &'a [LiveComposition],
     pub managed_current: &'a HashMap<ResourceId, PlanInputCurrent>,
     pub data_source_values: &'a DataSourceValues,
-    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub remote_bindings: &'a crate::upstream_exports::AdmittedRemoteBindings,
     pub wait_aliases: &'a [WaitAliasSpec],
 }
 
@@ -2290,7 +2290,7 @@ pub struct SavedPreApplyInputs<'a> {
     pub compositions: &'a [SavedComposition<crate::resource::NoPlaceholder>],
     pub managed_current: &'a HashMap<ResourceId, PlanInputCurrent>,
     pub data_source_values: &'a DataSourceValues<SavedModuleSource, ()>,
-    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub remote_bindings: &'a crate::upstream_exports::AdmittedRemoteBindings,
     pub wait_aliases: &'a [WaitAliasSpec],
 }
 
@@ -2305,7 +2305,7 @@ pub struct LivePreDataSourceReadInputs<'a> {
     pub compositions: &'a [LiveComposition],
     pub data_sources: &'a [crate::resource::DataSource],
     pub managed_current: &'a HashMap<ResourceId, PlanInputCurrent>,
-    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub remote_bindings: &'a crate::upstream_exports::AdmittedRemoteBindings,
     pub wait_aliases: &'a [WaitAliasSpec],
 }
 
@@ -2515,7 +2515,7 @@ impl ResolvedBindings {
         compositions: &[LiveComposition],
         data_sources: &[crate::resource::DataSource],
         managed_current: &HashMap<ResourceId, PlanInputCurrent>,
-        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        remote_bindings: &crate::upstream_exports::AdmittedRemoteBindings,
         wait_aliases: &[WaitAliasSpec],
     ) -> Self {
         let mut bindings = Self::build_managed_core_from_iter(
@@ -2538,7 +2538,7 @@ impl ResolvedBindings {
         compositions: &[LiveComposition],
         managed_current: &HashMap<ResourceId, PlanInputCurrent>,
         data_source_values: &DataSourceValues,
-        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        remote_bindings: &crate::upstream_exports::AdmittedRemoteBindings,
         wait_aliases: &[WaitAliasSpec],
     ) -> Self {
         let mut bindings = Self::build_managed_core_from_iter(
@@ -2630,7 +2630,7 @@ impl ResolvedBindings {
             D,
         >],
         managed_current: &HashMap<ResourceId, PlanInputCurrent>,
-        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        remote_bindings: &crate::upstream_exports::AdmittedRemoteBindings,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
     ) -> Self {
         Self::build_managed_core_from_iter(
@@ -2651,7 +2651,7 @@ impl ResolvedBindings {
             >,
         >,
         managed_current: &HashMap<ResourceId, PlanInputCurrent>,
-        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        remote_bindings: &crate::upstream_exports::AdmittedRemoteBindings,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
     ) -> Self {
         let mut by_name: HashMap<String, ResolvedBinding> = HashMap::new();
@@ -3166,6 +3166,7 @@ impl ResolvedBindings {
     /// The name is `set` rather than `insert` to avoid sounding like
     /// `HashMap::insert` (which returns the previous value); this method
     /// is fire-and-forget.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn set(&mut self, name: &str, attrs: HashMap<String, Value>, source: BindingValueSource) {
         let completeness = match source {
             BindingValueSource::Upstream => BindingCompleteness::Complete,
@@ -3176,7 +3177,32 @@ impl ResolvedBindings {
         self.set_with_completeness(name, attrs, source, completeness);
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn set_with_completeness(
+        &mut self,
+        name: &str,
+        attrs: HashMap<String, Value>,
+        source: BindingValueSource,
+        completeness: BindingCompleteness,
+    ) {
+        self.set_values_with_completeness(name, attrs, source, completeness);
+    }
+
+    pub(crate) fn install_upstream(
+        &mut self,
+        remote_bindings: &crate::upstream_exports::AdmittedRemoteBindings,
+    ) {
+        for (binding, exports) in remote_bindings {
+            self.set_values_with_completeness(
+                binding,
+                (**exports).clone(),
+                BindingValueSource::Upstream,
+                BindingCompleteness::Complete,
+            );
+        }
+    }
+
+    pub(crate) fn set_values_with_completeness(
         &mut self,
         name: &str,
         attrs: HashMap<String, Value>,
@@ -3343,7 +3369,9 @@ impl<'a> IterableBindings<'a> {
     /// `let` reads are in scope. This constructor exists for the
     /// carina-core parser tests that exercise the `upstream_state`
     /// iterable path with hand-built bindings.
-    pub fn from_upstream_only(remote_bindings: HashMap<String, HashMap<String, Value>>) -> Self {
+    pub fn from_upstream_only(
+        remote_bindings: crate::upstream_exports::AdmittedRemoteBindings,
+    ) -> Self {
         Self {
             bindings: std::borrow::Cow::Owned(ResolvedBindings {
                 by_name: remote_bindings
@@ -3353,8 +3381,8 @@ impl<'a> IterableBindings<'a> {
                             name,
                             ResolvedBinding {
                                 attributes: attributes
-                                    .into_iter()
-                                    .map(|(key, value)| (key, value.to_snapshot()))
+                                    .iter()
+                                    .map(|(key, value)| (key.clone(), value.to_snapshot()))
                                     .collect(),
                                 source: BindingValueSource::Upstream,
                                 completeness: BindingCompleteness::Complete,
@@ -5144,7 +5172,7 @@ mod resolved_bindings_tests {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &DataSourceValues::empty(),
-            remote_bindings: &remote,
+            remote_bindings: &crate::upstream_exports::remote_bindings_for_test(remote.clone()),
             wait_aliases: &[],
         });
 
@@ -5203,7 +5231,7 @@ mod resolved_bindings_tests {
                 &[],
             ),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &remote,
+            remote_bindings: &crate::upstream_exports::remote_bindings_for_test(remote.clone()),
             wait_aliases: &[],
         });
 
@@ -5255,7 +5283,7 @@ mod resolved_bindings_tests {
             compositions: &[],
             managed_current: &plan_input_states,
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &remote,
+            remote_bindings: &crate::upstream_exports::remote_bindings_for_test(remote.clone()),
             wait_aliases: &[],
         });
 
@@ -5314,7 +5342,7 @@ mod resolved_bindings_tests {
                 &[],
             ),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &remote,
+            remote_bindings: &crate::upstream_exports::remote_bindings_for_test(remote.clone()),
             wait_aliases: &[],
         });
 
@@ -5351,7 +5379,7 @@ mod resolved_bindings_tests {
                 &[],
             ),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &remote,
+            remote_bindings: &crate::upstream_exports::remote_bindings_for_test(remote.clone()),
             wait_aliases: &[],
         });
         assert!(resolved.get("anonymous").is_none());
@@ -5392,7 +5420,7 @@ mod resolved_bindings_tests {
                 &[],
             ),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &remote,
+            remote_bindings: &crate::upstream_exports::remote_bindings_for_test(remote.clone()),
             wait_aliases: &[],
         });
         let attrs = resolved.get("shared").expect("shared binding present");
@@ -5450,7 +5478,7 @@ mod resolved_bindings_tests {
                 &[],
             ),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &remote,
+            remote_bindings: &crate::upstream_exports::remote_bindings_for_test(remote.clone()),
             wait_aliases: &[],
         });
         let attrs = resolved.get("vpc").expect("vpc binding present");
@@ -5616,7 +5644,7 @@ mod resolved_bindings_tests {
                 &[],
             ),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &remote,
+            remote_bindings: &crate::upstream_exports::remote_bindings_for_test(remote.clone()),
             wait_aliases: &[],
         });
 
@@ -5778,7 +5806,7 @@ mod resolved_bindings_tests {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &remote,
+            remote_bindings: &crate::upstream_exports::remote_bindings_for_test(remote.clone()),
             wait_aliases: &[wait_spec("waited", "up")],
         });
         assert_eq!(

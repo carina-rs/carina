@@ -204,11 +204,12 @@ pub use carina_provider_protocol::types::{
 };
 pub use pattern_display::{DiagnosticPatternSpec, PatternSpecDisplay};
 pub use refinement_layers::intersect_bounds;
+pub(crate) use refinement_layers::{IdentifiedDeclaration, ScalarIdentityParts, bounds_are_empty};
+use refinement_layers::{IdentityDefinition, visit_identified_declarations};
 pub use refinement_layers::{
     IntIdentityLayer, IntIdentityParts, IntMemberConstraints, IntMemberParts, StringIdentityLayer,
     StringIdentityParts, StringMemberConstraints, StringMemberParts,
 };
-pub(crate) use refinement_layers::{ScalarIdentityParts, bounds_are_empty};
 mod refinement_walk;
 pub use refinement_walk::{RefinedScalarPosition, RefinementPathSegment, RefinementPositions};
 pub(crate) mod length_interval;
@@ -10621,6 +10622,7 @@ pub enum IdentifiedDeclarationKind {
     String,
     Int,
     Float,
+    Reference,
     Enum,
 }
 
@@ -10630,6 +10632,7 @@ impl fmt::Display for IdentifiedDeclarationKind {
             Self::String => "refined String",
             Self::Int => "refined Int",
             Self::Float => "refined Float",
+            Self::Reference => "Reference",
             Self::Enum => "Enum",
         })
     }
@@ -10822,7 +10825,8 @@ impl ValidatedProviderSchemaWitness {
         assignability_edges: Vec<AssignabilityEdge>,
     ) -> Result<Self, ProviderSchemaValidationError> {
         let declarations = identified_declarations_from_witnesses(&resources, &config);
-        let mut identity_layers = BTreeMap::<TypeIdentity, ScalarIdentityParts<'_>>::new();
+        let mut identity_layers =
+            BTreeMap::<TypeIdentity, IdentityDefinitionAgreement<'_, ()>>::new();
         let mut scalar_kinds = BTreeMap::<TypeIdentity, RefinedScalarKind>::new();
         let mut declaration_kinds =
             BTreeMap::<TypeIdentity, std::collections::BTreeSet<IdentifiedDeclarationKind>>::new();
@@ -10843,41 +10847,40 @@ impl ValidatedProviderSchemaWitness {
             }
         }
 
-        for (identity, attribute_type) in &declarations {
-            if let Some(builtin) = builtin_type_registry().get(identity)
-                && !same_builtin_declaration(
-                    attribute_type.scalar_identity_parts(),
-                    builtin
-                        .scalar_identity_parts()
-                        .expect("built-in scalar definition"),
-                )
+        for declaration in declarations {
+            if let Some(builtin) = builtin_identified_declarations().get(declaration.identity())
+                && !same_builtin_declaration(&declaration, builtin)
             {
                 return Err(ProviderSchemaValidationError::BuiltinTypeCollision {
-                    identity: identity.clone(),
+                    identity: declaration.identity().clone(),
                 });
             }
+            let identity = declaration.identity();
+            let kind = declaration.kind();
             if edge_endpoints.contains(identity) {
-                if matches!(attribute_type.raw_shape(), RawShape::Enum { .. }) {
-                    return Err(ProviderSchemaValidationError::EnumAssignabilityEndpoint {
-                        identity: identity.clone(),
-                    });
-                }
-                if matches!(attribute_type.raw_shape(), RawShape::Reference { .. }) {
-                    return Err(
-                        ProviderSchemaValidationError::ReferenceAssignabilityEndpoint {
+                match kind {
+                    IdentifiedDeclarationKind::Enum => {
+                        return Err(ProviderSchemaValidationError::EnumAssignabilityEndpoint {
                             identity: identity.clone(),
-                        },
-                    );
+                        });
+                    }
+                    IdentifiedDeclarationKind::Reference => {
+                        return Err(
+                            ProviderSchemaValidationError::ReferenceAssignabilityEndpoint {
+                                identity: identity.clone(),
+                            },
+                        );
+                    }
+                    IdentifiedDeclarationKind::String
+                    | IdentifiedDeclarationKind::Int
+                    | IdentifiedDeclarationKind::Float => {}
                 }
             }
-            let declaration = identified_declaration_kind(attribute_type)
-                .expect("identified declaration walk only yields identified scalar types");
-            let scalar_kind =
-                identified_declaration_scalar_kind(attribute_type).ok_or_else(|| {
-                    ProviderSchemaValidationError::MissingScalarKind {
-                        identity: identity.clone(),
-                    }
-                })?;
+            let scalar_kind = declaration.scalar_kind().ok_or_else(|| {
+                ProviderSchemaValidationError::MissingScalarKind {
+                    identity: identity.clone(),
+                }
+            })?;
             if let Some(first_kind) = scalar_kinds.get(identity)
                 && *first_kind != scalar_kind
             {
@@ -10887,26 +10890,23 @@ impl ValidatedProviderSchemaWitness {
                     second_kind: scalar_kind,
                 });
             }
-            if let Some(identity_layer) = attribute_type.scalar_identity_parts() {
-                if identity_layers
-                    .get(identity)
-                    .is_some_and(|first| !first.agrees_with(identity_layer))
-                {
-                    return Err(
-                        ProviderSchemaValidationError::ConflictingIdentityDeclarations {
-                            identity: identity.clone(),
-                        },
-                    );
-                }
-                identity_layers
-                    .entry(identity.clone())
-                    .or_insert(identity_layer);
+            if identity_layers
+                .entry(identity.clone())
+                .or_insert_with(IdentityDefinitionAgreement::new)
+                .check(declaration.definition(), ())
+                .is_err()
+            {
+                return Err(
+                    ProviderSchemaValidationError::ConflictingIdentityDeclarations {
+                        identity: identity.clone(),
+                    },
+                );
             }
             scalar_kinds.entry(identity.clone()).or_insert(scalar_kind);
             declaration_kinds
                 .entry(identity.clone())
                 .or_default()
-                .insert(declaration);
+                .insert(kind);
         }
 
         for identity in reference_forms.keys() {
@@ -10915,11 +10915,12 @@ impl ValidatedProviderSchemaWitness {
                     identity: identity.clone(),
                 });
             };
-            if let Some(declaration) = kinds
-                .iter()
-                .copied()
-                .find(|kind| *kind != IdentifiedDeclarationKind::String)
-            {
+            if let Some(declaration) = kinds.iter().copied().find(|kind| {
+                !matches!(
+                    kind,
+                    IdentifiedDeclarationKind::String | IdentifiedDeclarationKind::Reference
+                )
+            }) {
                 return Err(ProviderSchemaValidationError::NonStringReferenceForm {
                     identity: identity.clone(),
                     declaration,
@@ -10975,248 +10976,8 @@ impl ValidatedProviderSchemaWitness {
         }
     }
 
-    pub(crate) fn identified_declarations(&self) -> Vec<(TypeIdentity, CompiledAttributeType)> {
+    pub(crate) fn identified_declarations(&self) -> Vec<IdentifiedDeclaration<'_>> {
         identified_declarations_from_witnesses(&self.resources, &self.config)
-    }
-}
-
-fn identified_declaration_kind(
-    attribute_type: &CompiledAttributeType,
-) -> Option<IdentifiedDeclarationKind> {
-    match attribute_type.raw_shape() {
-        RawShape::UnloadedSchemaType(_) => None,
-        RawShape::Reference {
-            identity: _identity,
-            pattern: _pattern,
-            length: _length,
-        } => Some(IdentifiedDeclarationKind::String),
-        RawShape::String {
-            identity_layer:
-                StringIdentityParts {
-                    identity: Some(_identity),
-                    pattern: _pattern,
-                    length: _length,
-                    validate: _validate,
-                    to_dsl: _to_dsl,
-                },
-            member_layer: _,
-        } => Some(IdentifiedDeclarationKind::String),
-        RawShape::Int {
-            identity_layer:
-                IntIdentityParts {
-                    identity: Some(_identity),
-                    range: _range,
-                    validate: _validate,
-                },
-            member_layer: _,
-        } => Some(IdentifiedDeclarationKind::Int),
-        RawShape::Float {
-            identity: Some(_identity),
-            range: _range,
-            validate: _validate,
-        } => Some(IdentifiedDeclarationKind::Float),
-        RawShape::Enum {
-            identity: _identity,
-            base: _base,
-            values: _values,
-            dsl_aliases: _dsl_aliases,
-            validate: _validate,
-            to_dsl: _to_dsl,
-        } => Some(IdentifiedDeclarationKind::Enum),
-        RawShape::String {
-            identity_layer: StringIdentityParts { identity: None, .. },
-            member_layer: _,
-        }
-        | RawShape::Int {
-            identity_layer: IntIdentityParts { identity: None, .. },
-            member_layer: _,
-        }
-        | RawShape::Float {
-            identity: None,
-            range: _,
-            validate: _,
-        } => None,
-        RawShape::Bool | RawShape::Duration => None,
-        RawShape::List {
-            element_type: _element_type,
-            ordered: _ordered,
-            constraints: _constraints,
-        } => None,
-        RawShape::Map {
-            key: _key,
-            value: _value,
-            constraints: _,
-        } => None,
-        RawShape::Struct {
-            name: _name,
-            fields: _fields,
-            field_groups: _field_groups,
-            input_rules: _input_rules,
-        } => None,
-        RawShape::Union(_members) => None,
-        RawShape::Ref(_name) => None,
-    }
-}
-
-fn identified_declaration_scalar_kind(
-    attribute_type: &CompiledAttributeType,
-) -> Option<RefinedScalarKind> {
-    match attribute_type.raw_shape() {
-        RawShape::UnloadedSchemaType(_) => None,
-        RawShape::Reference {
-            identity: _identity,
-            pattern: _pattern,
-            length: _length,
-        } => Some(RefinedScalarKind::String),
-        RawShape::String {
-            identity_layer:
-                StringIdentityParts {
-                    identity: Some(_identity),
-                    pattern: _pattern,
-                    length: _length,
-                    validate: _validate,
-                    to_dsl: _to_dsl,
-                },
-            member_layer: _,
-        } => Some(RefinedScalarKind::String),
-        RawShape::Int {
-            identity_layer:
-                IntIdentityParts {
-                    identity: Some(_identity),
-                    range: _range,
-                    validate: _validate,
-                },
-            member_layer: _,
-        } => Some(RefinedScalarKind::Int),
-        RawShape::Float {
-            identity: Some(_identity),
-            range: _range,
-            validate: _validate,
-        } => Some(RefinedScalarKind::Float),
-        RawShape::Enum {
-            identity: _identity,
-            base,
-            values: _values,
-            dsl_aliases: _dsl_aliases,
-            validate: _validate,
-            to_dsl: _to_dsl,
-        } => scalar_kind_for_schema_base(base),
-        RawShape::String {
-            identity_layer: StringIdentityParts { identity: None, .. },
-            member_layer: _,
-        }
-        | RawShape::Int {
-            identity_layer: IntIdentityParts { identity: None, .. },
-            member_layer: _,
-        }
-        | RawShape::Float {
-            identity: None,
-            range: _,
-            validate: _,
-        } => None,
-        RawShape::Bool | RawShape::Duration => None,
-        RawShape::List {
-            element_type: _element_type,
-            ordered: _ordered,
-            constraints: _constraints,
-        } => None,
-        RawShape::Map {
-            key: _key,
-            value: _value,
-            constraints: _,
-        } => None,
-        RawShape::Struct {
-            name: _name,
-            fields: _fields,
-            field_groups: _field_groups,
-            input_rules: _input_rules,
-        } => None,
-        RawShape::Union(_members) => None,
-        RawShape::Ref(_name) => None,
-    }
-}
-
-fn visit_identified_declarations(
-    attribute_type: &CompiledAttributeType,
-    visitor: &mut dyn FnMut(&TypeIdentity, &CompiledAttributeType),
-) {
-    match attribute_type.raw_shape() {
-        RawShape::UnloadedSchemaType(_) => {}
-        RawShape::Reference {
-            identity,
-            pattern: _pattern,
-            length: _length,
-        } => visitor(identity, attribute_type),
-        RawShape::String {
-            identity_layer:
-                StringIdentityParts {
-                    identity: Some(identity),
-                    ..
-                },
-            member_layer: _,
-        }
-        | RawShape::Int {
-            identity_layer:
-                IntIdentityParts {
-                    identity: Some(identity),
-                    ..
-                },
-            member_layer: _,
-        }
-        | RawShape::Float {
-            identity: Some(identity),
-            range: _,
-            validate: _,
-        }
-        | RawShape::Enum {
-            identity,
-            base: _,
-            values: _,
-            dsl_aliases: _,
-            validate: _,
-            to_dsl: _,
-        } => visitor(identity, attribute_type),
-        RawShape::List {
-            element_type,
-            ordered: _,
-            constraints: _constraints,
-        } => visit_identified_declarations(element_type, visitor),
-        RawShape::Map {
-            key,
-            value,
-            constraints: _,
-        } => {
-            visit_identified_declarations(key, visitor);
-            visit_identified_declarations(value, visitor);
-        }
-        RawShape::Struct {
-            name: _, fields, ..
-        } => {
-            for field in fields {
-                visit_identified_declarations(&field.field_type, visitor);
-            }
-        }
-        RawShape::Union(members) => {
-            for member in members {
-                visit_identified_declarations(member, visitor);
-            }
-        }
-        RawShape::String {
-            identity_layer: StringIdentityParts { identity: None, .. },
-            member_layer: _,
-        }
-        | RawShape::Int {
-            identity_layer: IntIdentityParts { identity: None, .. },
-            member_layer: _,
-        }
-        | RawShape::Float {
-            identity: None,
-            range: _,
-            validate: _,
-        }
-        | RawShape::Bool
-        | RawShape::Duration
-        | RawShape::Ref(_) => {}
     }
 }
 
@@ -11226,24 +10987,22 @@ fn visit_identified_declarations(
 /// their canonical `BTreeMap` order, nested shapes retain declaration order,
 /// and provider-config roots come last. Provider dispatch and aggregate
 /// admission share this traversal rather than reconstructing identity tables.
-pub(crate) fn identified_declarations_from_witnesses(
-    resources: &[ValidatedResourceSchema],
-    config: &ValidatedConfigSchema,
-) -> Vec<(TypeIdentity, PatternAttributeType<Compiled>)> {
+pub(crate) fn identified_declarations_from_witnesses<'a>(
+    resources: &'a [ValidatedResourceSchema],
+    config: &'a ValidatedConfigSchema,
+) -> Vec<IdentifiedDeclaration<'a>> {
     let mut declarations = Vec::new();
-    let mut collect = |identity: &TypeIdentity, attribute_type: &PatternAttributeType<Compiled>| {
-        declarations.push((identity.clone(), attribute_type.clone()));
-    };
+    let mut collect = |declaration, ()| declarations.push(declaration);
     for schema in resources {
         for attribute in schema.effective_attributes() {
-            visit_identified_declarations(attribute.field_type(), &mut collect);
+            visit_identified_declarations(attribute.field_type(), (), &mut collect);
         }
         for definition in schema.parts().defs.values() {
-            visit_identified_declarations(definition, &mut collect);
+            visit_identified_declarations(definition, (), &mut collect);
         }
     }
     for attribute_type in config.parts().values() {
-        visit_identified_declarations(attribute_type, &mut collect);
+        visit_identified_declarations(attribute_type, (), &mut collect);
     }
     declarations
 }
@@ -11271,6 +11030,50 @@ fn push_schema_issue(
     });
 }
 
+/// Retain the first scalar definition even if an enum appeared before it.
+/// Context records the diagnostic origin without affecting agreement.
+struct IdentityDefinitionAgreement<'a, C> {
+    first: Option<(ScalarIdentityParts<'a>, C)>,
+}
+
+impl<'a, C> IdentityDefinitionAgreement<'a, C> {
+    fn new() -> Self {
+        Self { first: None }
+    }
+
+    fn check<R: PatternForm>(
+        &mut self,
+        definition: &IdentityDefinition<'a, R>,
+        context: C,
+    ) -> Result<(), &C> {
+        let parts = match definition {
+            IdentityDefinition::Scalar(parts) => *parts,
+            IdentityDefinition::Reference(parts) => ScalarIdentityParts::String(*parts),
+            // Enum definitions and canonical spellings agree through provider
+            // enum resolution. An enum must not mask later scalar definitions.
+            IdentityDefinition::Enum {
+                base: _,
+                values: _,
+                dsl_aliases: _,
+                to_dsl: _,
+            } => return Ok(()),
+        };
+        match self.first {
+            Some((first, ref first_context)) => {
+                if first.agrees_with(parts) {
+                    Ok(())
+                } else {
+                    Err(first_context)
+                }
+            }
+            None => {
+                self.first = Some((parts, context));
+                Ok(())
+            }
+        }
+    }
+}
+
 fn validate_identified_scalar_kind_consistency<'a>(
     attribute_type: &'a PatternAttributeType<Draft>,
     location: SchemaValidationIssueLocation,
@@ -11278,56 +11081,29 @@ fn validate_identified_scalar_kind_consistency<'a>(
         TypeIdentity,
         (
             RefinedScalarKind,
-            Option<ScalarIdentityParts<'a>>,
+            IdentityDefinitionAgreement<'a, SchemaValidationIssueLocation>,
             SchemaValidationIssueLocation,
         ),
     >,
     issues: &mut Vec<SchemaDefinitionIssue>,
 ) {
-    let identified = match attribute_type.raw_shape() {
-        RawShape::UnloadedSchemaType(_) => None,
-        RawShape::Reference {
-            identity,
-            pattern: _pattern,
-            length: _length,
-        } => Some((identity, RefinedScalarKind::String)),
-        RawShape::String {
-            identity_layer:
-                StringIdentityParts {
-                    identity: Some(identity),
-                    ..
-                },
-            ..
-        } => Some((identity, RefinedScalarKind::String)),
-        RawShape::Int {
-            identity_layer:
-                IntIdentityParts {
-                    identity: Some(identity),
-                    ..
-                },
-            ..
-        } => Some((identity, RefinedScalarKind::Int)),
-        RawShape::Float {
-            identity: Some(identity),
-            ..
-        } => Some((identity, RefinedScalarKind::Float)),
-        RawShape::Enum {
-            identity,
+    visit_identified_declarations(attribute_type, location, &mut |declaration, location| {
+        let identity = declaration.identity();
+        let scalar_kind = declaration.scalar_kind();
+        if scalar_kind.is_none() {
+            push_schema_issue(
+                issues,
+                &location,
+                format!("custom type `{identity}` must have a scalar base"),
+            );
+        }
+        if let IdentityDefinition::Enum {
             base,
             values,
             dsl_aliases,
-            validate: _validate,
             to_dsl,
-        } => {
-            let kind = scalar_kind_for_schema_base(base);
-            if kind.is_none() {
-                push_schema_issue(
-                    issues,
-                    &location,
-                    format!("custom type `{identity}` must have a scalar base"),
-                );
-            }
-
+        } = declaration.definition()
+        {
             match values {
                 Some(_values) => {
                     if to_dsl.is_some() {
@@ -11389,9 +11165,70 @@ fn validate_identified_scalar_kind_consistency<'a>(
                     }
                 }
             }
-
-            kind.map(|kind| (identity, kind))
         }
+        let Some(kind) = scalar_kind else {
+            return;
+        };
+        let (first_kind, agreement, first_location) = seen
+            .entry(identity.clone())
+            .or_insert_with(|| (kind, IdentityDefinitionAgreement::new(), location.clone()));
+        if *first_kind != kind {
+            push_schema_issue(
+                issues,
+                &location,
+                format!(
+                    "custom type `{identity}` is bound to both {first_kind} at {first_location} and {kind}"
+                ),
+            );
+        } else if let Err(first_location) =
+            agreement.check(declaration.definition(), location.clone())
+        {
+            push_schema_issue(
+                issues,
+                &location,
+                format!(
+                    "custom type `{identity}` has conflicting identity-layer constraints at {first_location} and {location}"
+                ),
+            );
+        }
+    });
+}
+
+/// Classify a scalar leaf independently of the caller's unloaded-type error policy.
+pub(crate) fn scalar_kind_for_identified_leaf<R: PatternForm>(
+    shape: RawShape<'_, R>,
+) -> Option<RefinedScalarKind> {
+    match shape {
+        RawShape::UnloadedSchemaType(_) => None,
+        RawShape::Reference {
+            identity: _identity,
+            pattern: _pattern,
+            length: _length,
+        } => Some(RefinedScalarKind::String),
+        RawShape::String {
+            identity_layer:
+                StringIdentityParts {
+                    identity: Some(_), ..
+                },
+            ..
+        } => Some(RefinedScalarKind::String),
+        RawShape::Int {
+            identity_layer: IntIdentityParts {
+                identity: Some(_), ..
+            },
+            ..
+        } => Some(RefinedScalarKind::Int),
+        RawShape::Float {
+            identity: Some(_), ..
+        } => Some(RefinedScalarKind::Float),
+        RawShape::Enum {
+            identity: _,
+            base,
+            values: _,
+            dsl_aliases: _,
+            validate: _,
+            to_dsl: _,
+        } => scalar_kind_for_schema_base(base),
         RawShape::String {
             identity_layer: StringIdentityParts { identity: None, .. },
             ..
@@ -11408,93 +11245,10 @@ fn validate_identified_scalar_kind_consistency<'a>(
         | RawShape::Struct { .. }
         | RawShape::Union(_)
         | RawShape::Ref(_) => None,
-    };
-    if let Some((identity, kind)) = identified {
-        let identity_layer = attribute_type.scalar_identity_parts();
-        if let Some((first_kind, first_layer, first_location)) = seen.get(identity) {
-            if *first_kind != kind {
-                push_schema_issue(
-                    issues,
-                    &location,
-                    format!(
-                        "custom type `{identity}` is bound to both {first_kind} at {first_location} and {kind}"
-                    ),
-                );
-            } else if first_layer
-                .zip(identity_layer)
-                .is_some_and(|(first, second)| !first.agrees_with(second))
-            {
-                push_schema_issue(
-                    issues,
-                    &location,
-                    format!(
-                        "custom type `{identity}` has conflicting identity-layer constraints at {first_location} and {location}"
-                    ),
-                );
-            }
-        } else {
-            seen.insert(identity.clone(), (kind, identity_layer, location.clone()));
-        }
-    }
-
-    match attribute_type.raw_shape() {
-        RawShape::UnloadedSchemaType(_) => {}
-        RawShape::List { element_type, .. } => validate_identified_scalar_kind_consistency(
-            element_type,
-            location.with_suffix(".element"),
-            seen,
-            issues,
-        ),
-        RawShape::Map {
-            key,
-            value,
-            constraints: _,
-        } => {
-            validate_identified_scalar_kind_consistency(
-                key,
-                location.with_suffix(".key"),
-                seen,
-                issues,
-            );
-            validate_identified_scalar_kind_consistency(
-                value,
-                location.with_suffix(".value"),
-                seen,
-                issues,
-            );
-        }
-        RawShape::Struct { fields, .. } => {
-            for field in fields {
-                validate_identified_scalar_kind_consistency(
-                    &field.field_type,
-                    location.with_suffix(format_args!(".{}", field.name)),
-                    seen,
-                    issues,
-                );
-            }
-        }
-        RawShape::Union(members) => {
-            for (index, member) in members.iter().enumerate() {
-                validate_identified_scalar_kind_consistency(
-                    member,
-                    location.with_suffix(format_args!("[{index}]")),
-                    seen,
-                    issues,
-                );
-            }
-        }
-        RawShape::Reference { .. }
-        | RawShape::String { .. }
-        | RawShape::Int { .. }
-        | RawShape::Float { .. }
-        | RawShape::Bool
-        | RawShape::Duration
-        | RawShape::Enum { .. }
-        | RawShape::Ref(_) => {}
     }
 }
 
-fn scalar_kind_for_schema_base<R: PatternForm>(
+pub(crate) fn scalar_kind_for_schema_base<R: PatternForm>(
     attribute_type: &PatternAttributeType<R>,
 ) -> Option<RefinedScalarKind> {
     match attribute_type.raw_shape() {
@@ -15049,14 +14803,58 @@ pub fn builtin_type_registry() -> &'static HashMap<TypeIdentity, CompiledAttribu
     })
 }
 
+fn builtin_identified_declarations()
+-> &'static HashMap<TypeIdentity, IdentifiedDeclaration<'static>> {
+    static DECLARATIONS: OnceLock<HashMap<TypeIdentity, IdentifiedDeclaration<'static>>> =
+        OnceLock::new();
+    DECLARATIONS.get_or_init(|| {
+        let mut declarations = HashMap::new();
+        for builtin in builtin_type_registry().values() {
+            visit_identified_declarations(builtin, (), &mut |declaration, ()| {
+                declarations.insert(declaration.identity().clone(), declaration);
+            });
+        }
+        declarations
+    })
+}
+
 fn same_builtin_declaration(
-    declaration: Option<ScalarIdentityParts<'_>>,
-    builtin: ScalarIdentityParts<'_>,
+    declaration: &IdentifiedDeclaration<'_>,
+    builtin: &IdentifiedDeclaration<'_>,
 ) -> bool {
-    let Some(declaration) = declaration else {
-        return false;
+    let (declaration, builtin) = match (declaration.definition(), builtin.definition()) {
+        (IdentityDefinition::Scalar(declaration), IdentityDefinition::Scalar(builtin)) => {
+            (*declaration, *builtin)
+        }
+        (
+            IdentityDefinition::Scalar(_),
+            IdentityDefinition::Reference(_)
+            | IdentityDefinition::Enum {
+                base: _,
+                values: _,
+                dsl_aliases: _,
+                to_dsl: _,
+            },
+        )
+        | (
+            IdentityDefinition::Reference(_)
+            | IdentityDefinition::Enum {
+                base: _,
+                values: _,
+                dsl_aliases: _,
+                to_dsl: _,
+            },
+            IdentityDefinition::Scalar(_)
+            | IdentityDefinition::Reference(_)
+            | IdentityDefinition::Enum {
+                base: _,
+                values: _,
+                dsl_aliases: _,
+                to_dsl: _,
+            },
+        ) => return false,
     };
-    if !declaration.same_definition(builtin) {
+    if !declaration.agrees_with(builtin) {
         return false;
     }
     match (declaration.callback(), builtin.callback()) {

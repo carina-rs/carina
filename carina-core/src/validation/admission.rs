@@ -376,6 +376,30 @@ enum AdmissionProof<'a, P: PlaceholderKind, B: BindingAddress> {
     Apply(KnownValue<'a, P, B>),
 }
 
+/// Main's ordinary assignment work requires a current, expression-origin value.
+/// Authored policy instead uses AssignmentCheck, including discarded positions.
+type OrdinaryAssignmentCheck<'a, P, B> =
+    &'a dyn Fn(
+        &CompiledAttributeType,
+        &Value<P, B>,
+        &LeafPath,
+        crate::parser::retained::AuthoredCursor<'_, B>,
+    ) -> Result<crate::schema::value_validation::AssignmentFindings, TypeError>;
+
+struct AssignmentChecks<'a, P: PlaceholderKind, B: BindingAddress> {
+    authored: Option<crate::schema::value_validation::AssignmentCheck<'a, P, B>>,
+    ordinary: Option<OrdinaryAssignmentCheck<'a, P, B>>,
+}
+
+impl<P: PlaceholderKind, B: BindingAddress> Default for AssignmentChecks<'_, P, B> {
+    fn default() -> Self {
+        Self {
+            authored: None,
+            ordinary: None,
+        }
+    }
+}
+
 pub struct AdmissionContext<
     'a,
     P: PlaceholderKind = NoPlaceholder,
@@ -385,7 +409,7 @@ pub struct AdmissionContext<
     proof: AdmissionProof<'a, P, B>,
     bindings: Option<&'a BindingIndex<'a, B>>,
     provider: &'a dyn ProviderTypeCheckContext,
-    assignment: Option<crate::schema::value_validation::AssignmentCheck<'a, P, B>>,
+    assignment: AssignmentChecks<'a, P, B>,
     cursor: crate::parser::retained::AuthoredCursor<'a, B>,
     coverage: std::cell::RefCell<crate::schema::value_validation::WalkCoverage>,
     untyped: Option<&'a dyn Fn() -> Vec<TypeError>>,
@@ -416,7 +440,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
             AdmissionProof::Validation(proof),
             bindings,
             provider,
-            crate::parser::retained::AuthoredCursor::Projected(phase),
+            crate::parser::retained::AuthoredCursor::projected(phase),
         )
     }
 
@@ -432,7 +456,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
             AdmissionProof::Plan(proof),
             None,
             provider,
-            crate::parser::retained::AuthoredCursor::Projected(phase),
+            crate::parser::retained::AuthoredCursor::projected(phase),
         )
     }
 
@@ -447,7 +471,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
             AdmissionProof::Apply(proof),
             None,
             provider,
-            crate::parser::retained::AuthoredCursor::Projected(phase),
+            crate::parser::retained::AuthoredCursor::projected(phase),
         ))
     }
 
@@ -482,8 +506,8 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
             proof: AdmissionProof::Apply(proof.clone()),
             bindings: None,
             provider,
-            assignment: None,
-            cursor: crate::parser::retained::AuthoredCursor::Projected(phase),
+            assignment: Default::default(),
+            cursor: crate::parser::retained::AuthoredCursor::projected(phase),
             coverage: Default::default(),
             untyped: None,
             declaration: None,
@@ -520,7 +544,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
                 proof,
                 bindings,
                 provider,
-                assignment: None,
+                assignment: Default::default(),
                 cursor,
                 coverage: Default::default(),
                 untyped: None,
@@ -550,27 +574,18 @@ impl<B: BindingAddress> Candidate<crate::resource::ParserPlaceholder, B> {
         ),
         AdmissionErrors,
     > {
-        let mismatch = |request| {
-            constraints(vec![AdmissionFinding {
-                path: LeafPath::from_segments([]),
-                error: assignment_seam_error(crate::parser::retained::MissingEvidence::new(
-                    request,
-                )),
-            }])
-        };
         let value = crate::resource::knowledge::ClassifiedRef::from(&proof).diagnostic_value();
         if !slot
             .projection()
             .is_some_and(|projection| std::ptr::eq(projection, value))
         {
-            return Err(mismatch("slot/projection proof pairing"));
+            return Err(seam_constraint(
+                crate::parser::retained::MissingEvidence::new("slot/projection proof pairing"),
+            ));
         }
-        let cursor = slot.cursor().map_err(|error| {
-            constraints(vec![AdmissionFinding {
-                path: LeafPath::from_segments([]),
-                error: assignment_seam_error(error),
-            }])
-        })?;
+        let cursor = crate::parser::retained::AuthoredCursor::authored(
+            slot.cursor().map_err(seam_constraint)?,
+        );
         Ok(Self::paired(
             value.clone(),
             AdmissionProof::Validation(proof),
@@ -584,7 +599,7 @@ impl<B: BindingAddress> Candidate<crate::resource::ParserPlaceholder, B> {
 impl<'a, P: PlaceholderKind, B: BindingAddress> AdmissionContext<'a, P, B> {
     fn with_checks<'s>(
         self,
-        assignment: Option<crate::schema::value_validation::AssignmentCheck<'s, P, B>>,
+        assignment: AssignmentChecks<'s, P, B>,
         untyped: &'s dyn Fn() -> Vec<TypeError>,
     ) -> AdmissionContext<'s, P, B>
     where
@@ -844,6 +859,13 @@ pub(crate) fn assignment_seam_error(error: crate::parser::retained::MissingEvide
             error: error.into(),
         },
     ))
+}
+
+pub(crate) fn seam_constraint(error: crate::parser::retained::MissingEvidence) -> AdmissionErrors {
+    constraints(vec![AdmissionFinding {
+        path: LeafPath::from_segments([]),
+        error: assignment_seam_error(error),
+    }])
 }
 
 fn join(root: &LeafPath, relative: &LeafPath) -> LeafPath {

@@ -18,21 +18,75 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+thread_local! {
+    static PROJECTION_COPY_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn count_projection_copy_work<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    PROJECTION_COPY_WORK.set(0);
+    let result = run();
+    (result, PROJECTION_COPY_WORK.get())
+}
+
+#[cfg(test)]
+fn record_projection_copy(value: &Value<ParserPlaceholder, RelativeBindingName>) {
+    fn size(value: &Value<ParserPlaceholder, RelativeBindingName>) -> usize {
+        1 + match value {
+            Value::Concrete(crate::resource::ConcreteValue::List(values)) => {
+                values.iter().map(size).sum()
+            }
+            Value::Concrete(crate::resource::ConcreteValue::Map(values)) => {
+                values.values().map(size).sum()
+            }
+            Value::Concrete(_) | Value::Deferred(_) => 0,
+        }
+    }
+    PROJECTION_COPY_WORK.update(|work| work + size(value));
+}
+
 mod cursor;
 pub use cursor::{
     AuthoredCursor, AuthoredSlots, AuthoredUse, CompletenessReport, EdgeRole, ExpansionInstanceId,
-    JudgedNodeRef, JudgedSlot, NodeId, ProjectedPhase, ProjectionGeneration, SlotDeclarationId,
-    UseId,
+    JudgedNodeRef, JudgedSlot, NoAuthoredEvidence, NodeId, ProjectedPhase, ProjectionGeneration,
+    SlotDeclarationId, UnreachedSlot, UseId,
 };
-pub(crate) use cursor::{AuthoredForm, SyntheticSource};
+pub(crate) use cursor::{AuthoredForm, AuthoredNavigation, CursorKind, SyntheticSource};
 
 /// The expansion scope is part of expression identity, even when two module
 /// instances originate at the same authored source location.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default)]
 pub(crate) enum ExpressionInstance {
     #[default]
     Root,
-    Module(Arc<str>),
+    Module(Arc<ExpressionEnvironment>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ExpressionEnvironmentId(u64);
+
+pub(crate) struct ExpressionEnvironment {
+    id: ExpressionEnvironmentId,
+    scope: Arc<str>,
+}
+
+impl std::fmt::Debug for ExpressionEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.scope.fmt(f)
+    }
+}
+
+impl PartialEq for ExpressionInstance {
+    fn eq(&self, other: &Self) -> bool {
+        self.id() == other.id()
+    }
+}
+impl Eq for ExpressionInstance {}
+impl std::hash::Hash for ExpressionInstance {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id().hash(state);
+    }
 }
 
 /// A failed evidence lookup is an invariant error, never deferred authority.
@@ -54,7 +108,107 @@ impl MissingEvidence {
 
 impl ExpressionInstance {
     pub(crate) fn for_scope(scope: &crate::resource::ModuleInstanceScope) -> Self {
-        Self::Module(Arc::from(scope.key()))
+        #[derive(Default)]
+        struct Environments {
+            scopes: HashMap<Arc<str>, std::sync::Weak<ExpressionEnvironment>>,
+            next_cleanup: usize,
+        }
+        static ENVIRONMENTS: std::sync::OnceLock<std::sync::Mutex<Environments>> =
+            std::sync::OnceLock::new();
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let mut environments = ENVIRONMENTS
+            .get_or_init(Default::default)
+            .lock()
+            .expect("expression environments lock");
+        if let Some(environment) = environments
+            .scopes
+            .get(scope.key())
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return Self::Module(environment);
+        }
+        if environments.scopes.len() >= environments.next_cleanup {
+            environments
+                .scopes
+                .retain(|_, environment| environment.strong_count() != 0);
+            environments.next_cleanup = environments.scopes.len().saturating_mul(2).max(64);
+        }
+        let environment = Arc::new(ExpressionEnvironment {
+            id: ExpressionEnvironmentId(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+            scope: Arc::from(scope.key()),
+        });
+        environments
+            .scopes
+            .insert(environment.scope.clone(), Arc::downgrade(&environment));
+        Self::Module(environment)
+    }
+
+    pub(crate) fn id(&self) -> ExpressionEnvironmentId {
+        match self {
+            Self::Root => ExpressionEnvironmentId(0),
+            Self::Module(environment) => environment.id,
+        }
+    }
+}
+
+/// Parser decisions are versioned independently of provisional Values. Each
+/// slot takes a constant-size view of this shared history, so later loop
+/// iterations cannot change the branch that produced an earlier projection.
+#[derive(Debug, Default)]
+struct ConditionHistory {
+    version: usize,
+    values: HashMap<NodeId, Vec<(usize, bool)>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct ConditionSnapshot {
+    history: Arc<std::sync::RwLock<ConditionHistory>>,
+    version: usize,
+    previous: Option<Arc<ConditionSnapshot>>,
+}
+
+impl ConditionSnapshot {
+    fn get(&self, id: NodeId) -> Option<bool> {
+        let selected = {
+            let history = self.history.read().expect("retained conditions lock");
+            history.values.get(&id).and_then(|values| {
+                let index = values.partition_point(|(version, _)| *version <= self.version);
+                index.checked_sub(1).map(|index| values[index].1)
+            })
+        };
+        selected.or_else(|| self.previous.as_ref()?.get(id))
+    }
+
+    fn over(&self, previous: &Self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.previous = Some(Arc::new(previous.clone()));
+        snapshot
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ConditionRecorder(Arc<std::sync::RwLock<ConditionHistory>>);
+
+impl ConditionRecorder {
+    pub(crate) fn extend(&self, decisions: impl IntoIterator<Item = (NodeId, bool)>) {
+        let mut history = self.0.write().expect("retained conditions lock");
+        for (id, selected) in decisions {
+            history.version += 1;
+            let version = history.version;
+            history
+                .values
+                .entry(id)
+                .or_default()
+                .push((version, selected));
+        }
+    }
+
+    fn snapshot(&self) -> ConditionSnapshot {
+        ConditionSnapshot {
+            history: self.0.clone(),
+            version: self.0.read().expect("retained conditions lock").version,
+            previous: None,
+        }
     }
 }
 
@@ -102,6 +256,15 @@ pub struct ExprValue<P: ValueKind = ParserPlaceholder, B: BindingAddress = Relat
 enum Projection<P: ValueKind, B: BindingAddress> {
     Pending,
     Value(Value<P, B>),
+}
+
+impl<P: ValueKind, B: BindingAddress> Projection<P, B> {
+    fn map_bindings<C: BindingAddress>(self, map: &mut impl FnMut(B) -> C) -> Projection<P, C> {
+        match self {
+            Self::Pending => Projection::Pending,
+            Self::Value(value) => Projection::Value(value.map_bindings(map)),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -404,8 +567,14 @@ pub(in crate::parser) fn resource_slots(
             continue;
         };
         if let Some(sink) = sinks.get(name) {
-            let projections = captures.projections_for(&sink.expression.authored);
-            slots.insert(name.clone(), sink.clone(), kind, instance, projections);
+            let conditions = captures.condition_snapshot();
+            slots.insert(
+                name.clone(),
+                sink.expression.clone(),
+                kind,
+                instance,
+                conditions,
+            );
         } else {
             // Grouped blocks have explicit compiler-owned container handles,
             // including when a pending child prevents a provisional Value.
@@ -413,8 +582,13 @@ pub(in crate::parser) fn resource_slots(
             if let Some(value) = values.get(name) {
                 expression.payload = Projection::Value(value.clone());
             }
-            let projections = captures.projections_for(&expression.authored);
-            slots.insert_container(name.clone(), expression, kind, instance, projections);
+            slots.insert(
+                name.clone(),
+                expression,
+                kind,
+                instance,
+                captures.condition_snapshot(),
+            );
         }
     }
     Ok(slots)
@@ -778,7 +952,11 @@ impl Expressions {
                 .read()
                 .expect("retained projections lock")
                 .iter()
-                .map(|(id, value)| ((self.instance.clone(), *id), value.clone()))
+                .map(|(id, value)| {
+                    #[cfg(test)]
+                    record_projection_copy(value);
+                    ((self.instance.clone(), *id), value.clone())
+                })
                 .collect(),
         );
     }
@@ -814,7 +992,6 @@ impl Expressions {
             out.roots
                 .push(compile(pair, file, source, &HashMap::new(), &mut captures));
         }
-        captures.definitions = out.definitions.clone();
         out.captures = Arc::new(captures);
         out
     }
@@ -923,7 +1100,7 @@ pub(in crate::parser) struct CapturedNodes {
     nodes: HashMap<ParseNodeKey, ExprValue>,
     resource_declarations: HashMap<NodeId, SlotDeclarationId>,
     values: std::sync::RwLock<HashMap<NodeId, Value<ParserPlaceholder, RelativeBindingName>>>,
-    definitions: IndexMap<RelativeBindingName, ExprValue>,
+    conditions: ConditionRecorder,
 }
 impl std::fmt::Debug for CapturedNodes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -931,29 +1108,21 @@ impl std::fmt::Debug for CapturedNodes {
     }
 }
 impl CapturedNodes {
-    fn projections_for(
+    fn condition_snapshot(&self) -> ConditionSnapshot {
+        self.conditions.snapshot()
+    }
+    pub(in crate::parser) fn record_selected_condition(
         &self,
-        root: &Arc<AuthoredExpr<ParserPlaceholder, RelativeBindingName>>,
-    ) -> HashMap<NodeId, Value<ParserPlaceholder, RelativeBindingName>> {
-        let values = self.values.read().expect("retained projections lock");
-        let mut projections = HashMap::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut pending = vec![root.as_ref()];
-        while let Some(node) = pending.pop() {
-            if !seen.insert(node.id) {
-                continue;
-            }
-            if let Some(value) = values.get(&node.id) {
-                projections.insert(node.id, value.clone());
-            }
-            pending.extend(node.children.iter().map(|child| child.authored.as_ref()));
-            if let ExprKind::Binding(binding) = &node.kind
-                && let Some(definition) = self.definitions.get(binding)
-            {
-                pending.push(&definition.authored);
-            }
+        pair: &Pair<'_, Rule>,
+        selected: bool,
+    ) {
+        if let Some(id) = self.node_id(pair) {
+            self.conditions.extend([(id, selected)]);
         }
-        projections
+        self.record(
+            pair,
+            Value::Concrete(crate::resource::ConcreteValue::Bool(selected)),
+        );
     }
     fn get(&self, key: &ParseNodeKey) -> Option<&ExprValue> {
         self.nodes.get(key)
@@ -1509,14 +1678,9 @@ fn compile_form(
                         if entry.as_rule() == Rule::map_entry {
                             let mut parts = entry.clone().into_inner();
                             let key = parts.next().expect("map key");
-                            let name = if key.as_rule() == Rule::string {
-                                super::expressions::string_literal::parse_string_literal(
-                                    key.clone(),
-                                )
-                                .unwrap_or_else(|_| key.as_str().to_string())
-                            } else {
-                                key.as_str().to_string()
-                            };
+                            // Keys must have the exact spelling used by the
+                            // value parser, including its escape handling.
+                            let name = super::context::extract_key_string(key).unwrap_or_default();
                             let value = compile(
                                 parts.next().expect("map value"),
                                 file,
@@ -1687,11 +1851,7 @@ fn compile_form(
         Rule::attribute => {
             let mut parts = pair.clone().into_inner();
             let name = parts.next().expect("attribute name");
-            let name = if name.as_rule() == Rule::string {
-                super::expressions::string_literal::parse_string_literal(name).unwrap_or_default()
-            } else {
-                name.as_str().to_string()
-            };
+            let name = super::context::extract_key_string(name).unwrap_or_default();
             let value = compile(
                 parts.next().expect("attribute value"),
                 file,
@@ -1902,6 +2062,9 @@ pub(crate) fn value_dependent_judgement_for_test() -> JudgedExpr {
 // Constructors for judgement evidence are confined to this module. In
 // particular, the syntax compiler and provisional evaluators cannot mint it.
 mod judgement {
+    #[cfg(test)]
+    mod round2_tests;
+
     use super::*;
     use crate::static_type::{InferenceError, InferenceIssue, NotInferableReason};
     use crate::validation::inference::{self, InferenceBinding, InferenceBindings};
@@ -3610,7 +3773,7 @@ mod judgement {
             generation,
             definition: definitions.contains(&expression.node_id()),
             environment: expression.authored.location.instance.clone(),
-            projections: Arc::default(),
+            conditions: ConditionSnapshot::default(),
         }));
         let mut resources = std::collections::HashSet::new();
         for resource in file
@@ -3620,21 +3783,18 @@ mod judgement {
             if !resources.insert(resource.id().clone()) {
                 continue;
             }
-            let slots = match resource {
-                super::super::ResourceRef::Resource(resource) => &resource.authored_slots,
-                super::super::ResourceRef::DataSource(source) => &source.authored_slots,
-                super::super::ResourceRef::Deferred { resource, .. } => {
-                    &resource.as_resource().authored_slots
+            let (slots, source) = match resource {
+                super::super::ResourceRef::Resource(resource) => {
+                    (&resource.authored_slots, resource.module_source.as_ref())
                 }
+                super::super::ResourceRef::DataSource(source) => {
+                    (&source.authored_slots, source.module_source.as_ref())
+                }
+                super::super::ResourceRef::Deferred { resource, .. } => (
+                    &resource.as_resource().authored_slots,
+                    resource.as_resource().module_source.as_ref(),
+                ),
                 super::super::ResourceRef::LiveComposition(_) => continue,
-            };
-            let source = match resource {
-                super::super::ResourceRef::Resource(resource) => resource.module_source.as_ref(),
-                super::super::ResourceRef::DataSource(source) => source.module_source.as_ref(),
-                super::super::ResourceRef::Deferred { resource, .. } => {
-                    resource.as_resource().module_source.as_ref()
-                }
-                super::super::ResourceRef::LiveComposition(_) => None,
             };
             let environment = source
                 .and_then(crate::resource::ModuleSource::identity_scope)

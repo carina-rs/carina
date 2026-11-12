@@ -1,8 +1,8 @@
 //! Closed authored inputs, shared syntax/judgement snapshots and per-use coverage.
 
 use super::{
-    AuthoredExpr, ExprKind, ExpressionInstance, ExpressionLocation, ExpressionReport, JudgedExpr,
-    MissingEvidence, Projection, SinkExpression,
+    AuthoredExpr, ConditionSnapshot, ExprKind, ExpressionInstance, ExpressionLocation,
+    ExpressionReport, JudgedExpr, MissingEvidence, Projection,
 };
 use crate::resource::knowledge::{Apply, Knowledge, PlanResolved};
 use crate::resource::{
@@ -122,6 +122,40 @@ pub(crate) enum AuthoredForm {
     Computed,
 }
 
+/// Syntax navigation shared by current and discarded assignment walks.
+pub(crate) enum AuthoredNavigation<'s, B: BindingAddress> {
+    Forward {
+        child: AuthoredUse<'s, B>,
+        authored: bool,
+    },
+    Secret(AuthoredUse<'s, B>),
+    Alternatives {
+        first: usize,
+        edge: EdgeRole,
+    },
+    List,
+    Map,
+    Parts,
+    Leaf,
+    Covered,
+}
+
+fn is_boundary_definition<B: BindingAddress>(
+    mut node: &AuthoredExpr<ParserPlaceholder, B>,
+) -> bool {
+    loop {
+        match &node.kind {
+            ExprKind::Resource { .. } | ExprKind::Function { .. } => return true,
+            ExprKind::Alias | ExprKind::Parens | ExprKind::Definition | ExprKind::Sequence
+                if node.children.len() == 1 =>
+            {
+                node = &node.children[0].authored;
+            }
+            _ => return false,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct UseInterner(
     std::sync::Mutex<std::collections::HashMap<(UseId, NodeId, ExpansionInstanceId), UseId>>,
@@ -145,8 +179,7 @@ pub(super) struct UseRoot<B: BindingAddress> {
     pub(super) generation: ProjectionGeneration,
     pub(super) definition: bool,
     pub(super) environment: ExpressionInstance,
-    pub(super) projections:
-        Arc<std::collections::HashMap<NodeId, Projection<ParserPlaceholder, B>>>,
+    pub(super) conditions: ConditionSnapshot,
 }
 impl<B: BindingAddress> UseRoot<B> {
     pub(super) fn map_bindings<C: BindingAddress>(
@@ -167,22 +200,7 @@ impl<B: BindingAddress> UseRoot<B> {
             generation: ProjectionGeneration::fresh(),
             definition: self.definition,
             environment: self.environment.clone(),
-            projections: Arc::new(
-                self.projections
-                    .iter()
-                    .map(|(id, value)| {
-                        (
-                            *id,
-                            match value {
-                                Projection::Pending => Projection::Pending,
-                                Projection::Value(value) => {
-                                    Projection::Value(value.clone().map_bindings(map))
-                                }
-                            },
-                        )
-                    })
-                    .collect(),
-            ),
+            conditions: self.conditions.clone(),
         }
     }
 }
@@ -195,7 +213,7 @@ pub struct JudgedNodeRef<'s, B: BindingAddress = RelativeBindingName> {
     snapshot: &'s ExpressionReport<B>,
     generation: ProjectionGeneration,
     environment: ExpressionInstance,
-    projections: &'s std::collections::HashMap<NodeId, Projection<ParserPlaceholder, B>>,
+    conditions: &'s ConditionSnapshot,
 }
 
 impl<B: BindingAddress> std::fmt::Debug for JudgedNodeRef<'_, B> {
@@ -207,7 +225,31 @@ impl<B: BindingAddress> std::fmt::Debug for JudgedNodeRef<'_, B> {
     }
 }
 
+/// Grammar aliases have no distinct authored position. Live cursors and
+/// unavailable-slot identities use exactly the same normalization.
+fn authored_chain<P: crate::resource::ValueKind, B: BindingAddress>(
+    node: &AuthoredExpr<P, B>,
+) -> impl Iterator<Item = &AuthoredExpr<P, B>> {
+    std::iter::successors(Some(node), |node| {
+        (matches!(node.kind, ExprKind::Alias) && node.children.len() == 1)
+            .then(|| node.children[0].authored.as_ref())
+    })
+}
+
 impl<'s, B: BindingAddress> JudgedNodeRef<'s, B> {
+    fn canonical(mut self) -> Result<Self, MissingEvidence> {
+        // Alias nodes are pass-through grammar levels, not authored syntax.
+        // Retain them in the expression report for diagnostic compatibility.
+        for node in authored_chain(self.node).skip(1) {
+            self.judgement = self
+                .snapshot
+                .node(&self.environment, node.id)
+                .ok_or_else(|| MissingEvidence::new(format!("authored node {:?}", node.id)))?;
+            self.node = node;
+        }
+        Ok(self)
+    }
+
     pub fn node_id(&self) -> NodeId {
         self.node.id
     }
@@ -225,18 +267,26 @@ impl<'s, B: BindingAddress> JudgedNodeRef<'s, B> {
     }
 
     /// Direct authored children in syntax order, paired with the same snapshot
-    /// and projection generation. Slot sealing verifies this correspondence.
-    pub fn children(&self) -> impl Iterator<Item = JudgedNodeRef<'s, B>> + '_ {
-        self.node.children.iter().map(move |child| JudgedNodeRef {
-            node: &child.authored,
-            judgement: self
-                .snapshot
-                .node(&self.environment, child.node_id())
-                .expect("sealed authored child judgement"),
-            snapshot: self.snapshot,
-            generation: self.generation,
-            projections: self.projections,
-            environment: self.environment.clone(),
+    /// and projection generation. A missing child judgement is a typed
+    /// correspondence failure, including on diagnostic-only operand reads.
+    pub fn children(
+        &self,
+    ) -> impl Iterator<Item = Result<JudgedNodeRef<'s, B>, MissingEvidence>> + '_ {
+        self.node.children.iter().map(move |child| {
+            JudgedNodeRef {
+                node: &child.authored,
+                judgement: self
+                    .snapshot
+                    .node(&self.environment, child.node_id())
+                    .ok_or_else(|| {
+                        MissingEvidence::new(format!("child judgement {:?}", child.node_id()))
+                    })?,
+                snapshot: self.snapshot,
+                generation: self.generation,
+                conditions: self.conditions,
+                environment: self.environment.clone(),
+            }
+            .canonical()
         })
     }
 
@@ -259,7 +309,7 @@ impl<'s, B: BindingAddress> JudgedNodeRef<'s, B> {
             judgement,
             snapshot: self.snapshot,
             generation: self.generation,
-            projections: self.projections,
+            conditions: self.conditions,
             environment: self.environment.clone(),
         })
     }
@@ -280,6 +330,8 @@ impl<'s, B: BindingAddress> JudgedNodeRef<'s, B> {
 enum ProjectionVisit {
     Value,
     Selection,
+    // A lowered child covered by the same owner is not another authored node.
+    ProjectionOnly,
 }
 
 /// A judged node at a particular use in a particular expansion.
@@ -365,29 +417,128 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
         let Some(expression) = self.node.snapshot.definitions.get(binding) else {
             return Ok(None);
         };
+        if is_boundary_definition(&expression.authored) {
+            return Ok(None);
+        }
         let judgement = self
             .node
             .snapshot
             .node(&expression.authored.location.instance, expression.node_id())
             .ok_or_else(|| MissingEvidence::new(format!("definition {binding}")))?;
-        Ok(Some(Self {
-            node: JudgedNodeRef {
-                node: &expression.authored,
-                judgement,
-                snapshot: self.node.snapshot,
-                generation: self.node.generation,
-                projections: self.node.projections,
-                environment: expression.authored.location.instance.clone(),
+        Ok(Some(
+            Self {
+                node: JudgedNodeRef {
+                    node: &expression.authored,
+                    judgement,
+                    snapshot: self.node.snapshot,
+                    generation: self.node.generation,
+                    conditions: self.node.conditions,
+                    environment: expression.authored.location.instance.clone(),
+                },
+                occurrence: self.node.snapshot.use_interner.edge(
+                    self.occurrence,
+                    self.node.node.id,
+                    self.instance,
+                ),
+                instance: self.instance,
+                edge: EdgeRole::AliasDefinition,
+                visit: ProjectionVisit::Value,
+            }
+            .canonical()?,
+        ))
+    }
+
+    pub(crate) fn parens_operand(&self) -> Result<Self, MissingEvidence> {
+        self.child(0, EdgeRole::Parens)
+    }
+
+    pub(crate) fn navigation(&self) -> Result<AuthoredNavigation<'s, B>, MissingEvidence> {
+        Ok(match self.form() {
+            AuthoredForm::Forward if self.child_count() != 0 => AuthoredNavigation::Forward {
+                child: self.child(self.child_count() - 1, self.edge())?,
+                authored: !matches!(self.node.kind(), ExprKind::Alias),
             },
-            occurrence: self.node.snapshot.use_interner.edge(
-                self.occurrence,
-                self.node.node.id,
-                self.instance,
-            ),
-            instance: self.instance,
-            edge: EdgeRole::AliasDefinition,
-            visit: ProjectionVisit::Value,
-        }))
+            AuthoredForm::Parens => AuthoredNavigation::Forward {
+                child: self.parens_operand()?,
+                authored: true,
+            },
+            AuthoredForm::Definition => {
+                if self
+                    .node
+                    .node
+                    .children
+                    .first()
+                    .is_some_and(|child| is_boundary_definition(&child.authored))
+                {
+                    AuthoredNavigation::Leaf
+                } else {
+                    AuthoredNavigation::Forward {
+                        child: self.child(0, EdgeRole::AliasDefinition)?,
+                        authored: true,
+                    }
+                }
+            }
+            AuthoredForm::Binding => match self.definition()? {
+                Some(definition) => AuthoredNavigation::Forward {
+                    child: definition,
+                    authored: true,
+                },
+                None => AuthoredNavigation::Leaf,
+            },
+            AuthoredForm::Secret => {
+                AuthoredNavigation::Secret(self.child(0, EdgeRole::SecretArgument)?)
+            }
+            AuthoredForm::If => AuthoredNavigation::Alternatives {
+                first: 1,
+                edge: EdgeRole::IfBranch,
+            },
+            AuthoredForm::Coalesce => AuthoredNavigation::Alternatives {
+                first: 0,
+                edge: EdgeRole::CoalesceOperand,
+            },
+            AuthoredForm::List => AuthoredNavigation::List,
+            AuthoredForm::Map => AuthoredNavigation::Map,
+            AuthoredForm::Computed => match self.node.kind() {
+                ExprKind::Interpolation { .. }
+                | ExprKind::Call(_)
+                | ExprKind::Integer { .. }
+                | ExprKind::Access(_)
+                | ExprKind::DynamicAccess => AuthoredNavigation::Parts,
+                _ => AuthoredNavigation::Covered,
+            },
+            AuthoredForm::Forward | AuthoredForm::Literal | AuthoredForm::Reference => {
+                AuthoredNavigation::Leaf
+            }
+        })
+    }
+
+    pub(crate) fn part(&self, index: usize) -> Result<Self, MissingEvidence> {
+        let role = match self.node.kind() {
+            ExprKind::Interpolation { .. } => EdgeRole::InterpolationPart,
+            ExprKind::Call(_) => EdgeRole::CallArgument,
+            ExprKind::Integer { .. } => EdgeRole::ArithmeticOperand,
+            ExprKind::Access(_) | ExprKind::DynamicAccess => {
+                if index == 0 {
+                    EdgeRole::AccessBase
+                } else {
+                    EdgeRole::AccessIndex
+                }
+            }
+            _ => return Err(MissingEvidence::new("authored expression part")),
+        };
+        self.child(index, role)
+    }
+
+    pub(crate) fn canonical(mut self) -> Result<Self, MissingEvidence> {
+        self.node = self.node.canonical()?;
+        Ok(self)
+    }
+
+    pub(crate) fn alternative(&self, index: usize) -> Result<Self, MissingEvidence> {
+        let AuthoredNavigation::Alternatives { first, edge } = self.navigation()? else {
+            return Err(MissingEvidence::new("authored alternative"));
+        };
+        self.child(first + index, edge)
     }
 
     pub(crate) fn known_condition(&self) -> Result<bool, MissingEvidence> {
@@ -397,21 +548,16 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             .children
             .first()
             .ok_or_else(|| MissingEvidence::new("if condition"))?;
-        let value = match self.node.projections.get(&condition.node_id()) {
-            Some(Projection::Value(value)) => value,
-            Some(Projection::Pending) => {
-                return Err(MissingEvidence::new(
-                    "substituted if condition projection is unavailable",
-                ));
-            }
-            None => self
-                .node
-                .snapshot
-                .projections
-                .get(&(self.node.environment.clone(), condition.node_id()))
-                .or_else(|| condition.projection())
-                .ok_or_else(|| MissingEvidence::new("if condition projection"))?,
-        };
+        if let Some(selected) = self.node.conditions.get(condition.node_id()) {
+            return Ok(selected);
+        }
+        let value = self
+            .node
+            .snapshot
+            .projections
+            .get(&(self.node.environment.clone(), condition.node_id()))
+            .or_else(|| condition.projection())
+            .ok_or_else(|| MissingEvidence::new("if condition projection"))?;
         let known = value
             .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
             .map_err(|_| MissingEvidence::new("if condition knowledge"))?
@@ -439,13 +585,13 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             .snapshot
             .node(&self.node.environment, child.node_id())
             .ok_or_else(|| MissingEvidence::new(format!("authored node {:?}", child.node_id())))?;
-        Ok(Self {
+        Self {
             node: JudgedNodeRef {
                 node: &child.authored,
                 judgement,
                 snapshot: self.node.snapshot,
                 generation: self.node.generation,
-                projections: self.node.projections,
+                conditions: self.node.conditions,
                 environment: self.node.environment.clone(),
             },
             occurrence: if self.form() == AuthoredForm::Definition {
@@ -460,7 +606,8 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             instance: self.instance,
             edge,
             visit: ProjectionVisit::Value,
-        })
+        }
+        .canonical()
     }
 
     pub fn node(&self) -> &JudgedNodeRef<'s, B> {
@@ -510,14 +657,7 @@ enum ProjectedOrigin {
 /// by their producer modules; there is no raw-value or lookup-failure source.
 /// Schema defaults used only for display are not an attribute producer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(
-    dead_code,
-    reason = "normalization/replay source cursors are reserved for their later admission boundaries"
-)]
 pub(crate) enum SyntheticSource {
-    DefaultTagsMerge(crate::executor::normalized::DefaultTagsMergeSource),
-    ProviderNormalization(crate::executor::normalized::ProviderNormalizationSource),
-    SavedPlanReplay(crate::saved_replay::SavedPlanReplaySource),
     ResourcePrefix(crate::identifier::ResourcePrefixSource),
 }
 
@@ -542,90 +682,142 @@ impl ProjectedPhase {
         Self(ProjectedOrigin::Apply)
     }
 
-    #[allow(
-        dead_code,
-        reason = "normalization/replay currently enter through their Plan/Apply proofs"
-    )]
     pub(crate) fn synthetic(source: SyntheticSource) -> Self {
         Self(ProjectedOrigin::Synthetic(source))
     }
 }
 
-/// Mandatory source authority for an assignment check. There is no missing or
-/// default case, and projection authority cannot be made from a failed lookup.
 #[derive(Debug, Clone)]
-pub enum AuthoredCursor<'s, B: BindingAddress = RelativeBindingName> {
+pub(crate) enum CursorKind<'s, B: BindingAddress = RelativeBindingName> {
     Authored(AuthoredUse<'s, B>),
     CoveredBy(AuthoredUse<'s, B>),
     Projected(ProjectedPhase),
 }
 
+/// Downstream code cannot manufacture a cursor phase.
+/// ```compile_fail,E0599
+/// use carina_core::parser::retained::{AuthoredCursor, AuthoredUse};
+/// fn cover(usage: AuthoredUse<'_>) { let _ = AuthoredCursor::CoveredBy(usage); }
+/// ```
+/// ```compile_fail,E0599
+/// use carina_core::parser::retained::{AuthoredCursor, AuthoredUse};
+/// fn author(usage: AuthoredUse<'_>) { let _ = AuthoredCursor::Authored(usage); }
+/// ```
+/// ```compile_fail,E0599
+/// use carina_core::parser::retained::{AuthoredCursor, ProjectedPhase};
+/// fn project(phase: ProjectedPhase) { let _: AuthoredCursor<'_> = AuthoredCursor::Projected(phase); }
+/// ```
+/// Source authority carried through assignment checks. Construction is
+/// confined to core; report-based paths cannot manufacture authored authority.
+#[derive(Debug, Clone)]
+pub struct AuthoredCursor<'s, B: BindingAddress = RelativeBindingName> {
+    pub(crate) kind: CursorKind<'s, B>,
+}
+
 impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
+    pub(crate) fn authored(usage: AuthoredUse<'s, B>) -> Self {
+        Self {
+            kind: CursorKind::Authored(usage),
+        }
+    }
+    pub(crate) fn projected(phase: ProjectedPhase) -> Self {
+        Self {
+            kind: CursorKind::Projected(phase),
+        }
+    }
+    pub(crate) fn covered_by(usage: AuthoredUse<'s, B>) -> Self {
+        Self {
+            kind: CursorKind::CoveredBy(usage),
+        }
+    }
+
     pub(crate) fn selection(&self) -> Self {
         let mut cursor = self.clone();
-        match &mut cursor {
-            Self::Authored(usage) | Self::CoveredBy(usage) => {
+        match &mut cursor.kind {
+            CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => {
                 usage.visit = ProjectionVisit::Selection
             }
-            Self::Projected(_) => {}
+            CursorKind::Projected(_) => {}
         }
         cursor
     }
     pub(crate) fn is_selection(&self) -> bool {
-        match self {
-            Self::Authored(usage) | Self::CoveredBy(usage) => {
+        match &self.kind {
+            CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => {
                 usage.visit == ProjectionVisit::Selection
             }
-            Self::Projected(_) => false,
+            CursorKind::Projected(_) => false,
         }
+    }
+
+    pub(crate) fn is_projection_only(&self) -> bool {
+        match &self.kind {
+            CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => {
+                usage.visit == ProjectionVisit::ProjectionOnly
+            }
+            CursorKind::Projected(_) => true,
+        }
+    }
+
+    pub(crate) fn covered_projection(&self) -> Self {
+        let mut cursor = self.covered();
+        if let CursorKind::CoveredBy(usage) = &mut cursor.kind {
+            usage.visit = ProjectionVisit::ProjectionOnly;
+        }
+        cursor
     }
     pub(crate) fn identity(
         &self,
     ) -> Option<(NodeId, UseId, ExpansionInstanceId, ProjectionGeneration)> {
-        match self {
-            Self::Authored(usage) | Self::CoveredBy(usage) => Some((
+        match &self.kind {
+            CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => Some((
                 usage.node.node.id,
                 usage.occurrence,
                 usage.instance,
                 usage.node.generation,
             )),
-            Self::Projected(_) => None,
+            CursorKind::Projected(_) => None,
         }
     }
-    pub(crate) fn for_map_key(&self) -> Self {
-        match self {
-            Self::Authored(usage) | Self::CoveredBy(usage) => {
-                let mut usage = usage.clone();
-                usage.edge = EdgeRole::MapKey;
-                Self::CoveredBy(usage)
-            }
-            Self::Projected(phase) => Self::Projected(*phase),
-        }
-    }
-
     pub(crate) fn covered(&self) -> Self {
-        match self {
-            Self::Authored(usage) | Self::CoveredBy(usage) => Self::CoveredBy(usage.clone()),
-            Self::Projected(phase) => Self::Projected(*phase),
+        match &self.kind {
+            CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => {
+                Self::covered_by(usage.clone())
+            }
+            CursorKind::Projected(phase) => Self::projected(*phase),
         }
     }
     pub(crate) fn child(&self, index: usize, edge: EdgeRole) -> Result<Self, MissingEvidence> {
-        match self {
-            Self::Authored(usage) => match usage.form() {
+        match &self.kind {
+            CursorKind::Authored(usage) => match usage.form() {
                 // A substituted parameter/loop leaf retains its own authored
                 // source; its projected container has no authored child edges.
                 AuthoredForm::Reference | AuthoredForm::Binding | AuthoredForm::Literal => {
-                    Ok(self.covered())
+                    Ok(self.covered_projection())
                 }
                 AuthoredForm::List
                 | AuthoredForm::If
                 | AuthoredForm::Coalesce
-                | AuthoredForm::Secret => usage.child(index, edge).map(Self::Authored),
+                | AuthoredForm::Secret => usage.child(index, edge).map(Self::authored),
                 _ => Err(MissingEvidence::new(
                     "required authored child correspondence",
                 )),
             },
-            Self::CoveredBy(_) | Self::Projected(_) => Ok(self.clone()),
+            CursorKind::CoveredBy(_) => Ok(self.covered_projection()),
+            CursorKind::Projected(_) => Ok(self.clone()),
+        }
+    }
+
+    pub(crate) fn alternative(&self, index: usize) -> Result<Self, MissingEvidence> {
+        match &self.kind {
+            CursorKind::Authored(usage) => match usage.form() {
+                AuthoredForm::Reference | AuthoredForm::Binding | AuthoredForm::Literal => {
+                    Ok(self.covered_projection())
+                }
+                _ => usage.alternative(index).map(Self::authored),
+            },
+            CursorKind::CoveredBy(_) => Ok(self.covered_projection()),
+            CursorKind::Projected(_) => Ok(self.clone()),
         }
     }
     pub(crate) fn field_child(
@@ -633,28 +825,29 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
         key: &str,
         alias: Option<&str>,
     ) -> Result<Self, MissingEvidence> {
-        let key = match self {
-            Self::Authored(usage)
+        let key = match &self.kind {
+            CursorKind::Authored(usage)
                 if usage.form() == AuthoredForm::Map
                     && !usage.map_keys().iter().any(|candidate| candidate == key) =>
             {
                 alias.unwrap_or(key)
             }
-            Self::Authored(_) | Self::CoveredBy(_) | Self::Projected(_) => key,
+            CursorKind::Authored(_) | CursorKind::CoveredBy(_) | CursorKind::Projected(_) => key,
         };
         self.map_child(key, EdgeRole::StructField)
     }
 
     pub(crate) fn map_child(&self, key: &str, edge: EdgeRole) -> Result<Self, MissingEvidence> {
-        match self {
-            Self::Authored(usage) => match usage.form() {
-                AuthoredForm::Map => usage.map_child(key, edge).map(Self::Authored),
+        match &self.kind {
+            CursorKind::Authored(usage) => match usage.form() {
+                AuthoredForm::Map => usage.map_child(key, edge).map(Self::authored),
                 AuthoredForm::Reference | AuthoredForm::Binding | AuthoredForm::Literal => {
-                    Ok(self.covered())
+                    Ok(self.covered_projection())
                 }
                 _ => Err(MissingEvidence::new("required authored map correspondence")),
             },
-            Self::CoveredBy(_) | Self::Projected(_) => Ok(self.clone()),
+            CursorKind::CoveredBy(_) => Ok(self.covered_projection()),
+            CursorKind::Projected(_) => Ok(self.clone()),
         }
     }
 }
@@ -669,8 +862,9 @@ pub struct JudgedSlot<B: BindingAddress = RelativeBindingName> {
     instance: ExpansionInstanceId,
     generation: ProjectionGeneration,
     snapshot: Arc<ExpressionReport<B>>,
+    snapshot_error: Option<MissingEvidence>,
     schema_kind: crate::schema::SchemaKind,
-    node_projections: Arc<std::collections::HashMap<NodeId, Projection<ParserPlaceholder, B>>>,
+    conditions: ConditionSnapshot,
 }
 
 impl<B: BindingAddress> std::fmt::Debug for JudgedSlot<B> {
@@ -684,16 +878,6 @@ impl<B: BindingAddress> std::fmt::Debug for JudgedSlot<B> {
 }
 
 impl JudgedSlot {
-    /// Capture the complete parser sink. Only a current report can subsequently
-    /// seal its cursor; the parser cannot mint judgement from a reduced value.
-    pub(in crate::parser) fn from_sink(
-        sink: SinkExpression,
-        schema_kind: crate::schema::SchemaKind,
-        instance: ExpansionInstanceId,
-    ) -> Self {
-        Self::from_expression(sink.expression, schema_kind, instance)
-    }
-
     fn from_expression(
         expression: super::ExprValue,
         schema_kind: crate::schema::SchemaKind,
@@ -706,8 +890,9 @@ impl JudgedSlot {
             instance,
             generation: ProjectionGeneration::fresh(),
             snapshot: Arc::new(ExpressionReport::empty()),
+            snapshot_error: None,
             schema_kind,
-            node_projections: Arc::default(),
+            conditions: ConditionSnapshot::default(),
         }
     }
 }
@@ -730,6 +915,7 @@ impl<B: BindingAddress> JudgedSlot<B> {
             .ok_or_else(|| MissingEvidence::new(format!("slot syntax {:?}", self.root.id)))?
             .clone();
         self.snapshot = snapshot;
+        self.snapshot_error = None;
         Ok(())
     }
 
@@ -740,34 +926,34 @@ impl<B: BindingAddress> JudgedSlot<B> {
         }
     }
 
-    pub fn cursor(&self) -> Result<AuthoredCursor<'_, B>, MissingEvidence> {
-        if self
+    pub fn cursor(&self) -> Result<AuthoredUse<'_, B>, MissingEvidence> {
+        if let Some(error) = &self.snapshot_error {
+            return Err(error.clone());
+        }
+        let judgement = self
             .snapshot
             .node(&self.snapshot.instance, self.root.id)
-            .is_none()
-        {
-            return Err(MissingEvidence::new(format!(
-                "slot {:?} requires a current judgement",
-                self.root.id
-            )));
-        }
-        Ok(AuthoredCursor::Authored(AuthoredUse {
+            .ok_or_else(|| {
+                MissingEvidence::new(format!(
+                    "slot {:?} requires a current judgement",
+                    self.root.id
+                ))
+            })?;
+        AuthoredUse {
             node: JudgedNodeRef {
                 node: &self.root,
-                judgement: self
-                    .snapshot
-                    .node(&self.snapshot.instance, self.root.id)
-                    .expect("checked current slot judgement"),
+                judgement,
                 snapshot: &self.snapshot,
                 generation: self.generation,
-                projections: &self.node_projections,
+                conditions: &self.conditions,
                 environment: self.snapshot.instance.clone(),
             },
             occurrence: self.occurrence,
             instance: self.instance,
             edge: EdgeRole::SlotRoot,
             visit: ProjectionVisit::Value,
-        }))
+        }
+        .canonical()
     }
 
     /// Materialization keeps original-source judgement. It renews value-proof
@@ -782,30 +968,9 @@ impl<B: BindingAddress> JudgedSlot<B> {
         slot
     }
 
-    pub(crate) fn map_archived_projections<E>(
-        &mut self,
-        mut transform: impl FnMut(
-            &Value<ParserPlaceholder, B>,
-        ) -> Result<Value<ParserPlaceholder, B>, E>,
-    ) {
-        let nodes = self
-            .node_projections
-            .iter()
-            .map(|(id, projection)| {
-                let projection = match projection {
-                    Projection::Pending => Projection::Pending,
-                    Projection::Value(value) => match transform(value) {
-                        Ok(value) => Projection::Value(value),
-                        // A structural handle cannot become a Value. Its old
-                        // archived payload is invalidated; required live access
-                        // to it returns a typed correspondence error.
-                        Err(_) => Projection::Pending,
-                    },
-                };
-                (*id, projection)
-            })
-            .collect();
-        self.node_projections = Arc::new(nodes);
+    /// Substitution installs its live value at the producer. Decisions already
+    /// taken by lowering remain immutable; expansion adds its own decisions.
+    pub(crate) fn invalidate_judgement(&mut self) {
         self.generation = ProjectionGeneration::fresh();
         self.snapshot = Arc::new(ExpressionReport::empty());
     }
@@ -829,12 +994,91 @@ impl<B: BindingAddress> JudgedSlot<B> {
     }
 }
 
-/// Per-use completeness, including definition uses hidden by a projection.
+/// Ordinary compatibility checks have no authority to reach these slots.
+#[derive(Debug, Clone)]
+pub struct NoAuthoredEvidence {
+    resource: crate::resource::ResourceId,
+    slots: Vec<UnreachedSlot>,
+}
+
+impl NoAuthoredEvidence {
+    /// Identify unchecked source slots without granting admission authority.
+    /// The evidence owner may differ from the resource whose values are checked.
+    pub fn for_resource<B: BindingAddress, D>(
+        source: &crate::parser::AnalysisResourceRef<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        let resource = source.id();
+        let slots = source.authored_slots();
+        Self {
+            resource: resource.clone(),
+            slots: slots
+                .into_iter()
+                .flat_map(|slots| slots.slots.iter())
+                .map(|(name, slot)| {
+                    let root =
+                        authored_chain(slot.root.as_ref()).fold(slot.root.as_ref(), |_, node| node);
+                    UnreachedSlot {
+                        resource: resource.clone(),
+                        attribute: name.clone(),
+                        node: root.id,
+                        occurrence: slot.occurrence,
+                        instance: slot.instance,
+                        generation: slot.generation,
+                    }
+                })
+                .collect(),
+        }
+    }
+    pub fn resource_id(&self) -> &crate::resource::ResourceId {
+        &self.resource
+    }
+    pub fn slots(&self) -> &[UnreachedSlot] {
+        &self.slots
+    }
+}
+
+/// A real authored slot whose ordinary report-based check supplied no cursor.
+/// It carries identity, never a fabricated judgement or authored proof.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UnreachedSlot {
+    resource: crate::resource::ResourceId,
+    attribute: String,
+    node: NodeId,
+    occurrence: UseId,
+    instance: ExpansionInstanceId,
+    generation: ProjectionGeneration,
+}
+impl UnreachedSlot {
+    pub fn resource_id(&self) -> &crate::resource::ResourceId {
+        &self.resource
+    }
+    pub fn attribute(&self) -> &str {
+        &self.attribute
+    }
+    pub fn node_id(&self) -> NodeId {
+        self.node
+    }
+    pub fn occurrence(&self) -> UseId {
+        self.occurrence
+    }
+    pub fn instance(&self) -> ExpansionInstanceId {
+        self.instance
+    }
+    pub fn generation(&self) -> ProjectionGeneration {
+        self.generation
+    }
+}
+
+/// Per-use completeness, including unavailable authored slot evidence.
 #[derive(Debug)]
 pub struct CompletenessReport<'s, B: BindingAddress = RelativeBindingName> {
     unreached: Vec<AuthoredUse<'s, B>>,
     work: usize,
     missing: Vec<MissingEvidence>,
+    unreached_slots: Vec<UnreachedSlot>,
 }
 
 impl<'s, B: BindingAddress> CompletenessReport<'s, B> {
@@ -845,6 +1089,12 @@ impl<'s, B: BindingAddress> CompletenessReport<'s, B> {
 
     pub fn correspondence_errors(&self) -> &[MissingEvidence] {
         &self.missing
+    }
+
+    /// Slots checked only through main's ordinary report path. These remain
+    /// unreached even when this report has no judgement for their source tree.
+    pub fn unreached_slots(&self) -> impl Iterator<Item = &UnreachedSlot> {
+        self.unreached_slots.iter()
     }
 
     /// The predicate inspects retained syntax; it does not classify a Value.
@@ -872,6 +1122,7 @@ impl<B: BindingAddress> ExpressionReport<B> {
             )>,
             report: &mut CompletenessReport<'s, B>,
         ) -> Result<(), MissingEvidence> {
+            let usage = usage.canonical()?;
             if !seen.insert((
                 usage.node.node.id,
                 usage.occurrence,
@@ -907,7 +1158,12 @@ impl<B: BindingAddress> ExpressionReport<B> {
                 _ => usage.edge,
             };
             for index in 0..usage.child_count() {
-                visit(usage.child(index, role)?, coverage, seen, report)?;
+                let child = if matches!(usage.navigation()?, AuthoredNavigation::Parts) {
+                    usage.part(index)?
+                } else {
+                    usage.child(index, role)?
+                };
+                visit(child, coverage, seen, report)?;
             }
             Ok(())
         }
@@ -915,14 +1171,12 @@ impl<B: BindingAddress> ExpressionReport<B> {
             unreached: Vec::new(),
             work: 0,
             missing: Vec::new(),
+            unreached_slots: coverage.unreached_slots().cloned().collect(),
         };
         let mut seen = Default::default();
         for root in self.use_roots.iter() {
             // A let initializer is not a qualifying use. Once a real slot use
             // reaches it, completeness is decided by each reference edge.
-            if root.definition && coverage.has_node(root.node.id, &root.environment) {
-                continue;
-            }
             let Some(judgement) = self.node(&root.environment, root.node.id) else {
                 report.missing.push(MissingEvidence::new(format!(
                     "completeness node {:?}",
@@ -938,7 +1192,7 @@ impl<B: BindingAddress> ExpressionReport<B> {
                     generation: coverage
                         .current_generation(root.occurrence, root.instance)
                         .map_or(root.generation, |current| root.generation.latest(current)),
-                    projections: &root.projections,
+                    conditions: &root.conditions,
                     environment: root.environment.clone(),
                 },
                 occurrence: root.occurrence,
@@ -946,6 +1200,16 @@ impl<B: BindingAddress> ExpressionReport<B> {
                 edge: EdgeRole::SlotRoot,
                 visit: ProjectionVisit::Value,
             };
+            let usage = match usage.canonical() {
+                Ok(usage) => usage,
+                Err(error) => {
+                    report.missing.push(error);
+                    continue;
+                }
+            };
+            if root.definition && coverage.has_node(usage.node.node.id, &root.environment) {
+                continue;
+            }
             if let Err(error) = visit(usage, coverage, &mut seen, &mut report) {
                 report.missing.push(error);
             }
@@ -986,6 +1250,13 @@ impl<B: BindingAddress> Default for AuthoredSlots<B> {
     }
 }
 impl<B: BindingAddress> AuthoredSlots<B> {
+    #[cfg(test)]
+    pub(crate) fn unbind_alias_for_test(&mut self, canonical: &str, authored: &str) {
+        let slot = self.slots.shift_remove(canonical).unwrap();
+        self.slots.insert(authored.to_owned(), slot);
+        self.aliases.clear();
+    }
+
     pub fn declaration_id(&self) -> Option<&SlotDeclarationId> {
         self.declaration.as_ref()
     }
@@ -1019,7 +1290,7 @@ impl<B: BindingAddress> AuthoredSlots<B> {
             generation: slot.generation,
             definition: false,
             environment: slot.snapshot.instance.clone(),
-            projections: slot.node_projections.clone(),
+            conditions: slot.conditions.clone(),
         })
     }
 
@@ -1039,16 +1310,24 @@ impl<B: BindingAddress> AuthoredSlots<B> {
             }
         }
     }
+    fn authored_name<'n>(
+        slots: &indexmap::IndexMap<String, JudgedSlot<B>>,
+        aliases: &'n std::collections::HashMap<String, String>,
+        name: &'n str,
+    ) -> &'n str {
+        if slots.contains_key(name) {
+            name
+        } else {
+            aliases.get(name).map(String::as_str).unwrap_or(name)
+        }
+    }
+
     pub(crate) fn synchronize(
         &mut self,
         attributes: &indexmap::IndexMap<String, Value<ParserPlaceholder, B>>,
     ) {
         for (name, value) in attributes {
-            let authored = if self.slots.contains_key(name) {
-                name
-            } else {
-                self.aliases.get(name).unwrap_or(name)
-            };
+            let authored = Self::authored_name(&self.slots, &self.aliases, name);
             if let Some(slot) = self.slots.get_mut(authored)
                 && slot.projection() != Some(value)
             {
@@ -1062,13 +1341,15 @@ impl<B: BindingAddress> AuthoredSlots<B> {
         snapshot: Result<Arc<ExpressionReport<B>>, MissingEvidence>,
     ) {
         for slot in self.slots.values_mut() {
-            // A live association failure remains a typed error at cursor().
-            match &snapshot {
-                Ok(snapshot) => {
-                    let _ = slot.attach_snapshot(snapshot.clone());
+            // Keep the exact typed attachment outcome. A failed association
+            // cannot silently turn into an empty "judged" snapshot.
+            slot.snapshot_error = match &snapshot {
+                Ok(snapshot) => slot.attach_snapshot(snapshot.clone()).err(),
+                Err(error) => {
+                    slot.snapshot = Arc::new(ExpressionReport::empty());
+                    Some(error.clone())
                 }
-                Err(_) => slot.snapshot = Arc::new(ExpressionReport::empty()),
-            }
+            };
         }
     }
     pub(crate) fn reinstance(&mut self) {
@@ -1099,10 +1380,7 @@ impl<B: BindingAddress> AuthoredSlots<B> {
                 .slots
                 .into_iter()
                 .map(|(name, slot)| {
-                    let projection = match slot.projection {
-                        Projection::Pending => Projection::Pending,
-                        Projection::Value(value) => Projection::Value(value.map_bindings(map)),
-                    };
+                    let projection = slot.projection.map_bindings(map);
                     let expression = super::ExprValue {
                         authored: slot.root,
                         payload: Projection::Pending,
@@ -1117,52 +1395,27 @@ impl<B: BindingAddress> AuthoredSlots<B> {
                             instance: slot.instance,
                             generation: ProjectionGeneration::fresh(),
                             snapshot: Arc::new(ExpressionReport::empty()),
+                            snapshot_error: None,
                             schema_kind: slot.schema_kind,
-                            node_projections: Arc::new(
-                                slot.node_projections
-                                    .iter()
-                                    .map(|(id, value)| {
-                                        (
-                                            *id,
-                                            match value {
-                                                Projection::Pending => Projection::Pending,
-                                                Projection::Value(value) => Projection::Value(
-                                                    value.clone().map_bindings(map),
-                                                ),
-                                            },
-                                        )
-                                    })
-                                    .collect(),
-                            ),
+                            conditions: slot.conditions,
                         },
                     )
                 })
                 .collect(),
         }
     }
-    pub(crate) fn record_condition_selections(
-        &mut self,
-        selected: &std::collections::HashMap<NodeId, bool>,
-    ) {
-        for slot in self.slots.values_mut() {
-            for (id, projection) in Arc::make_mut(&mut slot.node_projections) {
-                if let Some(value) = selected.get(id) {
-                    *projection = Projection::Value(Value::Concrete(
-                        crate::resource::ConcreteValue::Bool(*value),
-                    ));
-                }
-            }
+    pub(crate) fn record_condition_selections(&mut self, selected: &super::ConditionRecorder) {
+        // The expansion's immutable version includes newly decided nodes,
+        // even when their parse-time projections were unavailable. Slots share
+        // that store and retain their original parser decisions underneath it.
+        let selected = selected.snapshot();
+        if selected.version == 0 {
+            return;
         }
-    }
-    pub(crate) fn replace_expanded_projections(
-        &mut self,
-        attributes: &indexmap::IndexMap<String, Value<crate::resource::NoPlaceholder, B>>,
-    ) {
-        let attributes = attributes
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone().into_placeholder_type()))
-            .collect();
-        self.synchronize(&attributes);
+        for slot in self.slots.values_mut() {
+            slot.conditions = selected.over(&slot.conditions);
+            slot.generation = ProjectionGeneration::fresh();
+        }
     }
 
     pub(crate) fn replace_projections(
@@ -1171,11 +1424,7 @@ impl<B: BindingAddress> AuthoredSlots<B> {
     ) {
         let mut updated = std::collections::HashSet::new();
         for (name, value) in attributes {
-            let authored = if self.slots.contains_key(name) {
-                name
-            } else {
-                self.aliases.get(name).unwrap_or(name)
-            };
+            let authored = Self::authored_name(&self.slots, &self.aliases, name);
             if let Some(slot) = self.slots.get_mut(authored) {
                 updated.insert(slot.occurrence);
                 slot.replace_projection(value.clone());
@@ -1196,54 +1445,13 @@ impl AuthoredSlots {
     pub(in crate::parser) fn insert(
         &mut self,
         name: String,
-        sink: SinkExpression,
-        kind: crate::schema::SchemaKind,
-        instance: ExpansionInstanceId,
-        projections: std::collections::HashMap<
-            NodeId,
-            Value<ParserPlaceholder, RelativeBindingName>,
-        >,
-    ) {
-        self.insert_slot(
-            name,
-            JudgedSlot::from_sink(sink, kind, instance),
-            projections,
-        );
-    }
-
-    pub(in crate::parser) fn insert_container(
-        &mut self,
-        name: String,
         expression: super::ExprValue,
         kind: crate::schema::SchemaKind,
         instance: ExpansionInstanceId,
-        projections: std::collections::HashMap<
-            NodeId,
-            Value<ParserPlaceholder, RelativeBindingName>,
-        >,
+        conditions: ConditionSnapshot,
     ) {
-        self.insert_slot(
-            name,
-            JudgedSlot::from_expression(expression, kind, instance),
-            projections,
-        );
-    }
-
-    fn insert_slot(
-        &mut self,
-        name: String,
-        mut slot: JudgedSlot,
-        projections: std::collections::HashMap<
-            NodeId,
-            Value<ParserPlaceholder, RelativeBindingName>,
-        >,
-    ) {
-        slot.node_projections = Arc::new(
-            projections
-                .into_iter()
-                .map(|(id, value)| (id, Projection::Value(value)))
-                .collect(),
-        );
+        let mut slot = JudgedSlot::from_expression(expression, kind, instance);
+        slot.conditions = conditions;
         self.slots.insert(name, slot);
     }
 }

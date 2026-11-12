@@ -564,7 +564,9 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
                 &resources_for_plan,
             ),
             data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &remote_bindings,
+            remote_bindings: &carina_core::upstream_exports::remote_bindings_for_test(
+                remote_bindings.clone(),
+            ),
             wait_aliases: &wait_aliases,
         },
     );
@@ -599,7 +601,9 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
                     &resource_origins,
                 ),
                 data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
-                remote_bindings: &remote_bindings,
+                remote_bindings: &carina_core::upstream_exports::remote_bindings_for_test(
+                    remote_bindings.clone(),
+                ),
                 wait_aliases: &wait_aliases,
             },
             &HashMap::new(),

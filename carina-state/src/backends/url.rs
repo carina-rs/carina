@@ -187,11 +187,10 @@ pub async fn load_state_from_url(url: &StateUrl) -> BackendResult<StateFile> {
         .ok_or_else(|| BackendError::InvalidState(format!("No state at {}", url.display_target())))
 }
 
-/// Load published exports from a parsed `--state-url` without decoding
-/// resource rows or applying the full state-format version gate.
-///
-/// Returns an error if the URL resolves to a missing object or file.
-pub async fn load_published_exports_from_url(url: &StateUrl) -> BackendResult<PublishedExports> {
+/// Load export JSON for display while preserving nulls and encoded values.
+pub async fn load_encoded_published_exports_from_url(
+    url: &StateUrl,
+) -> BackendResult<PublishedExports> {
     let loaded = BackendSelection::explicit_url(url)
         .read_published_exports()
         .await?;
@@ -439,7 +438,9 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
 
         let url = StateUrl::parse(path.to_str().unwrap()).unwrap();
-        let error = load_published_exports_from_url(&url).await.unwrap_err();
+        let error = load_encoded_published_exports_from_url(&url)
+            .await
+            .unwrap_err();
 
         assert!(error.to_string().contains(&path.display().to_string()));
         assert!(error.to_string().contains("Please upgrade Carina"));
@@ -462,7 +463,7 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
 
         let url = StateUrl::parse(path.to_str().unwrap()).unwrap();
-        let error = load_published_exports_from_url(&url)
+        let error = load_encoded_published_exports_from_url(&url)
             .await
             .unwrap_err()
             .to_string();

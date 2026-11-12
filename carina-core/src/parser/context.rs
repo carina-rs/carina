@@ -238,6 +238,15 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         }
     }
 
+    pub(super) fn record_selected_condition(
+        &self,
+        token: &pest::iterators::Pair<'_, Rule>,
+        selected: bool,
+    ) {
+        self.authored_nodes
+            .record_selected_condition(token, selected);
+    }
+
     pub(super) fn set_authored_nodes(&mut self, nodes: Arc<super::retained::CapturedNodes>) {
         self.authored_nodes = nodes;
     }

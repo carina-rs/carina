@@ -36,6 +36,7 @@ use carina_core::resource::{
 #[cfg(test)]
 use carina_core::resource::{ConcreteValue, State};
 use carina_core::shutdown::ShutdownToken;
+use carina_core::upstream_exports::AdmittedRemoteBindings;
 use carina_core::value::{RenderedKey, render_value};
 use carina_state::{BackendLock, LockInfo, RowBasis, StateBackend, StateFile};
 
@@ -946,32 +947,66 @@ async fn execute_rehydrated_saved_plan(
 /// succeed and silently mixing plan-time and apply-time values
 /// produces incorrect cascade re-resolution.
 async fn verify_upstream_snapshot(
-    runtime: &crate::runtime::CommandRuntime,
+    wiring: &crate::wiring::WiringContext,
     sources: &[crate::commands::plan::UpstreamSource],
     snapshot: &HashMap<String, HashMap<String, Value>>,
     project_dir: &ResolvedPath,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
-    let upstream_states: Vec<ExpandedUpstreamState> = sources
-        .iter()
-        .map(|s| ExpandedUpstreamState {
-            binding: s.binding.clone(),
-            source: s.source.clone(),
-        })
-        .collect();
-    let provider_context = ProviderContext::new(runtime.environment().clone());
+    let provider_context = wiring.provider_context().as_provider_context();
     let mut cycle_guard = super::plan::seed_cycle_guard(project_dir);
-    let current = super::plan::load_upstream_states(
-        runtime,
-        &upstream_states,
-        project_dir,
-        &provider_context,
-        &mut cycle_guard,
-        super::plan::UpstreamMissingStatePolicy::Strict,
-    )
-    .await?;
-
+    let mut current = HashMap::new();
+    for source in sources {
+        let state = ExpandedUpstreamState {
+            binding: source.binding.clone(),
+            source: source.source.clone(),
+        };
+        let loaded = super::plan::load_selected_upstream_states(
+            wiring.runtime(),
+            std::slice::from_ref(&state),
+            project_dir,
+            provider_context,
+            &mut cycle_guard,
+            wiring.schemas(),
+            super::plan::UpstreamMissingStatePolicy::Strict,
+            None,
+        )
+        .await
+        .map_err(|error| {
+            classify_upstream_snapshot_error(source.binding.as_str(), apply_target, error)
+        })?;
+        current.extend(loaded);
+    }
     diff_upstream_snapshot(snapshot, &current, apply_target).map_err(AppError::Config)
+}
+
+pub(crate) fn classify_upstream_snapshot_error(
+    binding: &str,
+    apply_target: ApplyTarget<'_>,
+    error: crate::error::UpstreamLoadFailure,
+) -> AppError {
+    match error {
+        error @ crate::error::UpstreamLoadFailure::Admission { .. } => {
+            AppError::UpstreamSnapshotChanged(Box::new(
+                crate::error::UpstreamSnapshotChangedError {
+                    message: upstream_snapshot_drift(binding, apply_target),
+                    error: error.into(),
+                },
+            ))
+        }
+        crate::error::UpstreamLoadFailure::DroppedSavedKeys => {
+            AppError::Config(upstream_snapshot_drift(binding, apply_target))
+        }
+        crate::error::UpstreamLoadFailure::Other(error) => *error,
+    }
+}
+
+pub(crate) fn upstream_snapshot_drift(binding: &str, apply_target: ApplyTarget<'_>) -> String {
+    format!(
+        "upstream_state '{}' has drifted since the plan was created. Re-run `{}` so the apply uses the values it was computed against.",
+        binding,
+        apply_target.replan_command()
+    )
 }
 
 /// Pure comparison between a planned snapshot and a freshly-loaded
@@ -982,7 +1017,7 @@ async fn verify_upstream_snapshot(
 /// Split out so it can be unit-tested without a real upstream backend.
 fn diff_upstream_snapshot(
     snapshot: &HashMap<String, HashMap<String, Value>>,
-    current: &HashMap<String, HashMap<String, Value>>,
+    current: &AdmittedRemoteBindings,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), String> {
     for (binding, planned_attrs) in snapshot {
@@ -995,13 +1030,8 @@ fn diff_upstream_snapshot(
                     apply_target.replan_command()
                 ));
             }
-            Some(current_attrs) if current_attrs != planned_attrs => {
-                return Err(format!(
-                    "upstream_state '{}' has drifted since the plan was created. \
-                     Re-run `{}` so the apply uses the values it was computed against.",
-                    binding,
-                    apply_target.replan_command()
-                ));
+            Some(current_attrs) if &**current_attrs != planned_attrs => {
+                return Err(upstream_snapshot_drift(binding, apply_target));
             }
             Some(_) => {}
         }
@@ -1022,6 +1052,90 @@ fn diff_upstream_snapshot(
 #[cfg(test)]
 mod upstream_snapshot_tests {
     use super::*;
+    use carina_core::upstream_exports::remote_bindings_for_test;
+
+    #[test]
+    fn round2_4_wrapped_admission_failure_remains_drift() {
+        let admission = carina_core::upstream_exports::UpstreamExportAdmissionError::Decode {
+            binding: "orgs".into(),
+            key: "count".into(),
+            error: carina_core::value::PersistedValueDecodeError::NestedExportNull,
+        };
+        let error = crate::error::UpstreamLoadFailure::Admission {
+            error: Box::new(admission),
+            diagnostics: vec!["diagnostic-marker".into()],
+        };
+        let error =
+            classify_upstream_snapshot_error("orgs", ApplyTarget::Project(Path::new(".")), error);
+        assert!(
+            matches!(error, AppError::UpstreamSnapshotChanged(_)),
+            "{error:?}"
+        );
+        let text = crate::error::format_error_with_source_chain(&error);
+        assert!(
+            text.contains("diagnostic-marker") && text.contains("orgs.count"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn round2_4_backend_failure_with_diagnostics_is_not_drift() {
+        let error = AppError::TypeCheckDiagnostics(Box::new(crate::error::TypeCheckDiagnostics {
+            error: AppError::Backend(carina_state::BackendError::Io("read-marker".into())),
+            diagnostics: "diagnostic-marker".into(),
+        }));
+        let error = classify_upstream_snapshot_error(
+            "orgs",
+            ApplyTarget::Project(Path::new(".")),
+            crate::error::UpstreamLoadFailure::Other(Box::new(error)),
+        );
+        assert!(
+            matches!(error, AppError::TypeCheckDiagnostics(_)),
+            "{error:?}"
+        );
+        let text = crate::error::format_error_with_source_chain(&error);
+        assert!(
+            !text.contains("drifted")
+                && text.contains("read-marker")
+                && text.contains("diagnostic-marker"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn round1_5_upstream_backend_read_failure_is_not_drift() {
+        let root = tempfile::tempdir().unwrap();
+        let upstream = root.path().join("upstream");
+        std::fs::create_dir(&upstream).unwrap();
+        std::fs::write(upstream.join("main.crn"), "exports { count: Int = 7 }\n").unwrap();
+        std::fs::write(
+            upstream.join("backend.crn"),
+            "backend local { path = 'carina.state.json' }\n",
+        )
+        .unwrap();
+        std::fs::create_dir(upstream.join("carina.state.json")).unwrap();
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let wiring = crate::wiring::WiringContext::new_for_test(&runtime, vec![], &[]);
+        let sources = [crate::commands::plan::UpstreamSource {
+            binding: carina_core::resource::absolute_binding_address_for_test("orgs"),
+            source: "upstream".into(),
+        }];
+        let error = verify_upstream_snapshot(
+            &wiring,
+            &sources,
+            &HashMap::new(),
+            &ResolvedPath::new(root.path()).unwrap(),
+            ApplyTarget::Project(root.path()),
+        )
+        .await
+        .unwrap_err();
+        let message = crate::error::format_error_with_source_chain(&error);
+        assert!(
+            !message.contains("drifted"),
+            "read failures are not drift: {message}"
+        );
+        assert!(matches!(error, AppError::Backend(_)), "{error:?}");
+    }
 
     fn binding(name: &str, attrs: &[(&str, &str)]) -> (String, HashMap<String, Value>) {
         let map = attrs
@@ -1042,7 +1156,7 @@ mod upstream_snapshot_tests {
             vec![binding("network", &[("vpc_id", "vpc-A")])]
                 .into_iter()
                 .collect();
-        let current = snapshot.clone();
+        let current = remote_bindings_for_test(snapshot.clone());
         assert!(
             diff_upstream_snapshot(&snapshot, &current, ApplyTarget::Project(Path::new(".")))
                 .is_ok()
@@ -1058,10 +1172,11 @@ mod upstream_snapshot_tests {
             vec![binding("network", &[("vpc_id", "vpc-A")])]
                 .into_iter()
                 .collect();
-        let current: HashMap<String, HashMap<String, Value>> =
+        let current = remote_bindings_for_test(
             vec![binding("network", &[("vpc_id", "vpc-B")])]
                 .into_iter()
-                .collect();
+                .collect(),
+        );
         let err = diff_upstream_snapshot(&snapshot, &current, ApplyTarget::Project(Path::new(".")))
             .expect_err("must fail");
         assert!(
@@ -1077,7 +1192,7 @@ mod upstream_snapshot_tests {
             vec![binding("network", &[("vpc_id", "vpc-A")])]
                 .into_iter()
                 .collect();
-        let current: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let current = remote_bindings_for_test(HashMap::new());
         let err = diff_upstream_snapshot(&snapshot, &current, ApplyTarget::Project(Path::new(".")))
             .expect_err("must fail");
         assert!(err.contains("missing now"), "got: {err}");
@@ -1086,10 +1201,11 @@ mod upstream_snapshot_tests {
     #[test]
     fn binding_appeared_fails() {
         let snapshot: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        let current: HashMap<String, HashMap<String, Value>> =
+        let current = remote_bindings_for_test(
             vec![binding("network", &[("vpc_id", "vpc-A")])]
                 .into_iter()
-                .collect();
+                .collect(),
+        );
         let err = diff_upstream_snapshot(&snapshot, &current, ApplyTarget::Project(Path::new(".")))
             .expect_err("must fail");
         assert!(err.contains("added since"), "got: {err}");
@@ -1098,8 +1214,9 @@ mod upstream_snapshot_tests {
     #[test]
     fn empty_both_sides_passes() {
         let empty: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let current = remote_bindings_for_test(HashMap::new());
         assert!(
-            diff_upstream_snapshot(&empty, &empty, ApplyTarget::Project(Path::new("."))).is_ok()
+            diff_upstream_snapshot(&empty, &current, ApplyTarget::Project(Path::new("."))).is_ok()
         );
     }
 }
@@ -1908,7 +2025,11 @@ async fn run_apply_with_observer_factory(
                     runtime,
                     validated_config.resources().parsed(),
                     base_dir,
-                    provider_context,
+                    &validated_config
+                        .context()
+                        .provider_context()
+                        .with_runtime(provider_context),
+                    validated_config.context().schemas(),
                 )
                 .await?;
                 let (bucket_provider, bucket_normalizer) = create_state_bucket_bootstrap_provider(
@@ -2140,12 +2261,14 @@ async fn load_apply_provider_inputs<E>(
     parsed: &carina_core::parser::ExpandedFile<E>,
     base_dir: &ResolvedPath,
     provider_context: &ProviderContext,
+    schemas: &carina_core::schema::SchemaRegistry,
 ) -> Result<ResolvedProviderInputs, AppError> {
     load_and_resolve_provider_configs(
         runtime,
         parsed,
         base_dir,
         provider_context,
+        schemas,
         UpstreamMissingStatePolicy::Strict,
         ProviderUpstreamScope::All,
     )
@@ -2309,7 +2432,11 @@ async fn run_apply_locked_owned(
                 validated_config.context().runtime(),
                 parsed,
                 project_dir,
-                provider_context,
+                &validated_config
+                    .context()
+                    .provider_context()
+                    .with_runtime(provider_context),
+                validated_config.context().schemas(),
             )
             .await?;
             let provider_configs = provider_inputs.configs();
@@ -4174,6 +4301,13 @@ async fn run_apply_from_plan_locked_owned(
                 })?;
             let plan = checked_plan_file.plan();
 
+            // Admit upstream values before any migration write or binding installation.
+            let upstream_snapshot = super::plan::admit_saved_upstream_snapshot(
+                wiring.runtime(), rehydrated_plan_file.upstream_sources(), source,
+                wiring.provider_context().as_provider_context(), wiring.schemas(),
+                rehydrated_plan_file.upstream_snapshot(), apply_target,
+            )?;
+
             // Persist migrations only after successful re-admission, using
             // the heartbeat's serialized lock owner.
             if (pending_migration.is_some() || removed_legacy_data_source_rows)
@@ -4190,7 +4324,6 @@ async fn run_apply_from_plan_locked_owned(
                 .map_err(|error| AppError::Config(error.to_string()))?;
             // Use the same saved binding view for the state-only fast path
             // and executor, including compositions, reads and wait aliases.
-            let upstream_snapshot = rehydrated_plan_file.upstream_snapshot().clone();
             let pre_apply_input_current = carina_core::resource::into_plan_input_current_map(
                 managed_current.clone(),
                 wiring.schemas(),
@@ -4334,9 +4467,9 @@ async fn run_apply_from_plan_locked_owned(
             // plan-time and apply-time values during cascade re-resolution.
             if !rehydrated_plan_file.upstream_sources().is_empty() {
                 verify_upstream_snapshot(
-                    wiring.runtime(),
+                    wiring,
                     rehydrated_plan_file.upstream_sources(),
-                    &upstream_snapshot,
+                    rehydrated_plan_file.upstream_snapshot(),
                     source,
                     apply_target,
                 )
