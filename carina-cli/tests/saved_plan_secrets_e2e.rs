@@ -7,6 +7,7 @@ use std::process::{Command, Output};
 use serde_json::Value;
 use tempfile::TempDir;
 
+use carina_core::hint::ProjectCommand;
 use carina_core::resource::{
     ConcreteValue, DeferredValue, ExpandedValue as CoreValue, RedactedSecretHash,
 };
@@ -54,7 +55,13 @@ fn saved_plan_rejects_legacy_or_interpolated_constraint_strings_before_apply() {
         let decode =
             serde_json::from_value::<carina_cli::commands::plan::PlanFile>(document.clone())
                 .unwrap_err();
-        assert!(decode.to_string().contains("re-run `carina plan --out`"));
+        // The plan reader retains JSON coordinates, but has no project command.
+        assert!(
+            decode
+                .to_string()
+                .starts_with("invalid validation string literal")
+        );
+        assert!(!decode.to_string().contains("carina"));
         assert!(!format!("{decode:?} {decode}").contains("CANARY_4386"));
         fs::write(
             scenario.project.join("plan.json"),
@@ -65,7 +72,13 @@ fn saved_plan_rejects_legacy_or_interpolated_constraint_strings_before_apply() {
         let rendered = output_text(&output);
         assert!(!output.status.success());
         assert!(rendered.contains(expected), "{rendered}");
-        assert!(rendered.contains("carina plan --out"), "{rendered}");
+        let command = ProjectCommand::new("plan --out", &scenario.project)
+            .with_path_argument(Path::new("plan.json"))
+            .to_string();
+        assert!(
+            rendered.contains(&format!("Re-run `{command}`")),
+            "{rendered}"
+        );
         assert!(!rendered.contains("CANARY_4386"));
         assert_eq!(
             fs::read(scenario.project.join("carina.state.json")).ok(),

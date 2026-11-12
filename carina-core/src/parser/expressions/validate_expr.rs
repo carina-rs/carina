@@ -35,6 +35,8 @@ impl std::fmt::Display for ConstraintStringPosition {
 /// The saved form retains quotes and escapes: the raw contents alone cannot
 /// distinguish a single-quoted literal from an old, unevaluated interpolation.
 /// Decoding repeats the same grammar check as live parsing.
+/// Decode errors describe only the literal problem; the saved-plan CLI supplies
+/// recovery commands using the recorded project path.
 ///
 /// ```compile_fail
 /// use carina_core::parser::ValidateStringLiteral;
@@ -126,11 +128,8 @@ impl serde::Serialize for ValidateStringLiteral {
 impl<'de> serde::Deserialize<'de> for ValidateStringLiteral {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let source = String::deserialize(deserializer)?;
-        Self::from_source(&source).map_err(|_| {
-            serde::de::Error::custom(
-                "invalid validation string literal; re-run `carina plan --out`",
-            )
-        })
+        Self::from_source(&source)
+            .map_err(|_| serde::de::Error::custom("invalid validation string literal"))
     }
 }
 
@@ -469,7 +468,7 @@ mod tests {
         ] {
             let wire = serde_json::json!({"String": source});
             let error = serde_json::from_value::<crate::parser::ValidateExpr>(wire).unwrap_err();
-            assert!(error.to_string().contains("re-run `carina plan --out`"));
+            assert_eq!(error.to_string(), "invalid validation string literal");
             assert!(!format!("{error:?} {error}").contains("CANARY_4386"));
         }
     }

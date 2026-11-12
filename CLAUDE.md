@@ -660,6 +660,9 @@ A struct type represents a nested object with typed fields.
   `pending_constraints` contain `ValidateExpr` values, not retained types.
   Condition strings, `require` messages, and wait RHS strings retain checked
   quoted source so decoding can reject interpolation.
+  Core literal and wait-operand decode errors state only the problem; the
+  saved-plan CLI renders recovery commands with `hint::ProjectCommand`, using
+  the recorded project path and supplied plan-file path.
   Replay reloads refinement layers from fingerprint-checked provider schemas.
   Every typed sink uses the same String/Int identity-admission rule for
   equal identities and allowed widenings (#4349), including annotations,

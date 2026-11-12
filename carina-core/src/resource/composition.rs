@@ -2176,7 +2176,7 @@ mod tests {
                 "require messages must retain literal proof through serde"
             );
             let error = result.unwrap_err();
-            assert!(error.to_string().contains("re-run `carina plan --out`"));
+            assert_eq!(error.to_string(), "invalid validation string literal");
             assert!(!format!("{error} {error:?}").contains("CANARY_4386"));
         }
     }

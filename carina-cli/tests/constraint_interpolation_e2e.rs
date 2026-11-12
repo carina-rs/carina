@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 
+use carina_core::hint::ProjectCommand;
 use carina_core::provider::loaded_provider_snapshot_from_factories;
 use carina_core::schema::SchemaRegistry;
 use carina_lsp::{diagnostics::DiagnosticEngine, document::Document};
@@ -15,6 +16,78 @@ use tower_lsp::lsp_types::{Position, Range};
 
 const CANARY: &str = "CANARY_4386";
 const INTERPOLATION: &str = "${secret('CANARY_4386')}";
+
+#[test]
+fn round3_decode_hints_preserve_project_and_plan_paths() {
+    let fixture = Fixture::new_named(
+        "let w = wait vpc { until = vpc.identifier == 'vpc-id' }\nmock.test.resource { name = 'consumer' parent = w.identifier }\n",
+        Some("arguments { r: mock.test.resource }\nrequire r.identifier != 'x', 'safe message'\n"),
+        "project with spaces",
+    );
+    assert!(
+        fixture
+            .run(&["plan", "--out", "saved plan.json", "."])
+            .status
+            .success()
+    );
+    fixture.assert_no_written_canary();
+    let plan_path = fixture.project.join("saved plan.json");
+    let original: Value = serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
+    let index = original["plan"]["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|effect| effect.get("Wait").is_some())
+        .unwrap();
+    let command = ProjectCommand::new("plan --out", &fixture.project)
+        .with_path_argument(&plan_path)
+        .to_string();
+    let paths = [
+        fixture.project.join("carina.state.json"),
+        fixture.home.join("mock-state.json"),
+    ];
+    let state_before = paths.each_ref().map(|path| fs::read(path).ok());
+    for (pointer, value, problem) in [
+        (
+            "/compositions/0/pending_constraints/0/expression/Compare/rhs/String".to_string(),
+            json!(INTERPOLATION),
+            "invalid validation string literal",
+        ),
+        (
+            "/compositions/0/pending_constraints/0/message".to_string(),
+            json!(INTERPOLATION),
+            "invalid validation string literal",
+        ),
+        (
+            format!("/plan/effects/{index}/Wait/until/value"),
+            json!({"Map": {"CANARY_4386": {"Interpolation": [{"Literal": INTERPOLATION}]}}}),
+            "invalid wait operand",
+        ),
+    ] {
+        let mut plan = original.clone();
+        *plan.pointer_mut(&pointer).unwrap() = value;
+        fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
+        let apply = fixture.run_from(
+            &fixture.home,
+            &[
+                "apply",
+                "--auto-approve",
+                "--lock=false",
+                plan_path.to_str().unwrap(),
+            ],
+        );
+        assert!(!apply.status.success());
+        let stderr = String::from_utf8(apply.stderr).unwrap();
+        assert!(stderr.contains(&format!("Re-run `{command}`")));
+        assert!(stderr.contains(problem));
+        assert_eq!(
+            stderr.matches("carina plan --out").count(),
+            1,
+            "only the CLI's project-aware command belongs in this error"
+        );
+        assert!(paths.each_ref().map(|path| fs::read(path).ok()) == state_before);
+    }
+}
 
 #[test]
 fn round2_saved_wait_rejects_alternate_value_shapes_before_apply() {
@@ -60,7 +133,10 @@ fn round2_saved_wait_rejects_alternate_value_shapes_before_apply() {
             String::from_utf8_lossy(&apply.stdout),
             String::from_utf8_lossy(&apply.stderr)
         );
-        assert!(output.contains("re-run `carina plan --out`"));
+        let command = ProjectCommand::new("plan --out", &fixture.project)
+            .with_path_argument(Path::new("plan.bin"))
+            .to_string();
+        assert!(output.contains(&format!("Re-run `{command}`")));
         let result = serde_json::from_value::<carina_cli::commands::plan::PlanFile>(plan.clone());
         assert!(
             result.is_err(),
@@ -209,7 +285,13 @@ require r.identifier != 'x', 'safe message'
             "saved require messages must reject unchecked text"
         );
         let error = decoded.unwrap_err();
-        assert!(error.to_string().contains("re-run `carina plan --out`"));
+        // The plan reader retains JSON coordinates, but has no project command.
+        assert!(
+            error
+                .to_string()
+                .starts_with("invalid validation string literal")
+        );
+        assert!(!error.to_string().contains("carina"));
         assert!(!format!("{error} {error:?}").contains(CANARY));
         fs::write(&path, serde_json::to_vec(&object).unwrap()).unwrap();
         assert!(
@@ -247,8 +329,12 @@ fn files(path: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 
 impl Fixture {
     fn new(root: &str, module: Option<&str>) -> Self {
+        Self::new_named(root, module, "project")
+    }
+
+    fn new_named(root: &str, module: Option<&str>, project_name: &str) -> Self {
         let temp = tempfile::tempdir().unwrap();
-        let project = temp.path().join("project");
+        let project = temp.path().join(project_name);
         let home = temp.path().join("home");
         fs::create_dir(&project).unwrap();
         fs::create_dir(&home).unwrap();
@@ -290,10 +376,14 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.run_from(&self.project, args)
+    }
+
+    fn run_from(&self, directory: &Path, args: &[&str]) -> Output {
         let output = Command::new(env!("CARGO_BIN_EXE_carina"))
             .args(args)
-            .current_dir(&self.project)
-            .env("PWD", &self.project)
+            .current_dir(directory)
+            .env("PWD", directory)
             .env("HOME", &self.home)
             .env("CARINA_TEST_HOME", &self.home)
             .env("CARINA_TRUST_RECORD_DIR", self.home.join(".carina/trust"))

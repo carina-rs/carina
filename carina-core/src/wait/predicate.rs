@@ -100,9 +100,9 @@ impl TryFrom<AttrPathSerde> for AttrPath {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WaitPredicateError {
-    #[error("invalid wait operand; re-run `carina plan --out`")]
+    #[error("invalid wait operand")]
     UnsupportedOperand,
-    #[error("wait string requires a checked literal; re-run `carina plan --out`")]
+    #[error("wait string requires a checked literal")]
     UncheckedString,
     #[error("unresolved enum identifier `{identifier}`")]
     UnresolvedEnumIdentifier {
@@ -121,9 +121,9 @@ impl From<std::convert::Infallible> for WaitPredicateError {
 /// both path spelling and remediation text identical.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WaitResolutionError {
-    #[error("invalid wait operand; re-run `carina plan --out`")]
+    #[error("invalid wait operand")]
     UnsupportedOperand,
-    #[error("wait string requires a checked literal; re-run `carina plan --out`")]
+    #[error("wait string requires a checked literal")]
     UncheckedString,
     #[error("invalid predicate attribute path: {0}")]
     InvalidPath(AttrPathError),
@@ -327,7 +327,8 @@ enum WaitOperand {
     Identifier(WaitIdentifier),
 }
 
-const INVALID_WAIT_OPERAND: &str = "invalid wait operand; re-run `carina plan --out`";
+// The core has no project path. Saved-plan callers add scoped recovery guidance.
+const INVALID_WAIT_OPERAND: &str = "invalid wait operand";
 
 /// A resolved scalar wait value, sealed against unresolved enum identifiers,
 /// interpolation, references, secrets, unknowns, and collection values.
@@ -612,7 +613,7 @@ mod tests {
             ] {
                 assert!(result.is_err(), "only closed scalar wait operands may decode");
                 let error = result.unwrap_err();
-                assert!(error.to_string().contains("re-run `carina plan --out`"));
+                assert_eq!(error.to_string(), "invalid wait operand");
                 assert!(!format!("{error} {error:?}").contains("CANARY_4386"));
             }
         }
@@ -674,7 +675,7 @@ mod tests {
                     "wait constructors must reject non-parser shapes"
                 );
                 let error = result.unwrap_err();
-                assert!(error.to_string().contains("re-run `carina plan --out`"));
+                assert_eq!(error.to_string(), "invalid wait operand");
                 assert!(!format!("{error} {error:?}").contains("CANARY_4386"));
             }
         }
@@ -682,12 +683,11 @@ mod tests {
 
     #[test]
     fn round1_wait_decode_rejects_unchecked_or_interpolated_string_sources() {
-        assert!(
-            WaitRhs::<AbsoluteBindingAddress>::try_from(Value::Concrete(ConcreteValue::String(
-                "${secret('CANARY_4386')}".into()
-            ),))
-            .is_err()
-        );
+        let error = WaitRhs::<AbsoluteBindingAddress>::try_from(Value::Concrete(
+            ConcreteValue::String("${secret('CANARY_4386')}".into()),
+        ))
+        .unwrap_err();
+        assert_eq!(error.to_string(), "wait string requires a checked literal");
         for source in [
             "ready",
             "${secret('CANARY_4386')}",
@@ -700,7 +700,7 @@ mod tests {
                 "saved wait strings must carry checked literal source"
             );
             let error = result.unwrap_err();
-            assert!(error.to_string().contains("re-run `carina plan --out`"));
+            assert_eq!(error.to_string(), "invalid wait operand");
             assert!(!format!("{error} {error:?}").contains("CANARY_4386"));
         }
         for source in [

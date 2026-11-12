@@ -71,6 +71,11 @@ and carries complete resolved dependency addresses and the legacy dependency
 migration classification that apply checks against locked state before writing state
 v21. Older plans must be regenerated.
 
+Invalid condition literals, `require` messages, and wait operands are rejected
+before effects run. The error includes a replan command naming the saved-plan
+file and its recorded project directory, with paths quoted when needed. Use
+that command even when applying from a different working directory.
+
 When a saved plan contains secret placeholders, Carina also re-reads and
 evaluates the configuration from the source directory recorded in the plan.
 New saved secret hashes are PHC strings that embed their random salt and
