@@ -53,7 +53,9 @@ mod scalar_constraints;
 mod value_type;
 pub(crate) use resolve::resolve_resource_refs_in_session_unsealed;
 pub use resolve::{
-    AnalysisResolutionError, finalize_provider_configs_for_analysis,
+    AnalysisResolutionError, DEFAULT_TAGS_ATTRIBUTE, PlanPreviewProviderConfigs,
+    PlanProviderConfigurations, ProviderConfiguration, ProviderConfigurations,
+    ReadOnlyProviderConfig, ReadOnlyProviderConfigs, finalize_provider_configs_for_analysis,
     resolve_expanded_provider_unresolved_attributes_for_analysis,
     resolve_provider_unresolved_attributes_for_analysis, resolve_resource_refs_from_analysis,
 };

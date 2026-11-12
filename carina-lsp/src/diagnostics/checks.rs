@@ -730,6 +730,55 @@ impl DiagnosticRun<'_> {
         }
     }
 
+    /// Check expanded values while retaining the authored provider locations.
+    pub(super) fn check_provider_default_tags<B: BindingAddress>(
+        &self,
+        doc: &Document,
+        tree: &carina_core::parser::AnalysisTree<'_>,
+        providers: &[carina_core::parser::ProviderConfig<ParserPlaceholder, B>],
+        bindings: &GenericResolvedBindings<ParserPlaceholder, B>,
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        let upstream = tree
+            .upstream_states()
+            .iter()
+            .map(|upstream| upstream.detail().binding.as_str().to_owned())
+            .collect();
+        for provider in providers {
+            let Some(index) = tree.providers().iter().position(|authored| {
+                authored.name == provider.name && authored.binding == provider.binding
+            }) else {
+                continue;
+            };
+            if let Err(error) =
+                carina_core::parser::ResolvedProviderConfigs::validate_default_tag_knownness(
+                    std::slice::from_ref(provider),
+                    &upstream,
+                    bindings,
+                    self.provider_context,
+                )
+            {
+                for error in error.into_findings() {
+                    let finding = carina_core::parser::Located::new(
+                        tree.provider_attribute_location(
+                            index,
+                            carina_core::parser::DEFAULT_TAGS_ATTRIBUTE,
+                        )
+                        .clone(),
+                        error,
+                    );
+                    diagnostics.extend(render_merged(
+                        doc,
+                        &finding,
+                        DiagnosticSeverity::ERROR,
+                        finding.detail().to_string(),
+                    ));
+                }
+            }
+        }
+        diagnostics
+    }
+
     /// Validate provider configuration using its parser-owned header and keys.
     pub(super) fn check_provider_region(
         &self,

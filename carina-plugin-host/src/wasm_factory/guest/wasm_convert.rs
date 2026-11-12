@@ -2240,16 +2240,16 @@ mod tests {
             async |type_checks| {
                 let bindings = carina_core::binding_index::ResolvedBindings::default();
                 let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-                let schemas = carina_core::test_utils::preparation_schemas(
+                let schemas = carina_core::test_utils::preparation_schemas_with_attributes(
                     &resource.id,
                     carina_core::schema::SchemaKind::Resource,
+                    &resource.attributes,
                 );
-                let context = carina_core::executor::ProviderPreparationContext::new(
+                let context = carina_core::executor::ProviderPreparationContext::for_test(
                     &bindings,
                     &gate,
                     &[],
                     &carina_core::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -5160,8 +5160,8 @@ mod tests {
                 .with_attribute("map", secret(CoreValue::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([("key".into(), CoreValue::Concrete(ConcreteValue::String("value".into())))])))));
             let bindings = carina_core::binding_index::ResolvedBindings::default();
             let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-            let schemas = carina_core::test_utils::preparation_schemas(&resource.id, carina_core::schema::SchemaKind::Resource);
-            let context = carina_core::executor::ProviderPreparationContext::new(&bindings, &gate, &[], &carina_core::provider::NoopNormalizer, &[], &schemas, type_checks);
+            let schemas = carina_core::test_utils::preparation_schemas_with_attributes(&resource.id, carina_core::schema::SchemaKind::Resource, &resource.attributes);
+            let context = carina_core::executor::ProviderPreparationContext::for_test(&bindings, &gate, &[], &carina_core::provider::NoopNormalizer, &schemas, type_checks);
             let request = carina_core::executor::prepare_create_request(resource, &context).await.unwrap();
             let wire = core_to_wit_create_request(&request).res;
             let values: std::collections::HashMap<_, _> = wire.attributes.into_iter().collect();
@@ -5232,6 +5232,9 @@ mod tests {
         schemas.insert(
             "",
             PatternResourceSchema::new("test")
+                .attribute(PatternAttributeSchema::optional("nested", PatternAttributeType::struct_("Nested", vec![
+                    PatternStructField::optional("items", PatternAttributeType::list(PatternAttributeType::string())).build(),
+                ])).build())
                 .attribute(
                     PatternAttributeSchema::optional("top", PatternAttributeType::string())
                         .write_only()
@@ -5246,12 +5249,11 @@ mod tests {
                 .unwrap(),
         );
         let normalizer_boundary = crate::provider_text_fixtures::normalizer("", Box::new(LateSecrets));
-        let context = carina_core::executor::ProviderPreparationContext::new(
+        let context = carina_core::executor::ProviderPreparationContext::for_test(
             &bindings,
             &gate,
             &[],
             &normalizer_boundary,
-            &[],
             &schemas,
  type_checks,
 );
@@ -5363,18 +5365,23 @@ mod tests {
                 .validate()
                 .expect("test schema must be valid"),
         );
+        carina_core::test_utils::complete_fixture_schema(
+            &mut schemas,
+            &resource.id,
+            carina_core::schema::SchemaKind::Resource,
+            &resource.attributes,
+        );
         let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
             std::sync::Arc::new(Vec::new()),
             schemas.clone(),
             carina_core::EnvironmentSnapshot::empty(),
         );
         carina_core::validation::deferred_types::with_session_for_test_async(provider_types.provider_context(), async |type_checks| {
-        let preparation = carina_core::executor::ProviderPreparationContext::new(
+        let preparation = carina_core::executor::ProviderPreparationContext::for_test(
             &bindings,
             &module_gate,
             &[],
             &carina_core::provider::NoopNormalizer,
-            &[],
             &schemas,
             type_checks,
         );

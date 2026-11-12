@@ -122,8 +122,8 @@ use carina_core::module_resolver;
 use carina_core::name_override::{NameOverride, NameOverrideSource};
 use carina_core::parser::{
     ExpandedFile, ExpandedInferredExportParam, ExpandedInferredFile, ExpandedProviderConfig,
-    IntoExpandedExportParam, ProviderConfig, ResolvedProviderConfig, ResolvedProviderConfigs,
-    StateBlock, StateBlockAddress, WarningKind,
+    IntoExpandedExportParam, ProviderConfig, ProviderConfiguration, ProviderConfigurations,
+    ReadOnlyProviderConfigs, ResolvedProviderConfigs, StateBlock, StateBlockAddress, WarningKind,
 };
 #[cfg(test)]
 use carina_core::parser::{MovedAddresses, ParseWarning};
@@ -1245,10 +1245,12 @@ fn validation_report_from<'a>(
         base_dir,
         skip_resource_validation,
         duplicate_declarations,
+        crate::commands::ConfigNameResolution::EvaluatedOnly,
         |parsed, _catalog| Ok(parsed),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validation_report_with<'a, T>(
     context: &'a WiringContext,
     load_errors: &HashMap<String, String>,
@@ -1256,6 +1258,7 @@ fn validation_report_with<'a, T>(
     base_dir: &ResolvedPath,
     skip_resource_validation: bool,
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
+    name_resolution: crate::commands::ConfigNameResolution,
     finish: impl FnOnce(
         carina_core::parser::ModuleResolvedInferredFile,
         &ValidationProviderCatalog<'_>,
@@ -1283,7 +1286,7 @@ fn validation_report_with<'a, T>(
                 load_errors,
                 skip_resource_validation,
                 duplicate_declarations,
-                crate::commands::ConfigNameResolution::EvaluatedOnly,
+                name_resolution,
             );
             let result = match result {
                 Ok(crate::commands::ResolvedConfig::Evaluated { parsed }) => {
@@ -1670,6 +1673,23 @@ impl ProviderLoad {
         )
     }
 
+    /// Validate configuration for read/delete commands without resolving tags
+    /// that cannot reach a desired provider payload.
+    pub fn validate_read_only_config(
+        self,
+        parsed: carina_core::config_loader::InferredRootDirectory,
+        base_dir: &ResolvedPath,
+        duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
+    ) -> Result<ValidatedConfig<ExpandedInferredFile>, AppError> {
+        self.validate_evaluated_config_for(
+            parsed,
+            base_dir,
+            true,
+            duplicate_declarations,
+            crate::commands::ConfigNameResolution::ReadOnly,
+        )
+    }
+
     /// Validate an evaluated config and consume this exact load and file into
     /// one executable owner.
     pub fn validate_evaluated_config(
@@ -1679,6 +1699,23 @@ impl ProviderLoad {
         skip_resource_validation: bool,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<ValidatedConfig<ExpandedInferredFile>, AppError> {
+        self.validate_evaluated_config_for(
+            parsed,
+            base_dir,
+            skip_resource_validation,
+            duplicate_declarations,
+            crate::commands::ConfigNameResolution::EvaluatedOnly,
+        )
+    }
+
+    fn validate_evaluated_config_for(
+        self,
+        parsed: carina_core::config_loader::InferredRootDirectory,
+        base_dir: &ResolvedPath,
+        skip_resource_validation: bool,
+        duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
+        name_resolution: crate::commands::ConfigNameResolution,
+    ) -> Result<ValidatedConfig<ExpandedInferredFile>, AppError> {
         let report = validation_report_with(
             &self.context,
             &self.load_errors,
@@ -1686,6 +1723,7 @@ impl ProviderLoad {
             base_dir,
             skip_resource_validation,
             duplicate_declarations,
+            name_resolution,
             |parsed, catalog| {
                 require_expanded_config(&parsed, base_dir)?;
                 resolve_file_binding_uses(parsed, base_dir, &self.context, catalog)
@@ -1841,6 +1879,7 @@ impl MigrationCheckProviderLoad {
             base_dir,
             true,
             duplicate_declarations,
+            crate::commands::ConfigNameResolution::ReadOnly,
             |parsed, session| resolve_file_binding_uses(parsed, base_dir, &context, session),
         );
         report.print_warnings();
@@ -5174,6 +5213,24 @@ pub(crate) async fn get_provider_with_ctx(
     progress_sink: ProgressSink,
     plan: &provider_mod::ProviderPlan,
 ) -> Result<ProviderRouter, AppError> {
+    build_provider_router(ctx, configs, progress_sink, plan).await
+}
+
+pub(crate) async fn get_read_only_provider_with_ctx(
+    ctx: &WiringContext,
+    configs: &ReadOnlyProviderConfigs,
+    progress_sink: ProgressSink,
+    plan: &provider_mod::ProviderPlan,
+) -> Result<ProviderRouter, AppError> {
+    build_provider_router(ctx, configs, progress_sink, plan).await
+}
+
+async fn build_provider_router<C: ProviderConfigurations>(
+    ctx: &WiringContext,
+    configs: &C,
+    progress_sink: ProgressSink,
+    plan: &provider_mod::ProviderPlan,
+) -> Result<ProviderRouter, AppError> {
     let color_mode = ctx.runtime().color_mode();
     let mut router = ProviderRouter::new();
 
@@ -5181,7 +5238,11 @@ pub(crate) async fn get_provider_with_ctx(
     // Pass 1 handles every default instance (top-level `provider <kind>`
     // blocks). Pass 2 handles each named instance (`let <name> = provider
     // <kind> { ... }`), reusing the same context factory.
-    for provider_config in configs.iter().filter(|config| config.is_default()) {
+    for provider_config in configs
+        .configurations()
+        .iter()
+        .filter(|config| config.is_default())
+    {
         instantiate_provider_into_router(
             ctx,
             &mut router,
@@ -5193,7 +5254,11 @@ pub(crate) async fn get_provider_with_ctx(
         .await?;
     }
 
-    for provider_config in configs.iter().filter(|config| !config.is_default()) {
+    for provider_config in configs
+        .configurations()
+        .iter()
+        .filter(|config| !config.is_default())
+    {
         let inherited_source = kind_default_source(configs, provider_config.name());
         instantiate_provider_into_router(
             ctx,
@@ -5236,14 +5301,15 @@ pub(crate) async fn get_provider_with_ctx(
 /// default — the parser rejects `source` on `let <name> = provider
 /// <kind>` — so this is the only way to get the source URL while
 /// processing a named instance's wiring.
-fn kind_default_source<'a>(
-    configs: &'a ResolvedProviderConfigs,
+fn kind_default_source<'a, C: ProviderConfigurations>(
+    configs: &'a C,
     kind: &str,
 ) -> Option<&'a ProviderSource> {
     configs
+        .configurations()
         .iter()
         .find(|config| config.is_default() && config.name() == kind)
-        .and_then(ResolvedProviderConfig::source)
+        .and_then(|config| config.source())
 }
 
 /// Prepare the default instance used by implicit backend operations.
@@ -5251,10 +5317,10 @@ fn kind_default_source<'a>(
 /// Both state-bucket bootstrap and deletion route through this typed seam, so
 /// neither can recover an attribute map from `parsed.providers`. Providers
 /// without a declared block retain the historical empty-config fallback.
-pub(crate) fn prepare_default_provider_ready_config(
+pub(crate) fn prepare_default_provider_ready_config<C: ProviderConfigurations>(
     factory: &dyn ProviderFactory,
     provider_name: &str,
-    configs: &ResolvedProviderConfigs,
+    configs: &C,
 ) -> Result<ProviderReadyConfig, carina_core::executor::ProviderConfigPreparationError> {
     let config = configs.provider_or_implicit(provider_name);
     prepare_provider_ready_config(factory, config.as_ref())
@@ -5300,7 +5366,7 @@ fn format_provider_using_line(
 async fn instantiate_provider_into_router(
     ctx: &WiringContext,
     router: &mut ProviderRouter,
-    provider_config: &ResolvedProviderConfig,
+    provider_config: &dyn ProviderConfiguration,
     inherited_source: Option<&ProviderSource>,
     progress_sink: ProgressSink,
     plan: &provider_mod::ProviderPlan,
@@ -5318,13 +5384,22 @@ async fn instantiate_provider_into_router(
             format_provider_using_line(factory.name(), config.region(), binding, displayed_source)
                 .cyan(color_mode),
         );
-        router.add_provider_config(provider_config.as_provider_config(), provider);
+        router.add_provider_instance(
+            provider_mod::ProviderInstanceKey::new(
+                provider_config.name(),
+                binding.map(str::to_owned),
+            ),
+            provider,
+        );
     } else if let Some(builtin_mock) = ctx.builtin_mock()
         && provider_config.name() == BUILTIN_PROVIDER_NAME
     {
         progress_sink.line("Using mock provider".cyan(color_mode));
-        router.add_provider_config(
-            provider_config.as_provider_config(),
+        router.add_provider_instance(
+            provider_mod::ProviderInstanceKey::new(
+                provider_config.name(),
+                binding.map(str::to_owned),
+            ),
             provider_mod::ProviderBoundary::initialize(
                 builtin_mock,
                 &plan.session(provider_config.name(), binding, None),
@@ -5338,7 +5413,7 @@ async fn instantiate_provider_into_router(
 }
 
 fn missing_provider_message(
-    provider_config: &ResolvedProviderConfig,
+    provider_config: &dyn ProviderConfiguration,
     inherited_source: Option<&ProviderSource>,
 ) -> Option<String> {
     if provider_config.name().is_empty() {
@@ -5424,53 +5499,21 @@ fn take_unverified_official_load_error<E>(
 }
 
 /// Build a router exclusively from factories already retained by `ctx`.
+/// Read/delete configuration cannot select this desired-provider entry.
+///
+/// ```compile_fail,E0308
+/// use carina_cli::wiring::{WiringContext, create_providers_from_configs_with_ctx};
+/// use carina_core::{parser::ReadOnlyProviderConfigs, provider::ProviderPlan};
+/// fn desired(ctx: &WiringContext, config: &ReadOnlyProviderConfigs, plan: &ProviderPlan) {
+///     let _ = create_providers_from_configs_with_ctx(ctx, config, plan);
+/// }
+/// ```
 pub async fn create_providers_from_configs_with_ctx(
     ctx: &WiringContext,
     configs: &ResolvedProviderConfigs,
     plan: &provider_mod::ProviderPlan,
 ) -> Result<ProviderRouter, AppError> {
-    let color_mode = ctx.runtime().color_mode();
-    let mut router = ProviderRouter::new();
-
-    // Same two-pass shape as `get_provider_with_ctx`: default instances
-    // first, then named instances reuse the same context factory.
-    for config in configs.iter().filter(|config| config.is_default()) {
-        instantiate_provider_into_router(ctx, &mut router, config, None, ProgressSink::Human, plan)
-            .await?;
-    }
-    for config in configs.iter().filter(|config| !config.is_default()) {
-        let inherited_source = kind_default_source(configs, config.name());
-        instantiate_provider_into_router(
-            ctx,
-            &mut router,
-            config,
-            inherited_source,
-            ProgressSink::Human,
-            plan,
-        )
-        .await?;
-    }
-
-    if router.is_empty()
-        && let Some(builtin_mock) = ctx.builtin_mock()
-    {
-        ProgressSink::Human.line("Using mock provider".cyan(color_mode));
-        router.add_provider(
-            BUILTIN_PROVIDER_NAME.to_string(),
-            provider_mod::ProviderBoundary::initialize(
-                builtin_mock,
-                &plan.session(BUILTIN_PROVIDER_NAME, None, None),
-            )
-            .await?,
-        );
-        router.add_provider(
-            String::new(),
-            provider_mod::ProviderBoundary::initialize(builtin_mock, &plan.session("", None, None))
-                .await?,
-        );
-    }
-
-    Ok(router)
+    build_provider_router(ctx, configs, ProgressSink::Human, plan).await
 }
 
 /// Build only the desired-state normalizers needed to reproduce the plan-time
@@ -6088,6 +6131,29 @@ impl<'state> DeferredForExpansionPrelude<'state> {
         &self.wait_aliases
     }
 
+    /// Read/delete identity comparison consumes only construction attributes.
+    /// The temporary overlay preserves authored defaults and never escapes as
+    /// a raw configuration that could authorize desired dispatch.
+    pub(crate) fn detect_moves_for_read_only(
+        self,
+        ctx: &WiringContext,
+        comparison_provider: &ProviderRouter,
+        data_sources: &[DataSource],
+        configs: &ReadOnlyProviderConfigs,
+        authored: &[ExpandedProviderConfig],
+        claims: &StateBlockClaims,
+    ) -> Result<DetectedDeferredForExpansionPrelude<'state>, AppError> {
+        let mut identity = authored.to_vec();
+        for provider in &mut identity {
+            if let Some(config) = configs.configurations().iter().find(|config| {
+                config.name() == provider.name && config.binding() == provider.binding.as_deref()
+            }) {
+                provider.attributes = config.attributes().clone();
+            }
+        }
+        self.detect_moves(ctx, comparison_provider, data_sources, &identity, claims)
+    }
+
     pub(crate) fn detect_moves(
         self,
         ctx: &WiringContext,
@@ -6395,7 +6461,6 @@ pub(crate) struct AddressedDataSourceReadInputs<'a, 'backend> {
     pub schemas: &'a SchemaRegistry,
     pub saved_dep_bindings:
         &'a HashMap<ResourceId, carina_core::resource::PersistedDestroyDependencies>,
-    pub factories: &'a [Box<dyn ProviderFactory>],
     pub cancel: Option<&'a ShutdownToken>,
 }
 
@@ -6458,7 +6523,6 @@ async fn read_addressed_data_sources_phase2(
             schemas: inputs.schemas,
             wait_aliases: &addressed.wait_aliases,
             saved_dep_bindings: inputs.saved_dep_bindings,
-            factories: inputs.factories,
             cancel: inputs.cancel,
         },
         Phase2DataSourceStart::Unread,
@@ -7537,17 +7601,19 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                     state_file,
                     override_aware_resources.resources(),
                 );
-                let plan_input_desired = carina_core::resource::plan_input_desired_resources(
-                    &resolved_resources,
+                let final_inputs = carina_core::validation::admission::final_input::FinalPlanInputs::admit(
+                    resolved_resources,
+                    resolved_data_sources_for_plan,
                     context.schemas(),
-                );
+                    override_aware_resources.bindings(),
+                    session,
+                )?;
                 let dependents =
                     CascadeDependents::new(&resolved_unresolved_resources, deferred_create_targets);
                 let prepared = reference_preparation
                     .plan_with_cascades(
-                        &plan_input_desired,
+                        &final_inputs,
                         &dependents,
-                        &resolved_data_sources_for_plan,
                         provider,
                         PlanPriorStates::new(&plan_input_current, &addressed.orphans),
                         &directives_map,
@@ -7645,7 +7711,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                 let resources = M::build_resources(PostExpansionResourceInputs {
                     override_aware: &override_aware_resources,
                     unresolved_override_aware: &unresolved_override_aware_resources,
-                    resolved: resolved_resources,
+                    resolved: final_inputs.into_resources(),
                     paired_unresolved: paired_unresolved_resources,
                 });
 
@@ -8722,9 +8788,12 @@ async fn finish_expanded_refresh_state<
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
+pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<
+    E: Clone,
+    C: carina_core::parser::PlanProviderConfigurations,
+>(
     validated: ValidatedConfig<CanonicalResourcePair<E>>,
-    provider_configs: &ResolvedProviderConfigs,
+    provider_configs: &C,
     state_file: &Option<StateFile>,
     refresh: bool,
     progress_sink: ProgressSink,
@@ -8768,10 +8837,13 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
+async fn create_plan_from_parsed_with_upstream_with_ctx_inner<
+    E: Clone,
+    C: carina_core::parser::PlanProviderConfigurations,
+>(
     ctx: &WiringContext,
     canonical_resources: CanonicalResourcePair<E>,
-    provider_configs: &ResolvedProviderConfigs,
+    provider_configs: &C,
     provider_plan: &provider_mod::ProviderPlan,
     state_file: &Option<StateFile>,
     refresh: bool,
@@ -8783,7 +8855,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
 ) -> Result<ExpandedPlanContext<E>, AppError> {
     let color_mode = ctx.runtime().color_mode();
     let parsed = canonical_resources.parsed();
-    let raw_provider_configs = provider_configs.as_provider_configs();
+    let raw_provider_configs = provider_configs.plan_provider_configs();
     // Mutable: a same-config deferred-for loop is expanded into concrete
     // resources *after* refresh (carina#3132) and the augmented set is
     // re-sorted in place below. Every use up to that point sees the
@@ -8798,7 +8870,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     // Initialize the exact provider routes before automatic move detection;
     // create-only matching needs each owning instance's comparison scope.
     let provider =
-        get_provider_with_ctx(ctx, provider_configs, progress_sink, provider_plan).await?;
+        build_provider_router(ctx, provider_configs, progress_sink, provider_plan).await?;
     let expansion_prelude = DeferredForExpansionPrelude::new(
         &canonical_resources,
         &resolved_state_block_targets.removed_from,
@@ -8955,7 +9027,6 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
             remote_bindings,
             schemas: ctx.schemas(),
             saved_dep_bindings: &saved_dep_bindings,
-            factories: ctx.factories(),
             cancel: None,
         })
         .await?;
@@ -10049,22 +10120,17 @@ pub async fn read_data_source_with_retry(
     resource: &carina_core::resource::DataSource,
     bindings: &ResolvedBindings,
     module_gate: &carina_core::executor::ModuleConstraintGate,
-    factories: &[Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &carina_core::schema::SchemaRegistry,
     session: &ValidationProviderCatalog<'_>,
 ) -> Result<State, AppError> {
-    let preparation = carina_core::executor::ProviderPreparationContext::new(
+    let preparation = carina_core::executor::DataSourcePreparationContext::new(
         bindings,
         module_gate,
-        &[],
-        &carina_core::provider::NoopNormalizer,
-        factories,
         schemas,
         session,
     );
-    let ready =
-        carina_core::executor::prepare_provider_ready_data_source(resource.clone(), &preparation)
-            .map_err(|source| AppError::from_resource_preparation(resource.id.clone(), source))?;
+    let ready = carina_core::executor::prepare_data_source_query(resource.clone(), &preparation)
+        .map_err(|source| AppError::from_resource_preparation(resource.id.clone(), source))?;
     carina_core::executor::read_data_source_with_retry(provider, &ready)
         .await
         .map_err(AppError::Provider)
@@ -10094,7 +10160,6 @@ pub(crate) struct ReadDataSourcesInputs<'a, 'backend> {
     pub wait_aliases: &'a [WaitAliasSpec],
     pub saved_dep_bindings:
         &'a HashMap<ResourceId, carina_core::resource::PersistedDestroyDependencies>,
-    pub factories: &'a [Box<dyn ProviderFactory>],
     /// When present, stop dispatching new provider reads as soon as the
     /// command enters graceful shutdown. Reads already in flight are drained.
     pub cancel: Option<&'a ShutdownToken>,
@@ -10182,7 +10247,6 @@ pub(crate) struct ExpandedDataSourceReadInputs<'a, 'backend> {
     pub wait_aliases: &'a [WaitAliasSpec],
     pub saved_dep_bindings:
         &'a HashMap<ResourceId, carina_core::resource::PersistedDestroyDependencies>,
-    pub factories: &'a [Box<dyn ProviderFactory>],
     pub cancel: Option<&'a ShutdownToken>,
 }
 
@@ -10213,7 +10277,6 @@ pub(crate) async fn read_expanded_data_sources_phase2(
             schemas: inputs.schemas,
             wait_aliases: inputs.wait_aliases,
             saved_dep_bindings: inputs.saved_dep_bindings,
-            factories: inputs.factories,
             cancel: inputs.cancel,
         },
         Phase2DataSourceStart::Outcomes(values),
@@ -10520,7 +10583,6 @@ async fn read_data_sources_phase2_pass(
                                 &resource,
                                 bindings,
                                 module_gate,
-                                inputs.factories,
                                 inputs.schemas,
                                 session,
                             )
@@ -11531,7 +11593,6 @@ impl<E: Clone> ValidatedConfig<ExpandedFile<E>> {
                 remote_bindings,
                 schemas: ctx.schemas(),
                 saved_dep_bindings: &saved_dep_bindings,
-                factories: ctx.factories(),
                 cancel: Some(cancel),
             })
             .await?
@@ -11572,7 +11633,6 @@ impl<E: Clone> ValidatedConfig<ExpandedFile<E>> {
                 schemas: ctx.schemas(),
                 wait_aliases: &parts.wait_aliases,
                 saved_dep_bindings: &saved_dep_bindings,
-                factories: ctx.factories(),
                 cancel: Some(cancel),
             },
         )

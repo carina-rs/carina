@@ -1790,7 +1790,7 @@
             "kind": "resource",
             "resource_type": "test.resource",
             "fingerprint": {
-              "present": "7d229d9da47489cd2dcc3f7134b06d4b890604011249dc97950a94a977172eea"
+              "present": "d307859469bcbb06fdb09027a481c71507aef2fa609389875f04b914e1e27a77"
             }
           },
           {

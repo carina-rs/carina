@@ -394,6 +394,7 @@ pub fn validate_and_resolve_errors(
 
 pub(crate) enum ConfigNameResolution {
     EvaluatedOnly,
+    ReadOnly,
     Paired(Box<UnresolvedConfigSnapshot>),
 }
 
@@ -957,19 +958,47 @@ fn validate_and_resolve_configuration(
     // deferred provider attributes that reference those bindings
     // (`default_tags = mod.tags`), then finalize so the resolved values
     // are promoted into the typed `default_tags` field. See #2717.
-    if let Err(e) = carina_core::parser::resolve_expanded_provider_unresolved_attributes(
-        &mut parsed,
-        enriched_context.catalog(),
-    ) {
-        errors.push(AppError::Config(format!(
-            "Provider attribute resolution error: {}",
-            e
-        )));
-        return Err(non_empty_validation_failure(errors));
+    if !matches!(&name_resolution, ConfigNameResolution::ReadOnly) {
+        if let Err(e) = carina_core::parser::resolve_expanded_provider_unresolved_attributes(
+            &mut parsed,
+            enriched_context.catalog(),
+        ) {
+            errors.push(AppError::Config(format!(
+                "Provider attribute resolution error: {}",
+                e
+            )));
+            return Err(non_empty_validation_failure(errors));
+        }
+        if let Err(e) = carina_core::parser::finalize_provider_configs(&mut parsed) {
+            errors.push(AppError::Config(format!("Finalize error: {}", e)));
+            return Err(non_empty_validation_failure(errors));
+        }
     }
-    if let Err(e) = carina_core::parser::finalize_provider_configs(&mut parsed) {
-        errors.push(AppError::Config(format!("Finalize error: {}", e)));
-        return Err(non_empty_validation_failure(errors));
+
+    // Default-tag knownness uses the final composition graph, so a known
+    // module export is available to the same resolver as a local resource.
+    let upstream = parsed
+        .upstream_states
+        .iter()
+        .map(|upstream| upstream.binding.as_str().to_owned())
+        .collect();
+    // Read/delete validation retains the authored defaults without demanding
+    // them. Only its distinct provider-config route may omit those inputs.
+    if !matches!(&name_resolution, ConfigNameResolution::ReadOnly)
+        && let Err(error) =
+            carina_core::parser::ResolvedProviderConfigs::validate_default_tag_knownness(
+                &parsed.providers,
+                &upstream,
+                &carina_core::binding_index::ResolvedBindings::for_expanded_validation(&parsed),
+                enriched_context,
+            )
+    {
+        errors.extend(
+            error
+                .into_findings()
+                .into_iter()
+                .map(|error| AppError::ProviderConfigInvariant(Box::new(error))),
+        );
     }
 
     // Expansion carries module-internal side data in parallel with each
@@ -1000,7 +1029,7 @@ fn validate_and_resolve_configuration(
     // before per-resource schema checks can look up the renamed
     // attributes, so its failures gate the remaining pipeline.
     let mut resolved_config = match name_resolution {
-        ConfigNameResolution::EvaluatedOnly => {
+        ConfigNameResolution::EvaluatedOnly | ConfigNameResolution::ReadOnly => {
             let name_errors = resolve_file_names_with_ctx(ctx, &mut parsed);
             if !name_errors.is_empty() {
                 errors.extend(name_errors);

@@ -742,7 +742,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         managed_current: current_states,
         data_source_values: ExecutableDataSourceValues::empty(),
         normalizer: &NoopNormalizer,
-        provider_configs: &[],
+        provider_configs: &carina_core::test_utils::resolved_provider_configs(&[]),
         // carina#3063 (#3069): the executor re-applies the full
         // plan-time normalization pipeline on the apply path. Pass the
         // same factories/schemas the apply path threads through.
