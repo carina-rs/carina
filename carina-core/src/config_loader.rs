@@ -1653,14 +1653,7 @@ impl LocatedParseError {
 
     fn render(&self, fallback: &Path) -> String {
         if let Some(error) = crate::ConversionError::from_error(self.error.as_ref()) {
-            let location = error.location();
-            return format!(
-                "{}:{}:{}: {}",
-                location.file().path().display(),
-                location.span().start_line(),
-                location.span().start_column(),
-                crate::executor::render_error_chain(error),
-            );
+            return error.diagnostic().to_string();
         }
         if let Some(finding) = self.error.element_diagnostic() {
             let location = finding.location();
@@ -2093,6 +2086,26 @@ mod tests {
     use super::*;
     use crate::resource::Value;
     use std::fs;
+
+    #[test]
+    fn conversion_parse_diagnostic_uses_the_shared_message_shape() {
+        let path = Path::new("conversion-shape.crn");
+        let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let error = parser::parse_file(
+            "let converted = if 42 as String { 'ok' } else { 'ok' }",
+            path,
+            &catalog,
+        )
+        .unwrap_err();
+        let conversion = crate::ConversionError::from_error(&error).unwrap();
+        let expected = parser::Located::new(
+            conversion.location().clone(),
+            conversion.diagnostic_message(),
+        )
+        .to_string();
+        let located = LocatedParseError::in_file(path, error);
+        assert_eq!(located.render(path), expected);
+    }
 
     // macOS APFS rejects non-UTF-8 names.
     #[cfg(target_os = "linux")]

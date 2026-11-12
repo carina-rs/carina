@@ -363,47 +363,6 @@ pub struct ValueValidationFindings {
 }
 
 impl ValueValidationFindings {
-    fn separate_conversions(mut self) -> Self {
-        let channel = &mut self.conversions;
-        self.local_error = self.local_error.and_then(|error| channel.ordinary(error));
-        self.additional_local_errors = self
-            .additional_local_errors
-            .into_iter()
-            .filter_map(|error| channel.ordinary(error))
-            .collect();
-        self.local = self
-            .local
-            .into_iter()
-            .filter_map(|(path, error)| channel.ordinary(error).map(|error| (path, error)))
-            .collect();
-        self.located = self
-            .located
-            .into_iter()
-            .filter_map(|(path, error)| channel.ordinary(error).map(|error| (path, error)))
-            .collect();
-        self.assignment.errors = self
-            .assignment
-            .errors
-            .into_iter()
-            .filter_map(|(path, error)| channel.ordinary(error).map(|error| (path, error)))
-            .collect();
-        self.symbolic = self
-            .symbolic
-            .into_iter()
-            .filter_map(|finding| {
-                channel
-                    .ordinary(finding.error)
-                    .map(|error| SymbolicFinding { error, ..finding })
-            })
-            .collect();
-        self.provider = self
-            .provider
-            .into_iter()
-            .filter_map(|(path, error)| channel.ordinary(error).map(|error| (path, error)))
-            .collect();
-        self
-    }
-
     pub fn conversions(&self) -> &crate::ConversionChannel {
         &self.conversions
     }
@@ -521,17 +480,10 @@ impl SymbolicDiagnosticCoverage {
 
 impl ResourceValueValidation {
     pub(crate) fn from_errors(errors: Vec<TypeError>) -> Self {
-        let mut report = Self::default();
-        report.append_errors(errors);
-        report
-    }
-
-    pub(super) fn append_errors(&mut self, errors: Vec<TypeError>) {
-        self.errors.extend(
-            errors
-                .into_iter()
-                .filter_map(|error| self.conversions.ordinary(error)),
-        );
+        Self {
+            errors,
+            ..Default::default()
+        }
     }
 
     pub fn conversions(&self) -> &crate::ConversionChannel {
@@ -604,9 +556,6 @@ impl ResourceValueValidation {
     }
 
     pub(crate) fn push_attribute_error(&mut self, name: &str, error: TypeError) {
-        let Some(error) = self.conversions.ordinary(error) else {
-            return;
-        };
         self.error_paths.insert(
             self.errors.len(),
             (name.into(), LeafPath::from_segments([])),
@@ -914,23 +863,6 @@ impl<'a> CheckedValue<'a> {
 
     fn into_findings(mut self) -> ValueValidationFindings {
         self.retain_primary_finding();
-        // Split the independent callback streams before they acquire symbolic,
-        // local and located presentation copies. This is not per-use dedup.
-        let mut conversions = crate::ConversionChannel::default();
-        self.findings.assignment.errors = self
-            .findings
-            .assignment
-            .errors
-            .into_iter()
-            .filter_map(|(path, error)| conversions.ordinary(error).map(|error| (path, error)))
-            .collect();
-        self.findings.authored.errors = self
-            .findings
-            .authored
-            .errors
-            .into_iter()
-            .filter_map(|(path, error)| conversions.ordinary(error).map(|error| (path, error)))
-            .collect();
         // Preserve callback provenance while the two result streams are still
         // separate. Admission must never infer it from equal diagnostics.
         let symbolic =
@@ -955,7 +887,7 @@ impl<'a> CheckedValue<'a> {
         }
         self.findings.assignment.extend(self.findings.authored);
         ValueValidationFindings {
-            conversions,
+            conversions: std::mem::take(&mut self.findings.assignment.conversions),
             structure: ValueStructure::Scalar,
             local_error: match self.local {
                 LocalOutcome::Accepted(_) => None,
@@ -975,7 +907,6 @@ impl<'a> CheckedValue<'a> {
             additional_local_errors: self.findings.additional_local_errors,
             provider: self.findings.provider,
         }
-        .separate_conversions()
     }
 }
 
@@ -1037,7 +968,7 @@ pub(crate) fn untyped_symbolic_errors(errors: Vec<TypeError>) -> ValueValidation
             findings.additional_local_errors.push(error);
         }
     }
-    findings.separate_conversions()
+    findings
 }
 
 pub(crate) fn classification_error(error: TypeError) -> ValueValidationFindings {
@@ -1221,9 +1152,11 @@ struct CanonicalLeafError<'a> {
 /// It never classifies a value or walks children.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct AssignmentFindings {
+    pub(crate) conversions: crate::ConversionChannel,
     pub(crate) local: Vec<crate::validation::admission::LocalPath>,
     pub(crate) schema: crate::validation::admission::SchemaObligation,
     pub(crate) errors: Vec<(LeafPath, TypeError)>,
+    #[cfg(test)]
     pub(crate) deferred: Vec<DeferredHook>,
     // Consumed policy verdicts distinguish a matching member's source/value
     // rejection from an earlier member with the wrong destination identity.
@@ -1231,9 +1164,11 @@ pub(crate) struct AssignmentFindings {
 }
 impl AssignmentFindings {
     pub(crate) fn extend(&mut self, other: Self) {
+        self.conversions.append(other.conversions);
         self.local.extend(other.local);
         self.schema.extend(other.schema);
         self.errors.extend(other.errors);
+        #[cfg(test)]
         self.deferred.extend(other.deferred);
         self.matched_destination |= other.matched_destination;
     }
@@ -1241,11 +1176,13 @@ impl AssignmentFindings {
 impl InsideSecret for AssignmentFindings {
     fn inside_secret(self) -> Self {
         Self {
+            conversions: self.conversions.inside_secret(),
             local: self
                 .local
                 .into_iter()
                 .map(InsideSecret::inside_secret)
                 .collect(),
+            #[cfg(test)]
             deferred: self
                 .deferred
                 .into_iter()
@@ -1285,7 +1222,7 @@ pub(crate) enum AuthoredOutcome {
 // internal verdict. Callers cannot claim a position with empty findings.
 enum PolicyOutcome {
     Continue(AssignmentFindings),
-    Claimed(AssignmentFindings),
+    Claimed(crate::parser::retained::ConversionVerdict),
 }
 pub(crate) type AuthoredAssignmentCheck<'a, P, B> =
     &'a dyn Fn(
@@ -1352,60 +1289,23 @@ impl AssignmentProbe {
     }
 }
 
-pub(crate) struct CallbackSources<'a, P: ValueKind, B: BindingAddress> {
-    ordinary: AssignmentCheck<'a, P, B>,
-    policy: AuthoredChecks<'a, P, B>,
-    scope: AssignmentScope,
-    observer: Option<AssignmentCheck<'a, P, B>>,
-}
-impl<'a, P: ValueKind, B: BindingAddress> From<RequiredAssignmentCallbacks<'a, P, B>>
-    for CallbackSources<'a, P, B>
-{
-    fn from(callbacks: RequiredAssignmentCallbacks<'a, P, B>) -> Self {
-        Self {
-            ordinary: callbacks.ordinary,
-            policy: callbacks.authored,
-            scope: callbacks.scope,
-            observer: None,
-        }
-    }
-}
-#[cfg(test)]
-impl<'a, P: ValueKind, B: BindingAddress> From<AssignmentCallbacks<'a, P, B>>
-    for CallbackSources<'a, P, B>
-{
-    fn from(callbacks: AssignmentCallbacks<'a, P, B>) -> Self {
-        Self {
-            ordinary: callbacks.ordinary,
-            policy: AuthoredChecks::Validation(&|_, _, _, _| {
-                Ok(AuthoredOutcome::Continue(Default::default()))
-            }),
-            scope: AssignmentScope::Full,
-            observer: callbacks.authored,
-        }
-    }
-}
-impl<'a, P: ValueKind, B: BindingAddress> CallbackSources<'a, P, B> {
-    #[cfg(test)]
-    pub(crate) fn observe(mut self, observer: Option<AssignmentCheck<'a, P, B>>) -> Self {
-        self.observer = observer;
-        self
-    }
-}
-
 /// Member probes collect calls, never execute policy. Only the selected
 /// probe's tokens survive in CheckedValue; each token owns one FnOnce call.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct DeferredHook {
     index: usize,
     secret: bool,
 }
 
+#[cfg(test)]
 type HookCall<'a> = Box<dyn FnOnce() -> AssignmentFindings + 'a>;
+#[cfg(test)]
 #[derive(Default)]
 struct AuthoredHooks<'a> {
     calls: std::cell::RefCell<Vec<Option<HookCall<'a>>>>,
 }
+#[cfg(test)]
 impl<'a> AuthoredHooks<'a> {
     fn record(&self, call: HookCall<'a>) -> AssignmentFindings {
         let mut calls = self.calls.borrow_mut();
@@ -1434,18 +1334,21 @@ impl<'a> AuthoredHooks<'a> {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 enum HookExecution {
     Immediate,
     UnionProbe,
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 struct AuthoredHook<'a, P: ValueKind, B: BindingAddress> {
     callback: AssignmentCheck<'a, P, B>,
     hooks: std::rc::Rc<AuthoredHooks<'a>>,
     execution: HookExecution,
 }
+#[cfg(test)]
 impl<'a, P: ValueKind, B: BindingAddress> AuthoredHook<'a, P, B> {
     fn record(
         &self,
@@ -1475,20 +1378,46 @@ pub(crate) struct WalkCallbacks<'a, P: ValueKind, B: BindingAddress> {
     ordinary: AssignmentCheck<'a, P, B>,
     policy: AuthoredChecks<'a, P, B>,
     scope: AssignmentScope,
+    #[cfg(test)]
     authored: Option<AuthoredHook<'a, P, B>>,
 }
 impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
-    fn new(callbacks: CallbackSources<'a, P, B>) -> Self {
-        Self {
-            ordinary: callbacks.ordinary,
-            policy: callbacks.policy,
-            scope: callbacks.scope,
-            authored: callbacks.observer.map(|callback| AuthoredHook {
-                callback,
+    // A top-level walk owns its observer queue. Rebuild only that test-only
+    // state so callback borrows can shorten to the walk's local coverage.
+    fn for_walk<'w>(self) -> WalkCallbacks<'w, P, B>
+    where
+        'a: 'w,
+    {
+        WalkCallbacks {
+            ordinary: self.ordinary,
+            policy: self.policy,
+            scope: self.scope,
+            #[cfg(test)]
+            authored: self.authored.map(|hook| AuthoredHook {
+                callback: hook.callback,
                 hooks: Default::default(),
                 execution: HookExecution::Immediate,
             }),
         }
+    }
+    fn has_observer(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.authored.is_some()
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn observe(mut self, observer: Option<AssignmentCheck<'a, P, B>>) -> Self {
+        self.authored = observer.map(|callback| AuthoredHook {
+            callback,
+            hooks: Default::default(),
+            execution: HookExecution::Immediate,
+        });
+        self
     }
     fn policy(
         &self,
@@ -1498,25 +1427,27 @@ impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
         cursor: AuthoredCursor<'_, B>,
     ) -> PolicyOutcome {
         let rejected = |error| {
-            PolicyOutcome::Claimed(AssignmentFindings {
-                errors: vec![(path.clone(), error)],
-                ..Default::default()
-            })
+            PolicyOutcome::Claimed(crate::parser::retained::ConversionVerdict::Rejected(
+                AssignmentFindings {
+                    errors: vec![(path.clone(), error)],
+                    ..Default::default()
+                },
+            ))
         };
         match self.policy {
-            AuthoredChecks::Validation(check) => {
-                let judge = |declaration| match check(declaration, value, path, cursor.clone()) {
-                    Ok(AuthoredOutcome::Continue(findings)) => PolicyOutcome::Continue(findings),
-                    Ok(AuthoredOutcome::Claimed(witness)) => {
-                        match witness.consume(declaration, &cursor) {
-                            Ok(findings) => PolicyOutcome::Claimed(findings),
-                            Err(error) => rejected(error),
-                        }
-                    }
-                    Err(error) => rejected(error),
-                };
-                judge(attr)
-            }
+            AuthoredChecks::Validation(check) => match check(attr, value, path, cursor.clone()) {
+                Ok(AuthoredOutcome::Continue(findings)) => PolicyOutcome::Continue(findings),
+                Ok(AuthoredOutcome::Claimed(witness)) => match witness.consume(attr, &cursor) {
+                    Ok(verdict) => PolicyOutcome::Claimed(verdict),
+                    Err(error) => PolicyOutcome::Claimed(
+                        crate::parser::retained::ConversionVerdict::Rejected(AssignmentFindings {
+                            conversions: std::iter::once(error).collect(),
+                            ..Default::default()
+                        }),
+                    ),
+                },
+                Err(error) => rejected(error),
+            },
             AuthoredChecks::Projected(phase) => match cursor.kind {
                 CursorKind::Projected(current) if current == phase => {
                     PolicyOutcome::Continue(Default::default())
@@ -1530,17 +1461,25 @@ impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
         }
     }
     fn probing(&self) -> Self {
-        let mut callbacks = self.clone();
-        if let Some(authored) = &mut callbacks.authored {
-            authored.execution = HookExecution::UnionProbe;
+        #[cfg(test)]
+        {
+            let mut callbacks = self.clone();
+            if let Some(authored) = &mut callbacks.authored {
+                authored.execution = HookExecution::UnionProbe;
+            }
+            callbacks
         }
-        callbacks
+        #[cfg(not(test))]
+        {
+            self.clone()
+        }
     }
-    fn finish(&self, findings: &mut AssignmentFindings) {
+    fn finish(&self, _findings: &mut AssignmentFindings) {
+        #[cfg(test)]
         if let Some(authored) = &self.authored
             && matches!(authored.execution, HookExecution::Immediate)
         {
-            authored.hooks.finish(findings);
+            authored.hooks.finish(_findings);
         }
     }
 }
@@ -1549,7 +1488,13 @@ impl<'a, P: ValueKind, B: BindingAddress> From<RequiredAssignmentCallbacks<'a, P
     for WalkCallbacks<'a, P, B>
 {
     fn from(callbacks: RequiredAssignmentCallbacks<'a, P, B>) -> Self {
-        Self::new(callbacks.into())
+        Self {
+            ordinary: callbacks.ordinary,
+            policy: callbacks.authored,
+            scope: callbacks.scope,
+            #[cfg(test)]
+            authored: None,
+        }
     }
 }
 #[cfg(test)]
@@ -1557,7 +1502,15 @@ impl<'a, P: ValueKind, B: BindingAddress> From<AssignmentCallbacks<'a, P, B>>
     for WalkCallbacks<'a, P, B>
 {
     fn from(callbacks: AssignmentCallbacks<'a, P, B>) -> Self {
-        Self::new(callbacks.into())
+        Self {
+            ordinary: callbacks.ordinary,
+            policy: AuthoredChecks::Validation(&|_, _, _, _| {
+                Ok(AuthoredOutcome::Continue(Default::default()))
+            }),
+            scope: AssignmentScope::Full,
+            authored: None,
+        }
+        .observe(callbacks.authored)
     }
 }
 
@@ -1597,16 +1550,24 @@ impl<'a, B: BindingAddress> Claim<'a, B> {
     ) -> AssignmentFindings {
         match outcome {
             PolicyOutcome::Continue(findings) => findings,
-            PolicyOutcome::Claimed(findings) => {
-                // A child acceptance cannot revoke the rejected claim of a
-                // wrapper or a mixed-alternative parent at the same position.
+            PolicyOutcome::Claimed(verdict) => {
+                let (claim, findings) = match verdict {
+                    crate::parser::retained::ConversionVerdict::Accepted(findings) => (
+                        Self::Accepted {
+                            owner: std::rc::Rc::new(cursor),
+                        },
+                        findings,
+                    ),
+                    crate::parser::retained::ConversionVerdict::Rejected(findings) => (
+                        Self::Rejected {
+                            owner: std::rc::Rc::new(cursor),
+                        },
+                        findings,
+                    ),
+                };
+                // A child acceptance cannot revoke a wrapper's rejected claim.
                 if !self.is_rejected() {
-                    let owner = std::rc::Rc::new(cursor);
-                    *self = if findings.errors.is_empty() {
-                        Self::Accepted { owner }
-                    } else {
-                        Self::Rejected { owner }
-                    };
+                    *self = claim;
                 }
                 findings
             }
@@ -1645,7 +1606,7 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, P, B> {
         value: CheckValue<'_, P, B>,
         path: &FieldPath,
     ) -> Result<AssignmentFindings, TypeError> {
-        if self.claim.is_claimed() || self.callbacks.scope == AssignmentScope::ClaimedValues {
+        if self.claim.is_claimed() {
             return Ok(Default::default());
         }
         (self.callbacks.ordinary)(attr, value, &path.canonical(), self.cursor.clone())
@@ -1657,42 +1618,46 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, P, B> {
         value: CheckValue<'_, P, B>,
         path: &FieldPath,
     ) -> Result<AssignmentFindings, TypeError> {
-        if self.claim.is_claimed() || self.callbacks.scope == AssignmentScope::ClaimedValues {
+        if self.claim.is_claimed() {
             return Ok(Default::default());
         }
         (self.callbacks.ordinary)(attr, value, &path.canonical(), self.cursor.selection())
     }
 
-    fn policy(
-        &self,
+    fn apply_policy(
+        &mut self,
         attr: &CompiledAttributeType,
         value: CheckValue<'_, P, B>,
         path: &FieldPath,
-    ) -> PolicyOutcome {
+        findings: &mut AssignmentFindings,
+    ) {
         if matches!(
             &self.cursor.kind,
             CursorKind::Authored(_) | CursorKind::CoveredBy(_)
         ) && self.cursor.is_projection_only()
         {
-            return PolicyOutcome::Continue(Default::default());
+            return;
         }
-        self.callbacks
-            .policy(attr, value, &path.canonical(), self.cursor.clone())
+        let outcome = self
+            .callbacks
+            .policy(attr, value, &path.canonical(), self.cursor.clone());
+        findings.extend(self.claim.record(outcome, self.cursor.clone()));
     }
 
     fn authored(
         &self,
-        attr: &'a CompiledAttributeType,
-        value: CheckValue<'a, P, B>,
-        path: &FieldPath,
+        _attr: &'a CompiledAttributeType,
+        _value: CheckValue<'a, P, B>,
+        _path: &FieldPath,
     ) -> AssignmentFindings {
         if self.cursor.is_projection_only() {
             return Default::default();
         }
-        match &self.callbacks.authored {
-            Some(hook) => hook.record(attr, value, &path.canonical(), self.cursor.clone()),
-            None => Default::default(),
+        #[cfg(test)]
+        if let Some(hook) = &self.callbacks.authored {
+            return hook.record(_attr, _value, &_path.canonical(), self.cursor.clone());
         }
+        Default::default()
     }
 
     fn authored_parts(
@@ -1705,8 +1670,7 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, P, B> {
         let mut findings = AssignmentProbe::default();
         if !self.cursor.is_projection_only()
             && let CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) = &self.cursor.kind
-            && (self.callbacks.authored.is_some()
-                || usage.node().judgement().contains_any_conversion())
+            && (self.callbacks.has_observer() || usage.node().judgement().contains_any_conversion())
             && matches!(usage.navigation(), Ok(AuthoredNavigation::Parts))
         {
             for index in 0..usage.child_count() {
@@ -1746,8 +1710,8 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, P, B> {
         let mut findings = AssignmentProbe::default();
         let mut wrappers = Vec::new();
         let mut followed = std::collections::HashSet::new();
-        while let CursorKind::Authored(usage) = &self.cursor.kind {
-            self.coverage.borrow_mut().record(usage);
+        while let CursorKind::Authored(usage) = self.cursor.kind.clone() {
+            self.coverage.borrow_mut().record(&usage);
             if !followed.insert((usage.node().node_id(), usage.occurrence())) {
                 return Err(seam_error(crate::parser::retained::MissingEvidence::new(
                     "cyclic authored use",
@@ -1756,12 +1720,14 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, P, B> {
             self.cursor = match usage.navigation().map_err(seam_error)? {
                 AuthoredNavigation::Forward { child, authored } => {
                     if authored {
-                        let outcome =
-                            self.policy(attr, CheckValue::Current(value.diagnostic_value()), path);
-                        let policy = self.claim.record(outcome, self.cursor.clone());
-                        findings.authored.extend(policy);
+                        self.apply_policy(
+                            attr,
+                            CheckValue::Current(value.diagnostic_value()),
+                            path,
+                            &mut findings.authored,
+                        );
                     }
-                    if authored && self.callbacks.authored.is_some() {
+                    if authored && self.callbacks.has_observer() {
                         wrappers.push(self.cursor.clone());
                     }
                     AuthoredCursor::authored(child)
@@ -1770,16 +1736,18 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, P, B> {
                 AuthoredNavigation::Alternatives { first, .. }
                     if usage.form() == AuthoredForm::If && value.branches().is_none() =>
                 {
-                    let outcome =
-                        self.policy(attr, CheckValue::Current(value.diagnostic_value()), path);
-                    let policy = self.claim.record(outcome, self.cursor.clone());
-                    findings.authored.extend(policy);
+                    self.apply_policy(
+                        attr,
+                        CheckValue::Current(value.diagnostic_value()),
+                        path,
+                        &mut findings.authored,
+                    );
                     findings.ordinary.extend(self.check_selection(
                         attr,
                         CheckValue::Current(value.diagnostic_value()),
                         path,
                     )?);
-                    if self.callbacks.authored.is_some() {
+                    if self.callbacks.has_observer() {
                         wrappers.push(self.cursor.selection());
                     }
                     let selected = usize::from(!usage.known_condition().map_err(seam_error)?);
@@ -1805,16 +1773,18 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, P, B> {
                 AuthoredNavigation::Alternatives { .. }
                     if usage.form() == AuthoredForm::Coalesce && value.coalesce().is_none() =>
                 {
-                    let outcome =
-                        self.policy(attr, CheckValue::Current(value.diagnostic_value()), path);
-                    let policy = self.claim.record(outcome, self.cursor.clone());
-                    findings.authored.extend(policy);
+                    self.apply_policy(
+                        attr,
+                        CheckValue::Current(value.diagnostic_value()),
+                        path,
+                        &mut findings.authored,
+                    );
                     findings.ordinary.extend(self.check_selection(
                         attr,
                         CheckValue::Current(value.diagnostic_value()),
                         path,
                     )?);
-                    if self.callbacks.authored.is_some() {
+                    if self.callbacks.has_observer() {
                         wrappers.push(self.cursor.selection());
                     }
                     findings.extend(visit_discarded(
@@ -1854,28 +1824,30 @@ pub(crate) fn validate_authored_value_for_admission<
     ancestry: FieldAncestry,
     lookup: CustomTypeLookup<'_>,
     cursor: AuthoredCursor<'s, B>,
-    callbacks: impl Into<CallbackSources<'c, P, B>>,
+    callbacks: impl Into<WalkCallbacks<'c, P, B>>,
     coverage: &mut WalkCoverage,
 ) -> ValueValidationFindings {
     let visits = std::cell::RefCell::new(std::mem::take(coverage));
-    let callbacks = WalkCallbacks::new(callbacks.into());
-    let mut checked = ValueValidator::new(defs, Some(lookup))
-        .with_scope(callbacks.scope)
-        .walk_with_assignment(
-            attr,
-            value.into(),
-            &FieldPath::new(),
-            ancestry,
-            &mut Vec::new(),
-            Some(AssignmentWalk {
-                cursor,
-                callbacks: callbacks.clone(),
-                coverage: &visits,
-                claim: Claim::None,
-            }),
-        );
-    callbacks.finish(&mut checked.findings.authored);
-    drop(callbacks);
+    let checked = {
+        let callbacks = callbacks.into().for_walk();
+        let mut checked = ValueValidator::new(defs, Some(lookup))
+            .with_scope(callbacks.scope)
+            .walk_with_assignment(
+                attr,
+                value.into(),
+                &FieldPath::new(),
+                ancestry,
+                &mut Vec::new(),
+                Some(AssignmentWalk {
+                    cursor,
+                    callbacks: callbacks.clone(),
+                    coverage: &visits,
+                    claim: Claim::None,
+                }),
+            );
+        callbacks.finish(&mut checked.findings.authored);
+        checked
+    };
     let mut findings = checked.into_findings();
     *coverage = visits.into_inner();
     findings.structure = value_structure(value);
@@ -2111,7 +2083,9 @@ fn visit_syntax<'w, 's: 'w, P: PlaceholderKind, B: BindingAddress>(
                 )?;
                 let rank = (
                     std::cmp::Reverse(authored_shape_matches(resolved.attr, &cursor)),
-                    probe.ordinary.errors.len() + probe.authored.errors.len(),
+                    probe.ordinary.errors.len()
+                        + probe.authored.errors.len()
+                        + probe.authored.conversions.findings().len(),
                     std::cmp::Reverse(reached.len()),
                 );
                 if best.as_ref().is_none_or(|(current, _, _)| rank < *current) {
@@ -2152,6 +2126,7 @@ fn visit_syntax<'w, 's: 'w, P: PlaceholderKind, B: BindingAddress>(
                 authored.clone(),
             )?);
         }
+        #[cfg(test)]
         if let Some(hook) = &callbacks.authored {
             findings
                 .authored
@@ -2569,9 +2544,13 @@ impl<'a> ValueValidator<'a, '_> {
         let mut assignment = assignment;
         let parent_authored = match &mut assignment {
             Some(walk) => {
-                let outcome =
-                    walk.policy(attr, CheckValue::Current(value.diagnostic_value()), path);
-                let mut policy = walk.claim.record(outcome, walk.cursor.clone());
+                let mut policy = AssignmentFindings::default();
+                walk.apply_policy(
+                    attr,
+                    CheckValue::Current(value.diagnostic_value()),
+                    path,
+                    &mut policy,
+                );
                 policy.extend(walk.authored(
                     attr,
                     CheckValue::Current(value.diagnostic_value()),
@@ -2692,9 +2671,14 @@ impl<'a> ValueValidator<'a, '_> {
         let mut assignment = assignment;
         let parent_policy = match &mut assignment {
             Some(walk) => {
-                let outcome =
-                    walk.policy(attr, CheckValue::Current(value.diagnostic_value()), path);
-                walk.claim.record(outcome, walk.cursor.clone())
+                let mut policy = AssignmentFindings::default();
+                walk.apply_policy(
+                    attr,
+                    CheckValue::Current(value.diagnostic_value()),
+                    path,
+                    &mut policy,
+                );
+                policy
             }
             None => AssignmentFindings::default(),
         };
@@ -2838,9 +2822,14 @@ impl<'a> ValueValidator<'a, '_> {
         let mut assignment = assignment;
         let policy = match &mut assignment {
             Some(walk) => {
-                let outcome =
-                    walk.policy(attr, CheckValue::Current(value.diagnostic_value()), path);
-                walk.claim.record(outcome, walk.cursor.clone())
+                let mut policy = AssignmentFindings::default();
+                walk.apply_policy(
+                    attr,
+                    CheckValue::Current(value.diagnostic_value()),
+                    path,
+                    &mut policy,
+                );
+                policy
             }
             None => AssignmentFindings::default(),
         };
@@ -2920,6 +2909,7 @@ impl<'a> ValueValidator<'a, '_> {
             };
             if let Some(node) = node {
                 if checked.findings.authored.errors.is_empty()
+                    && checked.findings.authored.conversions.findings().is_empty()
                     && let Some(cause) = checked.first_error().cloned()
                 {
                     let mut error = crate::conversion::ConversionError::destination(
@@ -2930,15 +2920,15 @@ impl<'a> ValueValidator<'a, '_> {
                     if node.judgement().diagnostic_is_secret() {
                         error = error.inside_secret();
                     }
-                    checked.findings.authored.errors.push((
-                        path.canonical(),
-                        TypeError::Conversion {
-                            error,
-                            attribute: None,
-                        },
-                    ));
+                    checked
+                        .findings
+                        .authored
+                        .conversions
+                        .append(std::iter::once(error).collect());
                 }
-                if !checked.findings.authored.errors.is_empty() {
+                if !checked.findings.authored.errors.is_empty()
+                    || !checked.findings.authored.conversions.findings().is_empty()
+                {
                     checked.local = LocalOutcome::Accepted(Fit::with_kind(
                         FitExactness::EXACT,
                         attr,
@@ -3642,7 +3632,9 @@ impl<'a> ValueValidator<'a, '_> {
                 visited,
                 member_assignment,
             );
-            if !checked.findings.authored.errors.is_empty() {
+            if !checked.findings.authored.errors.is_empty()
+                || !checked.findings.authored.conversions.findings().is_empty()
+            {
                 if unmatched.as_ref().is_none_or(|(_, current)| {
                     checked.findings.authored.matched_destination && !current.matched_destination
                 }) {

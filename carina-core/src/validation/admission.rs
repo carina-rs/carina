@@ -155,7 +155,7 @@ pub(crate) fn conversion_local<K: DestinationKind, B: BindingAddress>(
     usage: &crate::parser::retained::AuthoredUse<'_, B>,
     declaration: &CompiledAttributeType,
     path: &LeafPath,
-) -> Result<crate::schema::value_validation::AssignmentFindings, TypeError> {
+) -> Result<crate::schema::value_validation::AssignmentFindings, crate::ConversionError> {
     matched.consume(usage, declaration)?;
     let mut findings = crate::schema::value_validation::AssignmentFindings::default();
     match K::defer_reference_check(path) {
@@ -783,15 +783,7 @@ pub struct AdmissionFindings {
 // TypeError carries diagnostic metadata, not floating-point values or schema
 // callbacks. Its structural equality is reflexive, including protected errors.
 impl Eq for AdmissionFindings {}
-impl std::error::Error for AdmissionFindings {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        if self.conversions.findings().is_empty() {
-            self.findings.first().map(|finding| &finding.error as _)
-        } else {
-            None
-        }
-    }
-}
+impl std::error::Error for AdmissionFindings {}
 impl crate::resource::InsideSecret for AdmissionFindings {
     fn inside_secret(self) -> Self {
         Self {

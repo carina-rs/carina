@@ -49,6 +49,7 @@ fn record_projection_copy(value: &Value<ParserPlaceholder, RelativeBindingName>)
 }
 
 mod conversion;
+pub(crate) use conversion::ConversionVerdict;
 pub(crate) use conversion::check as check_conversion;
 pub use conversion::{ConversionJudgement, MatchedConversionSource};
 
@@ -119,6 +120,34 @@ impl MissingEvidence {
         Self::new(format!("resource {id}"))
     }
 }
+
+/// Completeness cannot infer a verdict when authored correspondence is missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletenessErrors {
+    errors: Box<[MissingEvidence]>,
+}
+impl CompletenessErrors {
+    pub(crate) fn new(errors: &[MissingEvidence]) -> Self {
+        Self {
+            errors: errors.into(),
+        }
+    }
+    pub fn errors(&self) -> &[MissingEvidence] {
+        &self.errors
+    }
+}
+impl std::fmt::Display for CompletenessErrors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, error) in self.errors.iter().enumerate() {
+            if index != 0 {
+                writeln!(f)?;
+            }
+            write!(f, "{error}")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for CompletenessErrors {}
 
 impl ExpressionInstance {
     pub(crate) fn for_scope(scope: &crate::resource::ModuleInstanceScope) -> Self {
@@ -307,25 +336,33 @@ enum ParseOwnership {
 }
 impl<P: ValueKind, B: BindingAddress> AuthoredExpr<P, B> {
     fn parse_failure(&self, ordinary: super::ParseError) -> super::ParseError {
-        if crate::conversion::ConversionError::from_error(&ordinary).is_some() {
-            return ordinary;
-        }
         let kind = match self.parse_ownership {
             ParseOwnership::Conversion => crate::conversion::ConversionErrorKind::Source,
             ParseOwnership::Covered => crate::conversion::ConversionErrorKind::UnsupportedPosition,
             ParseOwnership::Ordinary => return ordinary,
         };
-        match &self.first_conversion {
-            Some(site) => super::ParseError::CheckedConversion(
-                crate::conversion::ConversionError::parse_failure(
-                    kind,
-                    &site.location,
-                    site.node,
-                    ordinary,
-                ),
-            ),
-            None => ordinary,
+        conversion_parse_failure(self.first_conversion.as_deref(), kind, ordinary)
+    }
+}
+
+fn conversion_parse_failure(
+    site: Option<&ConversionSite>,
+    kind: crate::conversion::ConversionErrorKind,
+    ordinary: super::ParseError,
+) -> super::ParseError {
+    if crate::conversion::ConversionError::from_error(&ordinary).is_some() {
+        return ordinary;
+    }
+    match site {
+        Some(site) => {
+            super::ParseError::CheckedConversion(crate::conversion::ConversionError::parse_failure(
+                kind,
+                &site.location,
+                site.node,
+                ordinary,
+            ))
         }
+        None => ordinary,
     }
 }
 
@@ -1274,23 +1311,12 @@ impl CapturedNodes {
         pair: &Pair<'_, Rule>,
         ordinary: super::ParseError,
     ) -> super::ParseError {
-        if crate::conversion::ConversionError::from_error(&ordinary).is_some() {
-            return ordinary;
-        }
-        match self
-            .get(&ParseNodeKey::of(pair))
-            .and_then(|node| node.authored.first_conversion.as_ref())
-        {
-            Some(site) => super::ParseError::CheckedConversion(
-                crate::conversion::ConversionError::parse_failure(
-                    crate::conversion::ConversionErrorKind::UnsupportedPosition,
-                    &site.location,
-                    site.node,
-                    ordinary,
-                ),
-            ),
-            None => ordinary,
-        }
+        conversion_parse_failure(
+            self.get(&ParseNodeKey::of(pair))
+                .and_then(|node| node.authored.first_conversion.as_deref()),
+            crate::conversion::ConversionErrorKind::UnsupportedPosition,
+            ordinary,
+        )
     }
     pub(in crate::parser) fn node_id(&self, pair: &Pair<'_, Rule>) -> Option<NodeId> {
         self.get(&ParseNodeKey::of(pair)).map(ExprValue::node_id)
@@ -1573,10 +1599,7 @@ fn compile_form(
             }
             right
         }
-        rule => {
-            let _ = rule;
-            compile_remaining_form(pair, file, source, scope, captures)
-        }
+        rule => compile_remaining_form(rule, pair, file, source, scope, captures),
     }
 }
 
@@ -1629,6 +1652,7 @@ fn compile_map(
 }
 
 fn compile_remaining_form(
+    rule: Rule,
     pair: Pair<'_, Rule>,
     file: &PreprocessedFile,
     source: &Path,
@@ -1636,7 +1660,7 @@ fn compile_remaining_form(
     captures: &mut CapturedNodes,
 ) -> ExprValue {
     let mut children = || compile_children(&pair, file, source, scope, captures);
-    match pair.as_rule() {
+    match rule {
         Rule::expression | Rule::primary => {
             let children = children();
             if children.len() == 1 {
@@ -1644,14 +1668,6 @@ fn compile_remaining_form(
             } else {
                 node(&pair, ExprKind::Sequence, children, file, source)
             }
-        }
-        Rule::coalesce_expr => {
-            let mut children = children();
-            let mut right = children.pop().expect("coalesce operand");
-            while let Some(left) = children.pop() {
-                right = node(&pair, ExprKind::Coalesce, vec![left, right], file, source);
-            }
-            right
         }
         Rule::pipe_expr => {
             let mut parts = pair.clone().into_inner();
@@ -1948,10 +1964,6 @@ fn compile_remaining_form(
                 source,
             )
         }
-        Rule::list => node(&pair, ExprKind::List, children(), file, source),
-        Rule::fn_body | Rule::if_body | Rule::else_clause | Rule::for_body => {
-            node(&pair, ExprKind::Sequence, children(), file, source)
-        }
         Rule::fn_def => {
             let return_type = pair
                 .clone()
@@ -2120,7 +2132,6 @@ fn compile_remaining_form(
             }
             node(&pair, ExprKind::Sink(name), values, file, source)
         }
-        Rule::if_expr => node(&pair, ExprKind::If, children(), file, source),
         Rule::wait_expr => {
             let mut parts = pair.clone().into_inner();
             let target = parts.next().expect("wait target");
@@ -2259,7 +2270,54 @@ fn compile_remaining_form(
         | Rule::reference_field
         | Rule::null_literal
         | Rule::EOI => node(&pair, ExprKind::Declaration, children(), file, source),
-        rule => node(
+        rule @ (Rule::COMMENT
+        | Rule::WHITESPACE
+        | Rule::add_op
+        | Rule::as_keyword
+        | Rule::block_comment
+        | Rule::block_content
+        | Rule::coalesce_expr
+        | Rule::compare_op
+        | Rule::conversion_type_path
+        | Rule::divide_op
+        | Rule::double_quoted_string
+        | Rule::duration_unit
+        | Rule::else_clause
+        | Rule::field_access
+        | Rule::file
+        | Rule::fn_body
+        | Rule::fn_param
+        | Rule::fn_params
+        | Rule::for_binding
+        | Rule::for_body
+        | Rule::for_indexed_binding
+        | Rule::for_iterable_primary
+        | Rule::for_map_binding
+        | Rule::for_simple_binding
+        | Rule::if_body
+        | Rule::if_expr
+        | Rule::index_access
+        | Rule::inline_ws
+        | Rule::interpolation
+        | Rule::interpolation_expr
+        | Rule::line_comment
+        | Rule::list
+        | Rule::map
+        | Rule::map_entry
+        | Rule::minus_op
+        | Rule::multiplicative_op
+        | Rule::multiply_op
+        | Rule::numeric_tail
+        | Rule::plus_op
+        | Rule::remainder_op
+        | Rule::single_quoted_char
+        | Rule::single_quoted_content
+        | Rule::single_quoted_string
+        | Rule::statement
+        | Rule::string_char
+        | Rule::string_literal
+        | Rule::string_part
+        | Rule::use_keyword) => node(
             &pair,
             ExprKind::Unsupported(format!("{rule:?}")),
             children(),

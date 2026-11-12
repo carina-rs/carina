@@ -3152,17 +3152,32 @@ pub fn validate_resources_with_ctx<
     errors
 }
 
-fn conversion_diagnostics(findings: carina_core::ConversionFindings) -> Vec<AppError> {
-    let (conversions, ordinary) = findings.into_parts();
-    conversions
-        .into_iter()
-        .map(|error| AppError::CheckedConversion { error })
-        .chain(
-            ordinary
+fn admission_diagnostics(
+    result: Result<(), validation::ResourceRefTypeValidationError>,
+    prefix: Option<&dyn std::fmt::Display>,
+) -> Vec<AppError> {
+    match result {
+        Ok(()) => Vec::new(),
+        Err(validation::ResourceRefTypeValidationError::Validation(report)) => {
+            let (ordinary, conversions) = report.into_parts();
+            let mut errors = conversions
+                .into_findings()
                 .into_iter()
-                .flat_map(|message| split_validation_message(&message)),
-        )
-        .collect()
+                .map(|error| AppError::CheckedConversion { error })
+                .collect::<Vec<_>>();
+            errors.extend(match prefix {
+                Some(prefix) => prefixed_validation_messages(&ordinary, prefix),
+                None => split_validation_message(&ordinary),
+            });
+            errors
+        }
+        Err(validation::ResourceRefTypeValidationError::AnalysisInvariant(error)) => {
+            vec![AppError::AnalysisInvariant(error)]
+        }
+        Err(validation::ResourceRefTypeValidationError::Correspondence(error)) => {
+            vec![AppError::AuthoredCompleteness(error)]
+        }
+    }
 }
 
 /// Shared authored admission pass; callers supply their enriched binding index.
@@ -3176,23 +3191,15 @@ pub fn validate_resource_admissions_with_ctx<
     bindings: &carina_core::binding_index::BindingIndex<'_, B>,
 ) -> Vec<AppError> {
     let mut sink = CliTypeCheckSink { errors: Vec::new() };
-    let mut errors = match validation::validate_resource_admissions(
-        judged,
-        bindings,
-        ctx.known_providers(),
-        &mut sink,
-    ) {
-        Ok(()) => Vec::new(),
-        Err(validation::ResourceRefTypeValidationError::Validation(message)) => {
-            split_validation_message(&message)
-        }
-        Err(validation::ResourceRefTypeValidationError::Conversions(findings)) => {
-            conversion_diagnostics(findings)
-        }
-        Err(validation::ResourceRefTypeValidationError::AnalysisInvariant(error)) => {
-            vec![AppError::AnalysisInvariant(error)]
-        }
-    };
+    let mut errors = admission_diagnostics(
+        validation::validate_resource_admissions(
+            judged,
+            bindings,
+            ctx.known_providers(),
+            &mut sink,
+        ),
+        None,
+    );
     errors.extend(sink.errors.into_iter().map(AppError::Validation));
     errors
 }
@@ -3272,20 +3279,10 @@ pub fn validate_resource_ref_types_with_ctx<
         ctx.provider_context().as_provider_context(),
     );
     let mut sink = CliTypeCheckSink { errors: Vec::new() };
-    let mut errors =
-        match validation::validate_resource_ref_types(judged, argument_names, &bindings, &mut sink)
-        {
-            Ok(()) => Vec::new(),
-            Err(validation::ResourceRefTypeValidationError::Validation(message)) => {
-                split_validation_message(&message)
-            }
-            Err(validation::ResourceRefTypeValidationError::Conversions(findings)) => {
-                conversion_diagnostics(findings)
-            }
-            Err(validation::ResourceRefTypeValidationError::AnalysisInvariant(error)) => {
-                vec![AppError::AnalysisInvariant(error)]
-            }
-        };
+    let mut errors = admission_diagnostics(
+        validation::validate_resource_ref_types(judged, argument_names, &bindings, &mut sink),
+        None,
+    );
     errors.extend(sink.errors.into_iter().map(AppError::Validation));
     errors
 }
@@ -4818,24 +4815,15 @@ pub(crate) fn validate_module_internal_ref_types(
             config.catalog(),
         );
         let mut sink = CliTypeCheckSink { errors: Vec::new() };
-        if let Err(joined) = validation::validate_resource_ref_types(
-            configuration.judged(),
-            &HashSet::new(),
-            &bindings,
-            &mut sink,
-        ) {
-            match joined {
-                validation::ResourceRefTypeValidationError::Validation(message) => {
-                    errors.extend(prefixed_validation_messages(&message, &prefix))
-                }
-                validation::ResourceRefTypeValidationError::Conversions(findings) => {
-                    errors.extend(conversion_diagnostics(findings))
-                }
-                validation::ResourceRefTypeValidationError::AnalysisInvariant(error) => {
-                    errors.push(AppError::AnalysisInvariant(error))
-                }
-            }
-        }
+        errors.extend(admission_diagnostics(
+            validation::validate_resource_ref_types(
+                configuration.judged(),
+                &HashSet::new(),
+                &bindings,
+                &mut sink,
+            ),
+            Some(&prefix),
+        ));
         for diagnostic in sink.errors {
             errors.extend(prefixed_validation_messages(&diagnostic, &prefix));
         }

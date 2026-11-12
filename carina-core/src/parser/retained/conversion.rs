@@ -46,7 +46,7 @@ pub struct MatchedConversionSource {
 /// ```compile_fail,E0451
 /// use carina_core::parser::retained::ConversionJudgement;
 /// fn forge() -> ConversionJudgement {
-///     ConversionJudgement { stamp: unreachable!(), location: unreachable!(), verdict: unreachable!(), destination_matched: true }
+///     ConversionJudgement { stamp: unreachable!(), location: unreachable!(), verdict: unreachable!() }
 /// }
 /// ```
 /// ```compile_fail,E0277
@@ -61,9 +61,8 @@ pub struct ConversionJudgement {
     stamp: SourceStamp,
     location: DeclarationLocation,
     verdict: ConversionVerdict,
-    destination_matched: bool,
 }
-enum ConversionVerdict {
+pub(crate) enum ConversionVerdict {
     Accepted(AssignmentFindings),
     Rejected(AssignmentFindings),
 }
@@ -79,7 +78,7 @@ impl ConversionJudgement {
         self,
         declaration: &CompiledAttributeType,
         cursor: &AuthoredCursor<'_, B>,
-    ) -> Result<AssignmentFindings, TypeError> {
+    ) -> Result<ConversionVerdict, ConversionError> {
         let matches = match &cursor.kind {
             CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => {
                 self.stamp == SourceStamp::new(usage, declaration)
@@ -87,43 +86,45 @@ impl ConversionJudgement {
             CursorKind::Projected(_) => false,
         };
         if !matches {
-            return Err(typed(
-                ConversionError::new(
-                    Kind::Destination,
-                    &self.location,
-                    "conversion verdict belongs to another authored use or destination",
-                )
-                .owned_by(self.stamp.node),
-            ));
+            return Err(ConversionError::new(
+                Kind::Destination,
+                &self.location,
+                "conversion verdict belongs to another authored use or destination",
+            )
+            .owned_by(self.stamp.node));
         }
-        let mut findings = match self.verdict {
-            ConversionVerdict::Accepted(findings) | ConversionVerdict::Rejected(findings) => {
-                findings
-            }
-        };
-        findings.matched_destination |= self.destination_matched;
-        Ok(findings)
+        Ok(self.verdict)
     }
 }
 
 fn claimed<B: BindingAddress>(
     usage: &AuthoredUse<'_, B>,
     declaration: &CompiledAttributeType,
-    findings: AssignmentFindings,
-    destination_matched: bool,
+    verdict: ConversionVerdict,
 ) -> AuthoredOutcome {
-    let verdict = if findings.errors.is_empty() {
-        ConversionVerdict::Accepted(findings)
-    } else {
-        ConversionVerdict::Rejected(findings)
-    };
     AuthoredOutcome::Claimed(ConversionJudgement {
         stamp: SourceStamp::new(usage, declaration),
         location: usage.node().location().authored,
         verdict,
-        destination_matched,
     })
 }
+fn rejected<B: BindingAddress>(
+    usage: &AuthoredUse<'_, B>,
+    declaration: &CompiledAttributeType,
+    failure: ConversionError,
+    matched_destination: bool,
+) -> AuthoredOutcome {
+    claimed(
+        usage,
+        declaration,
+        ConversionVerdict::Rejected(AssignmentFindings {
+            conversions: std::iter::once(failure).collect(),
+            matched_destination,
+            ..Default::default()
+        }),
+    )
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct SourceStamp {
     node: NodeId,
@@ -184,26 +185,16 @@ fn error<B: BindingAddress>(
         error
     }
 }
-fn typed(error: ConversionError) -> TypeError {
-    TypeError::Conversion {
-        error,
-        attribute: None,
-    }
-}
 fn rejection<B: BindingAddress>(
     usage: &AuthoredUse<'_, B>,
     declaration: &CompiledAttributeType,
     kind: Kind,
     message: &str,
-    path: &LeafPath,
 ) -> AuthoredOutcome {
-    claimed(
+    rejected(
         usage,
         declaration,
-        AssignmentFindings {
-            errors: vec![(path.clone(), typed(error(usage.node(), kind, message)))],
-            ..Default::default()
-        },
+        error(usage.conversion_owner(), kind, message),
         false,
     )
 }
@@ -287,29 +278,6 @@ fn destination<'d>(
     }
 }
 
-fn placement(edge: EdgeRole) -> Result<(), Kind> {
-    match edge {
-        EdgeRole::SecretArgument
-        | EdgeRole::ConvertOperand
-        | EdgeRole::InterpolationPart
-        | EdgeRole::CallArgument
-        | EdgeRole::ArithmeticOperand
-        | EdgeRole::AccessBase
-        | EdgeRole::AccessIndex
-        | EdgeRole::MapKey
-        | EdgeRole::Condition => Err(Kind::UnsupportedPosition),
-        EdgeRole::SlotRoot
-        | EdgeRole::Parens
-        | EdgeRole::IfBranch
-        | EdgeRole::CoalesceOperand
-        | EdgeRole::AliasDefinition
-        | EdgeRole::ListItem
-        | EdgeRole::MapValue
-        | EdgeRole::StructField
-        | EdgeRole::SequenceResult => Ok(()),
-    }
-}
-
 /// The sole authored B1 policy. Syntax navigation and value descent remain in
 /// the existing schema walk; this function only reads direct child evidence.
 pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: BindingAddress>(
@@ -328,35 +296,60 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
     let node = usage.node();
     match node.kind() {
         ExprKind::Convert { target } => {
-            match checked {
+            let discarded = match checked {
+                CheckValue::Current(_) => false,
+                CheckValue::Discarded => true,
                 CheckValue::Covered => {
                     return Ok(rejection(
                         &usage,
                         declaration,
                         Kind::UnsupportedPosition,
                         "conversion is not supported inside this expression",
-                        path,
                     ));
                 }
-                CheckValue::Current(_) | CheckValue::Discarded => {}
+            };
+            if usage.placement_edge() == EdgeRole::ConvertOperand {
+                return Ok(rejection(
+                    &usage,
+                    declaration,
+                    Kind::UnsupportedPosition,
+                    "a conversion cannot be the operand of another conversion",
+                ));
             }
-            if covered || placement(usage.placement_edge()).is_err() {
+            if covered || usage.placement_edge().restricts_conversion() {
                 return Ok(rejection(
                     &usage,
                     declaration,
                     Kind::UnsupportedPosition,
                     "conversion requires an independently typed destination",
-                    path,
                 ));
             }
-            let mut destination_matched = false;
+            let operand = node
+                .children()
+                .next()
+                .ok_or_else(|| {
+                    crate::validation::admission::assignment_seam_error(MissingEvidence::new(
+                        "conversion operand",
+                    ))
+                })?
+                .map_err(crate::validation::admission::assignment_seam_error)?;
+            let source = operand.judgement();
+            if source.is_conversion_output() {
+                return Ok(rejection(
+                    &usage,
+                    declaration,
+                    Kind::UnsupportedPosition,
+                    "a conversion cannot be the operand of another conversion",
+                ));
+            }
+            let mut matched_destination = false;
             let result = (|| {
                 let target = crate::conversion::resolve_target(
                     target.detail(),
                     &node.location().authored,
                     config,
                 )
-                .map_err(|e| typed(e.owned_by(node.node_id())))?;
+                .map_err(|failure| failure.owned_by(node.node_id()))?;
                 let selected = destination(declaration, &target, defs).map_err(|kind| {
                     error(
                         node,
@@ -364,97 +357,58 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
                         "conversion destination must have exactly one matching type identity",
                     )
                 })?;
-                destination_matched = true;
-                let operand = node
-                    .children()
-                    .next()
-                    .ok_or_else(|| {
-                        crate::validation::admission::assignment_seam_error(MissingEvidence::new(
-                            "conversion operand",
-                        ))
-                    })?
-                    .map_err(crate::validation::admission::assignment_seam_error)?;
-                if operand.judgement().is_conversion_output() {
-                    return Err(typed(error(
-                        node,
-                        Kind::UnsupportedPosition,
-                        "a conversion cannot be the operand of another conversion",
-                    )));
+                matched_destination = true;
+                let message = if discarded {
+                    "discarded conversion operand has an incompatible scalar kind"
+                } else {
+                    "conversion operand has no compatible scalar source judgement"
+                };
+                let source_type = check_scalar_kind(selected, source)
+                    .map_err(|kind| error(node, kind, message))?;
+                if discarded {
+                    return Ok(AssignmentFindings::default());
                 }
-                let source = operand.judgement();
-                match checked {
-                    CheckValue::Discarded => {
-                        check_scalar_kind(selected, source).map_err(|kind| {
-                            typed(error(
-                                node,
-                                kind,
-                                "discarded conversion operand has an incompatible scalar kind",
-                            ))
-                        })?;
-                    }
-                    CheckValue::Current(_) => {
-                        let source_type = check_scalar_kind(selected, source).map_err(|kind| {
-                            typed(error(
-                                node,
-                                kind,
-                                "conversion operand has no compatible scalar source judgement",
-                            ))
-                        })?;
-                        if let TypeExpr::SchemaType { owned } = source_type {
-                            let declaration = crate::conversion::source_declaration(
-                                owned,
-                                &node.location().authored,
-                                config,
-                            )
-                            .map_err(|error| typed(error.owned_by(node.node_id())))?;
-                            if let Some(bounds) = DeclarationBounds::from_declaration(selected)
-                                && DeclarationBounds::from_declaration(&declaration)
-                                    .is_some_and(|source| source.disjoint(&bounds))
-                            {
-                                return Err(typed(error(
-                                    node,
-                                    Kind::Disjoint,
-                                    "conversion source and destination declaration bounds are disjoint",
-                                )));
-                            }
-                        }
-                        let matched = MatchedConversionSource {
-                            stamp: SourceStamp::new(&usage, selected),
-                            location: node.location().authored,
-                        };
-                        return crate::validation::admission::conversion_local::<K, B>(
-                            matched, &usage, selected, path,
-                        )
-                        .map(|findings| claimed(&usage, declaration, findings, true));
-                    }
-                    CheckValue::Covered => {
-                        return Err(typed(error(
+                if let TypeExpr::SchemaType { owned } = source_type {
+                    let source_declaration = crate::conversion::source_declaration(
+                        owned,
+                        &node.location().authored,
+                        config,
+                    )
+                    .map_err(|failure| failure.owned_by(node.node_id()))?;
+                    if let Some(bounds) = DeclarationBounds::from_declaration(selected)
+                        && DeclarationBounds::from_declaration(&source_declaration)
+                            .is_some_and(|source| source.disjoint(&bounds))
+                    {
+                        return Err(error(
                             node,
-                            Kind::UnsupportedPosition,
-                            "covered conversion",
-                        )));
+                            Kind::Disjoint,
+                            "conversion source and destination declaration bounds are disjoint",
+                        ));
                     }
                 }
-                Ok(claimed(&usage, declaration, Default::default(), true))
+                let matched = MatchedConversionSource {
+                    stamp: SourceStamp::new(&usage, selected),
+                    location: node.location().authored,
+                };
+                crate::validation::admission::conversion_local::<K, B>(
+                    matched, &usage, selected, path,
+                )
             })();
             Ok(match result {
-                Ok(outcome) => outcome,
-                Err(failure) => {
-                    let failure = if node.judgement().diagnostic_is_secret() {
+                Ok(mut findings) => {
+                    findings.matched_destination = true;
+                    claimed(&usage, declaration, ConversionVerdict::Accepted(findings))
+                }
+                Err(failure) => rejected(
+                    &usage,
+                    declaration,
+                    if node.judgement().diagnostic_is_secret() {
                         failure.inside_secret()
                     } else {
                         failure
-                    };
-                    claimed(
-                        &usage,
-                        declaration,
-                        AssignmentFindings {
-                            errors: vec![(path.clone(), failure)],
-                            ..Default::default()
-                        },
-                        destination_matched,
-                    )
-                }
+                    },
+                    matched_destination,
+                ),
             })
         }
         ExprKind::If | ExprKind::Coalesce => {
@@ -490,7 +444,6 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
                             declaration,
                             Kind::UnsupportedPosition,
                             "conversion and ordinary alternatives cannot share a destination",
-                            path,
                         ));
                     }
                 }
@@ -539,30 +492,30 @@ impl<B: BindingAddress> ExpressionReport<B> {
     pub fn conversion_completeness(
         &self,
         coverage: &crate::schema::value_validation::WalkCoverage,
-    ) -> crate::ConversionChannel {
+    ) -> Result<crate::ConversionChannel, CompletenessErrors> {
         let report = self.completeness_report(coverage);
+        if !report.correspondence_errors().is_empty() {
+            return Err(CompletenessErrors::new(report.correspondence_errors()));
+        }
         // A real boundary use owns the rejection ahead of its definition-only
         // record. Partition completed evidence; do not revisit syntax or values.
         let (definitions, uses): (Vec<_>, Vec<_>) = report
             .unreached(|node| matches!(node.kind(), ExprKind::Convert { .. }))
             .partition(|usage| usage.definition_only());
-        uses.into_iter()
+        Ok(uses
+            .into_iter()
             .chain(definitions)
             .map(|usage| {
-                error(
-                    usage.node(),
-                    if usage.definition_only() {
-                        Kind::Unused
-                    } else {
-                        Kind::UnsupportedPosition
-                    },
-                    if usage.definition_only() {
-                        "conversion has no typed destination use"
-                    } else {
-                        "conversion boundary is not supported until B2"
-                    },
-                )
+                let (kind, message) = if usage.definition_only() {
+                    (Kind::Unused, "conversion has no typed destination use")
+                } else {
+                    (
+                        Kind::UnsupportedPosition,
+                        "conversion is not supported at this position",
+                    )
+                };
+                error(usage.node(), kind, message)
             })
-            .collect()
+            .collect())
     }
 }

@@ -107,6 +107,31 @@ pub enum EdgeRole {
     SequenceResult,
 }
 
+impl EdgeRole {
+    pub(crate) fn restricts_conversion(self) -> bool {
+        match self {
+            Self::SecretArgument
+            | Self::ConvertOperand
+            | Self::InterpolationPart
+            | Self::CallArgument
+            | Self::ArithmeticOperand
+            | Self::AccessBase
+            | Self::AccessIndex
+            | Self::MapKey
+            | Self::Condition => true,
+            Self::SlotRoot
+            | Self::Parens
+            | Self::IfBranch
+            | Self::CoalesceOperand
+            | Self::AliasDefinition
+            | Self::ListItem
+            | Self::MapValue
+            | Self::StructField
+            | Self::SequenceResult => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthoredForm {
     Forward,
@@ -345,7 +370,13 @@ pub struct AuthoredUse<'s, B: BindingAddress = RelativeBindingName> {
     edge: EdgeRole,
     visit: ProjectionVisit,
     definition_only: bool,
-    restriction: Option<EdgeRole>,
+    restriction: Option<std::rc::Rc<ConversionRestriction<'s, B>>>,
+}
+
+#[derive(Debug, Clone)]
+struct ConversionRestriction<'s, B: BindingAddress> {
+    edge: EdgeRole,
+    owner: JudgedNodeRef<'s, B>,
 }
 
 impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
@@ -450,7 +481,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
                 ),
                 instance: self.instance,
                 edge: EdgeRole::AliasDefinition,
-                restriction: self.inherited_restriction(),
+                restriction: self.inherited_restriction(EdgeRole::AliasDefinition),
                 visit: ProjectionVisit::Value,
                 definition_only: self.definition_only,
             }
@@ -619,7 +650,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             },
             instance: self.instance,
             edge,
-            restriction: self.inherited_restriction(),
+            restriction: self.inherited_restriction(edge),
             visit: ProjectionVisit::Value,
             definition_only: self.definition_only,
         }
@@ -627,29 +658,40 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
     }
 
     pub(crate) fn placement_edge(&self) -> EdgeRole {
-        self.restriction.unwrap_or(self.edge)
+        self.restriction
+            .as_ref()
+            .map_or(self.edge, |restriction| restriction.edge)
     }
-    fn inherited_restriction(&self) -> Option<EdgeRole> {
-        self.restriction.or(match self.edge {
-            EdgeRole::SecretArgument
-            | EdgeRole::ConvertOperand
-            | EdgeRole::InterpolationPart
-            | EdgeRole::CallArgument
-            | EdgeRole::ArithmeticOperand
-            | EdgeRole::AccessBase
-            | EdgeRole::AccessIndex
-            | EdgeRole::MapKey
-            | EdgeRole::Condition => Some(self.edge),
-            EdgeRole::SlotRoot
-            | EdgeRole::Parens
-            | EdgeRole::IfBranch
-            | EdgeRole::CoalesceOperand
-            | EdgeRole::AliasDefinition
-            | EdgeRole::ListItem
-            | EdgeRole::MapValue
-            | EdgeRole::StructField
-            | EdgeRole::SequenceResult => None,
-        })
+    pub(crate) fn conversion_owner(&self) -> &JudgedNodeRef<'s, B> {
+        match &self.restriction {
+            Some(restriction) if matches!(restriction.owner.kind(), ExprKind::Convert { .. }) => {
+                &restriction.owner
+            }
+            Some(_) | None => &self.node,
+        }
+    }
+    fn inherited_restriction(
+        &self,
+        edge: EdgeRole,
+    ) -> Option<std::rc::Rc<ConversionRestriction<'s, B>>> {
+        match &self.restriction {
+            Some(restriction)
+                if edge == EdgeRole::ConvertOperand
+                    && !matches!(restriction.owner.kind(), ExprKind::Convert { .. }) =>
+            {
+                Some(std::rc::Rc::new(ConversionRestriction {
+                    edge: restriction.edge,
+                    owner: self.node.clone(),
+                }))
+            }
+            Some(restriction) => Some(restriction.clone()),
+            None => edge.restricts_conversion().then(|| {
+                std::rc::Rc::new(ConversionRestriction {
+                    edge,
+                    owner: self.node.clone(),
+                })
+            }),
+        }
     }
 
     pub fn node(&self) -> &JudgedNodeRef<'s, B> {

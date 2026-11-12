@@ -3,9 +3,7 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 use tower_lsp::lsp_types::{DiagnosticSeverity, Position};
 
 #[test]
-fn conversion_lsp_chained_wrappers_keep_distinct_convert_ranges() {
-    let body = "mock.Sink { name = 'ok' as String as String }";
-    let source = format!("provider mock {{}}\n{body}\n");
+fn conversion_lsp_chains_report_one_outer_diagnostic() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
@@ -15,30 +13,28 @@ fn conversion_lsp_chained_wrappers_keep_distinct_convert_ranges() {
             .unwrap(),
     );
     let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
-    let document = create_document(&source);
-    let diagnostics = engine.analyze(&document, None);
-    let errors = diagnostics
-        .iter()
-        .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
-        .collect::<Vec<_>>();
-    assert_eq!(errors.len(), 2, "{diagnostics:#?}");
-    assert!(
-        errors
+    for depth in [2, 3] {
+        let body = format!("mock.Sink {{ name = 'ok'{} }}", " as String".repeat(depth));
+        let source = format!("provider mock {{}}\n{body}\n");
+        let diagnostics = engine.analyze(&create_document(&source), None);
+        let errors = diagnostics
             .iter()
-            .all(|error| error.range.start == Position::new(1, body.find("'ok'").unwrap() as u32))
-    );
-    let mut ends = errors
-        .iter()
-        .map(|error| error.range.end.character)
-        .collect::<Vec<_>>();
-    ends.sort();
-    assert_eq!(
-        ends,
-        [
-            (body.find("String").unwrap() + 6) as u32,
-            (body.rfind("String").unwrap() + 6) as u32
-        ]
-    );
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            errors[0].range.start,
+            Position::new(1, body.find("'ok'").unwrap() as u32)
+        );
+        assert_eq!(
+            errors[0].range.end,
+            Position::new(1, (body.rfind("String").unwrap() + 6) as u32)
+        );
+        assert_eq!(
+            errors[0].message,
+            "a conversion cannot be the operand of another conversion"
+        );
+    }
 }
 
 #[test]

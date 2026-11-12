@@ -687,8 +687,6 @@ fn parse_primary_eval_with_mode_inner(
                 message: "Resource expressions can only be used in let bindings".to_string(),
             })
         }
-        Rule::list => parse_list_eval(inner, ctx, mode),
-        Rule::map => parse_map_eval(inner, ctx, mode),
         Rule::namespaced_id => parse_namespaced_id_value(inner, ctx, Vec::new()),
         Rule::subscripted_id => {
             // `binding.field[idx]`, `binding.field.subfield[idx]…`,
@@ -1044,8 +1042,6 @@ fn parse_primary_eval_with_mode_inner(
                 }
             }
         }
-        Rule::if_expr => parse_if_value_expr_with_mode(inner, ctx, mode),
-        Rule::expression => parse_expression_eval_with_mode(inner, ctx, mode),
         Rule::read_resource_expr
         | Rule::wait_expr
         | Rule::upstream_state_expr

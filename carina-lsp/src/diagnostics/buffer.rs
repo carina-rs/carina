@@ -7,6 +7,16 @@ pub(super) fn render_document_parse_error(doc: &Document) -> Option<Diagnostic> 
         .map(|error| parse_error_in_document(doc, error))
 }
 
+pub(super) fn render_completeness_errors(
+    error: &carina_core::parser::retained::CompletenessErrors,
+) -> Vec<Diagnostic> {
+    error
+        .errors()
+        .iter()
+        .map(|error| carina_diagnostic(0, 0, 1, DiagnosticSeverity::ERROR, error.to_string()))
+        .collect()
+}
+
 /// Create a `Diagnostic` on a single line with the standard "carina" source.
 fn carina_diagnostic(
     line: u32,

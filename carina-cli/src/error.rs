@@ -1415,8 +1415,11 @@ pub enum AppError {
     ),
 
     /// A complete located diagnostic, with typed metadata available separately.
-    #[error("{}:{}:{}: {}", .error.location().file().path().display(), .error.location().span().start_line(), .error.location().span().start_column(), .error.diagnostic_message())]
+    #[error("{}", .error.diagnostic())]
     CheckedConversion { error: carina_core::ConversionError },
+
+    #[error(transparent)]
+    AuthoredCompleteness(carina_core::parser::retained::CompletenessErrors),
 
     /// Validation errors (schema mismatch, invalid config, etc.)
     #[error("{0}")]

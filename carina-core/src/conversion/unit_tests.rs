@@ -54,23 +54,6 @@ fn conversion_error_wrappers_render_each_message_once() -> Result<(), String> {
         Box::new(InferenceIssue::Failed(InferenceError::Conversion(
             conversion.clone(),
         ))),
-        Box::new(TypeError::from(conversion.clone())),
-        Box::new(TypeError::ListItemError {
-            index: 1,
-            inner: Box::new(TypeError::from(conversion.clone())),
-        }),
-        Box::new(TypeError::MapKeyError {
-            key: "key".into(),
-            inner: Box::new(TypeError::from(conversion.clone())),
-        }),
-        Box::new(TypeError::MapValueError {
-            key: "key".into(),
-            inner: Box::new(TypeError::from(conversion.clone())),
-        }),
-        Box::new(TypeError::StructFieldError {
-            field: "field".into(),
-            inner: Box::new(TypeError::from(conversion.clone())),
-        }),
     ];
     for wrapper in wrappers {
         let rendered = crate::executor::render_error_chain(wrapper.as_ref());
@@ -101,12 +84,19 @@ fn conversion_aggregate_wrappers_render_each_message_once() -> Result<(), String
     let mut findings = ConversionFindings::default();
     findings.extend(std::iter::once(conversion.clone()).collect());
     let wrappers: Vec<Box<dyn Error>> = vec![
-        Box::new(findings),
-        Box::new(std::iter::once(conversion.clone()).collect::<ConversionChannel>()),
+        Box::new(crate::validation::ResourceValidationReport {
+            ordinary: String::new(),
+            conversions: findings,
+        }),
         Box::new({
             let mut findings = ConversionFindings::default();
             findings.extend(std::iter::once(conversion.clone()).collect());
-            crate::validation::ResourceRefTypeValidationError::Conversions(findings)
+            crate::validation::ResourceRefTypeValidationError::Validation(
+                crate::validation::ResourceValidationReport {
+                    ordinary: String::new(),
+                    conversions: findings,
+                },
+            )
         }),
     ];
     for wrapper in wrappers {

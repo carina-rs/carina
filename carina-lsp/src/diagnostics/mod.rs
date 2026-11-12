@@ -2305,9 +2305,11 @@ impl DiagnosticRun<'_> {
                     conversion_findings.extend(findings);
                 }
             }
-            conversion_findings
-                .extend(expression_report.conversion_completeness(&authored_coverage));
-            for error in conversion_findings.into_parts().0 {
+            match expression_report.conversion_completeness(&authored_coverage) {
+                Ok(findings) => conversion_findings.extend(findings),
+                Err(error) => diagnostics.extend(buffer::render_completeness_errors(&error)),
+            }
+            for error in conversion_findings.into_findings() {
                 let finding = carina_core::parser::Located::new(error.location().clone(), error);
                 diagnostics.extend(render_merged(
                     doc,
@@ -2785,7 +2787,6 @@ fn is_duplicate_list_error(error: &TypeError) -> bool {
             alternatives: _,
         }
         | TypeError::UnionAlternativesMismatch { failures: _ }
-        | TypeError::Conversion { .. }
         | TypeError::BlockSyntaxNotAllowed { attribute: _ } => false,
     }
 }

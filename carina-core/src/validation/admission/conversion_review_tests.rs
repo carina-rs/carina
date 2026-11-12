@@ -3,6 +3,22 @@ use crate::parser::retained::{AuthoredCursor, ProjectedPhase};
 use crate::schema::AttributeType;
 
 #[test]
+fn ordinary_admission_findings_remain_terminal() {
+    let error = constraints(vec![AdmissionFinding {
+        path: LeafPath::from_segments([]),
+        error: TypeError::MissingRequired {
+            name: "ordinary-sentinel".into(),
+        },
+    }]);
+    let rendered = crate::executor::render_error_chain(error.resolution_error());
+    assert_eq!(
+        rendered.matches("ordinary-sentinel").count(),
+        1,
+        "{rendered}"
+    );
+}
+
+#[test]
 fn conversion_admission_error_renders_its_typed_channel_once() {
     let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let parsed = crate::parser::parse_file(

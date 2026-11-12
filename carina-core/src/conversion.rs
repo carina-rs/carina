@@ -26,7 +26,6 @@ pub enum ConversionErrorKind {
     /// Unsupported authored placement, including boundary placeholders until B2.
     UnsupportedPosition,
     Unused,
-    Cycle,
     Target,
     Source,
     ScalarKind,
@@ -126,11 +125,6 @@ impl ConversionError {
                 .and_then(crate::parser::ParseError::conversion_error)
                 .or_else(|| {
                     error
-                        .downcast_ref::<crate::schema::TypeError>()
-                        .and_then(crate::schema::TypeError::conversion_error)
-                })
-                .or_else(|| {
-                    error
                         .downcast_ref::<crate::static_type::InferenceError>()
                         .and_then(crate::static_type::InferenceError::conversion_error)
                 })
@@ -148,13 +142,8 @@ impl ConversionError {
                 })
                 .or_else(|| {
                     error
-                        .downcast_ref::<ConversionFindings>()
-                        .and_then(|findings| findings.findings().first())
-                })
-                .or_else(|| {
-                    error
-                        .downcast_ref::<ConversionChannel>()
-                        .and_then(|channel| channel.findings().first())
+                        .downcast_ref::<crate::validation::ResourceValidationReport>()
+                        .and_then(|report| report.conversions().findings().first())
                 })
                 .or_else(|| {
                     error
@@ -223,7 +212,6 @@ impl ConversionError {
                 ConversionErrorKind::Destination
                 | ConversionErrorKind::AmbiguousDestination
                 | ConversionErrorKind::Unused
-                | ConversionErrorKind::Cycle
                 | ConversionErrorKind::Target
                 | ConversionErrorKind::ScalarKind
                 | ConversionErrorKind::Disjoint => "checked conversion failed",
@@ -250,6 +238,10 @@ impl ConversionError {
             cause,
         ))));
         error
+    }
+    /// One located formatter for parse-time and validation-time diagnostics.
+    pub fn diagnostic(&self) -> crate::parser::Located<String> {
+        crate::parser::Located::new(self.location().clone(), self.diagnostic_message())
     }
     pub fn diagnostic_message(&self) -> String {
         let mut message = self.to_string();
@@ -302,27 +294,22 @@ impl InsideSecret for ConversionError {
 #[derive(Debug, Default)]
 pub struct ConversionFindings {
     findings: Vec<ConversionError>,
-    ordinary: Vec<String>,
     owners: std::collections::HashSet<crate::parser::retained::NodeId>,
 }
 impl ConversionFindings {
     /// The sole diagnostic deduplication owner, shared by CLI and LSP.
     pub fn extend(&mut self, channel: ConversionChannel) {
-        for error in channel.findings {
+        for error in channel.into_findings() {
             if error.owner().is_none_or(|owner| self.owners.insert(owner)) {
                 self.findings.push(error);
             }
         }
     }
-    pub(crate) fn with_ordinary(mut self, ordinary: Vec<String>) -> Self {
-        self.ordinary = ordinary;
-        self
-    }
     pub fn findings(&self) -> &[ConversionError] {
         &self.findings
     }
-    pub fn into_parts(self) -> (Vec<ConversionError>, Vec<String>) {
-        (self.findings, self.ordinary)
+    pub fn into_findings(self) -> Vec<ConversionError> {
+        self.findings
     }
 }
 
@@ -330,78 +317,67 @@ impl ConversionFindings {
 /// cannot carry an ordinary error and does not deduplicate per-use evidence.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConversionChannel {
+    // Empty successful walks allocate nothing, and every cached findings value
+    // carries only this pointer rather than another inline Vec.
+    findings: Option<Box<ConversionChannelData>>,
+}
+#[derive(Debug, Clone, PartialEq)]
+struct ConversionChannelData {
     findings: Vec<ConversionError>,
 }
 impl ConversionChannel {
     pub fn findings(&self) -> &[ConversionError] {
-        &self.findings
+        self.findings
+            .as_deref()
+            .map_or(&[], |data| data.findings.as_slice())
+    }
+    fn into_findings(self) -> Vec<ConversionError> {
+        self.findings.map_or_else(Vec::new, |data| data.findings)
     }
     pub(crate) fn append(&mut self, other: Self) {
-        self.findings.extend(other.findings);
-    }
-    /// Called only while constructing output reports, never by accessors or
-    /// diagnostic consumers. Internal TypeError carriers stop at this boundary.
-    pub(crate) fn ordinary(
-        &mut self,
-        error: crate::schema::TypeError,
-    ) -> Option<crate::schema::TypeError> {
-        if let Some(conversion) = ConversionError::from_error(&error) {
-            self.findings.push(conversion.clone());
-            None
-        } else {
-            Some(error)
+        if let Some(other) = other.findings {
+            match &mut self.findings {
+                Some(data) => data.findings.extend(other.findings),
+                None => self.findings = Some(other),
+            }
         }
     }
 }
 impl FromIterator<ConversionError> for ConversionChannel {
     fn from_iter<T: IntoIterator<Item = ConversionError>>(iter: T) -> Self {
+        let findings = iter.into_iter().collect::<Vec<_>>();
         Self {
-            findings: iter.into_iter().collect(),
+            findings: (!findings.is_empty()).then(|| Box::new(ConversionChannelData { findings })),
         }
     }
 }
 impl InsideSecret for ConversionChannel {
     fn inside_secret(self) -> Self {
-        Self {
-            findings: self.findings.inside_secret(),
-        }
+        self.into_findings().inside_secret().into_iter().collect()
     }
+}
+fn fmt_conversions(
+    findings: &[ConversionError],
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    for (index, error) in findings.iter().enumerate() {
+        if index != 0 {
+            writeln!(f)?;
+        }
+        write!(f, "{}", error.diagnostic())?;
+    }
+    Ok(())
 }
 impl std::fmt::Display for ConversionChannel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (index, error) in self.findings.iter().enumerate() {
-            if index != 0 {
-                writeln!(f)?;
-            }
-            write!(
-                f,
-                "{}",
-                crate::parser::Located::new(error.location().clone(), error.diagnostic_message())
-            )?;
-        }
-        Ok(())
+        fmt_conversions(self.findings(), f)
     }
 }
-impl std::error::Error for ConversionChannel {}
 impl std::fmt::Display for ConversionFindings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (index, error) in self.findings.iter().enumerate() {
-            if index != 0 {
-                writeln!(f)?;
-            }
-            write!(
-                f,
-                "{}",
-                crate::parser::Located::new(error.location().clone(), error.diagnostic_message())
-            )?;
-        }
-        for error in &self.ordinary {
-            write!(f, "\n{error}")?;
-        }
-        Ok(())
+        fmt_conversions(self.findings(), f)
     }
 }
-impl std::error::Error for ConversionFindings {}
 
 pub(crate) fn resolve_target(
     path: &ConversionTypePath,
@@ -556,7 +532,7 @@ impl DeclarationBounds {
                 let (c, d) = member_layer.length.unwrap_or((None, None));
                 Some(Self::String {
                     min: a.unwrap_or(0).max(c.unwrap_or(0)),
-                    max: minimum(b, d),
+                    max: b.into_iter().chain(d).min(),
                 })
             }
             RawShape::Int {
@@ -566,8 +542,8 @@ impl DeclarationBounds {
                 let (a, b) = identity_layer.range.unwrap_or((None, None));
                 let (c, d) = member_layer.range.unwrap_or((None, None));
                 Some(Self::Int {
-                    min: maximum(a, c),
-                    max: minimum(b, d),
+                    min: a.max(c),
+                    max: b.into_iter().chain(d).min(),
                 })
             }
             RawShape::Float { range, .. } => {
@@ -604,18 +580,6 @@ impl DeclarationBounds {
             | (Self::Int { .. }, Self::String { .. } | Self::Float { .. })
             | (Self::Float { .. }, Self::String { .. } | Self::Int { .. }) => false,
         }
-    }
-}
-fn minimum<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
-}
-fn maximum<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (a, b) => a.or(b),
     }
 }
 

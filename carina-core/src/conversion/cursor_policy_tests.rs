@@ -3,6 +3,88 @@ use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegist
 use std::{collections::HashSet, path::Path};
 
 #[test]
+fn conversion_chains_have_one_outer_diagnostic() {
+    for depth in [2, 3] {
+        let source = format!(
+            "mock.Sink {{ target = 'ok'{} }}",
+            " as mock.Name".repeat(depth)
+        );
+        let error = check(&source, &schema()).unwrap_err();
+        let crate::validation::ResourceRefTypeValidationError::Validation(report) = error else {
+            panic!("typed conversion required: {error:?}");
+        };
+        let findings = report.conversions();
+        assert_eq!(findings.findings().len(), 1, "{depth}: {findings:?}");
+        let error = &findings.findings()[0];
+        assert!(
+            error
+                .diagnostic_message()
+                .contains("cannot be the operand of another conversion"),
+            "{error}"
+        );
+        assert_eq!(
+            error.location().span().start_column(),
+            source.find("'ok'").unwrap() + 1
+        );
+        assert_eq!(
+            error.location().span().end_column(),
+            source.rfind(" }").unwrap() + 1
+        );
+    }
+}
+
+#[test]
+fn conversion_chains_keep_outer_owner_under_existing_restrictions() {
+    for depth in [2, 3] {
+        let chain = format!("'ok'{}", " as mock.Name".repeat(depth));
+        for (expression, message) in [
+            (
+                format!("secret({chain})"),
+                "checked conversion failed: (secret) failed validation",
+            ),
+            (
+                format!("\"${{{chain}}}\""),
+                "conversion is not supported inside this expression",
+            ),
+        ] {
+            let source = format!("mock.Sink {{ target = {expression} }}");
+            let error = check(&source, &schema()).unwrap_err();
+            let crate::validation::ResourceRefTypeValidationError::Validation(report) = error
+            else {
+                panic!("typed findings required: {error:?}");
+            };
+            let errors = report.conversions().findings();
+            assert_eq!(errors.len(), 1, "{source}: {errors:?}");
+            assert_eq!(errors[0].diagnostic_message(), message);
+            assert_eq!(
+                errors[0].location().span().start_column(),
+                source.find("'ok'").unwrap() + 1
+            );
+            assert_eq!(
+                errors[0].location().span().end_column(),
+                source.rfind("mock.Name").unwrap() + "mock.Name".len() + 1
+            );
+        }
+    }
+}
+
+#[test]
+fn conversion_without_resource_schema_reports_unsupported_position() {
+    let source = "mock.Unknown { target = 'ok' as mock.Name }";
+    let error = check(source, &schema()).unwrap_err();
+    let conversion = ConversionError::from_error(&error).unwrap();
+    assert_eq!(conversion.kind(), ConversionErrorKind::UnsupportedPosition);
+    assert_eq!(
+        conversion.diagnostic_message(),
+        "conversion is not supported at this position"
+    );
+    let crate::validation::ResourceRefTypeValidationError::Validation(report) = error else {
+        panic!("typed findings report required");
+    };
+    assert_eq!(report.ordinary(), "Unknown resource type: mock.Unknown");
+}
+
+#[test]
 fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots() {
     use crate::validation::admission::attributes::{
         ResourceAttributeInputs, resource_attribute_admissions,
@@ -69,22 +151,11 @@ fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots()
         }
     });
     assert_eq!(resources, 2);
-    conversions.extend(judged.report().conversion_completeness(&coverage));
+    conversions.extend(judged.report().conversion_completeness(&coverage).unwrap());
     assert_eq!(conversions.findings().len(), 1);
     assert_eq!(
         conversions.findings()[0].kind(),
         ConversionErrorKind::ScalarKind
-    );
-    let report =
-        crate::schema::ResourceValueValidation::from_errors(vec![crate::schema::TypeError::from(
-            conversions.findings()[0].clone(),
-        )]);
-    assert_eq!(report.errors().count(), 0);
-    assert_eq!(report.symbolic_errors().count(), 0);
-    assert_eq!(
-        report.conversions().findings().len(),
-        1,
-        "non-symbolic conversion must survive"
     );
 }
 
@@ -274,9 +345,10 @@ fn conversion_boundary_alias_use_takes_precedence_over_unused_definition() {
         "let converted = 'ok' as mock.Name\nprovider mock { endpoint = converted }",
     ] {
         let error = check(source, &schema()).unwrap_err();
-        let crate::validation::ResourceRefTypeValidationError::Conversions(findings) = error else {
+        let crate::validation::ResourceRefTypeValidationError::Validation(report) = error else {
             panic!("typed conversion finding required");
         };
+        let findings = report.conversions();
         assert_eq!(findings.findings().len(), 1, "{source}: {findings:?}");
         assert_eq!(
             findings.findings()[0].kind(),
@@ -341,9 +413,10 @@ fn conversion_discarded_union_rejects_ambiguous_identity() {
         ConversionError::from_error(&error).unwrap().kind(),
         ConversionErrorKind::AmbiguousDestination
     );
-    let crate::validation::ResourceRefTypeValidationError::Conversions(findings) = error else {
+    let crate::validation::ResourceRefTypeValidationError::Validation(report) = error else {
         panic!("structured conversion errors required");
     };
+    let findings = report.conversions();
     assert_eq!(
         findings.findings().len(),
         2,
@@ -612,9 +685,10 @@ fn conversion_covered_mixed_branches_report_the_convert_once() {
     );
     let source = "mock.Sink { target = \"${if true { 'ok' as mock.Name } else { 'ok' }}\" }";
     let error = check(source, &schemas).unwrap_err();
-    let crate::validation::ResourceRefTypeValidationError::Conversions(findings) = error else {
+    let crate::validation::ResourceRefTypeValidationError::Validation(report) = error else {
         panic!("typed conversion finding required");
     };
+    let findings = report.conversions();
     assert_eq!(findings.findings().len(), 1, "{findings:?}");
     assert_eq!(
         findings.findings()[0].location().span().start_column(),

@@ -1,6 +1,30 @@
 use super::*;
 
 #[test]
+fn conversion_completeness_surfaces_missing_judgement() {
+    let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = super::super::parse_file(
+        "provider mock { endpoint = 'ok' as String }",
+        Path::new("missing.crn"),
+        &catalog,
+    )
+    .unwrap();
+    let mut report = parsed.expression_report().clone();
+    Arc::make_mut(&mut report.nodes).clear();
+    let error = report
+        .conversion_completeness(&Default::default())
+        .unwrap_err();
+    assert!(!error.errors().is_empty());
+    assert!(
+        error
+            .errors()
+            .iter()
+            .all(|error| error.to_string().contains("completeness node")),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn conversion_discarded_union_claim_is_judged_once_and_covers_wrapped_leaf() {
     use crate::schema::value_validation::{
         AssignmentScope, AuthoredChecks, RequiredAssignmentCallbacks,
@@ -53,7 +77,8 @@ fn conversion_discarded_union_claim_is_judged_once_and_covers_wrapped_leaf() {
         2,
         "only the two parens wrappers retain ordinary checks; the claimed leaf has none"
     );
-    assert_eq!(findings.authored.errors.len(), 1);
+    assert!(findings.authored.errors.is_empty());
+    assert_eq!(findings.authored.conversions.findings().len(), 1);
 }
 
 #[test]

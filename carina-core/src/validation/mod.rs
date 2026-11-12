@@ -5325,17 +5325,50 @@ fn validate_resources_from_report<
 pub enum ResourceRefTypeValidationError {
     #[error(transparent)]
     AnalysisInvariant(#[from] crate::parser::AnalysisTreeError),
-    #[error("{0}")]
-    Validation(String),
     #[error(transparent)]
-    Conversions(crate::conversion::ConversionFindings),
+    Validation(ResourceValidationReport),
+    #[error(transparent)]
+    Correspondence(#[from] crate::parser::retained::CompletenessErrors),
 }
 
+/// Both diagnostic channels survive independently through the core/CLI boundary.
+#[derive(Debug)]
+pub struct ResourceValidationReport {
+    pub(crate) ordinary: String,
+    pub(crate) conversions: crate::ConversionFindings,
+}
+impl ResourceValidationReport {
+    pub fn ordinary(&self) -> &str {
+        &self.ordinary
+    }
+    pub fn conversions(&self) -> &crate::ConversionFindings {
+        &self.conversions
+    }
+    pub fn into_parts(self) -> (String, crate::ConversionFindings) {
+        (self.ordinary, self.conversions)
+    }
+    pub fn lines(&self) -> std::str::Lines<'_> {
+        self.ordinary.lines()
+    }
+}
+impl std::fmt::Display for ResourceValidationReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.conversions)?;
+        if !self.ordinary.is_empty() {
+            if !self.conversions.findings().is_empty() {
+                writeln!(f)?;
+            }
+            f.write_str(&self.ordinary)?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for ResourceValidationReport {}
 impl ResourceRefTypeValidationError {
     pub fn conversion_error(&self) -> Option<&crate::ConversionError> {
         match self {
-            Self::Conversions(findings) => findings.findings().first(),
-            Self::AnalysisInvariant(_) | Self::Validation(_) => None,
+            Self::Validation(report) => report.conversions.findings().first(),
+            Self::AnalysisInvariant(_) | Self::Correspondence(_) => None,
         }
     }
 }
@@ -5351,20 +5384,22 @@ pub fn validate_resource_ref_types<
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
 ) -> Result<(), ResourceRefTypeValidationError> {
     let report = resource_admission_report(judged, bindings, diagnostics)?;
-    if !report.conversions.findings().is_empty() {
-        return Err(ResourceRefTypeValidationError::Conversions(
-            report.conversions.with_ordinary(report.references),
-        ));
-    }
-    validation_messages_result(report.references)
+    validation_findings_result(report.references, report.conversions)
 }
 
-fn validation_messages_result(errors: Vec<String>) -> Result<(), ResourceRefTypeValidationError> {
-    if errors.is_empty() {
+fn validation_findings_result(
+    errors: Vec<String>,
+    conversions: crate::ConversionFindings,
+) -> Result<(), ResourceRefTypeValidationError> {
+    let ordinary = errors.join("\n");
+    if ordinary.is_empty() && conversions.findings().is_empty() {
         Ok(())
     } else {
         Err(ResourceRefTypeValidationError::Validation(
-            errors.join("\n"),
+            ResourceValidationReport {
+                ordinary,
+                conversions,
+            },
         ))
     }
 }
@@ -5394,12 +5429,7 @@ pub fn validate_resource_admissions<
         errors.push(values);
     }
     errors.extend(report.references);
-    if !report.conversions.findings().is_empty() {
-        return Err(ResourceRefTypeValidationError::Conversions(
-            report.conversions.with_ordinary(errors),
-        ));
-    }
-    validation_messages_result(errors)
+    validation_findings_result(errors, report.conversions)
 }
 
 fn publish_admission_diagnostics<T>(
@@ -5646,7 +5676,7 @@ fn resource_admission_report<
     for values in attributes.values_mut() {
         conversions.extend(values.take_conversions());
     }
-    conversions.extend(judged.report().conversion_completeness(&coverage));
+    conversions.extend(judged.report().conversion_completeness(&coverage)?);
     Ok(ResourceAdmissionReport {
         attributes,
         references: all_errors,

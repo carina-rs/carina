@@ -429,8 +429,10 @@ fn verdict<K: DestinationKind>(
         local: paths,
         schema,
         errors: _,
-        deferred: _,
+        #[cfg(test)]
+            deferred: _,
         matched_destination: _,
+        conversions: _,
     } = findings;
     match K::local(destination, paths, schema) {
         Ok(obligation) => AssignmentVerdict::NeedsLocal(obligation),
@@ -569,7 +571,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 &lookup,
                 context.cursor.clone(),
                 {
-                    let callbacks = crate::schema::value_validation::CallbackSources::from(
+                    let callbacks = crate::schema::value_validation::WalkCallbacks::from(
                         crate::schema::value_validation::RequiredAssignmentCallbacks {
                             ordinary: &check,
                             scope: context.scope,

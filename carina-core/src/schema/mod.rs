@@ -7769,7 +7769,6 @@ fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
         }
         | TypeError::StringLiteralExpectedEnum { .. }
         | TypeError::ValidationFailed { .. }
-        | TypeError::Conversion { .. }
         | TypeError::Knowledge { .. }
         | TypeError::Reference { .. }
         | TypeError::CustomTypeValidation { .. }
@@ -7810,11 +7809,6 @@ fn format_field_group_violation(path: &FieldPath, group: &FieldGroup) -> String 
 /// Type error
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TypeError {
-    #[error("{}", .error.diagnostic_message())]
-    Conversion {
-        error: crate::conversion::ConversionError,
-        attribute: Option<String>,
-    },
     #[error("Type mismatch: {types}")]
     TypeMismatch { types: MismatchTypeNames },
 
@@ -8017,45 +8011,6 @@ pub enum TypeError {
         DiagnosticText::new(attribute)
     )]
     BlockSyntaxNotAllowed { attribute: String },
-}
-
-impl From<crate::conversion::ConversionError> for TypeError {
-    fn from(error: crate::conversion::ConversionError) -> Self {
-        Self::Conversion {
-            error,
-            attribute: None,
-        }
-    }
-}
-
-impl TypeError {
-    /// Typed metadata is independent of a terminal diagnostic's source chain.
-    pub fn conversion_error(&self) -> Option<&crate::ConversionError> {
-        if let Self::Conversion { error, .. } = self {
-            return Some(error);
-        }
-        if let Self::Reference { error, .. } = self {
-            return match error.as_ref() {
-                crate::resource::SecretDiagnosticError::Public(error) => {
-                    crate::ConversionError::from_error(error)
-                }
-                crate::resource::SecretDiagnosticError::InsideSecret => None,
-            };
-        }
-        match self.diagnostic_shape() {
-            ValidationDiagnostic::Reason { reason, .. } => {
-                crate::ConversionError::from_error(reason)
-            }
-            ValidationDiagnostic::Child { child, .. }
-            | ValidationDiagnostic::HiddenChild { child, .. } => {
-                crate::ConversionError::from_error(child)
-            }
-            ValidationDiagnostic::Alternatives(failures) => {
-                failures.iter().find_map(Self::conversion_error)
-            }
-            ValidationDiagnostic::Plain(_) => None,
-        }
-    }
 }
 
 impl<B: BindingAddress> From<crate::resource::knowledge::KnowledgeError<B>> for TypeError {
@@ -8284,9 +8239,7 @@ impl TypeError {
             }
             // Knowledge failures retain typed terminal metadata; their Display
             // already includes the complete diagnostic, without a logical child.
-            Self::Knowledge { .. } | Self::Reference { .. } | Self::Conversion { .. } => {
-                ValidationDiagnostic::Plain(self)
-            }
+            Self::Knowledge { .. } | Self::Reference { .. } => ValidationDiagnostic::Plain(self),
             Self::TypeMismatch { .. }
             | Self::BindingShadowsEnumMember(_)
             | Self::InvalidEnumVariant { .. }
@@ -8320,8 +8273,7 @@ impl TypeError {
             | TypeError::StringLiteralExpectedEnum { attribute, .. }
             | TypeError::ResourceValidationFailed { attribute, .. }
             | TypeError::Knowledge { attribute, .. }
-            | TypeError::Reference { attribute, .. }
-            | TypeError::Conversion { attribute, .. } => attribute.as_deref(),
+            | TypeError::Reference { attribute, .. } => attribute.as_deref(),
             TypeError::ReadOnlyAttribute { name }
             | TypeError::UnknownAttribute { name, .. }
             | TypeError::BlockSyntaxNotAllowed { attribute: name } => Some(name),
@@ -8363,13 +8315,6 @@ impl TypeError {
     pub fn with_attribute(self, attribute: impl Into<String>) -> Self {
         let attribute = attribute.into();
         match self {
-            TypeError::Conversion {
-                error,
-                attribute: existing,
-            } => TypeError::Conversion {
-                error,
-                attribute: existing.or(Some(attribute)),
-            },
             TypeError::FieldGroupViolation { path, group } => TypeError::FieldGroupViolation {
                 path: path.prepend_field(attribute),
                 group,
@@ -16448,9 +16393,9 @@ impl PatternResourceSchema<Compiled> {
                     })
                     .collect(),
             )
-            && let Err(validation_errors) = run_resource_validator(validator, &attributes)
+            && let Err(mut validation_errors) = run_resource_validator(validator, &attributes)
         {
-            report.append_errors(validation_errors);
+            report.errors.append(&mut validation_errors);
         }
 
         report
@@ -16496,7 +16441,7 @@ impl PatternResourceSchema<Compiled> {
         );
         if selected.is_none_or(|names| !names.is_empty())
             && let Some(validator) = self.validator()
-            && let Err(errors) = run_resource_validator(
+            && let Err(mut errors) = run_resource_validator(
                 validator,
                 &attributes
                     .iter()
@@ -16509,7 +16454,7 @@ impl PatternResourceSchema<Compiled> {
                     .collect(),
             )
         {
-            report.append_errors(errors);
+            report.errors.append(&mut errors);
         }
         report
     }
@@ -16684,10 +16629,6 @@ impl crate::resource::InsideSecret for FieldPath {
 impl crate::resource::InsideSecret for TypeError {
     fn inside_secret(self) -> Self {
         match self {
-            TypeError::Conversion { error, attribute } => TypeError::Conversion {
-                error: error.inside_secret(),
-                attribute,
-            },
             TypeError::InvalidEnumVariant {
                 value_kind,
                 attribute,
