@@ -561,6 +561,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                     let reference = ReferenceCandidate {
                         reference: source.into_path(),
                     };
+                    // judge_at uses context.declaration only when supplied; resource attributes pass None.
                     reference
                         .judge_at::<K>(
                             contract,

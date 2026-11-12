@@ -86,6 +86,35 @@ fn authored_reference_metadata_does_not_clone_a_reference_path() {
 }
 
 #[test]
+fn final_provider_input_keeps_substituted_values_out_of_reference_judgement() {
+    with_source(|cursor, knowledge| {
+        assert!(cursor.source_reference().is_some());
+        assert!(matches!(
+            ClassifiedRef::from(&knowledge),
+            ClassifiedRef::Known(_)
+        ));
+        let attr = CompiledAttributeType::string();
+        let validator =
+            ValueValidator::for_final_provider_input(empty_defs_for_schema_walks(), no_lookup());
+        assert!(matches!(
+            validator.mode,
+            ValueValidationMode::FinalProviderInput
+        ));
+        // Final inputs enter walk without authored syntax or an AssignmentWalk.
+        let checked = validator.walk(
+            &attr,
+            (&knowledge).into(),
+            &FieldPath::new(),
+            FieldAncestry::WRITABLE,
+            &mut Vec::new(),
+        );
+        assert!(checked.accepts());
+        assert!(checked.into_findings().symbolic_findings().is_empty());
+        assert!(validator.reference_checked.0.borrow().is_empty());
+    });
+}
+
+#[test]
 fn unsubstituted_reference_keeps_ordinary_memo_allocations_and_skips_reference_callback() {
     with_files(
         "let source = mock.Source {}\n",

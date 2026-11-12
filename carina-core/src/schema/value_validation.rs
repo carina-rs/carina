@@ -314,15 +314,6 @@ pub enum SymbolicFindingOrigin {
     RecoveredReference,
 }
 
-impl SymbolicFindingOrigin {
-    pub fn covers_path(self) -> bool {
-        match self {
-            Self::Ordinary | Self::AuthoredHook => true,
-            Self::RecoveredReference => false,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct SymbolicFinding {
     origin: SymbolicFindingOrigin,
@@ -381,7 +372,10 @@ impl SymbolicFinding {
     /// Existing symbolic checks retain main's attribute-wide ownership. A
     /// restored reference owns its exact error, preserving other value errors.
     pub fn covers_path(&self) -> bool {
-        self.origin.covers_path()
+        match self.origin {
+            SymbolicFindingOrigin::Ordinary | SymbolicFindingOrigin::AuthoredHook => true,
+            SymbolicFindingOrigin::RecoveredReference => false,
+        }
     }
 }
 impl InsideSecret for SymbolicFinding {
