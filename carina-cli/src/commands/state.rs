@@ -3122,7 +3122,7 @@ mod tests {
     };
     use carina_core::resource::{
         ConcreteValue, DeferredValue, LiveComposition, LiveCompositionArgument,
-        LiveCompositionSignature, ModuleConstraintId, PendingModuleConstraint, Resource,
+        LiveCompositionSignature, PendingModuleConstraint, Resource,
     };
     use carina_core::schema::{
         AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
@@ -4425,17 +4425,18 @@ mod tests {
                     ))),
                 )]),
                 attributes: IndexMap::new(),
-                pending_constraints: vec![PendingModuleConstraint {
-                    id: ModuleConstraintId::argument_validation("value", 0),
-                    expression: ValidateExpr::Compare {
+                pending_constraints: vec![PendingModuleConstraint::argument_validation(
+                    "value",
+                    0,
+                    ValidateExpr::Compare {
                         lhs: Box::new(ValidateExpr::Var("value".to_string())),
                         op: CompareOp::Ne,
                         rhs: Box::new(ValidateExpr::String(
                             serde_json::from_value(serde_json::json!("'bad'")).unwrap(),
                         )),
                     },
-                    message: "value must not be bad".to_string(),
-                }],
+                    "value must not be bad".to_string(),
+                )],
             },
             binding: Some(absolute_binding("checked")),
             dependency_bindings: Default::default(),
@@ -4517,17 +4518,18 @@ mod tests {
                     ))),
                 )]),
                 attributes: IndexMap::new(),
-                pending_constraints: vec![PendingModuleConstraint {
-                    id: ModuleConstraintId::argument_validation("value", 0),
-                    expression: ValidateExpr::Compare {
+                pending_constraints: vec![PendingModuleConstraint::argument_validation(
+                    "value",
+                    0,
+                    ValidateExpr::Compare {
                         lhs: Box::new(ValidateExpr::Var("value".to_string())),
                         op: CompareOp::Ne,
                         rhs: Box::new(ValidateExpr::String(
                             serde_json::from_value(serde_json::json!("'bad'")).unwrap(),
                         )),
                     },
-                    message: "value must not be bad".to_string(),
-                }],
+                    "value must not be bad".to_string(),
+                )],
             },
             binding: Some(absolute_binding("checked")),
             dependency_bindings: Default::default(),

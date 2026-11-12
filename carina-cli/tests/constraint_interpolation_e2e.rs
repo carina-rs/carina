@@ -16,6 +16,154 @@ use tower_lsp::lsp_types::{Position, Range};
 const CANARY: &str = "CANARY_4386";
 const INTERPOLATION: &str = "${secret('CANARY_4386')}";
 
+#[test]
+fn round1_wait_condition_rejects_interpolation() {
+    Fixture::new("let w = wait vpc { until = vpc.identifier == \"${secret('CANARY_4386')}\" timeout = 1s }\nmock.test.resource { name = 'consumer' parent = w.identifier }\n", None)
+        .assert_rejected("main.crn", "`wait` condition");
+    Fixture::new("", Some("arguments { r: mock.test.resource }\nlet w = wait r { until = r.identifier == \"${secret('CANARY_4386')}\" timeout = 1s }\nmock.test.resource { name = 'consumer' parent = w.identifier }\n"))
+        .assert_rejected("checked/main.crn", "`wait` condition");
+
+    let fixture = Fixture::new(
+        "let w = wait vpc { until = vpc.identifier == \"vpc-id\" timeout = 1s }\nmock.test.resource { name = 'consumer' parent = w.identifier }\n",
+        None,
+    );
+    assert!(fixture.run(&["validate", "."]).status.success());
+    assert!(
+        fixture
+            .run(&["plan", "--out", "plan.bin", "."])
+            .status
+            .success()
+    );
+    let object: Value =
+        serde_json::from_slice(&fs::read(fixture.project.join("plan.bin")).unwrap()).unwrap();
+    let wait = object["plan"]["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|effect| effect.get("Wait"))
+        .unwrap();
+    assert_eq!(wait["until"]["value"]["String"], "\"vpc-id\"");
+    assert!(
+        fixture
+            .run(&["apply", "--auto-approve", "--lock=false", "plan.bin"])
+            .status
+            .success()
+    );
+    fixture.assert_no_written_canary();
+
+    for source in [
+        r#"'${secret("literal text")}'"#,
+        r#""\${secret('literal text')}""#,
+        r#""line\nquote\"slash\\tab\t""#,
+    ] {
+        let fixture = Fixture::new(
+            &format!(
+                "let w = wait vpc {{ until = vpc.identifier == {source} }}\nmock.test.resource {{ name = 'consumer' parent = w.identifier }}\n"
+            ),
+            None,
+        );
+        assert!(fixture.run(&["validate", "."]).status.success());
+        assert!(
+            fixture
+                .run(&["plan", "--out", "plan.bin", "."])
+                .status
+                .success()
+        );
+        let object: Value =
+            serde_json::from_slice(&fs::read(fixture.project.join("plan.bin")).unwrap()).unwrap();
+        let wait = object["plan"]["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|effect| effect.get("Wait"))
+            .unwrap();
+        assert_eq!(wait["until"]["value"]["String"], source);
+        fixture.assert_no_written_canary();
+    }
+}
+
+#[test]
+fn round1_require_message_keeps_proof_and_validation_message_keeps_secret_protection() {
+    let fixture = Fixture::new(
+        "",
+        Some(
+            r#"arguments { r: mock.test.resource { validation {
+condition = r.identifier == 'impossible'
+error_message = "${secret('CANARY_4386')}"
+} } }
+require r.identifier != 'x', 'safe message'
+"#,
+        ),
+    );
+    assert!(fixture.run(&["validate", "."]).status.success());
+    assert!(
+        fixture
+            .run(&["plan", "--out", "plan.bin", "."])
+            .status
+            .success()
+    );
+    let path = fixture.project.join("plan.bin");
+    let mut object: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let constraints = object["compositions"][0]["pending_constraints"]
+        .as_array()
+        .unwrap();
+    let validation = constraints
+        .iter()
+        .find(|c| c["id"] == "argument:r:0")
+        .unwrap();
+    assert_eq!(validation["message"], "validation failed for argument 'r'");
+    let apply = fixture.run(&["apply", "--auto-approve", "--lock=false", "plan.bin"]);
+    assert!(!apply.status.success());
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    assert!(rendered.contains("validation failed for argument 'r'"));
+    fixture.assert_no_written_canary();
+
+    let require_index = object["compositions"][0]["pending_constraints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|c| c["id"] == "require:0")
+        .unwrap();
+    assert_eq!(
+        object["compositions"][0]["pending_constraints"][require_index]["message"],
+        "'safe message'",
+        "require message must serialize its literal proof"
+    );
+    let state_paths = [
+        fixture.project.join("carina.state.json"),
+        fixture.home.join("mock-state.json"),
+    ];
+    let state_before = state_paths.each_ref().map(|path| fs::read(path).ok());
+    for source in ["${secret('CANARY_4386')}", "\"${secret('CANARY_4386')}\""] {
+        object["compositions"][0]["pending_constraints"][require_index]["message"] =
+            Value::from(source);
+        let decoded =
+            serde_json::from_value::<carina_cli::commands::plan::PlanFile>(object.clone());
+        assert!(
+            decoded.is_err(),
+            "saved require messages must reject unchecked text"
+        );
+        let error = decoded.unwrap_err();
+        assert!(error.to_string().contains("re-run `carina plan --out`"));
+        assert!(!format!("{error} {error:?}").contains(CANARY));
+        fs::write(&path, serde_json::to_vec(&object).unwrap()).unwrap();
+        assert!(
+            !fixture
+                .run(&["apply", "--auto-approve", "--lock=false", "plan.bin"])
+                .status
+                .success()
+        );
+        assert_eq!(
+            state_paths.each_ref().map(|path| fs::read(path).ok()),
+            state_before
+        );
+    }
+}
+
 struct Fixture {
     _temp: tempfile::TempDir,
     project: PathBuf,

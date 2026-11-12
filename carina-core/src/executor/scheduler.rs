@@ -927,9 +927,7 @@ mod tests {
 
     #[test]
     fn resource_identity_does_not_collide_with_binding_failure_key() {
-        use crate::resource::{
-            ConcreteValue, ResolvedResource, ResolvedResourceId, RootScope, Value,
-        };
+        use crate::resource::{ResolvedResource, ResolvedResourceId, RootScope};
         use crate::wait::{AttrPath, ManagedWaitTarget, WaitPredicate};
         use std::time::Duration;
 
@@ -960,7 +958,10 @@ mod tests {
                 target_id: ManagedWaitTarget::for_test(&target),
                 until: WaitPredicate::equals(
                     AttrPath::single("status"),
-                    Value::Concrete(ConcreteValue::String("ready".into())),
+                    serde_json::from_value::<crate::wait::WaitRhs>(
+                        serde_json::json!({"String": "'ready'"}),
+                    )
+                    .unwrap(),
                 )
                 .expect("valid wait predicate"),
                 until_surface: "shared.status == ready".to_string(),

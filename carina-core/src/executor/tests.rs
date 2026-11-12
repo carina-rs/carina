@@ -217,7 +217,9 @@ fn resolved_fixture_resources_with_wait(
         until_predicate: crate::parser::UntilPredicateAst {
             root: absolute_binding(target_binding),
             attribute_segments: vec!["ready".to_string()],
-            rhs: Value::Concrete(ConcreteValue::Bool(true)),
+            rhs: (Value::Concrete(ConcreteValue::Bool(true)))
+                .try_into()
+                .unwrap(),
         },
         timeout_secs: None,
         depends_on: Default::default(),
@@ -551,7 +553,10 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
                 target_id: managed_wait_target(wait_target.id.clone()),
                 until: WaitPredicate::equals(
                     AttrPath::single("status"),
-                    Value::Concrete(ConcreteValue::String("ready".into())),
+                    serde_json::from_value::<crate::wait::WaitRhs>(
+                        serde_json::json!({"String": "'ready'"}),
+                    )
+                    .unwrap(),
                 )
                 .unwrap(),
                 until_surface: "wait_target.status == ready".to_string(),
@@ -5143,19 +5148,20 @@ fn pending_module_composition(
 
 fn module_not_bad_constraint(argument: &str) -> crate::resource::PendingModuleConstraint {
     use crate::parser::{CompareOp, ValidateExpr};
-    use crate::resource::{ModuleConstraintId, PendingModuleConstraint};
+    use crate::resource::PendingModuleConstraint;
 
-    PendingModuleConstraint {
-        id: ModuleConstraintId::argument_validation(argument, 0),
-        expression: ValidateExpr::Compare {
+    PendingModuleConstraint::argument_validation(
+        argument,
+        0,
+        ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::Var(argument.to_string())),
             op: CompareOp::Ne,
             rhs: Box::new(ValidateExpr::String(
                 serde_json::from_value(serde_json::json!("'bad'")).unwrap(),
             )),
         },
-        message: format!("{argument} must not be bad"),
-    }
+        format!("{argument} must not be bad"),
+    )
 }
 
 fn module_require_equal_constraint(
@@ -5163,17 +5169,20 @@ fn module_require_equal_constraint(
     right: &str,
 ) -> crate::resource::PendingModuleConstraint {
     use crate::parser::{CompareOp, ValidateExpr};
-    use crate::resource::{ModuleConstraintId, PendingModuleConstraint};
+    use crate::resource::PendingModuleConstraint;
 
-    PendingModuleConstraint {
-        id: ModuleConstraintId::require(0),
-        expression: ValidateExpr::Compare {
+    PendingModuleConstraint::require(
+        0,
+        ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::Var(left.to_string())),
             op: CompareOp::Eq,
             rhs: Box::new(ValidateExpr::Var(right.to_string())),
         },
-        message: format!("{left} and {right} must match"),
-    }
+        serde_json::from_value(serde_json::json!(format!(
+            "'{left} and {right} must match'"
+        )))
+        .unwrap(),
+    )
 }
 
 #[tokio::test]
@@ -6126,7 +6135,10 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
         target_id: managed_wait_target(target_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
-            Value::Concrete(ConcreteValue::String("READY".into())),
+            serde_json::from_value::<crate::wait::WaitRhs>(
+                serde_json::json!({"String": "'READY'"}),
+            )
+            .unwrap(),
         )
         .unwrap(),
         until_surface: "wait-target.status == READY".to_string(),
@@ -6456,7 +6468,10 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
         target_id: managed_wait_target(cert_id),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
-            Value::Concrete(ConcreteValue::String("READY".into())),
+            serde_json::from_value::<crate::wait::WaitRhs>(
+                serde_json::json!({"String": "'READY'"}),
+            )
+            .unwrap(),
         )
         .unwrap(),
         until_surface: "cert.status == READY".to_string(),
@@ -6526,7 +6541,10 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
         target_id: managed_wait_target(cert_id),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
-            Value::Concrete(ConcreteValue::String("READY".into())),
+            serde_json::from_value::<crate::wait::WaitRhs>(
+                serde_json::json!({"String": "'READY'"}),
+            )
+            .unwrap(),
         )
         .unwrap(),
         until_surface: "cert.status == READY".to_string(),
@@ -10582,7 +10600,10 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         target_id: managed_wait_target(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
-            Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            serde_json::from_value::<crate::wait::WaitRhs>(
+                serde_json::json!({"String": "'ISSUED'"}),
+            )
+            .unwrap(),
         )
         .unwrap(),
         until_surface: "cert.status == ISSUED".to_string(),
@@ -10759,7 +10780,10 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
         target_id: managed_wait_target(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
-            Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            serde_json::from_value::<crate::wait::WaitRhs>(
+                serde_json::json!({"String": "'ISSUED'"}),
+            )
+            .unwrap(),
         )
         .unwrap(),
         until_surface: "cert.status == ISSUED".to_string(),
@@ -10880,7 +10904,10 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
         target_id: managed_wait_target(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
-            Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            serde_json::from_value::<crate::wait::WaitRhs>(
+                serde_json::json!({"String": "'ISSUED'"}),
+            )
+            .unwrap(),
         )
         .unwrap(),
         until_surface: "cert.status == ISSUED".to_string(),
@@ -11536,7 +11563,10 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
         target_id: managed_wait_target(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
-            Value::Concrete(ConcreteValue::String("issued".into())),
+            serde_json::from_value::<crate::wait::WaitRhs>(
+                serde_json::json!({"String": "'issued'"}),
+            )
+            .unwrap(),
         )
         .unwrap(),
         until_surface: "cert.status == \"issued\"".to_string(),

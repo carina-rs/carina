@@ -7,7 +7,7 @@ use crate::resource::{
     AuthoredDeferredValue as DeferredValue, AuthoredInterpolationPart as InterpolationPart,
     AuthoredValue as Value, DeferredValue as GenericDeferredValue, DiagnosticSourceSpan,
     ExpandedConcreteValue, ExpandedDeferredValue, ExpandedInterpolationPart, ExpandedResource,
-    ExpandedValue, ForLoopElement, LoopKind, LoopOriginKind, LoopSlot, ModuleSource, NoPlaceholder,
+    ExpandedValue, ForLoopElement, LoopKind, LoopOriginKind, LoopSlot, ModuleSource,
     ParserPlaceholder, PreventDestroy, Resource as GenericResource, RootScope,
     Value as GenericValue,
 };
@@ -1443,9 +1443,7 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
         until_predicate: UntilPredicateAst {
             root: "resource".into(),
             attribute_segments: vec!["status".to_string()],
-            rhs: GenericValue::<NoPlaceholder, RelativeBindingName>::Concrete(
-                crate::resource::ConcreteValue::String("ready".into()),
-            ),
+            rhs: serde_json::from_value(serde_json::json!({"String": "'ready'"})).unwrap(),
         },
         timeout_secs: None,
         depends_on: Default::default(),

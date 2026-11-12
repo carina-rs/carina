@@ -4185,13 +4185,11 @@ fn snapshot_constraints(
     constraints
         .iter()
         .map(|constraint| {
-            Ok(crate::resource::PendingModuleConstraint {
-                id: constraint.id.clone(),
-                message: constraint.message.clone(),
-                expression: constraint
+            Ok(constraint.with_expression(
+                constraint
                     .expression
                     .try_map_stage(&mut redact_secrets_in_value)?,
-            })
+            ))
         })
         .collect()
 }
@@ -4325,7 +4323,7 @@ pub fn rehydrate_saved_composition_with_candidate(
                     .signature
                     .pending_constraints
                     .iter()
-                    .find(|candidate| candidate.id == constraint.id)
+                    .find(|candidate| candidate.id() == constraint.id())
             }) {
                 // Operand spelling is diagnostic metadata. Match each
                 // argument's occurrences in authored traversal order.
@@ -4344,16 +4342,12 @@ pub fn rehydrate_saved_composition_with_candidate(
                         format!(
                             "{}.constraints.{}.{operand}",
                             saved.id,
-                            constraint.id.as_str(),
+                            constraint.id().as_str(),
                         ),
                     )
                 },
             )?;
-            Ok(crate::resource::PendingModuleConstraint {
-                id: constraint.id.clone(),
-                message: constraint.message.clone(),
-                expression,
-            })
+            Ok(constraint.with_expression(expression))
         })
         .collect::<Result<_, SecretRehydrationSiteError>>()?;
     Ok(saved

@@ -715,7 +715,8 @@ pub struct PlanFileContents<S = ModuleSource, P = SnapshotPlan<S>, V: PlanValueK
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
     /// Since format 43, schema patterns carry explicit modes and reasons.
-    /// Format 45 stores validation string literals with their checked source spelling.
+    /// Format 45 stores condition strings, require messages, and wait RHS strings
+    /// with their checked source spelling.
     /// Format 44 retains separate identity and member constraint layers.
     /// Plan format 42 retains replacement history and create-first dependency
     /// requirements for schema admission when loading saved plans.
@@ -1201,7 +1202,8 @@ impl PlanFile {
 /// replacement previous_attributes, required_by, and required_children.
 /// Format 43 requires explicit schema-pattern modes. Format 44 records v13
 /// schema fingerprints and separate identity/member constraint layers. Format 45
-/// retains quoted validation literals so decoding can reject interpolation.
+/// retains quoted condition literals, require messages, and wait RHS strings
+/// so decoding can reject interpolation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanFileWire {
     version: u32,
@@ -9157,8 +9159,7 @@ mod run_plan_out_tests {
     use carina_core::provider::ProviderRouter;
     use carina_core::resource::{
         AccessPath, DataSource, DeferredValue, LiveComposition, LiveCompositionArgument,
-        LiveCompositionSignature, ModuleConstraintId, PendingModuleConstraint, ResolvedResource,
-        ResourceId, Value,
+        LiveCompositionSignature, PendingModuleConstraint, ResolvedResource, ResourceId, Value,
     };
     #[cfg(test)]
     use std::fs;
@@ -9856,17 +9857,18 @@ mod run_plan_out_tests {
             signature: LiveCompositionSignature {
                 arguments,
                 attributes: indexmap::IndexMap::new(),
-                pending_constraints: vec![PendingModuleConstraint {
-                    id: ModuleConstraintId::argument_validation("name", 0),
-                    expression: ValidateExpr::Compare {
+                pending_constraints: vec![PendingModuleConstraint::argument_validation(
+                    "name",
+                    0,
+                    ValidateExpr::Compare {
                         lhs: Box::new(ValidateExpr::Var("name".to_string())),
                         op: CompareOp::Ne,
                         rhs: Box::new(ValidateExpr::String(
                             serde_json::from_value(serde_json::json!("'bad'")).unwrap(),
                         )),
                     },
-                    message: "name must not be bad".to_string(),
-                }],
+                    "name must not be bad".to_string(),
+                )],
             },
             binding: Some(absolute_binding("checked")),
             dependency_bindings: Default::default(),

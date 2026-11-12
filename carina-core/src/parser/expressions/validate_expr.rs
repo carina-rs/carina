@@ -16,6 +16,7 @@ pub enum ConstraintStringPosition {
     RequireCondition,
     ValidationCondition,
     RequireMessage,
+    WaitCondition,
 }
 
 impl std::fmt::Display for ConstraintStringPosition {
@@ -24,6 +25,7 @@ impl std::fmt::Display for ConstraintStringPosition {
             Self::RequireCondition => "`require` condition",
             Self::ValidationCondition => "validation condition",
             Self::RequireMessage => "`require` message",
+            Self::WaitCondition => "`wait` condition",
         })
     }
 }
@@ -40,58 +42,95 @@ impl std::fmt::Display for ConstraintStringPosition {
 /// ```
 /// ```compile_fail
 /// use carina_core::parser::ValidateStringLiteral;
-/// let _ = ValidateStringLiteral("${secret('private')}".to_string());
+/// let _ = ValidateStringLiteral {
+///     contents: "${secret('private')}".to_string(),
+///     quote: '"',
+/// };
 /// ```
 #[derive(Debug, Clone, Eq)]
-pub struct ValidateStringLiteral(String);
+pub struct ValidateStringLiteral {
+    contents: String,
+    quote: char,
+}
+
+#[derive(Debug)]
+struct LiteralFailure {
+    interpolation: Option<std::ops::Range<usize>>,
+}
 
 impl PartialEq for ValidateStringLiteral {
     fn eq(&self, other: &Self) -> bool {
-        // Quotes prove literal-ness on decode; main compared only the contents.
         self.as_str() == other.as_str()
+    }
+}
+impl PartialEq<str> for ValidateStringLiteral {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+impl PartialEq<&str> for ValidateStringLiteral {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
     }
 }
 
 impl ValidateStringLiteral {
-    fn from_pair(
-        pair: pest::iterators::Pair<'_, Rule>,
-    ) -> Result<Self, pest::iterators::Pair<'_, Rule>> {
-        assert_eq!(pair.as_rule(), Rule::string);
-        // Inspect only grammar string parts. Escaped dollars and single-quoted
-        // contents are literals even when their text contains `${`.
+    // Source is always reparsed here. A caller's pest rule tag or child tree
+    // cannot establish literal-ness, because safe code can manufacture pairs.
+    fn from_source(source: &str) -> Result<Self, LiteralFailure> {
+        let invalid = || LiteralFailure {
+            interpolation: None,
+        };
+        let pair = crate::parser::grammar::complete_string_pair(source).map_err(|_| invalid())?;
         if let Some(interpolation) = pair
-            .clone()
             .into_inner()
             .flatten()
             .find(|part| part.as_rule() == Rule::interpolation)
         {
-            return Err(interpolation);
+            let span = interpolation.as_span();
+            return Err(LiteralFailure {
+                interpolation: Some(span.start()..span.end()),
+            });
         }
-        Ok(Self(pair.as_str().to_owned()))
+        let (quote, contents) = if let Some(contents) =
+            source.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+        {
+            ('"', contents)
+        } else if let Some(contents) = source.strip_prefix('\'').and_then(|s| s.strip_suffix('\''))
+        {
+            ('\'', contents)
+        } else {
+            return Err(invalid());
+        };
+        Ok(Self {
+            contents: contents.to_owned(),
+            quote,
+        })
     }
 
     pub fn as_str(&self) -> &str {
-        // Preserve main's raw, unescaped validate-string value byte for byte.
-        &self.0[1..self.0.len() - 1]
+        &self.contents
+    }
+
+    pub(in crate::parser) fn is_single_quoted(&self) -> bool {
+        self.quote == '\''
     }
 }
 
 impl serde::Serialize for ValidateStringLiteral {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
+        serializer.serialize_str(&format!("{}{}{}", self.quote, self.contents, self.quote))
     }
 }
 
 impl<'de> serde::Deserialize<'de> for ValidateStringLiteral {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let source = String::deserialize(deserializer)?;
-        let invalid = || {
+        Self::from_source(&source).map_err(|_| {
             serde::de::Error::custom(
                 "invalid validation string literal; re-run `carina plan --out`",
             )
-        };
-        let pair = crate::parser::grammar::complete_string_pair(&source).map_err(|_| invalid())?;
-        Self::from_pair(pair).map_err(|_| invalid())
+        })
     }
 }
 
@@ -100,16 +139,43 @@ pub(in crate::parser) fn parse_constraint_string(
     ctx: &ParseContext,
     kind: ConstraintStringPosition,
 ) -> Result<ValidateStringLiteral, ParseError> {
-    ValidateStringLiteral::from_pair(pair).map_err(|interpolation| {
-        let location = ctx.declaration_location(&interpolation);
+    ValidateStringLiteral::from_source(pair.as_str()).map_err(|error| {
+        let location = ctx.literal_string_location(&pair, error.interpolation.clone());
         let span = location.span();
-        ParseError::InterpolationInConstraintString {
-            kind,
-            line: span.start_line(),
-            column: span.start_column(),
-            span,
-        }
-        .at(&location)
+        let error = if error.interpolation.is_some() {
+            ParseError::InterpolationInConstraintString {
+                kind,
+                line: span.start_line(),
+                column: span.start_column(),
+                span,
+            }
+        } else {
+            ParseError::InvalidExpression {
+                line: span.start_line(),
+                message: format!("invalid string literal in a {kind}"),
+            }
+        };
+        error.at(&location)
+    })
+}
+
+// Literal-only value helpers preserve their existing diagnostics and choose
+// whether to unescape after this single admission. They never trust pair children.
+pub(in crate::parser) fn parse_literal_string_pair(
+    pair: pest::iterators::Pair<'_, Rule>,
+) -> Result<ValidateStringLiteral, ParseError> {
+    ValidateStringLiteral::from_source(pair.as_str()).map_err(|error| {
+        let line = error
+            .interpolation
+            .and_then(|range| {
+                pest::Position::new(
+                    pair.as_span().get_input(),
+                    pair.as_span().start() + range.start,
+                )
+            })
+            .map(|position| position.line_col().0)
+            .unwrap_or_else(|| pair.line_col().0);
+        ParseError::InterpolationNotAllowedInLiteralString { line }
     })
 }
 
@@ -294,6 +360,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn round1_manufactured_string_pairs_cannot_bypass_literal_admission() {
+        for source in [r#""${secret('CANARY_4386')}""#, "", "\"", "'ok' trailing"] {
+            let pair = pest::state(source, |p| p.rule(Rule::string, |p| p.match_string(source)))
+                .unwrap()
+                .next()
+                .unwrap();
+            let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+            let file = std::sync::Arc::new(crate::parser::preprocess_file(source).unwrap());
+            let ctx = ParseContext::new(&config, std::path::Path::new("synthetic.crn"), file);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                parse_validate_expr(pair, &ctx, ConstraintStringPosition::RequireCondition)
+            }));
+            assert!(result.is_ok(), "literal admission must not panic");
+            let result = result.unwrap();
+            assert!(
+                result.is_err(),
+                "manufactured pairs must be checked against the grammar"
+            );
+            let error = result.unwrap_err();
+            assert!(!format!("{error} {error:?}").contains("CANARY_4386"));
+        }
+    }
+
+    #[test]
+    fn round1_fabricated_literal_children_cannot_bypass_key_or_literal_parsers() {
+        let source = r#""${secret('CANARY_4386')}""#;
+        let fabricate = || {
+            pest::state(source, |p| {
+                p.rule(Rule::string, |p| {
+                    p.rule(Rule::double_quoted_string, |p| {
+                        p.match_string("\"")
+                            .and_then(|p| {
+                                p.rule(Rule::string_part, |p| {
+                                    p.rule(Rule::string_literal, |p| {
+                                        p.match_string(&source[1..source.len() - 1])
+                                    })
+                                })
+                            })
+                            .and_then(|p| p.match_string("\""))
+                    })
+                })
+            })
+            .unwrap()
+            .next()
+            .unwrap()
+        };
+        let literal = super::super::string_literal::parse_string_literal(fabricate());
+        assert!(
+            literal.is_err(),
+            "literal parsing must recheck source, not fabricated children"
+        );
+        let key = crate::parser::context::extract_key_string(fabricate());
+        assert!(
+            key.is_err(),
+            "key parsing must use the same checked admission"
+        );
+        for error in [literal.unwrap_err(), key.unwrap_err()] {
+            assert!(!format!("{error} {error:?}").contains("CANARY_4386"));
+        }
+    }
+
+    #[test]
     fn validation_literal_values_and_source_proof_survive_serde() {
         for source in [
             r#""plain""#,
@@ -303,10 +431,7 @@ mod tests {
             r#"'quote\'slash\\'"#,
             "''",
         ] {
-            let literal = ValidateStringLiteral::from_pair(
-                crate::parser::grammar::complete_string_pair(source).unwrap(),
-            )
-            .unwrap();
+            let literal = ValidateStringLiteral::from_source(source).unwrap();
             assert_eq!(
                 literal.as_str().as_bytes(),
                 &source.as_bytes()[1..source.len() - 1]

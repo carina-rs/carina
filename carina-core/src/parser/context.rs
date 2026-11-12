@@ -367,6 +367,19 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         )
     }
 
+    pub(super) fn literal_string_location(
+        &self,
+        pair: &pest::iterators::Pair<'_, Rule>,
+        interpolation: Option<std::ops::Range<usize>>,
+    ) -> super::DeclarationLocation {
+        super::DeclarationLocation::literal_string(
+            pair,
+            interpolation,
+            &self.diagnostic_source.file,
+            &self.diagnostic_source.path,
+        )
+    }
+
     pub(super) fn diagnostic_source_span(
         &self,
         pair: &pest::iterators::Pair<'_, super::Rule>,
@@ -1045,53 +1058,12 @@ pub(crate) fn extract_key_string(
 ) -> Result<String, ParseError> {
     match pair.as_rule() {
         Rule::identifier => Ok(pair.as_str().to_string()),
-        Rule::string => {
-            let inner = pair
-                .into_inner()
-                .next()
-                .ok_or_else(|| ParseError::InternalError {
-                    expected: "string content".to_string(),
-                    context: "map/attribute key".to_string(),
-                })?;
-            match inner.as_rule() {
-                Rule::single_quoted_string => {
-                    // Extract content between quotes
-                    let content = inner
-                        .into_inner()
-                        .next()
-                        .map(|p| p.as_str().to_string())
-                        .unwrap_or_default();
-                    Ok(content)
-                }
-                Rule::double_quoted_string => {
-                    let mut result = String::new();
-                    for part in inner.into_inner() {
-                        match part.as_rule() {
-                            Rule::string_part => {
-                                let inner_part = part.into_inner().next().unwrap();
-                                match inner_part.as_rule() {
-                                    Rule::string_literal => result.push_str(inner_part.as_str()),
-                                    Rule::interpolation => {
-                                        return Err(ParseError::InternalError {
-                                            expected: "literal string".to_string(),
-                                            context: "interpolation not supported in map keys"
-                                                .to_string(),
-                                        });
-                                    }
-                                    _ => result.push_str(inner_part.as_str()),
-                                }
-                            }
-                            _ => result.push_str(part.as_str()),
-                        }
-                    }
-                    Ok(result)
-                }
-                _ => Err(ParseError::InternalError {
-                    expected: "quoted literal string".to_string(),
-                    context: "map/attribute key".to_string(),
-                }),
-            }
-        }
+        Rule::string => super::expressions::validate_expr::parse_literal_string_pair(pair)
+            .map(|literal| literal.as_str().to_owned())
+            .map_err(|_| ParseError::InternalError {
+                expected: "literal string".to_string(),
+                context: "interpolation not supported in map keys".to_string(),
+            }),
         _ => Err(ParseError::InternalError {
             expected: "identifier or literal string".to_string(),
             context: "map/attribute key".to_string(),

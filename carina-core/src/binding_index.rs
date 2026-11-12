@@ -4230,17 +4230,11 @@ let existing = read aws.ec2.Vpc {
             binding: RelativeBindingName::from("ready"),
             target: RelativeBindingName::from("instance"),
             until_raw: "instance.target_group_arn == 'ready'".to_string(),
-            until_predicate:
-                UntilPredicateAst {
-                    root: RelativeBindingName::new("instance"),
-                    attribute_segments: vec!["target_group_arn".to_string()],
-                    rhs: crate::resource::Value::<
-                        crate::resource::NoPlaceholder,
-                        RelativeBindingName,
-                    >::Concrete(crate::resource::ConcreteValue::String(
-                        "ready".into(),
-                    )),
-                },
+            until_predicate: UntilPredicateAst {
+                root: RelativeBindingName::new("instance"),
+                attribute_segments: vec!["target_group_arn".to_string()],
+                rhs: serde_json::from_value(serde_json::json!({"String": "'ready'"})).unwrap(),
+            },
             timeout_secs: None,
             depends_on: Default::default(),
             line: 1,

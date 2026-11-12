@@ -79,7 +79,7 @@ pub(crate) fn parse_wait_expr(
                     .trim()
                     .to_string();
                 let expr_pair = first_inner(child, "validate_expr", "wait_until_attr")?;
-                let predicate = lower_validate_expr_to_until(expr_pair, &target, attr_line)?;
+                let predicate = lower_validate_expr_to_until(expr_pair, &target, attr_line, ctx)?;
                 until_raw = Some(predicate_text);
                 until_predicate = Some(predicate);
             }
@@ -157,6 +157,7 @@ fn lower_validate_expr_to_until(
     pair: Pair<'_, Rule>,
     target_binding: &str,
     line: usize,
+    ctx: &ParseContext,
 ) -> Result<UntilPredicateAst, ParseError> {
     let cmp = descend_to_compare(pair, line)?;
     // `validate_comparison` has shape:
@@ -189,7 +190,7 @@ fn lower_validate_expr_to_until(
     let rhs_pair = unwrap_wait_arithmetic(rhs_pair, line)?;
     let mut lhs_segments = lower_until_lhs(lhs_pair, target_binding, line)?;
     let root = RelativeBindingName::new(lhs_segments.remove(0));
-    let rhs = lower_until_rhs(rhs_pair, line)?;
+    let rhs = lower_until_rhs(rhs_pair, line, ctx)?;
 
     Ok(UntilPredicateAst {
         root,
@@ -352,22 +353,20 @@ fn lower_until_lhs(
 /// Extract the literal RHS as a `Value`. Supports string, int, float,
 /// bool, duration, and namespaced-id enums (e.g.
 /// `aws.acm.Certificate.Status.Issued`).
-fn lower_until_rhs(pair: Pair<'_, Rule>, line: usize) -> Result<Value, ParseError> {
+fn lower_until_rhs(
+    pair: Pair<'_, Rule>,
+    line: usize,
+    ctx: &ParseContext,
+) -> Result<crate::wait::WaitRhs<RelativeBindingName>, ParseError> {
     let primary = first_inner(pair, "validate_primary inner", "until RHS")?;
-    match primary.as_rule() {
+    let value = match primary.as_rule() {
         Rule::string => {
-            // Strip surrounding quotes — same convention as
-            // validate_expr's string handling.
-            let raw = primary.as_str();
-            if raw.len() < 2 {
-                return Err(ParseError::InvalidExpression {
-                    line,
-                    message: "`until`: malformed string literal".to_string(),
-                });
-            }
-            Ok(Value::Concrete(ConcreteValue::String(
-                raw[1..raw.len() - 1].to_string().into(),
-            )))
+            let literal = super::validate_expr::parse_constraint_string(
+                primary,
+                ctx,
+                crate::parser::ConstraintStringPosition::WaitCondition,
+            )?;
+            return Ok(crate::wait::WaitRhs::literal(literal));
         }
         Rule::number => {
             let n: i64 = primary
@@ -439,7 +438,11 @@ fn lower_until_rhs(pair: Pair<'_, Rule>, line: usize) -> Result<Value, ParseErro
             line,
             message: format!("`until`: unsupported RHS shape ({:?})", other),
         }),
-    }
+    }?;
+    crate::wait::WaitRhs::try_from(value).map_err(|_| ParseError::InvalidExpression {
+        line,
+        message: "invalid wait literal".to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -487,7 +490,7 @@ mod tests {
         // resolution to the canonical AWS value happens downstream when
         // `create_plan` resolves the predicate against the target schema.
         assert!(matches!(
-            &we.until_predicate.rhs,
+            we.until_predicate.rhs.as_value(),
             Value::Concrete(ConcreteValue::EnumIdentifier(raw))
                 if raw.as_str() == "aws.acm.Certificate.Status.Issued"
         ));
@@ -508,7 +511,7 @@ mod tests {
     fn parses_quoted_dotted_string_rhs_as_string() {
         let we = parse_one("wait cert {\n    until = cert.status == 'A.json'\n}");
         assert!(matches!(
-            &we.until_predicate.rhs,
+            we.until_predicate.rhs.as_value(),
             Value::Concrete(ConcreteValue::String(value))
                 if value.expose_plaintext() == "A.json"
         ));
@@ -518,7 +521,7 @@ mod tests {
     fn parses_bare_identifier_rhs_as_enum_identifier() {
         let we = parse_one("wait job {\n    until = job.state == ready\n}");
         assert!(matches!(
-            &we.until_predicate.rhs,
+            we.until_predicate.rhs.as_value(),
             Value::Concrete(ConcreteValue::EnumIdentifier(raw)) if raw.as_str() == "ready"
         ));
     }

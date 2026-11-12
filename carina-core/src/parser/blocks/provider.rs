@@ -238,13 +238,11 @@ pub(in crate::parser) fn parse_require_statement(
         crate::parser::ConstraintStringPosition::RequireCondition,
     )?;
     let message_pair = next_pair(&mut inner, "string", "require statement")?;
-    crate::parser::expressions::validate_expr::parse_constraint_string(
-        message_pair.clone(),
+    let error_message = crate::parser::expressions::validate_expr::parse_constraint_string(
+        message_pair,
         ctx,
         crate::parser::ConstraintStringPosition::RequireMessage,
     )?;
-    let error_message =
-        crate::parser::AuthoredExpressionText::redact(message_pair, None).string_contents();
     Ok(RequireBlock::new_in_source(
         condition,
         error_message,

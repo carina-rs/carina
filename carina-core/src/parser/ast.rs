@@ -2813,14 +2813,14 @@ impl<P: ValueKind> ValidateExpr<P, AbsoluteBindingAddress> {
 #[derive(Debug, Clone)]
 pub struct RequireBlock<P: ValueKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
     pub condition: ValidateExpr<P, B>,
-    pub error_message: super::AuthoredExpressionText,
+    pub error_message: super::ValidateStringLiteral,
     source: DeclarationSource,
 }
 
 impl<P: ValueKind, B: BindingAddress> RequireBlock<P, B> {
     pub(crate) fn new_in_source(
         condition: ValidateExpr<P, B>,
-        error_message: super::AuthoredExpressionText,
+        error_message: super::ValidateStringLiteral,
         source_span: SourceSpan,
         source_location: super::DeclarationLocation,
     ) -> Self {
@@ -2835,7 +2835,12 @@ impl<P: ValueKind, B: BindingAddress> RequireBlock<P, B> {
     pub(crate) fn dummy(condition: ValidateExpr<P, B>, error_message: String) -> Self {
         Self::new_in_source(
             condition,
-            super::AuthoredExpressionText::literal_value(&error_message),
+            serde_json::from_value(serde_json::json!(if error_message.contains('\'') {
+                format!("\"{error_message}\"")
+            } else {
+                format!("'{error_message}'")
+            }))
+            .expect("fixture message is a parsed literal"),
             SourceSpan::dummy(),
             ModuleCallId::test_dummy_in("test.crn").location,
         )
@@ -5091,6 +5096,23 @@ impl SourceSpan {
         self.start_byte <= other.start_byte && self.end_byte >= other.end_byte
     }
 
+    pub(in crate::parser) fn from_interpolation_range(
+        start_byte: usize,
+        end_byte: usize,
+        file: &super::PreprocessedFile,
+    ) -> Self {
+        // The constructor's grammar-owned range ends at the closing brace.
+        // Map that included byte before advancing to its exclusive end, as a
+        // heredoc's next position may belong to the closing marker.
+        let Some(last) = end_byte.checked_sub(1).filter(|last| *last >= start_byte) else {
+            return Self::from_preprocessed_range(start_byte, end_byte, file);
+        };
+        let mut span = Self::from_preprocessed_range(start_byte, last, file);
+        span.end_byte += 1;
+        span.end_column += 1;
+        span
+    }
+
     pub(in crate::parser) fn from_preprocessed_range(
         start_byte: usize,
         end_byte: usize,
@@ -5890,7 +5912,7 @@ pub type ExpandedUpstreamState = UpstreamState<AbsoluteBindingAddress>;
 pub struct UntilPredicateAst<B: BindingAddress = RelativeBindingName> {
     pub root: B,
     pub attribute_segments: Vec<String>,
-    pub rhs: crate::resource::Value<NoPlaceholder, B>,
+    pub rhs: crate::wait::WaitRhs<B>,
 }
 
 /// A `wait <target> { ... }` declaration captured during parse.
@@ -9657,7 +9679,7 @@ mod substitute_placeholder_tests {
             until_predicate: UntilPredicateAst {
                 root: "resource_name".into(),
                 attribute_segments: vec!["status".to_string()],
-                rhs: Value::Concrete(ConcreteValue::String("ready".into())),
+                rhs: serde_json::from_value(serde_json::json!({"String": "'ready'"})).unwrap(),
             },
             timeout_secs: None,
             depends_on: Default::default(),

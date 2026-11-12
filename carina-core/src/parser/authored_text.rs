@@ -160,12 +160,6 @@ impl AuthoredExpressionText {
     ) -> Self {
         Self::literal_value(&source.text()[range])
     }
-
-    pub(in crate::parser) fn string_contents(mut self) -> Self {
-        let admitted = std::sync::Arc::make_mut(&mut self.admitted);
-        admitted.text = admitted.text[1..admitted.text.len() - 1].to_owned();
-        self
-    }
 }
 
 impl std::fmt::Debug for AuthoredExpressionText {

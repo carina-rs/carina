@@ -318,13 +318,14 @@ pub fn evaluate_module_constraints<P: PlaceholderKind, B: BindingAddress>(
             for argument in arguments {
                 for (ordinal, validation) in argument.validations.iter().enumerate() {
                     definitions.push((
-                        PendingModuleConstraint {
-                            id: ModuleConstraintId::argument_validation(&argument.name, ordinal),
-                            expression: validation.condition.clone(),
-                            message: validation.error_message.clone().unwrap_or_else(|| {
+                        PendingModuleConstraint::argument_validation(
+                            &argument.name,
+                            ordinal,
+                            validation.condition.clone(),
+                            validation.error_message.clone().unwrap_or_else(|| {
                                 format!("validation failed for argument '{}'", argument.name)
                             }),
-                        },
+                        ),
                         ModuleConstraintKind::ArgumentValidation {
                             argument: argument.name.clone(),
                         },
@@ -334,11 +335,11 @@ pub fn evaluate_module_constraints<P: PlaceholderKind, B: BindingAddress>(
             }
             for (ordinal, require) in requires.iter().enumerate() {
                 definitions.push((
-                    PendingModuleConstraint {
-                        id: ModuleConstraintId::require(ordinal),
-                        expression: require.condition.clone(),
-                        message: require.error_message.to_string(),
-                    },
+                    PendingModuleConstraint::require(
+                        ordinal,
+                        require.condition.clone(),
+                        require.error_message.clone(),
+                    ),
                     ModuleConstraintKind::Require,
                     declared_arguments.clone(),
                 ));
@@ -579,16 +580,12 @@ fn evaluate_pending_constraint_views<'a>(
             .pending_constraints()
             .iter()
             .map(|constraint| {
-                Ok(PendingModuleConstraint {
-                    id: constraint.id.clone(),
-                    expression: resolve_bound_constraint_values(
-                        constraint.expression(),
-                        bindings,
-                        &mut resolution_errors,
-                        session,
-                    )?,
-                    message: constraint.message.clone(),
-                })
+                Ok(constraint.with_expression(resolve_bound_constraint_values(
+                    constraint.expression(),
+                    bindings,
+                    &mut resolution_errors,
+                    session,
+                )?))
             })
             .collect::<Result<Vec<_>, crate::resource::UnavailableSecretError>>()
             .map_err(|error| ModuleConstraintResolutionError {

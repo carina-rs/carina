@@ -2102,11 +2102,8 @@ impl ModuleScopeResolver<'_> {
 
     fn resolve_wait_rhs(
         &self,
-        value: &crate::resource::Value<crate::resource::NoPlaceholder, RelativeBindingName>,
-    ) -> Result<
-        crate::resource::Value<crate::resource::NoPlaceholder, AbsoluteBindingAddress>,
-        ArgumentSubstitutionError,
-    > {
+        value: &crate::wait::WaitRhs<RelativeBindingName>,
+    ) -> Result<crate::wait::WaitRhs<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
         for binding in value.root_bindings() {
             if !self.local_bindings.contains(&binding) {
                 let diagnostic_source = value.diagnostic_source_for_root_binding(&binding);
@@ -2619,38 +2616,38 @@ fn bind_module_constraints(
         for (ordinal, validation) in parameter.validations.iter().enumerate() {
             let line = validation.source_span().start_line();
             let source_file = validation.source_file();
-            constraints.push(crate::resource::PendingModuleConstraint {
-                id: crate::resource::ModuleConstraintId::argument_validation(
+            constraints.push(
+                crate::resource::PendingModuleConstraint::argument_validation(
                     &parameter.name,
                     ordinal,
+                    bind_constraint_expression(
+                        &validation.condition,
+                        arguments,
+                        resolved_bindings,
+                        line,
+                        source_file,
+                    )?,
+                    validation.error_message.clone().unwrap_or_else(|| {
+                        format!("validation failed for argument '{}'", parameter.name)
+                    }),
                 ),
-                expression: bind_constraint_expression(
-                    &validation.condition,
-                    arguments,
-                    resolved_bindings,
-                    line,
-                    source_file,
-                )?,
-                message: validation.error_message.clone().unwrap_or_else(|| {
-                    format!("validation failed for argument '{}'", parameter.name)
-                }),
-            });
+            );
         }
     }
     for (ordinal, requirement) in module.requires.iter().enumerate() {
         let line = requirement.source_span().start_line();
         let source_file = requirement.source_file();
-        constraints.push(crate::resource::PendingModuleConstraint {
-            id: crate::resource::ModuleConstraintId::require(ordinal),
-            expression: bind_constraint_expression(
+        constraints.push(crate::resource::PendingModuleConstraint::require(
+            ordinal,
+            bind_constraint_expression(
                 &requirement.condition,
                 arguments,
                 resolved_bindings,
                 line,
                 source_file,
             )?,
-            message: requirement.error_message.to_string(),
-        });
+            requirement.error_message.clone(),
+        ));
     }
     Ok(constraints)
 }
@@ -3467,11 +3464,12 @@ fn expand_module_composition(
     let pending_constraints = pending_constraints
         .iter()
         .map(|constraint| {
-            Ok(crate::resource::PendingModuleConstraint {
-                id: constraint.id.clone(),
-                expression: resolve_module_constraint_expression(&constraint.expression, resolver)?,
-                message: constraint.message.clone(),
-            })
+            Ok(
+                constraint.with_expression(resolve_module_constraint_expression(
+                    &constraint.expression,
+                    resolver,
+                )?),
+            )
         })
         .collect::<Result<Vec<_>, ArgumentSubstitutionError>>()?;
 

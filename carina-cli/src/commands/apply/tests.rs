@@ -10,8 +10,8 @@ use carina_core::provider::{
 };
 use carina_core::resource::{
     DataSource, DeferredValue, LiveComposition, LiveCompositionArgument, LiveCompositionSignature,
-    ModuleConstraintId, PendingModuleConstraint, PlaceholderKind, ResolvedResource, Resource,
-    ResourceId, ResourceIdentity,
+    PendingModuleConstraint, PlaceholderKind, ResolvedResource, Resource, ResourceId,
+    ResourceIdentity,
 };
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use carina_core::schema::{
@@ -1738,9 +1738,10 @@ fn module_composition<P: PlaceholderKind + PartialEq, B: carina_core::resource::
                 saved_composition_argument(argument),
             )]),
             attributes: indexmap::IndexMap::new(),
-            pending_constraints: vec![PendingModuleConstraint {
-                id: ModuleConstraintId::argument_validation(argument_name, 0),
-                expression: carina_core::parser::ValidateExpr::Compare {
+            pending_constraints: vec![PendingModuleConstraint::argument_validation(
+                argument_name,
+                0,
+                carina_core::parser::ValidateExpr::Compare {
                     lhs: Box::new(carina_core::parser::ValidateExpr::Var(
                         argument_name.to_string(),
                     )),
@@ -1752,8 +1753,8 @@ fn module_composition<P: PlaceholderKind + PartialEq, B: carina_core::resource::
                         .unwrap(),
                     )),
                 },
-                message: format!("value must not be {rejected}"),
-            }],
+                format!("value must not be {rejected}"),
+            )],
         },
         binding: Some(binding.clone()),
         dependency_bindings: Default::default(),

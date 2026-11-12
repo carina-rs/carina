@@ -618,17 +618,114 @@ impl ModuleConstraintId {
 
 /// A module constraint whose referenced arguments were not fully known at
 /// expansion time.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PendingModuleConstraint<
     P: ValueKind = NoPlaceholder,
     B: BindingAddress = AbsoluteBindingAddress,
 > {
-    pub id: ModuleConstraintId,
+    id: ModuleConstraintId,
     pub expression: ValidateExpr<P, B>,
-    pub message: String,
+    message: ModuleConstraintMessage,
+}
+
+/// Require messages retain authored literal proof; validation messages are
+/// already evaluated public text. The constraint ID selects this distinction
+/// on decode, so an unchecked require string cannot use a fallback serde arm.
+#[derive(Debug, Clone, PartialEq)]
+enum ModuleConstraintMessage {
+    Require(crate::parser::ValidateStringLiteral),
+    Validation(String),
+}
+
+impl ModuleConstraintMessage {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Require(literal) => literal.as_str(),
+            Self::Validation(message) => message,
+        }
+    }
+}
+
+impl Serialize for ModuleConstraintMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Require(literal) => literal.serialize(serializer),
+            Self::Validation(message) => message.serialize(serializer),
+        }
+    }
+}
+
+impl<'de, P, B> Deserialize<'de> for PendingModuleConstraint<P, B>
+where
+    P: ValueKind + Deserialize<'de>,
+    B: BindingAddress + Deserialize<'de>,
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire<P: ValueKind, B: BindingAddress> {
+            id: ModuleConstraintId,
+            expression: ValidateExpr<P, B>,
+            message: serde_json::Value,
+        }
+        let Wire {
+            id,
+            expression,
+            message,
+        } = Wire::deserialize(deserializer)?;
+        let message = if id.validation_argument().is_some() {
+            String::deserialize(message)
+                .map(ModuleConstraintMessage::Validation)
+                .map_err(serde::de::Error::custom)?
+        } else {
+            crate::parser::ValidateStringLiteral::deserialize(message)
+                .map(ModuleConstraintMessage::Require)
+                .map_err(serde::de::Error::custom)?
+        };
+        Ok(Self {
+            id,
+            expression,
+            message,
+        })
+    }
 }
 
 impl<P: ValueKind, B: BindingAddress> PendingModuleConstraint<P, B> {
+    pub fn require(
+        ordinal: usize,
+        expression: ValidateExpr<P, B>,
+        message: crate::parser::ValidateStringLiteral,
+    ) -> Self {
+        Self {
+            id: ModuleConstraintId::require(ordinal),
+            expression,
+            message: ModuleConstraintMessage::Require(message),
+        }
+    }
+
+    pub fn argument_validation(
+        argument: &str,
+        ordinal: usize,
+        expression: ValidateExpr<P, B>,
+        message: String,
+    ) -> Self {
+        Self {
+            id: ModuleConstraintId::argument_validation(argument, ordinal),
+            expression,
+            message: ModuleConstraintMessage::Validation(message),
+        }
+    }
+
+    pub(crate) fn with_expression<Q: ValueKind, C: BindingAddress>(
+        &self,
+        expression: ValidateExpr<Q, C>,
+    ) -> PendingModuleConstraint<Q, C> {
+        PendingModuleConstraint {
+            id: self.id.clone(),
+            expression,
+            message: self.message.clone(),
+        }
+    }
+
     pub fn id(&self) -> &ModuleConstraintId {
         &self.id
     }
@@ -638,7 +735,7 @@ impl<P: ValueKind, B: BindingAddress> PendingModuleConstraint<P, B> {
     }
 
     pub fn message(&self) -> &str {
-        &self.message
+        self.message.as_str()
     }
 
     pub fn contains_redacted_secret_placeholder(&self) -> bool {
@@ -2065,6 +2162,24 @@ impl<P: PlanValueKind> SavedComposition<P> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn round1_require_message_decode_requires_checked_literal_source() {
+        for source in [
+            "${secret('CANARY_4386')}",
+            r#""${secret({ CANARY_4386 = 'value' })}""#,
+        ] {
+            let wire =
+                serde_json::json!({"id":"require:0","expression":{"Bool":false},"message":source});
+            let result = serde_json::from_value::<super::PendingModuleConstraint>(wire);
+            assert!(
+                result.is_err(),
+                "require messages must retain literal proof through serde"
+            );
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("re-run `carina plan --out`"));
+            assert!(!format!("{error} {error:?}").contains("CANARY_4386"));
+        }
+    }
     use super::*;
     use crate::parser::{CompareOp, TypeExpr, ValidateExpr};
     use crate::resource::{
@@ -2404,9 +2519,9 @@ mod tests {
                 signature: LiveCompositionSignature {
                     arguments: IndexMap::new(),
                     attributes: IndexMap::new(),
-                    pending_constraints: vec![PendingModuleConstraint {
-                        id: ModuleConstraintId::require(0),
-                        expression: ValidateExpr::Compare {
+                    pending_constraints: vec![PendingModuleConstraint::require(
+                        0,
+                        ValidateExpr::Compare {
                             lhs: Box::new(ValidateExpr::FunctionCall {
                                 name: "length".into(),
                                 args: vec![ValidateExpr::BoundArgument {
@@ -2423,8 +2538,9 @@ mod tests {
                             op: CompareOp::Gte,
                             rhs: Box::new(ValidateExpr::Int(12)),
                         },
-                        message: "password must be long enough".into(),
-                    }],
+                        serde_json::from_value(serde_json::json!("'password must be long enough'"))
+                            .unwrap(),
+                    )],
                 },
                 binding: Some(RootScope::new().resolve("secure".into())),
                 dependency_bindings: BTreeSet::new(),
@@ -2471,9 +2587,10 @@ mod tests {
     #[test]
     fn pending_constraints_survive_serde_round_trip_and_secret_redaction() {
         let source_root = tempfile::tempdir().expect("source root");
-        let constraint: PendingModuleConstraint = PendingModuleConstraint {
-            id: ModuleConstraintId::argument_validation("password", 0),
-            expression: ValidateExpr::Compare {
+        let constraint: PendingModuleConstraint = PendingModuleConstraint::argument_validation(
+            "password",
+            0,
+            ValidateExpr::Compare {
                 lhs: Box::new(ValidateExpr::FunctionCall {
                     name: "length".to_string(),
                     args: vec![ValidateExpr::Var("password".to_string())],
@@ -2481,8 +2598,8 @@ mod tests {
                 op: CompareOp::Gte,
                 rhs: Box::new(ValidateExpr::Int(12)),
             },
-            message: "password must contain at least 12 characters".to_string(),
-        };
+            "password must contain at least 12 characters".to_string(),
+        );
         let composition = LiveComposition {
             id: ResolvedResourceId::new(ResourceId::with_identity("_virtual", "secure")),
             signature: LiveCompositionSignature {
