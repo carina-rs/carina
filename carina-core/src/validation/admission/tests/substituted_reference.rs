@@ -91,6 +91,137 @@ fn check_with_schemas(source: &str, consumer: &str, schemas: &SchemaRegistry) ->
     .unwrap_or_default()
 }
 
+fn with_ordinary_check(
+    source_type: &str,
+    expression: &str,
+    ordinary: super::super::OrdinaryAssignmentCheck<
+        '_,
+        crate::resource::ParserPlaceholder,
+        crate::resource::RelativeBindingName,
+    >,
+) -> Vec<(LeafPath, TypeError)> {
+    let directory = tempfile::tempdir().unwrap();
+    for (name, body) in [
+        ("providers.crn", "provider mock {}\n".to_owned()),
+        (
+            "backend.crn",
+            "backend local { path = 'state.json' }\n".to_owned(),
+        ),
+        (
+            "sources.crn",
+            format!("let a = mock.{source_type} {{ name = 'abc' }}\n"),
+        ),
+        (
+            "main.crn",
+            format!("let sink = mock.Sink {{ value = {expression} }}\n"),
+        ),
+    ] {
+        std::fs::write(directory.path().join(name), body).unwrap();
+    }
+    let schemas = schemas();
+    let loaded_catalog = crate::parser::LoadedProviderContext::empty_for_test();
+    let catalog = loaded_catalog.as_provider_context();
+    let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let parsed = crate::config_loader::parse_directory(&path, catalog)
+        .unwrap()
+        .into_parsed();
+    let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, catalog);
+    let judged = loaded.judged();
+    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let resource = tree
+        .project_resources()
+        .find(|r| r.id().resource_type == "Sink")
+        .unwrap();
+    let slot = resource.authored_slot("value").unwrap();
+    let proof = slot
+        .projection()
+        .unwrap()
+        .knowledge(&KnowledgeContext::validation())
+        .unwrap()
+        .into_classification();
+    let bindings = BindingIndex::from_parsed(judged.file(), &schemas, catalog);
+    let destination = schemas
+        .resource_attribute_destination(resource.id(), "value", catalog)
+        .unwrap();
+    with_session_for_test(catalog, |session| {
+        let (candidate, context) =
+            Candidate::validation_slot(slot, proof, Some(&bindings), session).unwrap();
+        let untyped = Vec::new;
+        let context = context.with_checks(
+            AssignmentChecks {
+                authored: None,
+                ordinary: Some(ordinary),
+            },
+            &untyped,
+        );
+        assignment::judge_with_findings(&destination, &candidate, &context)
+            .err()
+            .unwrap()
+            .findings
+            .unwrap()
+            .into_located()
+    })
+}
+
+#[test]
+fn substituted_reference_ordinary_err_keeps_main_single_location() {
+    let ordinary =
+        |_: &CompiledAttributeType,
+         _: &Value<crate::resource::ParserPlaceholder, crate::resource::RelativeBindingName>,
+         _: &LeafPath,
+         _: crate::parser::retained::AuthoredCursor<'_>| {
+            Err(TypeError::ValidationFailed {
+                message: "ordinary failure".into(),
+            })
+        };
+    let literal = with_ordinary_check("Identity", "'abc'", &ordinary);
+    assert_eq!(literal.len(), 1);
+    for source in ["Identity", "Source"] {
+        let actual = with_ordinary_check(source, "a.name", &ordinary);
+        assert_eq!(
+            actual
+                .iter()
+                .filter(|(_, error)| error == &literal[0].1)
+                .count(),
+            1,
+            "{actual:#?}"
+        );
+        assert_eq!(
+            actual.len(),
+            1 + usize::from(source == "Source"),
+            "{actual:#?}"
+        );
+    }
+}
+
+#[test]
+fn substituted_reference_deduplicates_a_non_first_ordinary_error() {
+    let reference = with_ordinary_check("Source", "a.name", &|_, _, _, _| Ok(Default::default()));
+    assert_eq!(reference.len(), 1);
+    let reference_error = reference[0].1.clone();
+    let actual = with_ordinary_check("Source", "a.name", &|_, _, _, _| {
+        Ok(
+            crate::schema::value_validation::AssignmentFindings::from_errors(vec![
+                (
+                    LeafPath::from_segments([]),
+                    TypeError::ValidationFailed {
+                        message: "first ordinary error".into(),
+                    },
+                ),
+                (LeafPath::from_segments([]), reference_error.clone()),
+            ]),
+        )
+    });
+    assert_eq!(
+        actual
+            .iter()
+            .filter(|(_, error)| error == &reference_error)
+            .count(),
+        1,
+        "{actual:#?}"
+    );
+}
+
 #[test]
 fn substituted_reference_retains_main_value_constraint_diagnostics() {
     use crate::schema::{PatternMatch, PatternSpec, StringIdentityLayer, StringMemberConstraints};
@@ -244,6 +375,64 @@ fn substituted_reference_keeps_union_value_errors_and_one_source_error() {
         actual.contains(&unknown[0].replace("a.computed", "a.name")),
         "{actual:#?}"
     );
+}
+
+#[test]
+fn substituted_reference_judges_the_declared_union_independently_of_member_trials() {
+    use crate::schema::{PatternMatch, PatternSpec, StringIdentityLayer, StringMemberConstraints};
+    let mut schemas = schemas();
+    let source_type = identity("mock.First");
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("FirstSource")
+            .attribute(AttributeSchema::optional("name", source_type.clone()).build())
+            .attribute(AttributeSchema::provider_populated("computed", source_type).build())
+            .validate()
+            .unwrap(),
+    );
+    let member = |name, pattern| {
+        AttributeType::string_member(
+            StringIdentityLayer::new(Some(TypeIdentity::from_dotted(name)), None, None, None),
+            StringMemberConstraints::new(Some(PatternSpec::new(pattern, PatternMatch::Full)), None),
+        )
+    };
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("UnionSink")
+            .attribute(
+                AttributeSchema::optional(
+                    "value",
+                    AttributeType::union(vec![
+                        member("mock.First", "abc"),
+                        member("mock.Second", "bad"),
+                    ]),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let source = "let a = mock.FirstSource { name = 'bad' }\n";
+    let unknown = check_with_schemas(
+        source,
+        "let sink = mock.UnionSink { value = a.computed }\n",
+        &schemas,
+    );
+    assert!(unknown.is_empty(), "{unknown:#?}");
+    assert!(
+        check_with_schemas(
+            source,
+            "let sink = mock.UnionSink { value = 'bad' }\n",
+            &schemas
+        )
+        .is_empty()
+    );
+    let known = check_with_schemas(
+        source,
+        "let sink = mock.UnionSink { value = a.name }\n",
+        &schemas,
+    );
+    assert_eq!(known, unknown);
 }
 
 #[test]

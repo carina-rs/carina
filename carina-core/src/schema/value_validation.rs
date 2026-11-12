@@ -9,6 +9,9 @@ use crate::resource::ValueKind;
 use crate::resource::knowledge::{KnownView, ShapeView};
 use crate::validation::admission::assignment_seam_error as seam_error;
 
+mod references;
+use references::{AssignmentErrors, OrdinaryCheck, ReferenceInput, ReferenceMemo, ReferencePolicy};
+
 #[cfg(test)]
 mod cursor_allocations {
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -309,6 +312,15 @@ pub enum SymbolicFindingOrigin {
     RecoveredReference,
 }
 
+impl SymbolicFindingOrigin {
+    pub fn covers_path(self) -> bool {
+        match self {
+            Self::Ordinary | Self::AuthoredHook => true,
+            Self::RecoveredReference => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SymbolicFinding {
     origin: SymbolicFindingOrigin,
@@ -346,10 +358,7 @@ impl SymbolicFinding {
     /// Existing symbolic checks retain main's attribute-wide ownership. A
     /// restored reference owns its exact error, preserving other value errors.
     pub fn covers_path(&self) -> bool {
-        match self.origin {
-            SymbolicFindingOrigin::Ordinary | SymbolicFindingOrigin::AuthoredHook => true,
-            SymbolicFindingOrigin::RecoveredReference => false,
-        }
+        self.origin.covers_path()
     }
 }
 impl InsideSecret for SymbolicFinding {
@@ -765,6 +774,43 @@ struct UnionProviderFailure<'a> {
 }
 
 impl<'a> CheckedValue<'a> {
+    #[inline(never)]
+    fn from_union(
+        attr: &'a CompiledAttributeType,
+        result: Result<AdmittedUnion<'a>, Box<UnionFailure<'a>>>,
+    ) -> Self {
+        match result {
+            Ok(admitted) => {
+                let mut checked = CheckedValue::accepted(
+                    attr,
+                    admitted.selected.fit.exactness,
+                    FitKind::Union {
+                        member: admitted.selected.member,
+                        fit: Arc::new(admitted.selected.fit),
+                    },
+                );
+                checked.findings.assignment = admitted.assignment;
+                checked.findings.authored = admitted.authored;
+                checked.selected = Some(admitted.selected.member);
+                checked
+            }
+            Err(failure) => CheckedValue {
+                local: failure.local.map(|selected| {
+                    Fit::with_kind(
+                        selected.fit.exactness,
+                        attr,
+                        FitKind::Union {
+                            member: selected.member,
+                            fit: Arc::new(selected.fit),
+                        },
+                    )
+                }),
+                findings: failure.findings,
+                selected: failure.selected,
+            },
+        }
+    }
+
     fn accepted(
         attr: &'a CompiledAttributeType,
         exactness: FitExactness,
@@ -805,7 +851,7 @@ impl<'a> CheckedValue<'a> {
     }
 
     fn extend_assignment(&mut self, path: &FieldPath, findings: AssignmentFindings) {
-        for (location, error) in &findings.errors {
+        for (location, error) in findings.errors.iter() {
             self.reject(path, error.clone());
             self.findings.located.push((
                 FieldPath::from_canonical_segments(location.segments().iter().cloned()),
@@ -813,40 +859,6 @@ impl<'a> CheckedValue<'a> {
             ));
         }
         self.findings.assignment.extend(findings);
-    }
-
-    /// Restored source judgements reject the same probe after its ordinary
-    /// value check. Their symbolic report owns only that exact finding, so a
-    /// different local constraint at the same use remains visible.
-    fn retain_recovered_references(&mut self, findings: &mut AssignmentFindings) {
-        use crate::resource::SecretDiagnosticError;
-        use crate::validation::admission::AdmissionReferenceError;
-        for (path, error) in std::mem::take(&mut findings.recovered) {
-            let field_path = FieldPath::from_canonical_segments(path.segments().iter().cloned());
-            let same_finding = |ordinary: &TypeError| {
-                ordinary == &error
-                    || matches!((ordinary, &error),
-                        (TypeError::TypeMismatch { types: ordinary }, TypeError::Reference { error, .. })
-                        if matches!(error.as_ref(), SecretDiagnosticError::Public(AdmissionReferenceError::Computed(
-                            crate::validation::DeferredAccessTypeError::TypeMismatch { types, .. }
-                        )) if types == ordinary)
-                    )
-            };
-            if self
-                .findings
-                .local
-                .iter()
-                .chain(&self.findings.provider)
-                .any(|(ordinary_path, ordinary)| {
-                    ordinary_path == &field_path && same_finding(ordinary)
-                })
-            {
-                continue;
-            }
-            self.reject(&field_path, error.clone());
-            self.findings.located.push((field_path, error.clone()));
-            findings.recovered.push((path, error));
-        }
     }
 
     /// Container context applies equally to every undecided branch's CLI
@@ -899,23 +911,13 @@ impl<'a> CheckedValue<'a> {
             self.findings
                 .assignment
                 .errors
-                .iter()
-                .map(|(path, error)| SymbolicFinding::ordinary(path.clone(), error.clone()))
-                .chain(
-                    self.findings
-                        .assignment
-                        .recovered
-                        .iter()
-                        .map(|(path, error)| {
-                            SymbolicFinding::recovered_reference(path.clone(), error.clone())
-                        }),
-                )
+                .symbolic()
                 .chain(self.findings.authored.errors.iter().map(|(path, error)| {
                     SymbolicFinding::authored_hook(path.clone(), error.clone())
                 }))
                 .collect();
 
-        for (path, error) in self.findings.authored.errors.clone() {
+        for (path, error) in self.findings.authored.errors.clone().into_diagnostics() {
             let path = FieldPath::from_canonical_segments(path.segments().iter().cloned());
             if self.local.error().is_some() {
                 self.findings.additional_local_errors.push(error.clone());
@@ -952,6 +954,7 @@ struct ValueValidator<'a, 'lookup> {
     defs: &'a BTreeMap<String, CompiledAttributeType>,
     lookup: Option<CustomTypeLookup<'lookup>>,
     checked: std::cell::RefCell<HashMap<CheckedNode<'a>, CheckedValue<'a>>>,
+    reference_checked: ReferenceMemo<'a>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -969,6 +972,37 @@ struct CheckedNode<'a> {
     )>,
 }
 
+impl<'a> CheckedNode<'a> {
+    #[inline(never)]
+    fn new<P: PlaceholderKind, B: BindingAddress>(
+        declaration: &'a CompiledAttributeType,
+        evidence: crate::resource::knowledge::KnownNodeId,
+        ancestry: FieldAncestry,
+        references: &[&'a str],
+        assignment: Option<&AssignmentWalk<'_, P, B>>,
+    ) -> Self {
+        Self {
+            declaration,
+            evidence,
+            ancestry,
+            references: references.to_vec(),
+            authored: assignment.and_then(|walk| {
+                walk.cursor
+                    .identity()
+                    .map(|(node, usage, instance, generation)| {
+                        (
+                            node,
+                            usage,
+                            instance,
+                            generation,
+                            matches!(&walk.cursor.kind, CursorKind::CoveredBy(_)),
+                        )
+                    })
+            }),
+        }
+    }
+}
+
 impl<'a, 'lookup> ValueValidator<'a, 'lookup> {
     fn new(
         defs: &'a BTreeMap<String, CompiledAttributeType>,
@@ -978,6 +1012,7 @@ impl<'a, 'lookup> ValueValidator<'a, 'lookup> {
             defs,
             lookup,
             checked: Default::default(),
+            reference_checked: Default::default(),
         }
     }
 }
@@ -1185,19 +1220,21 @@ struct CanonicalLeafError<'a> {
 pub(crate) struct AssignmentFindings {
     pub(crate) local: Vec<crate::validation::admission::LocalPath>,
     pub(crate) schema: crate::validation::admission::SchemaObligation,
-    pub(crate) errors: Vec<(LeafPath, TypeError)>,
+    pub(crate) errors: AssignmentErrors,
     pub(crate) deferred: Vec<DeferredHook>,
-    /// New reference checks retain main's concrete-value diagnostics before
-    /// contributing their own rejection to the same value/union probe.
-    pub(crate) recovered: Vec<(LeafPath, TypeError)>,
 }
 impl AssignmentFindings {
+    pub(crate) fn from_errors(errors: impl IntoIterator<Item = (LeafPath, TypeError)>) -> Self {
+        Self {
+            errors: AssignmentErrors::ordinary(errors),
+            ..Default::default()
+        }
+    }
     pub(crate) fn extend(&mut self, other: Self) {
         self.local.extend(other.local);
         self.schema.extend(other.schema);
         self.errors.extend(other.errors);
         self.deferred.extend(other.deferred);
-        self.recovered.extend(other.recovered);
     }
 }
 impl InsideSecret for AssignmentFindings {
@@ -1217,16 +1254,7 @@ impl InsideSecret for AssignmentFindings {
                 })
                 .collect(),
             schema: self.schema,
-            errors: self
-                .errors
-                .into_iter()
-                .map(|(path, error)| (path.inside_secret(), error.inside_secret()))
-                .collect(),
-            recovered: self
-                .recovered
-                .into_iter()
-                .map(|(path, error)| (path.inside_secret(), error.inside_secret()))
-                .collect(),
+            errors: self.errors.inside_secret(),
         }
     }
 }
@@ -1329,10 +1357,7 @@ impl<'a, P: ValueKind, B: BindingAddress> AuthoredHook<'a, P, B> {
         let path = path.clone();
         let call = move || match callback(attr, value, &path, cursor) {
             Ok(findings) => findings,
-            Err(error) => AssignmentFindings {
-                errors: vec![(path, error)],
-                ..Default::default()
-            },
+            Err(error) => AssignmentFindings::from_errors([(path, error)]),
         };
         match self.execution {
             HookExecution::Immediate => call(),
@@ -1343,13 +1368,13 @@ impl<'a, P: ValueKind, B: BindingAddress> AuthoredHook<'a, P, B> {
 
 #[derive(Clone)]
 pub(crate) struct WalkCallbacks<'a, P: ValueKind, B: BindingAddress> {
-    ordinary: AssignmentCheck<'a, P, B>,
+    ordinary: OrdinaryCheck<'a, P, B>,
     authored: Option<AuthoredHook<'a, P, B>>,
 }
 impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
     fn new(callbacks: AssignmentCallbacks<'a, P, B>) -> Self {
         Self {
-            ordinary: callbacks.ordinary,
+            ordinary: OrdinaryCheck::Direct(callbacks.ordinary),
             authored: callbacks.authored.map(|callback| AuthoredHook {
                 callback,
                 hooks: Default::default(),
@@ -1410,7 +1435,7 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, P, B> {
         value: CheckValue<'_, P, B>,
         path: &FieldPath,
     ) -> Result<AssignmentFindings, TypeError> {
-        (self.callbacks.ordinary)(attr, value, &path.canonical(), self.cursor.clone())
+        (self.callbacks.ordinary.callback())(attr, value, &path.canonical(), self.cursor.clone())
     }
 
     fn check_selection(
@@ -1419,7 +1444,12 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, P, B> {
         value: CheckValue<'_, P, B>,
         path: &FieldPath,
     ) -> Result<AssignmentFindings, TypeError> {
-        (self.callbacks.ordinary)(attr, value, &path.canonical(), self.cursor.selection())
+        (self.callbacks.ordinary.callback())(
+            attr,
+            value,
+            &path.canonical(),
+            self.cursor.selection(),
+        )
     }
 
     fn authored(
@@ -1581,6 +1611,55 @@ pub(crate) fn validate_authored_value_for_admission<
 ) -> ValueValidationFindings {
     let visits = std::cell::RefCell::new(std::mem::take(coverage));
     let callbacks = WalkCallbacks::new(callbacks);
+    let mut checked = ValueValidator::new(defs, Some(lookup)).walk_with_assignment(
+        attr,
+        value.into(),
+        &FieldPath::new(),
+        ancestry,
+        &mut Vec::new(),
+        Some(AssignmentWalk {
+            cursor,
+            callbacks: callbacks.clone(),
+            coverage: &visits,
+        }),
+    );
+    callbacks.finish(&mut checked.findings.authored);
+    drop(callbacks);
+    let mut findings = checked.into_findings();
+    *coverage = visits.into_inner();
+    findings.structure = value_structure(value);
+    findings
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_authored_value_for_admission_with_references<
+    's,
+    'v,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    T: StructuralPending<'v, P, B>,
+>(
+    attr: &CompiledAttributeType,
+    value: &Classification<'v, P, B, T>,
+    defs: &BTreeMap<String, CompiledAttributeType>,
+    ancestry: FieldAncestry,
+    lookup: CustomTypeLookup<'_>,
+    cursor: AuthoredCursor<'s, B>,
+    callbacks: AssignmentCallbacks<'_, P, B>,
+    reference: Option<AssignmentCheck<'_, P, B>>,
+    coverage: &mut WalkCoverage,
+) -> ValueValidationFindings {
+    if reference.is_none() || cursor.is_projection_only() {
+        return validate_authored_value_for_admission(
+            attr, value, defs, ancestry, lookup, cursor, callbacks, coverage,
+        );
+    }
+    let visits = std::cell::RefCell::new(std::mem::take(coverage));
+    let policy = reference.map(|reference| ReferencePolicy::new(callbacks.ordinary, reference));
+    let mut callbacks = WalkCallbacks::new(callbacks);
+    if let Some(policy) = &policy {
+        callbacks.ordinary = OrdinaryCheck::References(policy);
+    }
     let mut checked = ValueValidator::new(defs, Some(lookup)).walk_with_assignment(
         attr,
         value.into(),
@@ -1786,7 +1865,7 @@ fn visit_syntax<'w, 's: 'w, P: PlaceholderKind, B: BindingAddress>(
                 )?;
                 let rank = (
                     std::cmp::Reverse(authored_shape_matches(resolved.attr, &cursor)),
-                    probe.ordinary.errors.len(),
+                    probe.ordinary.errors.iter().count(),
                     std::cmp::Reverse(reached.len()),
                 );
                 if best.as_ref().is_none_or(|(current, _, _)| rank < *current) {
@@ -1817,7 +1896,7 @@ fn visit_syntax<'w, 's: 'w, P: PlaceholderKind, B: BindingAddress>(
             }
         };
         if !matches!(visit, SyntaxVisit::Covered) {
-            findings.ordinary.extend((callbacks.ordinary)(
+            findings.ordinary.extend((callbacks.ordinary.callback())(
                 attr,
                 visit.value(),
                 &path.canonical(),
@@ -2054,33 +2133,35 @@ impl<'a> ValueValidator<'a, '_> {
     where
         'a: 'w,
     {
-        let (assignment, extra, wrappers) = match assignment {
+        let (mut assignment, mut extra, mut wrappers) = match assignment {
             Some(assignment) => match assignment.prepare(attr, self.defs, value, path, ancestry) {
                 Ok((assignment, findings, wrappers)) => (Some(assignment), findings, wrappers),
                 Err(error) => return CheckedValue::rejected(path, error),
             },
             None => (None, AssignmentProbe::default(), Vec::new()),
         };
+        if let Some(input) = ReferenceInput::take(&mut assignment) {
+            return self
+                .walk_reference_prepared(
+                    attr,
+                    value,
+                    path,
+                    ancestry,
+                    visited,
+                    input,
+                    &mut extra,
+                    &mut wrappers,
+                )
+                .finish(path, &self.reference_checked);
+        }
         let node = match value {
-            ClassifiedRef::Known(value) => Some(CheckedNode {
-                declaration: attr,
-                evidence: value.node_id(),
+            ClassifiedRef::Known(value) => Some(CheckedNode::new(
+                attr,
+                value.node_id(),
                 ancestry,
-                references: visited.clone(),
-                authored: assignment.as_ref().and_then(|walk| {
-                    walk.cursor
-                        .identity()
-                        .map(|(node, usage, instance, generation)| {
-                            (
-                                node,
-                                usage,
-                                instance,
-                                generation,
-                                matches!(&walk.cursor.kind, CursorKind::CoveredBy(_)),
-                            )
-                        })
-                }),
-            }),
+                visited,
+                assignment.as_ref(),
+            )),
             ClassifiedRef::Shape(_) | ClassifiedRef::Pending(_) | ClassifiedRef::Failed(_) => None,
         };
         if let Some(checked) = node
@@ -2132,7 +2213,7 @@ impl<'a> ValueValidator<'a, '_> {
             }
         }
         authored.extend(extra.authored);
-        for (_, error) in &extra.ordinary.errors {
+        for (_, error) in extra.ordinary.errors.iter() {
             checked.reject(path, error.clone());
         }
         authored.extend(std::mem::take(&mut checked.findings.authored));
@@ -2485,9 +2566,9 @@ impl<'a> ValueValidator<'a, '_> {
         let findings = match &assignment {
             Some(walk) => {
                 match walk.check(attr, CheckValue::Current(value.diagnostic_value()), path) {
-                    Ok(mut findings) if !findings.errors.is_empty() => {
+                    Ok(findings) if !findings.errors.is_empty() => {
                         let mut checked =
-                            CheckedValue::rejected(path, findings.errors[0].1.clone());
+                            CheckedValue::rejected(path, findings.errors.primary().clone());
                         checked.findings.additional_local_errors.extend(
                             findings
                                 .errors
@@ -2505,7 +2586,6 @@ impl<'a> ValueValidator<'a, '_> {
                                 )
                             },
                         ));
-                        checked.retain_recovered_references(&mut findings);
                         checked.findings.assignment = findings;
                         checked.findings.authored = authored;
                         checked.selected = Some(attr);
@@ -2527,10 +2607,8 @@ impl<'a> ValueValidator<'a, '_> {
             }
             None => AssignmentFindings::default(),
         };
-        let mut findings = findings;
         let mut checked =
             self.walk_resolved_value(attr, value, path, ancestry, visited, assignment.clone());
-        checked.retain_recovered_references(&mut findings);
         checked.findings.assignment.extend(findings);
         let mut authored = authored;
         if !probes && let Some(walk) = &assignment {
@@ -2587,43 +2665,17 @@ impl<'a> ValueValidator<'a, '_> {
             );
         }
         if let AttrTypeKind::Union(members) = &attr.kind {
-            return match self.union_with_assignment(
-                members.as_raw_slice(),
-                value,
-                path,
-                ancestry,
-                visited,
-                assignment,
-            ) {
-                Ok(admitted) => {
-                    let mut checked = CheckedValue::accepted(
-                        attr,
-                        admitted.selected.fit.exactness,
-                        FitKind::Union {
-                            member: admitted.selected.member,
-                            fit: Arc::new(admitted.selected.fit),
-                        },
-                    );
-                    checked.findings.assignment = admitted.assignment;
-                    checked.findings.authored = admitted.authored;
-                    checked.selected = Some(admitted.selected.member);
-                    checked
-                }
-                Err(failure) => CheckedValue {
-                    local: failure.local.map(|selected| {
-                        Fit::with_kind(
-                            selected.fit.exactness,
-                            attr,
-                            FitKind::Union {
-                                member: selected.member,
-                                fit: Arc::new(selected.fit),
-                            },
-                        )
-                    }),
-                    findings: failure.findings,
-                    selected: failure.selected,
-                },
-            };
+            return CheckedValue::from_union(
+                attr,
+                self.union_with_assignment(
+                    members.as_raw_slice(),
+                    value,
+                    path,
+                    ancestry,
+                    visited,
+                    assignment,
+                ),
+            );
         }
         let Some(concrete) = value.concrete() else {
             // Arithmetic has a known numeric result shape even while deferred.

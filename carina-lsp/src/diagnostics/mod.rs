@@ -1975,6 +1975,12 @@ impl DiagnosticRun<'_> {
                             }
                             for finding in &symbolic {
                                 let covers_path = finding.covers_path();
+                                if !enum_diagnostic_retains_symbolic(
+                                    emitted_enum_diagnostic,
+                                    finding.origin(),
+                                ) {
+                                    continue;
+                                }
                                 let (path, error) = finding.diagnostic();
                                 use carina_core::resource::SecretDiagnosticError;
                                 use carina_core::validation::admission::AdmissionReferenceError;
@@ -2066,6 +2072,10 @@ impl DiagnosticRun<'_> {
                                             .insert(canonical_name.to_string());
                                     }
                                 }
+                            }
+
+                            if emitted_enum_diagnostic {
+                                continue;
                             }
 
                             let container_findings = attr_findings
@@ -2667,6 +2677,13 @@ impl DiagnosticEngine {
 ///
 /// See #2309. The structured payload is consumed by
 /// [`crate::code_action::code_actions_for_diagnostic`].
+fn enum_diagnostic_retains_symbolic(
+    emitted: bool,
+    origin: carina_core::validation::SymbolicFindingOrigin,
+) -> bool {
+    !emitted || !origin.covers_path()
+}
+
 fn build_enum_diagnostic(
     error: Option<&TypeError>,
     attr_name: &str,

@@ -146,3 +146,103 @@ fn enum_block_alias_and_mixed_syntax_keep_main_diagnostics() {
         }
     }
 }
+
+#[test]
+fn substituted_enum_keeps_only_main_rich_diagnostic_and_reference_mismatch() {
+    let mut source_message = None;
+    for list in [false, true] {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("Source")
+                .attribute(AttributeSchema::optional("attr", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::provider_populated("computed", AttributeType::string())
+                        .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("StringSink")
+                .attribute(AttributeSchema::optional("first", AttributeType::string()).build())
+                .attribute(AttributeSchema::optional("second", AttributeType::string()).build())
+                .validate()
+                .unwrap(),
+        );
+        let mode = AttributeType::enum_(
+            TypeIdentity::from_dotted("mock.Mode"),
+            Some(vec!["active".into(), "passive".into()]),
+            Vec::new(),
+            None,
+            None,
+        );
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("EnumSink")
+                .attribute(
+                    AttributeSchema::optional(
+                        "status",
+                        if list {
+                            AttributeType::list(mode)
+                        } else {
+                            mode
+                        },
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let engine = engine_with_schemas(schemas);
+        let fixture = write_fixture(&[
+            ("providers.crn", "provider mock {}\n"),
+            ("backend.crn", "backend local { path = 'state.json' }\n"),
+            ("main.crn", ""),
+        ]);
+        let run = |value: &str| {
+            let value = if list {
+                format!("[{value}]")
+            } else {
+                value.to_owned()
+            };
+            std::fs::write(fixture.path().join("main.crn"), format!(
+                "let other = mock.Source {{ attr = 'invalid' }}\nlet alias = 'invalid'\nmock.StringSink {{\n  first = alias\n  second = other.attr\n}}\nmock.EnumSink {{ status = {value} }}\n"
+            )).unwrap();
+            analyze(&engine, &fixture, "main.crn")
+        };
+        // A literal alias never enters R3, so this keeps main's rich enum
+        // rendering and early continuation as the independent control.
+        let ordinary = run("alias");
+        assert_eq!(ordinary.len(), 1, "{ordinary:#?}");
+        let unknown = run("other.computed");
+        assert_eq!(unknown.len(), 1, "{unknown:#?}");
+        if !list {
+            source_message = Some(unknown[0].message.replace("other.computed", "other.attr"));
+        }
+        let known = run("other.attr");
+        assert_eq!(known.len(), 2, "list={list}: {known:#?}");
+        let enum_message = ordinary[0]
+            .message
+            .split_once("expects an enum identifier")
+            .unwrap()
+            .1;
+        assert_eq!(
+            known
+                .iter()
+                .filter(|finding| finding.message.ends_with(enum_message))
+                .count(),
+            1,
+            "{known:#?}"
+        );
+        assert_eq!(
+            known
+                .iter()
+                .filter(|finding| Some(&finding.message) == source_message.as_ref())
+                .count(),
+            1,
+            "{known:#?}"
+        );
+    }
+}

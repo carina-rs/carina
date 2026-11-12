@@ -208,15 +208,12 @@ fn round5_union_best_failing_hook_is_retained_once_live_and_discarded() {
                 path: &crate::schema::LeafPath,
                 _: AuthoredCursor<'_>| {
         calls.set(calls.get() + 1);
-        Ok(AssignmentFindings {
-            errors: vec![(
-                path.clone(),
-                crate::schema::TypeError::MissingRequired {
-                    name: format!("hook: {}", attr.type_name()),
-                },
-            )],
-            ..Default::default()
-        })
+        Ok(AssignmentFindings::from_errors(vec![(
+            path.clone(),
+            crate::schema::TypeError::MissingRequired {
+                name: format!("hook: {}", attr.type_name()),
+            },
+        )]))
     };
     let callbacks = AssignmentCallbacks {
         ordinary: &|_, _, _, _| Ok(Default::default()),
@@ -247,9 +244,9 @@ fn round5_union_best_failing_hook_is_retained_once_live_and_discarded() {
     .authored;
     assert_eq!(calls.get(), 1, "discarded hook invocations");
     for findings in [current, discarded] {
-        assert_eq!(findings.errors.len(), 1, "{findings:?}");
+        assert_eq!(findings.errors.iter().count(), 1, "{findings:?}");
         assert_eq!(
-            findings.errors[0].1,
+            findings.errors.iter().next().unwrap().1,
             crate::schema::TypeError::MissingRequired {
                 name: "hook: String".into()
             }
@@ -303,10 +300,7 @@ fn round6_parent_hook_errors_preserve_ordinary_child_diagnostics() {
         if returns_error.get() {
             Err(error)
         } else {
-            Ok(AssignmentFindings {
-                errors: vec![(path.clone(), error)],
-                ..Default::default()
-            })
+            Ok(AssignmentFindings::from_errors(vec![(path.clone(), error)]))
         }
     };
     let validate = |authored| {
@@ -340,7 +334,7 @@ fn round6_parent_hook_errors_preserve_ordinary_child_diagnostics() {
                 .local_findings()
                 .starts_with(expected.local_findings())
         );
-        assert_eq!(actual.take_assignment().errors.len(), 1);
+        assert_eq!(actual.take_assignment().errors.iter().count(), 1);
     }
 }
 
@@ -443,8 +437,8 @@ fn round6_union_hook_fires_once_for_best_ordinary_failure() {
                     _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
                     path: &crate::schema::LeafPath,
                     _: AuthoredCursor<'_>| {
-        Ok(AssignmentFindings {
-            errors: if attr.type_name() == "String" {
+        Ok(AssignmentFindings::from_errors(
+            if attr.type_name() == "String" {
                 vec![(
                     path.clone(),
                     crate::schema::TypeError::MissingRequired {
@@ -454,8 +448,7 @@ fn round6_union_hook_fires_once_for_best_ordinary_failure() {
             } else {
                 Vec::new()
             },
-            ..Default::default()
-        })
+        ))
     };
     let callbacks = AssignmentCallbacks {
         ordinary: &ordinary,
@@ -483,7 +476,7 @@ fn round6_union_hook_fires_once_for_best_ordinary_failure() {
         &mut Default::default(),
     )
     .unwrap();
-    assert_eq!(discarded.ordinary.errors.len(), 1);
+    assert_eq!(discarded.ordinary.errors.iter().count(), 1);
     assert_eq!(*calls.borrow(), ["String"]);
 }
 

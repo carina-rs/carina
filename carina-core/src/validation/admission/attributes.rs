@@ -887,13 +887,11 @@ fn typed_resource_attribute_admissions<
                 .collect::<Vec<_>>();
             if !errors.is_empty() {
                 let path = LeafPath::from_segments(_path.segments().iter().skip(1).cloned());
-                return Ok(crate::schema::value_validation::AssignmentFindings {
-                    errors: errors
-                        .into_iter()
-                        .map(|error| (path.clone(), error))
-                        .collect(),
-                    ..Default::default()
-                });
+                return Ok(
+                    crate::schema::value_validation::AssignmentFindings::from_errors(
+                        errors.into_iter().map(|error| (path.clone(), error)),
+                    ),
+                );
             }
             if let Some(judged) = judge_argument(expression.assignment_value(value)) {
                 return judged;
