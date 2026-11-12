@@ -58,6 +58,7 @@ pub async fn run_init(
                 providers,
                 mode,
                 runtime.accepted_egress(),
+                &mut |notice| eprintln!("{notice}"),
             )
             .map(|resolved| resolved.len())
         },
@@ -344,6 +345,7 @@ mod tests {
                     providers,
                     mode,
                     http,
+                    &mut |notice| eprintln!("{notice}"),
                 )
                 .map(|resolved| resolved.len())
             },
@@ -375,6 +377,7 @@ mod tests {
                     mode,
                     registry_http,
                     github_http,
+                    &mut |notice| eprintln!("{notice}"),
                 )
                 .map(|resolved| resolved.len())
             },
@@ -394,13 +397,19 @@ mod tests {
         let installed = carina_provider_resolver::find_installed_provider(
             &carina_core::paths::ResolvedPath::new(project).unwrap(),
             config,
+            &mut |notice| eprintln!("{notice}"),
         )
         .unwrap();
         let grants = TrustedLocalGrants::parse(&[], None).unwrap();
         let class = installed
-            .load_with(user_dirs, &grants, |verified| async move {
-                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
-            })
+            .load_with(
+                user_dirs,
+                &grants,
+                &mut |notice| eprintln!("{notice}"),
+                |verified| async move {
+                    Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+                },
+            )
             .await
             .unwrap();
         assert_eq!(class, ProviderTrustClass::Aws);
@@ -646,6 +655,7 @@ mod tests {
                     providers,
                     mode,
                     &http,
+                    &mut |notice| eprintln!("{notice}"),
                 )
                 .map(|resolved| resolved.len())
             },

@@ -10,7 +10,19 @@ pub use analysis::{
     DeclarationLocation, DeclarationProvenance, DirectoryScoped, FileScoped, Located,
 };
 mod ast;
+mod authored_text;
+mod failed_file;
+pub use failed_file::{
+    FailedFileText, ParseFailureKind, ProtectedParseFailure, PublicFailedFileText, failed_file_text,
+};
+mod protected_regions;
 pub(crate) use ast::ParserSeedMetadata;
+pub use authored_text::{AuthoredExpressionDiagnostic, AuthoredExpressionText};
+pub use grammar::SyntaxDiagnostic;
+mod attribute_key;
+pub use attribute_key::{AttributeKey, ConfigurationAttributes};
+pub use protected_regions::DiagnosticFileText;
+pub(crate) use protected_regions::{AdmittedLintName, LintSource};
 mod blocks;
 mod config;
 mod context;
@@ -28,6 +40,7 @@ pub use elements::{
 mod entry;
 pub(crate) use entry::{AuthoredParse, scope_parse_failure};
 mod error;
+mod evaluation;
 mod expressions;
 mod functions;
 mod grammar;
@@ -98,7 +111,7 @@ pub use ast::{
     ModuleResolvedInferredFile, ModuleResolvedParsedFile, MovedAddresses, ParsedBindingUses,
     ParsedDeferredForExpression, ParsedDeferredForPhase, ParsedExportParam, ParsedFile,
     ParserBindingMetadata, ParserDeferredForPhaseAudit, ParserPlaceholderBoundary,
-    PendingValueSlot, ProviderConfig, RequireBlock, ResolveExportBindingPhase,
+    PendingValueSlot, ProtectedPathKind, ProviderConfig, RequireBlock, ResolveExportBindingPhase,
     ResolvedDeferredForExpressions, ResolvedDeferredForPhase, ResourceAddress, ResourceContext,
     ResourceMut, ResourceRef, ResourceTypePath, RootBindingResolvedFile,
     RootBindingResolvedInferredFile, RootBindingResolvedParsedFile, SavedDeferredForExpression,

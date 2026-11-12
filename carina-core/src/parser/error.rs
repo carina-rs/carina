@@ -2,7 +2,7 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
-use super::{Rule, SourceSpan};
+use super::SourceSpan;
 use crate::eval_value::EvalValueError;
 use crate::resource::InsideSecret;
 use std::path::{Path, PathBuf};
@@ -40,7 +40,7 @@ pub enum DeferredForIterableResolution {
 #[error("{}", format_deferred_for_body_unsupported(*line, header, body, *iterable_resolution,phase_detail.as_deref()))]
 pub struct DeferredForBodyUnsupportedError {
     pub line: usize,
-    pub header: String,
+    pub header: super::AuthoredExpressionText,
     pub body: DeferredForBodyKind,
     pub span: SourceSpan,
     pub iterable_resolution: DeferredForIterableResolution,
@@ -105,6 +105,28 @@ pub(crate) fn parse_float_literal(text: &str, line: usize) -> Result<crate::Fini
 }
 
 /// Parse error.
+///
+/// Even code compiled in this crate cannot pair an independently constructed
+/// pest error with another source's admission:
+///
+/// ```compile_fail,E0599
+/// # include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/internal_rule_input_doctest.rs"));
+/// fn mismatched_admission() -> crate::parser::ParseError {
+///     let error: pest::error::Error<crate::parser::Rule> = pest::error::Error::new_from_pos(
+///         pest::error::ErrorVariant::CustomError { message: "invalid input".into() },
+///         pest::Position::from_start("secret('CANARY'"),
+///     );
+///     crate::parser::ParseError::syntax(error, crate::parser::failed_file_text(""))
+/// }
+/// # fn main() {}
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::parser::{Rule, ParseError};
+/// fn without_source(error: pest::error::Error<Rule>) -> ParseError {
+///     error.into()
+/// }
+/// ```
 ///
 /// Consumers cannot convert hand-built line numbers into a scoped finding:
 ///
@@ -173,13 +195,22 @@ pub enum ParseError {
     #[error(transparent)]
     AtElement(Box<super::Located<ParseError>>),
 
+    #[error("{0}")]
+    ProtectedFile(super::ProtectedParseFailure),
+
     // A pest diagnostic is a terminal, already formatted leaf. Keep it in
     // Display and do not expose it again through Error::source.
     #[error("Syntax error: {0}")]
-    Syntax(pest::error::Error<Rule>),
+    Syntax(super::SyntaxDiagnostic),
 
     #[error("Invalid expression at line {line}: {message}")]
     InvalidExpression { line: usize, message: String },
+
+    #[error("Invalid expression at line {line}{column}: {diagnostic}", column = .diagnostic.column_suffix())]
+    InvalidAuthoredExpression {
+        line: usize,
+        diagnostic: super::AuthoredExpressionDiagnostic,
+    },
 
     #[error("Invalid expression at line {line}: {error}")]
     Evaluation {
@@ -221,7 +252,7 @@ pub enum ParseError {
     )]
     DeferredForBodyTemplate {
         line: usize,
-        header: String,
+        header: super::AuthoredExpressionText,
         span: SourceSpan,
         error: Box<ParseError>,
     },
@@ -263,7 +294,7 @@ pub enum ParseError {
     )]
     SecretDerivedBackendAttribute {
         backend_type: String,
-        attribute: String,
+        attribute: super::AttributeKey,
         line: usize,
         start_column: usize,
         end_column: usize,
@@ -340,12 +371,6 @@ pub enum ParseError {
     UserFunctionError(String),
 }
 
-impl From<pest::error::Error<Rule>> for ParseError {
-    fn from(error: pest::error::Error<Rule>) -> Self {
-        Self::Syntax(error)
-    }
-}
-
 fn format_cyclic_let_binding(
     chain: &[crate::resource::DiagnosticPath<crate::resource::RelativeBindingName>],
 ) -> String {
@@ -366,7 +391,7 @@ fn format_cyclic_let_binding(
 
 fn format_deferred_for_body_unsupported(
     line: usize,
-    header: &str,
+    header: &super::AuthoredExpressionText,
     body: &DeferredForBodyKind,
     iterable_resolution: DeferredForIterableResolution,
     phase_detail: Option<&str>,
@@ -457,6 +482,128 @@ pub struct ParseWarning {
 }
 
 impl ParseError {
+    pub fn protected_failure(&self) -> Option<&super::ProtectedParseFailure> {
+        match self {
+            Self::ProtectedFile(failure) => Some(failure),
+            Self::Located { error, .. } => error.protected_failure(),
+            Self::AtElement(finding) => finding.detail().protected_failure(),
+            _ => None,
+        }
+    }
+
+    /// Parser-owned coordinates; line-only errors do not invent a range.
+    pub fn diagnostic_range(&self) -> Option<ParseWarningSpan> {
+        let from_span = |span: SourceSpan| ParseWarningSpan {
+            start_line: span.start_line(),
+            start_column: span.start_column(),
+            end_line: span.end_line(),
+            end_column: span.end_column(),
+        };
+        match self {
+            Self::Located { error, .. } => error.diagnostic_range(),
+            Self::AtElement(finding) => Some(from_span(finding.location().span())),
+            Self::InvalidAuthoredExpression { diagnostic, .. } => diagnostic.range(),
+            Self::ProtectedFile(failure) => Some(failure.range().clone()),
+            Self::Syntax(error) => {
+                let (start, end) = match error.line_col {
+                    pest::error::LineColLocation::Pos(position) => (position, position),
+                    pest::error::LineColLocation::Span(start, end) => (start, end),
+                };
+                Some(ParseWarningSpan {
+                    start_line: start.0,
+                    start_column: start.1,
+                    end_line: end.0,
+                    end_column: end.1,
+                })
+            }
+            Self::IntegerArithmetic {
+                line,
+                column,
+                end_column,
+                ..
+            } => Some(ParseWarningSpan {
+                start_line: *line,
+                start_column: *column,
+                end_line: *line,
+                end_column: *end_column,
+            }),
+            Self::SecretDerivedBackendAttribute {
+                line,
+                start_column,
+                end_column,
+                ..
+            } => Some(ParseWarningSpan {
+                start_line: *line,
+                start_column: *start_column,
+                end_line: *line,
+                end_column: *end_column,
+            }),
+            Self::UnresolvedDeclarationType { token, .. } => Some(from_span(token.span())),
+            Self::ReservedResourceAttribute {
+                line,
+                column,
+                end_line,
+                end_column,
+                ..
+            } => Some(ParseWarningSpan {
+                start_line: *line,
+                start_column: *column,
+                end_line: *end_line,
+                end_column: *end_column,
+            }),
+            Self::UnknownFunction { name, line, column } => Some(ParseWarningSpan {
+                start_line: *line,
+                start_column: *column,
+                end_line: *line,
+                end_column: *column + name.chars().count(),
+            }),
+            Self::DeferredForBodyUnsupported(details) => Some(from_span(details.span)),
+            Self::DeferredForBodyTemplate { span, .. }
+            | Self::UnboundLoopRead {
+                span: Some(span), ..
+            } => Some(from_span(*span)),
+            Self::UndefinedDeferredIterable { span, .. }
+            | Self::UndefinedIdentifier {
+                span: Some(span), ..
+            } => Some(from_span(**span)),
+            _ => None,
+        }
+    }
+
+    /// Safe diagnostic wording, separate from terminal location presentation.
+    pub fn diagnostic_message(&self) -> String {
+        match self {
+            Self::Located { error, .. } => error.diagnostic_message(),
+            Self::AtElement(finding) => finding.detail().diagnostic_message(),
+            // Pest's Display includes the source line. Keep authored text out
+            // of machine diagnostics, including malformed secret expressions.
+            Self::Syntax(error) => format!("Syntax error: {}", error.variant.message()),
+            Self::ProtectedFile(failure) => failure.kind().to_string(),
+            Self::InsideSecret { .. } => crate::resource::INSIDE_SECRET_MESSAGE.to_string(),
+            Self::InvalidAuthoredExpression { diagnostic, .. } => diagnostic.to_string(),
+            Self::InvalidExpression { message, .. }
+            | Self::IntegerArithmetic { message, .. }
+            | Self::UnresolvedDeclarationType { message, .. } => message.clone(),
+            Self::Evaluation { error, .. } => error.to_string(),
+            Self::InvalidFloatLiteral { source, .. } => format!(
+                "Invalid float literal: {}",
+                crate::executor::render_error_chain(source)
+            ),
+            Self::UnknownFunction { name, .. } => format!("Unknown function '{name}'"),
+            Self::ReservedResourceAttribute { attribute, .. } => format!(
+                "Reserved attribute name '{attribute}': names starting with '_' are reserved for Carina"
+            ),
+            Self::InterpolationNotAllowedInLiteralString { .. } => {
+                "interpolation is not allowed in this string literal".to_string()
+            }
+            Self::InvalidResourceIdentity { error, .. } => error.to_string(),
+            Self::DuplicateBinding { name, .. } => format!("Duplicate binding: {name}"),
+            Self::UserFunctionError(message) => message.clone(),
+            Self::RetainedEvidence(error) => error.to_string(),
+            _ => crate::executor::render_error_chain(self),
+        }
+    }
+
     pub(crate) fn from_resolution(error: crate::resolver::ResolutionError, line: usize) -> Self {
         use crate::resolver::ResolutionError;
         match error {
@@ -490,6 +637,7 @@ impl ParseError {
             error => {
                 let line = match error {
                     Self::InvalidExpression { line, .. }
+                    | Self::InvalidAuthoredExpression { line, .. }
                     | Self::Evaluation { line, .. }
                     | Self::IntegerArithmetic { line, .. }
                     | Self::SecretInConstraint { line }

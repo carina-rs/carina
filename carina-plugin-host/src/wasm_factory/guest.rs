@@ -1247,6 +1247,7 @@ impl WasmProviderFactory {
         epoch_ticker: EpochTicker,
         configured: ConfiguredProvider,
         network_request: GuestNetworkRequest<'_>,
+        notices: &mut WasmLoadNoticeSink,
     ) -> Result<Self, WasmProviderLoadError> {
         let budget = GuestCallBudget::PRODUCTION;
         let component_imports = ComponentImports::from_component(&engine, &component);
@@ -1261,6 +1262,7 @@ impl WasmProviderFactory {
             component.clone(),
             Arc::clone(&configured.label),
             budget,
+            notices,
         );
         let mut live = create_instance_auto(&mut rebuild).await?;
         let enable_http = live.world == InstantiationWorld::HttpEnabled;
@@ -1308,7 +1310,7 @@ impl WasmProviderFactory {
             .map_err(|error| {
                 WasmProviderLoadError::metadata("Failed to install diagnostic schemas", error)
             })?;
-        let init_instance = RebuildableInstance::new(live, rebuild);
+        let init_instance = RebuildableInstance::new(live, rebuild, notices.clone());
 
         Ok(Self {
             engine,
@@ -1451,10 +1453,16 @@ impl SchemaOnlyWasmProviderFactory {
         engine: Engine,
         component: Component,
         configured: ConfiguredProvider,
+        notices: &mut WasmLoadNoticeSink,
     ) -> Result<Self, WasmProviderLoadError> {
         let _epoch_ticker = EpochTicker::start(engine.clone());
-        let (mut store, bindings) =
-            create_schema_only_bindings(&engine, &component, Arc::clone(&configured.label)).await?;
+        let (mut store, bindings) = create_schema_only_bindings(
+            &engine,
+            &component,
+            Arc::clone(&configured.label),
+            notices,
+        )
+        .await?;
         let info_json = bindings.info_json();
         let (reported_name, display_name, version) = wasm_convert::json_to_provider_info(info_json)
             .map_err(|source| {
@@ -4588,12 +4596,12 @@ pub(super) mod tests {
                 let mut parsed = carina_core::parser::ExpandedInferredFile::default();
                 parsed.providers = vec![carina_core::parser::ProviderConfig {
                     name: factory.name().to_string(),
-                    attributes,
-                    default_tags: IndexMap::new(),
+                    attributes: (attributes).into(),
+                    default_tags: Default::default(),
                     source: None,
                     version: None,
                     revision: None,
-                    unresolved_attributes: IndexMap::new(),
+                    unresolved_attributes: Default::default(),
                     binding: None,
                 }];
                 let configs = carina_core::parser::resolve_provider_attributes_with_remote(
@@ -4887,6 +4895,7 @@ pub(super) mod tests {
             cache.path(),
             Some(&first_lock),
             &UnusedAwsCredentialProvisioner,
+            &mut crate::WasmLoadNoticeSink::new(move |_| {}),
         )
         .await;
 
@@ -4923,6 +4932,7 @@ pub(super) mod tests {
             cache.path(),
             Some(&locked),
             &FailingAwsCredentialProvisioner,
+            &mut crate::WasmLoadNoticeSink::new(move |_| {}),
         )
         .await;
 
@@ -4967,6 +4977,12 @@ pub(super) mod tests {
                 &cache,
                 Some(&locked),
                 &UnusedAwsCredentialProvisioner,
+                &mut crate::WasmLoadNoticeSink::new(move |notice| match notice {
+                    WasmLoadNotice::ValidationRebuilt(_) => {
+                        log::warn!(target: "carina_plugin_host::wasm_factory", "{notice}")
+                    }
+                    notice => eprintln!("{notice}"),
+                }),
             )
             .await
             .expect("mock WASM provider should load"),
@@ -4994,6 +5010,7 @@ pub(super) mod tests {
         let factory = SchemaOnlyWasmProviderFactory::from_bytes(
             VerifiedLoad::for_test(wasm_bytes, test_load_identity("mock")),
             &user_dirs,
+            &mut crate::WasmLoadNoticeSink::new(move |_| {}),
         )
         .await
         .expect("schema-only mock provider should load");
@@ -8827,6 +8844,7 @@ pub(super) mod tests {
             &bytes,
             ConfiguredProvider::new(&identity),
             GuestNetworkRequest::SchemaOnly,
+            &mut WasmLoadNoticeSink::new(|_| {}),
         )
         .await
         .unwrap();
@@ -10151,6 +10169,7 @@ pub(super) mod tests {
                 budget: GuestCallBudget::PRODUCTION,
                 http_test_route: None,
             },
+            WasmLoadNoticeSink::new(|_| {}),
         );
         instance.state.lock().await.instance = ValidationInstanceState::Poisoned {
             reason: PoisonReason::Cancelled,
@@ -10186,6 +10205,7 @@ pub(super) mod tests {
             .session("rebuild-test", None, None)
             .guest_inputs();
         let instance = RebuildableInstance {
+            notices: WasmLoadNoticeSink::new(|_| {}),
             state: Mutex::new(RebuildableState {
                 inputs: diagnostic_inputs.guest_inventory(),
                 instance: ValidationInstanceState::Poisoned {
@@ -10530,7 +10550,7 @@ pub(super) mod tests {
 
     fn review_bind_rebuild(error: ProviderError) -> carina_core::provider::HostError {
         let factory = ReviewErrorFactory(std::sync::Mutex::new(Some(error)));
-        let attributes = IndexMap::from([(
+        let attributes = IndexMap::<String, _>::from([(
             "password".into(),
             carina_core::resource::Value::Deferred(carina_core::resource::DeferredValue::Secret(
                 Box::new(carina_core::resource::Value::Concrete(
@@ -10542,7 +10562,7 @@ pub(super) mod tests {
         carina_core::executor::provider_ready::validate_and_canonicalize_provider_config(
             &factory,
             "review",
-            &attributes,
+            &((attributes.clone()).into()),
             &factory.provider_config_attribute_types(),
         )
         .unwrap_err()

@@ -20,7 +20,7 @@ use carina_cli::commands::plan::run_plan;
 use carina_cli::commands::providers::{ProvidersCommands, run_providers_command};
 use carina_cli::commands::skills;
 use carina_cli::commands::state::{StateCommands, run_force_unlock, run_state_command};
-use carina_cli::commands::validate::run_validate;
+use carina_cli::commands::validate::{collect_validate, render_validate};
 use carina_cli::error;
 use carina_cli::plan_image::{ImageTheme, PlanImageTarget};
 use carina_cli::{DEFAULT_PARALLELISM, DetailLevel};
@@ -410,7 +410,13 @@ async fn main() {
     // after `Cli::parse()` because that exits the process itself on
     // --help/--version/parse error, so those paths must not hide; and
     // before dispatch so all user-visible output runs cursor-hidden.
-    let _cursor_guard = carina_cli::cursor::CursorGuard::progress(&cursor);
+    let json = matches!(
+        &cli.command,
+        Commands::Validate { json: true, .. }
+            | Commands::Plan { json: true, .. }
+            | Commands::Export { json: true, .. }
+    );
+    let _cursor_guard = (!json).then(|| carina_cli::cursor::CursorGuard::progress(&cursor));
 
     let completion = carina_cli::signal::run_with_shutdown(&cursor, |shutdown| async move {
         // Handle Plan separately since it returns Result<bool, String>
@@ -465,15 +471,23 @@ async fn main() {
             }
         }
 
+        if let Commands::Validate { path, json } = &cli.command {
+            let runtime = resolve_user_dirs()
+                .map_err(Box::new)
+                .and_then(|dirs| inputs.runtime(dirs));
+            let report = match runtime {
+                Ok(runtime) => {
+                    let context = create_provider_context(runtime.environment().clone());
+                    collect_validate(Ok(&runtime), path, Some(&context))
+                }
+                Err(error) => collect_validate(Err(*error), path, None),
+            };
+            return CommandCompletion::Exit(render_validate(&report, *json, color_mode));
+        }
+
         let result: Result<(), error::AppError> = async {
             match cli.command {
-                Commands::Validate { path, json } => {
-                    let runtime = inputs
-                        .runtime(resolve_user_dirs()?)
-                        .map_err(|error| *error)?;
-                    let provider_context = create_provider_context(runtime.environment().clone());
-                    run_validate(&runtime, &path, json, &provider_context)
-                }
+                Commands::Validate { .. } => unreachable!(),
                 Commands::Plan { .. } => unreachable!(),
                 Commands::Apply {
                     path,

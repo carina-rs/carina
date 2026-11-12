@@ -364,7 +364,14 @@ pub fn run_fmt(
         path,
         mode,
         recursive,
-        |providers, directory| FormattingProviderLoad::load(runtime, providers, directory),
+        |providers, directory| {
+            FormattingProviderLoad::load(
+                runtime,
+                providers,
+                directory,
+                &mut crate::commands::human_provider_notices(runtime.color_mode()),
+            )
+        },
     )
 }
 

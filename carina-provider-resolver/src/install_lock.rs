@@ -44,9 +44,9 @@ impl<'lock> GuardedLockFile<'lock> {
         self.migration.take()
     }
 
-    pub(crate) fn report_migration(&mut self) {
+    pub(crate) fn report_migration(&mut self, notices: &mut impl FnMut(crate::ProviderLoadNotice)) {
         if let Some(migration) = self.take_migration() {
-            eprintln!("{migration}");
+            notices(crate::ProviderLoadNotice::migration(migration));
         }
     }
 

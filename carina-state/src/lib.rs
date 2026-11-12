@@ -18,7 +18,6 @@
 //! use carina_core::parser::BackendConfig as ParserBackendConfig;
 //! use carina_core::resource::{ConcreteValue, Value};
 //! use carina_state::{BackendSelection, MutationBackendSelection};
-//! use std::collections::HashMap;
 //! use std::path::Path;
 //!
 //! let raw_config = ParserBackendConfig {
@@ -28,7 +27,7 @@
 //!         ("key".to_string(), Value::Concrete(ConcreteValue::String("infra/prod/carina.state".into()))),
 //!         ("region".to_string(), Value::Concrete(ConcreteValue::enum_identifier("aws.Region.ap_northeast_1"))),
 //!     ].into_iter().collect(),
-//!     attribute_spans: HashMap::new(),
+//!     attribute_spans: Default::default(),
 //! };
 //! let selected = BackendSelection::verified_for_mutation(Path::new("."), Some(&raw_config))?;
 //! let MutationBackendSelection::Verified(selected) = selected else {

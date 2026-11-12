@@ -417,7 +417,13 @@ impl<'a> CstBuilder<'a> {
             | Rule::minus_op
             | Rule::multiply_op
             | Rule::divide_op
-            | Rule::remainder_op => None,
+            | Rule::remainder_op
+            // Shared syntax heads are silent; their children stay in the
+            // owning statement/expression just as before factoring.
+            | Rule::require_head
+            | Rule::let_head
+            | Rule::for_head
+            | Rule::if_head => None,
         }
     }
 

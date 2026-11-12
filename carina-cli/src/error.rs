@@ -1055,9 +1055,153 @@ pub struct UpstreamSnapshotChangedError {
     pub(crate) error: AppError,
 }
 
+pub struct ModuleResolutionFailure {
+    error: carina_core::module_resolver::ResidualModuleResolutionError,
+    base: carina_core::paths::ResolvedPath,
+}
+impl ModuleResolutionFailure {
+    pub(crate) fn new(
+        error: carina_core::module_resolver::ResidualModuleResolutionError,
+        base: carina_core::paths::ResolvedPath,
+    ) -> Self {
+        Self { error, base }
+    }
+    pub fn individual_errors(
+        &self,
+    ) -> Vec<carina_core::module_resolver::ModuleErrorDiagnostic<'_>> {
+        self.error.individual_errors()
+    }
+    pub fn source_directory(&self) -> PathBuf {
+        self.base.source_label()
+    }
+}
+impl std::fmt::Debug for ModuleResolutionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ModuleResolutionFailure { .. }")
+    }
+}
+impl std::fmt::Display for ModuleResolutionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !self.error.is_constraint() {
+            formatter.write_str("Module resolution error: ")?;
+        }
+        formatter.write_str(&self.error.display_relative_to(&self.base.source_label()))
+    }
+}
+impl std::error::Error for ModuleResolutionFailure {}
+
+type LocatedUpstream<D> =
+    carina_core::parser::Located<carina_core::upstream_exports::UpstreamDiagnostic<D>>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum UpstreamReferenceFailure {
+    #[error("{0}")]
+    Field(LocatedUpstream<carina_core::upstream_exports::UpstreamFieldError>),
+    #[error("{0}")]
+    Iterable(LocatedUpstream<carina_core::upstream_exports::UpstreamForIterableShapeError>),
+    #[error("{0}")]
+    Attribute(LocatedUpstream<carina_core::upstream_exports::UpstreamAttributeAccessShapeError>),
+    #[error("{0}")]
+    Subscript(LocatedUpstream<carina_core::upstream_exports::UpstreamSubscriptShapeError>),
+}
+impl UpstreamReferenceFailure {
+    pub fn diagnostic(&self) -> (&carina_core::parser::DeclarationLocation, String) {
+        fn project<D: carina_core::upstream_exports::UpstreamRefDiagnostic>(
+            finding: &LocatedUpstream<D>,
+        ) -> (&carina_core::parser::DeclarationLocation, String) {
+            (
+                finding.location(),
+                carina_core::upstream_exports::UpstreamRefDiagnostic::diagnostic_message(
+                    finding.detail(),
+                ),
+            )
+        }
+        match self {
+            Self::Field(finding) => project(finding),
+            Self::Iterable(finding) => project(finding),
+            Self::Attribute(finding) => project(finding),
+            Self::Subscript(finding) => project(finding),
+        }
+    }
+}
+
+/// Render module ownership as presentation without splitting findings.
+fn validation_finding_display(prefix: Option<&str>, finding: &impl std::fmt::Display) -> String {
+    let message = finding.to_string();
+    match prefix {
+        None => message,
+        Some(prefix) => message
+            .split('\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| format!("{prefix}: {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error("{}", .0.message)]
+    ProviderTypeCheck(Box<carina_core::parser::ParseWarning>),
+    #[error("{0}")]
+    UpstreamReference(Box<UpstreamReferenceFailure>),
+    #[error("{0}")]
+    ModuleResolution(Box<ModuleResolutionFailure>),
+    #[error("{0}")]
+    UpstreamResolution(
+        Box<carina_core::parser::Located<carina_core::upstream_exports::UpstreamResolveFailure>>,
+    ),
+
+    #[error("{0}")]
+    AttributePrefix(Box<carina_core::identifier::AttributePrefixError>),
+
+    #[error("{0}")]
+    ProviderConfiguration(
+        Box<carina_core::executor::provider_ready::ProviderConfigPreparationError>,
+    ),
+
+    #[error("{}", validation_finding_display(prefix.as_deref(), finding.detail()))]
+    ParameterReference {
+        prefix: Option<String>,
+        finding: Box<carina_core::parser::Located<carina_core::validation::ReferenceFinding>>,
+    },
+
+    #[error("{}", validation_finding_display(prefix.as_deref(), finding.detail()))]
+    ParameterValue {
+        prefix: Option<String>,
+        finding: Box<carina_core::parser::Located<carina_core::validation::ParameterValueFinding>>,
+    },
+
+    #[error("{}", .0.detail())]
+    UpstreamSource(
+        Box<carina_core::parser::Located<carina_core::upstream_exports::MissingUpstreamDirectory>>,
+    ),
+
+    #[error(transparent)]
+    ConfigurationLoad(Box<carina_core::config_loader::ConfigurationLoadFailure>),
+
+    #[error("Failed to read {}: {error}", file.display())]
+    ValidationFileRead {
+        file: PathBuf,
+        error: std::io::Error,
+    },
+
+    #[error("{0}")]
+    InputFinding(Box<carina_core::input_rules::InputFinding>),
+
+    #[error(transparent)]
+    InputPreparation(Box<carina_core::input_rules::AuthoredInputPreparationError>),
+
+    #[error(transparent)]
+    ResourceAdmission(Box<carina_core::validation::ResourceAdmissionFinding>),
+
+    #[error("{0}")]
+    Parse(Box<carina_core::parser::ParseError>),
+
+    #[error("{0}")]
+    AnalysisResolution(Box<carina_core::parser::AnalysisResolutionError>),
+
     #[error(transparent)]
     UpstreamSnapshotChanged(Box<UpstreamSnapshotChangedError>),
 
@@ -1312,7 +1456,7 @@ pub enum AppError {
     #[error("{error}; required by provider '{provider}' attribute '{attribute}'")]
     ProviderReferencedUpstream {
         provider: String,
-        attribute: String,
+        attribute: carina_core::parser::AttributeKey,
         error: Box<AppError>,
     },
 
@@ -1383,6 +1527,11 @@ pub enum AppError {
     /// One core-owned module-call finding at its parser-authored location.
     #[error(transparent)]
     ModuleCall(Box<carina_core::validation::ModuleCallFinding>),
+
+    #[error("{0}")]
+    TypeResolution(
+        Box<carina_core::parser::Located<carina_core::validation::TypeResolutionDiagnostic>>,
+    ),
 
     /// Invalid parser/expansion provenance at the sealed analysis boundary.
     #[error(transparent)]

@@ -580,7 +580,7 @@ fn round1_seam_expansion_records_a_decision_without_a_parse_projection() {
         "yes".into(),
     )));
     let mut slots = AuthoredSlots::default();
-    slots.slots.insert("input".into(), slot);
+    slots.slots.insert("input", slot);
     let decisions = super::super::ConditionRecorder::default();
     decisions.extend([(condition, true)]);
     slots.record_condition_selections(&decisions);

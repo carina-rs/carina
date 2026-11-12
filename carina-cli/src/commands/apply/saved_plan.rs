@@ -1271,7 +1271,6 @@ mod tests {
         ResolvedResourceId, Resource, ResourceId, State, Value,
     };
     use carina_state::{ResourceState, StateFile};
-    use indexmap::IndexMap;
 
     use super::{
         DesiredVerifiedPlanFile, HistoricalResourceAddresses, InspectedPlanFile,
@@ -1353,10 +1352,10 @@ mod tests {
             source: Some(format!("file://{name}.wasm").parse().unwrap()),
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
         }
     }
 

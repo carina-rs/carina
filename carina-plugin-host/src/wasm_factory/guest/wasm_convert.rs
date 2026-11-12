@@ -1607,8 +1607,8 @@ pub(crate) fn core_data_source_to_wit_resource(
 // confinement-allow-return: Outbound checked attributes; strings are wire keys, never diagnostic text.
 pub(crate) fn checked_attributes_to_wit(attributes: &WireAttributes) -> Vec<(String, wit::Value)> {
     attributes
-        .iter()
-        .map(|(key, value)| (key.clone(), checked_value_to_wit(value)))
+        .transport_iter()
+        .map(|(key, value)| (key.to_owned(), checked_value_to_wit(value)))
         .collect()
 }
 

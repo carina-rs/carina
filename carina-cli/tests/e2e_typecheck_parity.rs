@@ -1320,7 +1320,7 @@ fn issue_4282_module_join_reports_named_string_length_rule() {
     assert_module_constructed_string(
         "join('', ['carina-', '360000', '-role'])",
         "role_name",
-        Some("length 18 is outside allowed range [1, 16]"),
+        Some("length 18 is outside allowed range 1..=16"),
     );
 }
 
@@ -1329,7 +1329,7 @@ fn issue_4282_module_interpolation_reports_named_string_length_rule() {
     assert_module_constructed_string(
         r#""carina-${'360000'}-role""#,
         "role_name",
-        Some("length 18 is outside allowed range [1, 16]"),
+        Some("length 18 is outside allowed range 1..=16"),
     );
 }
 
@@ -1349,7 +1349,7 @@ fn issue_4282_module_trim_at_named_string_uses_interpolation_rules() {
     assert_module_constructed_string(
         "trim(' carina-360000-role ')",
         "role_name",
-        Some("length 18 is outside allowed range [1, 16]"),
+        Some("length 18 is outside allowed range 1..=16"),
     );
 }
 
@@ -1419,7 +1419,7 @@ fn issue_4282_split_at_named_string_list_checks_values_in_cli_and_lsp() {
     for (input, expected_rule) in [
         ("abc,def", None),
         ("A,b", Some("does not match required pattern /^[a-z]+$/")),
-        ("abc,abcd", Some("length 4 is outside allowed range [1, 3]")),
+        ("abc,abcd", Some("length 4 is outside allowed range 1..=3")),
         (
             "abc,123",
             Some("does not match required pattern /^[a-z]+$/"),
@@ -1692,6 +1692,7 @@ struct AnnotationDiagnostic {
     severity: &'static str,
     code: Option<String>,
     message: String,
+    range: (usize, usize, usize, usize),
 }
 
 fn cli_annotation_diagnostics(
@@ -1699,123 +1700,92 @@ fn cli_annotation_diagnostics(
     output: &std::process::Output,
     load_errors: &HashMap<String, String>,
 ) -> Vec<AnnotationDiagnostic> {
-    use carina_cli::error::AppError;
-    use carina_core::parser::WarningKind;
-
-    // Read the typed production report before rendering. The subprocess below
-    // independently verifies that validate prints those same severities,
-    // counts and messages; terminal text does not expose diagnostic codes.
+    // Both the injected-provider adapter and subprocess consume the production
+    // collector. Only the injected provider failure reason differs.
     let typed = carina_cli::commands::validate::validate_diagnostics_with_factories(
         &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
         Vec::new(),
         load_errors.clone(),
     );
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("one validate JSON document");
     let mut diagnostics = Vec::new();
-    for warning in typed.warnings {
-        let code = match warning.kind {
-            WarningKind::ProviderSchemasNotLoaded => "providers_not_loaded",
-            other => panic!("unexpected CLI warning kind: {other:?}"),
-        };
-        diagnostics.push(AnnotationDiagnostic {
-            severity: "WARNING",
-            code: Some(code.to_string()),
-            message: warning.message,
-        });
-    }
-    for error in typed.errors {
-        match &error {
-            AppError::ModuleCall(finding)
-                if finding.kind()
-                    == carina_core::validation::ModuleCallFindingKind::TypeResolution => {}
-            AppError::Validation(message)
-                if load_errors.values().any(|reason| reason == message) =>
-            {
-                continue;
+    let mut injected = Vec::new();
+    for (report, findings) in [(&json, &mut diagnostics), (&typed.json, &mut injected)] {
+        let mut provider_errors = 0;
+        for (field, severity) in [("errors", "ERROR"), ("warnings", "WARNING")] {
+            for finding in report[field].as_array().into_iter().flatten() {
+                assert_eq!(finding["severity"], severity.to_lowercase());
+                let message = finding["message"].as_str().unwrap();
+                let provider_error = if std::ptr::eq(report, &typed.json) {
+                    load_errors.values().any(|reason| reason == message)
+                } else {
+                    load_errors
+                        .keys()
+                        .any(|provider| message.starts_with(&format!("Provider '{provider}' ")))
+                };
+                if provider_error {
+                    assert_eq!(severity, "ERROR");
+                    assert!(finding["code"].is_null());
+                    assert!(finding["location"].is_null());
+                    provider_errors += 1;
+                    continue;
+                }
+                let location = &finding["location"];
+                assert!(
+                    location["file"].as_str().unwrap().ends_with("main.crn"),
+                    "{finding}"
+                );
+                assert!(
+                    location["range"]["start"]["line"].as_u64().unwrap() > 0,
+                    "{finding}"
+                );
+                assert!(
+                    location["range"]["start"]["column"].as_u64().unwrap() > 0,
+                    "{finding}"
+                );
+                findings.push(AnnotationDiagnostic {
+                    severity,
+                    code: finding["code"].as_str().map(str::to_string),
+                    message: message.to_string(),
+                    range: (
+                        location["range"]["start"]["line"].as_u64().unwrap() as usize,
+                        location["range"]["start"]["column"].as_u64().unwrap() as usize,
+                        location["range"]["end"]["line"].as_u64().unwrap() as usize,
+                        location["range"]["end"]["column"].as_u64().unwrap() as usize,
+                    ),
+                });
             }
-            other => panic!("unexpected CLI error: {other:?}"),
         }
-        let formatted = carina_cli::error::format_error_with_source_chain(&error);
-        for (message, count) in cli_located_message_multiset(&[formatted]) {
-            assert_eq!(count, 1);
-            diagnostics.push(AnnotationDiagnostic {
-                severity: "ERROR",
-                code: None,
-                message,
-            });
-        }
+        assert_eq!(provider_errors, load_errors.len(), "{report}");
+        findings.sort();
     }
-
-    let stderr = std::str::from_utf8(&output.stderr).expect("CLI diagnostics must be UTF-8");
-    let mut printed = Vec::new();
-    let mut provider_errors = 0;
-    let mut provider_notices = 0;
-    for line in stderr.lines() {
-        if load_errors
-            .keys()
-            .any(|provider| line.starts_with(&format!("Provider '{provider}' ")))
-        {
-            provider_notices += 1;
-            continue;
-        }
-        if let Some(warning) = line.trim().strip_prefix('⚠') {
-            let (_, message) = warning.split_once(": ").expect("located CLI warning");
-            printed.push(("WARNING", message.to_string()));
-            continue;
-        }
-        let message = line
-            .strip_prefix("Error: ")
-            .unwrap_or_else(|| panic!("unexpected stderr line: {line:?}; stderr: {stderr}"));
-        // Each located finding's file/line header is rendered separately.
-        if message
-            .rsplit_once(" at line ")
-            .is_some_and(|(file, line)| file.ends_with(".crn") && line.parse::<usize>().is_ok())
-        {
-            continue;
-        }
-        if load_errors
-            .keys()
-            .any(|provider| message.starts_with(&format!("Provider '{provider}' ")))
-        {
-            provider_errors += 1;
-        } else {
-            printed.push(("ERROR", message.to_string()));
-        }
-    }
-    assert_eq!(provider_errors, load_errors.len(), "{stderr}");
-    assert_eq!(provider_notices, load_errors.len(), "{stderr}");
-    let mut expected = diagnostics
-        .iter()
-        .map(|diagnostic| (diagnostic.severity, diagnostic.message.clone()))
-        .collect::<Vec<_>>();
-    expected.sort();
-    printed.sort();
     assert_eq!(
-        printed, expected,
-        "subprocess and typed CLI report differ: {stderr}"
+        diagnostics, injected,
+        "subprocess and production collector differ"
     );
     let success = load_errors.is_empty()
         && diagnostics
             .iter()
             .all(|diagnostic| diagnostic.severity != "ERROR");
-    assert_eq!(output.status.success(), success, "{stderr}");
-    if success {
-        let json: serde_json::Value =
-            serde_json::from_slice(&output.stdout).expect("successful validate JSON");
-        assert_eq!(json["status"], "ok", "{json}");
-        assert!(
-            json.get("warnings").is_none(),
-            "unexpected warnings: {json}"
-        );
-    } else {
-        assert!(output.stdout.is_empty(), "failed validate emitted stdout");
+    assert_eq!(output.status.success(), success);
+    assert_eq!(json["status"], if success { "ok" } else { "error" });
+    if !success {
+        assert_eq!(json["resource_count"], 0);
+        assert_eq!(json["resources"], serde_json::json!([]));
     }
-    diagnostics.sort();
     diagnostics
 }
 
 fn lsp_annotation_diagnostics(
     diagnostics: &[tower_lsp::lsp_types::Diagnostic],
     load_errors: &HashMap<String, String>,
+    source: &str,
 ) -> Vec<AnnotationDiagnostic> {
     use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString};
 
@@ -1849,6 +1819,28 @@ fn lsp_annotation_diagnostics(
             severity,
             code,
             message: diagnostic.message.clone(),
+            range: {
+                let scalar_column = |position: tower_lsp::lsp_types::Position| {
+                    let mut units = 0;
+                    source
+                        .lines()
+                        .nth(position.line as usize)
+                        .unwrap()
+                        .chars()
+                        .take_while(|character| {
+                            units += character.len_utf16();
+                            units <= position.character as usize
+                        })
+                        .count()
+                        + 1
+                };
+                (
+                    diagnostic.range.start.line as usize + 1,
+                    scalar_column(diagnostic.range.start),
+                    diagnostic.range.end.line as usize + 1,
+                    scalar_column(diagnostic.range.end),
+                )
+            },
         });
     }
     assert_eq!(provider_errors, load_errors.len(), "{diagnostics:#?}");
@@ -1908,7 +1900,7 @@ fn assert_annotation_parity(
     let diagnostics = engine
         .with_provider_errors(load_errors.clone())
         .analyze(&document, Some(&path));
-    let lsp = lsp_annotation_diagnostics(&diagnostics, &load_errors);
+    let lsp = lsp_annotation_diagnostics(&diagnostics, &load_errors, source);
     assert_eq!(
         lsp, cli,
         "CLI and LSP must agree on every type finding's severity, code, count, and message; source: {source}; diagnostics: {diagnostics:#?}"
@@ -6357,7 +6349,7 @@ fn assert_single_value_walk_f03_errors(errors: &[String]) {
     );
     assert!(
         errors[0].contains("Invalid value 'abcd' for 'params' (VpcId)")
-            && errors[0].contains("length 4 is outside allowed range [, 3]"),
+            && errors[0].contains("length 4 is outside allowed range unbounded..=3"),
         "F03 must retain the local length diagnostic: {errors:#?}",
     );
     assert!(
@@ -6818,7 +6810,9 @@ fn issue_4276_round1_module_if_reports_undecided_branch_constraints() {
             .iter()
             .map(|d| d.message.as_str())
             .collect::<Vec<_>>(),
-        vec!["Invalid value 'too long' for 'params': length 8 is outside allowed range [, 3]",]
+        vec![
+            "Invalid value 'too long' for 'params': length 8 is outside allowed range unbounded..=3",
+        ]
     );
 }
 
@@ -6884,7 +6878,7 @@ fn issue_4276_round2_c_identified_module_if_cli_checks_expanded_value_once() {
             Vec::new()
         } else {
             vec![
-                "awsccmock.test.Sink.<pending>: Invalid value 'vpc-123' for 'params' (VpcId): length 7 is outside allowed range [, 5]",
+                "awsccmock.test.Sink.<pending>: Invalid value 'vpc-123' for 'params' (VpcId): length 7 is outside allowed range unbounded..=5",
             ]
         };
         assert_eq!(
@@ -6911,7 +6905,7 @@ fn issue_4276_round2_c_identified_module_if_lsp_reports_local_branch_error() {
             .map(|d| d.message.as_str())
             .collect::<Vec<_>>(),
         vec![
-            "Invalid value 'vpc-123' for 'params' (VpcId): length 7 is outside allowed range [, 5]",
+            "Invalid value 'vpc-123' for 'params' (VpcId): length 7 is outside allowed range unbounded..=5",
         ]
     );
     assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
@@ -6963,7 +6957,7 @@ fn issue_4276_round1_module_if_expansion_reports_chosen_branch_once() {
         if !flag {
             assert_eq!(
                 cli[0],
-                "awsccmock.test.Sink.<pending>: Invalid value 'too long' for 'params': length 8 is outside allowed range [, 3]"
+                "awsccmock.test.Sink.<pending>: Invalid value 'too long' for 'params': length 8 is outside allowed range unbounded..=3"
             );
         }
     }
@@ -7160,7 +7154,7 @@ fn issue_4276_round1_provider_config_keeps_main_local_error_text() {
     assert_eq!(
         cli,
         vec![
-            "provider awsccmock: params: List item at index 0: Invalid VpcId value 'abcd': length 4 is outside allowed range [, 3]"
+            "provider awsccmock: params: List item at index 0: Invalid VpcId value 'abcd': length 4 is outside allowed range unbounded..=3"
         ]
     );
     let diagnostics =
@@ -7180,7 +7174,7 @@ fn issue_4276_round1_provider_config_keeps_main_local_error_text() {
     assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
     assert_eq!(
         diagnostics[0].message,
-        "provider awsccmock: params: List item at index 0: Invalid VpcId value 'abcd': length 4 is outside allowed range [, 3]"
+        "provider awsccmock: params: List item at index 0: Invalid VpcId value 'abcd': length 4 is outside allowed range unbounded..=3"
     );
     assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
     assert_eq!(
@@ -7294,7 +7288,7 @@ fn single_value_walk_nested_local_failure_skips_provider_rejection() {
         let errors = diagnostics(single_value_walk_m01_factories(params.clone()), &fixture);
         assert_eq!(errors.len(), 1, "one nested local failure: {errors:#?}");
         assert!(
-            errors[0].contains("length 4 is outside allowed range [, 3]"),
+            errors[0].contains("length 4 is outside allowed range unbounded..=3"),
             "{errors:#?}"
         );
         assert!(!errors[0].contains("rejected `VpcId`"), "{errors:#?}");
@@ -7317,7 +7311,7 @@ fn single_value_walk_valid_sibling_still_reports_provider_rejection() {
         assert_eq!(
             errors
                 .iter()
-                .filter(|error| error.contains("length 4 is outside allowed range [, 3]"))
+                .filter(|error| error.contains("length 4 is outside allowed range unbounded..=3"))
                 .count(),
             1,
             "{errors:#?}"

@@ -187,7 +187,7 @@ pub(super) struct AttributeLocationIndex {
 
 #[derive(Debug, Default)]
 struct AttributeLocationNode {
-    fields: std::collections::HashMap<String, AttributeLocationNode>,
+    fields: indexmap::IndexMap<super::AttributeKey, AttributeLocationNode>,
     indices: std::collections::HashMap<usize, AttributeLocationNode>,
     keys: Vec<usize>,
     first_block: Option<usize>,
@@ -229,11 +229,13 @@ impl AttributeLocationIndex {
             #[cfg(test)]
             record_attribute_location_work(1);
             node = match segment {
-                super::AttributePathSegment::Attribute(name)
-                | super::AttributePathSegment::StructField(name)
-                | super::AttributePathSegment::Key(name) => {
-                    node.fields.entry(name.clone()).or_default()
-                }
+                super::AttributePathSegment::Attribute(_)
+                | super::AttributePathSegment::StructField(_)
+                | super::AttributePathSegment::Key(_)
+                | super::AttributePathSegment::ProtectedKey { .. } => node
+                    .fields
+                    .entry(segment.semantic_key().expect("named segment"))
+                    .or_default(),
                 super::AttributePathSegment::ListIndex(index) => {
                     node.indices.entry(*index).or_default()
                 }
@@ -1735,7 +1737,8 @@ pub struct AnalysisTree<
     loop_groups: std::collections::HashSet<String>,
     syntax: &'a super::SyntaxInventory<B>,
     type_annotations: Vec<Located<crate::validation::TypeResolutionContext>>,
-    provider_attribute_locations: Vec<std::collections::HashMap<String, DeclarationLocation>>,
+    provider_attribute_locations:
+        Vec<std::collections::HashMap<super::AttributeKey, DeclarationLocation>>,
     upstream_states: Vec<Located<&'a super::UpstreamState<B>>>,
     value_references: Vec<AnalysisValueReference<B>>,
     validation_values: Vec<Located<FunctionValidationValue<'a, P, B>>>,
@@ -2616,13 +2619,17 @@ where
         self.provider_declaration(index).location()
     }
 
-    pub fn provider_attribute_location(&self, index: usize, name: &str) -> &DeclarationLocation {
+    pub fn provider_attribute_location<Q: indexmap::Equivalent<super::AttributeKey> + ?Sized>(
+        &self,
+        index: usize,
+        name: &Q,
+    ) -> &DeclarationLocation {
         let declaration = self.provider_declaration(index);
         declaration
             .attributes
             .iter()
             .rev()
-            .find(|attribute| attribute.detail() == name)
+            .find(|attribute| name.equivalent(attribute.detail()))
             .map_or(declaration.location(), |attribute| attribute.location())
     }
 
@@ -2649,7 +2656,10 @@ where
     pub fn backend_location(&self) -> Option<&'a DeclarationLocation> {
         self.backend_location
     }
-    pub fn backend_attribute_location(&self, name: &str) -> &'a DeclarationLocation {
+    pub fn backend_attribute_location<Q: indexmap::Equivalent<super::AttributeKey> + ?Sized>(
+        &self,
+        name: &Q,
+    ) -> &'a DeclarationLocation {
         let header = self
             .backend_location
             .expect("backend must exist before validating its attributes");
@@ -2657,7 +2667,7 @@ where
             .backend_keys()
             .iter()
             .rev()
-            .find(|key| key.detail() == name && key.location().file() == header.file())
+            .find(|key| name.equivalent(key.detail()) && key.location().file() == header.file())
             .map(|key| key.location())
             .unwrap_or(header)
     }
@@ -2669,7 +2679,7 @@ where
     }
     pub(crate) fn provider_attribute_locations(
         &self,
-    ) -> &[std::collections::HashMap<String, DeclarationLocation>] {
+    ) -> &[std::collections::HashMap<super::AttributeKey, DeclarationLocation>] {
         &self.provider_attribute_locations
     }
     pub fn type_annotations(&self) -> &[Located<crate::validation::TypeResolutionContext>] {
@@ -2769,9 +2779,15 @@ where
 
     /// The general project walk, matching `File::iter_all_resources`.
     pub fn project_resources(&self) -> impl Iterator<Item = &AnalysisResourceRef<'a, P, T, D, B>> {
-        self.resources
+        let resources = self
+            .resources
             .iter()
-            .filter(|resource| resource.in_project_walk)
+            .filter(|resource| resource.in_project_walk);
+        #[cfg(any(test, feature = "test-utils"))]
+        let resources = resources.inspect(|_| {
+            crate::test_work::record(crate::test_work::Operation::ProjectResource, 1);
+        });
+        resources
     }
 
     /// Materialized resources, compositions and data sources in declaration

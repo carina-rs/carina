@@ -3,7 +3,6 @@ use std::sync::{Arc, Barrier};
 
 use carina_core::{UserDirs, parser::ProviderConfig};
 use carina_provider_resolver::{LockFile, LockMode, ProviderInstallLock, resolve_all};
-use indexmap::IndexMap;
 
 fn file_provider(name: &str, path: &std::path::Path) -> ProviderConfig {
     ProviderConfig {
@@ -11,10 +10,10 @@ fn file_provider(name: &str, path: &std::path::Path) -> ProviderConfig {
         source: Some(format!("file://{}", path.display()).parse().unwrap()),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
     }
 }
 
@@ -52,10 +51,18 @@ fn resolving_unchanged_file_provider_twice_leaves_only_final_artifact() {
         &install_lock,
         std::slice::from_ref(&provider),
         LockMode::Normal,
+        &mut |_| {},
     )
     .unwrap();
     let destination = first["test"].as_path().to_path_buf();
-    resolve_all(&user_dirs, &install_lock, &[provider], LockMode::Normal).unwrap();
+    resolve_all(
+        &user_dirs,
+        &install_lock,
+        &[provider],
+        LockMode::Normal,
+        &mut |_| {},
+    )
+    .unwrap();
 
     let entries = fs::read_dir(destination.parent().unwrap())
         .unwrap()
@@ -85,7 +92,14 @@ fn concurrent_resolutions_preserve_both_lock_entries() {
                 &carina_core::paths::ResolvedPath::new(&project_dir).unwrap(),
             )
             .unwrap();
-            resolve_all(&user_dirs, &install_lock, &[provider], LockMode::Normal).unwrap();
+            resolve_all(
+                &user_dirs,
+                &install_lock,
+                &[provider],
+                LockMode::Normal,
+                &mut |_| {},
+            )
+            .unwrap();
         })
     });
     start.wait();

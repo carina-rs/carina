@@ -2649,7 +2649,7 @@ fn bind_module_constraints(
                 line,
                 source_file,
             )?,
-            message: requirement.error_message.clone(),
+            message: requirement.error_message.to_string(),
         });
     }
     Ok(constraints)

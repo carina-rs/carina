@@ -95,7 +95,7 @@ fn map_length_validate_rejects_eleven_entries_in_directory() {
     assert_eq!(diagnostics.len(), 1, "{}", diagnostics.join("\n"));
     assert!(diagnostics[0].contains("params"), "{}", diagnostics[0]);
     assert!(
-        diagnostics[0].contains("length 11 is outside allowed range [0, 10]"),
+        diagnostics[0].contains("length 11 is outside allowed range 0..=10"),
         "{}",
         diagnostics[0]
     );

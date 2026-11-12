@@ -142,6 +142,7 @@ type EventCallback = Arc<dyn Fn(BoundProviderEvent) + Send + Sync>;
 pub(super) enum EventSink {
     Default,
     Custom(EventCallback),
+    Filtered(EventCallback),
 }
 
 pub(super) type ProtectedAddresses = HashMap<ResourceId, AddressProtection>;
@@ -433,6 +434,7 @@ impl ProviderDiagnosticChannel {
         let presentation = Presentation {
             sink: match &self.presentation.sink {
                 EventSink::Custom(sink) => EventSink::Custom(sink.clone()),
+                EventSink::Filtered(sink) => EventSink::Filtered(sink.clone()),
                 EventSink::Default => presentation.sink,
             },
             ..presentation
@@ -623,7 +625,7 @@ impl ProviderDiagnosticChannel {
         // stderr's trace opt-in. Filter default output before charging either
         // quota; hidden events also contribute nothing to the suppression notice.
         let enabled = match &self.presentation.sink {
-            EventSink::Default => default_level_enabled(level),
+            EventSink::Default | EventSink::Filtered(_) => default_level_enabled(level),
             EventSink::Custom(_) => true,
         };
         if !enabled {
@@ -696,7 +698,7 @@ fn deliver_event(
     if let Some(event) = bind_event(event, scope, presentation) {
         match &presentation.sink {
             EventSink::Default => write_default_event(event),
-            EventSink::Custom(sink) => sink(event),
+            EventSink::Custom(sink) | EventSink::Filtered(sink) => sink(event),
         }
         true
     } else {

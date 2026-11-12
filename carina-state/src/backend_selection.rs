@@ -478,18 +478,19 @@ mod tests {
     fn local_config(path: &str) -> ParserBackendConfig {
         ParserBackendConfig {
             backend_type: "local".to_string(),
-            attributes: HashMap::from([(
+            attributes: (HashMap::<String, _>::from([(
                 "path".to_string(),
                 Value::Concrete(ConcreteValue::String(path.to_string().into())),
-            )]),
-            attribute_spans: HashMap::new(),
+            )]))
+            .into(),
+            attribute_spans: Default::default(),
         }
     }
 
     fn s3_config(bucket: &str) -> ParserBackendConfig {
         ParserBackendConfig {
             backend_type: "s3".to_string(),
-            attributes: HashMap::from([
+            attributes: (HashMap::<String, _>::from([
                 (
                     "bucket".to_string(),
                     Value::Concrete(ConcreteValue::String(bucket.to_string().into())),
@@ -502,8 +503,9 @@ mod tests {
                     "region".to_string(),
                     Value::Concrete(ConcreteValue::String("us-east-1".into())),
                 ),
-            ]),
-            attribute_spans: HashMap::new(),
+            ]))
+            .into(),
+            attribute_spans: Default::default(),
         }
     }
 

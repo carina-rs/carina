@@ -317,9 +317,9 @@ enum ExprKind<B: BindingAddress> {
         segments: Vec<PathSegment>,
     },
     List,
-    Map(Vec<String>),
+    Map(Vec<super::AttributeKey>),
     NestedBlock {
-        name: String,
+        name: super::AttributeKey,
         header: DeclarationLocation,
     },
     Interpolation {
@@ -349,7 +349,7 @@ enum ExprKind<B: BindingAddress> {
         resource_type: String,
         read: bool,
     },
-    Sink(String),
+    Sink(super::AttributeKey),
     If,
     For,
     Wait,
@@ -568,7 +568,7 @@ pub(in crate::parser) fn resource_slots(
         let ExprKind::Sink(name) = &child.authored.kind else {
             continue;
         };
-        if let Some(sink) = sinks.get(name) {
+        if let Some(sink) = name.lookup_hash(sinks) {
             let conditions = captures.condition_snapshot();
             slots.insert(
                 name.clone(),
@@ -1022,7 +1022,7 @@ fn node(
 }
 
 fn lower_blocks(children: Vec<ExprValue>) -> Vec<ExprValue> {
-    let mut groups: IndexMap<String, Vec<ExprValue>> = IndexMap::new();
+    let mut groups: IndexMap<super::AttributeKey, Vec<ExprValue>> = IndexMap::new();
     let mut headers = HashMap::new();
     for child in &children {
         if let ExprKind::NestedBlock { name, header } = &child.authored.kind {
@@ -1232,18 +1232,20 @@ fn compile_form_entry(
 /// Authored diagnostic source is retained only when its parsed graph contains
 /// no intrinsic secrets. A protected graph cannot contribute any raw source.
 #[derive(Debug, Clone)]
-pub(crate) struct DiagnosticSourceText(Option<Arc<str>>);
+pub(crate) struct DiagnosticSourceText(Option<super::AuthoredExpressionText>);
 
 impl DiagnosticSourceText {
     pub(crate) fn into_text(self) -> Option<Arc<str>> {
-        self.0
+        self.0.map(|text| Arc::from(text.as_str().trim_end()))
     }
 }
 
 #[cfg(test)]
 impl From<&'static str> for DiagnosticSourceText {
     fn from(text: &'static str) -> Self {
-        Self(Some(text.into()))
+        // Test metadata supplies literal display text, often just a partial
+        // header. Production construction below always consumes parsed pairs.
+        Self(Some(super::AuthoredExpressionText::literal_value(text)))
     }
 }
 
@@ -1266,8 +1268,10 @@ pub(super) fn diagnostic_source_text(
     if contains_secret(&expression) {
         return DiagnosticSourceText(None);
     }
-    let range = super::SourceSpan::preprocessed_range(&pair);
-    DiagnosticSourceText(Some(file.original_slice(range).trim_end().into()))
+    DiagnosticSourceText(Some(super::AuthoredExpressionText::redact(
+        pair,
+        Some(file),
+    )))
 }
 
 fn reference_form(pair: Pair<'_, Rule>) -> Option<Pair<'_, Rule>> {
@@ -1682,7 +1686,7 @@ fn compile_form(
                             let key = parts.next().expect("map key");
                             // Keys must have the exact spelling used by the
                             // value parser, including its escape handling.
-                            let name = super::context::extract_key_string(key).unwrap_or_default();
+                            let name = super::AttributeKey::literal_in_file(key, file);
                             let value = compile(
                                 parts.next().expect("map value"),
                                 file,
@@ -1853,7 +1857,7 @@ fn compile_form(
         Rule::attribute => {
             let mut parts = pair.clone().into_inner();
             let name = parts.next().expect("attribute name");
-            let name = super::context::extract_key_string(name).unwrap_or_default();
+            let name = super::AttributeKey::literal_in_file(name, file);
             let value = compile(
                 parts.next().expect("attribute value"),
                 file,
@@ -1925,7 +1929,7 @@ fn compile_form(
         Rule::module_call => node(&pair, ExprKind::ModuleCall, children(), file, source),
         Rule::nested_block => {
             let name_pair = pair.clone().into_inner().next().expect("nested block name");
-            let name = name_pair.as_str().to_string();
+            let name = super::AttributeKey::authored_in_file(name_pair.clone(), file);
             let header = DeclarationLocation::expression_node(&name_pair, file, source);
             let members = children().into_iter().skip(1).collect::<Vec<_>>();
             let (fields, mut locals): (Vec<_>, Vec<_>) = members
@@ -2323,7 +2327,7 @@ mod judgement {
         alternatives: Arc<Vec<JudgedExpr>>,
         member: Option<Arc<JudgedExpr>>,
         elements: Arc<Vec<JudgedExpr>>,
-        fields: Arc<IndexMap<String, JudgedExpr>>,
+        fields: Arc<crate::parser::ConfigurationAttributes<JudgedExpr>>,
     }
 
     impl std::fmt::Debug for JudgedExprData {
@@ -2504,10 +2508,10 @@ mod judgement {
                 .iter()
                 .chain(self.member.iter().map(Arc::as_ref))
         }
-        pub(crate) fn fields(&self) -> impl Iterator<Item = (&str, &JudgedExpr)> {
-            self.fields
-                .iter()
-                .map(|(name, field)| (name.as_str(), field))
+        pub(crate) fn fields(
+            &self,
+        ) -> impl Iterator<Item = (&crate::parser::AttributeKey, &JudgedExpr)> {
+            self.fields.iter()
         }
         pub fn coalesce_operands(&self) -> Option<&[JudgedExpr; 2]> {
             self.coalesce.as_deref()
@@ -4793,9 +4797,7 @@ mod judgement {
             for child in children {
                 match &child.authored.kind {
                     ExprKind::Sink(name) => {
-                        let aliases = schema.schema().as_schema().block_name_map();
-                        let canonical = aliases.get(name).map(String::as_str).unwrap_or(name);
-                        if let Some(attribute) = schema.schema().effective_attribute(canonical) {
+                        if let Some(attribute) = name.effective_attribute(schema.schema()) {
                             if attribute.is_read_only() {
                                 continue;
                             }
