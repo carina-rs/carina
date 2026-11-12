@@ -1920,6 +1920,10 @@ impl DiagnosticRun<'_> {
 
                             let assignment_value =
                                 judged_expression.assignment_value(typecheck_value);
+                            let symbolic = attr_findings.symbolic_findings().to_vec();
+                            let has_exact_findings =
+                                symbolic.iter().any(|finding| !finding.covers_path());
+                            let mut emitted_enum_diagnostic = false;
                             if matches!(
                                 effective_type.shape(),
                                 carina_core::schema::Shape::Enum { .. }
@@ -1931,12 +1935,17 @@ impl DiagnosticRun<'_> {
                                 rref,
                             ) {
                                 diagnostics.push(diag);
+                                emitted_enum_diagnostic = true;
                                 reported_attribute_diagnostics.insert(canonical_name.to_string());
                                 // Continue past the generic match: this attribute
                                 // is already reported with the richer diagnostic.
-                                continue;
+                                if !has_exact_findings {
+                                    continue;
+                                }
                             }
-                            if let Some(error) = attr_findings.local_error() {
+                            if !emitted_enum_diagnostic
+                                && let Some(error) = attr_findings.local_error()
+                            {
                                 let tagged = error.clone().with_attribute(attr_name);
                                 if crate::code_action::enum_diagnostic_data_for_error(&tagged)
                                     .is_some()
@@ -1955,14 +1964,17 @@ impl DiagnosticRun<'_> {
                                         rref.replaceable_attribute_value(attr_name),
                                     ) {
                                         diagnostics.push(diagnostic);
+                                        emitted_enum_diagnostic = true;
                                         reported_attribute_diagnostics
                                             .insert(canonical_name.to_string());
                                     }
-                                    continue;
+                                    if !has_exact_findings {
+                                        continue;
+                                    }
                                 }
                             }
-                            let symbolic = attr_findings.symbolic_findings().to_vec();
                             for finding in &symbolic {
+                                let covers_path = finding.covers_path();
                                 let (path, error) = finding.diagnostic();
                                 use carina_core::resource::SecretDiagnosticError;
                                 use carina_core::validation::admission::AdmissionReferenceError;
@@ -2049,10 +2061,10 @@ impl DiagnosticRun<'_> {
                                     }) {
                                         diagnostics.push(diagnostic);
                                     }
-                                    // This diagnostic is now present, including
-                                    // when the expression pass emitted it first.
-                                    reported_attribute_diagnostics
-                                        .insert(canonical_name.to_string());
+                                    if covers_path {
+                                        reported_attribute_diagnostics
+                                            .insert(canonical_name.to_string());
+                                    }
                                 }
                             }
 
@@ -2092,7 +2104,9 @@ impl DiagnosticRun<'_> {
                                         .insert(canonical_name.to_string());
                                 }
                                 diagnostics.extend(nested);
-                            } else if symbolic.is_empty() {
+                            } else if !symbolic.iter().any(|finding| finding.covers_path())
+                                && !emitted_enum_diagnostic
+                            {
                                 let error = attr_findings.local_error();
                                 let message = match error {
                                     Some(TypeError::TypeMismatch { types }) => {

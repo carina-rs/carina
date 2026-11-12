@@ -223,6 +223,20 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> From<&AdmissionContext<'a, P, B>
 }
 
 impl<B: BindingAddress> ReferenceCandidate<B> {
+    pub(super) fn error_with_origin(&self, error: TypeError) -> TypeError {
+        match error {
+            TypeError::TypeMismatch { types } => {
+                reference_error(AdmissionReferenceError::Computed(
+                    crate::validation::DeferredAccessTypeError::reference_mismatch(
+                        crate::binding_index::RefTypeMismatch::direct(types),
+                        self.reference.as_ref(),
+                    ),
+                ))
+            }
+            error => error,
+        }
+    }
+
     /// This entry is available only on reference evidence. Placement still
     /// requires `admit`, which also checks the boundary proof and actual value.
     #[cfg(test)]
@@ -430,6 +444,7 @@ fn verdict<K: DestinationKind>(
         schema,
         errors: _,
         deferred: _,
+        recovered: _,
     } = findings;
     match K::local(destination, paths, schema) {
         Ok(obligation) => AssignmentVerdict::NeedsLocal(obligation),
@@ -498,6 +513,15 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
     let mut checked = match &context.proof {
         AdmissionProof::Validation(proof) => {
             let reference_context = ReferenceContext::from(context);
+            #[derive(PartialEq)]
+            enum RecoveredUse {
+                NotRejected,
+                Rejected,
+            }
+            // Only a rejected enclosing judgement suppresses re-judging the
+            // same authored use in its schema member trials. Other member
+            // judgements still participate in the ordinary union selection.
+            let recovered_uses = std::cell::RefCell::new(std::collections::HashMap::new());
             let authored =
                 |attr: &CompiledAttributeType,
                  checked: crate::schema::value_validation::CheckValue<'_, P, B>,
@@ -511,9 +535,9 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
             let check =
                 |attr: &CompiledAttributeType,
                  checked: crate::schema::value_validation::CheckValue<'_, P, B>,
-                 path: &LeafPath,
+                 relative_path: &LeafPath,
                  cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
-                    let path = join(&contract.path, path);
+                    let path = join(&contract.path, relative_path);
                     let mut findings = Default::default();
                     // Selection parents are policy-only: main's ordinary local
                     // and reference obligations belong to the selected child.
@@ -533,8 +557,63 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                             &mut findings,
                         )?,
                         CandidateOrigin::Expression => {
-                            if let Some(check) = context.assignment.ordinary {
-                                findings.extend(check(attr, value, &path, cursor)?);
+                            let ordinary = context.assignment.ordinary.map_or_else(
+                                || Ok(Default::default()),
+                                |check| check(attr, value, &path, cursor.clone()),
+                            );
+                            // A schema-backed source keeps its declared reference
+                            // contract even when directory substitution made its
+                            // projection concrete. Literal aliases have no such
+                            // source authority. Discarded syntax never enters the
+                            // ordinary Current-value path above.
+                            let source = cursor.source_reference().filter(|source| {
+                                reference_context.bindings.is_some_and(|bindings| {
+                                    bindings
+                                        .schema_attribute_ref_type(source.reference.as_ref())
+                                        .is_some()
+                                })
+                            });
+                            if let Some(source) = source {
+                                match ordinary {
+                                    Ok(ordinary) => findings.extend(ordinary),
+                                    Err(error) => {
+                                        findings.errors.push((relative_path.clone(), error))
+                                    }
+                                }
+                                let identity = source.identity;
+                                if recovered_uses.borrow().get(&identity)
+                                    == Some(&RecoveredUse::Rejected)
+                                {
+                                    return Ok(findings);
+                                }
+                                let reference = ReferenceCandidate {
+                                    reference: source.reference,
+                                };
+                                let result = reference.judge_at::<K>(
+                                    contract,
+                                    attr,
+                                    &path,
+                                    &reference_context,
+                                    &mut findings,
+                                );
+                                recovered_uses
+                                    .borrow_mut()
+                                    .entry(identity)
+                                    .or_insert_with(|| {
+                                        if result.is_err() {
+                                            RecoveredUse::Rejected
+                                        } else {
+                                            RecoveredUse::NotRejected
+                                        }
+                                    });
+                                if let Err(error) = result {
+                                    findings.recovered.push((
+                                        relative_path.clone(),
+                                        reference.error_with_origin(error),
+                                    ));
+                                }
+                            } else {
+                                findings.extend(ordinary?);
                             }
                         }
                     }

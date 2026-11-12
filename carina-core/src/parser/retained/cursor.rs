@@ -344,7 +344,18 @@ pub struct AuthoredUse<'s, B: BindingAddress = RelativeBindingName> {
     visit: ProjectionVisit,
 }
 
+type AuthoredUseIdentity = (NodeId, UseId, ExpansionInstanceId, ProjectionGeneration);
+
 impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
+    fn identity(&self) -> AuthoredUseIdentity {
+        (
+            self.node.node.id,
+            self.occurrence,
+            self.instance,
+            self.node.generation,
+        )
+    }
+
     pub fn edge(&self) -> EdgeRole {
         self.edge
     }
@@ -714,6 +725,12 @@ pub struct AuthoredCursor<'s, B: BindingAddress = RelativeBindingName> {
     pub(crate) kind: CursorKind<'s, B>,
 }
 
+/// Reference syntax paired with the identity of its authored use.
+pub(crate) struct SourceReference<B: BindingAddress> {
+    pub(crate) reference: crate::resource::ReferencePath<B>,
+    pub(crate) identity: AuthoredUseIdentity,
+}
+
 impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
     pub(crate) fn authored(usage: AuthoredUse<'s, B>) -> Self {
         Self {
@@ -759,6 +776,32 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
         }
     }
 
+    /// The source reference survives directory substitution independently of
+    /// the current value. Forwarding and selections have already advanced to
+    /// their authored child before ordinary assignment asks for this origin.
+    pub(crate) fn source_reference(&self) -> Option<SourceReference<B>> {
+        let CursorKind::Authored(usage) = &self.kind else {
+            return None;
+        };
+        match usage.node.kind() {
+            ExprKind::Reference {
+                binding,
+                attribute,
+                segments,
+            } => Some(SourceReference {
+                reference: crate::resource::ReferencePath::Access(
+                    crate::resource::AccessPath::from_binding(
+                        binding.clone(),
+                        attribute.clone(),
+                        segments.clone(),
+                    ),
+                ),
+                identity: usage.identity(),
+            }),
+            _ => None,
+        }
+    }
+
     pub(crate) fn covered_projection(&self) -> Self {
         let mut cursor = self.covered();
         if let CursorKind::CoveredBy(usage) = &mut cursor.kind {
@@ -766,16 +809,9 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
         }
         cursor
     }
-    pub(crate) fn identity(
-        &self,
-    ) -> Option<(NodeId, UseId, ExpansionInstanceId, ProjectionGeneration)> {
+    pub(crate) fn identity(&self) -> Option<AuthoredUseIdentity> {
         match &self.kind {
-            CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => Some((
-                usage.node.node.id,
-                usage.occurrence,
-                usage.instance,
-                usage.node.generation,
-            )),
+            CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => Some(usage.identity()),
             CursorKind::Projected(_) => None,
         }
     }

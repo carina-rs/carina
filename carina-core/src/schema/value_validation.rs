@@ -306,6 +306,7 @@ fn value_structure<P: PlaceholderKind, B: BindingAddress, T>(
 pub enum SymbolicFindingOrigin {
     Ordinary,
     AuthoredHook,
+    RecoveredReference,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -329,11 +330,26 @@ impl SymbolicFinding {
             error,
         }
     }
+    fn recovered_reference(path: LeafPath, error: TypeError) -> Self {
+        Self {
+            origin: SymbolicFindingOrigin::RecoveredReference,
+            path,
+            error,
+        }
+    }
     pub fn origin(&self) -> SymbolicFindingOrigin {
         self.origin
     }
     pub fn diagnostic(&self) -> (&LeafPath, &TypeError) {
         (&self.path, &self.error)
+    }
+    /// Existing symbolic checks retain main's attribute-wide ownership. A
+    /// restored reference owns its exact error, preserving other value errors.
+    pub fn covers_path(&self) -> bool {
+        match self.origin {
+            SymbolicFindingOrigin::Ordinary | SymbolicFindingOrigin::AuthoredHook => true,
+            SymbolicFindingOrigin::RecoveredReference => false,
+        }
     }
 }
 impl InsideSecret for SymbolicFinding {
@@ -516,13 +532,18 @@ impl ResourceValueValidation {
                 .and_then(|(name, path)| {
                     symbolic.get(&(name, path)).map(|findings| {
                         if findings.iter().any(|finding| {
-                            finding.origin == SymbolicFindingOrigin::AuthoredHook
-                                && (error == &finding.error
-                                    || *error == finding.error.clone().with_attribute(name))
+                            matches!(
+                                finding.origin,
+                                SymbolicFindingOrigin::AuthoredHook
+                                    | SymbolicFindingOrigin::RecoveredReference
+                            ) && (error == &finding.error
+                                || *error == finding.error.clone().with_attribute(name))
                         }) {
                             SymbolicDiagnosticCoverage::Finding
-                        } else {
+                        } else if findings.iter().any(|finding| finding.covers_path()) {
                             SymbolicDiagnosticCoverage::Path
+                        } else {
+                            SymbolicDiagnosticCoverage::Unowned
                         }
                     })
                 })
@@ -794,6 +815,40 @@ impl<'a> CheckedValue<'a> {
         self.findings.assignment.extend(findings);
     }
 
+    /// Restored source judgements reject the same probe after its ordinary
+    /// value check. Their symbolic report owns only that exact finding, so a
+    /// different local constraint at the same use remains visible.
+    fn retain_recovered_references(&mut self, findings: &mut AssignmentFindings) {
+        use crate::resource::SecretDiagnosticError;
+        use crate::validation::admission::AdmissionReferenceError;
+        for (path, error) in std::mem::take(&mut findings.recovered) {
+            let field_path = FieldPath::from_canonical_segments(path.segments().iter().cloned());
+            let same_finding = |ordinary: &TypeError| {
+                ordinary == &error
+                    || matches!((ordinary, &error),
+                        (TypeError::TypeMismatch { types: ordinary }, TypeError::Reference { error, .. })
+                        if matches!(error.as_ref(), SecretDiagnosticError::Public(AdmissionReferenceError::Computed(
+                            crate::validation::DeferredAccessTypeError::TypeMismatch { types, .. }
+                        )) if types == ordinary)
+                    )
+            };
+            if self
+                .findings
+                .local
+                .iter()
+                .chain(&self.findings.provider)
+                .any(|(ordinary_path, ordinary)| {
+                    ordinary_path == &field_path && same_finding(ordinary)
+                })
+            {
+                continue;
+            }
+            self.reject(&field_path, error.clone());
+            self.findings.located.push((field_path, error.clone()));
+            findings.recovered.push((path, error));
+        }
+    }
+
     /// Container context applies equally to every undecided branch's CLI
     /// error. Path-tagged LSP findings keep their precise child locations.
     fn wrap_local_errors(mut self, wrap: impl Fn(TypeError) -> TypeError) -> Self {
@@ -846,6 +901,15 @@ impl<'a> CheckedValue<'a> {
                 .errors
                 .iter()
                 .map(|(path, error)| SymbolicFinding::ordinary(path.clone(), error.clone()))
+                .chain(
+                    self.findings
+                        .assignment
+                        .recovered
+                        .iter()
+                        .map(|(path, error)| {
+                            SymbolicFinding::recovered_reference(path.clone(), error.clone())
+                        }),
+                )
                 .chain(self.findings.authored.errors.iter().map(|(path, error)| {
                     SymbolicFinding::authored_hook(path.clone(), error.clone())
                 }))
@@ -1123,6 +1187,9 @@ pub(crate) struct AssignmentFindings {
     pub(crate) schema: crate::validation::admission::SchemaObligation,
     pub(crate) errors: Vec<(LeafPath, TypeError)>,
     pub(crate) deferred: Vec<DeferredHook>,
+    /// New reference checks retain main's concrete-value diagnostics before
+    /// contributing their own rejection to the same value/union probe.
+    pub(crate) recovered: Vec<(LeafPath, TypeError)>,
 }
 impl AssignmentFindings {
     pub(crate) fn extend(&mut self, other: Self) {
@@ -1130,6 +1197,7 @@ impl AssignmentFindings {
         self.schema.extend(other.schema);
         self.errors.extend(other.errors);
         self.deferred.extend(other.deferred);
+        self.recovered.extend(other.recovered);
     }
 }
 impl InsideSecret for AssignmentFindings {
@@ -1151,6 +1219,11 @@ impl InsideSecret for AssignmentFindings {
             schema: self.schema,
             errors: self
                 .errors
+                .into_iter()
+                .map(|(path, error)| (path.inside_secret(), error.inside_secret()))
+                .collect(),
+            recovered: self
+                .recovered
                 .into_iter()
                 .map(|(path, error)| (path.inside_secret(), error.inside_secret()))
                 .collect(),
@@ -2412,7 +2485,7 @@ impl<'a> ValueValidator<'a, '_> {
         let findings = match &assignment {
             Some(walk) => {
                 match walk.check(attr, CheckValue::Current(value.diagnostic_value()), path) {
-                    Ok(findings) if !findings.errors.is_empty() => {
+                    Ok(mut findings) if !findings.errors.is_empty() => {
                         let mut checked =
                             CheckedValue::rejected(path, findings.errors[0].1.clone());
                         checked.findings.additional_local_errors.extend(
@@ -2432,6 +2505,7 @@ impl<'a> ValueValidator<'a, '_> {
                                 )
                             },
                         ));
+                        checked.retain_recovered_references(&mut findings);
                         checked.findings.assignment = findings;
                         checked.findings.authored = authored;
                         checked.selected = Some(attr);
@@ -2453,8 +2527,10 @@ impl<'a> ValueValidator<'a, '_> {
             }
             None => AssignmentFindings::default(),
         };
+        let mut findings = findings;
         let mut checked =
             self.walk_resolved_value(attr, value, path, ancestry, visited, assignment.clone());
+        checked.retain_recovered_references(&mut findings);
         checked.findings.assignment.extend(findings);
         let mut authored = authored;
         if !probes && let Some(walk) = &assignment {

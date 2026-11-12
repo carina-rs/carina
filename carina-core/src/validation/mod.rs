@@ -2726,6 +2726,16 @@ impl InsideSecret for DeferredAccessTypeError {
 }
 
 impl DeferredAccessTypeError {
+    pub(crate) fn reference_mismatch<B: BindingAddress>(
+        mismatch: crate::binding_index::RefTypeMismatch,
+        reference: ReferencePathRef<'_, B>,
+    ) -> Self {
+        Self::TypeMismatch {
+            types: mismatch.type_names().clone(),
+            origin: mismatch.origin_description(reference),
+        }
+    }
+
     /// Return the authored operator span when this computed-expression error
     /// came from integer arithmetic. Frontends use this only for source
     /// anchoring; the diagnostic text and validity decision remain in core.
@@ -2804,12 +2814,9 @@ pub fn check_deferred_access_type<B: BindingAddress>(
                 Err(RefTypeAssignabilityError::Unchecked(reason)) => {
                     Err(unchecked_assignment_error(reason))
                 }
-                Err(RefTypeAssignabilityError::Mismatch(mismatch)) => {
-                    Err(DeferredAccessTypeError::TypeMismatch {
-                        types: mismatch.type_names().clone(),
-                        origin: mismatch.origin_description(path.into()),
-                    })
-                }
+                Err(RefTypeAssignabilityError::Mismatch(mismatch)) => Err(
+                    DeferredAccessTypeError::reference_mismatch(mismatch, path.into()),
+                ),
             },
             RefType::UnknownAttribute(RefTypeError::InvalidAccess { step, actual, .. }) => {
                 Err(DeferredAccessTypeError::InvalidAccess {
