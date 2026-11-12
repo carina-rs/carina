@@ -156,6 +156,158 @@ fn success(output: &Output) {
     assert!(output.status.success(), "{}", output_text(output));
 }
 
+#[test]
+fn round5_directory_read_error_chain_renders_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("blocked.crn");
+    fs::write(&file, [0xff]).unwrap();
+    let context =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let error = carina_core::config_loader::parse_directory_for_metadata_report(
+        &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &context,
+        &Default::default(),
+        &SchemaRegistry::new(),
+    )
+    .unwrap_err();
+    assert_eq!(error.source_file(), Some(file.as_path()));
+    assert_eq!(
+        error.io_error().unwrap().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Failed to read {}: {}",
+            file.display(),
+            error.io_error().unwrap()
+        )
+    );
+    assert_eq!(
+        carina_cli::error::format_error_with_source_chain(&error),
+        error.to_string()
+    );
+}
+
+#[test]
+fn round5_directory_discovery_error_chain_renders_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing");
+    let context =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let error = carina_core::config_loader::parse_directory_for_metadata_report(
+        &carina_core::paths::ResolvedPath::new(missing).unwrap(),
+        &context,
+        &Default::default(),
+        &SchemaRegistry::new(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.io_error().unwrap().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert_eq!(
+        carina_cli::error::format_error_with_source_chain(&error),
+        error.to_string()
+    );
+}
+
+fn round5_upstream_failures() -> (
+    carina_core::upstream_exports::UpstreamExportSourceError,
+    carina_core::upstream_exports::UpstreamResolveFailure,
+) {
+    use carina_core::config_loader::parse_directory;
+    use carina_core::paths::ResolvedPath;
+    use carina_core::upstream_exports::{
+        resolve_upstream_exports_from_parsed, resolve_upstream_exports_report,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let upstream = directory.path().join("upstream");
+    fs::create_dir(&upstream).unwrap();
+    fs::write(
+        upstream.join("guards.crn"),
+        "require false, 'upstream guard'\n",
+    )
+    .unwrap();
+    fs::write(
+        upstream.join("exports.crn"),
+        "exports { value: String = 'published' }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("main.crn"),
+        "let prior = upstream_state { source = './upstream' }\n",
+    )
+    .unwrap();
+    let base = ResolvedPath::new(directory.path()).unwrap();
+    let upstream = ResolvedPath::new(upstream).unwrap();
+    let context =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+        let parsed = parse_directory(&upstream, &context).unwrap();
+        let source_error = resolve_upstream_exports_from_parsed(
+            parsed,
+            &upstream,
+            session,
+            None,
+            &Default::default(),
+        )
+        .unwrap_err();
+        let parsed = parse_directory(&base, &context).unwrap();
+        let tree = carina_core::parser::AnalysisTree::try_from_file(parsed.parsed()).unwrap();
+        let (_, errors) = resolve_upstream_exports_report(&base, &tree, session, None).unwrap();
+        assert_eq!(errors.len(), 1);
+        (
+            source_error,
+            errors.into_iter().next().unwrap().into_parts().1,
+        )
+    })
+}
+
+#[test]
+fn round5_module_guard_error_chain_renders_once() {
+    let (source_error, _) = round5_upstream_failures();
+    let carina_core::upstream_exports::UpstreamExportSourceError::Module { error, .. } =
+        source_error
+    else {
+        panic!("expected module failure");
+    };
+    let finding = error.directory_constraint().unwrap();
+    assert!(finding.location().file().path().ends_with("guards.crn"));
+    assert_eq!(finding.location().span().start_column(), 9);
+    assert_eq!(finding.location().span().end_column(), 14);
+    assert_eq!(
+        finding.detail().to_string(),
+        "require failed: upstream guard"
+    );
+    assert_eq!(
+        carina_cli::error::format_error_with_source_chain(error.as_ref()),
+        error.to_string()
+    );
+}
+
+#[test]
+fn round5_upstream_source_error_chain_renders_once() {
+    let (error, _) = round5_upstream_failures();
+    let (base, module) = error.module_failure().unwrap();
+    assert!(base.ends_with("upstream"));
+    assert!(module.directory_constraint().is_some());
+    assert_eq!(
+        carina_cli::error::format_error_with_source_chain(&error),
+        error.to_string()
+    );
+}
+
+#[test]
+fn round5_upstream_report_error_chain_renders_once() {
+    let (_, error) = round5_upstream_failures();
+    assert!(error.module_failure().is_some());
+    assert_eq!(
+        carina_cli::error::format_error_with_source_chain(&error),
+        error.to_string()
+    );
+}
+
 fn assert_round4_empty_template(blocks: &str) {
     let directory = Directory::new("true");
     fs::create_dir(directory.project.join("empty")).unwrap();

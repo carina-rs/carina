@@ -590,7 +590,7 @@ impl UpstreamResolveFailure {
     }
     fn into_legacy(mut self) -> UpstreamResolveError {
         // Only the explicit compatibility API requests a location-free String
-        // container. Diagnostic callers retain the typed source chain below.
+        // container. Diagnostic callers retain typed causes via the accessors.
         if let UpstreamResolveCause::Module { error, .. } = &self.cause {
             self.legacy.reason = error.to_string();
         }
@@ -607,15 +607,9 @@ impl std::fmt::Display for UpstreamResolveFailure {
         }
     }
 }
-impl std::error::Error for UpstreamResolveFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match &self.cause {
-            UpstreamResolveCause::Module { error, .. } => Some(error.as_ref()),
-            UpstreamResolveCause::Parse(error) => Some(error.as_ref()),
-            UpstreamResolveCause::Message | UpstreamResolveCause::Boundaries(_) => None,
-        }
-    }
-}
+// Display includes the complete cause with upstream context. Keep typed
+// causes in parse_failure/module_failure, not as duplicate rendered links.
+impl std::error::Error for UpstreamResolveFailure {}
 
 /// A reference in the downstream project whose field isn't declared by the
 /// upstream's `exports { }` block.
@@ -933,7 +927,6 @@ pub enum UpstreamExportSourceError {
     #[error("{error}")]
     Module {
         base: std::path::PathBuf,
-        #[source]
         error: Box<crate::module_resolver::ModuleError>,
     },
     #[error("{}", .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"))]
@@ -941,6 +934,17 @@ pub enum UpstreamExportSourceError {
 }
 
 impl UpstreamExportSourceError {
+    /// Source directory and typed resolver failure whose complete diagnostic
+    /// is already rendered by this error's Display.
+    pub fn module_failure(
+        &self,
+    ) -> Option<(&std::path::Path, &crate::module_resolver::ModuleError)> {
+        match self {
+            Self::Module { base, error } => Some((base, error)),
+            _ => None,
+        }
+    }
+
     fn into_resolve_failure(
         self,
         binding: String,

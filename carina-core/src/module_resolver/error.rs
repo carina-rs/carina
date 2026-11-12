@@ -202,7 +202,7 @@ pub enum ModuleError {
 
     #[error("{0}")]
     DirectoryConstraint(
-        #[source] Box<crate::parser::Located<super::validation::DirectoryConstraintDiagnostic>>,
+        Box<crate::parser::Located<super::validation::DirectoryConstraintDiagnostic>>,
     ),
 
     #[error(
@@ -224,6 +224,17 @@ impl From<ParseError> for ModuleError {
 }
 
 impl ModuleError {
+    /// Authored directory guard and location, without exposing the diagnostic
+    /// already included in this error's Display as another source-chain link.
+    pub fn directory_constraint(
+        &self,
+    ) -> Option<&crate::parser::Located<super::validation::DirectoryConstraintDiagnostic>> {
+        match self.root_cause() {
+            Self::DirectoryConstraint(finding) => Some(finding),
+            _ => None,
+        }
+    }
+
     pub(crate) fn with_provider_type_warnings(
         self,
         warnings: Vec<crate::parser::ParseWarning>,

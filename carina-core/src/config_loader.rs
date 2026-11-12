@@ -1018,7 +1018,8 @@ impl DirectoryFiles {
 #[error("Failed to read {}: {error}", .file.display())]
 struct DirectorySourceReadFailure {
     file: PathBuf,
-    #[source]
+    // Display includes the complete I/O diagnostic. DirectoryParseFailure
+    // exposes the typed error without repeating it through Error::source.
     error: std::io::Error,
 }
 
@@ -1581,10 +1582,10 @@ pub struct DirectoryParseFailure {
 enum DirectoryParseFailureKind {
     #[error("{0}")]
     Message(String),
-    #[error("{0}")]
-    Discovery(#[source] std::io::Error),
-    #[error("{0}")]
-    SourceRead(#[source] DirectorySourceReadFailure),
+    #[error(transparent)]
+    Discovery(std::io::Error),
+    #[error(transparent)]
+    SourceRead(DirectorySourceReadFailure),
     #[error(transparent)]
     Element(Box<parser::Located<parser::ParseError>>),
     #[error("{location}: {error}")]
@@ -1643,6 +1644,16 @@ impl DirectoryParseFailure {
             DirectoryParseFailureKind::Element(finding) => Some(finding.location().file().path()),
             DirectoryParseFailureKind::SourceRead(failure) => Some(failure.file.as_path()),
             DirectoryParseFailureKind::Message(_) | DirectoryParseFailureKind::Discovery(_) => None,
+        }
+    }
+
+    /// Original discovery or source-read failure, retained independently of
+    /// the complete terminal diagnostic rendered by Display.
+    pub fn io_error(&self) -> Option<&std::io::Error> {
+        match &self.kind {
+            DirectoryParseFailureKind::Discovery(error) => Some(error),
+            DirectoryParseFailureKind::SourceRead(failure) => Some(&failure.error),
+            _ => None,
         }
     }
 

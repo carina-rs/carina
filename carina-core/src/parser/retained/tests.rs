@@ -198,7 +198,11 @@ fn round3_unreadable_sibling_has_a_typed_source_failure_and_no_witness() {
     ));
     assert!(buffer.judged().report().findings().is_empty());
     assert_eq!(failure.source_file(), Some(blocked.as_path()));
-    assert!(std::error::Error::source(&failure).is_some());
+    assert!(matches!(
+        failure.io_error().unwrap().kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidData
+    ));
+    assert!(std::error::Error::source(&failure).is_none());
 }
 
 #[test]
@@ -301,7 +305,7 @@ fn round1_retained_require_cannot_lose_its_evaluation_obligation() {
 }
 
 #[test]
-fn round1_strict_require_error_retains_location_and_source_chain() {
+fn round1_strict_require_error_retains_location_and_typed_cause() {
     use std::error::Error;
     let parsed = crate::parser::parse_file(
         "require false, 'chain guard'\n",
@@ -316,17 +320,25 @@ fn round1_strict_require_error_retains_location_and_source_chain() {
     ));
     assert!(error.to_string().contains("upstream/guards.crn:1:9"));
     let located = error
-        .source()
-        .expect("the located error remains in the chain");
-    assert!(located.source().is_some());
+        .directory_constraint()
+        .expect("the located error remains available as a typed cause");
+    assert!(
+        located
+            .location()
+            .file()
+            .path()
+            .ends_with("upstream/guards.crn")
+    );
+    assert_eq!(located.detail().to_string(), "require failed: chain guard");
+    assert!(error.source().is_none());
     let upstream = crate::upstream_exports::UpstreamExportSourceError::Module {
         base: std::path::PathBuf::from("upstream"),
         error: Box::new(error),
     };
-    assert!(
-        upstream.source().is_some(),
-        "upstream discovery must retain its typed module cause"
-    );
+    let (base, module) = upstream.module_failure().unwrap();
+    assert_eq!(base, std::path::Path::new("upstream"));
+    assert!(module.directory_constraint().is_some());
+    assert!(upstream.source().is_none());
 }
 
 #[test]
