@@ -1303,12 +1303,39 @@ fn non_empty_validation_failure(errors: Vec<AppError>) -> NonEmptyValidationErro
 /// helpers return into individual `AppError::Validation` entries. Command and
 /// wiring validation paths share this renderer so multi-error results retain
 /// identical splitting behavior.
-pub(crate) fn split_validation_message(joined: &str) -> Vec<AppError> {
-    joined
-        .split('\n')
-        .filter(|s| !s.is_empty())
-        .map(|s| AppError::Validation(s.to_string()))
-        .collect()
+pub(crate) trait ValidationMessages {
+    fn validation_errors(&self) -> Vec<AppError>;
+}
+impl ValidationMessages for str {
+    fn validation_errors(&self) -> Vec<AppError> {
+        self.split('\n')
+            .filter(|s| !s.is_empty())
+            .map(|s| AppError::Validation(s.to_string()))
+            .collect()
+    }
+}
+impl ValidationMessages for String {
+    fn validation_errors(&self) -> Vec<AppError> {
+        self.as_str().validation_errors()
+    }
+}
+impl ValidationMessages for carina_core::validation::ResourceValidationReport {
+    fn validation_errors(&self) -> Vec<AppError> {
+        let mut errors = self.ordinary().validation_errors();
+        errors.extend(
+            self.conversions()
+                .findings()
+                .iter()
+                .cloned()
+                .map(|error| AppError::ResourceAdmission(Box::new(error.into()))),
+        );
+        errors
+    }
+}
+pub(crate) fn split_validation_message(
+    joined: &(impl ValidationMessages + ?Sized),
+) -> Vec<AppError> {
+    joined.validation_errors()
 }
 
 #[cfg(test)]

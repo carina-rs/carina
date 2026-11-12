@@ -393,15 +393,39 @@ type ExpandedConfiguration<'a> = carina_core::parser::retained::JudgedFile<
 struct ExpandedDiagnosticValidationInputs<'a> {
     configuration: &'a ExpandedConfiguration<'a>,
     resources: HashMap<&'a carina_core::resource::ResourceId, &'a ExpandedResource<'a>>,
+    // Compatibility observer for main's seam tests. Production coverage is
+    // owned only by ConversionValidation and borrowed for every walk.
+    #[cfg(test)]
     coverage: carina_core::validation::admission::WalkCoverage,
     binding_index: carina_core::binding_index::BindingIndex<'a, AbsoluteBindingAddress>,
 }
 
 impl ExpandedDiagnosticValidationInputs<'_> {
+    #[cfg(test)]
     fn resource_admissions(
         &mut self,
         resource_id: &carina_core::resource::ResourceId,
         session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Option<carina_core::schema::ResourceValueValidation> {
+        let mut coverage = std::mem::take(&mut self.coverage);
+        let result = self.resource_admissions_with_coverage(resource_id, session, &mut coverage);
+        self.coverage = coverage;
+        result
+    }
+    fn resource_admissions_in(
+        &mut self,
+        validation: &mut carina_core::parser::retained::ConversionValidation,
+        resource_id: &carina_core::resource::ResourceId,
+        session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Option<carina_core::schema::ResourceValueValidation> {
+        validation
+            .walk(|coverage| self.resource_admissions_with_coverage(resource_id, session, coverage))
+    }
+    fn resource_admissions_with_coverage(
+        &mut self,
+        resource_id: &carina_core::resource::ResourceId,
+        session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
+        coverage: &mut carina_core::validation::admission::WalkCoverage,
     ) -> Option<carina_core::schema::ResourceValueValidation> {
         let resource = *self.resources.get(resource_id)?;
         let schemas = self.configuration.schemas();
@@ -442,7 +466,7 @@ impl ExpandedDiagnosticValidationInputs<'_> {
                 &self.binding_index,
                 session,
                 schemas,
-                &mut self.coverage,
+                coverage,
             ),
         )
     }
@@ -1247,6 +1271,7 @@ impl DiagnosticRun<'_> {
                 Some(ExpandedDiagnosticValidationInputs {
                     configuration,
                     resources,
+                    #[cfg(test)]
                     coverage: Default::default(),
                     binding_index:
                         carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
@@ -1526,6 +1551,11 @@ impl DiagnosticRun<'_> {
                     );
                 }
             }
+            let mut conversion_validation =
+                carina_core::parser::retained::ConversionValidation::new(expression_report);
+            if let Some(configuration) = &expanded_configuration {
+                conversion_validation.include(configuration.judged().report());
+            }
             if let Some(inputs) = expanded_validation_inputs.as_mut() {
                 // A rejected call already owns the diagnostic. Do not add a
                 // downstream resource consequence of that same rejection.
@@ -1549,11 +1579,14 @@ impl DiagnosticRun<'_> {
                         continue;
                     };
                     let call = &origin.module_call_path().root().id;
-                    let Some(report) =
-                        inputs.resource_admissions(&resource.id, self.provider_context)
-                    else {
+                    let Some(mut report) = inputs.resource_admissions_in(
+                        &mut conversion_validation,
+                        &resource.id,
+                        self.provider_context,
+                    ) else {
                         continue;
                     };
+                    conversion_validation.record(report.take_conversions());
                     for error in report.errors() {
                         let finding = carina_core::parser::Located::new(
                             call.declaration_location().clone(),
@@ -1607,8 +1640,6 @@ impl DiagnosticRun<'_> {
                 .map(|resolved| resolved.iter_all_resources().collect::<Vec<_>>());
             // Every schema finding is anchored by the sealed parser view,
             // including the semantic per-file fallback after a buffer parse fails.
-            let mut authored_coverage = carina_core::validation::admission::WalkCoverage::default();
-            let mut conversion_findings = carina_core::ConversionFindings::default();
             let mut admitted_resources = HashSet::new();
             for (resource_index, rref) in tree.project_resources().enumerate() {
                 let resource_id = rref.id();
@@ -1783,12 +1814,12 @@ impl DiagnosticRun<'_> {
                     });
                     let mut value_validation = expanded_validation_inputs.as_mut()
                         .filter(|_| uses_composition_output)
-                        .and_then(|inputs| inputs.resource_admissions(resource_id, self.provider_context))
-                        .unwrap_or_else(|| carina_core::validation::admission::attributes::resource_attribute_admissions(
-                            admission_resource, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, evaluated_inputs, &binding_index, self.provider_context, &self.schemas, &mut authored_coverage,
-                        ));
+                        .and_then(|inputs| inputs.resource_admissions_in(&mut conversion_validation, admission_resource.id(), self.provider_context))
+                        .unwrap_or_else(|| conversion_validation.walk(|coverage| carina_core::validation::admission::attributes::resource_attribute_admissions(
+                            admission_resource, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, evaluated_inputs, &binding_index, self.provider_context, &self.schemas, coverage,
+                        )));
                     admitted_resources.insert(admission_resource.id().clone());
-                    conversion_findings.extend(value_validation.take_conversions());
+                    conversion_validation.record(value_validation.take_conversions());
                     // Attribute rendering consumes its report entries. Preserve
                     // core's diagnostic ownership before taking those entries.
                     let resource_diagnostic_errors = value_validation
@@ -2320,15 +2351,11 @@ impl DiagnosticRun<'_> {
                     .project_resources()
                     .filter(|resource| !admitted_resources.contains(resource.id()))
                 {
-                    let findings = carina_core::validation::admission::attributes::unrendered_resource_conversion_admissions(resource, pre_expansion_configuration.judged(), &binding_index, self.provider_context, &mut authored_coverage);
-                    conversion_findings.extend(findings);
+                    let findings = conversion_validation.walk(|coverage| carina_core::validation::admission::attributes::unrendered_resource_conversion_admissions(resource, pre_expansion_configuration.judged(), &binding_index, self.provider_context, coverage));
+                    conversion_validation.record(findings);
                 }
             }
-            match expression_report.conversion_completeness(&authored_coverage) {
-                Ok(findings) => conversion_findings.extend(findings),
-                Err(error) => diagnostics.extend(buffer::render_completeness_errors(&error)),
-            }
-            for error in conversion_findings.into_findings() {
+            for error in conversion_validation.complete().into_findings() {
                 let finding = carina_core::parser::Located::new(error.location().clone(), error);
                 diagnostics.extend(render_merged(
                     doc,

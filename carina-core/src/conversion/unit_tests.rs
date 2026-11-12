@@ -11,7 +11,7 @@ fn location() -> Result<DeclarationLocation, String> {
     let parsed = crate::parser::parse_file(
         "let sample = 'ok'",
         std::path::Path::new("conversion-unit.crn"),
-        &super::tests::catalog(),
+        &crate::conversion::tests::catalog(),
     )
     .map_err(|error| error.to_string())?;
     parsed
@@ -25,11 +25,7 @@ fn location() -> Result<DeclarationLocation, String> {
 
 #[test]
 fn conversion_error_wrappers_render_each_message_once() -> Result<(), String> {
-    use crate::{
-        parser::ParseError,
-        schema::TypeError,
-        static_type::{InferenceError, InferenceIssue},
-    };
+    use crate::{parser::ParseError, schema::TypeError};
     let location = location()?;
     let mut conversion = ConversionError::new(
         ConversionErrorKind::Source,
@@ -50,10 +46,6 @@ fn conversion_error_wrappers_render_each_message_once() -> Result<(), String> {
     let wrappers: Vec<Box<dyn Error>> = vec![
         Box::new(conversion.clone()),
         Box::new(ParseError::CheckedConversion(conversion.clone())),
-        Box::new(InferenceError::Conversion(conversion.clone())),
-        Box::new(InferenceIssue::Failed(InferenceError::Conversion(
-            conversion.clone(),
-        ))),
     ];
     for wrapper in wrappers {
         let rendered = crate::executor::render_error_chain(wrapper.as_ref());
@@ -125,7 +117,7 @@ fn conversion_aggregate_wrappers_render_each_message_once() -> Result<(), String
 fn conversion_type_path_and_loaded_scalar_target() -> Result<(), String> {
     let path = ConversionTypePath::new("mock.Name");
     assert_eq!(path.as_str(), "mock.Name");
-    let target = resolve_target(&path, &location()?, &super::tests::catalog())
+    let target = resolve_target(&path, &location()?, &crate::conversion::tests::catalog())
         .map_err(|error| error.to_string())?;
     assert_eq!(target.identity(), &TypeIdentity::from_dotted("mock.Name"));
     assert_eq!(target.scalar_kind(), RefinedScalarKind::String);
@@ -139,7 +131,7 @@ fn conversion_target_requires_a_loaded_named_scalar() -> Result<(), String> {
         let error = resolve_target(
             &ConversionTypePath::new(path),
             &location,
-            &super::tests::catalog(),
+            &crate::conversion::tests::catalog(),
         )
         .expect_err("non-target was resolved");
         assert_eq!(error.kind(), ConversionErrorKind::Target);
@@ -301,8 +293,9 @@ fn conversion_source_declarations_do_not_promote_slot_member_bounds_to_read_boun
     );
     let source = ResolvedSchemaType::from_schema_declaration("mock", &declaration)
         .ok_or("projection fixture was not a scalar")?;
-    let declaration = source_declaration(&source, &location()?, &super::tests::catalog())
-        .map_err(|e| e.to_string())?;
+    let declaration =
+        source_declaration(&source, &location()?, &crate::conversion::tests::catalog())
+            .map_err(|e| e.to_string())?;
     assert_eq!(
         DeclarationBounds::from_declaration(&declaration),
         Some(DeclarationBounds::String {
@@ -315,7 +308,7 @@ fn conversion_source_declarations_do_not_promote_slot_member_bounds_to_read_boun
 
 #[test]
 fn conversion_source_declarations_load_annotation_evidence() -> Result<(), String> {
-    let catalog = super::tests::catalog();
+    let catalog = crate::conversion::tests::catalog();
     let location = location()?;
     let source = resolve_target(&ConversionTypePath::new("mock.Name"), &location, &catalog)
         .map_err(|e| e.to_string())?;
@@ -395,7 +388,7 @@ fn conversion_source_declaration_resolution_errors_keep_the_source_kind() -> Res
     let target = resolve_target(
         &ConversionTypePath::new("mock.Name"),
         &location,
-        &super::tests::catalog(),
+        &crate::conversion::tests::catalog(),
     )
     .map_err(|e| e.to_string())?;
     let unloaded = ProviderContext::new(crate::EnvironmentSnapshot::empty());

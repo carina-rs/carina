@@ -70,21 +70,74 @@ pub struct AssignmentProof<K: DestinationKind> {
 /// The shared value traversal may collect and protect tokens, but cannot
 /// manufacture one from a path or a strict destination kind.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LocalPath(LeafPath);
-
+pub struct LocalPath {
+    path: LeafPath,
+    selected: Option<Box<crate::parser::retained::conversion::MatchedDestination>>,
+}
 impl LocalPath {
     pub(super) fn for_recheck<K: RechecksResolved>(_: K, path: LeafPath) -> Self {
-        Self(path)
+        Self {
+            path,
+            selected: None,
+        }
     }
-
+    #[cfg(test)]
     pub(super) fn into_path(self) -> LeafPath {
-        self.0
+        self.path
+    }
+    pub(super) fn selected(
+        mut self,
+        selected: crate::parser::retained::conversion::MatchedDestination,
+    ) -> Self {
+        self.selected = Some(Box::new(selected));
+        self
+    }
+    pub(super) fn collect(paths: Vec<Self>) -> (Vec<LeafPath>, ConversionRechecks) {
+        let mut all = Vec::with_capacity(paths.len());
+        let mut rechecks = Vec::new();
+        for local in paths {
+            if let Some(selected) = local.selected {
+                rechecks.push((local.path.clone(), *selected));
+            }
+            all.push(local.path);
+        }
+        rechecks.sort_by(|(a, _), (b, _)| a.segments().cmp(b.segments()));
+        (all, ConversionRechecks(rechecks))
+    }
+}
+impl crate::resource::InsideSecret for LocalPath {
+    fn inside_secret(self) -> Self {
+        Self {
+            path: self.path.inside_secret(),
+            ..self
+        }
     }
 }
 
-impl crate::resource::InsideSecret for LocalPath {
-    fn inside_secret(self) -> Self {
-        Self(self.0.inside_secret())
+/// Existing local-path obligations with their sealed declaration payloads.
+/// Paths address local work; member identity is never looked up at discharge.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConversionRechecks(
+    Vec<(
+        LeafPath,
+        crate::parser::retained::conversion::MatchedDestination,
+    )>,
+);
+impl ConversionRechecks {
+    pub(crate) fn selected(
+        &self,
+        root: &LeafPath,
+        path: &LeafPath,
+    ) -> Option<&crate::parser::retained::conversion::MatchedDestination> {
+        self.0
+            .binary_search_by(|(candidate, _)| {
+                candidate
+                    .segments()
+                    .iter()
+                    .cmp(root.segments().iter().chain(path.segments()))
+            })
+            .ok()
+            .map(|index| &self.0[index].1)
     }
 }
 
@@ -596,13 +649,16 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 contract.ancestry,
                 &lookup,
                 context.cursor.clone(),
-                crate::schema::value_validation::RequiredAssignmentCallbacks {
-                    ordinary: &|_, _, _, _| Ok(Default::default()),
-                    scope: crate::schema::value_validation::AssignmentScope::Full,
-                    authored: crate::schema::value_validation::AuthoredChecks::Projected(
-                        crate::parser::retained::ProjectedPhase::plan(proof),
-                    ),
-                },
+                crate::schema::value_validation::WalkCallbacks::from(
+                    crate::schema::value_validation::RequiredAssignmentCallbacks {
+                        ordinary: &|_, _, _, _| Ok(Default::default()),
+                        scope: crate::schema::value_validation::AssignmentScope::Full,
+                        authored: crate::schema::value_validation::AuthoredChecks::Projected(
+                            crate::parser::retained::ProjectedPhase::plan(proof),
+                        ),
+                    },
+                )
+                .rechecking(&candidate.obligations.rechecks, &contract.path),
                 &mut context.coverage.borrow_mut(),
             )
         }
@@ -614,11 +670,16 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 contract.ancestry,
                 &lookup,
                 context.cursor.clone(),
-                crate::schema::value_validation::RequiredAssignmentCallbacks {
-                    ordinary: &|_, _, _, _| Ok(Default::default()),
-                    scope: crate::schema::value_validation::AssignmentScope::Full,
-                    authored: crate::schema::value_validation::AuthoredChecks::Projected(*phase),
-                },
+                crate::schema::value_validation::WalkCallbacks::from(
+                    crate::schema::value_validation::RequiredAssignmentCallbacks {
+                        ordinary: &|_, _, _, _| Ok(Default::default()),
+                        scope: crate::schema::value_validation::AssignmentScope::Full,
+                        authored: crate::schema::value_validation::AuthoredChecks::Projected(
+                            *phase,
+                        ),
+                    },
+                )
+                .rechecking(&candidate.obligations.rechecks, &contract.path),
                 &mut context.coverage.borrow_mut(),
             )
         }
@@ -654,9 +715,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
         }]));
     }
     if !errors.is_empty() || !checked.conversions().findings().is_empty() {
-        let mut error = constraints_with_conversions(errors, checked.conversions().clone());
-        error.findings = Some(Box::new(checked));
-        return Err(error);
+        return Err(checked_constraints(errors, checked));
     }
     Ok(AssignmentJudgement {
         verdict: verdict(destination, assignment),

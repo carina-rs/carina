@@ -80,56 +80,6 @@ fn conversion_cli_module_keeps_the_ordinary_error_prefix() {
 }
 
 #[test]
-fn conversion_cli_error_is_terminal_and_renders_the_cause_once() {
-    use std::error::Error;
-    let error = carina_core::parser::parse_file(
-        "let converted = if 42 as String { 'ok' } else { 'ok' }",
-        std::path::Path::new("terminal.crn"),
-        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-    )
-    .unwrap_err();
-    let conversion = carina_core::ConversionError::from_error(&error)
-        .unwrap()
-        .clone();
-    let app = carina_cli::error::AppError::CheckedConversion {
-        error: conversion.clone(),
-    };
-    assert!(
-        app.source().is_none(),
-        "a located conversion is a terminal CLI diagnostic"
-    );
-    let typed = app
-        .conversion_error()
-        .expect("terminal errors retain typed metadata");
-    assert_eq!(typed.kind(), conversion.kind());
-    assert_eq!(typed.location(), conversion.location());
-    let rendered = carina_core::executor::render_error_chain(&app);
-    assert_eq!(
-        rendered,
-        carina_core::parser::Located::new(
-            conversion.location().clone(),
-            conversion.diagnostic_message(),
-        )
-        .to_string()
-    );
-    assert_eq!(
-        rendered.matches(&conversion.to_string()).count(),
-        1,
-        "{rendered}"
-    );
-    let mut cause = conversion.source();
-    while let Some(error) = cause {
-        assert_eq!(
-            rendered.matches(&error.to_string()).count(),
-            1,
-            "{rendered}"
-        );
-        cause = error.source();
-    }
-    assert!(rendered.contains("terminal.crn:1:20:"), "{rendered}");
-}
-
-#[test]
 fn conversion_cli_directory_alias_rejection_is_reported_once() {
     for count in [1, 8] {
         let directory = tempfile::tempdir().unwrap();
@@ -200,4 +150,35 @@ fn conversion_cli_directory_parse_rejection_keeps_the_convert_location() {
         "{text}"
     );
     assert!(text.contains("sibling.crn:1:20:"), "{text}");
+}
+
+#[test]
+fn conversion_cli_module_body_rejection_has_one_owner() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("child")).unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    std::fs::write(directory.path().join("main.crn"),
+        "let child = use { source = './child' }\nlet one = child { input = 'ok' }\nlet two = child { input = 'ok' }\n").unwrap();
+    std::fs::write(
+        directory.path().join("child/main.crn"),
+        "arguments { input: String }\nlet sink = mock.test.resource { name = input as String }\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+        .current_dir(directory.path())
+        .args(["validate", ".", "--json"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!output.status.success(), "{json}");
+    let errors = json["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{json}");
+    assert_eq!(errors[0]["code"], "conversion_target", "{json}");
+    assert!(
+        errors[0]["location"]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("child/main.crn"),
+        "{json}"
+    );
 }

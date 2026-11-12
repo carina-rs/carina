@@ -263,6 +263,12 @@ fn authored_chain<P: crate::resource::ValueKind, B: BindingAddress>(
     })
 }
 
+pub(super) fn canonical_root_id<B: BindingAddress>(
+    node: &AuthoredExpr<ParserPlaceholder, B>,
+) -> NodeId {
+    authored_chain(node).fold(node.id, |_, node| node.id)
+}
+
 impl<'s, B: BindingAddress> JudgedNodeRef<'s, B> {
     fn canonical(mut self) -> Result<Self, MissingEvidence> {
         // Alias nodes are pass-through grammar levels, not authored syntax.
@@ -380,9 +386,6 @@ struct ConversionRestriction<'s, B: BindingAddress> {
 }
 
 impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
-    pub(crate) fn definition_only(&self) -> bool {
-        self.definition_only
-    }
     pub fn edge(&self) -> EdgeRole {
         self.edge
     }
@@ -1099,7 +1102,6 @@ impl<B: BindingAddress> JudgedSlot<B> {
 /// Ordinary compatibility checks have no authority to reach these slots.
 #[derive(Debug, Clone)]
 pub struct NoAuthoredEvidence {
-    contains_conversion: bool,
     resource: crate::resource::ResourceId,
     slots: Vec<UnreachedSlot>,
 }
@@ -1116,14 +1118,6 @@ impl NoAuthoredEvidence {
         let resource = source.id();
         let slots = source.authored_slots();
         Self {
-            contains_conversion: slots.is_some_and(|slots| {
-                slots.slots.values().any(|slot| {
-                    slot.root.first_conversion.is_some()
-                        || slot
-                            .cursor()
-                            .is_ok_and(|usage| usage.node().judgement().contains_any_conversion())
-                })
-            }),
             resource: resource.clone(),
             slots: slots
                 .into_iter()
@@ -1143,9 +1137,7 @@ impl NoAuthoredEvidence {
                 .collect(),
         }
     }
-    pub(crate) fn contains_conversion(&self) -> bool {
-        self.contains_conversion
-    }
+
     pub fn resource_id(&self) -> &crate::resource::ResourceId {
         &self.resource
     }
@@ -1624,3 +1616,6 @@ impl AuthoredSlots {
         self.slots.insert(name, slot);
     }
 }
+
+#[cfg(test)]
+mod conversion_review_tests;

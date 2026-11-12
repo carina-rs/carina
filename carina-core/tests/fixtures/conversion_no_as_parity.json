@@ -1,0 +1,131 @@
+[
+  {
+    "name": "user_functions",
+    "files": {
+      "providers.crn": "provider mock {}\n",
+      "values.crn": "let value = 'ok'\n",
+      "main.crn": "fn echo(value: String): String { value }\nlet sink = mock.test.resource { name = echo(value) }\nexports { result: String = sink.name }\n"
+    },
+    "expected": {
+      "status": "ok",
+      "resource_count": 1,
+      "resources": [
+        "mock.test.resource.sink"
+      ]
+    }
+  },
+  {
+    "name": "pipes_compose",
+    "files": {
+      "providers.crn": "provider mock {}\n",
+      "main.crn": "let transform = split(',') >> join('-')\nlet result = 'a,b' |> transform()\nlet sink = mock.test.resource { name = result }\nexports { result: String = sink.name }\n"
+    },
+    "expected": {
+      "status": "error",
+      "resource_count": 0,
+      "resources": [],
+      "errors": [
+        {
+          "message": "missing expression evidence: function declaration or builtin signature",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "main.crn",
+            "range": {
+              "start": {
+                "line": 2,
+                "column": 23
+              },
+              "end": {
+                "line": 2,
+                "column": 34
+              }
+            }
+          }
+        },
+        {
+          "message": "missing expression evidence: function declaration or builtin signature",
+          "severity": "error",
+          "code": null,
+          "location": {
+            "file": "main.crn",
+            "range": {
+              "start": {
+                "line": 3,
+                "column": 40
+              },
+              "end": {
+                "line": 3,
+                "column": 46
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "name": "list_for",
+    "files": {
+      "providers.crn": "provider mock {}\n",
+      "main.crn": "for item in ['a', 'b'] { mock.test.resource { name = item } }\n"
+    },
+    "expected": {
+      "status": "ok",
+      "resource_count": 2,
+      "resources": [
+        "mock.test.resource.mock_test_resource_16fd5378",
+        "mock.test.resource.mock_test_resource_8d40d250"
+      ]
+    }
+  },
+  {
+    "name": "map_for",
+    "files": {
+      "providers.crn": "provider mock {}\n",
+      "values.crn": "let things = { one = 'a' two = 'b' }\n",
+      "main.crn": "for key, value in things { mock.test.resource { name = \"${key}-${value}\" } }\n"
+    },
+    "expected": {
+      "status": "ok",
+      "resource_count": 2,
+      "resources": [
+        "mock.test.resource.mock_test_resource_f89930fd",
+        "mock.test.resource.mock_test_resource_9ef09250"
+      ]
+    }
+  },
+  {
+    "name": "interpolation_if_coalesce",
+    "files": {
+      "providers.crn": "provider mock {}\n",
+      "values.crn": "let source = 'ok'\n",
+      "main.crn": "let sink = mock.test.resource { name = if true { \"${source}\" } else { source ?? 'fallback' } }\nexports { result: String = sink.name }\n"
+    },
+    "expected": {
+      "status": "ok",
+      "resource_count": 1,
+      "resources": [
+        "mock.test.resource.sink"
+      ]
+    }
+  },
+  {
+    "name": "nested_modules_arguments_exports",
+    "files": {
+      "providers.crn": "provider mock {}\n",
+      "main.crn": "let child = use { source = './child' }\nlet net = child { value = 'ok' }\nlet sink = mock.test.resource { name = net.out }\nexports { result: String = sink.name }\n",
+      "child/main.crn": "arguments { value: String }\nlet grand = use { source = './grand' }\nlet inner = grand { value = value }\nattributes { out: String = inner.out }\n",
+      "child/grand/main.crn": "arguments { value: String }\nattributes { out: String = value }\n"
+    },
+    "expected": {
+      "status": "ok",
+      "resource_count": 3,
+      "resources": [
+        "mock.test.resource.sink",
+        "_virtual.net.inner",
+        "_virtual.net"
+      ]
+    }
+  }
+]

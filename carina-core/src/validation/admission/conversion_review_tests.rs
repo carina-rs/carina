@@ -20,38 +20,56 @@ fn ordinary_admission_findings_remain_terminal() {
 
 #[test]
 fn conversion_admission_error_renders_its_typed_channel_once() {
-    let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-    let parsed = crate::parser::parse_file(
-        "let source = 'ok'",
-        std::path::Path::new("terminal.crn"),
-        &catalog,
-    )
-    .unwrap();
-    let location = parsed
-        .parser_binding_metadata
-        .syntax()
-        .expressions()
-        .binding(&crate::resource::RelativeBindingName::new("source"))
-        .unwrap()
-        .location()
-        .clone();
-    let conversion = crate::ConversionError::new(
-        crate::ConversionErrorKind::Source,
-        &location,
-        "admission-conversion-sentinel",
-    );
-    let error = constraints_with_conversions(Vec::new(), std::iter::once(conversion).collect());
-    let rendered = crate::executor::render_error_chain(&error);
-    assert_eq!(
-        rendered.matches("admission-conversion-sentinel").count(),
-        1,
-        "{rendered}"
-    );
-    assert_eq!(
-        crate::ConversionError::from_error(&error)
+    tests::fixture(
+        AttributeType::string(),
+        AttributeType::string(),
+        |catalog, schemas, _, _| {
+            let parsed = crate::parser::parse_file(
+                "let sink = test.Sink { target = 'ok' as String }",
+                std::path::Path::new("terminal.crn"),
+                catalog,
+            )
             .unwrap()
-            .location(),
-        &location
+            .resolve_root_for_test();
+            let configuration =
+                crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
+            let tree =
+                crate::parser::AnalysisTree::try_from_file(configuration.judged().file()).unwrap();
+            let resource = tree.resources().next().unwrap();
+            let slot = resource.authored_slot("target").unwrap();
+            let value = slot.projection().unwrap();
+            let proof = value
+                .knowledge(&KnowledgeContext::validation())
+                .unwrap()
+                .into_classification();
+            let bindings =
+                BindingIndex::from_parsed(configuration.judged().file(), schemas, catalog);
+            let destination = schemas
+                .resource_attribute_destination(resource.id(), "target", catalog)
+                .unwrap();
+            crate::validation::deferred_types::with_session_for_test(catalog, |session| {
+                let (candidate, context) =
+                    Candidate::validation_slot(slot, proof, Some(&bindings), session).unwrap();
+                let error = admit(&destination, candidate, &context).unwrap_err();
+                let conversion = error.conversion_error().unwrap();
+                let rendered = crate::executor::render_error_chain(&error);
+                assert_eq!(
+                    rendered.matches(&conversion.to_string()).count(),
+                    1,
+                    "{rendered}"
+                );
+                assert_eq!(
+                    crate::ConversionError::from_error(&error)
+                        .unwrap()
+                        .location(),
+                    conversion.location()
+                );
+                assert!(
+                    crate::ConversionError::from_error(error.resolution_error()).is_none(),
+                    "ordinary resolution errors cannot retain a conversion channel"
+                );
+            });
+        },
     );
 }
 

@@ -147,8 +147,8 @@ mod conversion_review_tests;
 
 pub use crate::schema::value_validation::WalkCoverage;
 use assignment::AssignmentVerdict;
-pub(crate) use assignment::LocalPath;
 pub use assignment::{AssignmentProof, ReferenceCandidate, SchemaObligation};
+pub(crate) use assignment::{ConversionRechecks, LocalPath};
 
 pub(crate) fn conversion_local<K: DestinationKind, B: BindingAddress>(
     matched: crate::parser::retained::MatchedConversionSource,
@@ -156,10 +156,10 @@ pub(crate) fn conversion_local<K: DestinationKind, B: BindingAddress>(
     declaration: &CompiledAttributeType,
     path: &LeafPath,
 ) -> Result<crate::schema::value_validation::AssignmentFindings, crate::ConversionError> {
-    matched.consume(usage, declaration)?;
+    let selected = matched.consume(usage, declaration)?;
     let mut findings = crate::schema::value_validation::AssignmentFindings::default();
     match K::defer_reference_check(path) {
-        Some(local) => findings.local.push(local),
+        Some(local) => findings.local.push(local.selected(selected)),
         None => findings.schema.require_reference(),
     }
     Ok(findings)
@@ -175,6 +175,11 @@ mod sealed {
         where
             Self: super::DestinationKind;
         fn defer_reference_check(path: &super::LeafPath) -> Option<super::assignment::LocalPath>;
+        fn rechecks(
+            obligation: &<Self as super::DestinationKind>::LocalObligation,
+        ) -> &super::ConversionRechecks
+        where
+            Self: super::DestinationKind;
         fn schema(
             obligation: &<Self as super::DestinationKind>::LocalObligation,
         ) -> &super::SchemaObligation
@@ -208,11 +213,13 @@ pub mod kind {
                     if paths.is_empty() {
                         return Err(schema);
                     }
-                    Ok(super::DeferredLocal { destination: destination.clone(), paths: paths.into_iter().map(super::assignment::LocalPath::into_path).collect(), schema })
+                    let (paths, rechecks) = super::assignment::LocalPath::collect(paths);
+                    Ok(super::DeferredLocal { destination: destination.clone(), paths, schema, rechecks })
                 }
                 fn defer_reference_check(path: &super::LeafPath) -> Option<super::assignment::LocalPath> {
                     Some(super::assignment::LocalPath::for_recheck(Self, path.clone()))
                 }
+                fn rechecks(obligation: &<Self as super::DestinationKind>::LocalObligation) -> &super::ConversionRechecks { &obligation.rechecks }
                 fn schema(obligation: &<Self as super::DestinationKind>::LocalObligation) -> &super::SchemaObligation { &obligation.schema }
                 fn reference_assignment<'a, B: super::BindingAddress>(
                     source: crate::schema::TypeInSchema<'a, crate::schema::Compiled>,
@@ -249,6 +256,7 @@ pub struct DeferredLocal<K: DestinationKind> {
     destination: Destination<K>,
     paths: Vec<LeafPath>,
     schema: SchemaObligation,
+    rechecks: ConversionRechecks,
 }
 impl<K: DestinationKind> DeferredLocal<K> {
     pub fn paths(&self) -> &[LeafPath] {
@@ -386,6 +394,7 @@ pub struct Candidate<P: PlaceholderKind = NoPlaceholder, B: BindingAddress = Abs
 struct CandidateObligations {
     identity: DeclarationId,
     schema: SchemaObligation,
+    rechecks: ConversionRechecks,
 }
 
 enum AdmissionProof<'a, P: PlaceholderKind, B: BindingAddress> {
@@ -567,6 +576,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
                 obligations: CandidateObligations {
                     identity,
                     schema: SchemaObligation::default(),
+                    rechecks: Default::default(),
                 },
                 value,
             },
@@ -778,7 +788,6 @@ pub struct AdmissionFinding {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdmissionFindings {
     findings: Vec<AdmissionFinding>,
-    conversions: crate::ConversionChannel,
 }
 // TypeError carries diagnostic metadata, not floating-point values or schema
 // callbacks. Its structural equality is reflexive, including protected errors.
@@ -787,7 +796,6 @@ impl std::error::Error for AdmissionFindings {}
 impl crate::resource::InsideSecret for AdmissionFindings {
     fn inside_secret(self) -> Self {
         Self {
-            conversions: self.conversions.inside_secret(),
             findings: self
                 .findings
                 .into_iter()
@@ -802,12 +810,6 @@ impl crate::resource::InsideSecret for AdmissionFindings {
 impl AdmissionFindings {
     pub fn findings(&self) -> &[AdmissionFinding] {
         &self.findings
-    }
-    pub fn conversions(&self) -> &crate::ConversionChannel {
-        &self.conversions
-    }
-    pub fn conversion_error(&self) -> Option<&crate::ConversionError> {
-        self.conversions.findings().first()
     }
 }
 impl std::fmt::Display for AdmissionFindings {
@@ -832,49 +834,105 @@ impl std::fmt::Display for AdmissionFindings {
                 write!(f, "{}: {}", finding.path, finding.error)?;
             }
         }
-        if !self.conversions.findings().is_empty() {
-            if !self.findings.is_empty() {
-                f.write_str("; ")?;
-            }
-            write!(f, "{}", self.conversions)?;
-        }
         Ok(())
     }
 }
 
+/// Authored admission errors retain their typed conversion channel.
+/// They cannot be erased into an ordinary reference-resolution failure.
+///
+/// ```compile_fail
+/// use carina_core::{resolver::ResolutionError, validation::admission::AdmissionErrors};
+/// fn erase(error: AdmissionErrors) -> ResolutionError { error.into() }
+/// ```
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("{operation} admission failed")] // error-chain: caller-renders-sources
+#[error("value admission failed")] // error-chain: caller-renders-sources
 pub struct AdmissionErrors {
     findings: Option<Box<crate::schema::ValueValidationFindings>>,
-    operation: AdmissionOperation,
+    #[source]
+    source: AdmissionFailure,
+}
+#[derive(Debug, Clone, PartialEq)]
+enum AdmissionFailure {
+    Ordinary(ResolutionError),
+    Converted {
+        ordinary: ResolutionError,
+        conversions: crate::ConversionChannel,
+    },
+}
+impl AdmissionFailure {
+    fn ordinary(&self) -> &ResolutionError {
+        match self {
+            Self::Ordinary(error)
+            | Self::Converted {
+                ordinary: error, ..
+            } => error,
+        }
+    }
+    fn conversion_error(&self) -> Option<&crate::ConversionError> {
+        match self {
+            Self::Ordinary(_) => None,
+            Self::Converted { conversions, .. } => conversions.findings().first(),
+        }
+    }
+}
+impl std::fmt::Display for AdmissionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ordinary(error) => write!(f, "{error}"),
+            Self::Converted {
+                ordinary,
+                conversions,
+            } => {
+                let ordinary = ordinary.to_string();
+                if !ordinary.is_empty() {
+                    write!(f, "{ordinary}; ")?;
+                }
+                write!(f, "{conversions}")
+            }
+        }
+    }
+}
+impl std::error::Error for AdmissionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Ordinary(error) => error.source(),
+            Self::Converted { .. } => None,
+        }
+    }
+}
+/// Compatibility wrapper for main's ordinary resolution-error conversion API.
+/// Its source cannot carry an authored conversion channel.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("conversion admission failed")] // error-chain: caller-renders-sources
+pub struct OrdinaryAdmissionError {
     #[source]
     source: ResolutionError,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AdmissionOperation {
-    Value,
-    Conversion,
+impl OrdinaryAdmissionError {
+    pub(crate) fn into_resolution_error(self) -> ResolutionError {
+        self.source
+    }
+    pub fn resolution_error(&self) -> &ResolutionError {
+        &self.source
+    }
 }
-impl std::fmt::Display for AdmissionOperation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Value => "value",
-            Self::Conversion => "conversion",
-        })
+impl From<OrdinaryAdmissionError> for ResolutionError {
+    fn from(error: OrdinaryAdmissionError) -> Self {
+        error.into_resolution_error()
     }
 }
 impl PartialEq for AdmissionErrors {
     fn eq(&self, other: &Self) -> bool {
-        self.operation == other.operation && self.source == other.source
+        self.source == other.source
     }
 }
 impl Eq for AdmissionErrors {}
 impl From<ResolutionError> for AdmissionErrors {
     fn from(source: ResolutionError) -> Self {
         Self {
-            operation: AdmissionOperation::Value,
             findings: None,
-            source,
+            source: AdmissionFailure::Ordinary(source),
         }
     }
 }
@@ -883,19 +941,24 @@ impl<B: BindingAddress> From<KnowledgeError<B>> for AdmissionErrors {
         ResolutionError::from(error).into()
     }
 }
-impl From<AdmissionErrors> for ResolutionError {
-    fn from(error: AdmissionErrors) -> Self {
-        error.into_resolution_error()
-    }
-}
 impl crate::resource::InsideSecret for AdmissionErrors {
     fn inside_secret(self) -> Self {
         Self {
-            operation: self.operation,
             findings: self
                 .findings
                 .map(|findings| Box::new((*findings).inside_secret())),
-            source: self.source.inside_secret(),
+            source: match self.source {
+                AdmissionFailure::Ordinary(error) => {
+                    AdmissionFailure::Ordinary(error.inside_secret())
+                }
+                AdmissionFailure::Converted {
+                    ordinary,
+                    conversions,
+                } => AdmissionFailure::Converted {
+                    ordinary: ordinary.inside_secret(),
+                    conversions: conversions.inside_secret(),
+                },
+            },
         }
     }
 }
@@ -918,38 +981,41 @@ fn join(root: &LeafPath, relative: &LeafPath) -> LeafPath {
     LeafPath::from_segments(root.segments().iter().chain(relative.segments()).cloned())
 }
 fn constraints(findings: Vec<AdmissionFinding>) -> AdmissionErrors {
-    constraints_with_conversions(findings, Default::default())
+    ResolutionError::AdmissionConstraints(Box::new(AdmissionFindings { findings })).into()
 }
-fn constraints_with_conversions(
+fn checked_constraints(
     findings: Vec<AdmissionFinding>,
-    conversions: crate::ConversionChannel,
+    checked: crate::schema::ValueValidationFindings,
 ) -> AdmissionErrors {
-    ResolutionError::AdmissionConstraints(Box::new(AdmissionFindings {
-        findings,
-        conversions,
-    }))
-    .into()
+    let ordinary = ResolutionError::AdmissionConstraints(Box::new(AdmissionFindings { findings }));
+    let source = if checked.conversions().findings().is_empty() {
+        AdmissionFailure::Ordinary(ordinary)
+    } else {
+        AdmissionFailure::Converted {
+            ordinary,
+            conversions: checked.conversions().clone(),
+        }
+    };
+    AdmissionErrors {
+        findings: Some(Box::new(checked)),
+        source,
+    }
 }
 
 impl AdmissionErrors {
-    pub(crate) fn into_resolution_error(self) -> ResolutionError {
-        self.source
+    pub fn conversion_error(&self) -> Option<&crate::ConversionError> {
+        self.source.conversion_error()
     }
-
     pub(crate) fn take_findings(&mut self) -> Option<crate::schema::ValueValidationFindings> {
         self.findings.take().map(|findings| *findings)
     }
-    /// Preserve #4260's pinned error-chain label when conversion orchestration
-    /// rebases onto this shared wrapper. This grants no placement authority.
-    pub fn conversion(source: ResolutionError) -> Self {
-        Self {
-            operation: AdmissionOperation::Conversion,
-            findings: None,
-            source,
-        }
+    /// Preserve main's ordinary resolution-error label without granting an
+    /// authored admission error an erasing From/Into implementation.
+    pub fn conversion(source: ResolutionError) -> OrdinaryAdmissionError {
+        OrdinaryAdmissionError { source }
     }
     pub fn resolution_error(&self) -> &ResolutionError {
-        &self.source
+        self.source.ordinary()
     }
 }
 
@@ -1069,10 +1135,13 @@ impl<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> PendingAdmission
         let mut candidate = self.inner.candidate;
         match self.inner.assignment {
             AssignmentVerdict::Proven(_) => {}
-            AssignmentVerdict::NeedsLocal(local) => candidate
-                .obligations
-                .schema
-                .extend(K::schema(&local).clone()),
+            AssignmentVerdict::NeedsLocal(local) => {
+                candidate
+                    .obligations
+                    .schema
+                    .extend(K::schema(&local).clone());
+                candidate.obligations.rechecks = K::rechecks(&local).clone();
+            }
             AssignmentVerdict::NeedsSchema(schema) => candidate.obligations.schema.extend(schema),
         }
         let (candidate, boundary) = candidate.at_apply(

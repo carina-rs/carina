@@ -2994,8 +2994,7 @@ fn check_inferred_assignment<P: PlaceholderKind, B: BindingAddress>(
             });
         }
         Err(crate::static_type::InferenceIssue::Failed(
-            error @ (inference::InferenceError::Conversion(_)
-            | inference::InferenceError::InsideSecret { .. }
+            error @ (inference::InferenceError::InsideSecret { .. }
             | inference::InferenceError::SecretAssignmentMismatch { .. }
             | inference::InferenceError::InvalidIntegerArithmeticOperand { .. }
             | inference::InferenceError::HeterogeneousCollection { .. }
@@ -5162,7 +5161,6 @@ pub struct ResourceAdmissionFinding {
 #[derive(Debug)]
 enum ResourceAdmissionDetail {
     Conversion(crate::ConversionError),
-    Completeness(crate::parser::retained::CompletenessErrors),
     Schema {
         resource: crate::resource::ResourceId,
         attribute: Option<String>,
@@ -5207,7 +5205,6 @@ impl ResourceAdmissionFinding {
         match &self.detail {
             ResourceAdmissionDetail::Schema { error, .. } => Some(error),
             ResourceAdmissionDetail::Conversion(_)
-            | ResourceAdmissionDetail::Completeness(_)
             | ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
@@ -5218,7 +5215,6 @@ impl ResourceAdmissionFinding {
         match &self.detail {
             ResourceAdmissionDetail::Schema { resource, .. } => Some(resource),
             ResourceAdmissionDetail::Conversion(_)
-            | ResourceAdmissionDetail::Completeness(_)
             | ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
@@ -5228,8 +5224,7 @@ impl ResourceAdmissionFinding {
     pub fn conversion_error(&self) -> Option<&crate::ConversionError> {
         match &self.detail {
             ResourceAdmissionDetail::Conversion(error) => Some(error),
-            ResourceAdmissionDetail::Completeness(_)
-            | ResourceAdmissionDetail::Schema { .. }
+            ResourceAdmissionDetail::Schema { .. }
             | ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
@@ -5239,7 +5234,6 @@ impl ResourceAdmissionFinding {
     pub fn code(&self) -> Option<&'static str> {
         match &self.detail {
             ResourceAdmissionDetail::Conversion(error) => Some(error.kind().code()),
-            ResourceAdmissionDetail::Completeness(_) => Some("authored_completeness"),
             ResourceAdmissionDetail::Schema { .. }
             | ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
@@ -5253,7 +5247,6 @@ impl ResourceAdmissionFinding {
     pub fn message(&self) -> String {
         match &self.detail {
             ResourceAdmissionDetail::Conversion(error) => error.diagnostic_message(),
-            ResourceAdmissionDetail::Completeness(error) => error.to_string(),
             ResourceAdmissionDetail::Schema {
                 mismatch: Some(mismatch),
                 ..
@@ -5321,22 +5314,12 @@ impl From<crate::ConversionError> for ResourceAdmissionFinding {
         }
     }
 }
-impl From<crate::parser::retained::CompletenessErrors> for ResourceAdmissionFinding {
-    fn from(error: crate::parser::retained::CompletenessErrors) -> Self {
-        Self {
-            human: String::new(),
-            location: None,
-            detail: ResourceAdmissionDetail::Completeness(error),
-        }
-    }
-}
 impl std::fmt::Display for ResourceAdmissionFinding {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.detail {
             ResourceAdmissionDetail::Conversion(error) => {
                 write!(formatter, "{}", error.diagnostic())
             }
-            ResourceAdmissionDetail::Completeness(error) => write!(formatter, "{error}"),
             ResourceAdmissionDetail::Schema { .. }
             | ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
@@ -5683,8 +5666,6 @@ pub enum ResourceRefTypeValidationError {
     AnalysisInvariant(#[from] crate::parser::AnalysisTreeError),
     #[error(transparent)]
     Validation(ResourceValidationReport),
-    #[error(transparent)]
-    Correspondence(#[from] crate::parser::retained::CompletenessErrors),
 }
 
 /// Both diagnostic channels survive independently through the core/CLI boundary.
@@ -5724,7 +5705,7 @@ impl ResourceRefTypeValidationError {
     pub fn conversion_error(&self) -> Option<&crate::ConversionError> {
         match self {
             Self::Validation(report) => report.conversions.findings().first(),
-            Self::AnalysisInvariant(_) | Self::Correspondence(_) => None,
+            Self::AnalysisInvariant(_) => None,
         }
     }
 }
@@ -5863,7 +5844,6 @@ struct ResourceAdmissionReport {
     attributes: HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>,
     references: ResourceAdmissionFindings,
     conversions: crate::ConversionFindings,
-    completeness: Option<crate::parser::retained::CompletenessErrors>,
 }
 impl ResourceAdmissionReport {
     fn into_findings(self) -> Vec<ResourceAdmissionFinding> {
@@ -5874,13 +5854,9 @@ impl ResourceAdmissionReport {
                 .into_iter()
                 .map(ResourceAdmissionFinding::from),
         );
-        findings.extend(self.completeness.map(ResourceAdmissionFinding::from));
         findings
     }
     fn into_legacy_result(self) -> Result<(), ResourceRefTypeValidationError> {
-        if let Some(error) = self.completeness {
-            return Err(ResourceRefTypeValidationError::Correspondence(error));
-        }
         validation_findings_result(
             self.references
                 .0
@@ -5955,7 +5931,8 @@ fn resource_admission_report<
     let registry = judged.schemas();
     let mut all_errors = ResourceAdmissionFindings::default();
     let mut attributes = HashMap::new();
-    let mut coverage = admission::WalkCoverage::default();
+    let mut conversion_validation =
+        crate::parser::retained::ConversionValidation::new(judged.report());
     let inference_bindings = inference::bindings_from_parsed(parsed);
     let tree = crate::parser::AnalysisTree::try_from_file(parsed)?;
 
@@ -5995,18 +5972,21 @@ fn resource_admission_report<
                         &crate::resource::knowledge::KnowledgeContext::validation(),
                         |_, _| {},
                     );
-                    let values = admission::attributes::resource_attribute_admissions(
-                        resource,
-                        parsed,
-                        schema,
-                        &classified,
-                        resource.quoted_string_attrs(),
-                        &inputs,
-                        bindings,
-                        session,
-                        registry,
-                        &mut coverage,
-                    );
+                    let mut values = conversion_validation.walk(|coverage| {
+                        admission::attributes::resource_attribute_admissions(
+                            resource,
+                            parsed,
+                            schema,
+                            &classified,
+                            resource.quoted_string_attrs(),
+                            &inputs,
+                            bindings,
+                            session,
+                            registry,
+                            coverage,
+                        )
+                    });
+                    conversion_validation.record(values.take_conversions());
                     let location = resource.diagnostic_label();
                     for (attribute, path, error) in values.symbolic_errors() {
                         let start = all_errors.0.len();
@@ -6099,22 +6079,11 @@ fn resource_admission_report<
         ));
     }
 
-    let mut conversions = crate::ConversionFindings::default();
-    for values in attributes.values_mut() {
-        conversions.extend(values.take_conversions());
-    }
-    let completeness = match judged.report().conversion_completeness(&coverage) {
-        Ok(findings) => {
-            conversions.extend(findings);
-            None
-        }
-        Err(error) => Some(error),
-    };
+    let conversions = conversion_validation.complete();
     Ok(ResourceAdmissionReport {
         attributes,
         references: all_errors,
         conversions,
-        completeness,
     })
 }
 
@@ -6397,8 +6366,7 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
     let inferred = match deferred_iterable_shape_for_phase(&judged) {
         Ok(inferred) => Some(inferred),
         Err(crate::static_type::InferenceIssue::Failed(
-            error @ (inference::InferenceError::Conversion(_)
-            | inference::InferenceError::InsideSecret { .. }
+            error @ (inference::InferenceError::InsideSecret { .. }
             | inference::InferenceError::SecretAssignmentMismatch { .. }
             | inference::InferenceError::MissingEvidence(_)
             | inference::InferenceError::IncompatibleCoalesceTypes { .. }

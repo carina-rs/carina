@@ -3487,15 +3487,18 @@ pub fn validate_resource_ref_types_with_ctx<
         ctx.schemas(),
         ctx.provider_context().as_provider_context(),
     );
-    let _argument_names = argument_names;
     let mut sink = CliTypeCheckSink { errors: Vec::new() };
-    let mut errors = match validation::resource_reference_findings(judged, &bindings, &mut sink) {
-        Ok(findings) => findings
-            .into_iter()
-            .map(|finding| AppError::ResourceAdmission(Box::new(finding)))
-            .collect::<Vec<_>>(),
-        Err(error) => vec![AppError::AnalysisInvariant(error)],
-    };
+    let mut errors =
+        match validation::validate_resource_ref_types(judged, argument_names, &bindings, &mut sink)
+        {
+            Ok(()) => Vec::new(),
+            Err(validation::ResourceRefTypeValidationError::Validation(message)) => {
+                split_validation_message(&message)
+            }
+            Err(validation::ResourceRefTypeValidationError::AnalysisInvariant(error)) => {
+                vec![AppError::AnalysisInvariant(error)]
+            }
+        };
     errors.extend(sink.errors.into_iter().map(AppError::Validation));
     errors
 }

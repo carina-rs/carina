@@ -1,10 +1,12 @@
 //! Checked conversion policy over the walk's authored cursor. No value routing.
 
+pub(crate) mod diagnostic;
+
 use super::*;
-use crate::conversion::{ConversionError, ConversionErrorKind as Kind, DeclarationBounds};
 use crate::schema::value_validation::{AssignmentFindings, AuthoredOutcome, CheckValue};
 use crate::schema::{AttrTypeKind, CompiledAttributeType, LeafPath, RefinedScalarKind, TypeError};
 use crate::validation::admission::DestinationKind;
+use diagnostic::{ConversionError, ConversionErrorKind as Kind, DeclarationBounds};
 
 /// A matched source is consumed only at its exact authored use and borrowed
 /// declaration. It carries no value, placement receipt, or reusable authority.
@@ -38,6 +40,28 @@ use crate::validation::admission::DestinationKind;
 pub struct MatchedConversionSource {
     stamp: SourceStamp,
     location: DeclarationLocation,
+    selected: MatchedDestination,
+}
+
+/// The declaration retained by a consumed matched-source witness. It is
+/// transient local work, never part of a Value or a saved plan.
+#[derive(Debug, Clone)]
+pub(crate) struct MatchedDestination {
+    declaration: Arc<CompiledAttributeType>,
+    owner: AcceptedConversion,
+}
+impl PartialEq for MatchedDestination {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.declaration, &other.declaration) && self.owner == other.owner
+    }
+}
+impl MatchedDestination {
+    pub(crate) fn declaration(&self) -> &CompiledAttributeType {
+        &self.declaration
+    }
+    pub(crate) fn owner(&self) -> &AcceptedConversion {
+        &self.owner
+    }
 }
 
 /// A conversion's accept or reject verdict for one authored use and borrowed
@@ -62,9 +86,50 @@ pub struct ConversionJudgement {
     location: DeclarationLocation,
     verdict: ConversionVerdict,
 }
-pub(crate) enum ConversionVerdict {
-    Accepted(AssignmentFindings),
+pub(crate) struct ConversionVerdict(Box<Decision>);
+enum Decision {
+    Accepted(AssignmentFindings, AcceptedConversion),
     Rejected(AssignmentFindings),
+}
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AcceptedConversion {
+    node: NodeId,
+    location: DeclarationLocation,
+    secret: bool,
+}
+impl AcceptedConversion {
+    pub(crate) fn reject_destination(&self, cause: TypeError) -> ConversionError {
+        let error = ConversionError::destination(&self.location, self.node, cause);
+        if self.secret {
+            error.inside_secret()
+        } else {
+            error
+        }
+    }
+}
+impl ConversionVerdict {
+    pub(crate) fn decide<T>(
+        self,
+        accepted: impl FnOnce(AssignmentFindings, AcceptedConversion) -> T,
+        rejected: impl FnOnce(AssignmentFindings) -> T,
+    ) -> T {
+        match *self.0 {
+            Decision::Accepted(findings, owner) => accepted(findings, owner),
+            Decision::Rejected(findings) => rejected(findings),
+        }
+    }
+    pub(crate) fn seam_rejection(path: LeafPath, error: TypeError) -> Self {
+        Self(Box::new(Decision::Rejected(AssignmentFindings {
+            errors: vec![(path, error)],
+            ..Default::default()
+        })))
+    }
+    pub(crate) fn invalid_witness(error: ConversionError) -> Self {
+        Self(Box::new(Decision::Rejected(AssignmentFindings {
+            conversions: std::iter::once(error).collect(),
+            ..Default::default()
+        })))
+    }
 }
 impl std::fmt::Debug for ConversionJudgement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -117,11 +182,11 @@ fn rejected<B: BindingAddress>(
     claimed(
         usage,
         declaration,
-        ConversionVerdict::Rejected(AssignmentFindings {
+        ConversionVerdict(Box::new(Decision::Rejected(AssignmentFindings {
             conversions: std::iter::once(failure).collect(),
             matched_destination,
             ..Default::default()
-        }),
+        }))),
     )
 }
 
@@ -159,7 +224,7 @@ impl MatchedConversionSource {
         self,
         usage: &AuthoredUse<'_, B>,
         declaration: &CompiledAttributeType,
-    ) -> Result<(), ConversionError> {
+    ) -> Result<MatchedDestination, ConversionError> {
         if self.stamp != SourceStamp::new(usage, declaration) {
             return Err(ConversionError::new(
                 Kind::Destination,
@@ -168,7 +233,7 @@ impl MatchedConversionSource {
             )
             .owned_by(self.stamp.node));
         }
-        Ok(())
+        Ok(self.selected)
     }
 }
 
@@ -205,7 +270,7 @@ pub(crate) fn check_scalar_kind<'a>(
     declaration: &CompiledAttributeType,
     judgement: &'a JudgedExpr,
 ) -> Result<&'a TypeExpr, Kind> {
-    let expected = crate::conversion::scalar_kind(declaration).ok_or(Kind::Source)?;
+    let expected = diagnostic::scalar_kind(declaration).ok_or(Kind::Source)?;
     let source = judgement.assignment_source_type().ok_or(Kind::Source)?;
     let actual = match source {
         TypeExpr::String | TypeExpr::StringLiteral(_) => RefinedScalarKind::String,
@@ -324,15 +389,28 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
                     "conversion requires an independently typed destination",
                 ));
             }
-            let operand = node
+            let operand = match node
                 .children()
                 .next()
-                .ok_or_else(|| {
-                    crate::validation::admission::assignment_seam_error(MissingEvidence::new(
-                        "conversion operand",
-                    ))
-                })?
-                .map_err(crate::validation::admission::assignment_seam_error)?;
+                .unwrap_or_else(|| Err(MissingEvidence::new("conversion operand")))
+            {
+                Ok(operand) => operand,
+                Err(missing) => {
+                    let owner = usage.conversion_owner();
+                    let failure = error(
+                        owner,
+                        Kind::Source,
+                        "conversion operand has no source judgement",
+                    )
+                    .with_evidence(missing);
+                    let failure = if owner.judgement().diagnostic_is_secret() {
+                        failure.inside_secret()
+                    } else {
+                        failure
+                    };
+                    return Ok(rejected(&usage, declaration, failure, false));
+                }
+            };
             let source = operand.judgement();
             if source.is_conversion_output() {
                 return Ok(rejection(
@@ -344,12 +422,9 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
             }
             let mut matched_destination = false;
             let result = (|| {
-                let target = crate::conversion::resolve_target(
-                    target.detail(),
-                    &node.location().authored,
-                    config,
-                )
-                .map_err(|failure| failure.owned_by(node.node_id()))?;
+                let target =
+                    diagnostic::resolve_target(target.detail(), &node.location().authored, config)
+                        .map_err(|failure| failure.owned_by(node.node_id()))?;
                 let selected = destination(declaration, &target, defs).map_err(|kind| {
                     error(
                         node,
@@ -369,12 +444,9 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
                     return Ok(AssignmentFindings::default());
                 }
                 if let TypeExpr::SchemaType { owned } = source_type {
-                    let source_declaration = crate::conversion::source_declaration(
-                        owned,
-                        &node.location().authored,
-                        config,
-                    )
-                    .map_err(|failure| failure.owned_by(node.node_id()))?;
+                    let source_declaration =
+                        diagnostic::source_declaration(owned, &node.location().authored, config)
+                            .map_err(|failure| failure.owned_by(node.node_id()))?;
                     if let Some(bounds) = DeclarationBounds::from_declaration(selected)
                         && DeclarationBounds::from_declaration(&source_declaration)
                             .is_some_and(|source| source.disjoint(&bounds))
@@ -389,6 +461,14 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
                 let matched = MatchedConversionSource {
                     stamp: SourceStamp::new(&usage, selected),
                     location: node.location().authored,
+                    selected: MatchedDestination {
+                        declaration: Arc::new(selected.clone()),
+                        owner: AcceptedConversion {
+                            node: node.node_id(),
+                            location: node.location().authored,
+                            secret: node.judgement().diagnostic_is_secret(),
+                        },
+                    },
                 };
                 crate::validation::admission::conversion_local::<K, B>(
                     matched, &usage, selected, path,
@@ -397,7 +477,18 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
             Ok(match result {
                 Ok(mut findings) => {
                     findings.matched_destination = true;
-                    claimed(&usage, declaration, ConversionVerdict::Accepted(findings))
+                    claimed(
+                        &usage,
+                        declaration,
+                        ConversionVerdict(Box::new(Decision::Accepted(
+                            findings,
+                            AcceptedConversion {
+                                node: node.node_id(),
+                                location: node.location().authored,
+                                secret: node.judgement().diagnostic_is_secret(),
+                            },
+                        ))),
+                    )
                 }
                 Err(failure) => rejected(
                     &usage,
@@ -486,36 +577,283 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
     }
 }
 
+/// Parsed-node inventory. It is populated by the existing authored index,
+/// before any node judgement is requested; unavailable walk evidence cannot
+/// remove a Convert from this set.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum InventoryContext {
+    Definition,
+    Value,
+    Boundary,
+}
+#[derive(Clone)]
+pub(super) struct InventoryEntry {
+    node: NodeId,
+    environment: ExpressionEnvironmentId,
+    owner: ConversionSite,
+    definition: bool,
+    boundary: bool,
+    secret: bool,
+    roots: std::collections::HashSet<RootRequirement>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct RootRequirement {
+    node: NodeId,
+    occurrence: UseId,
+    instance: ExpansionInstanceId,
+    generation: ProjectionGeneration,
+}
+pub(super) type ConversionNodes = HashMap<(NodeId, ExpressionEnvironmentId), InventoryEntry>;
+pub(super) enum ConversionInventory {
+    Nodes(ConversionNodes, Vec<RootRequirement>),
+    Joined(Arc<Self>, Arc<Self>),
+}
+impl Default for ConversionInventory {
+    fn default() -> Self {
+        Self::Nodes(Default::default(), Vec::new())
+    }
+}
+impl ConversionInventory {
+    // Reports share inventory chunks; joining module reports never copies
+    // the inventory accumulated by earlier modules.
+    fn entries<'a>(
+        &'a self,
+        coverage: &'a crate::schema::value_validation::WalkCoverage,
+    ) -> impl Iterator<Item = (&'a InventoryEntry, bool)> {
+        let mut stack = vec![self];
+        let mut current = None;
+        let mut unresolved = false;
+        std::iter::from_fn(move || {
+            loop {
+                if let Some(entries) = &mut current
+                    && let Some(entry) = std::iter::Iterator::next(entries)
+                {
+                    return Some((entry, unresolved));
+                }
+                match stack.pop()? {
+                    Self::Nodes(nodes, roots) => {
+                        unresolved = roots.iter().any(|root| {
+                            !coverage.reached_root(
+                                root.node,
+                                root.occurrence,
+                                root.instance,
+                                root.generation,
+                            )
+                        });
+                        current = Some(nodes.values());
+                    }
+                    Self::Joined(left, right) => {
+                        stack.push(right);
+                        stack.push(left);
+                    }
+                }
+            }
+        })
+    }
+}
+
+pub(super) type InventoryBuilder =
+    HashMap<(NodeId, ExpressionEnvironmentId), std::rc::Rc<std::cell::RefCell<InventoryEntry>>>;
+#[derive(Clone, Default)]
+pub(super) enum ConversionOrigins {
+    #[default]
+    Empty,
+    Entry(std::rc::Rc<std::cell::RefCell<InventoryEntry>>),
+    Joined(std::rc::Rc<Self>, std::rc::Rc<Self>),
+}
+impl ConversionOrigins {
+    pub(super) fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Empty, right) => right,
+            (left, Self::Empty) => left,
+            (
+                left @ (Self::Entry(_) | Self::Joined(..)),
+                right @ (Self::Entry(_) | Self::Joined(..)),
+            ) => Self::Joined(std::rc::Rc::new(left), std::rc::Rc::new(right)),
+        }
+    }
+    fn entries(&self) -> impl Iterator<Item = &std::rc::Rc<std::cell::RefCell<InventoryEntry>>> {
+        let mut stack = vec![self];
+        std::iter::from_fn(move || {
+            loop {
+                match stack.pop()? {
+                    Self::Empty => {}
+                    Self::Entry(entry) => return Some(entry),
+                    Self::Joined(left, right) => {
+                        stack.push(right);
+                        stack.push(left);
+                    }
+                }
+            }
+        })
+    }
+}
+pub(super) fn inventory_entry<B: BindingAddress>(
+    node: &AuthoredExpr<ParserPlaceholder, B>,
+    context: InventoryContext,
+    secret: bool,
+    owner: Option<&ConversionSite>,
+    inventory: &mut InventoryBuilder,
+) -> ConversionOrigins {
+    let entry = InventoryEntry {
+        node: node.id,
+        environment: node.location.instance.id(),
+        owner: owner.cloned().unwrap_or_else(|| ConversionSite {
+            node: node.id,
+            location: node.location.authored.clone(),
+        }),
+        definition: context == InventoryContext::Definition,
+        boundary: context == InventoryContext::Boundary,
+        secret,
+        roots: Default::default(),
+    };
+    let shared = inventory
+        .entry((entry.node, entry.environment))
+        .or_insert_with(|| std::rc::Rc::new(std::cell::RefCell::new(entry.clone())));
+    {
+        let mut current = shared.borrow_mut();
+        current.definition &= entry.definition;
+        current.boundary |= entry.boundary;
+        current.secret |= entry.secret;
+    }
+    ConversionOrigins::Entry(shared.clone())
+}
+pub(super) fn require_root<B: BindingAddress>(
+    root: &cursor::UseRoot<B>,
+    origins: Option<&ConversionOrigins>,
+    unresolved_roots: &mut Vec<RootRequirement>,
+) {
+    let requirement = RootRequirement {
+        node: cursor::canonical_root_id(&root.node),
+        occurrence: root.occurrence,
+        instance: root.instance,
+        generation: root.generation,
+    };
+    match origins {
+        Some(origins) => {
+            for entry in origins.entries() {
+                entry.borrow_mut().roots.insert(requirement);
+            }
+        }
+        // An unknown authored root cannot prove any conversion in this parsed
+        // inventory. The empty inventory still has no obligations.
+        None => unresolved_roots.push(requirement),
+    }
+}
+fn complete_inventory(
+    inventory: &ConversionInventory,
+    coverage: &crate::schema::value_validation::WalkCoverage,
+) -> crate::ConversionChannel {
+    inventory
+        .entries(coverage)
+        .filter(|(entry, unresolved)| {
+            *unresolved
+                || entry.boundary
+                || !coverage.conversion_judged(entry.node, entry.environment)
+                || entry.roots.iter().any(|root| {
+                    !coverage.reached_root(
+                        root.node,
+                        root.occurrence,
+                        root.instance,
+                        root.generation,
+                    )
+                })
+        })
+        .map(|(entry, _)| {
+            let (kind, message) = if entry.definition && !entry.boundary && entry.roots.is_empty() {
+                (Kind::Unused, "conversion has no typed destination use")
+            } else {
+                (
+                    Kind::UnsupportedPosition,
+                    "conversion is not supported at this position",
+                )
+            };
+            let error = ConversionError::new(kind, &entry.owner.location, message)
+                .owned_by(entry.owner.node);
+            if entry.secret {
+                error.inside_secret()
+            } else {
+                error
+            }
+        })
+        .collect()
+}
+
+/// All document-set admission walks borrow this session's coverage. Completion
+/// consumes the same session and its parsed Convert inventory; callers cannot
+/// supply a different coverage when completing validation.
+pub struct ConversionValidation {
+    inventories: Vec<Arc<ConversionInventory>>,
+    coverage: crate::schema::value_validation::WalkCoverage,
+    findings: crate::ConversionFindings,
+}
+impl ConversionValidation {
+    pub fn new<B: BindingAddress>(report: &ExpressionReport<B>) -> Self {
+        Self {
+            inventories: vec![report.conversions.clone()],
+            coverage: Default::default(),
+            findings: Default::default(),
+        }
+    }
+    pub fn include<B: BindingAddress>(&mut self, report: &ExpressionReport<B>) {
+        self.inventories.push(report.conversions.clone());
+    }
+    pub fn walk<T>(
+        &mut self,
+        walk: impl FnOnce(&mut crate::schema::value_validation::WalkCoverage) -> T,
+    ) -> T {
+        walk(&mut self.coverage)
+    }
+    pub fn record(&mut self, findings: crate::ConversionChannel) {
+        self.findings.extend(findings);
+    }
+    pub fn complete(mut self) -> crate::ConversionFindings {
+        for inventory in self.inventories {
+            self.findings
+                .extend(complete_inventory(&inventory, &self.coverage));
+        }
+        self.findings
+    }
+}
+#[cfg(test)]
 impl<B: BindingAddress> ExpressionReport<B> {
-    /// B1 boundary errors are placeholders until B2 supplies boundary cursors.
-    /// Completeness, including unavailable slot authority, never grants admission.
-    pub fn conversion_completeness(
+    pub(crate) fn conversion_completeness(
         &self,
         coverage: &crate::schema::value_validation::WalkCoverage,
-    ) -> Result<crate::ConversionChannel, CompletenessErrors> {
-        let report = self.completeness_report(coverage);
-        if !report.correspondence_errors().is_empty() {
-            return Err(CompletenessErrors::new(report.correspondence_errors()));
-        }
-        // A real boundary use owns the rejection ahead of its definition-only
-        // record. Partition completed evidence; do not revisit syntax or values.
-        let (definitions, uses): (Vec<_>, Vec<_>) = report
-            .unreached(|node| matches!(node.kind(), ExprKind::Convert { .. }))
-            .partition(|usage| usage.definition_only());
-        Ok(uses
-            .into_iter()
-            .chain(definitions)
-            .map(|usage| {
-                let (kind, message) = if usage.definition_only() {
-                    (Kind::Unused, "conversion has no typed destination use")
-                } else {
-                    (
-                        Kind::UnsupportedPosition,
-                        "conversion is not supported at this position",
-                    )
-                };
-                error(usage.node(), kind, message)
-            })
-            .collect())
+    ) -> crate::ConversionChannel {
+        complete_inventory(&self.conversions, coverage)
     }
+}
+
+pub(super) fn parse_failure(
+    site: Option<&ConversionSite>,
+    kind: crate::conversion::ConversionErrorKind,
+    ordinary: crate::parser::ParseError,
+) -> crate::parser::ParseError {
+    if crate::conversion::ConversionError::from_error(&ordinary).is_some() {
+        return ordinary;
+    }
+    match site {
+        Some(site) => crate::parser::ParseError::CheckedConversion(
+            crate::conversion::ConversionError::parse_failure(
+                kind,
+                &site.location,
+                site.node,
+                ordinary,
+            ),
+        ),
+        None => ordinary,
+    }
+}
+
+pub(super) fn rejected_key(
+    site: &ConversionSite,
+    ordinary: crate::parser::ParseError,
+) -> ConversionError {
+    ConversionError::parse_failure(
+        Kind::UnsupportedPosition,
+        &site.location,
+        site.node,
+        ordinary,
+    )
 }

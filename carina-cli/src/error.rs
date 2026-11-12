@@ -1563,13 +1563,6 @@ pub enum AppError {
         >,
     ),
 
-    /// A complete located diagnostic, with typed metadata available separately.
-    #[error("{}", .error.diagnostic())]
-    CheckedConversion { error: carina_core::ConversionError },
-
-    #[error(transparent)]
-    AuthoredCompleteness(carina_core::parser::retained::CompletenessErrors),
-
     /// Validation errors (schema mismatch, invalid config, etc.)
     #[error("{0}")]
     Validation(String),
@@ -1721,15 +1714,6 @@ impl From<carina_core::validation::ExportBoundaryError> for AppError {
 }
 
 impl AppError {
-    pub fn conversion_error(&self) -> Option<&carina_core::ConversionError> {
-        match self {
-            Self::CheckedConversion { error } => Some(error),
-            Self::Parse(error) => error.conversion_error(),
-            Self::ResourceAdmission(finding) => finding.conversion_error(),
-            error => carina_core::ConversionError::from_error(error),
-        }
-    }
-
     pub(crate) fn invalid_saved_plan_provider_evidence(
         path: carina_core::paths::DisplayPath,
         replan_command: Option<String>,

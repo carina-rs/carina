@@ -293,11 +293,6 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
         AppError::ProviderRouting(finding) => {
             Diagnostic::located(finding.detail().to_string(), finding.location())
         }
-        AppError::CheckedConversion { error } => conversion_diagnostic(error),
-        AppError::AuthoredCompleteness(error) => Diagnostic {
-            code: Some("authored_completeness".into()),
-            ..Diagnostic::new(error.to_string(), "error")
-        },
         AppError::ResourceAdmission(finding) => Diagnostic {
             code: finding.code().map(str::to_owned),
             location: finding.location().map(Location::authored),

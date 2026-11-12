@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::binding_index::{BindingIndex, ResolvedBindings};
+use crate::parser::ProviderContext;
 use crate::parser::{
     DeferredForPhaseTraversal, ExportParamLike, File, IdentifiedCustomTypeDeclaration,
     OwnedTypeIdentity, ProviderCustomTypes,
@@ -163,7 +164,7 @@ fn member(min: u64, max: u64) -> AttributeType {
     )
 }
 
-pub(super) fn catalog() -> ProviderContext {
+pub(crate) fn catalog() -> ProviderContext {
     use crate::schema::CompiledAttributeType as T;
     let declarations = vec![
         T::refined_string(
@@ -344,18 +345,19 @@ where
             let schema = resource
                 .schema(schemas)
                 .ok_or_else(|| format!("missing fixture schema: {:?}", resource.id()))?;
-            let admitted = crate::validation::admission::attributes::resource_attribute_admissions(
-                resource,
-                judged.file(),
-                schema,
-                &classified,
-                resource.quoted_string_attrs(),
-                &inputs,
-                &bindings,
-                session,
-                schemas,
-                &mut coverage,
-            );
+            let mut admitted =
+                crate::validation::admission::attributes::resource_attribute_admissions(
+                    resource,
+                    judged.file(),
+                    schema,
+                    &classified,
+                    resource.quoted_string_attrs(),
+                    &inputs,
+                    &bindings,
+                    session,
+                    schemas,
+                    &mut coverage,
+                );
             let mut local = admitted
                 .errors()
                 .chain(admitted.symbolic_errors().map(|(_, _, error)| error))
@@ -372,7 +374,7 @@ where
                     .iter()
                     .map(|error| finding(error)),
             );
-            conversions.extend(admitted.into_conversions());
+            conversions.extend(admitted.take_conversions());
             let label = match attributes.get("plain") {
                 Some(Value::Concrete(ConcreteValue::String(label))) => label
                     .diagnostic_literal()
@@ -1027,7 +1029,10 @@ fn conversion_exactly_one_diagnostic_per_rejected_convert_with_many_alias_uses()
 }
 
 fn check_pending_discharge(at_apply: Option<(&str, bool)>) -> TestResult {
-    let fixture = Fixture::string();
+    check_pending_discharge_in(Fixture::string(), at_apply)
+}
+
+fn check_pending_discharge_in(fixture: Fixture, at_apply: Option<(&str, bool)>) -> TestResult {
     let source = "let producer = mock.Source {}\nlet converted = producer.output as mock.Name\nlet sink = mock.Sink { target = converted }";
     let parsed = crate::parser::parse_file(source, Path::new("conversion.crn"), &fixture.catalog)
         .map_err(|error| format!("normal parse rejected authored source: {error}"))?
@@ -1321,4 +1326,19 @@ fn conversion_completeness_work_scales_linearly_for_aliases_branches_and_contain
         );
     }
     Ok(())
+}
+
+#[test]
+fn conversion_deferred_union_retains_the_selected_member_at_apply() -> TestResult {
+    for (text, accepted) in [("ok", true), ("toolong-for-slot", false)] {
+        check_pending_discharge_in(
+            Fixture::new(
+                AttributeType::string(),
+                AttributeType::union(vec![named(), AttributeType::string()]),
+            ),
+            Some((text, accepted)),
+        )?;
+    }
+    check_pending_discharge(Some(("ok", true)))?;
+    check_pending_discharge(Some(("toolong-for-slot", false)))
 }

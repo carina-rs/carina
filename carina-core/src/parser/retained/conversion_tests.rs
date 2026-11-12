@@ -1,27 +1,28 @@
 use super::*;
 
 #[test]
-fn conversion_completeness_surfaces_missing_judgement() {
+fn conversion_completion_uses_syntax_inventory_when_judgements_are_missing() {
     let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
-    let parsed = super::super::parse_file(
-        "provider mock { endpoint = 'ok' as String }",
-        Path::new("missing.crn"),
-        &catalog,
-    )
-    .unwrap();
-    let mut report = parsed.expression_report().clone();
-    Arc::make_mut(&mut report.nodes).clear();
-    let error = report
-        .conversion_completeness(&Default::default())
-        .unwrap_err();
-    assert!(!error.errors().is_empty());
-    assert!(
-        error
-            .errors()
-            .iter()
-            .all(|error| error.to_string().contains("completeness node")),
-        "{error:?}"
-    );
+    for (source, count) in [
+        ("provider mock { endpoint = 'ok' as String }", 1),
+        ("provider mock { endpoint = 'ok' }", 0),
+    ] {
+        let parsed = super::super::parse_file(source, Path::new("missing.crn"), &catalog).unwrap();
+        let mut report = parsed.expression_report().clone();
+        Arc::make_mut(&mut report.nodes).clear();
+        let conversions = report.conversion_completeness(&Default::default());
+        assert_eq!(conversions.findings().len(), count);
+        for error in conversions.findings() {
+            assert_eq!(
+                error.kind(),
+                crate::ConversionErrorKind::UnsupportedPosition
+            );
+            assert_eq!(
+                error.location().span().start_column(),
+                source.find("'ok'").unwrap() + 1
+            );
+        }
+    }
 }
 
 #[test]
@@ -429,5 +430,31 @@ fn conversion_parser_failures_keep_unsupported_placement_and_the_convert_range()
             "{error:?}"
         );
         assert!(conversion.location().span().start_column() > 1);
+    }
+}
+
+#[test]
+fn conversion_quoted_keys_own_the_convert_range_and_one_typed_error() {
+    for source in [
+        r#"mock.Sink { "${'target' as mock.Name}" = 'ok' }"#,
+        r#"let value = { "${'key' as mock.Name}" = 'ok' }"#,
+    ] {
+        let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let error = super::super::parse_file(source, Path::new("keys.crn"), &catalog).unwrap_err();
+        let conversion = crate::ConversionError::from_error(&error).unwrap();
+        assert_eq!(
+            conversion.kind(),
+            crate::ConversionErrorKind::UnsupportedPosition
+        );
+        assert_eq!(
+            conversion.location().span().start_column(),
+            source.find("'").unwrap() + 1
+        );
+        assert_eq!(
+            crate::executor::render_error_chain(&error)
+                .matches(&conversion.to_string())
+                .count(),
+            1
+        );
     }
 }

@@ -621,24 +621,8 @@ pub fn resource_attribute_admissions<
 ) -> crate::schema::ResourceValueValidation {
     if let Err(missing) = inputs.authored_evidence() {
         coverage.no_authored_evidence(missing);
-        if missing.contains_conversion()
-            || resource.authored_slots().is_some_and(|slots| {
-                resource.attributes().keys().any(|name| {
-                    slots
-                        .get(name)
-                        .ok()
-                        .and_then(|slot| slot.cursor().ok())
-                        .is_some_and(|usage| usage.node().judgement().contains_any_conversion())
-                })
-            })
-        {
-            return crate::schema::ResourceValueValidation::from_errors(vec![
-                assignment_seam_error(crate::parser::retained::MissingEvidence::new(
-                    "conversion resource has no authored admission evidence",
-                )),
-            ]);
-        }
     }
+
     let visits = std::cell::RefCell::new(std::mem::take(coverage));
     let findings = if uses_resource_attribute_admission(resource.kind()) {
         typed_resource_attribute_admissions::<kind::ResourceAttribute, _, _, _>(
@@ -1059,18 +1043,14 @@ where
     let Some(schema) = resource.schema(judged.schemas()) else {
         return Default::default();
     };
-    let mut inputs = match ResourceAttributeInputs::for_resource(resource, judged.report()) {
-        Ok(inputs) => inputs,
-        Err(error) => {
-            return crate::schema::ResourceValueValidation::from_errors(vec![
-                assignment_seam_error(error),
-            ])
-            .into_conversions();
-        }
-    };
+    let values = resource.resolved_attributes();
+    let mut inputs = ResourceAttributeInputs::for_resource(resource, judged.report())
+        .unwrap_or_else(|_| {
+            ResourceAttributeInputs::from_report(resource, &values, judged.report())
+        });
     inputs.scope = crate::schema::value_validation::AssignmentScope::ClaimedValues;
     let attributes = inputs.classify(&KnowledgeContext::validation(), |_, _| {});
-    resource_attribute_admissions(
+    let mut findings = resource_attribute_admissions(
         resource,
         judged.file(),
         schema,
@@ -1081,8 +1061,8 @@ where
         session,
         judged.schemas(),
         coverage,
-    )
-    .into_conversions()
+    );
+    findings.take_conversions()
 }
 
 #[cfg(test)]

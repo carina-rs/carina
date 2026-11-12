@@ -151,7 +151,7 @@ fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots()
         }
     });
     assert_eq!(resources, 2);
-    conversions.extend(judged.report().conversion_completeness(&coverage).unwrap());
+    conversions.extend(judged.report().conversion_completeness(&coverage));
     assert_eq!(conversions.findings().len(), 1);
     assert_eq!(
         conversions.findings()[0].kind(),
@@ -453,7 +453,8 @@ fn conversion_no_authored_evidence_cannot_admit_a_converted_slot() {
     let bindings =
         crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-        let report = crate::validation::admission::attributes::resource_attribute_admissions(
+        let mut coverage = Default::default();
+        let mut report = crate::validation::admission::attributes::resource_attribute_admissions(
             resource,
             judged.file(),
             resource.schema(&schemas).unwrap(),
@@ -463,11 +464,17 @@ fn conversion_no_authored_evidence_cannot_admit_a_converted_slot() {
             &bindings,
             session,
             &schemas,
-            &mut Default::default(),
+            &mut coverage,
         );
-        assert!(
-            report.errors().next().is_some() || report.symbolic_errors().next().is_some(),
-            "missing authored authority was admitted"
+        assert_eq!(report.errors().count(), 0, "{report:?}");
+        assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");
+        let mut conversions = ConversionFindings::default();
+        conversions.extend(report.take_conversions());
+        conversions.extend(judged.report().conversion_completeness(&coverage));
+        assert_eq!(conversions.findings().len(), 1);
+        assert_eq!(
+            conversions.findings()[0].kind(),
+            ConversionErrorKind::UnsupportedPosition
         );
     });
 }
@@ -694,4 +701,144 @@ fn conversion_covered_mixed_branches_report_the_convert_once() {
         findings.findings()[0].location().span().start_column(),
         source.find("'ok' as").unwrap() + 1
     );
+}
+
+#[test]
+fn conversion_no_as_directory_inventory_is_vacuous_without_any_walk_evidence() {
+    let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+        "../../tests/fixtures/conversion_no_as_parity.json"
+    ))
+    .unwrap();
+    let catalog = super::tests::catalog();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    for case in cases {
+        let directory = tempfile::tempdir().unwrap();
+        for (file, source) in case["files"].as_object().unwrap() {
+            let path = directory.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, source.as_str().unwrap()).unwrap();
+        }
+        let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+        let parsed = crate::config_loader::parse_directory(&path, &catalog).unwrap();
+        {
+            let configuration = crate::config_loader::load_buffer_configuration(
+                parsed.parsed(),
+                &schemas,
+                &catalog,
+            );
+            let conversions =
+                crate::parser::retained::ConversionValidation::new(configuration.judged().report())
+                    .complete();
+            assert!(
+                conversions.findings().is_empty(),
+                "{}: {conversions}",
+                case["name"]
+            );
+        }
+        crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+            match crate::module_resolver::resolve_modules_with_providerless_config(
+                parsed, &path, session, &schemas,
+            ) {
+                Ok(graph) => {
+                    assert_eq!(case["expected"]["status"], "ok", "{}", case["name"]);
+                    let configuration =
+                        crate::config_loader::load_buffer_configuration(&graph, &schemas, &catalog);
+                    let conversions = crate::parser::retained::ConversionValidation::new(
+                        configuration.judged().report(),
+                    )
+                    .complete();
+                    assert!(
+                        conversions.findings().is_empty(),
+                        "{}: {conversions}",
+                        case["name"]
+                    );
+                }
+                Err(error) => {
+                    assert_eq!(
+                        case["expected"]["status"], "error",
+                        "{}: {error}",
+                        case["name"]
+                    );
+                    assert!(ConversionError::from_error(&error).is_none(), "{error}");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(case["expected"]["errors"][0]["message"].as_str().unwrap()),
+                        "{error}"
+                    );
+                }
+            }
+        });
+    }
+}
+
+#[test]
+fn conversion_one_authored_alias_use_cannot_cover_another_use_without_evidence() {
+    use crate::validation::admission::attributes::{
+        ResourceAttributeInputs, resource_attribute_admissions,
+    };
+    let schemas = schema();
+    let catalog = super::tests::catalog();
+    for second in ["converted", "'ok'"] {
+        let source = format!(
+            "let converted = 'ok' as mock.Name\nlet first = mock.Sink {{ target = converted }}\nlet second = mock.Sink {{ target = {second} }}"
+        );
+        let parsed = crate::parser::parse_file(&source, Path::new("alias-evidence.crn"), &catalog)
+            .unwrap()
+            .resolve_root_for_test();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let judged = configuration.judged();
+        let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let bindings =
+            crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+        let mut validation = crate::parser::retained::ConversionValidation::new(judged.report());
+        crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+            for resource in tree.resources() {
+                let values = resource.resolved_attributes();
+                let inputs = if resource.binding() == Some("second") {
+                    ResourceAttributeInputs::from_report(resource, &values, judged.report())
+                } else {
+                    ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap()
+                };
+                let classified = inputs.classify(
+                    &crate::resource::knowledge::KnowledgeContext::validation(),
+                    |_, _| {},
+                );
+                let mut report = validation.walk(|coverage| {
+                    resource_attribute_admissions(
+                        resource,
+                        judged.file(),
+                        resource.schema(&schemas).unwrap(),
+                        &classified,
+                        resource.quoted_string_attrs(),
+                        &inputs,
+                        &bindings,
+                        session,
+                        &schemas,
+                        coverage,
+                    )
+                });
+                assert_eq!(report.errors().count(), 0, "{report:?}");
+                assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");
+                validation.record(report.take_conversions());
+            }
+        });
+        let conversions = validation.complete();
+        assert_eq!(
+            conversions.findings().len(),
+            usize::from(second == "converted"),
+            "{source}\n{conversions}"
+        );
+        for error in conversions.findings() {
+            assert_eq!(error.kind(), ConversionErrorKind::UnsupportedPosition);
+        }
+    }
 }

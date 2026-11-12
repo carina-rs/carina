@@ -107,6 +107,8 @@ impl<P: ValueKind, B: BindingAddress> Clone for CheckValue<'_, P, B> {
 pub struct WalkCoverage {
     visits: std::collections::HashSet<(NodeId, UseId, ExpansionInstanceId, ProjectionGeneration)>,
     work: usize,
+    conversion_verdicts:
+        std::collections::HashSet<(NodeId, crate::parser::retained::ExpressionEnvironmentId)>,
     generations: std::collections::HashMap<(UseId, ExpansionInstanceId), ProjectionGeneration>,
     nodes: std::collections::HashSet<(NodeId, crate::parser::retained::ExpressionEnvironmentId)>,
     unavailable: std::collections::HashSet<crate::parser::retained::UnreachedSlot>,
@@ -122,6 +124,7 @@ impl WalkCoverage {
 
     pub(crate) fn extend(&mut self, other: Self) {
         self.visits.extend(other.visits);
+        self.conversion_verdicts.extend(other.conversion_verdicts);
         self.nodes.extend(other.nodes);
         self.unavailable.extend(other.unavailable);
         self.work += other.work;
@@ -153,6 +156,40 @@ impl WalkCoverage {
                 generation,
             ))
         })
+    }
+
+    pub(crate) fn reached_root(
+        &self,
+        node: NodeId,
+        occurrence: UseId,
+        instance: ExpansionInstanceId,
+        generation: ProjectionGeneration,
+    ) -> bool {
+        let generation = self
+            .current_generation(occurrence, instance)
+            .map_or(generation, |current| current.latest(generation));
+        self.visits
+            .contains(&(node, occurrence, instance, generation))
+    }
+    pub(crate) fn conversion_judged(
+        &self,
+        node: NodeId,
+        environment: crate::parser::retained::ExpressionEnvironmentId,
+    ) -> bool {
+        self.conversion_verdicts.contains(&(node, environment))
+    }
+    fn verdict<B: BindingAddress>(
+        &mut self,
+        cursor: &AuthoredCursor<'_, B>,
+        outcome: &PolicyOutcome,
+    ) {
+        if let PolicyOutcome::Claimed(_) = outcome
+            && let CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) = &cursor.kind
+            && usage.form() == AuthoredForm::Convert
+        {
+            self.conversion_verdicts
+                .insert((usage.node().node_id(), usage.node().environment().id()));
+        }
     }
 
     pub(crate) fn record<B: BindingAddress>(&mut self, authored: &AuthoredUse<'_, B>) {
@@ -485,17 +522,12 @@ impl ResourceValueValidation {
             ..Default::default()
         }
     }
-
     pub fn conversions(&self) -> &crate::ConversionChannel {
         &self.conversions
     }
 
     pub fn take_conversions(&mut self) -> crate::ConversionChannel {
         std::mem::take(&mut self.conversions)
-    }
-
-    pub fn into_conversions(self) -> crate::ConversionChannel {
-        self.conversions
     }
 
     pub(crate) fn error_slice(&self) -> &[TypeError] {
@@ -914,6 +946,10 @@ struct ValueValidator<'a, 'lookup> {
     defs: &'a BTreeMap<String, CompiledAttributeType>,
     lookup: Option<CustomTypeLookup<'lookup>>,
     scope: AssignmentScope,
+    rechecks: Option<(
+        &'a crate::validation::admission::ConversionRechecks,
+        &'a LeafPath,
+    )>,
     checked: std::cell::RefCell<HashMap<CheckedNode<'a>, CheckedValue<'a>>>,
 }
 
@@ -941,10 +977,21 @@ impl<'a, 'lookup> ValueValidator<'a, 'lookup> {
             defs,
             lookup,
             scope: AssignmentScope::Full,
+            rechecks: None,
             checked: Default::default(),
         }
     }
 
+    fn with_rechecks(
+        mut self,
+        rechecks: Option<(
+            &'a crate::validation::admission::ConversionRechecks,
+            &'a LeafPath,
+        )>,
+    ) -> Self {
+        self.rechecks = rechecks;
+        self
+    }
     fn with_scope(mut self, scope: AssignmentScope) -> Self {
         self.scope = scope;
         self
@@ -1378,6 +1425,10 @@ pub(crate) struct WalkCallbacks<'a, P: ValueKind, B: BindingAddress> {
     ordinary: AssignmentCheck<'a, P, B>,
     policy: AuthoredChecks<'a, P, B>,
     scope: AssignmentScope,
+    rechecks: Option<(
+        &'a crate::validation::admission::ConversionRechecks,
+        &'a LeafPath,
+    )>,
     #[cfg(test)]
     authored: Option<AuthoredHook<'a, P, B>>,
 }
@@ -1392,6 +1443,7 @@ impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
             ordinary: self.ordinary,
             policy: self.policy,
             scope: self.scope,
+            rechecks: self.rechecks,
             #[cfg(test)]
             authored: self.authored.map(|hook| AuthoredHook {
                 callback: hook.callback,
@@ -1399,6 +1451,14 @@ impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
                 execution: HookExecution::Immediate,
             }),
         }
+    }
+    pub(crate) fn rechecking(
+        mut self,
+        rechecks: &'a crate::validation::admission::ConversionRechecks,
+        root: &'a LeafPath,
+    ) -> Self {
+        self.rechecks = Some((rechecks, root));
+        self
     }
     fn has_observer(&self) -> bool {
         #[cfg(test)]
@@ -1427,11 +1487,9 @@ impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
         cursor: AuthoredCursor<'_, B>,
     ) -> PolicyOutcome {
         let rejected = |error| {
-            PolicyOutcome::Claimed(crate::parser::retained::ConversionVerdict::Rejected(
-                AssignmentFindings {
-                    errors: vec![(path.clone(), error)],
-                    ..Default::default()
-                },
+            PolicyOutcome::Claimed(crate::parser::retained::ConversionVerdict::seam_rejection(
+                path.clone(),
+                error,
             ))
         };
         match self.policy {
@@ -1440,10 +1498,7 @@ impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
                 Ok(AuthoredOutcome::Claimed(witness)) => match witness.consume(attr, &cursor) {
                     Ok(verdict) => PolicyOutcome::Claimed(verdict),
                     Err(error) => PolicyOutcome::Claimed(
-                        crate::parser::retained::ConversionVerdict::Rejected(AssignmentFindings {
-                            conversions: std::iter::once(error).collect(),
-                            ..Default::default()
-                        }),
+                        crate::parser::retained::ConversionVerdict::invalid_witness(error),
                     ),
                 },
                 Err(error) => rejected(error),
@@ -1492,6 +1547,7 @@ impl<'a, P: ValueKind, B: BindingAddress> From<RequiredAssignmentCallbacks<'a, P
             ordinary: callbacks.ordinary,
             policy: callbacks.authored,
             scope: callbacks.scope,
+            rechecks: None,
             #[cfg(test)]
             authored: None,
         }
@@ -1508,17 +1564,22 @@ impl<'a, P: ValueKind, B: BindingAddress> From<AssignmentCallbacks<'a, P, B>>
                 Ok(AuthoredOutcome::Continue(Default::default()))
             }),
             scope: AssignmentScope::Full,
+            rechecks: None,
             authored: None,
         }
         .observe(callbacks.authored)
     }
 }
 
+struct AcceptedClaim<'a, B: BindingAddress> {
+    cursor: AuthoredCursor<'a, B>,
+    conversion: crate::parser::retained::conversion::AcceptedConversion,
+}
 #[derive(Clone)]
 enum Claim<'a, B: BindingAddress> {
     None,
     Accepted {
-        owner: std::rc::Rc<AuthoredCursor<'a, B>>,
+        owner: std::rc::Rc<AcceptedClaim<'a, B>>,
     },
     Rejected {
         owner: std::rc::Rc<AuthoredCursor<'a, B>>,
@@ -1537,10 +1598,17 @@ impl<'a, B: BindingAddress> Claim<'a, B> {
             Self::Rejected { .. } => true,
         }
     }
-    fn owner(&self) -> Option<&std::rc::Rc<AuthoredCursor<'a, B>>> {
+    fn owner(&self) -> Option<&AuthoredCursor<'a, B>> {
         match self {
             Self::None => None,
-            Self::Accepted { owner } | Self::Rejected { owner } => Some(owner),
+            Self::Accepted { owner } => Some(&owner.cursor),
+            Self::Rejected { owner } => Some(owner),
+        }
+    }
+    fn conversion(&self) -> Option<&crate::parser::retained::conversion::AcceptedConversion> {
+        match self {
+            Self::Accepted { owner } => Some(&owner.conversion),
+            Self::None | Self::Rejected { .. } => None,
         }
     }
     fn record(
@@ -1551,20 +1619,27 @@ impl<'a, B: BindingAddress> Claim<'a, B> {
         match outcome {
             PolicyOutcome::Continue(findings) => findings,
             PolicyOutcome::Claimed(verdict) => {
-                let (claim, findings) = match verdict {
-                    crate::parser::retained::ConversionVerdict::Accepted(findings) => (
-                        Self::Accepted {
-                            owner: std::rc::Rc::new(cursor),
-                        },
-                        findings,
-                    ),
-                    crate::parser::retained::ConversionVerdict::Rejected(findings) => (
-                        Self::Rejected {
-                            owner: std::rc::Rc::new(cursor),
-                        },
-                        findings,
-                    ),
-                };
+                let (claim, findings) = verdict.decide(
+                    |findings, conversion| {
+                        (
+                            Self::Accepted {
+                                owner: std::rc::Rc::new(AcceptedClaim {
+                                    cursor: cursor.clone(),
+                                    conversion,
+                                }),
+                            },
+                            findings,
+                        )
+                    },
+                    |findings| {
+                        (
+                            Self::Rejected {
+                                owner: std::rc::Rc::new(cursor.clone()),
+                            },
+                            findings,
+                        )
+                    },
+                );
                 // A child acceptance cannot revoke a wrapper's rejected claim.
                 if !self.is_rejected() {
                     *self = claim;
@@ -1641,6 +1716,7 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, P, B> {
         let outcome = self
             .callbacks
             .policy(attr, value, &path.canonical(), self.cursor.clone());
+        self.coverage.borrow_mut().verdict(&self.cursor, &outcome);
         findings.extend(self.claim.record(outcome, self.cursor.clone()));
     }
 
@@ -1832,6 +1908,7 @@ pub(crate) fn validate_authored_value_for_admission<
         let callbacks = callbacks.into().for_walk();
         let mut checked = ValueValidator::new(defs, Some(lookup))
             .with_scope(callbacks.scope)
+            .with_rechecks(callbacks.rechecks)
             .walk_with_assignment(
                 attr,
                 value.into(),
@@ -2116,6 +2193,7 @@ fn visit_syntax<'w, 's: 'w, P: PlaceholderKind, B: BindingAddress>(
             }
         };
         let outcome = callbacks.policy(attr, visit.value(), &path.canonical(), authored.clone());
+        coverage.verdict(&authored, &outcome);
         let policy = visit.claim.record(outcome, authored.clone());
         findings.authored.extend(policy);
         if !visit.claim.is_claimed() && !matches!(visit.mode, SyntaxVisit::Covered) {
@@ -2384,6 +2462,21 @@ impl<'a> ValueValidator<'a, '_> {
     where
         'a: 'w,
     {
+        let selected = self
+            .rechecks
+            .and_then(|(rechecks, root)| rechecks.selected(root, &path.canonical()));
+        let attr = selected.map_or(attr, |selected| selected.declaration());
+        let assignment = assignment.map(|mut walk| {
+            if let Some(selected) = selected {
+                walk.claim = Claim::Accepted {
+                    owner: std::rc::Rc::new(AcceptedClaim {
+                        cursor: walk.cursor.clone(),
+                        conversion: selected.owner().clone(),
+                    }),
+                };
+            }
+            walk
+        });
         let (assignment, extra, wrappers) = match assignment {
             Some(assignment) => match assignment.prepare(attr, self.defs, value, path, ancestry) {
                 Ok((assignment, findings, wrappers)) => (Some(assignment), findings, wrappers),
@@ -2908,47 +3001,29 @@ impl<'a> ValueValidator<'a, '_> {
         };
         let mut checked =
             self.walk_resolved_value(attr, value, path, ancestry, visited, assignment.clone());
-        if let Some(owner) = assignment
-            .as_ref()
-            .filter(|walk| !walk.claim.is_rejected())
-            .and_then(|walk| walk.claim.owner())
-        {
-            let node = match &owner.kind {
-                CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => Some(usage.node()),
-                CursorKind::Projected(_) => None,
-            };
-            if let Some(node) = node {
-                if checked.findings.authored.errors.is_empty()
-                    && checked.findings.authored.conversions.findings().is_empty()
-                    && let Some(cause) = checked.first_error().cloned()
-                {
-                    let mut error = crate::conversion::ConversionError::destination(
-                        node.location().declaration(),
-                        node.node_id(),
-                        cause,
-                    );
-                    if node.judgement().diagnostic_is_secret() {
-                        error = error.inside_secret();
-                    }
-                    checked
-                        .findings
-                        .authored
-                        .conversions
-                        .append(std::iter::once(error).collect());
-                }
-                if !checked.findings.authored.errors.is_empty()
-                    || !checked.findings.authored.conversions.findings().is_empty()
-                {
-                    checked.local = LocalOutcome::Accepted(Fit::with_kind(
-                        FitExactness::EXACT,
-                        attr,
-                        FitKind::Failed,
-                    ));
-                    checked.findings.local.clear();
-                    checked.findings.located.clear();
-                    checked.findings.additional_local_errors.clear();
-                    checked.findings.provider.clear();
-                }
+        if let Some(conversion) = assignment.as_ref().and_then(|walk| walk.claim.conversion()) {
+            if checked.findings.authored.errors.is_empty()
+                && checked.findings.authored.conversions.findings().is_empty()
+                && let Some(cause) = checked.first_error().cloned()
+            {
+                checked
+                    .findings
+                    .authored
+                    .conversions
+                    .append(std::iter::once(conversion.reject_destination(cause)).collect());
+            }
+            if !checked.findings.authored.errors.is_empty()
+                || !checked.findings.authored.conversions.findings().is_empty()
+            {
+                checked.local = LocalOutcome::Accepted(Fit::with_kind(
+                    FitExactness::EXACT,
+                    attr,
+                    FitKind::Failed,
+                ));
+                checked.findings.local.clear();
+                checked.findings.located.clear();
+                checked.findings.additional_local_errors.clear();
+                checked.findings.provider.clear();
             }
         }
         checked.findings.assignment.extend(findings);
@@ -3636,7 +3711,7 @@ impl<'a> ValueValidator<'a, '_> {
         for member in members {
             let member_assignment = assignment.clone().map(|mut walk| {
                 if let Some(owner) = walk.claim.owner() {
-                    walk.cursor = owner.as_ref().clone();
+                    walk.cursor = owner.clone();
                     walk.claim = Claim::None;
                 }
                 walk

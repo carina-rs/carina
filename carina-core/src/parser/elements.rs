@@ -1104,8 +1104,11 @@ impl SyntaxInventory {
         pairs: Pairs<'_, Rule>,
         file: &PreprocessedFile,
         source: &Path,
-    ) -> Self {
+    ) -> Result<Self, super::ParseError> {
         let expressions = super::retained::Expressions::from_pairs(pairs.clone(), file, source);
+        if let Some(error) = expressions.parse_error() {
+            return Err(error);
+        }
         let declarations = declaration_inventory(pairs.clone(), file, source);
         use crate::validation::{
             TypeResolutionContext as Context, TypeResolutionDeclarationKind as Kind,
@@ -1290,6 +1293,6 @@ impl SyntaxInventory {
                 }
             }
         }
-        out
+        Ok(out)
     }
 }

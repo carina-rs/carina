@@ -48,10 +48,10 @@ fn record_projection_copy(value: &Value<ParserPlaceholder, RelativeBindingName>)
     PROJECTION_COPY_WORK.update(|work| work + size(value));
 }
 
-mod conversion;
+pub(crate) mod conversion;
 pub(crate) use conversion::ConversionVerdict;
 pub(crate) use conversion::check as check_conversion;
-pub use conversion::{ConversionJudgement, MatchedConversionSource};
+pub use conversion::{ConversionJudgement, ConversionValidation, MatchedConversionSource};
 
 mod cursor;
 pub use cursor::{
@@ -120,34 +120,6 @@ impl MissingEvidence {
         Self::new(format!("resource {id}"))
     }
 }
-
-/// Completeness cannot infer a verdict when authored correspondence is missing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompletenessErrors {
-    errors: Box<[MissingEvidence]>,
-}
-impl CompletenessErrors {
-    pub(crate) fn new(errors: &[MissingEvidence]) -> Self {
-        Self {
-            errors: errors.into(),
-        }
-    }
-    pub fn errors(&self) -> &[MissingEvidence] {
-        &self.errors
-    }
-}
-impl std::fmt::Display for CompletenessErrors {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (index, error) in self.errors.iter().enumerate() {
-            if index != 0 {
-                writeln!(f)?;
-            }
-            write!(f, "{error}")?;
-        }
-        Ok(())
-    }
-}
-impl std::error::Error for CompletenessErrors {}
 
 impl ExpressionInstance {
     pub(crate) fn for_scope(scope: &crate::resource::ModuleInstanceScope) -> Self {
@@ -341,28 +313,7 @@ impl<P: ValueKind, B: BindingAddress> AuthoredExpr<P, B> {
             ParseOwnership::Covered => crate::conversion::ConversionErrorKind::UnsupportedPosition,
             ParseOwnership::Ordinary => return ordinary,
         };
-        conversion_parse_failure(self.first_conversion.as_deref(), kind, ordinary)
-    }
-}
-
-fn conversion_parse_failure(
-    site: Option<&ConversionSite>,
-    kind: crate::conversion::ConversionErrorKind,
-    ordinary: super::ParseError,
-) -> super::ParseError {
-    if crate::conversion::ConversionError::from_error(&ordinary).is_some() {
-        return ordinary;
-    }
-    match site {
-        Some(site) => {
-            super::ParseError::CheckedConversion(crate::conversion::ConversionError::parse_failure(
-                kind,
-                &site.location,
-                site.node,
-                ordinary,
-            ))
-        }
-        None => ordinary,
+        conversion::parse_failure(self.first_conversion.as_deref(), kind, ordinary)
     }
 }
 
@@ -753,6 +704,12 @@ impl<B: BindingAddress> Default for Expressions<B> {
 impl<B: BindingAddress> Expressions<B> {
     pub fn binding(&self, name: &B) -> Option<&ExprValue<ParserPlaceholder, B>> {
         self.definitions.get(name)
+    }
+    pub(in crate::parser) fn parse_error(&self) -> Option<super::ParseError> {
+        self.captures
+            .parse_error
+            .clone()
+            .map(super::ParseError::CheckedConversion)
     }
     pub(in crate::parser) fn captured_nodes(&self) -> Arc<CapturedNodes> {
         self.captures.clone()
@@ -1270,6 +1227,7 @@ pub(in crate::parser) struct CapturedNodes {
     resource_declarations: HashMap<NodeId, SlotDeclarationId>,
     values: std::sync::RwLock<HashMap<NodeId, Value<ParserPlaceholder, RelativeBindingName>>>,
     conditions: ConditionRecorder,
+    parse_error: Option<crate::ConversionError>,
 }
 impl std::fmt::Debug for CapturedNodes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1311,7 +1269,7 @@ impl CapturedNodes {
         pair: &Pair<'_, Rule>,
         ordinary: super::ParseError,
     ) -> super::ParseError {
-        conversion_parse_failure(
+        conversion::parse_failure(
             self.get(&ParseNodeKey::of(pair))
                 .and_then(|node| node.authored.first_conversion.as_deref()),
             crate::conversion::ConversionErrorKind::UnsupportedPosition,
@@ -1614,35 +1572,56 @@ fn compile_map(
     scope: &HashMap<String, ExprValue>,
     captures: &mut CapturedNodes,
 ) -> ExprValue {
-    let entries = lower_blocks(
-        pair.clone()
-            .into_inner()
-            .map(|entry| {
-                if entry.as_rule() == Rule::map_entry {
-                    let mut parts = entry.clone().into_inner();
-                    let key = parts.next().expect("map key");
-                    // Keys must have the exact spelling used by the
-                    // value parser, including its escape handling.
-                    let key_syntax = compile(key.clone(), file, source, scope, captures);
-                    let name = super::AttributeKey::literal_in_file(key, file);
-                    let value = compile(
-                        parts.next().expect("map value"),
-                        file,
-                        source,
-                        scope,
-                        captures,
-                    );
-                    let mut values = vec![value];
-                    if key_syntax.authored.first_conversion.is_some() {
-                        values.push(key_syntax);
-                    }
-                    node(&entry, ExprKind::Sink(name), values, file, source)
-                } else {
-                    compile(entry, file, source, scope, captures)
+    let entries = pair
+        .clone()
+        .into_inner()
+        .map(|entry| {
+            if entry.as_rule() == Rule::map_entry {
+                let mut parts = entry.clone().into_inner();
+                let key = parts.next().expect("map key");
+                let key_syntax = (key.as_rule() == Rule::string)
+                    .then(|| compile(key.clone(), file, source, scope, captures));
+                if let Some(key_syntax) = &key_syntax
+                    && let Some(site) = key_syntax.authored.first_conversion.as_deref()
+                    && let Err(ordinary) = super::extract_key_string(key.clone())
+                {
+                    captures
+                        .parse_error
+                        .get_or_insert_with(|| conversion::rejected_key(site, ordinary));
+                    return Err(Box::new(key_syntax.clone()));
                 }
-            })
-            .collect(),
-    );
+                let name = super::AttributeKey::literal_in_file(key, file);
+                let value = compile(
+                    parts.next().expect("map value"),
+                    file,
+                    source,
+                    scope,
+                    captures,
+                );
+                let mut values = vec![value];
+                if let Some(key_syntax) = key_syntax
+                    && key_syntax.authored.first_conversion.is_some()
+                {
+                    values.push(key_syntax);
+                }
+                Ok(node(&entry, ExprKind::Sink(name), values, file, source))
+            } else {
+                Ok(compile(entry, file, source, scope, captures))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let entries = match entries {
+        Ok(entries) => lower_blocks(entries),
+        Err(key) => {
+            return node(
+                &pair,
+                ExprKind::Unsupported("map with rejected key".into()),
+                vec![*key],
+                file,
+                source,
+            );
+        }
+    };
     let keys = entries
         .iter()
         .map(|entry| {
@@ -2121,7 +2100,23 @@ fn compile_remaining_form(
         Rule::attribute => {
             let mut parts = pair.clone().into_inner();
             let name = parts.next().expect("attribute name");
-            let key_syntax = compile(name.clone(), file, source, scope, captures);
+            let key_syntax = (name.as_rule() == Rule::string)
+                .then(|| compile(name.clone(), file, source, scope, captures));
+            if let Some(key_syntax) = &key_syntax
+                && let Some(site) = key_syntax.authored.first_conversion.as_deref()
+                && let Err(ordinary) = super::extract_key_string(name.clone())
+            {
+                captures
+                    .parse_error
+                    .get_or_insert_with(|| conversion::rejected_key(site, ordinary));
+                return node(
+                    &pair,
+                    ExprKind::Unsupported("attribute with rejected key".into()),
+                    vec![key_syntax.clone()],
+                    file,
+                    source,
+                );
+            }
             let name = super::AttributeKey::literal_in_file(name, file);
             let value = compile(
                 parts.next().expect("attribute value"),
@@ -2131,7 +2126,9 @@ fn compile_remaining_form(
                 captures,
             );
             let mut values = vec![value];
-            if key_syntax.authored.first_conversion.is_some() {
+            if let Some(key_syntax) = key_syntax
+                && key_syntax.authored.first_conversion.is_some()
+            {
                 values.push(key_syntax);
             }
             node(&pair, ExprKind::Sink(name), values, file, source)
@@ -3571,6 +3568,7 @@ mod judgement {
         bindings: Arc<HashMap<B, JudgedExpr>>,
         expressions: Arc<HashMap<ExpressionLocation, JudgedExpr>>,
         pub(super) nodes: Arc<HashMap<(ExpressionInstance, NodeId), JudgedExpr>>,
+        pub(super) conversions: Arc<conversion::ConversionInventory>,
         pub(super) syntax_nodes: Arc<AuthoredNodes<B>>,
         pub(super) use_roots: Arc<Vec<cursor::UseRoot<B>>>,
         pub(super) use_interner: Arc<cursor::UseInterner>,
@@ -3641,6 +3639,7 @@ mod judgement {
                 bindings: Arc::default(),
                 expressions: Arc::default(),
                 nodes: Arc::default(),
+                conversions: Arc::default(),
                 syntax_nodes: Arc::default(),
                 use_roots: Arc::default(),
                 use_interner: Arc::default(),
@@ -3660,6 +3659,10 @@ mod judgement {
             Arc::make_mut(&mut self.bindings).extend(Arc::unwrap_or_clone(other.bindings));
             Arc::make_mut(&mut self.expressions).extend(Arc::unwrap_or_clone(other.expressions));
             Arc::make_mut(&mut self.nodes).extend(Arc::unwrap_or_clone(other.nodes));
+            self.conversions = Arc::new(conversion::ConversionInventory::Joined(
+                self.conversions.clone(),
+                other.conversions,
+            ));
             Arc::make_mut(&mut self.syntax_nodes).extend(Arc::unwrap_or_clone(other.syntax_nodes));
             Arc::make_mut(&mut self.use_roots).extend(Arc::unwrap_or_clone(other.use_roots));
             Arc::make_mut(&mut self.definitions).extend(Arc::unwrap_or_clone(other.definitions));
@@ -3702,6 +3705,7 @@ mod judgement {
                     .into(),
                 expressions: self.expressions.clone(),
                 nodes: self.nodes.clone(),
+                conversions: self.conversions.clone(),
                 use_roots: {
                     let mut memo = HashMap::new();
                     Arc::new(
@@ -4029,30 +4033,203 @@ mod judgement {
                 bindings.insert(wait.binding.to_string(), target);
             }
         }
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        enum IndexPurpose {
+            AuthoredAndInventory,
+            Inventory,
+        }
+        #[derive(Clone, Copy)]
+        struct InventoryVisit<'a> {
+            purpose: IndexPurpose,
+            context: conversion::InventoryContext,
+            secret: bool,
+            owner: Option<&'a ConversionSite>,
+        }
+        struct IndexState<'a, B: BindingAddress> {
+            authored: HashMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
+            visited: HashMap<
+                (usize, conversion::InventoryContext, bool, IndexPurpose),
+                conversion::ConversionOrigins,
+            >,
+            conversions: conversion::InventoryBuilder,
+            origins: HashMap<(NodeId, ExpressionEnvironmentId), conversion::ConversionOrigins>,
+        }
         fn index<'a, B: BindingAddress>(
             expression: &'a ExprValue<ParserPlaceholder, B>,
-            authored: &mut HashMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
-            visited: &mut std::collections::HashSet<usize>,
-        ) {
-            if !visited.insert(Arc::as_ptr(&expression.authored) as usize) {
-                return;
+            definitions: &'a IndexMap<B, ExprValue<ParserPlaceholder, B>>,
+            state: &mut IndexState<'a, B>,
+            visit: InventoryVisit<'a>,
+        ) -> conversion::ConversionOrigins {
+            use conversion::InventoryContext::{Boundary, Definition, Value};
+            let InventoryVisit {
+                context,
+                secret,
+                owner,
+                purpose,
+            } = visit;
+            let node = &expression.authored;
+            let secret = secret || matches!(node.kind, ExprKind::Secret);
+            let context = match node.kind {
+                ExprKind::Function { .. }
+                | ExprKind::ProviderDeclaration
+                | ExprKind::ModuleCall
+                | ExprKind::Declaration => Boundary,
+                ExprKind::Convert { .. }
+                | ExprKind::Scalar(_)
+                | ExprKind::Parameter(_)
+                | ExprKind::LoopSlot(_)
+                | ExprKind::UntypedParameter
+                | ExprKind::Binding(_)
+                | ExprKind::Reference { .. }
+                | ExprKind::List
+                | ExprKind::Map(_)
+                | ExprKind::NestedBlock { .. }
+                | ExprKind::Interpolation { .. }
+                | ExprKind::EmptyInterpolation
+                | ExprKind::Secret
+                | ExprKind::Call(_)
+                | ExprKind::Sequence
+                | ExprKind::Access(_)
+                | ExprKind::Integer { .. }
+                | ExprKind::Alias
+                | ExprKind::Parens
+                | ExprKind::Definition
+                | ExprKind::Element
+                | ExprKind::Iterable
+                | ExprKind::Resource { .. }
+                | ExprKind::Sink(_)
+                | ExprKind::For
+                | ExprKind::Wait
+                | ExprKind::Compose
+                | ExprKind::DynamicAccess
+                | ExprKind::Boolean
+                | ExprKind::Unsupported(_)
+                | ExprKind::If
+                | ExprKind::Coalesce => context,
+            };
+            let key = (Arc::as_ptr(node) as usize, context, secret, purpose);
+            if let Some(origins) = state.visited.get(&key) {
+                return origins.clone();
             }
-            authored
-                .entry(expression.authored.location.clone())
-                .or_insert(expression);
-            for child in &expression.authored.children {
-                index(child, authored, visited);
+            state
+                .visited
+                .insert(key, conversion::ConversionOrigins::Empty);
+            let mut origins = if matches!(node.kind, ExprKind::Convert { .. }) {
+                conversion::inventory_entry(node, context, secret, owner, &mut state.conversions)
+            } else {
+                conversion::ConversionOrigins::Empty
+            };
+            match purpose {
+                IndexPurpose::AuthoredAndInventory => {
+                    state
+                        .authored
+                        .entry(node.location.clone())
+                        .or_insert(expression);
+                }
+                IndexPurpose::Inventory => {}
             }
+            if let ExprKind::Binding(binding) | ExprKind::Reference { binding, .. } = &node.kind
+                && let Some(definition) = definitions.get(binding)
+            {
+                origins = origins.join(index(
+                    definition,
+                    definitions,
+                    state,
+                    InventoryVisit {
+                        context,
+                        secret,
+                        owner,
+                        purpose: IndexPurpose::Inventory,
+                    },
+                ));
+            }
+            let owner = if matches!(node.kind, ExprKind::Convert { .. }) {
+                owner.or(node.first_conversion.as_deref())
+            } else if matches!(node.kind, ExprKind::Alias | ExprKind::Parens) {
+                owner
+            } else {
+                None
+            };
+            for child in &node.children {
+                let context = if matches!(node.kind, ExprKind::Resource { .. }) {
+                    if matches!(
+                        child.authored.kind,
+                        ExprKind::Sink(_) | ExprKind::NestedBlock { .. }
+                    ) {
+                        Value
+                    } else {
+                        Definition
+                    }
+                } else {
+                    context
+                };
+                origins = origins.join(index(
+                    child,
+                    definitions,
+                    state,
+                    InventoryVisit {
+                        context,
+                        secret,
+                        owner,
+                        purpose,
+                    },
+                ));
+            }
+            // Resource inputs end at their independently typed slot; referencing
+            // a resource output does not transport its input conversions.
+            if matches!(
+                node.kind,
+                ExprKind::Resource { .. } | ExprKind::ModuleCall | ExprKind::Function { .. }
+            ) {
+                origins = conversion::ConversionOrigins::Empty;
+            }
+            state
+                .origins
+                .insert((node.id, node.location.instance.id()), origins.clone());
+            state.visited.insert(key, origins.clone());
+            origins
         }
-        let mut authored = HashMap::new();
-        let mut visited = std::collections::HashSet::new();
+        let mut index_state = IndexState {
+            authored: HashMap::new(),
+            visited: HashMap::new(),
+            conversions: HashMap::new(),
+            origins: HashMap::new(),
+        };
+        let definitions: std::collections::HashSet<_> = expressions
+            .definitions
+            .values()
+            .map(ExprValue::node_id)
+            .collect();
         for expression in expressions
             .roots
             .iter()
             .chain(expressions.definitions.values())
         {
-            index(expression, &mut authored, &mut visited);
+            let context = if definitions.contains(&expression.node_id())
+                || matches!(expression.authored.kind, ExprKind::Definition)
+            {
+                conversion::InventoryContext::Definition
+            } else {
+                conversion::InventoryContext::Value
+            };
+            index(
+                expression,
+                &expressions.definitions,
+                &mut index_state,
+                InventoryVisit {
+                    context,
+                    secret: false,
+                    owner: None,
+                    purpose: IndexPurpose::AuthoredAndInventory,
+                },
+            );
         }
+        let IndexState {
+            authored,
+            conversions,
+            origins,
+            visited: _,
+        } = index_state;
         let functions = authored
             .values()
             .filter_map(|expression| {
@@ -4108,6 +4285,7 @@ mod judgement {
             bindings: Arc::new(judged_bindings),
             expressions: Arc::new(judge.by_location),
             nodes: Arc::new(judge.by_node),
+            conversions: Arc::default(),
             syntax_nodes: Arc::new(judge.syntax_nodes),
             use_roots: Arc::default(),
             use_interner: Arc::default(),
@@ -4131,18 +4309,6 @@ mod judgement {
                 .collect::<HashMap<_, _>>()
                 .into(),
         };
-        let mut snapshots = HashMap::new();
-        for (id, previous) in expressions.report.resource_reports.iter() {
-            let snapshot = snapshots
-                .entry(previous.instance.clone())
-                .or_insert_with(|| {
-                    let mut snapshot = report.clone();
-                    snapshot.instance = previous.instance.clone();
-                    snapshot.resource_reports = Arc::default();
-                    Arc::new(snapshot)
-                });
-            Arc::make_mut(&mut report.resource_reports).insert(id.clone(), snapshot.clone());
-        }
         let instance = ExpansionInstanceId::fresh();
         let generation = ProjectionGeneration::fresh();
         let definitions: std::collections::HashSet<_> = expressions
@@ -4162,6 +4328,7 @@ mod judgement {
             conditions: ConditionSnapshot::default(),
         }));
         let mut resources = std::collections::HashSet::new();
+        let mut unresolved_roots = Vec::new();
         for resource in file
             .iter_all_resources()
             .chain(file.deferred_for_phase.analysis_resource_refs())
@@ -4188,8 +4355,33 @@ mod judgement {
                 .unwrap_or_else(|| expressions.instance.clone());
             roots.extend(slots.use_roots().map(|mut root| {
                 root.environment = environment.clone();
+                conversion::require_root(
+                    &root,
+                    origins.get(&(root.node.id, environment.id())),
+                    &mut unresolved_roots,
+                );
                 root
             }));
+        }
+        report.conversions = Arc::new(conversion::ConversionInventory::Nodes(
+            conversions
+                .into_iter()
+                .map(|(key, entry)| (key, entry.borrow().clone()))
+                .collect(),
+            unresolved_roots,
+        ));
+        let mut snapshots = HashMap::new();
+        for (id, previous) in expressions.report.resource_reports.iter() {
+            let snapshot = snapshots
+                .entry(previous.instance.clone())
+                .or_insert_with(|| {
+                    let mut snapshot = report.clone();
+                    snapshot.instance = previous.instance.clone();
+                    snapshot.use_roots = Arc::default();
+                    snapshot.resource_reports = Arc::default();
+                    Arc::new(snapshot)
+                });
+            Arc::make_mut(&mut report.resource_reports).insert(id.clone(), snapshot.clone());
         }
         report.record_instance(file, None);
         report
