@@ -242,7 +242,7 @@ pub(crate) struct ConversionFindings {
     owners: std::collections::HashSet<crate::parser::retained::NodeId>,
 }
 impl ConversionFindings {
-    /// The sole diagnostic deduplication owner, shared by CLI and LSP.
+    /// One diagnostic per Convert NodeId: the first rejection wins (shared by CLI and LSP).
     pub fn extend(&mut self, channel: ConversionChannel) {
         for error in channel.into_findings() {
             if error.owner().is_none_or(|owner| self.owners.insert(owner)) {

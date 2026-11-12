@@ -15,7 +15,6 @@ use super::error::ModuleError;
 /// A parsed module plus non-blocking diagnostics discovered while its sibling
 /// files were still separate.
 pub struct LoadedModule {
-    pub(super) directory: ResolvedPath,
     pub parsed: ParsedFile,
     pub duplicate_declarations: Vec<crate::config_loader::DuplicateDeclaration>,
 }
@@ -162,7 +161,6 @@ fn load_directory_module_with_diagnostics_and_config(
         None
     } else {
         Some(LoadedModule {
-            directory: dir_path.clone(),
             parsed: merged,
             duplicate_declarations,
         })

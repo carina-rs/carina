@@ -2798,6 +2798,21 @@ where
         &self.iterables
     }
 
+    pub(crate) fn admission_scope(&self) -> super::retained::AuthoredScopeId {
+        self.file
+            .parser_binding_metadata
+            .syntax()
+            .expressions()
+            .admission_scope()
+    }
+    pub(crate) fn admission_report(&self) -> &super::retained::ExpressionReport<B> {
+        self.file
+            .parser_binding_metadata
+            .syntax()
+            .expressions()
+            .admission_report()
+    }
+
     pub fn resources(&self) -> impl Iterator<Item = &AnalysisResourceRef<'a, P, T, D, B>> {
         self.resources.iter()
     }

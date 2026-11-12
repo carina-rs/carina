@@ -245,7 +245,6 @@ fn conversion_sibling_coverage_preserves_ordinary_provider_callback_counts() {
 fn conversion_report_fallback_keeps_ordinary_diagnostics_in_current_and_sibling_files() {
     use carina_core::validation::admission::attributes::{
         ResourceAttributeInputs, resource_attribute_admissions,
-        unrendered_resource_conversion_admissions,
     };
     use carina_core::{binding_index::BindingIndex, validation::ConversionValidation};
     let mut schemas = SchemaRegistry::new();
@@ -314,15 +313,21 @@ fn conversion_report_fallback_keeps_ordinary_diagnostics_in_current_and_sibling_
                     let empty_configuration = carina_core::config_loader::load_buffer_configuration(
                         &empty, &schemas, &catalog,
                     );
-                    validation.walk(|coverage| {
-                        unrendered_resource_conversion_admissions(
-                            resource,
-                            empty_configuration.judged(),
-                            &bindings,
-                            session,
-                            coverage,
-                        )
-                    });
+                    validation.admit_remaining_resources(
+                        &tree,
+                        empty_configuration.judged(),
+                        &bindings,
+                        session,
+                        &std::collections::HashSet::new(),
+                    );
+                } else {
+                    validation.admit_remaining_resources(
+                        &tree,
+                        judged,
+                        &bindings,
+                        session,
+                        &std::collections::HashSet::from([resource.id().clone()]),
+                    );
                 }
             });
             let presented = validation.complete().into_presented();

@@ -961,27 +961,6 @@ impl ModuleLocationKey {
     }
 }
 
-/// The existing module cache distinguishes loaded authored snapshots from
-/// templates which have passed the resolver's preparation and import checks.
-#[derive(Clone)]
-pub(super) enum CachedModule {
-    Authored(ParsedFile),
-    Resolved(ParsedFile),
-}
-impl CachedModule {
-    pub(super) fn resolved(&self) -> Option<&ParsedFile> {
-        match self {
-            Self::Resolved(module) => Some(module),
-            Self::Authored(_) => None,
-        }
-    }
-    fn parsed(&self) -> &ParsedFile {
-        match self {
-            Self::Authored(parsed) | Self::Resolved(parsed) => parsed,
-        }
-    }
-}
-
 /// Context for module resolution
 pub(crate) struct ModuleResolver<'cfg, P = StrictTypeResolution> {
     /// Base directory for resolving relative imports
@@ -995,7 +974,7 @@ pub(crate) struct ModuleResolver<'cfg, P = StrictTypeResolution> {
     source_overrides: crate::config_loader::SourceOverrides,
     resolution: crate::config_loader::ModuleResolutionContext,
     /// Cache of loaded modules: path -> ParsedFile
-    pub(super) module_cache: HashMap<crate::paths::CanonicalPath, CachedModule>,
+    pub(super) module_cache: HashMap<crate::paths::CanonicalPath, ParsedFile>,
     /// Currently resolving modules (for cycle detection)
     pub(super) resolving: HashSet<crate::paths::CanonicalPath>,
     /// Imported module definitions by alias
@@ -1197,7 +1176,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         let mut warnings = self
             .module_cache
             .values()
-            .flat_map(|module| &module.parsed().warnings)
+            .flat_map(|module| &module.warnings)
             .filter(|warning| warning.kind == crate::parser::WarningKind::ProviderSchemasNotLoaded)
             .cloned()
             .collect::<Vec<_>>();
@@ -1255,22 +1234,15 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
 
         // Parsed templates share canonical identities, but nested import
         // locations belong to each spelling and its pinned directory.
-        let authored = match self.module_cache.get(&canonical).cloned() {
-            Some(CachedModule::Resolved(mut module)) => {
-                self.resolving.insert(canonical.clone());
-                let result = self.resolve_nested_modules(&mut module, &full_path);
-                self.resolving.remove(&canonical);
-                return result.map(|()| module);
-            }
-            Some(CachedModule::Authored(module)) => Some(module),
-            None => None,
-        };
+        if let Some(mut module) = self.module_cache.get(&canonical).cloned() {
+            self.resolving.insert(canonical.clone());
+            let result = self.resolve_nested_modules(&mut module, &full_path);
+            self.resolving.remove(&canonical);
+            return result.map(|()| module);
+        }
 
         self.resolving.insert(canonical.clone());
-        let loaded = match authored {
-            Some(module) => self.prepare_directory_module(module),
-            None => self.load_directory_module(&full_path),
-        };
+        let loaded = self.load_directory_module(&full_path);
         let mut parsed = match loaded {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -1325,8 +1297,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         self.resolving.remove(&canonical);
 
         // Cache the module
-        self.module_cache
-            .insert(canonical, CachedModule::Resolved(parsed.clone()));
+        self.module_cache.insert(canonical, parsed.clone());
 
         Ok(parsed)
     }
@@ -1364,10 +1335,6 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
         }
 
-        self.prepare_directory_module(merged)
-    }
-
-    fn prepare_directory_module(&self, mut merged: ParsedFile) -> Result<ParsedFile, ModuleError> {
         // Preserve authored value trees while this file is a reusable
         // template. Reference resolution may fold a direct reference, but an
         // argument-dependent `if` must derive dependencies only after its
@@ -2108,34 +2075,6 @@ pub fn resolve_modules_with_diagnostics<E: ResolveExportBindingPhase<ParserPlace
     )
 }
 
-/// Expand the same loader-owned module snapshots used by static preflight.
-/// Their authored node identities survive preparation and expansion.
-pub fn resolve_modules_with_diagnostics_from_loaded_modules<
-    'a,
-    E: ResolveExportBindingPhase<ParserPlaceholder> + Clone,
->(
-    parsed: &RootDirectoryParse<E>,
-    base_dir: &ResolvedPath,
-    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-    schemas: &SchemaRegistry,
-    covered_findings: &[crate::validation::ModuleCallFinding],
-    modules: impl IntoIterator<Item = &'a super::LoadedModule>,
-) -> ModuleResolutionDiagnosticResult<E::Absolute> {
-    let mut resolver = ModuleResolver::with_constraint_reports(
-        base_dir,
-        config,
-        schemas,
-        parsed.module_resolution_context(),
-    );
-    for module in modules {
-        resolver
-            .module_cache
-            .entry(module.directory.identity())
-            .or_insert_with(|| CachedModule::Authored(module.parsed.clone()));
-    }
-    resolve_modules_with_diagnostics_and_resolver(parsed.parsed(), resolver, covered_findings)
-}
-
 pub fn resolve_modules_with_diagnostics_and_overrides<
     E: ResolveExportBindingPhase<ParserPlaceholder> + Clone,
 >(
@@ -2203,8 +2142,27 @@ fn resolve_modules_with_diagnostics_and_resolver<
     graph.warnings.extend(resolver.provider_type_warnings());
     let mut graph = finish_root_expansion(graph, contributions, &root);
     crate::parser::retained::judge_configuration(&mut graph, resolver.schemas, resolver.config());
-    let (graph, deferred_for_errors) = finalize_deferred_for_bodies_collecting(graph);
+    let (mut graph, deferred_for_errors) = finalize_deferred_for_bodies_collecting(graph);
     errors.extend(deferred_for_errors);
+    let mut retained_templates = HashSet::new();
+    for directory in resolver.module_locations.values() {
+        let identity = directory.identity();
+        if retained_templates.insert(identity.clone())
+            && let Some(template) = resolver.module_cache.get(&identity)
+        {
+            crate::parser::retained::retain_module_inventory(
+                &mut graph,
+                template.expression_report(),
+                crate::validation::FindingSubject::Module(
+                    crate::paths::DisplayPath::for_diagnostics_from(
+                        directory.source_label(),
+                        &resolver.io_base_dir,
+                    )
+                    .to_string(),
+                ),
+            );
+        }
+    }
     let constraint_reports = resolver
         .constraint_reports
         .into_inner()

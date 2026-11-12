@@ -50,15 +50,6 @@ impl ModuleWalk {
         schemas: &carina_core::schema::SchemaRegistry,
     ) -> Self {
         let context = carina_core::parser::ProviderContext::new(environment.clone());
-        Self::load_with_context(parsed, base_dir, &context, schemas)
-    }
-
-    pub(crate) fn load_with_context<E>(
-        parsed: &carina_core::parser::File<E>,
-        base_dir: &ResolvedPath,
-        context: &carina_core::parser::ProviderContext,
-        schemas: &carina_core::schema::SchemaRegistry,
-    ) -> Self {
         let mut walk = Self::default();
         let base_dir = base_dir.clone();
         let mut visited = HashSet::new();
@@ -72,7 +63,7 @@ impl ModuleWalk {
                 &base_dir,
                 &mut visited,
                 &mut walk.modules,
-                context,
+                &context,
                 schemas,
             );
         }

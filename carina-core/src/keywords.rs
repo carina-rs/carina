@@ -14,7 +14,7 @@ pub enum KeywordKind {
     /// `upstream_state`, `exports`, `attributes`, `arguments`, `validation`,
     /// `moved`, `removed`.
     Declaration,
-    /// Control flow: `for`, `in`, `if`, `else`.
+    /// Control flow and checked conversion: `for`, `in`, `if`, `else`, `as`.
     Control,
     /// Prefix / non-block keywords: `use`, `import`, `require`, `read`.
     Other,
@@ -35,6 +35,7 @@ pub const KEYWORDS: &[(&str, KeywordKind)] = &[
     ("removed", KeywordKind::Declaration),
     ("upstream_state", KeywordKind::Declaration),
     ("validation", KeywordKind::Declaration),
+    ("as", KeywordKind::Control),
     ("else", KeywordKind::Control),
     ("for", KeywordKind::Control),
     ("if", KeywordKind::Control),

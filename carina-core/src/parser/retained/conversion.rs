@@ -597,6 +597,15 @@ pub(crate) type ConversionNodes = HashMap<(NodeId, ExpressionEnvironmentId), Inv
 pub(crate) enum ConversionInventory {
     Nodes(ConversionNodes, Vec<RootRequirement>),
     Joined(Arc<Self>, Arc<Self>),
+    Template {
+        inventory: Arc<Self>,
+        subject: crate::validation::FindingSubject,
+    },
+}
+#[derive(Clone, Copy)]
+enum InventoryRole<'a> {
+    Authored,
+    Template(&'a crate::validation::FindingSubject),
 }
 impl Default for ConversionInventory {
     fn default() -> Self {
@@ -604,37 +613,22 @@ impl Default for ConversionInventory {
     }
 }
 impl ConversionInventory {
-    // Reports share inventory chunks; joining module reports never copies
-    // the inventory accumulated by earlier modules.
-    fn entries<'a>(
-        &'a self,
-        coverage: &'a crate::schema::value_validation::WalkCoverage,
-    ) -> impl Iterator<Item = (&'a InventoryEntry, bool)> {
-        let mut stack = vec![self];
-        let mut current = None;
-        let mut unresolved = false;
+    // Shared chunks are visited once; root evidence is checked once per chunk.
+    fn chunks(
+        &self,
+    ) -> impl Iterator<Item = (&ConversionNodes, &[RootRequirement], InventoryRole<'_>)> {
+        let mut stack = vec![(self, InventoryRole::Authored)];
         std::iter::from_fn(move || {
             loop {
-                if let Some(entries) = &mut current
-                    && let Some(entry) = std::iter::Iterator::next(entries)
-                {
-                    return Some((entry, unresolved));
-                }
-                match stack.pop()? {
-                    Self::Nodes(nodes, roots) => {
-                        unresolved = roots.iter().any(|root| {
-                            !coverage.reached_root(
-                                root.node,
-                                root.occurrence,
-                                root.instance,
-                                root.generation,
-                            )
-                        });
-                        current = Some(nodes.values());
-                    }
+                let (inventory, role) = stack.pop()?;
+                match inventory {
+                    Self::Nodes(nodes, roots) => return Some((nodes, roots.as_slice(), role)),
                     Self::Joined(left, right) => {
-                        stack.push(right);
-                        stack.push(left);
+                        stack.push((right, role));
+                        stack.push((left, role));
+                    }
+                    Self::Template { inventory, subject } => {
+                        stack.push((inventory, InventoryRole::Template(subject)))
                     }
                 }
             }
@@ -732,46 +726,102 @@ pub(super) fn require_root<B: BindingAddress>(
         None => unresolved_roots.push(requirement),
     }
 }
+/// No resource walk is needed to publish judgements already recorded by parsing.
+pub(crate) fn parse_rejections(
+    inventory: &ConversionInventory,
+) -> (crate::ConversionChannel, AdmissionRequirement) {
+    let mut errors = crate::ConversionChannel::default();
+    let mut requirement = AdmissionRequirement::Empty;
+    for (nodes, _, role) in inventory.chunks() {
+        for entry in nodes.values() {
+            requirement = AdmissionRequirement::Required;
+            if let Some(ParseJudgement::Rejected(error)) = entry.parsing.judgement() {
+                errors.append(std::iter::once(in_inventory_role(error.clone(), role)).collect());
+            }
+        }
+    }
+    (errors, requirement)
+}
+#[derive(Clone, Copy)]
+pub(crate) enum AdmissionRequirement {
+    Empty,
+    Required,
+}
+
+fn in_inventory_role(error: ConversionError, role: InventoryRole<'_>) -> ConversionError {
+    match role {
+        InventoryRole::Authored => error,
+        InventoryRole::Template(subject) => error.in_subject(subject.clone()),
+    }
+}
+
 pub(crate) fn complete_inventory(
     inventory: &ConversionInventory,
     coverage: &crate::schema::value_validation::WalkCoverage,
+    _admitted: &crate::validation::AdmissionComplete,
 ) -> crate::ConversionChannel {
     inventory
-        .entries(coverage)
-        .filter_map(|(entry, unresolved)| {
-            match entry.parsing.judgement() {
-                Some(ParseJudgement::OperandFailed) => return None,
-                Some(ParseJudgement::Rejected(error)) => return Some(error.clone()),
-                None => {}
-            }
-            if !unresolved
-                && !entry.boundary
-                && coverage.conversion_judged(entry.node, entry.environment)
-                && entry.roots.iter().all(|root| {
-                    coverage.reached_root(
+        .chunks()
+        .flat_map(|(nodes, roots, role)| {
+            let unresolved = match role {
+                InventoryRole::Authored => roots.iter().any(|root| {
+                    !coverage.reached_root(
                         root.node,
                         root.occurrence,
                         root.instance,
                         root.generation,
                     )
-                })
-            {
-                return None;
-            }
-            let (kind, message) = if entry.definition && !entry.boundary && entry.roots.is_empty() {
-                (Kind::Unused, "conversion has no typed destination use")
-            } else {
-                (
-                    Kind::UnsupportedPosition,
-                    "conversion is not supported at this position",
-                )
+                }),
+                InventoryRole::Template(_) => false,
             };
-            let error = ConversionError::new(kind, &entry.owner.location, message)
-                .owned_by(entry.owner.node);
-            Some(if entry.secret {
-                error.inside_secret()
-            } else {
-                error
+            nodes.values().filter_map(move |entry| {
+                match entry.parsing.judgement() {
+                    Some(ParseJudgement::OperandFailed) => return None,
+                    Some(ParseJudgement::Rejected(error)) => {
+                        return Some(in_inventory_role(error.clone(), role));
+                    }
+                    None => {}
+                }
+                let judged = match role {
+                    InventoryRole::Authored => {
+                        !unresolved
+                            && !entry.boundary
+                            && coverage.conversion_judged(entry.node, entry.environment)
+                            && entry.roots.iter().all(|root| {
+                                coverage.reached_root(
+                                    root.node,
+                                    root.occurrence,
+                                    root.instance,
+                                    root.generation,
+                                )
+                            })
+                    }
+                    // Instances have their own full use checks. A template has no
+                    // runtime use; retain only nodes no instance ever judged.
+                    InventoryRole::Template(_) => coverage.template_conversion_judged(entry.node),
+                };
+                if judged {
+                    return None;
+                }
+                let (kind, message) =
+                    if entry.definition && !entry.boundary && entry.roots.is_empty() {
+                        (Kind::Unused, "conversion has no typed destination use")
+                    } else {
+                        (
+                            Kind::UnsupportedPosition,
+                            "conversion is not supported at this position",
+                        )
+                    };
+                let error = in_inventory_role(
+                    ConversionError::new(kind, &entry.owner.location, message)
+                        .owned_by(entry.owner.node),
+                    role,
+                );
+                Some(if entry.secret {
+                    error.inside_secret()
+                } else {
+                    error
+                })
             })
         })
         .collect()

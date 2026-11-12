@@ -10,9 +10,11 @@ pub mod deferred_types;
 pub mod depends_on;
 mod parameter_findings;
 mod presentation;
+pub(crate) use presentation::{AdmissionComplete, AdmittedConversions};
 pub use presentation::{
-    ConversionValidation, FindingSubject, OrdinaryFinding, PresentedConversion, PresentedFinding,
-    PresentedFindings, ResourceValidationReport, ValidationClientError,
+    AdmissionIncomplete, ClientFindingKind, ConversionValidation, FindingSubject, OrdinaryFinding,
+    PresentedConversion, PresentedFinding, PresentedFindings, ResourceAdmissionStep,
+    ResourceValidationReport, ValidationClientError,
 };
 pub mod routing;
 pub mod typecheck;
@@ -5174,10 +5176,28 @@ enum ResourceAdmissionDetail {
     Arithmetic(Box<crate::parser::Located<IntegerArithmeticTypeFinding>>),
     Iterable(Box<crate::parser::Located<DeferredForIterableTypeDiagnostic>>),
     UnavailableSchema(AnonymousResourceSchemaError),
+    Incomplete(AdmissionIncomplete),
     Message,
 }
 
 impl ResourceAdmissionFinding {
+    fn incomplete(error: AdmissionIncomplete) -> Self {
+        Self {
+            human: error.to_string(),
+            detail: ResourceAdmissionDetail::Incomplete(error),
+            location: None,
+        }
+    }
+    pub fn admission_incomplete(&self) -> Option<&AdmissionIncomplete> {
+        match &self.detail {
+            ResourceAdmissionDetail::Incomplete(error) => Some(error),
+            ResourceAdmissionDetail::Schema { .. }
+            | ResourceAdmissionDetail::Arithmetic(_)
+            | ResourceAdmissionDetail::Iterable(_)
+            | ResourceAdmissionDetail::UnavailableSchema(_)
+            | ResourceAdmissionDetail::Message => None,
+        }
+    }
     /// Add CLI module context as presentation without changing the finding.
     fn with_context(mut self, prefix: &str) -> Self {
         self.human = self
@@ -5211,6 +5231,7 @@ impl ResourceAdmissionFinding {
             ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
+            | ResourceAdmissionDetail::Incomplete(_)
             | ResourceAdmissionDetail::Message => None,
         }
     }
@@ -5220,6 +5241,7 @@ impl ResourceAdmissionFinding {
             ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
+            | ResourceAdmissionDetail::Incomplete(_)
             | ResourceAdmissionDetail::Message => None,
         }
     }
@@ -5229,6 +5251,7 @@ impl ResourceAdmissionFinding {
             | ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
+            | ResourceAdmissionDetail::Incomplete(_)
             | ResourceAdmissionDetail::Message => None,
         }
     }
@@ -5254,6 +5277,7 @@ impl ResourceAdmissionFinding {
             ResourceAdmissionDetail::Arithmetic(finding) => finding.detail().to_string(),
             ResourceAdmissionDetail::Iterable(finding) => finding.detail().to_string(),
             ResourceAdmissionDetail::UnavailableSchema(error) => error.to_string(),
+            ResourceAdmissionDetail::Incomplete(error) => error.to_string(),
             ResourceAdmissionDetail::Message => self.human.clone(),
         }
     }
@@ -5302,6 +5326,7 @@ impl std::fmt::Display for ResourceAdmissionFinding {
             | ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
+            | ResourceAdmissionDetail::Incomplete(_)
             | ResourceAdmissionDetail::Message => formatter.write_str(&self.human),
         }
     }
@@ -5700,7 +5725,39 @@ pub fn resource_reference_findings_in<
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
     subject: FindingSubject,
 ) -> Result<(), crate::parser::AnalysisTreeError> {
-    let report = resource_admission_report(judged, bindings, diagnostics, run, &subject)?;
+    let report = resource_admission_report(
+        judged,
+        bindings,
+        diagnostics,
+        run,
+        &subject,
+        presentation::AdmissionBoundary::Scope(judged.report().admission_scope()),
+    )?;
+    run.ordinary(report.references.0, subject);
+    Ok(())
+}
+
+/// Ordinary module preflight uses its own parse, never an expansion inventory.
+pub fn resource_reference_preflight_findings_in<
+    E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
+    B: BindingAddress,
+    F: ValidationClientError,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+>(
+    run: &mut ConversionValidation<F>,
+    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    bindings: &BindingIndex<'_, B>,
+    diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
+    subject: FindingSubject,
+) -> Result<(), crate::parser::AnalysisTreeError> {
+    let report = resource_admission_report(
+        judged,
+        bindings,
+        diagnostics,
+        run,
+        &subject,
+        presentation::AdmissionBoundary::Preflight,
+    )?;
     run.ordinary(report.references.0, subject);
     Ok(())
 }
@@ -5788,7 +5845,14 @@ fn complete_resource_admission_report<
     run: &mut ConversionValidation<F>,
     subject: &FindingSubject,
 ) -> Result<ResourceAdmissionReport, crate::parser::AnalysisTreeError> {
-    let mut report = resource_admission_report(judged, bindings, diagnostics, run, subject)?;
+    let mut report = resource_admission_report(
+        judged,
+        bindings,
+        diagnostics,
+        run,
+        subject,
+        presentation::AdmissionBoundary::Scope(judged.report().admission_scope()),
+    )?;
     let mut findings = resource_values_report(
         judged.file(),
         judged.schemas(),
@@ -5898,12 +5962,12 @@ fn resource_admission_report<
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
     conversion_validation: &mut ConversionValidation<F>,
     subject: &FindingSubject,
+    boundary: presentation::AdmissionBoundary,
 ) -> Result<ResourceAdmissionReport, crate::parser::AnalysisTreeError> {
     let parsed = judged.file();
     let registry = judged.schemas();
     let mut all_errors = ResourceAdmissionFindings::default();
     let mut attributes = HashMap::new();
-    conversion_validation.include_in(judged.report(), subject.clone());
     let inference_bindings = inference::bindings_from_parsed(parsed);
     let tree = crate::parser::AnalysisTree::try_from_file(parsed)?;
 
@@ -5924,56 +5988,24 @@ fn resource_admission_report<
             |session| {
                 // Match the main-branch project walk. Parser-side deferred read
                 // templates are checked at expansion, not admitted here.
-                for resource in tree.project_resources() {
-                    let Some(schema) = resource.schema(registry) else {
-                        continue;
-                    };
-                    let attrs = resource.attributes();
-                    let inputs = match admission::attributes::ResourceAttributeInputs::for_resource(
-                        resource,
-                        judged.report(),
-                    ) {
-                        Ok(inputs) => inputs,
+                for step in conversion_validation.resource_steps(
+                    tree.project_resources(),
+                    judged,
+                    bindings,
+                    session,
+                    subject.clone(),
+                    boundary.clone(),
+                ) {
+                    let (resource, result) = step.into_parts();
+                    let values = match result {
+                        Ok(Some(values)) => values,
+                        Ok(None) => continue,
                         Err(error) => {
                             all_errors.push(error.to_string());
                             continue;
                         }
                     };
-                    let classified = inputs.classify(
-                        &crate::resource::knowledge::KnowledgeContext::validation(),
-                        |_, _| {},
-                    );
-                    let source = resource.module_source();
-                    let resource_subject = match subject {
-                        FindingSubject::Module(_) => subject.clone(),
-                        FindingSubject::Root => source.and_then(ModuleSource::module_call).map_or(
-                            FindingSubject::Root,
-                            |module| {
-                                FindingSubject::Module(
-                                    module
-                                        .module_call_path()
-                                        .calls()
-                                        .map(|call| call.display_label())
-                                        .collect::<Vec<_>>()
-                                        .join(" -> "),
-                                )
-                            },
-                        ),
-                    };
-                    let values = conversion_validation.walk_in(resource_subject, |coverage| {
-                        admission::attributes::resource_attribute_admissions(
-                            resource,
-                            parsed,
-                            schema,
-                            &classified,
-                            resource.quoted_string_attrs(),
-                            &inputs,
-                            bindings,
-                            session,
-                            registry,
-                            coverage,
-                        )
-                    });
+                    let attrs = resource.attributes();
                     let location = resource.diagnostic_label();
                     for (attribute, path, error) in values.symbolic_errors() {
                         let start = all_errors.0.len();

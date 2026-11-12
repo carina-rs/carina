@@ -5110,7 +5110,7 @@ pub(crate) fn validate_module_internal_ref_types(
             errors: Vec::new(),
             warnings: Vec::new(),
         };
-        if let Err(error) = validation::resource_reference_findings_in(
+        if let Err(error) = validation::resource_reference_preflight_findings_in(
             errors,
             configuration.judged(),
             &bindings,

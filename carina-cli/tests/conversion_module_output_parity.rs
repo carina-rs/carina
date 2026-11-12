@@ -282,7 +282,7 @@ fn conversion_module_body_kinds_have_one_presented_owner_and_context() {
 }
 
 #[test]
-fn conversion_root_inventory_survives_an_ordinary_early_failure() {
+fn conversion_unused_inventory_waits_for_admission_after_an_ordinary_early_failure() {
     let directory = tempfile::tempdir().unwrap();
     let path = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
     let mut ordinary = Vec::new();
@@ -310,13 +310,102 @@ fn conversion_root_inventory_survives_an_ordinary_early_failure() {
                 others.push(error.clone());
             }
         }
-        assert_eq!(conversions.len(), usize::from(converted), "{}", report.json);
-        if converted {
-            assert_eq!(conversions[0]["code"], "conversion_unused");
-            assert_eq!(conversions[0]["location"]["range"]["start"]["line"], 2);
-        }
+        assert!(
+            conversions.is_empty(),
+            "unused destinations require an admission pass: {}",
+            report.json
+        );
         ordinary.push(others);
     }
     assert!(!ordinary[0].is_empty());
     assert_eq!(ordinary[0], ordinary[1]);
+}
+
+#[test]
+fn round3_early_ordinary_failure_does_not_reject_a_valid_conversion_cli_and_lsp() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("main.crn");
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    let loaded = loaded_provider_snapshot_from_factories(
+        Arc::new(factories()),
+        SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
+    );
+    let engine =
+        carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+    for named in [false, true] {
+        let mut cli_findings = Vec::new();
+        let mut lsp_findings = Vec::new();
+        for expression in ["'ok'", "'ok' as mock.Name"] {
+            let source = if named {
+                format!(
+                    "let broken = mock.Sink {{ attr = missing.output }}\nlet accepted = mock.Sink {{ attr = {expression} }}\n"
+                )
+            } else {
+                format!(
+                    "mock.Sink {{ attr = missing.output }}\nmock.Sink {{ attr = {expression} }}\n"
+                )
+            };
+            std::fs::write(&path, &source).unwrap();
+            let report = carina_cli::commands::validate::validate_diagnostics_with_factories(
+                &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+                carina_cli::wiring::LoadedProviderFactory::for_test(factories()),
+                HashMap::new(),
+            );
+            cli_findings.push(report.json["errors"].clone());
+            let document = carina_lsp::document::Document::new_with_path(
+                source,
+                path.clone(),
+                Arc::new(carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                )),
+            );
+            let diagnostics = engine.analyze(&document, Some(&path));
+            lsp_findings.push(
+                diagnostics
+                    .into_iter()
+                    .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(cli_findings[0], cli_findings[1], "named={named}");
+        assert_eq!(lsp_findings[0], lsp_findings[1], "named={named}");
+        assert!(!lsp_findings[0].is_empty());
+    }
+}
+
+#[test]
+fn round3_parse_rejection_survives_an_ordinary_early_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("main.crn"), "provider mock {}\nlet invalid = if 42 as String { 'ok' } else { 'ok' }\nmock.Sink { attr = missing.output }\n").unwrap();
+    let report = carina_cli::commands::validate::validate_diagnostics_with_factories(
+        &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+        carina_cli::wiring::LoadedProviderFactory::for_test(factories()),
+        HashMap::new(),
+    );
+    let errors = report.json["errors"].as_array().unwrap();
+    let conversions: Vec<_> = errors
+        .iter()
+        .filter(|error| {
+            error["code"]
+                .as_str()
+                .is_some_and(|code| code.starts_with("conversion_"))
+        })
+        .collect();
+    assert_eq!(conversions.len(), 1, "{}", report.json);
+    assert!(
+        conversions[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("inside this expression"),
+        "{}",
+        report.json
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error["message"].as_str().unwrap().contains("missing")),
+        "{}",
+        report.json
+    );
 }

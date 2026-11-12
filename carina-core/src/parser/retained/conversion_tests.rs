@@ -11,9 +11,26 @@ fn conversion_completion_uses_syntax_inventory_when_judgements_are_missing() {
         let parsed = super::super::parse_file(source, Path::new("missing.crn"), &catalog).unwrap();
         let mut report = parsed.expression_report().clone();
         Arc::make_mut(&mut report.nodes).clear();
-        let conversions = ConversionValidation::<std::convert::Infallible>::new(&report)
-            .complete()
-            .into_presented();
+        let schemas = crate::schema::SchemaRegistry::new();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let judged = configuration.judged();
+        let tree = super::super::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let bindings =
+            crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+        let mut validation = ConversionValidation::<std::convert::Infallible>::new(&report);
+        crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+            validation
+                .admitted_resources(
+                    &tree,
+                    judged,
+                    &bindings,
+                    session,
+                    crate::validation::FindingSubject::Root,
+                )
+                .for_each(drop);
+        });
+        let conversions = validation.complete().into_presented();
         assert_eq!(
             crate::conversion::tests::conversion_errors(&conversions).len(),
             count
@@ -244,6 +261,7 @@ fn conversion_live_covered_and_discarded_uses_each_supply_a_verdict() {
                 coverage,
             )
         });
+        validation.finish_test_admission_pass();
         let presented = validation.complete().into_presented();
         assert!(result.local_error().is_none());
         assert_eq!(
@@ -325,6 +343,7 @@ fn conversion_claim_preserves_ordinary_checks_below_a_rejected_wrapper() {
             coverage,
         )
     });
+    validation.finish_test_admission_pass();
     let presented = validation.complete().into_presented();
     assert!(result.local_error().is_none());
     assert_eq!(

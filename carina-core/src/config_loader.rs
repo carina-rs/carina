@@ -2187,11 +2187,28 @@ mod tests {
             &catalog,
         )
         .unwrap();
-        let presented = crate::validation::ConversionValidation::<std::convert::Infallible>::new(
-            parsed.expression_report(),
-        )
-        .complete()
-        .into_presented();
+        let schemas = SchemaRegistry::new();
+        let configuration = load_buffer_configuration(&parsed, &schemas, &catalog);
+        let judged = configuration.judged();
+        let tree = parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let bindings =
+            crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+        let mut validation =
+            crate::validation::ConversionValidation::<std::convert::Infallible>::new(
+                judged.report(),
+            );
+        crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+            validation
+                .admitted_resources(
+                    &tree,
+                    judged,
+                    &bindings,
+                    session,
+                    crate::validation::FindingSubject::Root,
+                )
+                .for_each(drop);
+        });
+        let presented = validation.complete().into_presented();
         assert_eq!(presented.len(), 1);
         let crate::validation::PresentedFinding::Conversion(conversion) =
             presented.iter().next().unwrap()

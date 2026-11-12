@@ -127,5 +127,35 @@
         "_virtual.net"
       ]
     }
+  },
+  {
+    "name": "module_for",
+    "files": {
+      "providers.crn": "provider mock {}\n",
+      "main.crn": "let net = use { source = './modules/net' }\nnet { names = ['one', 'two'] }\n",
+      "modules/net/main.crn": "arguments { names: list(String) }\nfor n in names { mock.test.resource { name = n } }\n"
+    },
+    "expected": {
+      "status": "ok",
+      "resource_count": 1,
+      "resources": [
+        "mock.test.resource.<pending> (deferred for at modules/net/main.crn:2)"
+      ]
+    }
+  },
+  {
+    "name": "module_for_if",
+    "files": {
+      "providers.crn": "provider mock {}\n",
+      "main.crn": "let net = use { source = './modules/net' }\nnet { names = ['one', 'two'] }\n",
+      "modules/net/main.crn": "arguments { names: list(String) }\nfor n in names { mock.test.resource { name = if true { n } else { n } } }\n"
+    },
+    "expected": {
+      "status": "ok",
+      "resource_count": 1,
+      "resources": [
+        "mock.test.resource.<pending> (deferred for at modules/net/main.crn:2)"
+      ]
+    }
   }
 ]

@@ -151,6 +151,7 @@ fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots()
         }
     });
     assert_eq!(resources, 2);
+    validation.finish_test_admission_pass();
     let conversions = validation.complete().into_presented();
     assert_eq!(conversion_errors(&conversions).len(), 1);
     assert_eq!(
@@ -471,6 +472,7 @@ fn conversion_no_authored_evidence_cannot_admit_a_converted_slot() {
         });
         assert_eq!(report.errors().count(), 0, "{report:?}");
         assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");
+        validation.finish_test_admission_pass();
         let conversions = validation.complete().into_presented();
         assert_eq!(conversion_errors(&conversions).len(), 1);
         assert_eq!(
@@ -835,6 +837,7 @@ fn conversion_one_authored_alias_use_cannot_cover_another_use_without_evidence()
                 assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");
             }
         });
+        validation.finish_test_admission_pass();
         let conversions = validation.complete().into_presented();
         assert_eq!(
             conversion_errors(&conversions).len(),
@@ -849,3 +852,125 @@ fn conversion_one_authored_alias_use_cannot_cover_another_use_without_evidence()
 
 #[path = "review_round2_tests.rs"]
 mod review_round2_tests;
+
+#[test]
+fn round3_completion_without_an_admission_pass_is_an_internal_error() {
+    use crate::validation::{ConversionValidation, PresentedFinding};
+    let catalog = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = crate::parser::parse_file(
+        "let converted = 'ok' as mock.Name",
+        Path::new("not_admitted.crn"),
+        &catalog,
+    )
+    .unwrap();
+    let report = ConversionValidation::<std::convert::Infallible>::new(parsed.expression_report())
+        .complete()
+        .into_presented();
+    assert_eq!(report.len(), 1, "{report:?}");
+    assert!(
+        matches!(report.iter().next(), Some(PresentedFinding::Ordinary(_))),
+        "{report:?}"
+    );
+    assert!(
+        report
+            .to_string()
+            .contains("admission pass did not complete"),
+        "{report:?}"
+    );
+    let plain = crate::parser::parse_file(
+        "let ordinary = 'ok'",
+        Path::new("not_admitted.crn"),
+        &catalog,
+    )
+    .unwrap();
+    assert!(
+        ConversionValidation::<std::convert::Infallible>::new(plain.expression_report())
+            .complete()
+            .into_presented()
+            .is_empty()
+    );
+}
+
+#[test]
+fn round3_partial_admission_driver_cannot_mint_completion() {
+    for operand in ["'ok'", "42"] {
+        let catalog = super::tests::catalog();
+        let schemas = schema();
+        let parsed = crate::parser::parse_file(
+            &format!("mock.Sink {{ target = {operand} as mock.Name }}"),
+            Path::new("partial.crn"),
+            &catalog,
+        )
+        .unwrap();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let judged = configuration.judged();
+        let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let bindings =
+            crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+        let mut run: crate::validation::ConversionValidation =
+            crate::validation::ConversionValidation::new(judged.report());
+        crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+            let mut pass = run.admitted_resources(
+                &tree,
+                judged,
+                &bindings,
+                session,
+                crate::validation::FindingSubject::Root,
+            );
+            assert!(pass.next().is_some());
+            // Drop before exhaustion, even though this fixture has one resource.
+        });
+        let presented = run.complete().into_presented();
+        assert!(conversion_errors(&presented).is_empty(), "{presented:?}");
+        assert!(
+            presented
+                .to_string()
+                .contains("admission pass did not complete"),
+            "{presented:?}"
+        );
+    }
+}
+
+#[test]
+fn round3_admitting_another_document_cannot_complete_a_scope() {
+    let catalog = super::tests::catalog();
+    let schemas = schema();
+    let parsed = crate::parser::parse_file(
+        "let unused = 'ok' as mock.Name",
+        Path::new("not_admitted.crn"),
+        &catalog,
+    )
+    .unwrap();
+    let other = crate::parser::parse_file(
+        "mock.Sink { target = 'ok' }",
+        Path::new("other.crn"),
+        &catalog,
+    )
+    .unwrap();
+    let configuration = crate::config_loader::load_buffer_configuration(&other, &schemas, &catalog);
+    let judged = configuration.judged();
+    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let bindings =
+        crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+    let mut run: crate::validation::ConversionValidation =
+        crate::validation::ConversionValidation::new(parsed.expression_report());
+    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+        run.admitted_resources(
+            &tree,
+            judged,
+            &bindings,
+            session,
+            crate::validation::FindingSubject::Root,
+        )
+        .for_each(drop);
+    });
+    let presented = run.complete().into_presented();
+    assert!(conversion_errors(&presented).is_empty(), "{presented:?}");
+    assert!(
+        presented
+            .to_string()
+            .contains("admission pass did not complete"),
+        "{presented:?}"
+    );
+}

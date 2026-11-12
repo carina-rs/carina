@@ -596,7 +596,14 @@ pub(crate) fn validate_and_resolve_report_inner(
         enriched_context,
     );
     let mut validation =
-        carina_core::validation::ConversionValidation::<AppError>::for_directory(&parsed);
+        match &name_resolution {
+            ConfigNameResolution::ReadOnly => carina_core::validation::ConversionValidation::<
+                AppError,
+            >::for_read_only_directory(&parsed),
+            ConfigNameResolution::EvaluatedOnly | ConfigNameResolution::Paired(_) => {
+                carina_core::validation::ConversionValidation::<AppError>::for_directory(&parsed)
+            }
+        };
     let result = validate_and_resolve_configuration(
         access,
         parsed,
@@ -655,10 +662,10 @@ fn validate_and_resolve_configuration(
     // resource-validation preference. Keep the recursive module snapshots
     // available even on destroy/state recovery paths; the later optional
     // policy checks remain gated by `skip_resource_validation`.
-    let module_walk = ModuleWalk::load_with_context(
+    let module_walk = ModuleWalk::load(
         parsed.parsed(),
         base_dir,
-        enriched_context.catalog(),
+        &enriched_context.catalog().environment,
         ctx.schemas(),
     );
 
@@ -907,20 +914,19 @@ fn validate_and_resolve_configuration(
         return Err(ValidationStopped);
     }
 
-    let module_resolution = module_resolver::resolve_modules_with_diagnostics_from_loaded_modules(
+    let module_resolution = module_resolver::resolve_modules_with_diagnostics(
         &parsed,
         base_dir,
         enriched_context,
         ctx.schemas(),
         &authored_module_call_findings,
-        module_walk.iter().map(|module| module.loaded()),
     );
     let mut parsed = match module_resolution {
         module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
             *authored_inputs = graph
                 .authored_inputs()
                 .map_err(|error| {
-                    errors.push(AppError::Provider(error.into()));
+                    errors.replace_ordinary_error(AppError::Provider(error.into()));
                     ValidationStopped
                 })?
                 .clone();

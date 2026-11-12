@@ -30,6 +30,28 @@ use carina_core::validation::DeferredAccessTypeError;
 #[cfg(test)]
 use carina_core::validation::admission::attributes::uses_resource_attribute_admission;
 
+#[derive(Debug)]
+struct OrdinaryDiagnostic(Diagnostic);
+impl std::fmt::Display for OrdinaryDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.message)
+    }
+}
+impl carina_core::validation::ValidationClientError for OrdinaryDiagnostic {
+    fn kind(&self) -> carina_core::validation::ClientFindingKind {
+        match self.0.severity {
+            None => carina_core::validation::ClientFindingKind::Error,
+            Some(severity) => {
+                if severity == DiagnosticSeverity::ERROR {
+                    carina_core::validation::ClientFindingKind::Error
+                } else {
+                    carina_core::validation::ClientFindingKind::Notice
+                }
+            }
+        }
+    }
+}
+
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
 fn authored_validation_resources<'t, 'a>(
@@ -412,9 +434,9 @@ impl ExpandedDiagnosticValidationInputs<'_> {
         self.coverage = coverage;
         result
     }
-    fn resource_admissions_in(
+    fn resource_admissions_in<F: carina_core::validation::ValidationClientError>(
         &mut self,
-        validation: &mut carina_core::validation::ConversionValidation,
+        validation: &mut carina_core::validation::ConversionValidation<F>,
         resource_id: &carina_core::resource::ResourceId,
         session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Option<carina_core::schema::ResourceValueValidation> {
@@ -1571,16 +1593,20 @@ impl DiagnosticRun<'_> {
                     );
                 }
             }
-            let mut conversion_validation: carina_core::validation::ConversionValidation =
-                carina_core::validation::ConversionValidation::new(expression_report);
+            let mut conversion_validation: carina_core::validation::ConversionValidation<
+                OrdinaryDiagnostic,
+            > = carina_core::validation::ConversionValidation::new(expression_report);
+            let prior_diagnostics = std::mem::take(&mut diagnostics);
+            conversion_validation.extend(prior_diagnostics.iter().cloned().map(OrdinaryDiagnostic));
             if let Some(configuration) = &expanded_configuration {
                 conversion_validation.include(configuration.judged().report());
             }
             if let Some(inputs) = expanded_validation_inputs.as_mut() {
                 // A rejected call already owns the diagnostic. Do not add a
                 // downstream resource consequence of that same rejection.
-                let rejected_calls: Vec<_> = diagnostics
+                let rejected_calls: Vec<_> = prior_diagnostics
                     .iter()
+                    .chain(diagnostics.iter())
                     .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
                     .map(|diagnostic| diagnostic.range)
                     .collect();
@@ -1617,6 +1643,7 @@ impl DiagnosticRun<'_> {
                             DiagnosticSeverity::ERROR,
                             format!("{}: {}", resource.id, finding.detail()),
                         ) && !rejected_calls.contains(&diagnostic.range)
+                            && !prior_diagnostics.contains(&diagnostic)
                             && !diagnostics.contains(&diagnostic)
                         {
                             diagnostics.push(diagnostic);
@@ -2115,10 +2142,12 @@ impl DiagnosticRun<'_> {
                                 if let Some(diagnostic) =
                                     render_merged(doc, &finding, severity, finding.detail().clone())
                                 {
-                                    if !diagnostics.iter().any(|existing| {
-                                        existing.range == diagnostic.range
-                                            && existing.message == diagnostic.message
-                                    }) {
+                                    if !prior_diagnostics.iter().chain(diagnostics.iter()).any(
+                                        |existing| {
+                                            existing.range == diagnostic.range
+                                                && existing.message == diagnostic.message
+                                        },
+                                    ) {
                                         diagnostics.push(diagnostic);
                                     }
                                     // This diagnostic is now present, including
@@ -2365,18 +2394,32 @@ impl DiagnosticRun<'_> {
             }
 
             if let Some(authored_tree) = &authored_tree {
-                for resource in authored_tree
-                    .project_resources()
-                    .filter(|resource| !admitted_resources.contains(resource.id()))
-                {
-                    conversion_validation.walk_resource(resource, |coverage| carina_core::validation::admission::attributes::unrendered_resource_conversion_admissions(resource, pre_expansion_configuration.judged(), &binding_index, self.provider_context, coverage));
-                }
+                conversion_validation.admit_remaining_resources(
+                    authored_tree,
+                    pre_expansion_configuration.judged(),
+                    &binding_index,
+                    self.provider_context,
+                    &admitted_resources,
+                );
             }
+            conversion_validation.extend(
+                std::mem::take(&mut diagnostics)
+                    .into_iter()
+                    .map(OrdinaryDiagnostic),
+            );
             for finding in conversion_validation.complete().into_presented() {
                 use carina_core::validation::{OrdinaryFinding, PresentedFinding};
                 match finding {
                     PresentedFinding::Ordinary(OrdinaryFinding::Resource(error)) => {
-                        if let Some(location) = error.location() {
+                        if error.admission_incomplete().is_some() {
+                            diagnostics.push(Diagnostic {
+                                range: Range::default(),
+                                severity: Some(DiagnosticSeverity::ERROR),
+                                source: Some("carina".into()),
+                                message: error.message(),
+                                ..Default::default()
+                            });
+                        } else if let Some(location) = error.location() {
                             let finding = carina_core::parser::Located::new(
                                 location.clone(),
                                 error.message(),
@@ -2389,7 +2432,9 @@ impl DiagnosticRun<'_> {
                             ));
                         }
                     }
-                    PresentedFinding::Ordinary(OrdinaryFinding::Client(never)) => match *never {},
+                    PresentedFinding::Ordinary(OrdinaryFinding::Client(diagnostic)) => {
+                        diagnostics.push(diagnostic.0)
+                    }
                     PresentedFinding::Conversion(error) => {
                         let finding = carina_core::parser::Located::new(
                             error.location().clone(),

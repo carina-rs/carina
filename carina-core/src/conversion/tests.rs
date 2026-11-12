@@ -17,7 +17,7 @@ use crate::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StringIdentityLayer,
     StringMemberConstraints, StructField, TypeIdentity,
 };
-use crate::validation::admission::{Candidate, admit, attributes::ResourceAttributeInputs};
+use crate::validation::admission::{Candidate, admit};
 use crate::validation::deferred_types::with_session_for_test;
 use crate::validation::{
     ConversionValidation, OrdinaryFinding, PresentedFinding, PresentedFindings,
@@ -374,31 +374,12 @@ where
         let bare = crate::validation::check_expanded_bare_binding_uses(&context);
         findings.extend(bare.findings().iter().map(|e| finding(e)));
         let mut resources = Vec::new();
-        for resource in tree
-            .resources()
-            .filter(|resource| resource.kind() != crate::parser::AnalysisItemKind::Composition)
-        {
+        for step in validation.admitted_authored_test_resources(&tree, judged, &bindings, session) {
+            let (resource, result) = step.into_parts();
             let attributes = resource.attributes();
-            let inputs = ResourceAttributeInputs::for_resource(resource, judged.report())
-                .map_err(|error| error.to_string())?;
-            let classified = inputs.classify(&KnowledgeContext::validation(), |_, _| {});
-            let schema = resource
-                .schema(schemas)
+            let mut admitted = result
+                .map_err(|error| error.to_string())?
                 .ok_or_else(|| format!("missing fixture schema: {:?}", resource.id()))?;
-            let mut admitted = validation.walk(|coverage| {
-                crate::validation::admission::attributes::resource_attribute_admissions(
-                    resource,
-                    judged.file(),
-                    schema,
-                    &classified,
-                    resource.quoted_string_attrs(),
-                    &inputs,
-                    &bindings,
-                    session,
-                    schemas,
-                    coverage,
-                )
-            });
             let mut local = admitted
                 .errors()
                 .chain(admitted.symbolic_errors().map(|(_, _, error)| error))

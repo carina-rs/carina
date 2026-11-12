@@ -675,6 +675,21 @@ pub(in crate::parser) fn resource_slots(
     Ok(slots)
 }
 
+/// Transient identity of a parser-owned document scope, shared by its snapshots.
+#[derive(Clone)]
+pub(crate) struct AuthoredScopeId(Arc<()>);
+impl Default for AuthoredScopeId {
+    fn default() -> Self {
+        Self(Arc::new(()))
+    }
+}
+impl PartialEq for AuthoredScopeId {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for AuthoredScopeId {}
+
 /// Parser-owned expression inventory. Merging and binding expansion preserve
 /// this value wholesale; no provisional evaluator receives its authored roots.
 ///
@@ -694,6 +709,8 @@ pub struct Expressions<B: BindingAddress = RelativeBindingName> {
     roots: Vec<ExprValue<ParserPlaceholder, B>>,
     definitions: IndexMap<B, ExprValue<ParserPlaceholder, B>>,
     report: Arc<ExpressionReport<B>>,
+    templates: Arc<conversion::ConversionInventory>,
+    scope: AuthoredScopeId,
     arguments: HashMap<B, TypeExpr>,
     instance: ExpressionInstance,
     captures: Arc<CapturedNodes>,
@@ -727,6 +744,8 @@ impl<B: BindingAddress> Default for Expressions<B> {
             roots: Vec::new(),
             definitions: IndexMap::new(),
             report: Arc::new(ExpressionReport::empty()),
+            templates: Arc::default(),
+            scope: AuthoredScopeId::default(),
             arguments: HashMap::new(),
             instance: ExpressionInstance::Root,
             captures: Arc::default(),
@@ -736,6 +755,12 @@ impl<B: BindingAddress> Default for Expressions<B> {
 }
 
 impl<B: BindingAddress> Expressions<B> {
+    pub(crate) fn admission_scope(&self) -> AuthoredScopeId {
+        self.scope.clone()
+    }
+    pub(crate) fn admission_report(&self) -> &ExpressionReport<B> {
+        &self.report
+    }
     pub fn binding(&self, name: &B) -> Option<&ExprValue<ParserPlaceholder, B>> {
         self.definitions.get(name)
     }
@@ -748,6 +773,10 @@ impl<B: BindingAddress> Expressions<B> {
     }
 
     pub(super) fn extend(&mut self, other: Self) {
+        self.templates = Arc::new(conversion::ConversionInventory::Joined(
+            self.templates.clone(),
+            other.templates,
+        ));
         self.roots.extend(other.roots);
         self.definitions.extend(other.definitions);
         self.arguments.extend(other.arguments);
@@ -761,6 +790,8 @@ impl<B: BindingAddress> Expressions<B> {
     ) -> Expressions<C> {
         let mut memo = HashMap::new();
         Expressions {
+            templates: self.templates,
+            scope: self.scope,
             captures: Arc::default(),
             projections: Arc::new(
                 self.projections
@@ -960,6 +991,29 @@ pub(crate) fn attach_report<E, D, B: BindingAddress>(
     let report = Arc::new(report);
     attach_slot_reports(file, &report);
     file.parser_binding_metadata.syntax.expressions_mut().report = report;
+}
+
+/// Keep inventories from the resolver's actual reusable templates, including
+/// authored definitions that expansion does not project into runtime values.
+pub(crate) fn retain_module_inventory<E, D, B: BindingAddress, C: BindingAddress>(
+    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    template: &ExpressionReport<C>,
+    subject: crate::validation::FindingSubject,
+) {
+    let expressions = file.parser_binding_metadata.syntax.expressions_mut();
+    let inventory = Arc::new(conversion::ConversionInventory::Template {
+        inventory: template.conversion_inventory(),
+        subject,
+    });
+    expressions.templates = Arc::new(conversion::ConversionInventory::Joined(
+        expressions.templates.clone(),
+        inventory.clone(),
+    ));
+    let report = Arc::make_mut(&mut expressions.report);
+    report.conversions = Arc::new(conversion::ConversionInventory::Joined(
+        report.conversions.clone(),
+        inventory,
+    ));
 }
 
 fn prepare_slots<E, D, B: BindingAddress>(
@@ -3647,6 +3701,7 @@ mod judgement {
 
     #[derive(Clone)]
     pub struct ExpressionReport<B: BindingAddress = RelativeBindingName> {
+        scope: AuthoredScopeId,
         bindings: Arc<HashMap<B, JudgedExpr>>,
         expressions: Arc<HashMap<ExpressionLocation, JudgedExpr>>,
         pub(super) nodes: Arc<HashMap<(ExpressionInstance, NodeId), JudgedExpr>>,
@@ -3718,6 +3773,7 @@ mod judgement {
         }
         pub(super) fn empty() -> Self {
             Self {
+                scope: AuthoredScopeId::default(),
                 bindings: Arc::default(),
                 expressions: Arc::default(),
                 nodes: Arc::default(),
@@ -3787,6 +3843,7 @@ mod judgement {
                     .into(),
                 expressions: self.expressions.clone(),
                 nodes: self.nodes.clone(),
+                scope: self.scope.clone(),
                 conversions: self.conversions.clone(),
                 use_roots: {
                     let mut memo = HashMap::new();
@@ -4078,6 +4135,9 @@ mod judgement {
                 .access_locations()
                 .ok_or_else(|| MissingEvidence::new("access location"))?;
             self.expression(location.expression_location())
+        }
+        pub(crate) fn admission_scope(&self) -> AuthoredScopeId {
+            self.scope.clone()
         }
         pub(crate) fn conversion_inventory(&self) -> Arc<super::conversion::ConversionInventory> {
             self.conversions.clone()
@@ -4380,6 +4440,7 @@ mod judgement {
             bindings: Arc::new(judged_bindings),
             expressions: Arc::new(judge.by_location),
             nodes: Arc::new(judge.by_node),
+            scope: expressions.scope.clone(),
             conversions: Arc::default(),
             syntax_nodes: Arc::new(judge.syntax_nodes),
             use_roots: Arc::default(),
@@ -4458,12 +4519,16 @@ mod judgement {
                 root
             }));
         }
-        report.conversions = Arc::new(conversion::ConversionInventory::Nodes(
+        let authored_inventory = Arc::new(conversion::ConversionInventory::Nodes(
             conversions
                 .into_iter()
                 .map(|(key, entry)| (key, entry.borrow().clone()))
                 .collect(),
             unresolved_roots,
+        ));
+        report.conversions = Arc::new(conversion::ConversionInventory::Joined(
+            expressions.templates.clone(),
+            authored_inventory,
         ));
         let mut snapshots = HashMap::new();
         for (id, previous) in expressions.report.resource_reports.iter() {
