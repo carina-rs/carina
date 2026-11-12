@@ -73,6 +73,91 @@ fn resolve_modules(
     .map_err(|error| *error)
 }
 
+#[test]
+fn root_require_directory_and_module_share_scope_evaluation() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("checked")).unwrap();
+    fs::write(
+        directory.path().join("providers.crn"),
+        "backend local { path = 'carina.state.json' }\nprovider mock {}\n",
+    )
+    .unwrap();
+    fs::write(directory.path().join("main.crn"), "let n = 2\nlet r = mock.test.resource { name = 'root' }\nlet checked = use { source = './checked' }\nlet control = checked { n = 2 }\n").unwrap();
+    fs::write(
+        directory.path().join("checked/arguments.crn"),
+        "arguments { n: Int }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("checked/guards.crn"),
+        "require n == 2, 'module guard'\n",
+    )
+    .unwrap();
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    for (condition, expected) in [
+        ("false", "require failed: root guard"),
+        ("n == 2", "unknown variable 'n' in constraint expression"),
+        (
+            "r.identifier != null",
+            "unknown variable 'r' in constraint expression",
+        ),
+        (
+            "missing == 2",
+            "unknown variable 'missing' in constraint expression",
+        ),
+        (
+            "env('unused') == 1",
+            "unknown function 'env' in constraint expression",
+        ),
+    ] {
+        fs::write(
+            directory.path().join("guards.crn"),
+            format!("require {condition}, 'root guard'\n"),
+        )
+        .unwrap();
+        let parsed = crate::config_loader::parse_directory(&path, &config).unwrap();
+        crate::validation::deferred_types::with_session_for_test(&config, |session| {
+            let result = super::resolve_modules_providerless(parsed, &path, session);
+            assert!(result.is_err(), "ignored root constraint: {condition}");
+            let error = result.err().unwrap();
+            let ModuleError::DirectoryConstraint(diagnostic) = &error else {
+                panic!("directory failure must retain its own owner: {error}");
+            };
+            assert!(diagnostic.location().file().path().ends_with("guards.crn"));
+            assert_eq!(diagnostic.location().span().start_line(), 1);
+            assert_eq!(diagnostic.location().span().start_column(), 9);
+            assert!(error.to_string().contains(expected), "{error}");
+        });
+    }
+    fs::write(
+        directory.path().join("guards.crn"),
+        "require true, 'root guard'\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("checked/guards.crn"),
+        "require n == 3, 'module guard'\n",
+    )
+    .unwrap();
+    let parsed = crate::config_loader::parse_directory(&path, &config).unwrap();
+    crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        let error = super::resolve_modules_providerless(parsed, &path, session)
+            .err()
+            .unwrap();
+        let ModuleError::Constraint(diagnostic) = error.root_cause() else {
+            panic!("module failure must retain its call owner: {error}");
+        };
+        assert_eq!(
+            diagnostic.to_string(),
+            "module 'checked' (call 'control'): arguments 'n': module guard (got n = 2)"
+        );
+        assert!(
+            matches!(&diagnostic.origin, ConstraintOrigin::LiveCall(call) if call.source_file().ends_with("main.crn") && call.call_span().start_line() == 4)
+        );
+    });
+}
+
 fn resolve_modules_with_config(
     parsed: ParsedFile,
     base_dir: &std::path::Path,

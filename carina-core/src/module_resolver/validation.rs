@@ -18,6 +18,92 @@ use crate::resource::{
 
 use super::ModuleError;
 
+/// A directory has no arguments or composition identity. Only module calls
+/// carry the labels and parser identity needed for module diagnostics.
+#[derive(Clone, Copy)]
+pub enum ConstraintScopeOwner<'a> {
+    Directory,
+    ModuleCall {
+        module: &'a str,
+        instance: &'a str,
+        binding: Option<&'a str>,
+        call_id: Option<&'a ModuleCallId>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryConstraintDiagnostic {
+    message: String,
+    detail: Option<String>,
+}
+
+impl fmt::Display for DirectoryConstraintDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "require failed: {}", self.message)?;
+        if let Some(detail) = &self.detail {
+            write!(f, "; {detail}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Scope ownership is retained through rendering; a directory failure cannot
+/// be mistaken for an anonymous module call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstraintDiagnostic {
+    Directory(DirectoryConstraintDiagnostic),
+    ModuleCall(Box<ModuleConstraintDiagnostic>),
+}
+
+impl fmt::Display for ConstraintDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Directory(diagnostic) => diagnostic.fmt(f),
+            Self::ModuleCall(diagnostic) => diagnostic.fmt(f),
+        }
+    }
+}
+
+pub(crate) struct ConstraintDeclaration<P: PlaceholderKind, B: BindingAddress> {
+    pub constraint: PendingModuleConstraint<P, B>,
+    pub location: crate::parser::DeclarationLocation,
+}
+
+/// The sole declaration collector, shared by expansion and direct evaluator
+/// callers. Locations stay live-only; pending module records retain format 45.
+pub(crate) fn collect_constraint_declarations<P: PlaceholderKind, B: BindingAddress>(
+    arguments: &[ArgumentParameter<crate::parser::TypeExpr, P, B>],
+    requires: &[RequireBlock<P, B>],
+) -> Vec<ConstraintDeclaration<P, B>> {
+    let mut declarations = Vec::new();
+    for argument in arguments {
+        for (ordinal, validation) in argument.validations.iter().enumerate() {
+            declarations.push(ConstraintDeclaration {
+                constraint: PendingModuleConstraint::argument_validation(
+                    &argument.name,
+                    ordinal,
+                    validation.condition.clone(),
+                    validation.error_message.clone().unwrap_or_else(|| {
+                        format!("validation failed for argument '{}'", argument.name)
+                    }),
+                ),
+                location: validation.condition_location().clone(),
+            });
+        }
+    }
+    for (ordinal, require) in requires.iter().enumerate() {
+        declarations.push(ConstraintDeclaration {
+            constraint: PendingModuleConstraint::require(
+                ordinal,
+                require.condition.clone(),
+                require.error_message.clone(),
+            ),
+            location: require.condition_location().clone(),
+        });
+    }
+    declarations
+}
+
 /// A failed module value constraint with deterministic, display-safe actuals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleConstraintViolation {
@@ -270,6 +356,18 @@ impl<P: PlaceholderKind, B: BindingAddress> EvaluatedModuleConstraint<P, B> {
         binding: Option<&str>,
         call_id: Option<&ModuleCallId>,
     ) -> Option<ModuleConstraintDiagnostic> {
+        match self.diagnostic(ConstraintScopeOwner::ModuleCall {
+            module,
+            instance,
+            binding,
+            call_id,
+        })? {
+            ConstraintDiagnostic::ModuleCall(diagnostic) => Some(*diagnostic),
+            ConstraintDiagnostic::Directory(_) => unreachable!("module-call owner"),
+        }
+    }
+
+    pub fn diagnostic(&self, owner: ConstraintScopeOwner<'_>) -> Option<ConstraintDiagnostic> {
         let (message, actuals, detail) = match &self.evaluation {
             ConstraintEvaluation::Violated(violation) => {
                 (violation.message.clone(), violation.actuals.clone(), None)
@@ -281,20 +379,33 @@ impl<P: PlaceholderKind, B: BindingAddress> EvaluatedModuleConstraint<P, B> {
             ),
             ConstraintEvaluation::Satisfied | ConstraintEvaluation::Pending => return None,
         };
-        Some(ModuleConstraintDiagnostic {
-            module: module.to_string(),
-            instance: instance.to_string(),
-            origin: call_id
-                .cloned()
-                .map(ConstraintOrigin::LiveCall)
-                .unwrap_or(ConstraintOrigin::Saved),
-            call: ModuleConstraintCall::from_binding(binding),
-            kind: self.kind.clone(),
-            arguments: self.arguments.clone(),
-            message,
-            actuals,
-            detail,
-        })
+        let ConstraintScopeOwner::ModuleCall {
+            module,
+            instance,
+            binding,
+            call_id,
+        } = owner
+        else {
+            return Some(ConstraintDiagnostic::Directory(
+                DirectoryConstraintDiagnostic { message, detail },
+            ));
+        };
+        Some(ConstraintDiagnostic::ModuleCall(Box::new(
+            ModuleConstraintDiagnostic {
+                module: module.to_string(),
+                instance: instance.to_string(),
+                origin: call_id
+                    .cloned()
+                    .map(ConstraintOrigin::LiveCall)
+                    .unwrap_or(ConstraintOrigin::Saved),
+                call: ModuleConstraintCall::from_binding(binding),
+                kind: self.kind.clone(),
+                arguments: self.arguments.clone(),
+                message,
+                actuals,
+                detail,
+            },
+        )))
     }
 }
 
@@ -305,7 +416,7 @@ pub fn evaluate_module_constraints<P: PlaceholderKind, B: BindingAddress>(
     constraints: ModuleConstraints<'_, P, B>,
     argument_values: &HashMap<String, Value<P, B>>,
 ) -> Vec<EvaluatedModuleConstraint<P, B>> {
-    let definitions = match constraints {
+    let definitions: Vec<_> = match constraints {
         ModuleConstraints::Declarations {
             arguments,
             requires,
@@ -314,37 +425,22 @@ pub fn evaluate_module_constraints<P: PlaceholderKind, B: BindingAddress>(
                 .iter()
                 .map(|argument| argument.name.clone())
                 .collect::<BTreeSet<_>>();
-            let mut definitions = Vec::new();
-            for argument in arguments {
-                for (ordinal, validation) in argument.validations.iter().enumerate() {
-                    definitions.push((
-                        PendingModuleConstraint::argument_validation(
-                            &argument.name,
-                            ordinal,
-                            validation.condition.clone(),
-                            validation.error_message.clone().unwrap_or_else(|| {
-                                format!("validation failed for argument '{}'", argument.name)
-                            }),
+            collect_constraint_declarations(arguments, requires)
+                .into_iter()
+                .map(|declaration| {
+                    let constraint = declaration.constraint;
+                    let (kind, names) = match constraint.id().validation_argument() {
+                        Some(argument) => (
+                            ModuleConstraintKind::ArgumentValidation {
+                                argument: argument.to_string(),
+                            },
+                            BTreeSet::from([argument.to_string()]),
                         ),
-                        ModuleConstraintKind::ArgumentValidation {
-                            argument: argument.name.clone(),
-                        },
-                        BTreeSet::from([argument.name.clone()]),
-                    ));
-                }
-            }
-            for (ordinal, require) in requires.iter().enumerate() {
-                definitions.push((
-                    PendingModuleConstraint::require(
-                        ordinal,
-                        require.condition.clone(),
-                        require.error_message.clone(),
-                    ),
-                    ModuleConstraintKind::Require,
-                    declared_arguments.clone(),
-                ));
-            }
-            definitions
+                        None => (ModuleConstraintKind::Require, declared_arguments.clone()),
+                    };
+                    (constraint, kind, names)
+                })
+                .collect()
         }
         ModuleConstraints::Pending(constraints) => constraints
             .iter()

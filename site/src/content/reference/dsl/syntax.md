@@ -428,11 +428,29 @@ See [Expressions](/reference/dsl/expressions/) for details on function definitio
 
 ## Require Statement
 
-Assert conditions that must be true, with a custom error message if they fail:
+Assert conditions that must be true, with a custom error message if they fail.
+Inside a module, a condition can reference its declared arguments:
 
 ```crn
+arguments {
+  subnets: list(String)
+  cidr_block: String
+}
+
 require length(subnets) > 0, 'At least one subnet must be specified'
 require cidr_block != '', 'CIDR block cannot be empty'
 ```
 
-The condition is a [validate expression](/reference/dsl/expressions/#validate-expressions) that supports comparison operators (`==`, `!=`, `>`, `<`, `>=`, `<=`) and logical operators (`&&`, `||`, `!`).
+At the root of a configuration directory, `require` has no arguments in scope.
+Its condition must use literals, operators, and supported constraint functions
+(`len` and `length`). Root conditions cannot reference `let` bindings,
+resources, data sources, or module calls, including those in sibling files.
+Every root condition is decided during validation; a false condition prevents
+planning, saving a plan, and live apply. The CLI and language server report it
+at the condition's own file and position.
+
+```crn
+require length('production') > 0, 'Environment label cannot be empty'
+```
+
+The condition is a [validate expression](/reference/dsl/expressions/#validate-expressions) that supports comparison operators (`==`, `!=`, `>`, `<`, `>=`, `<=`), integer arithmetic (`+`, `-`, `*`, `/`, `%`), and logical operators (`&&`, `||`, `!`).

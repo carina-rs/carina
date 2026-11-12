@@ -3691,6 +3691,14 @@ mod judgement {
             authored,
             expressions,
             bindings: &bindings,
+            directory_requires: if crate::validation::is_module_definition(file) {
+                Default::default()
+            } else {
+                file.requires
+                    .iter()
+                    .map(|require| require.condition_location().clone())
+                    .collect()
+            },
             functions,
             schemas,
             config,
@@ -3818,6 +3826,7 @@ mod judgement {
         authored: HashMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
         expressions: &'a Expressions<B>,
         bindings: &'a InferenceBindings<ParserPlaceholder, B>,
+        directory_requires: std::collections::HashSet<DeclarationLocation>,
         functions: HashMap<(ExpressionInstance, String), Arc<FunctionSignature>>,
         schemas: &'a crate::schema::SchemaRegistry,
         config: &'a super::super::ProviderContext,
@@ -3870,13 +3879,22 @@ mod judgement {
             let outer_scope = self.scope;
             self.scope = scope;
             self.visiting.push(id);
-            // Always visit every child, even for length(), selected access,
-            // interpolation, and a coalesce whose left payload is concrete.
-            let mut children = root
-                .children
-                .iter()
-                .map(|child| self.judge(child))
-                .collect::<Vec<_>>();
+            // A directory require has no value-expression environment. The
+            // shared constraint evaluator owns its entire declaration, so
+            // directory lets and general builtin signatures cannot preempt
+            // its scope checks. Reusable modules retain their existing static
+            // diagnostics before the same evaluator checks each instance.
+            let directory_require = self.directory_requires.contains(&root.location.authored);
+            // Other expressions still visit every child, even for length(),
+            // selected access, interpolation, and concrete-left coalescing.
+            let mut children = if directory_require {
+                Vec::new()
+            } else {
+                root.children
+                    .iter()
+                    .map(|child| self.judge(child))
+                    .collect::<Vec<_>>()
+            };
             if matches!(&root.kind, ExprKind::Call(name) if name == "join"
                 && !self.functions.contains_key(&(root.location.instance.clone(), name.clone())))
                 && root.children.get(1).is_some_and(Self::is_list_literal)
@@ -3910,7 +3928,11 @@ mod judgement {
                     owner: FailureOwner::Boundary,
                 };
             }
-            let mut result = self.infer(expression, &children);
+            let mut result = if directory_require {
+                declaration()
+            } else {
+                self.infer(expression, &children)
+            };
             result.data_mut().origin = Some(root.location.clone());
             result.data_mut().authority = Some(self.authority.clone());
             if matches!(root.kind, ExprKind::Reference { .. }) {

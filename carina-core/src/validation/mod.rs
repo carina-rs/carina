@@ -8279,7 +8279,7 @@ pub enum ModuleCallFindingMessage {
     ReferenceType(Box<ModuleCallReferenceDiagnostic>),
     TypeResolution(Box<crate::parser::Located<TypeResolutionDiagnostic>>),
     AttributeReference(Box<CompositionAttributeRefError>),
-    Constraint(Box<crate::module_resolver::ModuleConstraintDiagnostic>),
+    Constraint(crate::module_resolver::ConstraintDiagnostic),
 }
 
 impl ModuleCallFindingMessage {
@@ -8681,7 +8681,12 @@ impl ModuleCallFinding {
                     ModuleCallFindingMessage::ReferenceType(error) => call
                         .argument_value_location(&error.identity.argument)
                         .unwrap_or_else(|| call.declaration_location()),
-                    ModuleCallFindingMessage::Constraint(diagnostic) => match &diagnostic.kind {
+                    ModuleCallFindingMessage::Constraint(
+                        crate::module_resolver::ConstraintDiagnostic::Directory(_),
+                    ) => unreachable!("directory findings have authored anchors"),
+                    ModuleCallFindingMessage::Constraint(
+                        crate::module_resolver::ConstraintDiagnostic::ModuleCall(diagnostic),
+                    ) => match &diagnostic.kind {
                         crate::module_resolver::ModuleConstraintKind::ArgumentValidation {
                             argument,
                         } => call
@@ -9777,6 +9782,30 @@ impl ModuleCallChecker<'_> {
         compositions: &[crate::resource::LiveComposition<P>],
     ) {
         for report in reports {
+            let report = match report {
+                crate::module_resolver::ConstraintScopeReport::Directory(failures) => {
+                    for failure in failures {
+                        let anchor = ModuleCallFindingAnchor::new(failure.location().clone());
+                        let owner = ModuleCallFindingOwnerSource::Authored(anchor.clone());
+                        self.push_finding(ModuleCallFinding {
+                            kind: ModuleCallFindingKind::Constraint,
+                            owners: vec![ModuleCallFindingOwner {
+                                root: owner.clone(),
+                                immediate: owner,
+                            }],
+                            anchor,
+                            message: ModuleCallFindingMessage::Constraint(
+                                crate::module_resolver::ConstraintDiagnostic::Directory(
+                                    failure.detail().clone(),
+                                ),
+                            ),
+                            identity: None,
+                        });
+                    }
+                    continue;
+                }
+                crate::module_resolver::ConstraintScopeReport::ModuleCall(report) => report,
+            };
             for outcome in &report.outcomes {
                 let crate::module_resolver::ResolvedModuleConstraintStatus::Failed {
                     diagnostic,
@@ -9818,7 +9847,11 @@ impl ModuleCallChecker<'_> {
                     });
                 }
                 for owner in owners {
-                    let message = ModuleCallFindingMessage::Constraint(diagnostic.clone());
+                    let message = ModuleCallFindingMessage::Constraint(
+                        crate::module_resolver::ConstraintDiagnostic::ModuleCall(
+                            diagnostic.clone(),
+                        ),
+                    );
                     match authored_argument {
                         true => self.push_finding(ModuleCallFinding::argument_value(
                             ModuleCallFindingKind::Constraint,

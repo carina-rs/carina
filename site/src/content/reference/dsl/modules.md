@@ -157,6 +157,11 @@ reference every argument declared by the module. An undeclared name is an
 error during validation, even when one of the declared argument values is
 still unresolved.
 
+At the root of a configuration directory, a `require` condition has no
+arguments in scope. It may use constants and supported constraint functions,
+but cannot reference directory `let` bindings or resources. Root requirements
+are always checked during validation. See [Require Statement](/reference/dsl/syntax/#require-statement).
+
 ### When Constraints Run
 
 Carina checks a constraint when its input value becomes known:
@@ -173,6 +178,11 @@ Carina checks a constraint when its input value becomes known:
 Pending constraints remain attached to the module call and are checked again
 at later resolution boundaries. This matters when an update or replacement
 publishes a value that differs from the value available during planning.
+
+Saving a plan requires successful validation of root requirements. Applying a
+saved plan uses that validated snapshot without rereading source files or
+replaying root requirements. Plans with an unsupported format version must
+be regenerated.
 
 Resource schema value constraints follow the same value-time rule. Carina
 checks authored literal values first, then re-checks reference values against
