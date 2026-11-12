@@ -6585,8 +6585,8 @@ pub(crate) enum UpstreamMissingStatePolicy {
 pub(crate) enum ProviderUpstreamScope {
     /// Load every upstream because resource resolution also consumes them.
     All,
-    /// Load bindings referenced by construction-time attributes and default tags.
-    ProviderReferences,
+    /// Read/delete commands load only provider attributes and omit default tags.
+    ProviderConfigurationOnly,
 }
 
 /// Upstream values and the provider configs resolved from the same snapshot.
@@ -6644,7 +6644,7 @@ pub(crate) async fn load_and_resolve_provider_configs<E>(
                         )
                         .await?
                     }
-                    ProviderUpstreamScope::ProviderReferences => {
+                    ProviderUpstreamScope::ProviderConfigurationOnly => {
                         load_provider_referenced_upstream_states(
                             runtime,
                             parsed,
@@ -6664,7 +6664,9 @@ pub(crate) async fn load_and_resolve_provider_configs<E>(
                 } else { HashSet::new() };
                 let configs = ResolvedProviderConfigs::resolve_with_remote(
                     parsed, &remote_bindings, session, |key, value| {
-                        if ResolvedProviderConfigs::references_only(value, &missing) {
+                        if matches!(scope, ProviderUpstreamScope::ProviderConfigurationOnly) {
+                            false
+                        } else if ResolvedProviderConfigs::references_only(value, &missing) {
                             log::error!("Skipping default_tag '{key}' with unresolvable value: upstream state is missing");
                             false
                         } else { true }
@@ -6811,14 +6813,10 @@ fn provider_referenced_upstream_states<E>(
         .collect();
     let mut pending = VecDeque::new();
     for provider in &parsed.providers {
-        for (attribute, value) in
-            provider
-                .attributes
-                .iter()
-                .map(|(key, value)| (key.clone(), value))
-                .chain(provider.default_tags.iter().map(|(key, value)| {
-                    (ResolvedProviderConfigs::default_tag_attribute(key), value)
-                }))
+        for (attribute, value) in provider
+            .attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), value))
         {
             enqueue_value(
                 value,
@@ -7558,7 +7556,7 @@ mod load_upstream_states_tests {
             &context,
             &schemas,
             UpstreamMissingStatePolicy::Strict,
-            ProviderUpstreamScope::ProviderReferences,
+            ProviderUpstreamScope::ProviderConfigurationOnly,
         )
         .await
         .expect("unrelated invalid exports must not block provider-only commands");
@@ -7986,7 +7984,7 @@ mod load_upstream_states_tests {
     }
 
     #[tokio::test]
-    async fn provider_reference_scope_requires_default_tag_upstream_values() {
+    async fn provider_reference_scope_ignores_default_tag_upstream_values() {
         let temp = tempfile::tempdir().unwrap();
         let referenced = temp.path().join("referenced");
         let unrelated = temp.path().join("unrelated");
@@ -8025,24 +8023,23 @@ mod load_upstream_states_tests {
         ]);
         let parsed = resolve_file_for_test(parsed, temp.path());
 
-        let error = load_and_resolve_provider_configs(
+        let inputs = load_and_resolve_provider_configs(
             &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
             UpstreamMissingStatePolicy::Strict,
-            ProviderUpstreamScope::ProviderReferences,
+            ProviderUpstreamScope::ProviderConfigurationOnly,
         )
         .await
-        .err()
-        .expect("default_tags are construction-time inputs and require their upstream values");
-        let rendered = error.to_string();
-        assert!(rendered.contains("default_tags.Owner"), "{rendered}");
-        assert!(rendered.contains("mgmt"), "{rendered}");
+        .expect("read/delete provider construction must not load tag-only upstreams");
         assert!(
-            !rendered.contains("unrelated"),
-            "unreferenced upstreams must not be loaded: {rendered}"
+            inputs
+                .configs()
+                .as_provider_configs()
+                .iter()
+                .all(|config| config.default_tags.is_empty())
         );
     }
 
@@ -8085,7 +8082,7 @@ mod load_upstream_states_tests {
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
             UpstreamMissingStatePolicy::Strict,
-            ProviderUpstreamScope::ProviderReferences,
+            ProviderUpstreamScope::ProviderConfigurationOnly,
         )
         .await
         .expect("provider scope must load upstreams reached through resource attributes");

@@ -1534,6 +1534,18 @@ impl ProviderLoad {
         )
     }
 
+    /// Validate configuration for read/delete commands without resolving tags
+    /// that cannot reach a desired provider payload.
+    pub fn validate_read_only_config(
+        self,
+        mut parsed: carina_core::config_loader::InferredRootDirectory,
+        base_dir: &ResolvedPath,
+        duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
+    ) -> Result<ValidatedConfig<ExpandedInferredFile>, AppError> {
+        parsed.omit_provider_default_tags();
+        self.validate_evaluated_config(parsed, base_dir, true, duplicate_declarations)
+    }
+
     /// Validate an evaluated config and consume this exact load and file into
     /// one executable owner.
     pub fn validate_evaluated_config(

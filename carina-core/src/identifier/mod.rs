@@ -1452,6 +1452,24 @@ pub(crate) fn identity_required_bindings<
     required
 }
 
+const PREFIX_COMPANION_SUFFIX: &str = "_prefix";
+
+fn prefix_companion_attribute(base: &str) -> String {
+    format!("{base}{PREFIX_COMPANION_SUFFIX}")
+}
+
+/// Canonicalization recorded these prefixes after consuming their companions.
+/// Replay uses the same naming convention as the canonicalizer.
+pub(crate) fn consumed_prefix_companions<S, P: PlaceholderKind, B: BindingAddress, D>(
+    resource: &Resource<S, P, B, D>,
+) -> HashSet<String> {
+    resource
+        .prefixes
+        .keys()
+        .map(|name| prefix_companion_attribute(name))
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ResourcePrefixSource(());
 
@@ -1481,7 +1499,7 @@ pub fn resolve_attr_prefixes<P: PlaceholderKind, B: BindingAddress>(
             .attributes
             .iter()
             .filter_map(|(key, value)| {
-                if let Some(base_attr) = key.strip_suffix("_prefix")
+                if let Some(base_attr) = key.strip_suffix(PREFIX_COMPANION_SUFFIX)
                     && let Value::Concrete(ConcreteValue::String(prefix_value)) = value
                     && let Some(attr_schema) = schema.attributes.get(base_attr)
                     && is_string_compatible_type(&attr_schema.attr_type, &schema.defs)
@@ -1493,7 +1511,7 @@ pub fn resolve_attr_prefixes<P: PlaceholderKind, B: BindingAddress>(
             .collect();
 
         for (base_attr, prefix_value) in prefix_attrs {
-            let prefix_key = format!("{}_prefix", base_attr);
+            let prefix_key = prefix_companion_attribute(&base_attr);
 
             // Error if prefix is empty
             if prefix_value.expose_plaintext().is_empty() {

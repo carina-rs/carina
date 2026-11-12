@@ -758,17 +758,19 @@ impl DiagnosticRun<'_> {
                     self.provider_context,
                 )
             {
-                let finding = carina_core::parser::Located::new(
-                    tree.provider_attribute_location(index, "default_tags")
-                        .clone(),
-                    error,
-                );
-                diagnostics.extend(render_merged(
-                    doc,
-                    &finding,
-                    DiagnosticSeverity::ERROR,
-                    finding.detail().to_string(),
-                ));
+                for error in error.into_findings() {
+                    let finding = carina_core::parser::Located::new(
+                        tree.provider_attribute_location(index, "default_tags")
+                            .clone(),
+                        error,
+                    );
+                    diagnostics.extend(render_merged(
+                        doc,
+                        &finding,
+                        DiagnosticSeverity::ERROR,
+                        finding.detail().to_string(),
+                    ));
+                }
             }
         }
         diagnostics

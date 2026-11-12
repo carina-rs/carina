@@ -2158,6 +2158,55 @@ mod provider_config_tests {
             .await
         }
 
+        #[test]
+        fn issue_4304_3a_review1_plan_reports_every_resource_and_data_source() {
+            let mut schemas = SchemaRegistry::new();
+            for data in [false, true] {
+                let schema = PatternResourceSchema::new("test.Final").attribute(
+                    PatternAttributeSchema::optional("value", PatternAttributeType::bool()).build(),
+                );
+                schemas.insert(
+                    "mock",
+                    (if data {
+                        schema.as_data_source()
+                    } else {
+                        schema
+                    })
+                    .validate()
+                    .unwrap(),
+                );
+            }
+            let resources = ["first", "second"]
+                .into_iter()
+                .map(|name| {
+                    let resource = Resource::with_provider("mock", "test.Final", name, None)
+                        .with_attribute("value", text("invalid"));
+                    ResolvedResource::resolve_with_schemas(resource.into(), &schemas).unwrap()
+                })
+                .collect();
+            let mut data =
+                crate::resource::DataSource::with_provider("mock", "test.Final", "lookup", None);
+            data.set_attr("value", text("invalid"));
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| {
+                    let error = crate::validation::admission::final_input::FinalPlanInputs::admit(
+                        resources,
+                        vec![ResolvedDataSource::new(data.into_provider_data_source())],
+                        &schemas,
+                        &ResolvedBindings::default(),
+                        session,
+                    )
+                    .unwrap_err();
+                    assert_eq!(error.findings().len(), 3, "{error:?}");
+                    let message = diagnostic(&error);
+                    for name in ["first", "second", "lookup"] {
+                        assert!(message.contains(name), "missing {name}: {message}");
+                    }
+                },
+            );
+        }
+
         #[tokio::test]
         async fn issue_4304_3a_cleanup_plan_keeps_all_findings() {
             let error = cleanup_candidate(false, true).await;

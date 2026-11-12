@@ -124,6 +124,13 @@ impl std::error::Error for FinalInputErrors {}
 /// A single finding keeps its established source chain. Collections expose all
 /// findings through the same accessor, without selecting a representative leaf.
 impl FinalInputError {
+    fn into_findings(self) -> Vec<Self> {
+        match self {
+            Self::Findings(errors) => errors.0,
+            error => vec![error],
+        }
+    }
+
     pub fn findings(&self) -> &[Self] {
         match self {
             Self::Findings(errors) => errors.findings(),
@@ -414,40 +421,51 @@ impl<S> FinalPlanInputs<S> {
         bindings: &ResolvedBindings,
         session: &dyn ProviderTypeCheckContext,
     ) -> Result<Self, FinalInputError> {
+        let mut errors = Vec::new();
         for resource in &resources {
             let raw = resource.as_resource();
-            let schema = schemas
-                .get_for(raw)
-                .ok_or_else(|| FinalInputError::MissingSchema {
+            let result = match schemas.get_for(raw) {
+                Some(schema) => check(
+                    &raw.id,
+                    &raw.attributes,
+                    &raw.attributes,
+                    Some(&raw.default_tag_keys),
+                    schema,
+                    Stage::Plan(bindings),
+                    session,
+                ),
+                None => Err(FinalInputError::MissingSchema {
                     resource: Box::new(raw.id.clone()),
-                })?;
-            check(
-                &raw.id,
-                &raw.attributes,
-                &raw.attributes,
-                Some(&raw.default_tag_keys),
-                schema,
-                Stage::Plan(bindings),
-                session,
-            )?;
+                }),
+            };
+            if let Err(error) = result {
+                errors.extend(error.into_findings());
+            }
         }
         for resource in &data_sources {
             let raw = resource.as_inner();
-            let schema =
-                schemas
-                    .get_for_data_source(raw)
-                    .ok_or_else(|| FinalInputError::MissingSchema {
-                        resource: Box::new(raw.id.clone()),
-                    })?;
-            check(
-                &raw.id,
-                &raw.attributes,
-                &raw.attributes,
-                None,
-                schema,
-                Stage::Plan(bindings),
-                session,
-            )?;
+            let result = match schemas.get_for_data_source(raw) {
+                Some(schema) => check(
+                    &raw.id,
+                    &raw.attributes,
+                    &raw.attributes,
+                    None,
+                    schema,
+                    Stage::Plan(bindings),
+                    session,
+                ),
+                None => Err(FinalInputError::MissingSchema {
+                    resource: Box::new(raw.id.clone()),
+                }),
+            };
+            if let Err(error) = result {
+                errors.extend(error.into_findings());
+            }
+        }
+        match errors.len() {
+            0 => {}
+            1 => return Err(errors.pop().expect("one finding")),
+            _ => return Err(FinalInputError::Findings(FinalInputErrors(errors))),
         }
         Ok(Self {
             resources: FinalInput { payload: resources },

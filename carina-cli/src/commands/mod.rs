@@ -917,13 +917,24 @@ fn validate_and_resolve_configuration(
         .iter()
         .map(|upstream| upstream.binding.as_str().to_owned())
         .collect();
-    if let Err(error) = carina_core::parser::ResolvedProviderConfigs::validate_default_tag_knownness(
-        &parsed.providers,
-        &upstream,
-        &carina_core::binding_index::ResolvedBindings::for_expanded_validation(&parsed),
-        enriched_context,
-    ) {
-        errors.push(AppError::ProviderConfigInvariant(Box::new(error)));
+    // Evaluated-only recovery commands do not send desired values. Paired
+    // plan/apply revalidation keeps the same default-tag guard even when it
+    // skips unrelated resource validation during recovery.
+    if (!skip_resource_validation || matches!(&name_resolution, ConfigNameResolution::Paired(_)))
+        && let Err(error) =
+            carina_core::parser::ResolvedProviderConfigs::validate_default_tag_knownness(
+                &parsed.providers,
+                &upstream,
+                &carina_core::binding_index::ResolvedBindings::for_expanded_validation(&parsed),
+                enriched_context,
+            )
+    {
+        errors.extend(
+            error
+                .into_findings()
+                .into_iter()
+                .map(|error| AppError::ProviderConfigInvariant(Box::new(error))),
+        );
     }
 
     // Expansion carries module-internal side data in parallel with each

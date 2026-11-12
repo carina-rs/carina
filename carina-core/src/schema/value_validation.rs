@@ -884,11 +884,17 @@ impl<'a> CheckedValue<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ValueValidationMode {
+    Declaration,
+    FinalProviderInput,
+}
+
 struct ValueValidator<'a, 'lookup> {
     defs: &'a BTreeMap<String, CompiledAttributeType>,
     lookup: Option<CustomTypeLookup<'lookup>>,
     checked: std::cell::RefCell<HashMap<CheckedNode<'a>, CheckedValue<'a>>>,
-    final_provider_input: bool,
+    mode: ValueValidationMode,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -907,6 +913,16 @@ struct CheckedNode<'a> {
 }
 
 impl<'a, 'lookup> ValueValidator<'a, 'lookup> {
+    fn for_final_provider_input(
+        defs: &'a BTreeMap<String, CompiledAttributeType>,
+        lookup: CustomTypeLookup<'lookup>,
+    ) -> Self {
+        Self {
+            mode: ValueValidationMode::FinalProviderInput,
+            ..Self::new(defs, Some(lookup))
+        }
+    }
+
     fn new(
         defs: &'a BTreeMap<String, CompiledAttributeType>,
         lookup: Option<CustomTypeLookup<'lookup>>,
@@ -915,7 +931,7 @@ impl<'a, 'lookup> ValueValidator<'a, 'lookup> {
             defs,
             lookup,
             checked: Default::default(),
-            final_provider_input: false,
+            mode: ValueValidationMode::Declaration,
         }
     }
 }
@@ -1084,9 +1100,7 @@ pub(crate) fn validate_final_provider_value<
     ancestry: FieldAncestry,
     lookup: CustomTypeLookup<'_>,
 ) -> ValueValidationFindings {
-    let mut validator = ValueValidator::new(defs, Some(lookup));
-    validator.final_provider_input = true;
-    validator
+    ValueValidator::for_final_provider_input(defs, lookup)
         .walk(
             attr,
             value.into(),
@@ -2649,17 +2663,23 @@ impl<'a> ValueValidator<'a, '_> {
                     .collect::<Vec<_>>();
                 // Final inputs include semantic callbacks for compact lists;
                 // authored and historical StringLists retain local checks.
-                ValueValidator::new(self.defs, self.lookup.filter(|_| self.final_provider_input))
-                    .list(
-                        attr,
-                        element_type,
-                        *constraints,
-                        &cached,
-                        true,
-                        path,
-                        ancestry,
-                        None,
-                    )
+                ValueValidator::new(
+                    self.defs,
+                    match self.mode {
+                        ValueValidationMode::Declaration => None,
+                        ValueValidationMode::FinalProviderInput => self.lookup,
+                    },
+                )
+                .list(
+                    attr,
+                    element_type,
+                    *constraints,
+                    &cached,
+                    true,
+                    path,
+                    ancestry,
+                    None,
+                )
             }
             (AttrTypeKind::Struct { .. }, ConcreteValueRef::Map(map)) => {
                 self.struct_value(attr, value, map, path, ancestry, assignment)

@@ -257,13 +257,11 @@ pub(super) async fn resolve_resource<S: Clone>(
                 }
                 resolved.attributes.insert(key.clone(), resolved_value);
             }
+            let consumed_companions = crate::identifier::consumed_prefix_companions(&target);
             for (key, source_expr) in &source.attributes {
                 // Prefix companions were consumed by host canonicalization.
                 // Their generated destination value is already in the target.
-                if key
-                    .strip_suffix("_prefix")
-                    .is_some_and(|name| target.prefixes.contains_key(name))
-                {
+                if consumed_companions.contains(key) {
                     continue;
                 }
                 if target.attributes.contains_key(key) {

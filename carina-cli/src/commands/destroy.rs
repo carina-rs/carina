@@ -151,7 +151,7 @@ pub async fn run_destroy(
     super::apply::symlink_retarget_test_barrier("CARINA_TEST_DESTROY_CONFIG_HANDSHAKE_DIR").await;
     let providers = ProviderLoad::load(runtime, &parsed.providers, base_dir)?;
     let validated_config =
-        providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
+        providers.validate_read_only_config(parsed, base_dir, &duplicate_declarations)?;
 
     let verified_backend = verify_for_mutation(
         base_dir,
@@ -225,10 +225,9 @@ pub async fn run_destroy_with_factories_for_test(
     let loaded = load_configuration_with_config(&project, &context, &Default::default())?;
     let providers =
         ProviderLoad::for_test_with_provider_phase(runtime, factories, &loaded.parsed.providers);
-    let validated = providers.validate_evaluated_config(
+    let validated = providers.validate_read_only_config(
         loaded.parsed,
         &project,
-        true,
         &loaded.duplicate_declarations,
     )?;
     let backend: Arc<dyn StateBackend> =
@@ -445,7 +444,7 @@ async fn run_destroy_locked_owned(
         &ctx.provider_context().with_runtime(provider_context),
         ctx.schemas(),
         UpstreamMissingStatePolicy::Strict,
-        ProviderUpstreamScope::ProviderReferences,
+        ProviderUpstreamScope::ProviderConfigurationOnly,
     )
     .await?;
 
@@ -1702,7 +1701,7 @@ async fn run_destroy_locked(
         }
     };
     let parsed = carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed);
-    let validated_config = match providers.validate_evaluated_config(parsed, base_dir, true, &[]) {
+    let validated_config = match providers.validate_read_only_config(parsed, base_dir, &[]) {
         Ok(validated_config) => validated_config,
         Err(error) => {
             return finish_lock_command(
@@ -2837,12 +2836,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn destroy_rejects_default_tags_referencing_local_computed_attributes() {
+    async fn destroy_allows_default_tags_referencing_local_computed_attributes() {
         let color_mode = crate::output_style::ColorMode::Plain;
         let (_temp, base_dir, parsed) = provider_default_tags_local_resource_fixture();
         let backend = crate::commands::local_backend_for_test(base_dir.join("state.json"));
 
-        let error = run_destroy_locked(
+        run_destroy_locked(
             &crate::test_support::TestCommandRuntime::new(),
             color_mode,
             parsed,
@@ -2858,17 +2857,16 @@ mod tests {
             ShutdownToken::running(),
         )
         .await
-        .expect_err("provider configuration must reject unresolved defaults before destroy");
-        assert!(error.to_string().contains("default_tags"), "{error}");
+        .expect("destroy must defer provider default tags until resource normalization");
     }
 
     #[tokio::test]
-    async fn destroy_rejects_missing_required_default_tag_upstream() {
+    async fn destroy_ignores_missing_upstream_referenced_only_by_default_tags() {
         let color_mode = crate::output_style::ColorMode::Plain;
         let (_temp, base_dir, parsed) = provider_default_tags_missing_upstream_fixture();
         let backend = crate::commands::local_backend_for_test(base_dir.join("state.json"));
 
-        let error = run_destroy_locked(
+        run_destroy_locked(
             &crate::test_support::TestCommandRuntime::new(),
             color_mode,
             parsed,
@@ -2884,8 +2882,7 @@ mod tests {
             ShutdownToken::running(),
         )
         .await
-        .expect_err("provider configuration must reject unresolved defaults before destroy");
-        assert!(error.to_string().contains("default_tags"), "{error}");
+        .expect("destroy must not load upstream state used only by default tags");
     }
 
     #[test]
@@ -3226,7 +3223,7 @@ mod tests {
         let providers = ProviderLoad::load(fixture.runtime(), &parsed.providers, &base_dir)
             .expect("mock provider must load");
         let validated_config = providers
-            .validate_evaluated_config(parsed, &base_dir, true, &loaded.duplicate_declarations)
+            .validate_read_only_config(parsed, &base_dir, &loaded.duplicate_declarations)
             .expect("fixture must validate");
         let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(15));
         let backend = fixture.lock_loss_backend_handle();

@@ -356,7 +356,7 @@ async fn native_update_checks_observed_ignored_leaves_after_patch_substitution()
 }
 
 #[test]
-fn native_data_source_checks_even_unschematized_attributes() {
+fn native_data_source_rejects_non_wire_declared_attribute_values() {
     crate::validation::deferred_types::with_session_for_test(
         &crate::parser::LoadedProviderContext::empty_for_test(),
         |type_checks| {

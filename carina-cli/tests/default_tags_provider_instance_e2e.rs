@@ -392,7 +392,6 @@ provider mock {
   }
 }
 
-
 mock.test.resource {
   name = "tagged"
 }

@@ -491,6 +491,15 @@ impl<E: parser::ExportParamLike + Clone> RootDirectoryParse<E> {
 }
 
 impl<E> RootDirectoryParse<E> {
+    /// Recovery commands that never send desired inputs omit provider defaults
+    /// before expression resolution and validation of the remaining config.
+    pub fn omit_provider_default_tags(&mut self) {
+        for provider in &mut self.parsed.providers {
+            provider.default_tags.clear();
+            provider.unresolved_attributes.shift_remove("default_tags");
+        }
+    }
+
     pub fn resolve_provider_unresolved_attributes(
         &mut self,
         config: &ProviderContext,

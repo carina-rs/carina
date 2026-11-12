@@ -636,6 +636,9 @@ pub enum ProviderConfigValueError {
 #[derive(Debug, Error)]
 pub enum ProviderConfigInvariantError {
     #[error(transparent)]
+    Findings(ProviderConfigFindings),
+
+    #[error(transparent)]
     UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
 
     // Composite leaf: retain the typed knownness error and render it once.
@@ -653,6 +656,32 @@ pub enum ProviderConfigInvariantError {
         key: String,
         error: Box<crate::resolver::ResolutionError>,
     },
+}
+
+/// A terminal collection owns every typed provider-config finding.
+#[derive(Debug)]
+pub struct ProviderConfigFindings(Vec<ProviderConfigInvariantError>);
+
+impl std::fmt::Display for ProviderConfigFindings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, error) in self.0.iter().enumerate() {
+            if index != 0 {
+                writeln!(f)?;
+            }
+            write!(f, "{error}")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for ProviderConfigFindings {}
+
+impl ProviderConfigInvariantError {
+    pub fn into_findings(self) -> Vec<Self> {
+        match self {
+            Self::Findings(errors) => errors.0,
+            error => vec![error],
+        }
+    }
 }
 
 impl ResolvedProviderConfigs {
@@ -688,21 +717,33 @@ impl ResolvedProviderConfigs {
         bindings: &crate::binding_index::ResolvedBindings<P, B>,
         session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), ProviderConfigInvariantError> {
+        let mut errors = Vec::new();
         for provider in providers {
             for (key, value) in &provider.default_tags {
                 if Self::references_only(value, upstream) {
                     continue;
                 }
-                let resolved = crate::resolver::resolve_ref_value(value, bindings, session)
+                let result = crate::resolver::resolve_ref_value(value, bindings, session)
                     .map_err(|error| ProviderConfigInvariantError::DefaultTagResolution {
                         provider: provider.name.clone(),
                         key: key.clone(),
                         error: Box::new(error),
-                    })?;
-                Self::check_value(provider, &Self::default_tag_attribute(key), &resolved)?;
+                    })
+                    .and_then(|resolved| {
+                        Self::check_value(provider, &Self::default_tag_attribute(key), &resolved)
+                    });
+                if let Err(error) = result {
+                    errors.push(error);
+                }
             }
         }
-        Ok(())
+        match errors.len() {
+            0 => Ok(()),
+            1 => Err(errors.pop().expect("one finding")),
+            _ => Err(ProviderConfigInvariantError::Findings(
+                ProviderConfigFindings(errors),
+            )),
+        }
     }
 
     fn check_value<P: crate::resource::PlaceholderKind, B: BindingAddress>(

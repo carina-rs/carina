@@ -37,7 +37,11 @@ impl crate::provider::ProviderNormalizer for FinalInputNormalizer {
     }
 }
 
-async fn assert_dispatch_rejects_normalized_value(nested: bool, replacement: bool) {
+async fn assert_dispatch_rejects_normalized_value(
+    nested: bool,
+    replacement: bool,
+    conflicting: bool,
+) {
     let callbacks = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&callbacks);
     let list = PatternAttributeType::list(PatternAttributeType::string_member(
@@ -78,11 +82,14 @@ async fn assert_dispatch_rejects_normalized_value(nested: bool, replacement: boo
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        PatternResourceSchema::new("test")
-            .with_coexisting_replacement()
-            .attribute(PatternAttributeSchema::optional("value", declaration).build())
-            .validate()
-            .unwrap(),
+        (if conflicting {
+            PatternResourceSchema::new("test").with_conflicting_replacement()
+        } else {
+            PatternResourceSchema::new("test").with_coexisting_replacement()
+        })
+        .attribute(PatternAttributeSchema::optional("value", declaration).build())
+        .validate()
+        .unwrap(),
     );
     let provider = MockProvider::new();
     let resource = make_resource("example", &[]);
@@ -109,7 +116,9 @@ async fn assert_dispatch_rejects_normalized_value(nested: bool, replacement: boo
             ),
         );
     }
-    let checked = checked_fixture_plan(&plan);
+    let checked = crate::input_rules::FinalizedPlan::new(plan)
+        .check_inputs(&schemas, &current)
+        .unwrap();
     let observer = MockObserver::new();
     let operations = Arc::new(Mutex::new(Vec::new()));
     let normalizer = crate::provider::ConfiguredNormalizer::fixture(FinalInputNormalizer {
@@ -182,17 +191,17 @@ async fn assert_dispatch_rejects_normalized_value(nested: bool, replacement: boo
 
 #[tokio::test]
 async fn issue_4304_3a_dispatch_rejects_provider_normalized_string_list() {
-    assert_dispatch_rejects_normalized_value(false, false).await;
+    assert_dispatch_rejects_normalized_value(false, false, false).await;
 }
 
 #[tokio::test]
 async fn issue_4304_3a_dispatch_rejects_provider_normalized_nested_struct_field() {
-    assert_dispatch_rejects_normalized_value(true, false).await;
+    assert_dispatch_rejects_normalized_value(true, false, false).await;
 }
 
 #[tokio::test]
 async fn issue_4304_3a_final_admission_precedes_replacement_delete_release() {
-    assert_dispatch_rejects_normalized_value(false, true).await;
+    assert_dispatch_rejects_normalized_value(false, true, false).await;
 }
 
 fn text(value: &str) -> Value {
@@ -392,4 +401,166 @@ async fn apply_resolution_excludes_normalization_only_data_source_attributes() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].get_attr("tags"), Some(&normalized_tags()));
     assert_eq!(requests[0].get_attr("runtime"), Some(&text("resolved")));
+}
+
+#[tokio::test]
+async fn issue_4304_3a_review1_destroy_first_final_admission_holds_delete() {
+    assert_dispatch_rejects_normalized_value(false, true, true).await;
+}
+
+async fn review1_deferred_final_admission(replace: bool) {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        PatternResourceSchema::new("test")
+            .with_conflicting_replacement()
+            .attribute(
+                PatternAttributeSchema::optional("value", PatternAttributeType::bool()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let template = crate::parser::DeferredForExpression::new(
+        Some("main.crn".into()),
+        1,
+        "for item in ['one', 'two']".into(),
+        crate::parser::DeferredForTarget::bound(absolute_binding("children")).unwrap(),
+        Value::Concrete(ConcreteValue::List(vec![text("one"), text("two")])),
+        crate::parser::ForBinding::Simple("item".into()),
+        crate::resource::Resource::<ModuleSource, LoopSlot>::new("test", "children"),
+    );
+    let compiled = crate::test_support::compiled_loop(Box::new(template));
+    let old = (0..2)
+        .map(|i| DeferredReplaceDelete {
+            id: ResolvedResourceId::new(ResourceId::with_identity(
+                "test",
+                ResourceIdentity::new(format!("children[{i}]")),
+            )),
+            identifier: fixture_applied_identifier(format!("old-{i}")),
+            generation: EffectGeneration::Current,
+            previous_attributes: HashMap::new(),
+            directives: Default::default(),
+            binding: Some(absolute_binding(&format!("children[{i}]"))),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+        })
+        .collect::<Vec<_>>();
+    let current = old
+        .iter()
+        .map(|old| {
+            (
+                old.id.as_inner().clone(),
+                Current::from_snapshot(
+                    State::existing(old.id.as_inner().clone(), HashMap::new())
+                        .with_identifier(old.identifier.as_str()),
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut plan = Plan::new();
+    if replace {
+        plan.add(Effect::DeferredReplace(Box::new(
+            crate::effect::DeferredReplacePayload::new(
+                NonEmptyDeletes::try_new(old.clone()).unwrap(),
+                compiled.template,
+                compiled.dependency_template,
+            ),
+        )));
+    } else {
+        for delete in &old {
+            plan.add(delete.to_delete_effect());
+        }
+        plan.add(Effect::DeferredCreate(compiled));
+    }
+    let checked = crate::input_rules::FinalizedPlan::new(plan)
+        .check_inputs(&schemas, &current)
+        .unwrap();
+    assert!(
+        checked.pending_inputs().is_empty(),
+        "final admission must protect replacements without authored input rules"
+    );
+    let provider = MockProvider::new();
+    for delete in &old {
+        provider.push_delete(Ok(()));
+        provider.push_create(Ok(ok_state(delete.id.as_inner())));
+    }
+    let operations = Arc::new(Mutex::new(Vec::new()));
+    let normalizer = crate::provider::ConfiguredNormalizer::fixture(FinalInputNormalizer {
+        value: if replace {
+            text("invalid normalized Bool")
+        } else {
+            Value::Concrete(ConcreteValue::Bool(true))
+        },
+        operations: Arc::clone(&operations),
+    });
+    let observer = MockObserver::new();
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            ExecutionInput {
+                provider_context: crate::parser::ProviderContext::new(
+                    crate::EnvironmentSnapshot::empty(),
+                ),
+                plan: &checked,
+                provider_check_inputs: ProviderCheckInputs::Authored,
+                compositions: &[],
+                bindings: ResolvedBindings::default(),
+                managed_current: current.clone(),
+                data_source_values: ExecutableDataSourceValues::empty(),
+                normalizer: &normalizer,
+                provider_configs: &[],
+                factories: &[],
+                schemas: &schemas,
+                parallelism: NonZeroUsize::new(1).unwrap(),
+                precompleted_success_count: 0,
+                checkpoint_sink: ExecutionCheckpointSink::noop(),
+            },
+            &observer,
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+    assert!(!operations.lock().unwrap().is_empty());
+    if replace {
+        assert_eq!(result.failure_count(), 1, "{:?}", observer.events());
+        assert!(provider.calls().is_empty(), "{:?}", provider.calls());
+        assert!(result.successfully_deleted.is_empty());
+        assert_eq!(result.managed_current, current);
+        let message = format!("{:?}", observer.events());
+        assert!(
+            message.contains("value") && message.contains("normaliz"),
+            "{message}"
+        );
+    } else {
+        assert_eq!(result.failure_count(), 0, "{:?}", observer.events());
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 4, "{calls:?}");
+        for delete in &old {
+            let id = delete.id.to_string();
+            let teardown = calls
+                .iter()
+                .position(|(op, row)| op == "delete" && row == &id)
+                .unwrap();
+            let create = calls
+                .iter()
+                .position(|(op, row)| op == "create" && row == &id)
+                .unwrap();
+            assert!(
+                teardown < create,
+                "destroy-first order must match main: {calls:?}"
+            );
+        }
+        assert_eq!(provider.captured_create_resources().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn issue_4304_3a_review1_deferred_replace_final_admission_holds_deletes() {
+    review1_deferred_final_admission(true).await;
+}
+
+#[tokio::test]
+async fn issue_4304_3a_review1_deferred_create_delete_candidates_preserve_success_order() {
+    review1_deferred_final_admission(false).await;
 }
