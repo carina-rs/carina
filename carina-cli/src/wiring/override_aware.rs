@@ -447,7 +447,7 @@ pub struct RebuildBindingsInputs<'a> {
     pub compositions: &'a [carina_core::resource::LiveComposition],
     pub managed_current: &'a HashMap<ResourceId, carina_core::resource::PlanInputCurrent>,
     pub data_source_values: &'a DataSourceValues,
-    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub remote_bindings: &'a carina_core::upstream_exports::AdmittedRemoteBindings,
     pub wait_aliases: &'a [carina_core::binding_index::WaitAliasSpec],
 }
 
@@ -886,7 +886,9 @@ mod tests {
                         compositions: &compositions,
                         managed_current: &managed_current,
                         data_source_values: &data_source_values,
-                        remote_bindings: &remote_bindings,
+                        remote_bindings: &carina_core::upstream_exports::remote_bindings_for_test(
+                            remote_bindings.clone(),
+                        ),
                         wait_aliases: &wait_aliases,
                     },
                     &HashMap::new(),

@@ -833,6 +833,23 @@ pub fn load_configuration_for_metadata(
     .map_err(|error| error.to_string())
 }
 
+impl LoadedConfig {
+    /// Reuse this directory's parsed source for upstream export discovery,
+    /// retaining metadata-only demand rather than evaluating upstream values.
+    pub fn upstream_export_source(
+        &self,
+        catalog: &ProviderContext,
+        schemas: &SchemaRegistry,
+    ) -> Result<ParsedRootDirectory, String> {
+        let resolution = ResolutionContext::issue(ResolutionPhase::Bootstrap).metadata_only();
+        let mut parsed = self.unresolved_parsed.parsed.clone();
+        parser::resolve_resource_refs_in_context(&mut parsed, catalog, None, resolution)
+            .map_err(|error| error.to_string())?;
+        crate::parser::retained::judge_configuration(&mut parsed, schemas, catalog);
+        Ok(RootDirectoryParse::with_resolution(parsed, resolution))
+    }
+}
+
 /// Typed classification of a current-configuration load failure.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -2981,8 +2998,8 @@ for account_id in orgs.accounts {
             message: "upstream iterable is not yet available".to_string(),
         });
 
-        let bindings =
-            crate::binding_index::IterableBindings::from_upstream_only(HashMap::from([(
+        let bindings = crate::binding_index::IterableBindings::from_upstream_only(
+            crate::upstream_exports::remote_bindings_for_test(HashMap::from([(
                 "orgs".to_string(),
                 HashMap::from([(
                     "accounts".to_string(),
@@ -2996,7 +3013,8 @@ for account_id in orgs.accounts {
                         ]),
                     ),
                 )]),
-            )]));
+            )])),
+        );
         let mut parsed = parsed
             .into_expanded(
                 &crate::schema::SchemaRegistry::new(),

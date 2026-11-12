@@ -16,7 +16,7 @@ use carina_core::plan::Plan;
 use carina_core::provider::{
     BoxFuture, ProviderFactory, ProviderInitialization, ProviderInstanceKey, ProviderRouter,
 };
-use carina_core::resource::{Current, ResolvedResource, ResourceId, SnapshotState, State, Value};
+use carina_core::resource::{Current, ResolvedResource, ResourceId, SnapshotState, State};
 use carina_core::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, StructField,
     TypeIdentity, ValidatedResourceSchema,
@@ -541,18 +541,43 @@ where
     // unreadable — so `resolve_refs_for_plan` knows the binding name
     // and can stamp surviving refs as `(known after upstream apply: <ref>)`
     // instead of leaving the raw dot-form (#2366).
-    let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    let mut remote_bindings: carina_core::upstream_exports::AdmittedRemoteBindings = HashMap::new();
     for us in &parsed.upstream_states {
         let dir = base_dir.join(&us.source).unwrap();
         let state_path = dir
             .join(carina_state::LocalBackend::DEFAULT_STATE_FILE)
             .unwrap();
-        let bindings = state_path
+        let exports = state_path
             .read()
             .ok()
-            .and_then(|bytes| PublishedExports::from_state_bytes(&bytes).ok())
-            .map(|exports| exports.build_remote_bindings())
-            .unwrap_or_default();
+            .map(|bytes| PublishedExports::from_state_bytes(&bytes))
+            .transpose()?;
+        let bindings = carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
+            |session| {
+                match exports {
+                    Some(exports) => {
+                        carina_core::upstream_exports::ResolvedUpstreamSource::for_test(
+                            us.binding.as_str(),
+                            None,
+                        )
+                        .decode_and_admit(
+                            exports
+                                .values()
+                                .iter()
+                                .map(|(key, value)| (key.clone(), value)),
+                            session,
+                        )
+                    }
+                    None => carina_core::upstream_exports::ResolvedUpstreamSource::for_test(
+                        us.binding.as_str(),
+                        None,
+                    )
+                    .admit_snapshot(HashMap::new(), session),
+                }
+                .map_err(|error| AppError::UpstreamExportAdmission(Box::new(error)))
+            },
+        )?;
         remote_bindings.insert(us.binding.to_string(), bindings);
     }
     let resolved_provider_configs = carina_core::validation::deferred_types::with_session_for_test(
@@ -1678,6 +1703,41 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn round1_8_corrupt_fixture_export_is_not_an_absent_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let upstream = root.path().join("upstream");
+        let downstream = root.path().join("downstream");
+        fs::create_dir(&upstream).unwrap();
+        fs::create_dir(&downstream).unwrap();
+        fs::write(
+            upstream.join("main.crn"),
+            "exports { count: String = 'authored' }\n",
+        )
+        .unwrap();
+        fs::write(downstream.join("main.crn"), "provider mock {}\nlet orgs = upstream_state { source = '../upstream' }\nlet item = mock.test.resource { name = 'item'\ncomment = \"${orgs.count ?? 'fallback'}\" }\n").unwrap();
+        let mut state = serde_json::to_value(StateFile::new()).unwrap();
+        state["exports"] = serde_json::json!({"count": ["before", null, "after"]});
+        fs::write(
+            upstream.join("carina.state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let error = build_plan_from_fixture_path(&runtime, &downstream)
+            .err()
+            .expect("corrupt fixture exports must fail admission instead of becoming absent");
+        assert!(
+            matches!(error, AppError::UpstreamExportAdmission(_)),
+            "{error:?}"
+        );
+        let message = crate::error::format_error_with_source_chain(&error);
+        assert!(
+            message.contains("orgs.count") && message.contains("[1]"),
+            "{message}"
+        );
+    }
 
     #[test]
     fn fixture_plan_and_router_return_typed_mock_input_errors() {

@@ -1870,6 +1870,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         &parsed,
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        &carina_core::schema::SchemaRegistry::new(),
         UpstreamMissingStatePolicy::Strict,
         ProviderUpstreamScope::All,
     )
@@ -2775,6 +2776,7 @@ async fn state_bucket_bootstrap_prepares_resolved_upstream_provider_config() {
         &expanded,
         &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        &carina_core::schema::SchemaRegistry::new(),
     )
     .await
     .expect("bootstrap provider inputs must resolve");
@@ -2822,6 +2824,7 @@ async fn apply_provider_loading_remains_all_strict_for_tag_only_upstreams() {
         &parsed,
         &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        &carina_core::schema::SchemaRegistry::new(),
     )
     .await
     {
@@ -2890,6 +2893,11 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     )
     .unwrap();
     std::fs::write(
+        upstream.join("exports.crn"),
+        "exports { role_arn: String = 'fixture' }\n",
+    )
+    .unwrap();
+    std::fs::write(
         downstream.join("backend.crn"),
         "backend local { path = \"carina.state.json\" }\n",
     )
@@ -2942,6 +2950,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
         &expanded,
         &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        &carina_core::schema::SchemaRegistry::new(),
     )
     .await
     .unwrap();
@@ -5238,6 +5247,7 @@ async fn missing_upstream_default_tags_are_omitted_before_saved_plan_apply() {
         &parsed,
         &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        &carina_core::schema::SchemaRegistry::new(),
         UpstreamMissingStatePolicy::Lenient,
         ProviderUpstreamScope::All,
     )
@@ -5465,7 +5475,9 @@ fn apply_emits_legacy_override_warning_to_stderr() {
                     compositions: &[],
                     managed_current: &current_states,
                     data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
-                    remote_bindings: &remote_bindings,
+                    remote_bindings: &carina_core::upstream_exports::remote_bindings_for_test(
+                        remote_bindings.clone(),
+                    ),
                     wait_aliases: &wait_aliases,
                 },
                 &HashMap::new(),

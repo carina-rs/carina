@@ -429,6 +429,7 @@ fn verdict<K: DestinationKind>(
         local: paths,
         schema,
         errors: _,
+        deferred: _,
     } = findings;
     match K::local(destination, paths, schema) {
         Ok(obligation) => AssignmentVerdict::NeedsLocal(obligation),
@@ -593,7 +594,6 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
             .schema
             .extend(candidate.obligations.schema.clone());
     }
-    checked.symbolic = std::mem::take(&mut assignment.errors);
     let mut errors = Vec::new();
     for (path, error) in checked.clone().into_located() {
         errors.push(AdmissionFinding {

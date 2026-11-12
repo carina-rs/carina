@@ -116,14 +116,34 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
+        Self::from_report_with_evidence(
+            resource,
+            values,
+            report,
+            crate::parser::retained::NoAuthoredEvidence::for_resource(resource),
+        )
+    }
+
+    /// Report-based checks keep their checked owner and resolved values.
+    /// Unreached source identities are metadata, never a replacement owner.
+    pub fn from_report_with_evidence<D>(
+        resource: &crate::parser::AnalysisResourceRef<
+            '_,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            B,
+        >,
+        values: &HashMap<String, Value<ParserPlaceholder, B>>,
+        report: &crate::parser::retained::ExpressionReport<B>,
+        unchecked: crate::parser::retained::NoAuthoredEvidence,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
         Self {
             owner: resource.id().clone(),
-            evidence: ResourceEvidence::NoAuthoredEvidence(Arc::new(
-                crate::parser::retained::NoAuthoredEvidence::for_resource(
-                    resource.id(),
-                    resource.authored_slots(),
-                ),
-            )),
+            evidence: ResourceEvidence::NoAuthoredEvidence(Arc::new(unchecked)),
             report: Some(Arc::new(report.clone())),
             inputs: values
                 .iter()
@@ -245,16 +265,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             owner: resource.id().clone(),
             report: None,
             inputs,
-            evidence: if resource.authored_declaration_id().is_some() {
-                ResourceEvidence::Slots
-            } else {
-                ResourceEvidence::NoAuthoredEvidence(Arc::new(
-                    crate::parser::retained::NoAuthoredEvidence::for_resource(
-                        resource.id(),
-                        resource.authored_slots(),
-                    ),
-                ))
-            },
+            evidence: ResourceEvidence::Slots,
         }
     }
 

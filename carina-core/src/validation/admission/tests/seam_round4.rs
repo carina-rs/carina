@@ -152,7 +152,19 @@ fn trace_materialized(
     }
 }
 
+fn exactly_once(visits: &[Visit]) {
+    let mut seen = HashSet::new();
+    for visit in visits {
+        assert!(
+            seen.insert((visit.position.node, visit.position.usage)),
+            "authored hook invoked more than once: {visits:?}"
+        );
+    }
+}
+
 fn same_navigation(trace: Trace) {
+    exactly_once(&trace.live);
+    exactly_once(&trace.discarded);
     let live = trace
         .live
         .iter()
@@ -246,6 +258,8 @@ fn round4_union_retains_one_hook_finding_from_selected_member() {
     );
     assert_eq!(trace.findings, 1, "{:?}", trace.live);
     assert!(trace.live.iter().any(|visit| visit.declaration == "String"));
+    exactly_once(&trace.live);
+    exactly_once(&trace.discarded);
 }
 
 #[test]

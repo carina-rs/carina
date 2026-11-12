@@ -463,7 +463,9 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
                     &[],
                 ),
                 data_source_values: &DataSourceValues::empty(),
-                remote_bindings: &remote_bindings,
+                remote_bindings: &carina_core::upstream_exports::remote_bindings_for_test(
+                    remote_bindings.clone(),
+                ),
                 wait_aliases: &wait_aliases,
             },
         );
@@ -672,7 +674,9 @@ async fn nested_module_wait_binding_survives_two_expansions() {
                     &[],
                 ),
                 data_source_values: &DataSourceValues::empty(),
-                remote_bindings: &remote_bindings,
+                remote_bindings: &carina_core::upstream_exports::remote_bindings_for_test(
+                    remote_bindings.clone(),
+                ),
                 wait_aliases: &wait_aliases,
             },
         );
@@ -856,7 +860,9 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
                     &[],
                 ),
                 data_source_values: &DataSourceValues::empty(),
-                remote_bindings: &remote_bindings,
+                remote_bindings: &carina_core::upstream_exports::remote_bindings_for_test(
+                    remote_bindings.clone(),
+                ),
                 wait_aliases: &wait_aliases,
             },
         );

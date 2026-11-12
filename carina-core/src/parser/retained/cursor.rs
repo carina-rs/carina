@@ -225,17 +225,27 @@ impl<B: BindingAddress> std::fmt::Debug for JudgedNodeRef<'_, B> {
     }
 }
 
+/// Grammar aliases have no distinct authored position. Live cursors and
+/// unavailable-slot identities use exactly the same normalization.
+fn authored_chain<P: crate::resource::ValueKind, B: BindingAddress>(
+    node: &AuthoredExpr<P, B>,
+) -> impl Iterator<Item = &AuthoredExpr<P, B>> {
+    std::iter::successors(Some(node), |node| {
+        (matches!(node.kind, ExprKind::Alias) && node.children.len() == 1)
+            .then(|| node.children[0].authored.as_ref())
+    })
+}
+
 impl<'s, B: BindingAddress> JudgedNodeRef<'s, B> {
     fn canonical(mut self) -> Result<Self, MissingEvidence> {
         // Alias nodes are pass-through grammar levels, not authored syntax.
         // Retain them in the expression report for diagnostic compatibility.
-        while matches!(self.node.kind, ExprKind::Alias) && self.node.children.len() == 1 {
-            let child = &self.node.children[0].authored;
+        for node in authored_chain(self.node).skip(1) {
             self.judgement = self
                 .snapshot
-                .node(&self.environment, child.id)
-                .ok_or_else(|| MissingEvidence::new(format!("authored node {:?}", child.id)))?;
-            self.node = child;
+                .node(&self.environment, node.id)
+                .ok_or_else(|| MissingEvidence::new(format!("authored node {:?}", node.id)))?;
+            self.node = node;
         }
         Ok(self)
     }
@@ -992,20 +1002,24 @@ pub struct NoAuthoredEvidence {
 }
 
 impl NoAuthoredEvidence {
-    pub(crate) fn for_resource<B: BindingAddress>(
-        resource: &crate::resource::ResourceId,
-        slots: Option<&AuthoredSlots<B>>,
-    ) -> Self {
+    /// Identify unchecked source slots without granting admission authority.
+    /// The evidence owner may differ from the resource whose values are checked.
+    pub fn for_resource<B: BindingAddress, D>(
+        source: &crate::parser::AnalysisResourceRef<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        let resource = source.id();
+        let slots = source.authored_slots();
         Self {
             resource: resource.clone(),
             slots: slots
                 .into_iter()
                 .flat_map(|slots| slots.slots.iter())
                 .map(|(name, slot)| {
-                    let mut root = slot.root.as_ref();
-                    while matches!(root.kind, ExprKind::Alias) && root.children.len() == 1 {
-                        root = &root.children[0].authored;
-                    }
+                    let root =
+                        authored_chain(slot.root.as_ref()).fold(slot.root.as_ref(), |_, node| node);
                     UnreachedSlot {
                         resource: resource.clone(),
                         attribute: name.clone(),

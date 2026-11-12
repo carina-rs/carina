@@ -268,3 +268,151 @@ fn round2_lsp_missing_expanded_report_selects_main_fallback() {
     let actual = serde_json::json!(actual);
     assert_eq!(actual, expected["no_expanded_report"]);
 }
+
+#[test]
+fn round6_report_fallback_records_the_matched_authored_slots() {
+    let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let parse = |source| {
+        carina_core::parser::parse_file(source, std::path::Path::new("buffer.crn"), &config)
+            .unwrap()
+    };
+    // Independent buffer and expanded parses share a declaration key, never
+    // their authored node/use identities. Neither has this report's resource.
+    let buffer = parse("mock.Test { input = ('bad') }");
+    let expanded = parse("mock.Test { input = ('bad') }");
+    let previous = parse("mock.Previous { input = 1 }");
+    let schemas = SchemaRegistry::new();
+    let sealed =
+        carina_core::config_loader::load_buffer_configuration(&previous, &schemas, &config);
+    let buffer_tree = carina_core::parser::AnalysisTree::try_from_file(&buffer).unwrap();
+    let expanded_tree = carina_core::parser::AnalysisTree::try_from_file(&expanded).unwrap();
+    let authored = buffer_tree.resources().next().unwrap();
+    let resource = expanded_tree.resources().next().unwrap();
+    assert_eq!(
+        authored.authored_instance_key(),
+        resource.authored_instance_key()
+    );
+    let map = authored_validation_resources(&buffer_tree);
+    let expected =
+        carina_core::validation::admission::attributes::ResourceAttributeInputs::from_report(
+            authored,
+            &authored.resolved_attributes(),
+            sealed.judged().report(),
+        );
+    let (_, actual) = select_admission_inputs(
+        resource,
+        Some(&map),
+        &resource.resolved_attributes(),
+        sealed.judged().report(),
+    );
+    let expected = expected.authored_evidence().unwrap_err();
+    let actual = actual.authored_evidence().unwrap_err();
+    assert_eq!(
+        actual.slots(),
+        expected.slots(),
+        "unreached identities belong to the authored match"
+    );
+}
+
+#[test]
+fn round7_report_fallback_checks_expanded_resource_with_authored_unreached_slots() {
+    use carina_core::resource::knowledge::KnowledgeContext;
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use carina_core::validation::admission::attributes::{
+        ResourceAttributeInputs, resource_attribute_admissions,
+    };
+    let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(AttributeSchema::optional("input", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    // The source address is shared, while resolution has changed the owner.
+    // Only the expanded Sink has a per-resource report in this analysis.
+    let authored = carina_core::parser::parse_file(
+        "arguments { x: Int }\nmock.Source { input = x + 1 }",
+        std::path::Path::new("fallback.crn"),
+        &config,
+    )
+    .unwrap();
+    let expanded = carina_core::parser::parse_file(
+        "arguments { x: Int }\nmock.Sink { input = x + 1 }",
+        std::path::Path::new("fallback.crn"),
+        &config,
+    )
+    .unwrap();
+    let configuration =
+        carina_core::config_loader::load_buffer_configuration(&expanded, &schemas, &config);
+    let judged = configuration.judged();
+    let authored_tree = carina_core::parser::AnalysisTree::try_from_file(&authored).unwrap();
+    let expanded_tree = carina_core::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let source = authored_tree.resources().next().unwrap();
+    let rref = expanded_tree.resources().next().unwrap();
+    assert_eq!(source.authored_instance_key(), rref.authored_instance_key());
+    assert_ne!(source.id(), rref.id());
+    let values = rref.resolved_attributes();
+    assert!(ResourceAttributeInputs::from_resolved(source, &values, judged.report()).is_err());
+    let main_inputs = ResourceAttributeInputs::from_report(rref, &values, judged.report());
+    let source_inputs = ResourceAttributeInputs::from_report(source, &values, judged.report());
+    let map = authored_validation_resources(&authored_tree);
+    let (selected, inputs) = select_admission_inputs(rref, Some(&map), &values, judged.report());
+    let bindings =
+        carina_core::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &config);
+    let admit = |resource, inputs: &ResourceAttributeInputs<_>| {
+        let classified = inputs.classify(&KnowledgeContext::validation(), |_, error| {
+            panic!("{error}")
+        });
+        let mut coverage = Default::default();
+        let errors =
+            carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
+                let report = resource_attribute_admissions(
+                    resource,
+                    judged.file(),
+                    rref.schema(&schemas).unwrap(),
+                    &classified,
+                    rref.quoted_string_attrs(),
+                    inputs,
+                    &bindings,
+                    session,
+                    &schemas,
+                    &mut coverage,
+                );
+                report
+                    .errors()
+                    .map(ToString::to_string)
+                    .chain(
+                        report
+                            .symbolic_errors()
+                            .map(|(name, path, error)| format!("{name}:{path}:{error}")),
+                    )
+                    .collect::<Vec<_>>()
+            });
+        (errors, coverage)
+    };
+    let (expected, _) = admit(rref, &main_inputs);
+    assert!(
+        !expected.is_empty(),
+        "main reports the arithmetic type mismatch"
+    );
+    let (actual, coverage) = admit(selected, &inputs);
+    assert_eq!(
+        actual, expected,
+        "fallback diagnostics must use the expanded resource"
+    );
+    assert!(std::ptr::eq(selected, rref));
+    let source_slots = source_inputs.authored_evidence().unwrap_err().slots();
+    assert_eq!(
+        inputs.authored_evidence().unwrap_err().slots(),
+        source_slots
+    );
+    let missing = judged
+        .report()
+        .completeness_report(&coverage)
+        .unreached_slots()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(missing, source_slots);
+}

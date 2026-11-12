@@ -202,10 +202,12 @@ fn round5_union_best_failing_hook_is_retained_once_live_and_discarded() {
         .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
         .unwrap()
         .into_classification();
+    let calls = std::cell::Cell::new(0);
     let hook = |attr: &crate::schema::CompiledAttributeType,
                 _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
                 path: &crate::schema::LeafPath,
                 _: AuthoredCursor<'_>| {
+        calls.set(calls.get() + 1);
         Ok(AssignmentFindings {
             errors: vec![(
                 path.clone(),
@@ -231,6 +233,7 @@ fn round5_union_best_failing_hook_is_retained_once_live_and_discarded() {
         &mut WalkCoverage::default(),
     );
     let current = current.take_assignment();
+    assert_eq!(calls.replace(0), 1, "live hook invocations");
     let discarded = visit_discarded(
         attr,
         schema.as_schema().defs(),
@@ -242,6 +245,7 @@ fn round5_union_best_failing_hook_is_retained_once_live_and_discarded() {
     )
     .unwrap()
     .authored;
+    assert_eq!(calls.get(), 1, "discarded hook invocations");
     for findings in [current, discarded] {
         assert_eq!(findings.errors.len(), 1, "{findings:?}");
         assert_eq!(
@@ -251,6 +255,236 @@ fn round5_union_best_failing_hook_is_retained_once_live_and_discarded() {
             }
         );
     }
+}
+
+#[test]
+fn round6_parent_hook_errors_preserve_ordinary_child_diagnostics() {
+    use crate::schema::value_validation::{
+        AssignmentCallbacks, AssignmentFindings, CheckValue, validate_authored_value_for_admission,
+    };
+    let slot = slot("let input = ['bad']");
+    let root = slot.cursor().unwrap().node().node_id();
+    let schema = crate::schema::ResourceSchema::new("Sink")
+        .attribute(
+            crate::schema::AttributeSchema::optional(
+                "input",
+                crate::schema::AttributeType::list(crate::schema::AttributeType::int()),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let attr = &schema.as_schema().attributes()["input"].attr_type;
+    let proof = slot
+        .projection()
+        .unwrap()
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .unwrap()
+        .into_classification();
+    let ordinary_calls = std::cell::RefCell::new(Vec::new());
+    let ordinary = |_: &crate::schema::CompiledAttributeType,
+                    _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                    path: &crate::schema::LeafPath,
+                    _: AuthoredCursor<'_>| {
+        ordinary_calls.borrow_mut().push(path.clone());
+        Ok(Default::default())
+    };
+    let returns_error = std::cell::Cell::new(false);
+    let hook = |_: &crate::schema::CompiledAttributeType,
+                _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                path: &crate::schema::LeafPath,
+                cursor: AuthoredCursor<'_>| {
+        if cursor.identity().unwrap().0 != root {
+            return Ok(AssignmentFindings::default());
+        }
+        let error = crate::schema::TypeError::MissingRequired {
+            name: "hook parent".into(),
+        };
+        if returns_error.get() {
+            Err(error)
+        } else {
+            Ok(AssignmentFindings {
+                errors: vec![(path.clone(), error)],
+                ..Default::default()
+            })
+        }
+    };
+    let validate = |authored| {
+        validate_authored_value_for_admission(
+            attr,
+            &proof,
+            schema.as_schema().defs(),
+            crate::schema::FieldAncestry::WRITABLE,
+            &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
+            AuthoredCursor::authored(slot.cursor().unwrap()),
+            AssignmentCallbacks {
+                ordinary: &ordinary,
+                authored,
+            },
+            &mut Default::default(),
+        )
+    };
+    let expected = validate(None);
+    let expected_calls = ordinary_calls.replace(Vec::new());
+    assert!(
+        expected.local_error().is_some(),
+        "main rejects the invalid list item"
+    );
+    for error in [false, true] {
+        returns_error.set(error);
+        let mut actual = validate(Some(&hook));
+        assert_eq!(ordinary_calls.replace(Vec::new()), expected_calls);
+        assert_eq!(actual.local_error(), expected.local_error());
+        assert!(
+            actual
+                .local_findings()
+                .starts_with(expected.local_findings())
+        );
+        assert_eq!(actual.take_assignment().errors.len(), 1);
+    }
+}
+
+#[test]
+fn round6_discarded_union_coverage_is_independent_of_the_hook() {
+    use crate::schema::value_validation::{AssignmentCallbacks, CheckValue, visit_discarded};
+    let slot = slot("let input = ['one', 'two']");
+    let schema = crate::schema::ResourceSchema::new("Sink")
+        .attribute(
+            crate::schema::AttributeSchema::optional(
+                "input",
+                crate::schema::AttributeType::union(vec![
+                    crate::schema::AttributeType::list(crate::schema::AttributeType::int()),
+                    crate::schema::AttributeType::list(crate::schema::AttributeType::string()),
+                ]),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let root = slot.cursor().unwrap();
+    let expected = [
+        root.clone(),
+        root.child(0, EdgeRole::ListItem).unwrap(),
+        root.child(1, EdgeRole::ListItem).unwrap(),
+    ];
+    let calls = std::cell::Cell::new(0);
+    let hook = |_: &crate::schema::CompiledAttributeType,
+                _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                _: &crate::schema::LeafPath,
+                _: AuthoredCursor<'_>| {
+        calls.set(calls.get() + 1);
+        Ok(Default::default())
+    };
+    let mut work = Vec::new();
+    for authored in [
+        None,
+        Some(&hook as crate::schema::value_validation::AssignmentCheck<'_, _, _>),
+    ] {
+        let mut coverage = Default::default();
+        visit_discarded(
+            &schema.as_schema().attributes()["input"].attr_type,
+            schema.as_schema().defs(),
+            &crate::schema::FieldPath::new(),
+            crate::schema::FieldAncestry::WRITABLE,
+            root.clone(),
+            AssignmentCallbacks {
+                ordinary: &|_, _, _, _| Ok(Default::default()),
+                authored,
+            },
+            &mut coverage,
+        )
+        .unwrap();
+        assert_eq!(coverage.len(), expected.len());
+        for usage in &expected {
+            assert!(coverage.reached(usage));
+        }
+        work.push(coverage.work());
+    }
+    assert_eq!(work[0], work[1]);
+    assert_eq!(calls.get(), expected.len());
+}
+
+#[test]
+fn round6_union_hook_fires_once_for_best_ordinary_failure() {
+    use crate::schema::value_validation::{
+        AssignmentCallbacks, AssignmentFindings, CheckValue, validate_authored_value_for_admission,
+        visit_discarded,
+    };
+    let slot = slot("let input = 'value'");
+    let schema = crate::schema::ResourceSchema::new("Sink")
+        .attribute(
+            crate::schema::AttributeSchema::optional(
+                "input",
+                crate::schema::AttributeType::union(vec![
+                    crate::schema::AttributeType::int(),
+                    crate::schema::AttributeType::string(),
+                ]),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let attr = &schema.as_schema().attributes()["input"].attr_type;
+    let proof = slot
+        .projection()
+        .unwrap()
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .unwrap()
+        .into_classification();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let hook = |attr: &crate::schema::CompiledAttributeType,
+                _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                _: &crate::schema::LeafPath,
+                _: AuthoredCursor<'_>| {
+        calls.borrow_mut().push(attr.type_name());
+        Ok(Default::default())
+    };
+    let ordinary = |attr: &crate::schema::CompiledAttributeType,
+                    _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                    path: &crate::schema::LeafPath,
+                    _: AuthoredCursor<'_>| {
+        Ok(AssignmentFindings {
+            errors: if attr.type_name() == "String" {
+                vec![(
+                    path.clone(),
+                    crate::schema::TypeError::MissingRequired {
+                        name: "ordinary".into(),
+                    },
+                )]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        })
+    };
+    let callbacks = AssignmentCallbacks {
+        ordinary: &ordinary,
+        authored: Some(&hook),
+    };
+    let current = validate_authored_value_for_admission(
+        attr,
+        &proof,
+        schema.as_schema().defs(),
+        crate::schema::FieldAncestry::WRITABLE,
+        &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
+        AuthoredCursor::authored(slot.cursor().unwrap()),
+        callbacks,
+        &mut Default::default(),
+    );
+    assert!(current.local_error().is_some());
+    assert_eq!(calls.replace(Vec::new()), ["String"]);
+    let discarded = visit_discarded(
+        attr,
+        schema.as_schema().defs(),
+        &crate::schema::FieldPath::new(),
+        crate::schema::FieldAncestry::WRITABLE,
+        slot.cursor().unwrap(),
+        callbacks,
+        &mut Default::default(),
+    )
+    .unwrap();
+    assert_eq!(discarded.ordinary.errors.len(), 1);
+    assert_eq!(*calls.borrow(), ["String"]);
 }
 
 fn slot(source: &str) -> JudgedSlot {

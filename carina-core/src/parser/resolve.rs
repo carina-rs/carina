@@ -2534,7 +2534,7 @@ where
 /// [`ResolvedProviderConfigs`].
 pub fn resolve_provider_attributes_with_remote<E, D>(
     parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>,
-    remote_bindings: &HashMap<String, HashMap<String, RuntimeValue>>,
+    remote_bindings: &crate::upstream_exports::AdmittedRemoteBindings,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<ResolvedProviderConfigs, ProviderConfigResolutionError> {
     ResolvedProviderConfigs::resolve_with_remote(parsed, remote_bindings, config, |_, _| true)
@@ -2543,9 +2543,11 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
 impl ResolvedProviderConfigs {
     /// Resolve provider attributes while the command selects which default tags
     /// participate (for example, its established missing-upstream exception).
+    /// Admitted empty upstream snapshots remain complete; omitted bindings
+    /// remain unknown until their upstream state is available.
     pub fn resolve_with_remote<E, D>(
         parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>,
-        remote_bindings: &HashMap<String, HashMap<String, RuntimeValue>>,
+        remote_bindings: &crate::upstream_exports::AdmittedRemoteBindings,
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
         retain_default_tag: impl Fn(&str, &RuntimeValue) -> bool,
     ) -> Result<Self, ProviderConfigResolutionError> {
@@ -2573,7 +2575,7 @@ impl ResolvedProviderConfigs {
                         .collect(),
                 };
                 parser_bindings.insert(binding_name.to_string(), attributes.clone());
-                bindings.set_with_completeness(
+                bindings.set_values_with_completeness(
                     binding_name,
                     attributes,
                     crate::binding_index::BindingValueSource::Local,
@@ -2581,14 +2583,9 @@ impl ResolvedProviderConfigs {
                 );
             }
         }
+        bindings.install_upstream(remote_bindings);
         for (binding, attrs) in remote_bindings {
-            parser_bindings.insert(binding.clone(), attrs.clone());
-            bindings.set_with_completeness(
-                binding,
-                attrs.clone(),
-                crate::binding_index::BindingValueSource::Upstream,
-                crate::binding_index::BindingCompleteness::Complete,
-            );
+            parser_bindings.insert(binding.clone(), (**attrs).clone());
         }
 
         let mut providers = Vec::with_capacity(parsed.providers.len());

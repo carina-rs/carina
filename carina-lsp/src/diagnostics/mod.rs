@@ -61,18 +61,24 @@ fn select_admission_inputs<'r, 'a>(
     let authored = resource
         .authored_instance_key()
         .and_then(|key| authored_resources?.get(&key).copied());
-    match authored.and_then(|resource| {
-        ResourceAttributeInputs::from_resolved(resource, values, report)
+    match authored.and_then(|source| {
+        ResourceAttributeInputs::from_resolved(source, values, report)
             .ok()
-            .map(|inputs| (resource, inputs))
+            .map(|inputs| (source, inputs))
     }) {
         Some(authored) => authored,
-        // A missing tree/key/report is not evidence that source syntax is
-        // absent. This constructor preserves main's checks and carries typed
-        // NoAuthoredEvidence; admission records its slots as unreached.
+        // Main checks the expanded owner against its resolved values. Only
+        // unchecked-slot metadata comes from the matched source tree.
         None => (
             resource,
-            ResourceAttributeInputs::from_report(resource, values, report),
+            ResourceAttributeInputs::from_report_with_evidence(
+                resource,
+                values,
+                report,
+                carina_core::parser::retained::NoAuthoredEvidence::for_resource(
+                    authored.unwrap_or(resource),
+                ),
+            ),
         ),
     }
 }
@@ -1778,6 +1784,12 @@ impl DiagnosticRun<'_> {
                         .unwrap_or_else(|| carina_core::validation::admission::attributes::resource_attribute_admissions(
                             admission_resource, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, evaluated_inputs, &binding_index, self.provider_context, &self.schemas, &mut authored_coverage,
                         ));
+                    // Attribute rendering consumes its report entries. Preserve
+                    // core's diagnostic ownership before taking those entries.
+                    let resource_diagnostic_errors = value_validation
+                        .diagnostic_errors()
+                        .map(|(error, _, coverage)| (error.clone(), coverage))
+                        .collect::<Vec<_>>();
                     let mut reported_attribute_diagnostics = HashSet::new();
                     let retained_failures = resource_attributes
                         .keys()
@@ -1967,8 +1979,9 @@ impl DiagnosticRun<'_> {
                                     continue;
                                 }
                             }
-                            let symbolic = attr_findings.symbolic_errors().to_vec();
-                            for (path, error) in &symbolic {
+                            let symbolic = attr_findings.symbolic_findings().to_vec();
+                            for finding in &symbolic {
+                                let (path, error) = finding.diagnostic();
                                 use carina_core::resource::SecretDiagnosticError;
                                 use carina_core::validation::admission::AdmissionReferenceError;
                                 let (location, severity, message) = match error {
@@ -2163,7 +2176,7 @@ impl DiagnosticRun<'_> {
 
                     // Render the report produced by the single owner-bound walk.
                     {
-                        for error in value_validation.errors() {
+                        for (error, symbolic_coverage) in resource_diagnostic_errors {
                             if error
                                 .attribute_name()
                                 .is_some_and(|name| retained_failures.contains(name))
@@ -2172,7 +2185,7 @@ impl DiagnosticRun<'_> {
                             }
                             // Existence checks render lookup failures at their
                             // reference tokens, even when admission emits none.
-                            if let TypeError::Reference { error, .. } = error
+                            if let TypeError::Reference { error, .. } = &error
                                 && let carina_core::resource::SecretDiagnosticError::Public(error) = error.as_ref()
                                 && match error {
                                     carina_core::validation::admission::AdmissionReferenceError::UnknownBinding { .. }
@@ -2185,7 +2198,6 @@ impl DiagnosticRun<'_> {
                             {
                                 continue;
                             }
-                            let error = error.clone();
                             if let carina_core::schema::TypeError::MissingRequired { name } = &error
                                 && pending_resource_sinks.iter().any(
                                     |(pending_resource, authored_name)| {
@@ -2253,9 +2265,10 @@ impl DiagnosticRun<'_> {
                             }) {
                                 continue;
                             }
-                            if error
-                                .attribute_name()
-                                .is_some_and(|name| reported_attribute_diagnostics.contains(name))
+                            if symbolic_coverage.owns_finding()
+                                || error.attribute_name().is_some_and(|name| {
+                                    reported_attribute_diagnostics.contains(name)
+                                })
                             {
                                 continue;
                             }

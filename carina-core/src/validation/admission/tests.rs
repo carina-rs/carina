@@ -3135,3 +3135,85 @@ fn round3_admission_hook_receives_covered_positions() {
     let visits = round3_admission_hook("mock.Sink { input = 1 + 2 }", AttributeType::int());
     assert!(visits.iter().any(|visit| visit.covered), "{visits:?}");
 }
+
+#[test]
+fn round7_hook_error_without_attribute_has_one_diagnostic_owner() {
+    use crate::resource::{ParserPlaceholder, RelativeBindingName};
+    use crate::schema::value_validation::{AttributeAdmission, CheckValue};
+    let catalog = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(AttributeSchema::optional("input", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let parsed = crate::parser::parse_and_resolve("mock.Sink { input = 'value' }").unwrap();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let judged = configuration.judged();
+    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let resource = tree.resources().next().unwrap();
+    let slot = resource.authored_slot("input").unwrap();
+    let proof = slot
+        .projection()
+        .unwrap()
+        .knowledge(&KnowledgeContext::validation())
+        .unwrap()
+        .into_classification();
+    let attributes = HashMap::from([("input".into(), proof)]);
+    let destination = schemas
+        .resource_attribute_destination(resource.id(), "input", &catalog)
+        .unwrap();
+    let report = with_session_for_test(&catalog, |session| {
+        let hook = |_: &crate::schema::CompiledAttributeType,
+                    _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                    _: &crate::schema::LeafPath,
+                    _: crate::parser::retained::AuthoredCursor<'_>| {
+            Err(crate::schema::TypeError::MissingRequired {
+                name: "hook finding".into(),
+            })
+        };
+        resource
+            .schema(&schemas)
+            .unwrap()
+            .schema()
+            .as_schema()
+            .validate_admission_report(
+                &attributes,
+                &|_| false,
+                &AttributeAdmission {
+                    known: &|_, _, proof| {
+                        let (candidate, context) =
+                            Candidate::validation_slot(slot, proof.clone(), None, session).unwrap();
+                        let untyped = Vec::new;
+                        let context = context.with_checks(
+                            AssignmentChecks {
+                                authored: Some(&hook),
+                                ordinary: None,
+                            },
+                            &untyped,
+                        );
+                        let mut error = admit(&destination, candidate, &context).unwrap_err();
+                        error.take_findings().unwrap()
+                    },
+                    unknown: None,
+                },
+            )
+    });
+    assert_eq!(report.symbolic_errors().count(), 1);
+    let errors = report.diagnostic_errors().collect::<Vec<_>>();
+    assert_eq!(errors.len(), 1);
+    let (error, path, coverage) = errors[0];
+    assert!(
+        error.attribute_name().is_none(),
+        "owner cannot be inferred from error text"
+    );
+    assert_eq!(path.unwrap().0, "input");
+    assert!(coverage.owns_path(), "CLI already suppresses this echo");
+    assert!(
+        coverage.owns_finding(),
+        "LSP must suppress the same hook finding"
+    );
+}
