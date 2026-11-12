@@ -3,7 +3,7 @@ use carina_core::validation::SymbolicFindingOrigin;
 
 #[test]
 fn unrenderable_enum_error_still_owns_the_generic_diagnostic_path() {
-    use super::super::{HandledEnumDiagnostic, render_local_enum_diagnostic};
+    use super::super::render_local_enum_diagnostic;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
     let root = tempfile::tempdir().unwrap();
     for (name, body) in [
@@ -51,18 +51,17 @@ fn unrenderable_enum_error_still_owns_the_generic_diagnostic_path() {
             .clone(),
         error,
     );
-    let outcome = render_local_enum_diagnostic(&doc, &finding, None);
-    assert!(matches!(
-        outcome,
-        Some(HandledEnumDiagnostic { rendered: None })
-    ));
+    let data = crate::code_action::enum_diagnostic_data_for_error(finding.detail());
+    let handled = data.is_some();
+    let outcome = render_local_enum_diagnostic(&doc, &finding, None, data.unwrap());
+    assert!(outcome.is_none());
     let retained: Vec<_> = [
         SymbolicFindingOrigin::Ordinary,
         SymbolicFindingOrigin::AuthoredHook,
         SymbolicFindingOrigin::RecoveredReference,
     ]
     .into_iter()
-    .filter(|origin| enum_diagnostic_retains_symbolic(outcome.is_some(), *origin))
+    .filter(|origin| enum_diagnostic_retains_symbolic(handled, *origin))
     .collect();
     assert_eq!(retained, [SymbolicFindingOrigin::RecoveredReference]);
 }

@@ -556,23 +556,8 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 };
             let reference_check =
                 |attr: &CompiledAttributeType,
-                 checked: crate::schema::value_validation::CheckValue<'_, P, B>,
                  relative_path: &LeafPath,
-                 cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
-                    let findings = Default::default();
-                    if cursor.is_selection() {
-                        return Ok(findings);
-                    }
-                    let crate::schema::value_validation::CheckValue::Current(value) = checked
-                    else {
-                        return Ok(findings);
-                    };
-                    if !matches!(CandidateOrigin::of(value), CandidateOrigin::Expression) {
-                        return Ok(findings);
-                    }
-                    let Some(source) = cursor.source_reference() else {
-                        return Ok(findings);
-                    };
+                 source: crate::parser::retained::SourceReference<'_, B>| {
                     let reference = ReferenceCandidate {
                         reference: source.into_path(),
                     };
@@ -588,7 +573,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                             &mut Default::default(),
                         )
                         .map_err(|error| reference.error_with_origin(error))?;
-                    Ok(findings)
+                    Ok(Default::default())
                 };
             crate::schema::value_validation::validate_authored_value_for_admission_with_references(
                 contract.attr(),

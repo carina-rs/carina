@@ -244,7 +244,7 @@ fn round5_union_best_failing_hook_is_retained_once_live_and_discarded() {
     .authored;
     assert_eq!(calls.get(), 1, "discarded hook invocations");
     for findings in [current, discarded] {
-        assert_eq!(findings.errors.iter().count(), 1, "{findings:?}");
+        assert_eq!(findings.errors.len(), 1, "{findings:?}");
         assert_eq!(
             findings.errors.iter().next().unwrap().1,
             crate::schema::TypeError::MissingRequired {
@@ -334,7 +334,7 @@ fn round6_parent_hook_errors_preserve_ordinary_child_diagnostics() {
                 .local_findings()
                 .starts_with(expected.local_findings())
         );
-        assert_eq!(actual.take_assignment().errors.iter().count(), 1);
+        assert_eq!(actual.take_assignment().errors.len(), 1);
     }
 }
 
@@ -476,7 +476,7 @@ fn round6_union_hook_fires_once_for_best_ordinary_failure() {
         &mut Default::default(),
     )
     .unwrap();
-    assert_eq!(discarded.ordinary.errors.iter().count(), 1);
+    assert_eq!(discarded.ordinary.errors.len(), 1);
     assert_eq!(*calls.borrow(), ["String"]);
 }
 

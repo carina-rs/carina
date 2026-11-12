@@ -8,6 +8,76 @@ enum ErrorOrigin {
     RecoveredReference,
 }
 
+// Boxing keeps the origin attached to every error without enlarging a
+// recursive CheckedValue frame. Transformations use the attached mark;
+// projecting the diagnostic never determines its origin.
+#[derive(Debug, Clone)]
+pub(super) struct CheckedError(Box<ErrorDetail>);
+
+#[derive(Debug, Clone)]
+struct ErrorDetail {
+    error: TypeError,
+    origin: ErrorOrigin,
+}
+
+impl CheckedError {
+    fn new(error: TypeError, origin: ErrorOrigin) -> Self {
+        Self(Box::new(ErrorDetail { error, origin }))
+    }
+
+    pub(super) fn diagnostic(&self) -> &TypeError {
+        &self.0.error
+    }
+
+    pub(super) fn into_diagnostic(self) -> TypeError {
+        self.0.error
+    }
+
+    pub(super) fn wrap(self, wrap: impl FnOnce(TypeError) -> TypeError) -> Self {
+        match self.0.origin {
+            ErrorOrigin::Ordinary => Self::from(wrap(self.into_diagnostic())),
+            ErrorOrigin::RecoveredReference => self,
+        }
+    }
+}
+
+impl From<TypeError> for CheckedError {
+    fn from(error: TypeError) -> Self {
+        Self::new(error, ErrorOrigin::Ordinary)
+    }
+}
+
+impl InsideSecret for CheckedError {
+    fn inside_secret(self) -> Self {
+        let ErrorDetail { error, origin } = *self.0;
+        let error = match origin {
+            ErrorOrigin::Ordinary => error.inside_secret(),
+            ErrorOrigin::RecoveredReference => protect_reference_error(error),
+        };
+        Self::new(error, origin)
+    }
+}
+
+impl UnionFailureError for CheckedError {
+    fn type_error(&self) -> &TypeError {
+        self.diagnostic()
+    }
+
+    fn from_type_error(error: TypeError) -> Self {
+        Self::from(error)
+    }
+
+    fn from_errors(first: Self, rest: impl IntoIterator<Item = Self>) -> Self {
+        let ErrorDetail { error, origin } = *first.0;
+        match UnionArmFailures::new(error, rest.into_iter().map(Self::into_diagnostic)) {
+            Ok(failures) => Self::from(TypeError::UnionAlternativesMismatch { failures }),
+            // A collapsed diagnostic keeps its first candidate's origin;
+            // a newly generated multi-arm summary is an ordinary diagnostic.
+            Err(error) => Self::new(error, origin),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct AssignmentError {
     diagnostic: (LeafPath, TypeError),
@@ -18,20 +88,6 @@ struct AssignmentError {
 pub(crate) struct AssignmentErrors(Vec<AssignmentError>);
 
 impl AssignmentErrors {
-    #[inline(never)]
-    pub(super) fn owns_recovered(&self, error: &TypeError) -> bool {
-        self.0.iter().any(|entry| {
-            entry.origin == ErrorOrigin::RecoveredReference && &entry.diagnostic.1 == error
-        })
-    }
-
-    pub(super) fn protect_error(&self, error: TypeError) -> TypeError {
-        if self.owns_recovered(&error) {
-            protect_reference_error(error)
-        } else {
-            error.inside_secret()
-        }
-    }
     pub(crate) fn ordinary(errors: impl IntoIterator<Item = (LeafPath, TypeError)>) -> Self {
         Self(
             errors
@@ -58,8 +114,20 @@ impl AssignmentErrors {
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
-    pub(super) fn primary(&self) -> &TypeError {
-        &self.0[0].diagnostic.1
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub(super) fn primary(&self) -> CheckedError {
+        let entry = &self.0[0];
+        CheckedError::new(entry.diagnostic.1.clone(), entry.origin)
+    }
+    pub(super) fn checked(&self) -> impl Iterator<Item = (&LeafPath, CheckedError)> {
+        self.0.iter().map(|entry| {
+            (
+                &entry.diagnostic.0,
+                CheckedError::new(entry.diagnostic.1.clone(), entry.origin),
+            )
+        })
     }
     pub(super) fn into_diagnostics(self) -> impl Iterator<Item = (LeafPath, TypeError)> {
         self.0.into_iter().map(|entry| entry.diagnostic)
@@ -145,18 +213,13 @@ impl<'a, P: ValueKind, B: BindingAddress> OrdinaryCheck<'a, P, B> {
 pub(super) struct ReferencePolicy<'a, P: ValueKind, B: BindingAddress> {
     ordinary: AssignmentCheck<'a, P, B>,
     schema_source: &'a dyn Fn(&B) -> bool,
-    reference: AssignmentCheck<'a, P, B>,
-    scopes: std::cell::RefCell<Vec<ReferenceScope>>,
-}
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct ReferenceScope {
-    identity: UseIdentity,
-    declaration: *const CompiledAttributeType,
+    reference: ReferenceJudge<'a, B>,
+    scopes: std::cell::RefCell<Vec<UseIdentity>>,
 }
 impl<'a, P: ValueKind, B: BindingAddress> ReferencePolicy<'a, P, B> {
     pub(super) fn new(
         ordinary: AssignmentCheck<'a, P, B>,
-        reference: ReferenceCheck<'a, P, B>,
+        reference: ReferenceCheck<'a, B>,
     ) -> Self {
         Self {
             ordinary,
@@ -165,86 +228,61 @@ impl<'a, P: ValueKind, B: BindingAddress> ReferencePolicy<'a, P, B> {
             scopes: Default::default(),
         }
     }
-    fn enter(
-        &self,
-        identity: UseIdentity,
-        attr: &CompiledAttributeType,
-    ) -> ScopeGuard<'_, 'a, P, B> {
-        let mut scopes = self.scopes.borrow_mut();
-        // The declaration is fixed before trials run. Re-entering this use
-        // inherits its enclosing sink, independently of callback execution order.
-        let (scope, owner) =
-            if let Some(scope) = scopes.iter().rev().find(|scope| scope.identity == identity) {
-                (scope.clone(), false)
-            } else {
-                let scope = ReferenceScope {
-                    identity,
-                    declaration: attr,
-                };
-                scopes.push(scope.clone());
-                (scope, true)
-            };
-        ScopeGuard {
-            policy: self,
-            scope,
-            owner,
-        }
+    fn enter(&self, identity: UseIdentity) -> ScopeGuard<'_, 'a, P, B> {
+        // Qualification excludes an identity already being judged. Establish
+        // the declaration's scope before any ordinary union-member trial.
+        self.scopes.borrow_mut().push(identity);
+        ScopeGuard { policy: self }
     }
 }
 struct ScopeGuard<'s, 'a, P: ValueKind, B: BindingAddress> {
     policy: &'s ReferencePolicy<'a, P, B>,
-    scope: ReferenceScope,
-    owner: bool,
 }
 impl<P: ValueKind, B: BindingAddress> Drop for ScopeGuard<'_, '_, P, B> {
     fn drop(&mut self) {
-        if self.owner {
-            self.policy.scopes.borrow_mut().pop();
-        }
+        self.policy.scopes.borrow_mut().pop();
     }
 }
 
-pub(super) struct ReferenceInput<'w, 's, P: PlaceholderKind, B: BindingAddress>(
-    &'w AssignmentWalk<'s, P, B>,
-);
+pub(super) struct ReferenceInput<'w, 's, P: PlaceholderKind, B: BindingAddress> {
+    walk: &'w AssignmentWalk<'s, P, B>,
+    policy: &'s ReferencePolicy<'s, P, B>,
+    source: crate::parser::retained::SourceReference<'w, B>,
+}
 impl<'w, 's, P: PlaceholderKind, B: BindingAddress> ReferenceInput<'w, 's, P, B> {
     #[inline(never)]
     pub(super) fn for_walk(
         known: bool,
-        assignment: &'w Option<AssignmentWalk<'s, P, B>>,
+        assignment: Option<&'w AssignmentWalk<'s, P, B>>,
     ) -> Option<Self> {
         if !known {
             return None;
         }
-        let walk = assignment.as_ref()?;
+        let walk = assignment?;
         let OrdinaryCheck::References(policy) = walk.callbacks.ordinary else {
             return None;
         };
+        if walk.cursor.is_selection() {
+            return None;
+        }
         let source = walk.cursor.source_reference()?;
         let identity = source.identity;
         // Member trials inherit the enclosing declaration's judgement. They
         // keep the ordinary memo and never allocate reference state of their own.
-        if policy
-            .scopes
-            .borrow()
-            .iter()
-            .any(|scope| scope.identity == identity)
-            || !(policy.schema_source)(source.binding)
-        {
+        if policy.scopes.borrow().contains(&identity) || !(policy.schema_source)(source.binding) {
             return None;
         }
-        Some(Self(walk))
+        Some(Self {
+            walk,
+            policy,
+            source,
+        })
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct ReferenceNode<'a> {
-    node: CheckedNode<'a>,
-    scope: ReferenceScope,
-}
 #[derive(Default)]
 pub(super) struct ReferenceMemo<'a>(
-    std::cell::RefCell<HashMap<ReferenceNode<'a>, std::rc::Rc<CheckedValue<'a>>>>,
+    std::cell::RefCell<HashMap<CheckedNode<'a>, std::rc::Rc<CheckedValue<'a>>>>,
 );
 
 pub(super) struct AppliedReferenceValue<'a>(std::rc::Rc<CheckedValue<'a>>);
@@ -260,8 +298,8 @@ impl<'a> AppliedReferenceValue<'a> {
 pub(super) struct PendingReferencedValue<'a>(Box<ReferenceResult<'a>>);
 struct ReferenceResult<'a> {
     value: CheckedValue<'a>,
-    reference: Option<Result<AssignmentFindings, TypeError>>,
-    key: Option<ReferenceNode<'a>>,
+    reference: Result<AssignmentFindings, TypeError>,
+    key: Option<CheckedNode<'a>>,
 }
 impl<'a> PendingReferencedValue<'a> {
     #[inline(never)]
@@ -276,12 +314,13 @@ impl<'a> PendingReferencedValue<'a> {
             key,
         } = *self.0;
         match reference {
-            None => {}
-            Some(Ok(findings)) => value.extend_assignment(path, findings),
-            Some(Err(error)) => {
+            Ok(findings) => value.extend_assignment(path, findings),
+            Err(error) => {
                 use crate::resource::SecretDiagnosticError;
                 use crate::validation::admission::AdmissionReferenceError;
                 value.retain_primary_finding();
+                // Equality only suppresses a duplicate diagnostic here; every
+                // retained error carries its own origin through transformations.
                 let same = |ordinary: &TypeError| {
                     ordinary == &error
                         || matches!((ordinary, &error),
@@ -295,11 +334,19 @@ impl<'a> PendingReferencedValue<'a> {
                     .findings
                     .located
                     .iter()
-                    .chain(&value.findings.provider)
-                    .any(|(ordinary_path, ordinary)| ordinary_path == path && same(ordinary))
+                    .any(|(ordinary_path, ordinary)| {
+                        ordinary_path == path && same(ordinary.diagnostic())
+                    })
+                    && !value
+                        .findings
+                        .provider
+                        .iter()
+                        .any(|(ordinary_path, ordinary)| ordinary_path == path && same(ordinary))
                 {
-                    value.reject(path, error.clone());
-                    value.findings.located.push((path.clone(), error.clone()));
+                    let checked_error =
+                        CheckedError::new(error.clone(), ErrorOrigin::RecoveredReference);
+                    value.reject(path, checked_error.clone());
+                    value.findings.located.push((path.clone(), checked_error));
                     value.findings.assignment.errors.0.push(AssignmentError {
                         diagnostic: (path.canonical(), error),
                         origin: ErrorOrigin::RecoveredReference,
@@ -318,7 +365,7 @@ impl<'a> PendingReferencedValue<'a> {
 impl<'a> ValueValidator<'a, '_> {
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
-    pub(super) fn walk_reference_prepared<
+    pub(super) fn walk_reference<
         'w,
         'v: 'w,
         P: PlaceholderKind,
@@ -331,57 +378,41 @@ impl<'a> ValueValidator<'a, '_> {
         path: &FieldPath,
         ancestry: FieldAncestry,
         visited: &mut Vec<&'a str>,
-        input: ReferenceInput<'_, 'w, P, B>,
+        assignment: Option<&AssignmentWalk<'w, P, B>>,
         extra: &mut AssignmentProbe,
         wrappers: &mut Vec<AuthoredCursor<'w, B>>,
-    ) -> AppliedReferenceValue<'a>
+    ) -> Option<AppliedReferenceValue<'a>>
     where
         'a: 'w,
     {
-        let walk = input.0;
-        let (OrdinaryCheck::References(policy), Some(source)) =
-            (walk.callbacks.ordinary, walk.cursor.source_reference())
-        else {
-            // ReferenceInput borrows the immutable walk it qualified. Record
-            // missing evidence if that private construction invariant changes.
-            return AppliedReferenceValue(std::rc::Rc::new(CheckedValue::rejected(
-                path,
-                seam_error(crate::parser::retained::MissingEvidence::new(
-                    "qualified source reference",
-                )),
-            )));
-        };
-        let identity = source.identity;
-        let scope = policy.enter(identity, attr);
+        let input = ReferenceInput::for_walk(matches!(value, ClassifiedRef::Known(_)), assignment)?;
+        let ReferenceInput {
+            walk,
+            policy,
+            source,
+        } = input;
+        let _scope = policy.enter(source.identity);
         let key = match value {
-            ClassifiedRef::Known(value) => Some(ReferenceNode {
-                node: CheckedNode::new(attr, value.node_id(), ancestry, visited, Some(walk)),
-                scope: scope.scope.clone(),
-            }),
+            ClassifiedRef::Known(value) => Some(CheckedNode::new(
+                attr,
+                value.node_id(),
+                ancestry,
+                visited,
+                Some(walk),
+            )),
             _ => None,
         };
         if let Some(checked) = key
             .as_ref()
             .and_then(|key| self.reference_checked.0.borrow().get(key).cloned())
         {
-            return AppliedReferenceValue(checked);
+            return Some(AppliedReferenceValue(checked));
         }
-        let reference = if scope.owner {
+        let reference = {
             let mut resolving = visited.clone();
-            Some(
-                resolve_refs_on_path(attr, self.defs, &mut resolving)
-                    .map_err(|error| error.into_validation_error())
-                    .and_then(|resolved| {
-                        (policy.reference)(
-                            resolved.attr,
-                            CheckValue::Current(value.diagnostic_value()),
-                            &path.canonical(),
-                            walk.cursor.clone(),
-                        )
-                    }),
-            )
-        } else {
-            None
+            resolve_refs_on_path(attr, self.defs, &mut resolving)
+                .map_err(|error| error.into_validation_error())
+                .and_then(|resolved| (policy.reference)(resolved.attr, &path.canonical(), source))
         };
         let mut checked =
             self.walk_value(attr, value, path, ancestry, visited, Some((*walk).clone()));
@@ -395,12 +426,14 @@ impl<'a> ValueValidator<'a, '_> {
             std::mem::take(wrappers),
         );
         checked.retain_primary_finding();
-        PendingReferencedValue(Box::new(ReferenceResult {
-            value: checked,
-            reference,
-            key,
-        }))
-        .finish(path, &self.reference_checked)
+        Some(
+            PendingReferencedValue(Box::new(ReferenceResult {
+                value: checked,
+                reference,
+                key,
+            }))
+            .finish(path, &self.reference_checked),
+        )
     }
 }
 

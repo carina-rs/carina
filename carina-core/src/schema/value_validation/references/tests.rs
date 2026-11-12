@@ -1,4 +1,13 @@
 use super::*;
+use crate::parser::retained::SourceReference;
+
+fn allow_reference(
+    _: &CompiledAttributeType,
+    _: &LeafPath,
+    _: SourceReference<'_, RelativeBindingName>,
+) -> Result<AssignmentFindings, TypeError> {
+    Ok(Default::default())
+}
 
 fn with_source(
     test: impl FnOnce(AuthoredCursor<'_>, Classification<'_, ParserPlaceholder, RelativeBindingName>),
@@ -102,7 +111,7 @@ fn unsubstituted_reference_uses_no_reference_state_or_allocations() {
                 &ordinary,
                 ReferenceCheck {
                     schema_source: &|_| true,
-                    check: &ordinary,
+                    check: &allow_reference,
                 },
             );
             let coverage = Default::default();
@@ -120,7 +129,7 @@ fn unsubstituted_reference_uses_no_reference_state_or_allocations() {
                 assert!(
                     ReferenceInput::for_walk(
                         matches!(ClassifiedRef::from(&knowledge), ClassifiedRef::Known(_)),
-                        &assignment
+                        assignment.as_ref()
                     )
                     .is_none()
                 );
@@ -142,11 +151,10 @@ fn reference_member_trials_do_not_allocate_reference_state() {
             &ordinary,
             ReferenceCheck {
                 schema_source: &|_| true,
-                check: &ordinary,
+                check: &allow_reference,
             },
         );
-        let attr = CompiledAttributeType::string();
-        let _scope = policy.enter(cursor.identity().unwrap(), &attr);
+        let _scope = policy.enter(cursor.identity().unwrap());
         let coverage = Default::default();
         let mut callbacks = WalkCallbacks::new(AssignmentCallbacks {
             ordinary: &ordinary,
@@ -159,7 +167,7 @@ fn reference_member_trials_do_not_allocate_reference_state() {
             coverage: &coverage,
         });
         let allocations = cursor_allocations::count(|| {
-            assert!(ReferenceInput::for_walk(true, &assignment).is_none());
+            assert!(ReferenceInput::for_walk(true, assignment.as_ref()).is_none());
         });
         assert_eq!(allocations, 0);
     });
@@ -191,13 +199,13 @@ fn substituted_module_output_keeps_ordinary_memo_and_skips_reference_callback() 
                             _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
                             _: &LeafPath,
                             _: AuthoredCursor<'_>| Ok(Default::default());
-            let reference = |_: &CompiledAttributeType,
-                             _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
-                             _: &LeafPath,
-                             _: AuthoredCursor<'_>| {
-                calls.set(calls.get() + 1);
-                Ok(Default::default())
-            };
+            let reference =
+                |_: &CompiledAttributeType,
+                 _: &LeafPath,
+                 _: SourceReference<'_, RelativeBindingName>| {
+                    calls.set(calls.get() + 1);
+                    Ok(Default::default())
+                };
             let schema_source = |binding: &RelativeBindingName| {
                 bindings.is_schema_attribute_source(binding.as_str())
             };
@@ -257,9 +265,8 @@ fn reference_scope_does_not_reuse_member_trial_cache() {
                         _: &LeafPath,
                         _: AuthoredCursor<'_>| Ok(Default::default());
         let reference = |_: &CompiledAttributeType,
-                         _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
                          _: &LeafPath,
-                         _: AuthoredCursor<'_>| {
+                         _: SourceReference<'_, RelativeBindingName>| {
             Err(TypeError::ValidationFailed {
                 message: "declared sink rejection".into(),
             })
@@ -291,7 +298,7 @@ fn reference_scope_does_not_reuse_member_trial_cache() {
                 [false, true]
             };
             for trial in checks {
-                let scope = trial.then(|| policy.enter(identity, &union));
+                let scope = trial.then(|| policy.enter(identity));
                 let checked = validator.walk_with_assignment(
                     member,
                     (&knowledge).into(),
@@ -313,42 +320,52 @@ fn reference_scope_does_not_reuse_member_trial_cache() {
 
 #[test]
 fn reference_declaration_is_independent_of_union_trial_order() {
-    let union = CompiledAttributeType::union(vec![
-        CompiledAttributeType::string(),
-        CompiledAttributeType::int(),
-    ]);
-    let AttrTypeKind::Union(members) = &union.kind else {
-        unreachable!()
-    };
-    let member = &members.as_raw_slice()[0];
-    with_source(|cursor, _| {
-        let ordinary = |_: &CompiledAttributeType,
-                        _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
-                        _: &LeafPath,
-                        _: AuthoredCursor<'_>| Ok(Default::default());
-        let policy = ReferencePolicy::new(
-            &ordinary,
-            ReferenceCheck {
-                schema_source: &|_| true,
-                check: &ordinary,
-            },
-        );
-        let identity = cursor.source_reference().unwrap().identity;
-        for member_first in [false, true] {
-            let root = policy.enter(identity, &union);
-            let checks = if member_first {
-                [member, &union]
-            } else {
-                [&union, member]
-            };
-            for attr in checks {
-                let trial = policy.enter(identity, attr);
-                assert_eq!(trial.scope.declaration, &union as *const _);
-                assert!(!trial.owner);
-            }
-            assert!(root.owner);
-        }
-    });
+    for members in [
+        vec![
+            CompiledAttributeType::string(),
+            CompiledAttributeType::int(),
+        ],
+        vec![
+            CompiledAttributeType::int(),
+            CompiledAttributeType::string(),
+        ],
+    ] {
+        let union = CompiledAttributeType::union(members);
+        with_source(|cursor, knowledge| {
+            let calls = std::cell::Cell::new(0);
+            let ordinary = |_: &CompiledAttributeType,
+                            _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                            _: &LeafPath,
+                            _: AuthoredCursor<'_>| Ok(Default::default());
+            let reference =
+                |attr: &CompiledAttributeType,
+                 _: &LeafPath,
+                 _: SourceReference<'_, RelativeBindingName>| {
+                    assert!(std::ptr::eq(attr, &union));
+                    calls.set(calls.get() + 1);
+                    Ok(Default::default())
+                };
+            let findings = validate_authored_value_for_admission_with_references(
+                &union,
+                &knowledge,
+                empty_defs_for_schema_walks(),
+                FieldAncestry::WRITABLE,
+                no_lookup(),
+                cursor,
+                AssignmentCallbacks {
+                    ordinary: &ordinary,
+                    authored: None,
+                },
+                ReferenceCheck {
+                    schema_source: &|_| true,
+                    check: &reference,
+                },
+                &mut Default::default(),
+            );
+            assert!(findings.into_located().is_empty());
+            assert_eq!(calls.get(), 1);
+        });
+    }
 }
 
 #[test]
@@ -360,7 +377,7 @@ fn pending_reference_is_applied_before_any_findings_can_merge() {
     let checked = CheckedValue::accepted(&attr, FitExactness::EXACT, FitKind::Failed);
     let pending = PendingReferencedValue(Box::new(ReferenceResult {
         value: checked,
-        reference: Some(Err(error)),
+        reference: Err(error),
         key: None,
     }));
     let checked = pending
@@ -394,9 +411,8 @@ fn recovered_reference_memo_hits_allocate_only_what_the_ordinary_walk_does() {
                         _: &LeafPath,
                         _: AuthoredCursor<'_>| Ok(Default::default());
         let reference = |_: &CompiledAttributeType,
-                         _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
                          _: &LeafPath,
-                         _: AuthoredCursor<'_>| {
+                         _: SourceReference<'_, RelativeBindingName>| {
             calls.set(calls.get() + 1);
             Ok(Default::default())
         };
@@ -454,13 +470,13 @@ fn reference_resolution_failures_keep_the_ordinary_error_once() {
                             _: &LeafPath,
                             _: AuthoredCursor<'_>| Ok(Default::default());
             let calls = std::cell::Cell::new(0);
-            let reference = |_: &CompiledAttributeType,
-                             _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
-                             _: &LeafPath,
-                             _: AuthoredCursor<'_>| {
-                calls.set(calls.get() + 1);
-                Ok(Default::default())
-            };
+            let reference =
+                |_: &CompiledAttributeType,
+                 _: &LeafPath,
+                 _: SourceReference<'_, RelativeBindingName>| {
+                    calls.set(calls.get() + 1);
+                    Ok(Default::default())
+                };
             let lookup = no_lookup();
             let callbacks = AssignmentCallbacks {
                 ordinary: &ordinary,
@@ -495,6 +511,110 @@ fn reference_resolution_failures_keep_the_ordinary_error_once() {
             .into_located();
             assert_eq!(actual, expected);
             assert_eq!(calls.get(), 0);
+        }
+    });
+}
+
+fn source_mismatch(cursor: &AuthoredCursor<'_>) -> TypeError {
+    let reference = cursor.source_reference().unwrap().into_path();
+    let TypeError::TypeMismatch { types } =
+        TypeError::value_type_mismatch("mock.RecoveryProbe".into(), "String".into())
+    else {
+        unreachable!()
+    };
+    // The payload uses the shared constructor that judge_argument reaches
+    // through error_with_origin.
+    TypeError::Reference {
+        error: Box::new(crate::resource::SecretDiagnosticError::Public(
+            crate::validation::admission::AdmissionReferenceError::Computed(
+                crate::validation::DeferredAccessTypeError::reference_mismatch(
+                    crate::binding_index::RefTypeMismatch::direct(types),
+                    reference.as_ref(),
+                ),
+            ),
+        )),
+        attribute: None,
+    }
+}
+
+#[test]
+fn equal_ordinary_and_recovered_errors_keep_distinct_transformation_origins() {
+    with_source(|cursor, _| {
+        let attr = CompiledAttributeType::string();
+        let error = source_mismatch(&cursor);
+        let path = FieldPath::new();
+        let other = path.push_field("recovered");
+        let recovered = PendingReferencedValue(Box::new(ReferenceResult {
+            value: CheckedValue::accepted(&attr, FitExactness::EXACT, FitKind::Failed),
+            reference: Err(error.clone()),
+            key: None,
+        }))
+        .finish(&other, &ReferenceMemo::default())
+        .into_checked();
+        let mut ordinary = CheckedValue::rejected(&path, error.clone());
+        ordinary
+            .findings
+            .additional_local_errors
+            .push(error.clone().into());
+        ordinary.extend_assignment(&other, recovered.findings.assignment);
+        let wrapped = ordinary
+            .clone()
+            .wrap_local_errors(|error| error.at_struct_field("outer"));
+        assert!(matches!(
+            wrapped.local.error().map(CheckedError::diagnostic),
+            Some(TypeError::StructFieldError { .. })
+        ));
+        assert!(matches!(
+            wrapped.findings.additional_local_errors[0].diagnostic(),
+            TypeError::StructFieldError { .. }
+        ));
+        let protected = ordinary.inside_secret();
+        use crate::resource::SecretDiagnosticError;
+        assert!(
+            matches!(protected.local.error().map(CheckedError::diagnostic), Some(TypeError::Reference { error, .. }) if matches!(error.as_ref(), SecretDiagnosticError::InsideSecret))
+        );
+        assert!(
+            matches!(protected.findings.local[0].1.diagnostic(), TypeError::Reference { error, .. } if matches!(error.as_ref(), SecretDiagnosticError::InsideSecret))
+        );
+        assert!(
+            matches!(protected.findings.located[0].1.diagnostic(), TypeError::Reference { error, .. } if matches!(error.as_ref(), SecretDiagnosticError::InsideSecret))
+        );
+        assert!(
+            matches!(protected.findings.additional_local_errors[0].diagnostic(), TypeError::Reference { error, .. } if matches!(error.as_ref(), SecretDiagnosticError::InsideSecret))
+        );
+        assert!(
+            matches!(protected.findings.located[1].1.diagnostic(), TypeError::Reference { error, .. } if matches!(error.as_ref(), SecretDiagnosticError::Public(_)))
+        );
+    });
+}
+
+#[test]
+fn deduplicated_union_error_keeps_the_first_errors_origin() {
+    with_source(|cursor, _| {
+        let error = source_mismatch(&cursor);
+        for origin in [ErrorOrigin::Ordinary, ErrorOrigin::RecoveredReference] {
+            let other = match origin {
+                ErrorOrigin::Ordinary => ErrorOrigin::RecoveredReference,
+                ErrorOrigin::RecoveredReference => ErrorOrigin::Ordinary,
+            };
+            let selected = CheckedError::from_errors(
+                CheckedError::new(error.clone(), origin),
+                [CheckedError::new(error.clone(), other)],
+            );
+            assert_eq!(selected.diagnostic(), &error);
+            let wrapped = selected
+                .clone()
+                .wrap(|error| error.at_struct_field("outer"));
+            assert_eq!(
+                matches!(wrapped.diagnostic(), TypeError::StructFieldError { .. }),
+                origin == ErrorOrigin::Ordinary,
+            );
+            use crate::resource::SecretDiagnosticError;
+            let protected = selected.inside_secret();
+            assert_eq!(
+                matches!(protected.diagnostic(), TypeError::Reference { error, .. } if matches!(error.as_ref(), SecretDiagnosticError::InsideSecret)),
+                origin == ErrorOrigin::Ordinary,
+            );
         }
     });
 }
