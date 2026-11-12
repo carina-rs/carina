@@ -153,7 +153,7 @@ async fn guest_stderr_round5_deferred_ref_grows_during_and_after_create() {
         managed_current: Default::default(),
         data_source_values: carina_core::data_source_value::ExecutableDataSourceValues::empty(),
         normalizer: &NoopNormalizer,
-        provider_configs: &[],
+        provider_configs: &carina_core::test_utils::resolved_provider_configs(&[]),
         provider_context: carina_core::parser::ProviderContext::new(
             carina_core::EnvironmentSnapshot::empty(),
         ),

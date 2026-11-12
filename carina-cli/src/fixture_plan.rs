@@ -465,12 +465,33 @@ where
     // This fixture intentionally uses a second, fuller schema context for
     // planning; the test-only constructor marks that separately assembled
     // context as the fixture's validated execution wiring.
+    let mut fixture_schemas = fixture_schemas();
+    for resource in canonical_resources.parsed().iter_all_resources() {
+        for (owner, schema) in &mut fixture_schemas {
+            if owner == &resource.id().provider
+                && schema.as_schema().resource_type() == resource.id().resource_type
+            {
+                *schema = match &resource {
+                    carina_core::parser::ResourceRef::Resource(resource) => {
+                        schema.with_fixture_attributes(&resource.attributes)
+                    }
+                    carina_core::parser::ResourceRef::DataSource(resource) => {
+                        schema.with_fixture_attributes(&resource.attributes)
+                    }
+                    carina_core::parser::ResourceRef::Deferred { resource, .. } => {
+                        schema.with_fixture_attributes(resource.attributes())
+                    }
+                    carina_core::parser::ResourceRef::LiveComposition(_) => schema.clone(),
+                };
+            }
+        }
+    }
     let mut validated_config = ValidatedConfig::for_fixture_with_additional_schemas(
         runtime,
         canonical_resources,
         load_factories(fixture_provider_factories(&fixture_pathbuf)),
         &provider_configs,
-        fixture_schemas(),
+        fixture_schemas,
     );
     if fixture_pathbuf.file_name().is_some_and(|name| {
         name == "moved_claims_precede_heuristics"

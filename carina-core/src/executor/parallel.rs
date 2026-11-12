@@ -384,9 +384,9 @@ pub(super) async fn execute_effects_sequential<
     let mut effects = admitted.effects().to_vec();
     let mut materialization_requirements = crate::replacement::create_first_requirements(&effects);
     let mut total = count_runtime_effects(&effects, &input.data_source_values);
-    let mut input_checks = match ExecutionInputChecks::new(
+    let mut input_checks = match ExecutionInputChecks::for_plan(
         std::mem::take(&mut input.input_checks),
-        &effects,
+        &admitted,
         &source_effect_indices,
     ) {
         Ok(checks) => checks,
@@ -682,7 +682,7 @@ pub(super) async fn execute_effects_sequential<
                 ordinary_old: &ordinary_old,
                 requirements: &materialization_requirements,
                 identity_inputs: super::deferred_dispatch::DeferredIdentityInputs {
-                    provider_configs: input.provider_configs,
+                    provider_configs: input.provider_configs.as_provider_configs(),
                     factories: input.factories,
                     schemas: input.schemas,
                     type_checks,
@@ -750,7 +750,7 @@ pub(super) async fn execute_effects_sequential<
                         completed_synchronous_dispatch = true;
                         break;
                     }
-                    if input_checks.has_rules(idx) {
+                    if input_checks.needs_cohort_preparation(idx) {
                         let deletes = combined
                             .input_replacement_sites()
                             .into_iter()
@@ -763,7 +763,6 @@ pub(super) async fn execute_effects_sequential<
                         let module_gate = &module_gate;
                         let configs = input.provider_configs;
                         let normalizer = input.normalizer;
-                        let factories = input.factories;
                         let schemas = input.schemas;
                         in_flight.push_non_wait(idx, move |_start| async move {
                             let context = ProviderPreparationContext::new(
@@ -771,7 +770,6 @@ pub(super) async fn execute_effects_sequential<
                                 module_gate,
                                 configs,
                                 normalizer,
-                                factories,
                                 schemas,
                                 type_checks,
                             );
@@ -860,7 +858,6 @@ pub(super) async fn execute_effects_sequential<
             let module_gate = &module_gate;
             let normalizer = input.normalizer;
             let provider_configs = input.provider_configs;
-            let factories = input.factories;
             let schemas = input.schemas;
             let preparation_write = preparation_nodes.write(idx);
             let basic = ready.and_then(|ready| ready.into_basic());
@@ -883,7 +880,6 @@ pub(super) async fn execute_effects_sequential<
                     module_gate,
                     provider_configs,
                     normalizer,
-                    factories,
                     schemas,
                     type_checks,
                 );
@@ -1937,6 +1933,7 @@ mod tests {
                     plan.effects().iter().map(Effect::resource_id),
                 );
                 let checked_plan = crate::executor::tests::checked_fixture_plan(&plan);
+                let provider_configs = crate::test_utils::resolved_provider_configs(&[]);
                 let mut input: RuntimeExecutionInput = ExecutionInput {
                     provider_context: crate::parser::ProviderContext::clone(
                         &crate::parser::LoadedProviderContext::empty_for_test(),
@@ -1952,7 +1949,7 @@ mod tests {
                     data_source_values: crate::data_source_value::ExecutableDataSourceValues::empty(
                     ),
                     normalizer: &NoopNormalizer,
-                    provider_configs: &[],
+                    provider_configs: &provider_configs,
                     factories: &[],
                     schemas: &schemas,
                     parallelism: std::num::NonZeroUsize::new(2).unwrap(),
@@ -2104,6 +2101,7 @@ mod tests {
                     plan.effects().iter().map(Effect::resource_id),
                 );
                 let checked_plan = crate::executor::tests::checked_fixture_plan(&plan);
+                let provider_configs = crate::test_utils::resolved_provider_configs(&[]);
                 let mut input: RuntimeExecutionInput = ExecutionInput {
                     provider_context: crate::parser::ProviderContext::clone(
                         &crate::parser::LoadedProviderContext::empty_for_test(),
@@ -2119,7 +2117,7 @@ mod tests {
                     data_source_values: crate::data_source_value::ExecutableDataSourceValues::empty(
                     ),
                     normalizer: &NoopNormalizer,
-                    provider_configs: &[],
+                    provider_configs: &provider_configs,
                     factories: &[],
                     schemas: &schemas,
                     parallelism: std::num::NonZeroUsize::new(2).unwrap(),

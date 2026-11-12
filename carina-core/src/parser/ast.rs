@@ -8297,7 +8297,7 @@ where
             value.collect_leftover_placeholders(
                 LeftoverPlaceholderContext::ProviderAttribute {
                     provider: name.clone(),
-                    attribute: attribute.clone().with_diagnostic_prefix("default_tags."),
+                    attribute: super::ResolvedProviderConfigs::default_tag_attribute(attribute),
                 },
                 reject_all,
                 &mut errors,

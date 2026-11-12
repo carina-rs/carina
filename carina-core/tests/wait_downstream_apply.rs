@@ -175,6 +175,14 @@ fn fixture_schemas(resources: &[Resource]) -> SchemaRegistry {
             .insert_provider_witness(provider, &witness)
             .expect("fixture provider witness is consistent");
     }
+    for resource in resources {
+        carina_core::test_utils::complete_fixture_schema(
+            &mut schemas,
+            &resource.id,
+            carina_core::schema::SchemaKind::Resource,
+            &resource.attributes,
+        );
+    }
     schemas
 }
 
@@ -526,7 +534,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         managed_current: managed_current(current_states),
         data_source_values: ExecutableDataSourceValues::empty(),
         normalizer: &NoopNormalizer,
-        provider_configs: &[],
+        provider_configs: &carina_core::test_utils::resolved_provider_configs(&[]),
         factories: &[],
         schemas: &registry,
         parallelism: carina_core::executor::TEST_UNCAPPED,
@@ -736,7 +744,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         managed_current: managed_current(current_states),
         data_source_values: ExecutableDataSourceValues::empty(),
         normalizer: &NoopNormalizer,
-        provider_configs: &[],
+        provider_configs: &carina_core::test_utils::resolved_provider_configs(&[]),
         factories: &[],
         schemas: &registry,
         parallelism: carina_core::executor::TEST_UNCAPPED,

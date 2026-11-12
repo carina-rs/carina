@@ -8571,3 +8571,65 @@ fn invalid_sibling_attributes_are_both_reported_without_failed_input() {
 fn guarded_failure_preserves_cli_lsp_sibling_findings() {
     assert_round2_attribute_siblings(&round2_attribute_fixture("guarded_failure_siblings"));
 }
+
+#[test]
+fn issue_4304_3a_review1_all_unknown_default_tags_have_cli_lsp_parity() {
+    let fixture = write_fixture(&[
+        (
+            "first.crn",
+            "provider test { default_tags = { First = management.identifier
+ Second = management.identifier } }
+",
+        ),
+        (
+            "second.crn",
+            "let second = provider test { default_tags = { Third = management.identifier
+ Fourth = management.identifier } }
+",
+        ),
+        (
+            "main.crn",
+            "let management = test.Management {}
+",
+        ),
+    ]);
+    let schemas = single_schema_map(ResourceSchema::new("test.Management").attribute(
+        AttributeSchema::provider_populated("identifier", AttributeType::string()).build(),
+    ));
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let engine = engine_with_schemas(schemas);
+    let lsp = ["first.crn", "second.crn"]
+        .into_iter()
+        .flat_map(|name| lsp_diagnostics(&engine, &fixture, name))
+        .filter(|finding| finding.message.contains("default_tags."))
+        .collect::<Vec<_>>();
+    let cli = cli
+        .iter()
+        .filter(|message| message.contains("default_tags."))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cli.len(),
+        4,
+        "CLI must retain every provider/tag finding: {cli:#?}"
+    );
+    assert_eq!(
+        lsp.len(),
+        4,
+        "LSP must retain every provider/tag finding: {lsp:#?}"
+    );
+    for key in ["First", "Second", "Third", "Fourth"] {
+        let slot = format!("default_tags.{key}");
+        assert_eq!(
+            cli.iter().filter(|message| message.contains(&slot)).count(),
+            1,
+            "{cli:#?}"
+        );
+        assert_eq!(
+            lsp.iter()
+                .filter(|finding| finding.message.contains(&slot))
+                .count(),
+            1,
+            "{lsp:#?}"
+        );
+    }
+}
