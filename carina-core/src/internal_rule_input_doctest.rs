@@ -26,6 +26,8 @@ pub mod binding_index;
 mod binding_index_split_tests;
 pub mod builtins;
 pub mod config_loader;
+mod conversion;
+pub use conversion::{ConversionChannel, ConversionError, ConversionErrorKind, ConversionFindings};
 pub mod data_source_value;
 pub mod deps;
 pub mod desired;

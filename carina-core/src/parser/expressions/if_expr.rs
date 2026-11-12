@@ -231,8 +231,9 @@ pub(crate) fn parse_if_expr(
             &condition_value,
             condition_source,
         );
-    let decision = decide_if_condition(&condition_value, ctx.config)
-        .map_err(|error| error.into_parse_error(condition_line))?;
+    let decision = decide_if_condition(&condition_value, ctx.config).map_err(|error| {
+        ctx.conversion_boundary_error(&condition_token, error.into_parse_error(condition_line))
+    })?;
     if let Some(selected) = decision {
         ctx.record_selected_condition(&condition_token, selected);
     }
@@ -509,8 +510,9 @@ pub(crate) fn parse_if_value_expr_with_mode(
             &condition_value,
             condition_source,
         );
-    let decision = decide_if_condition(&condition_value, ctx.config)
-        .map_err(|error| error.into_parse_error(condition_line))?;
+    let decision = decide_if_condition(&condition_value, ctx.config).map_err(|error| {
+        ctx.conversion_boundary_error(&condition_token, error.into_parse_error(condition_line))
+    })?;
     if let Some(selected) = decision {
         ctx.record_selected_condition(&condition_token, selected);
     }

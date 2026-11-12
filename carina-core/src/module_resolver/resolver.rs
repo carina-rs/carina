@@ -510,6 +510,7 @@ impl ResidualModuleResolutionError {
                 | ParseError::SecretInConstraint { .. }
                 | ParseError::ValueWalk(_)
                 | ParseError::UserFunctionError(_)
+                | ParseError::CheckedConversion(_)
                 | ParseError::RetainedEvidence(_) => false,
             },
             ModuleError::ParseInFile { path, error } => {

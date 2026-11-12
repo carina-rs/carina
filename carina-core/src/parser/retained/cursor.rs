@@ -89,6 +89,7 @@ fn fresh_identity() -> u64 {
 pub enum EdgeRole {
     SlotRoot,
     Parens,
+    ConvertOperand,
     IfBranch,
     CoalesceOperand,
     AliasDefinition,
@@ -110,6 +111,7 @@ pub enum EdgeRole {
 pub(crate) enum AuthoredForm {
     Forward,
     Parens,
+    Convert,
     Definition,
     Binding,
     Reference,
@@ -319,7 +321,7 @@ impl<'s, B: BindingAddress> JudgedNodeRef<'s, B> {
         self.node.location.clone()
     }
 
-    pub(in crate::parser::retained) fn kind(&self) -> &ExprKind<B> {
+    pub(crate) fn kind(&self) -> &ExprKind<B> {
         &self.node.kind
     }
 }
@@ -342,9 +344,14 @@ pub struct AuthoredUse<'s, B: BindingAddress = RelativeBindingName> {
     instance: ExpansionInstanceId,
     edge: EdgeRole,
     visit: ProjectionVisit,
+    definition_only: bool,
+    restriction: Option<EdgeRole>,
 }
 
 impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
+    pub(crate) fn definition_only(&self) -> bool {
+        self.definition_only
+    }
     pub fn edge(&self) -> EdgeRole {
         self.edge
     }
@@ -353,6 +360,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
         match self.node.kind() {
             ExprKind::Alias | ExprKind::Sink(_) | ExprKind::Sequence => AuthoredForm::Forward,
             ExprKind::Parens => AuthoredForm::Parens,
+            ExprKind::Convert { .. } => AuthoredForm::Convert,
             ExprKind::Definition => AuthoredForm::Definition,
             ExprKind::Binding(_) => AuthoredForm::Binding,
             ExprKind::Reference { .. } => AuthoredForm::Reference,
@@ -442,7 +450,9 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
                 ),
                 instance: self.instance,
                 edge: EdgeRole::AliasDefinition,
+                restriction: self.inherited_restriction(),
                 visit: ProjectionVisit::Value,
+                definition_only: self.definition_only,
             }
             .canonical()?,
         ))
@@ -457,6 +467,10 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             AuthoredForm::Forward if self.child_count() != 0 => AuthoredNavigation::Forward {
                 child: self.child(self.child_count() - 1, self.edge())?,
                 authored: !matches!(self.node.kind(), ExprKind::Alias),
+            },
+            AuthoredForm::Convert => AuthoredNavigation::Forward {
+                child: self.child(0, EdgeRole::ConvertOperand)?,
+                authored: true,
             },
             AuthoredForm::Parens => AuthoredNavigation::Forward {
                 child: self.parens_operand()?,
@@ -605,9 +619,37 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             },
             instance: self.instance,
             edge,
+            restriction: self.inherited_restriction(),
             visit: ProjectionVisit::Value,
+            definition_only: self.definition_only,
         }
         .canonical()
+    }
+
+    pub(crate) fn placement_edge(&self) -> EdgeRole {
+        self.restriction.unwrap_or(self.edge)
+    }
+    fn inherited_restriction(&self) -> Option<EdgeRole> {
+        self.restriction.or(match self.edge {
+            EdgeRole::SecretArgument
+            | EdgeRole::ConvertOperand
+            | EdgeRole::InterpolationPart
+            | EdgeRole::CallArgument
+            | EdgeRole::ArithmeticOperand
+            | EdgeRole::AccessBase
+            | EdgeRole::AccessIndex
+            | EdgeRole::MapKey
+            | EdgeRole::Condition => Some(self.edge),
+            EdgeRole::SlotRoot
+            | EdgeRole::Parens
+            | EdgeRole::IfBranch
+            | EdgeRole::CoalesceOperand
+            | EdgeRole::AliasDefinition
+            | EdgeRole::ListItem
+            | EdgeRole::MapValue
+            | EdgeRole::StructField
+            | EdgeRole::SequenceResult => None,
+        })
     }
 
     pub fn node(&self) -> &JudgedNodeRef<'s, B> {
@@ -952,6 +994,8 @@ impl<B: BindingAddress> JudgedSlot<B> {
             instance: self.instance,
             edge: EdgeRole::SlotRoot,
             visit: ProjectionVisit::Value,
+            definition_only: false,
+            restriction: None,
         }
         .canonical()
     }
@@ -997,6 +1041,7 @@ impl<B: BindingAddress> JudgedSlot<B> {
 /// Ordinary compatibility checks have no authority to reach these slots.
 #[derive(Debug, Clone)]
 pub struct NoAuthoredEvidence {
+    contains_conversion: bool,
     resource: crate::resource::ResourceId,
     slots: Vec<UnreachedSlot>,
 }
@@ -1013,6 +1058,14 @@ impl NoAuthoredEvidence {
         let resource = source.id();
         let slots = source.authored_slots();
         Self {
+            contains_conversion: slots.is_some_and(|slots| {
+                slots.slots.values().any(|slot| {
+                    slot.root.first_conversion.is_some()
+                        || slot
+                            .cursor()
+                            .is_ok_and(|usage| usage.node().judgement().contains_any_conversion())
+                })
+            }),
             resource: resource.clone(),
             slots: slots
                 .into_iter()
@@ -1031,6 +1084,9 @@ impl NoAuthoredEvidence {
                 })
                 .collect(),
         }
+    }
+    pub(crate) fn contains_conversion(&self) -> bool {
+        self.contains_conversion
     }
     pub fn resource_id(&self) -> &crate::resource::ResourceId {
         &self.resource
@@ -1121,8 +1177,18 @@ impl<B: BindingAddress> ExpressionReport<B> {
                 ProjectionGeneration,
             )>,
             report: &mut CompletenessReport<'s, B>,
+            active: &mut std::collections::HashSet<(NodeId, super::ExpressionEnvironmentId)>,
         ) -> Result<(), MissingEvidence> {
-            let usage = usage.canonical()?;
+            let mut usage = usage.canonical()?;
+            if matches!(
+                usage.node.node.kind,
+                ExprKind::Function { .. }
+                    | ExprKind::ProviderDeclaration
+                    | ExprKind::ModuleCall
+                    | ExprKind::Declaration
+            ) {
+                usage.definition_only = false;
+            }
             if !seen.insert((
                 usage.node.node.id,
                 usage.occurrence,
@@ -1135,16 +1201,27 @@ impl<B: BindingAddress> ExpressionReport<B> {
             if !coverage.reached(&usage) {
                 report.unreached.push(usage.clone());
             }
-            // Attribute slots supply their own per-instance roots. Do not
-            // manufacture a second use for the enclosing resource declaration.
-            if matches!(usage.node.node.kind, ExprKind::Resource { .. }) {
+            let active_node = (usage.node.node.id, usage.node.environment.id());
+            if !active.insert(active_node) {
+                // Reference cycles do not create infinitely many qualifying
+                // uses. Inference owns their existing diagnostic.
                 return Ok(());
             }
+            // Attribute slots supply their own per-instance roots. Do not
+            // manufacture a second use for the enclosing resource declaration.
+
             if let Some(definition) = usage.definition()? {
-                visit(definition, coverage, seen, report)?;
+                visit(definition, coverage, seen, report, active)?;
+            }
+            if matches!(usage.node.node.kind, ExprKind::Resource { .. })
+                && usage.node.node.first_conversion.is_none()
+            {
+                active.remove(&active_node);
+                return Ok(());
             }
             let role = match &usage.node.node.kind {
                 ExprKind::Parens => EdgeRole::Parens,
+                ExprKind::Convert { .. } => EdgeRole::ConvertOperand,
                 ExprKind::Definition => EdgeRole::AliasDefinition,
                 ExprKind::Secret => EdgeRole::SecretArgument,
                 ExprKind::List => EdgeRole::ListItem,
@@ -1158,13 +1235,39 @@ impl<B: BindingAddress> ExpressionReport<B> {
                 _ => usage.edge,
             };
             for index in 0..usage.child_count() {
-                let child = if matches!(usage.navigation()?, AuthoredNavigation::Parts) {
+                // Attribute slots own their inputs; resource-local initializers
+                // remain definition-only completeness roots, including dead lets.
+                if matches!(usage.node.node.kind, ExprKind::Resource { .. })
+                    && (matches!(
+                        usage.node.node.children[index].authored.kind,
+                        ExprKind::Sink(_) | ExprKind::NestedBlock { .. }
+                    ) || usage.node.node.children[index]
+                        .authored
+                        .first_conversion
+                        .is_none())
+                {
+                    continue;
+                }
+                let mut child = if matches!(usage.navigation()?, AuthoredNavigation::Parts) {
                     usage.part(index)?
                 } else {
                     usage.child(index, role)?
                 };
-                visit(child, coverage, seen, report)?;
+                if matches!(usage.node.node.kind, ExprKind::Resource { .. }) {
+                    if coverage.has_node(child.node.node.id, &child.node.environment) {
+                        continue;
+                    }
+                    child.definition_only = true;
+                }
+                if matches!(usage.node.node.kind, ExprKind::If) && index == 0 {
+                    child.edge = EdgeRole::Condition;
+                }
+                if matches!(usage.node.node.kind, ExprKind::Sink(_)) && index == 1 {
+                    child.edge = EdgeRole::MapKey;
+                }
+                visit(child, coverage, seen, report, active)?;
             }
+            active.remove(&active_node);
             Ok(())
         }
         let mut report = CompletenessReport {
@@ -1199,6 +1302,8 @@ impl<B: BindingAddress> ExpressionReport<B> {
                 instance: root.instance,
                 edge: EdgeRole::SlotRoot,
                 visit: ProjectionVisit::Value,
+                definition_only: root.definition,
+                restriction: None,
             };
             let usage = match usage.canonical() {
                 Ok(usage) => usage,
@@ -1210,7 +1315,13 @@ impl<B: BindingAddress> ExpressionReport<B> {
             if root.definition && coverage.has_node(usage.node.node.id, &root.environment) {
                 continue;
             }
-            if let Err(error) = visit(usage, coverage, &mut seen, &mut report) {
+            if let Err(error) = visit(
+                usage,
+                coverage,
+                &mut seen,
+                &mut report,
+                &mut Default::default(),
+            ) {
                 report.missing.push(error);
             }
         }

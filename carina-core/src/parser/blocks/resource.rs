@@ -6,9 +6,7 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use crate::eval_value::{EvalValue, ParsedSinkValue, UnexpandedStructuralHandleKind};
-use crate::parser::context::{
-    ExpressionMode, ParseContext, extract_key_string, first_inner, next_pair,
-};
+use crate::parser::context::{ExpressionMode, ParseContext, first_inner, next_pair};
 use crate::parser::error::ParseError;
 use crate::parser::util::expression_is_plain_string_literal;
 use crate::parser::{BoundDeferredTarget, Rule};
@@ -263,7 +261,7 @@ fn parse_block_contents_with_quoted(
                         let key_pair =
                             next_pair(&mut attr_inner, "attribute name", "block content")?;
                         let key_span = key_pair.as_span();
-                        let key = extract_key_string(key_pair)?;
+                        let key = ctx.key_string(key_pair)?;
                         reject_reserved_resource_attribute(
                             &key,
                             key_span,
@@ -334,7 +332,7 @@ fn parse_block_contents_with_quoted(
                 let mut attr_inner = content_pair.into_inner();
                 let key_pair = next_pair(&mut attr_inner, "attribute name", "block content")?;
                 let key_span = key_pair.as_span();
-                let key = extract_key_string(key_pair)?;
+                let key = ctx.key_string(key_pair)?;
                 reject_reserved_resource_attribute(&key, key_span, reserved_attribute_names)?;
                 let value_pair = next_pair(&mut attr_inner, "attribute value", "block content")?;
                 record_quoted_if_literal(quoted_out, &key, &value_pair);

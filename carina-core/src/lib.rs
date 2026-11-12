@@ -28,10 +28,7 @@ mod binding_index_split_tests;
 pub mod builtins;
 pub mod config_loader;
 mod conversion;
-pub use conversion::{
-    ConversionError, ConversionErrorKind, ConversionTypePath, DeclarationBounds, resolve_target,
-    scalar_kind, source_declarations,
-};
+pub use conversion::{ConversionChannel, ConversionError, ConversionErrorKind, ConversionFindings};
 pub mod data_source_value;
 pub mod deps;
 pub mod desired;

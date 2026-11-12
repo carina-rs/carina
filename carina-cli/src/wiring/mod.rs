@@ -3152,6 +3152,19 @@ pub fn validate_resources_with_ctx<
     errors
 }
 
+fn conversion_diagnostics(findings: carina_core::ConversionFindings) -> Vec<AppError> {
+    let (conversions, ordinary) = findings.into_parts();
+    conversions
+        .into_iter()
+        .map(|error| AppError::CheckedConversion { error })
+        .chain(
+            ordinary
+                .into_iter()
+                .flat_map(|message| split_validation_message(&message)),
+        )
+        .collect()
+}
+
 /// Shared authored admission pass; callers supply their enriched binding index.
 pub fn validate_resource_admissions_with_ctx<
     E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
@@ -3172,6 +3185,9 @@ pub fn validate_resource_admissions_with_ctx<
         Ok(()) => Vec::new(),
         Err(validation::ResourceRefTypeValidationError::Validation(message)) => {
             split_validation_message(&message)
+        }
+        Err(validation::ResourceRefTypeValidationError::Conversions(findings)) => {
+            conversion_diagnostics(findings)
         }
         Err(validation::ResourceRefTypeValidationError::AnalysisInvariant(error)) => {
             vec![AppError::AnalysisInvariant(error)]
@@ -3262,6 +3278,9 @@ pub fn validate_resource_ref_types_with_ctx<
             Ok(()) => Vec::new(),
             Err(validation::ResourceRefTypeValidationError::Validation(message)) => {
                 split_validation_message(&message)
+            }
+            Err(validation::ResourceRefTypeValidationError::Conversions(findings)) => {
+                conversion_diagnostics(findings)
             }
             Err(validation::ResourceRefTypeValidationError::AnalysisInvariant(error)) => {
                 vec![AppError::AnalysisInvariant(error)]
@@ -4808,6 +4827,9 @@ pub(crate) fn validate_module_internal_ref_types(
             match joined {
                 validation::ResourceRefTypeValidationError::Validation(message) => {
                     errors.extend(prefixed_validation_messages(&message, &prefix))
+                }
+                validation::ResourceRefTypeValidationError::Conversions(findings) => {
+                    errors.extend(conversion_diagnostics(findings))
                 }
                 validation::ResourceRefTypeValidationError::AnalysisInvariant(error) => {
                     errors.push(AppError::AnalysisInvariant(error))

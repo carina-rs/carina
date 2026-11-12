@@ -1589,6 +1589,8 @@ impl DiagnosticRun<'_> {
             // Every schema finding is anchored by the sealed parser view,
             // including the semantic per-file fallback after a buffer parse fails.
             let mut authored_coverage = carina_core::validation::admission::WalkCoverage::default();
+            let mut conversion_findings = carina_core::ConversionFindings::default();
+            let mut admitted_resources = HashSet::new();
             for (resource_index, rref) in tree.project_resources().enumerate() {
                 let resource_id = rref.id();
                 let resource_attributes = rref.attributes();
@@ -1766,6 +1768,8 @@ impl DiagnosticRun<'_> {
                         .unwrap_or_else(|| carina_core::validation::admission::attributes::resource_attribute_admissions(
                             admission_resource, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, evaluated_inputs, &binding_index, self.provider_context, &self.schemas, &mut authored_coverage,
                         ));
+                    admitted_resources.insert(admission_resource.id().clone());
+                    conversion_findings.extend(value_validation.take_conversions());
                     // Attribute rendering consumes its report entries. Preserve
                     // core's diagnostic ownership before taking those entries.
                     let resource_diagnostic_errors = value_validation
@@ -2292,6 +2296,27 @@ impl DiagnosticRun<'_> {
                 }
             }
 
+            if let Some(authored_tree) = &authored_tree {
+                for resource in authored_tree
+                    .project_resources()
+                    .filter(|resource| !admitted_resources.contains(resource.id()))
+                {
+                    let findings = carina_core::validation::admission::attributes::unrendered_resource_conversion_admissions(resource, pre_expansion_configuration.judged(), &binding_index, self.provider_context, &mut authored_coverage);
+                    conversion_findings.extend(findings);
+                }
+            }
+            conversion_findings
+                .extend(expression_report.conversion_completeness(&authored_coverage));
+            for error in conversion_findings.into_parts().0 {
+                let finding = carina_core::parser::Located::new(error.location().clone(), error);
+                diagnostics.extend(render_merged(
+                    doc,
+                    &finding,
+                    DiagnosticSeverity::ERROR,
+                    finding.detail().diagnostic_message(),
+                ));
+            }
+
             // Check the current buffer's attributes against directory-wide
             // binding authority while keeping diagnostics owned by this file.
             diagnostics.extend(self.check_attributes_blocks(
@@ -2760,6 +2785,7 @@ fn is_duplicate_list_error(error: &TypeError) -> bool {
             alternatives: _,
         }
         | TypeError::UnionAlternativesMismatch { failures: _ }
+        | TypeError::Conversion { .. }
         | TypeError::BlockSyntaxNotAllowed { attribute: _ } => false,
     }
 }

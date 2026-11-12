@@ -142,10 +142,28 @@ pub mod attributes;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod conversion_review_tests;
+
 pub use crate::schema::value_validation::WalkCoverage;
 use assignment::AssignmentVerdict;
 pub(crate) use assignment::LocalPath;
 pub use assignment::{AssignmentProof, ReferenceCandidate, SchemaObligation};
+
+pub(crate) fn conversion_local<K: DestinationKind, B: BindingAddress>(
+    matched: crate::parser::retained::MatchedConversionSource,
+    usage: &crate::parser::retained::AuthoredUse<'_, B>,
+    declaration: &CompiledAttributeType,
+    path: &LeafPath,
+) -> Result<crate::schema::value_validation::AssignmentFindings, TypeError> {
+    matched.consume(usage, declaration)?;
+    let mut findings = crate::schema::value_validation::AssignmentFindings::default();
+    match K::defer_reference_check(path) {
+        Some(local) => findings.local.push(local),
+        None => findings.schema.require_reference(),
+    }
+    Ok(findings)
+}
 
 mod sealed {
     pub trait Sealed: Sized {
@@ -373,7 +391,10 @@ struct CandidateObligations {
 enum AdmissionProof<'a, P: PlaceholderKind, B: BindingAddress> {
     Validation(crate::resource::knowledge::Classification<'a, P, B>),
     Plan(PlanResolved<'a, P, B>),
-    Apply(KnownValue<'a, P, B>),
+    Apply {
+        known: KnownValue<'a, P, B>,
+        phase: crate::parser::retained::ProjectedPhase,
+    },
 }
 
 /// Main's ordinary assignment work requires a current, expression-origin value.
@@ -387,6 +408,7 @@ type OrdinaryAssignmentCheck<'a, P, B> =
     ) -> Result<crate::schema::value_validation::AssignmentFindings, TypeError>;
 
 struct AssignmentChecks<'a, P: PlaceholderKind, B: BindingAddress> {
+    #[cfg(test)]
     authored: Option<crate::schema::value_validation::AssignmentCheck<'a, P, B>>,
     ordinary: Option<OrdinaryAssignmentCheck<'a, P, B>>,
 }
@@ -394,6 +416,7 @@ struct AssignmentChecks<'a, P: PlaceholderKind, B: BindingAddress> {
 impl<P: PlaceholderKind, B: BindingAddress> Default for AssignmentChecks<'_, P, B> {
     fn default() -> Self {
         Self {
+            #[cfg(test)]
             authored: None,
             ordinary: None,
         }
@@ -410,6 +433,7 @@ pub struct AdmissionContext<
     bindings: Option<&'a BindingIndex<'a, B>>,
     provider: &'a dyn ProviderTypeCheckContext,
     assignment: AssignmentChecks<'a, P, B>,
+    scope: crate::schema::value_validation::AssignmentScope,
     cursor: crate::parser::retained::AuthoredCursor<'a, B>,
     coverage: std::cell::RefCell<crate::schema::value_validation::WalkCoverage>,
     untyped: Option<&'a dyn Fn() -> Vec<TypeError>>,
@@ -468,7 +492,10 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
         let proof = Self::known_at_apply(proof)?;
         Ok(Self::paired(
             proof.to_value(),
-            AdmissionProof::Apply(proof),
+            AdmissionProof::Apply {
+                known: proof,
+                phase,
+            },
             None,
             provider,
             crate::parser::retained::AuthoredCursor::projected(phase),
@@ -503,10 +530,14 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
         let proof = Self::known_at_apply(proof)?;
         let context = AdmissionContext {
             identity: obligations.identity,
-            proof: AdmissionProof::Apply(proof.clone()),
+            proof: AdmissionProof::Apply {
+                known: proof.clone(),
+                phase,
+            },
             bindings: None,
             provider,
             assignment: Default::default(),
+            scope: crate::schema::value_validation::AssignmentScope::Full,
             cursor: crate::parser::retained::AuthoredCursor::projected(phase),
             coverage: Default::default(),
             untyped: None,
@@ -545,6 +576,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
                 bindings,
                 provider,
                 assignment: Default::default(),
+                scope: crate::schema::value_validation::AssignmentScope::Full,
                 cursor,
                 coverage: Default::default(),
                 untyped: None,
@@ -615,11 +647,11 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> AdmissionContext<'a, P, B> {
         match &self.proof {
             AdmissionProof::Validation(proof) => proof.sites().collect(),
             AdmissionProof::Plan(proof) => proof.knowledge().sites().collect(),
-            AdmissionProof::Apply(_) => vec![],
+            AdmissionProof::Apply { .. } => vec![],
         }
     }
     fn is_apply(&self) -> bool {
-        matches!(self.proof, AdmissionProof::Apply(_))
+        matches!(self.proof, AdmissionProof::Apply { .. })
     }
 }
 
@@ -746,14 +778,24 @@ pub struct AdmissionFinding {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdmissionFindings {
     findings: Vec<AdmissionFinding>,
+    conversions: crate::ConversionChannel,
 }
 // TypeError carries diagnostic metadata, not floating-point values or schema
 // callbacks. Its structural equality is reflexive, including protected errors.
 impl Eq for AdmissionFindings {}
-impl std::error::Error for AdmissionFindings {}
+impl std::error::Error for AdmissionFindings {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        if self.conversions.findings().is_empty() {
+            self.findings.first().map(|finding| &finding.error as _)
+        } else {
+            Some(&self.conversions)
+        }
+    }
+}
 impl crate::resource::InsideSecret for AdmissionFindings {
     fn inside_secret(self) -> Self {
         Self {
+            conversions: self.conversions.inside_secret(),
             findings: self
                 .findings
                 .into_iter()
@@ -768,6 +810,9 @@ impl crate::resource::InsideSecret for AdmissionFindings {
 impl AdmissionFindings {
     pub fn findings(&self) -> &[AdmissionFinding] {
         &self.findings
+    }
+    pub fn conversions(&self) -> &crate::ConversionChannel {
+        &self.conversions
     }
 }
 impl std::fmt::Display for AdmissionFindings {
@@ -791,6 +836,12 @@ impl std::fmt::Display for AdmissionFindings {
             } else {
                 write!(f, "{}: {}", finding.path, finding.error)?;
             }
+        }
+        if !self.conversions.findings().is_empty() {
+            if !self.findings.is_empty() {
+                f.write_str("; ")?;
+            }
+            write!(f, "{}", self.conversions)?;
         }
         Ok(())
     }
@@ -872,7 +923,17 @@ fn join(root: &LeafPath, relative: &LeafPath) -> LeafPath {
     LeafPath::from_segments(root.segments().iter().chain(relative.segments()).cloned())
 }
 fn constraints(findings: Vec<AdmissionFinding>) -> AdmissionErrors {
-    ResolutionError::AdmissionConstraints(Box::new(AdmissionFindings { findings })).into()
+    constraints_with_conversions(findings, Default::default())
+}
+fn constraints_with_conversions(
+    findings: Vec<AdmissionFinding>,
+    conversions: crate::ConversionChannel,
+) -> AdmissionErrors {
+    ResolutionError::AdmissionConstraints(Box::new(AdmissionFindings {
+        findings,
+        conversions,
+    }))
+    .into()
 }
 
 impl AdmissionErrors {

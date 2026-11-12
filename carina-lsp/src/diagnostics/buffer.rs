@@ -226,6 +226,23 @@ pub(super) fn parse_error_message(error: &ParseError) -> String {
 
 fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
     match error {
+        ParseError::CheckedConversion(error) => {
+            let span = error.location().span();
+            carina_diagnostic_range(
+                Range::new(
+                    Position::new(
+                        span.start_line().saturating_sub(1) as u32,
+                        span.start_column().saturating_sub(1) as u32,
+                    ),
+                    Position::new(
+                        span.end_line().saturating_sub(1) as u32,
+                        span.end_column().saturating_sub(1) as u32,
+                    ),
+                ),
+                DiagnosticSeverity::ERROR,
+                error.diagnostic_message(),
+            )
+        }
         ParseError::Located { error, .. } => parse_error_to_diagnostic(error),
         ParseError::AtElement(finding) => parse_error_to_diagnostic(finding.detail()),
         ParseError::Syntax(pest_error) => {

@@ -16,6 +16,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct ResourceAttributeInputs<B: BindingAddress> {
     owner: ResourceId,
+    pub(super) scope: crate::schema::value_validation::AssignmentScope,
     report: Option<Arc<crate::parser::retained::ExpressionReport<B>>>,
     inputs: IndexMap<String, StoredInput<B>>,
     evidence: ResourceEvidence,
@@ -143,6 +144,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     {
         Self {
             owner: resource.id().clone(),
+            scope: crate::schema::value_validation::AssignmentScope::Full,
             evidence: ResourceEvidence::NoAuthoredEvidence(Arc::new(unchecked)),
             report: Some(Arc::new(report.clone())),
             inputs: values
@@ -263,6 +265,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             .collect();
         Self {
             owner: resource.id().clone(),
+            scope: crate::schema::value_validation::AssignmentScope::Full,
             report: None,
             inputs,
             evidence: ResourceEvidence::Slots,

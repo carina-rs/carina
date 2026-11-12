@@ -1414,6 +1414,13 @@ pub enum AppError {
         >,
     ),
 
+    /// The location is context; the typed source renders its message once.
+    #[error("{}:{}:{}:", .error.location().file().path().display(), .error.location().span().start_line(), .error.location().span().start_column())]
+    CheckedConversion {
+        #[source]
+        error: carina_core::ConversionError,
+    },
+
     /// Validation errors (schema mismatch, invalid config, etc.)
     #[error("{0}")]
     Validation(String),

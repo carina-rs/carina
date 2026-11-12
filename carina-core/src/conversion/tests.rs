@@ -335,6 +335,7 @@ where
         let bare = crate::validation::check_expanded_bare_binding_uses(&context);
         findings.extend(bare.findings().iter().map(|e| finding(e)));
         let mut resources = Vec::new();
+        let mut conversions = ConversionFindings::default();
         for resource in tree
             .resources()
             .filter(|resource| resource.kind() != crate::parser::AnalysisItemKind::Composition)
@@ -358,7 +359,7 @@ where
                 schemas,
                 &mut coverage,
             );
-            let local = admitted
+            let mut local = admitted
                 .errors()
                 .chain(admitted.symbolic_errors().map(|(_, _, error)| error))
                 .map(|e| finding(e))
@@ -367,6 +368,14 @@ where
                 conversion: error.conversion.clone(),
                 rendered: error.rendered.clone(),
             }));
+            local.extend(
+                admitted
+                    .conversions()
+                    .findings()
+                    .iter()
+                    .map(|error| finding(error)),
+            );
+            conversions.extend(admitted.into_conversions());
             let label = match attributes.get("plain") {
                 Some(Value::Concrete(ConcreteValue::String(label))) => label
                     .diagnostic_literal()
@@ -376,6 +385,7 @@ where
             };
             resources.push((label, local));
         }
+        findings.extend(conversions.findings().iter().map(|error| finding(error)));
         // Also require the CLI's public aggregate admission entry point to
         // agree. It currently renders errors into strings; keep the structured
         // findings above for kind/location and diagnostic-ownership assertions.
@@ -702,65 +712,15 @@ fn conversion_rb1_converted_alias_enters_the_selected_data_source_attribute() ->
     Ok(())
 }
 
-struct ConfigFactory;
-
-impl crate::provider::ProviderFactory for ConfigFactory {
-    fn name(&self) -> &str {
-        "mock"
-    }
-    fn display_name(&self) -> &str {
-        "mock"
-    }
-    fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-        crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
-            "endpoint".into(),
-            named(),
-        )]))
-        .expect("typed provider-config fixture")
-    }
-    fn validate_config(
-        &self,
-        _: &crate::provider::CanonicalProviderConfigAttributes,
-        _: &crate::provider::ProviderValidationInputs,
-    ) -> crate::provider::ProviderResult<()> {
-        Ok(())
-    }
-    fn create_provider(
-        &self,
-        _: &crate::provider::ProviderSession,
-        _: crate::provider::InitializeOutcomeMint,
-    ) -> crate::provider::BoxFuture<
-        '_,
-        crate::provider::ProviderResult<crate::provider::ProviderInitialization>,
-    > {
-        Box::pin(async {
-            Err(crate::provider::ProviderError::internal(
-                "validation-only fixture",
-            ))
-        })
-    }
-    fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
-        Vec::new()
-    }
-    fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
-        crate::schema::ValidatedProviderSchemaWitness::new(
-            self.schemas(),
-            self.provider_config_attribute_types(),
-            Default::default(),
-            vec![],
-        )
-        .expect("provider-config fixture witness")
-    }
-}
-
 #[test]
-fn conversion_rb1_provider_config_uses_its_independently_typed_destination() -> TestResult {
+fn conversion_rb1_provider_config_is_a_boundary_placeholder_until_b2() -> TestResult {
     let fixture = Fixture::string();
     let source = "provider mock { endpoint = 'ok' as mock.Name }";
-    fixture.check(source)?.assert_accepted();
-    let parsed = crate::parser::parse_file(source, Path::new("conversion.crn"), &fixture.catalog)
-        .map_err(|e| format!("normal parse rejected authored source: {e}"))?;
-    crate::validation::validate_provider_config(&parsed, &[Box::new(ConfigFactory)])
+    fixture.check(source)?.assert_findings(&[(
+        ConversionErrorKind::UnsupportedPosition,
+        site(source, "'ok' as"),
+    )]);
+    Ok(())
 }
 
 #[test]

@@ -144,6 +144,8 @@ pub enum NotInferableReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InferenceError {
+    #[error("{0}")]
+    Conversion(#[source] crate::conversion::ConversionError),
     #[error("{}", crate::resource::INSIDE_SECRET_MESSAGE)]
     InsideSecret {},
     #[error("Type mismatch: {types} (from {})", crate::schema::SECRET_VALUE_MASK)]
@@ -186,6 +188,7 @@ pub enum InferenceError {
 impl crate::resource::InsideSecret for InferenceError {
     fn inside_secret(self) -> Self {
         match self {
+            Self::Conversion(error) => Self::Conversion(error.inside_secret()),
             error @ (Self::InsideSecret {}
             | Self::SecretAssignmentMismatch { .. }
             | Self::HeterogeneousCollection { .. }

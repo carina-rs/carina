@@ -1652,6 +1652,16 @@ impl LocatedParseError {
     }
 
     fn render(&self, fallback: &Path) -> String {
+        if let Some(error) = crate::ConversionError::from_error(self.error.as_ref()) {
+            let location = error.location();
+            return format!(
+                "{}:{}:{}: {}",
+                location.file().path().display(),
+                location.span().start_line(),
+                location.span().start_column(),
+                crate::executor::render_error_chain(error),
+            );
+        }
         if let Some(finding) = self.error.element_diagnostic() {
             let location = finding.location();
             let span = location.span();

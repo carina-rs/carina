@@ -16,6 +16,8 @@ use pest::iterators::{Pair, Pairs};
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 #[cfg(test)]
+mod conversion_tests;
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]
@@ -46,6 +48,10 @@ fn record_projection_copy(value: &Value<ParserPlaceholder, RelativeBindingName>)
     PROJECTION_COPY_WORK.update(|work| work + size(value));
 }
 
+mod conversion;
+pub(crate) use conversion::check as check_conversion;
+pub use conversion::{ConversionJudgement, MatchedConversionSource};
+
 mod cursor;
 pub use cursor::{
     AuthoredCursor, AuthoredSlots, AuthoredUse, CompletenessReport, EdgeRole, ExpansionInstanceId,
@@ -53,6 +59,14 @@ pub use cursor::{
     SlotDeclarationId, UnreachedSlot, UseId,
 };
 pub(crate) use cursor::{AuthoredForm, AuthoredNavigation, CursorKind, SyntheticSource};
+
+/// The existing authored walk owns source diagnostics for expressions that
+/// require its policy. This is diagnostic ownership, not an admission proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindingDiagnosticOwner {
+    OrdinarySource,
+    AuthoredExpression,
+}
 
 /// The expansion scope is part of expression identity, even when two module
 /// instances originate at the same authored source location.
@@ -273,7 +287,46 @@ struct AuthoredExpr<P: ValueKind, B: BindingAddress> {
     definition_use: UseId,
     location: ExpressionLocation,
     kind: ExprKind<B>,
+    first_conversion: Option<Arc<ConversionSite>>,
+    parse_ownership: ParseOwnership,
     children: Vec<ExprValue<P, B>>,
+}
+
+// Constant-size diagnostic summaries are computed while the parser constructs
+// each node. They are never admission authority or a syntax/value join.
+#[derive(Debug, Clone)]
+struct ConversionSite {
+    node: NodeId,
+    location: DeclarationLocation,
+}
+#[derive(Debug, Clone, Copy)]
+enum ParseOwnership {
+    Conversion,
+    Covered,
+    Ordinary,
+}
+impl<P: ValueKind, B: BindingAddress> AuthoredExpr<P, B> {
+    fn parse_failure(&self, ordinary: super::ParseError) -> super::ParseError {
+        if crate::conversion::ConversionError::from_error(&ordinary).is_some() {
+            return ordinary;
+        }
+        let kind = match self.parse_ownership {
+            ParseOwnership::Conversion => crate::conversion::ConversionErrorKind::Source,
+            ParseOwnership::Covered => crate::conversion::ConversionErrorKind::UnsupportedPosition,
+            ParseOwnership::Ordinary => return ordinary,
+        };
+        match &self.first_conversion {
+            Some(site) => super::ParseError::CheckedConversion(
+                crate::conversion::ConversionError::parse_failure(
+                    kind,
+                    &site.location,
+                    site.node,
+                    ordinary,
+                ),
+            ),
+            None => ordinary,
+        }
+    }
 }
 
 type AuthoredNodes<B> =
@@ -303,7 +356,10 @@ impl<P: ValueKind, B: BindingAddress> std::fmt::Debug for AuthoredExpr<P, B> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum ExprKind<B: BindingAddress> {
+pub(crate) enum ExprKind<B: BindingAddress> {
+    Convert {
+        target: Box<Located<crate::conversion::ConversionTypePath>>,
+    },
     Scalar(TypeExpr),
     Parameter(TypeExpr),
     LoopSlot(TypeExpr),
@@ -361,7 +417,7 @@ enum ExprKind<B: BindingAddress> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct FunctionSignature {
+pub(crate) struct FunctionSignature {
     parameters: Vec<(String, Option<TypeExpr>)>,
     return_type: Option<TypeExpr>,
 }
@@ -396,6 +452,7 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
         }
         let authored = Arc::unwrap_or_clone(self.authored);
         let kind = match authored.kind {
+            ExprKind::Convert { target } => ExprKind::Convert { target },
             ExprKind::Binding(binding) => ExprKind::Binding(map(binding)),
             ExprKind::Reference {
                 binding,
@@ -455,6 +512,8 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
             definition_use: authored.definition_use,
             location: authored.location,
             kind,
+            first_conversion: authored.first_conversion,
+            parse_ownership: authored.parse_ownership,
             children: authored
                 .children
                 .into_iter()
@@ -503,7 +562,7 @@ pub(in crate::parser) fn evaluate(
                 &mut CapturedNodes::default(),
             )
         });
-    let value = reduce()?;
+    let value = reduce().map_err(|error| expression.authored.parse_failure(error))?;
     captures.record(&pair_for_record, value.clone());
     expression.payload = Projection::Value(value);
     Ok(expression)
@@ -528,7 +587,7 @@ pub(in crate::parser) fn evaluate_sink(
         ),
         None => return Err(MissingEvidence::new("live sink parser identity").into()),
     };
-    let payload = reduce()?;
+    let payload = reduce().map_err(|error| expression.authored.parse_failure(error))?;
     if let crate::eval_value::ParsedSinkValue::Ready(value) = &payload {
         captures.record(&pair_for_record, value.clone());
         expression.payload = Projection::Value(value.clone());
@@ -985,7 +1044,11 @@ impl Expressions {
                         out.definitions
                             .insert(RelativeBindingName::new(name), expression.clone());
                     }
-                    out.roots.push(expression);
+                    out.roots.push(if name == "_" {
+                        node(&pair, ExprKind::Definition, vec![expression], file, source)
+                    } else {
+                        expression
+                    });
                     continue;
                 }
             }
@@ -1004,15 +1067,78 @@ fn node(
     file: &PreprocessedFile,
     source: &Path,
 ) -> ExprValue {
+    node_at(
+        DeclarationLocation::expression_node(pair, file, source),
+        kind,
+        children,
+    )
+}
+
+fn node_at(
+    location: DeclarationLocation,
+    kind: ExprKind<RelativeBindingName>,
+    children: Vec<ExprValue>,
+) -> ExprValue {
+    let id = NodeId::fresh();
+    let first_conversion = if matches!(kind, ExprKind::Convert { .. }) {
+        Some(Arc::new(ConversionSite {
+            node: id,
+            location: location.clone(),
+        }))
+    } else {
+        children
+            .iter()
+            .find_map(|child| child.authored.first_conversion.clone())
+    };
+    let parse_ownership = match &kind {
+        ExprKind::Convert { .. } => ParseOwnership::Conversion,
+        ExprKind::Interpolation { .. }
+        | ExprKind::Call(_)
+        | ExprKind::Integer { .. }
+        | ExprKind::Access(_)
+        | ExprKind::DynamicAccess
+        | ExprKind::Secret => ParseOwnership::Covered,
+        ExprKind::Alias | ExprKind::Parens | ExprKind::Definition | ExprKind::Sink(_) => {
+            children.first().map_or(ParseOwnership::Ordinary, |child| {
+                child.authored.parse_ownership
+            })
+        }
+        ExprKind::Sequence => children.last().map_or(ParseOwnership::Ordinary, |child| {
+            child.authored.parse_ownership
+        }),
+        ExprKind::Scalar(_)
+        | ExprKind::Parameter(_)
+        | ExprKind::LoopSlot(_)
+        | ExprKind::UntypedParameter
+        | ExprKind::Binding(_)
+        | ExprKind::Reference { .. }
+        | ExprKind::List
+        | ExprKind::Map(_)
+        | ExprKind::NestedBlock { .. }
+        | ExprKind::EmptyInterpolation
+        | ExprKind::Coalesce
+        | ExprKind::Function { .. }
+        | ExprKind::Element
+        | ExprKind::Iterable
+        | ExprKind::Resource { .. }
+        | ExprKind::If
+        | ExprKind::For
+        | ExprKind::Wait
+        | ExprKind::Compose
+        | ExprKind::ModuleCall
+        | ExprKind::Boolean
+        | ExprKind::Declaration
+        | ExprKind::ProviderDeclaration
+        | ExprKind::Unsupported(_) => ParseOwnership::Ordinary,
+    };
     ExprValue {
         authored: Arc::new(AuthoredExpr {
-            id: NodeId::fresh(),
+            id,
             definition_use: UseId::fresh(),
-            location: ExpressionLocation::new(
-                ExpressionInstance::Root,
-                &DeclarationLocation::expression_node(pair, file, source),
-            ),
+            location: ExpressionLocation::new(ExpressionInstance::Root, &location),
             kind,
+            first_conversion,
+            parse_ownership,
             children,
         }),
         payload: Projection::Pending,
@@ -1042,6 +1168,10 @@ fn lower_blocks(children: Vec<ExprValue>) -> Vec<ExprValue> {
                     definition_use: UseId::fresh(),
                     location: ExpressionLocation::new(ExpressionInstance::Root, &headers[&name]),
                     kind: ExprKind::List,
+                    first_conversion: records
+                        .iter()
+                        .find_map(|child| child.authored.first_conversion.clone()),
+                    parse_ownership: ParseOwnership::Ordinary,
                     children: records,
                 }),
                 payload: Projection::Pending,
@@ -1059,6 +1189,8 @@ fn lower_blocks(children: Vec<ExprValue>) -> Vec<ExprValue> {
                         definition_use: UseId::fresh(),
                         location: ExpressionLocation::new(ExpressionInstance::Root, header),
                         kind: ExprKind::Sink(name.clone()),
+                        first_conversion: groups[name].authored.first_conversion.clone(),
+                        parse_ownership: ParseOwnership::Ordinary,
                         children: vec![groups[name].clone()],
                     }),
                     payload: Projection::Pending,
@@ -1127,6 +1259,39 @@ impl CapturedNodes {
     fn get(&self, key: &ParseNodeKey) -> Option<&ExprValue> {
         self.nodes.get(key)
     }
+    pub(in crate::parser) fn expression_failure(
+        &self,
+        pair: &Pair<'_, Rule>,
+        ordinary: super::ParseError,
+    ) -> super::ParseError {
+        match self.get(&ParseNodeKey::of(pair)) {
+            Some(expression) => expression.authored.parse_failure(ordinary),
+            None => ordinary,
+        }
+    }
+    pub(in crate::parser) fn boundary_failure(
+        &self,
+        pair: &Pair<'_, Rule>,
+        ordinary: super::ParseError,
+    ) -> super::ParseError {
+        if crate::conversion::ConversionError::from_error(&ordinary).is_some() {
+            return ordinary;
+        }
+        match self
+            .get(&ParseNodeKey::of(pair))
+            .and_then(|node| node.authored.first_conversion.as_ref())
+        {
+            Some(site) => super::ParseError::CheckedConversion(
+                crate::conversion::ConversionError::parse_failure(
+                    crate::conversion::ConversionErrorKind::UnsupportedPosition,
+                    &site.location,
+                    site.node,
+                    ordinary,
+                ),
+            ),
+            None => ordinary,
+        }
+    }
     pub(in crate::parser) fn node_id(&self, pair: &Pair<'_, Rule>) -> Option<NodeId> {
         self.get(&ParseNodeKey::of(pair)).map(ExprValue::node_id)
     }
@@ -1153,8 +1318,10 @@ impl CapturedNodes {
         let mut values = self.values.write().expect("retained projections lock");
         loop {
             values.insert(expression.node_id(), value.clone());
-            if matches!(expression.authored.kind, ExprKind::Alias | ExprKind::Parens)
-                && let [child] = expression.authored.children.as_slice()
+            if matches!(
+                expression.authored.kind,
+                ExprKind::Alias | ExprKind::Parens | ExprKind::Convert { .. }
+            ) && let [child] = expression.authored.children.as_slice()
             {
                 expression = child;
             } else {
@@ -1165,31 +1332,44 @@ impl CapturedNodes {
 }
 
 fn compile(
-    pair: Pair<'_, Rule>,
+    mut pair: Pair<'_, Rule>,
     file: &PreprocessedFile,
     source: &Path,
     scope: &HashMap<String, ExprValue>,
     captures: &mut CapturedNodes,
 ) -> ExprValue {
-    let key = ParseNodeKey::of(&pair);
-    if let Some(expression) = captures.get(&key) {
-        return expression.clone();
+    // Grammar forwarding is iterative. Deep authored alternatives must not
+    // multiply the Rust stack by every precedence/alias grammar level.
+    let mut wrappers = Vec::new();
+    let mut expression = loop {
+        let key = ParseNodeKey::of(&pair);
+        if let Some(expression) = captures.get(&key) {
+            break expression.clone();
+        }
+        if let Some(child) = forwarding_child(&pair) {
+            wrappers.push(pair);
+            pair = child;
+        } else {
+            let expression = compile_form(pair, file, source, scope, captures);
+            captures.insert(key, expression.clone());
+            break expression;
+        }
+    };
+    for pair in wrappers.into_iter().rev() {
+        let kind = if pair.as_rule() == Rule::primary && pair.as_str().trim_start().starts_with('(')
+        {
+            ExprKind::Parens
+        } else {
+            ExprKind::Alias
+        };
+        expression = node(&pair, kind, vec![expression], file, source);
+        captures.insert(ParseNodeKey::of(&pair), expression.clone());
     }
-    let expression = compile_form_entry(pair, file, source, scope, captures);
-    captures.insert(key, expression.clone());
     expression
 }
 
-fn compile_form_entry(
-    pair: Pair<'_, Rule>,
-    file: &PreprocessedFile,
-    source: &Path,
-    scope: &HashMap<String, ExprValue>,
-    captures: &mut CapturedNodes,
-) -> ExprValue {
-    // Keep pass-through grammar levels off the large form compiler's stack.
-    // Each still receives its authored location and its own checked evidence.
-    if matches!(
+fn forwarding_child<'i>(pair: &Pair<'i, Rule>) -> Option<Pair<'i, Rule>> {
+    let forwarding = matches!(
         pair.as_rule(),
         Rule::expression
             | Rule::primary
@@ -1208,23 +1388,13 @@ fn compile_form_entry(
             | Rule::validate_additive_expr
             | Rule::validate_multiplicative_expr
     ) || (pair.as_rule() == Rule::validate_not_expr
-        && !pair.as_str().trim_start().starts_with('!'))
-    {
-        let mut parts = pair.clone().into_inner();
-        if let Some(child) = parts.next()
-            && parts.next().is_none()
-        {
-            let child = compile(child, file, source, scope, captures);
-            let kind =
-                if pair.as_rule() == Rule::primary && pair.as_str().trim_start().starts_with('(') {
-                    ExprKind::Parens
-                } else {
-                    ExprKind::Alias
-                };
-            return node(&pair, kind, vec![child], file, source);
-        }
+        && !pair.as_str().trim_start().starts_with('!'));
+    if !forwarding {
+        return None;
     }
-    compile_form(pair, file, source, scope, captures)
+    let mut parts = pair.clone().into_inner();
+    let child = parts.next()?;
+    parts.next().is_none().then_some(child)
 }
 
 /// Authored diagnostic source is retained only when its parsed graph contains
@@ -1333,6 +1503,47 @@ pub(in crate::parser) fn record_interpolation_binding(
     }
 }
 
+fn compile_children(
+    pair: &Pair<'_, Rule>,
+    file: &PreprocessedFile,
+    source: &Path,
+    scope: &HashMap<String, ExprValue>,
+    captures: &mut CapturedNodes,
+) -> Vec<ExprValue> {
+    let mut scope = scope.clone();
+    let mut children = Vec::new();
+    for child in pair.clone().into_inner().flat_map(|child| {
+        if child.as_rule() == Rule::block_content {
+            child.into_inner().collect::<Vec<_>>()
+        } else {
+            vec![child]
+        }
+    }) {
+        if matches!(
+            child.as_rule(),
+            Rule::local_binding
+                | Rule::fn_local_let
+                | Rule::for_local_binding
+                | Rule::if_local_binding
+        ) {
+            let mut parts = child.clone().into_inner();
+            let name = parts
+                .next()
+                .expect("local binding name")
+                .as_str()
+                .to_string();
+            if let Some(rhs) = parts.find(|part| part.as_rule() == Rule::expression) {
+                let expression = compile(rhs, file, source, &scope, captures);
+                scope.insert(name, expression.clone());
+                children.push(expression);
+            }
+        } else {
+            children.push(compile(child, file, source, &scope, captures));
+        }
+    }
+    lower_blocks(children)
+}
+
 fn compile_form(
     pair: Pair<'_, Rule>,
     file: &PreprocessedFile,
@@ -1340,40 +1551,91 @@ fn compile_form(
     scope: &HashMap<String, ExprValue>,
     captures: &mut CapturedNodes,
 ) -> ExprValue {
-    let mut children = || {
-        let mut scope = scope.clone();
-        let mut children = Vec::new();
-        for child in pair.clone().into_inner().flat_map(|child| {
-            if child.as_rule() == Rule::block_content {
-                child.into_inner().collect::<Vec<_>>()
-            } else {
-                vec![child]
-            }
-        }) {
-            if matches!(
-                child.as_rule(),
-                Rule::local_binding
-                    | Rule::fn_local_let
-                    | Rule::for_local_binding
-                    | Rule::if_local_binding
-            ) {
-                let mut parts = child.clone().into_inner();
-                let name = parts
-                    .next()
-                    .expect("local binding name")
-                    .as_str()
-                    .to_string();
-                if let Some(rhs) = parts.find(|part| part.as_rule() == Rule::expression) {
-                    let expression = compile(rhs, file, source, &scope, captures);
-                    scope.insert(name, expression.clone());
-                    children.push(expression);
-                }
-            } else {
-                children.push(compile(child, file, source, &scope, captures));
-            }
+    match pair.as_rule() {
+        Rule::if_expr => {
+            let children = compile_children(&pair, file, source, scope, captures);
+            node(&pair, ExprKind::If, children, file, source)
         }
-        lower_blocks(children)
-    };
+        Rule::list => {
+            let children = compile_children(&pair, file, source, scope, captures);
+            node(&pair, ExprKind::List, children, file, source)
+        }
+        Rule::fn_body | Rule::if_body | Rule::else_clause | Rule::for_body => {
+            let children = compile_children(&pair, file, source, scope, captures);
+            node(&pair, ExprKind::Sequence, children, file, source)
+        }
+        Rule::map => compile_map(pair, file, source, scope, captures),
+        Rule::coalesce_expr => {
+            let mut children = compile_children(&pair, file, source, scope, captures);
+            let mut right = children.pop().expect("coalesce operand");
+            while let Some(left) = children.pop() {
+                right = node(&pair, ExprKind::Coalesce, vec![left, right], file, source);
+            }
+            right
+        }
+        rule => {
+            let _ = rule;
+            compile_remaining_form(pair, file, source, scope, captures)
+        }
+    }
+}
+
+fn compile_map(
+    pair: Pair<'_, Rule>,
+    file: &PreprocessedFile,
+    source: &Path,
+    scope: &HashMap<String, ExprValue>,
+    captures: &mut CapturedNodes,
+) -> ExprValue {
+    let entries = lower_blocks(
+        pair.clone()
+            .into_inner()
+            .map(|entry| {
+                if entry.as_rule() == Rule::map_entry {
+                    let mut parts = entry.clone().into_inner();
+                    let key = parts.next().expect("map key");
+                    // Keys must have the exact spelling used by the
+                    // value parser, including its escape handling.
+                    let key_syntax = compile(key.clone(), file, source, scope, captures);
+                    let name = super::context::extract_key_string(key).unwrap_or_default();
+                    let value = compile(
+                        parts.next().expect("map value"),
+                        file,
+                        source,
+                        scope,
+                        captures,
+                    );
+                    let mut values = vec![value];
+                    if key_syntax.authored.first_conversion.is_some() {
+                        values.push(key_syntax);
+                    }
+                    node(&entry, ExprKind::Sink(name), values, file, source)
+                } else {
+                    compile(entry, file, source, scope, captures)
+                }
+            })
+            .collect(),
+    );
+    let keys = entries
+        .iter()
+        .map(|entry| {
+            let ExprKind::Sink(name) = &entry.authored.kind else {
+                unreachable!("compiled map entry");
+            };
+            name.clone()
+        })
+        .collect();
+    node(&pair, ExprKind::Map(keys), entries, file, source)
+}
+
+fn compile_remaining_form(
+    pair: Pair<'_, Rule>,
+    file: &PreprocessedFile,
+    source: &Path,
+    scope: &HashMap<String, ExprValue>,
+    captures: &mut CapturedNodes,
+) -> ExprValue {
+    let mut children = || compile_children(&pair, file, source, scope, captures);
     match pair.as_rule() {
         Rule::expression | Rule::primary => {
             let children = children();
@@ -1479,6 +1741,23 @@ fn compile_form(
                 captures,
             );
             for step in parts {
+                if step.as_rule() == Rule::as_keyword {
+                    continue;
+                }
+                if step.as_rule() == Rule::conversion_type_path {
+                    let target = Located::new(
+                        DeclarationLocation::expression_node(&step, file, source),
+                        crate::conversion::ConversionTypePath::new(step.as_str()),
+                    );
+                    value = node_at(
+                        DeclarationLocation::conversion_expression(&pair, &step, file, source),
+                        ExprKind::Convert {
+                            target: Box::new(target),
+                        },
+                        vec![value],
+                    );
+                    continue;
+                }
                 let operand = step
                     .clone()
                     .into_inner()
@@ -1670,40 +1949,6 @@ fn compile_form(
             )
         }
         Rule::list => node(&pair, ExprKind::List, children(), file, source),
-        Rule::map => {
-            let entries = lower_blocks(
-                pair.clone()
-                    .into_inner()
-                    .map(|entry| {
-                        if entry.as_rule() == Rule::map_entry {
-                            let mut parts = entry.clone().into_inner();
-                            let key = parts.next().expect("map key");
-                            // Keys must have the exact spelling used by the
-                            // value parser, including its escape handling.
-                            let name = super::context::extract_key_string(key).unwrap_or_default();
-                            let value = compile(
-                                parts.next().expect("map value"),
-                                file,
-                                source,
-                                scope,
-                                captures,
-                            );
-                            node(&entry, ExprKind::Sink(name), vec![value], file, source)
-                        } else {
-                            compile(entry, file, source, scope, captures)
-                        }
-                    })
-                    .collect(),
-            );
-            let keys = entries
-                .iter()
-                .map(|entry| match &entry.authored.kind {
-                    ExprKind::Sink(name) => name.clone(),
-                    _ => unreachable!("compiled map entry"),
-                })
-                .collect();
-            node(&pair, ExprKind::Map(keys), entries, file, source)
-        }
         Rule::fn_body | Rule::if_body | Rule::else_clause | Rule::for_body => {
             node(&pair, ExprKind::Sequence, children(), file, source)
         }
@@ -1720,12 +1965,20 @@ fn compile_form(
                 });
             let mut scope = scope.clone();
             let mut parameters = Vec::new();
+            let mut defaults = Vec::new();
             for parameter in pair
                 .clone()
                 .into_inner()
                 .flatten()
                 .filter(|part| part.as_rule() == Rule::fn_param)
             {
+                if let Some(default) = parameter
+                    .clone()
+                    .into_inner()
+                    .find(|part| part.as_rule() == Rule::expression)
+                {
+                    defaults.push(compile(default, file, source, &scope, captures));
+                }
                 let mut parts = parameter.into_inner();
                 let name = parts.next().expect("function parameter name");
                 if let Some(annotation) = parts.find(|part| part.as_rule() == Rule::type_expr)
@@ -1747,12 +2000,13 @@ fn compile_form(
                     );
                 }
             }
-            let children = pair
+            let mut children: Vec<_> = pair
                 .clone()
                 .into_inner()
                 .filter(|part| part.as_rule() == Rule::fn_body)
                 .map(|body| compile(body, file, source, &scope, captures))
                 .collect();
+            children.extend(defaults);
             node(
                 &pair,
                 ExprKind::Function {
@@ -1851,6 +2105,7 @@ fn compile_form(
         Rule::attribute => {
             let mut parts = pair.clone().into_inner();
             let name = parts.next().expect("attribute name");
+            let key_syntax = compile(name.clone(), file, source, scope, captures);
             let name = super::context::extract_key_string(name).unwrap_or_default();
             let value = compile(
                 parts.next().expect("attribute value"),
@@ -1859,7 +2114,11 @@ fn compile_form(
                 scope,
                 captures,
             );
-            node(&pair, ExprKind::Sink(name), vec![value], file, source)
+            let mut values = vec![value];
+            if key_syntax.authored.first_conversion.is_some() {
+                values.push(key_syntax);
+            }
+            node(&pair, ExprKind::Sink(name), values, file, source)
         }
         Rule::if_expr => node(&pair, ExprKind::If, children(), file, source),
         Rule::wait_expr => {
@@ -2313,6 +2572,9 @@ mod judgement {
     #[derive(Clone)]
     pub struct JudgedExprData {
         diagnostic_scope: DiagnosticScope,
+        contains_conversion: bool,
+        conversion_output: bool,
+        any_conversion: bool,
         origin: Option<ExpressionLocation>,
         boundary_owner: Option<Arc<DeclarationLocation>>,
         judgement: ExprJudgement,
@@ -2347,6 +2609,9 @@ mod judgement {
     impl PartialEq for JudgedExprData {
         fn eq(&self, other: &Self) -> bool {
             self.diagnostic_scope == other.diagnostic_scope
+                && self.contains_conversion == other.contains_conversion
+                && self.conversion_output == other.conversion_output
+                && self.any_conversion == other.any_conversion
                 && self.origin == other.origin
                 && self.boundary_owner == other.boundary_owner
                 && self.judgement == other.judgement
@@ -2493,6 +2758,18 @@ mod judgement {
         }
         fn mark_failed(&mut self, error: InferenceError, owner: FailureOwner) {
             self.data_mut().judgement = ExprJudgement::Failed { error, owner };
+        }
+        pub(crate) fn diagnostic_is_secret(&self) -> bool {
+            self.diagnostic_scope.is_secret()
+        }
+        pub(crate) fn contains_conversion(&self) -> bool {
+            self.contains_conversion
+        }
+        pub(crate) fn contains_any_conversion(&self) -> bool {
+            self.any_conversion
+        }
+        pub(crate) fn is_conversion_output(&self) -> bool {
+            self.conversion_output
         }
         pub fn static_type(&self) -> Result<&TypeExpr, InferenceIssue> {
             self.judgement.static_type()
@@ -2722,6 +2999,28 @@ mod judgement {
         type Target = JudgedExpr;
         fn deref(&self) -> &Self::Target {
             &self.expression
+        }
+    }
+
+    impl JudgedExpr {
+        pub(crate) fn binding_diagnostic_owner(
+            &self,
+            expected: Option<&TypeExpr>,
+            fallback: &TypeExpr,
+            config: &crate::parser::ProviderContext,
+        ) -> BindingDiagnosticOwner {
+            if self.contains_any_conversion() {
+                return BindingDiagnosticOwner::AuthoredExpression;
+            }
+            let view = self.for_sink(expected.unwrap_or(fallback), config);
+            if view.is_interpolation()
+                || (view.is_single_string_construction()
+                    && expected.is_some_and(|sink| admit_expression(self, sink).is_ok()))
+            {
+                BindingDiagnosticOwner::AuthoredExpression
+            } else {
+                BindingDiagnosticOwner::OrdinarySource
+            }
         }
     }
 
@@ -3771,7 +4070,8 @@ mod judgement {
             occurrence: expression.authored.definition_use,
             instance,
             generation,
-            definition: definitions.contains(&expression.node_id()),
+            definition: definitions.contains(&expression.node_id())
+                || matches!(expression.authored.kind, ExprKind::Definition),
             environment: expression.authored.location.instance.clone(),
             conditions: ConditionSnapshot::default(),
         }));
@@ -3907,6 +4207,47 @@ mod judgement {
                 };
             }
             let mut result = self.infer(expression, &children);
+            result.data_mut().any_conversion |= matches!(root.kind, ExprKind::Convert { .. })
+                || children.iter().any(JudgedExpr::contains_any_conversion);
+            let eligible = match &root.kind {
+                ExprKind::Convert { .. } => true,
+                ExprKind::If => children.iter().skip(1).any(JudgedExpr::contains_conversion),
+                ExprKind::Binding(_) => result.contains_conversion,
+                ExprKind::Alias
+                | ExprKind::Parens
+                | ExprKind::Definition
+                | ExprKind::Sequence
+                | ExprKind::Sink(_)
+                | ExprKind::List
+                | ExprKind::Map(_)
+                | ExprKind::NestedBlock { .. }
+                | ExprKind::Coalesce => children.iter().any(JudgedExpr::contains_conversion),
+                ExprKind::Scalar(_)
+                | ExprKind::Parameter(_)
+                | ExprKind::LoopSlot(_)
+                | ExprKind::UntypedParameter
+                | ExprKind::Reference { .. }
+                | ExprKind::Interpolation { .. }
+                | ExprKind::EmptyInterpolation
+                | ExprKind::Secret
+                | ExprKind::Call(_)
+                | ExprKind::Function { .. }
+                | ExprKind::Access(_)
+                | ExprKind::Integer { .. }
+                | ExprKind::Element
+                | ExprKind::Iterable
+                | ExprKind::Resource { .. }
+                | ExprKind::For
+                | ExprKind::Wait
+                | ExprKind::Compose
+                | ExprKind::DynamicAccess
+                | ExprKind::ModuleCall
+                | ExprKind::Boolean
+                | ExprKind::Declaration
+                | ExprKind::ProviderDeclaration
+                | ExprKind::Unsupported(_) => false,
+            };
+            result.data_mut().contains_conversion = eligible;
             result.data_mut().origin = Some(root.location.clone());
             result.data_mut().authority = Some(self.authority.clone());
             if matches!(root.kind, ExprKind::Reference { .. }) {
@@ -4243,6 +4584,15 @@ mod judgement {
                 )
             };
             match &root.kind {
+                ExprKind::Convert { .. } => {
+                    let mut result =
+                        value_dependent("checked conversion requires authored admission");
+                    result.data_mut().conversion_output = true;
+                    if children[0].diagnostic_is_secret() {
+                        result.data_mut().diagnostic_scope = DiagnosticScope::Secret;
+                    }
+                    result
+                }
                 ExprKind::Scalar(ty) => {
                     ordinary(Ok(ty.clone()), true).with_kind(|_| InferredKind::Literal)
                 }
@@ -5050,6 +5400,9 @@ mod judgement {
         };
         JudgedExpr(Arc::new(JudgedExprData {
             diagnostic_scope: DiagnosticScope::Public,
+            contains_conversion: false,
+            conversion_output: false,
+            any_conversion: false,
             origin: None,
             boundary_owner: None,
             judgement,

@@ -279,6 +279,28 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         )
     }
 
+    pub(super) fn conversion_expression_error(
+        &self,
+        pair: &pest::iterators::Pair<'_, Rule>,
+        error: ParseError,
+    ) -> ParseError {
+        self.authored_nodes.expression_failure(pair, error)
+    }
+    pub(super) fn conversion_boundary_error(
+        &self,
+        pair: &pest::iterators::Pair<'_, Rule>,
+        error: ParseError,
+    ) -> ParseError {
+        self.authored_nodes.boundary_failure(pair, error)
+    }
+    pub(super) fn key_string(
+        &self,
+        pair: pest::iterators::Pair<'_, Rule>,
+    ) -> Result<String, ParseError> {
+        extract_key_string(pair.clone())
+            .map_err(|error| self.conversion_boundary_error(&pair, error))
+    }
+
     pub(super) fn authored_node_id(
         &self,
         pair: &pest::iterators::Pair<'_, Rule>,

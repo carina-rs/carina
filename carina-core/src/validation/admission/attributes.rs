@@ -217,7 +217,7 @@ impl<K: RechecksResolved> AdmittedAttributes<K> {
 
 pub(crate) enum ApplyAdmissionErrors {
     Admission(AdmissionErrors),
-    Constraints(crate::schema::ResourceValueValidation),
+    Constraints(Box<crate::schema::ResourceValueValidation>),
 }
 impl From<AdmissionErrors> for ApplyAdmissionErrors {
     fn from(error: AdmissionErrors) -> Self {
@@ -365,7 +365,7 @@ fn admit_apply_attributes<K: RechecksResolved>(
         return Err(ApplyAdmissionErrors::Admission(failures.pop().unwrap()));
     }
     if report.errors().next().is_some() {
-        return Err(ApplyAdmissionErrors::Constraints(report));
+        return Err(ApplyAdmissionErrors::Constraints(Box::new(report)));
     }
     Ok(AdmittedAttributes {
         kind: PhantomData,
@@ -535,6 +535,7 @@ fn admit_validation_attributes_with_input<
         };
         let boundary = boundary.with_checks(
             super::AssignmentChecks {
+                #[cfg(test)]
                 authored: None,
                 ordinary: assignment.as_ref().map(|check| check as &_),
             },
@@ -620,6 +621,23 @@ pub fn resource_attribute_admissions<
 ) -> crate::schema::ResourceValueValidation {
     if let Err(missing) = inputs.authored_evidence() {
         coverage.no_authored_evidence(missing);
+        if missing.contains_conversion()
+            || resource.authored_slots().is_some_and(|slots| {
+                resource.attributes().keys().any(|name| {
+                    slots
+                        .get(name)
+                        .ok()
+                        .and_then(|slot| slot.cursor().ok())
+                        .is_some_and(|usage| usage.node().judgement().contains_any_conversion())
+                })
+            })
+        {
+            return crate::schema::ResourceValueValidation::from_errors(vec![
+                assignment_seam_error(crate::parser::retained::MissingEvidence::new(
+                    "conversion resource has no authored admission evidence",
+                )),
+            ]);
+        }
     }
     let visits = std::cell::RefCell::new(std::mem::take(coverage));
     let findings = if uses_resource_attribute_admission(resource.kind()) {
@@ -977,22 +995,25 @@ fn typed_resource_attribute_admissions<
         if let Some(error) = declaration_errors.get(name) {
             return Err(seam_constraint(error.clone()));
         }
-        match inputs.input(resource, name).map_err(seam_constraint)? {
-            AttributeInput::Authored { slot, .. } => {
-                Candidate::validation_slot(slot, proof, Some(bindings), session)
-            }
-            AttributeInput::Projected { phase, .. } => Ok(Candidate::validation_projected(
-                proof,
-                Some(bindings),
-                session,
-                phase,
-            )),
-            AttributeInput::Reported => Ok(Candidate::validation_classified(
-                proof,
-                Some(bindings),
-                session,
-            )),
-        }
+        let (candidate, mut boundary) =
+            match inputs.input(resource, name).map_err(seam_constraint)? {
+                AttributeInput::Authored { slot, .. } => {
+                    Candidate::validation_slot(slot, proof, Some(bindings), session)
+                }
+                AttributeInput::Projected { phase, .. } => Ok(Candidate::validation_projected(
+                    proof,
+                    Some(bindings),
+                    session,
+                    phase,
+                )),
+                AttributeInput::Reported => Ok(Candidate::validation_classified(
+                    proof,
+                    Some(bindings),
+                    session,
+                )),
+            }?;
+        boundary.scope = inputs.scope;
+        Ok((candidate, boundary))
     };
     let input = ValidationInput::Resource {
         candidate: &candidate,
@@ -1009,6 +1030,59 @@ fn typed_resource_attribute_admissions<
         Some(&declarations),
         input,
     )
+}
+
+/// Complete authored conversion evidence for a sibling file whose ordinary
+/// diagnostics are outside the current LSP document. Each resource is visited
+/// once; ordinary/provider callbacks retain the main-branch document scope.
+pub fn unrendered_resource_conversion_admissions<E, D, B: BindingAddress>(
+    resource: &crate::parser::AnalysisResourceRef<
+        '_,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+        B,
+    >,
+    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    bindings: &BindingIndex<'_, B>,
+    session: &dyn ProviderTypeCheckContext,
+    coverage: &mut WalkCoverage,
+) -> crate::ConversionChannel
+where
+    E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
+    D: crate::parser::DeferredForPhaseTraversal<
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            B,
+        >,
+{
+    let Some(schema) = resource.schema(judged.schemas()) else {
+        return Default::default();
+    };
+    let mut inputs = match ResourceAttributeInputs::for_resource(resource, judged.report()) {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            return crate::schema::ResourceValueValidation::from_errors(vec![
+                assignment_seam_error(error),
+            ])
+            .into_conversions();
+        }
+    };
+    inputs.scope = crate::schema::value_validation::AssignmentScope::ClaimedValues;
+    let attributes = inputs.classify(&KnowledgeContext::validation(), |_, _| {});
+    resource_attribute_admissions(
+        resource,
+        judged.file(),
+        schema,
+        &attributes,
+        resource.quoted_string_attrs(),
+        &inputs,
+        bindings,
+        session,
+        judged.schemas(),
+        coverage,
+    )
+    .into_conversions()
 }
 
 #[cfg(test)]

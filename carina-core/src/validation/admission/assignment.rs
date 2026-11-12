@@ -430,6 +430,7 @@ fn verdict<K: DestinationKind>(
         schema,
         errors: _,
         deferred: _,
+        matched_destination: _,
     } = findings;
     match K::local(destination, paths, schema) {
         Ok(obligation) => AssignmentVerdict::NeedsLocal(obligation),
@@ -503,6 +504,21 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                  checked: crate::schema::value_validation::CheckValue<'_, P, B>,
                  path: &LeafPath,
                  cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
+                    crate::parser::retained::check_conversion::<K, P, B>(
+                        attr,
+                        checked,
+                        &join(&contract.path, path),
+                        cursor,
+                        contract.defs(),
+                        context.provider.catalog(),
+                    )
+                };
+            #[cfg(test)]
+            let observer =
+                |attr: &CompiledAttributeType,
+                 checked: crate::schema::value_validation::CheckValue<'_, P, B>,
+                 path: &LeafPath,
+                 cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
                     match context.assignment.authored {
                         Some(hook) => hook(attr, checked, &join(&contract.path, path), cursor),
                         None => Ok(Default::default()),
@@ -515,6 +531,11 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                  cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
                     let path = join(&contract.path, path);
                     let mut findings = Default::default();
+                    if context.scope
+                        == crate::schema::value_validation::AssignmentScope::ClaimedValues
+                    {
+                        return Ok(findings);
+                    }
                     // Selection parents are policy-only: main's ordinary local
                     // and reference obligations belong to the selected child.
                     if cursor.is_selection() {
@@ -547,9 +568,20 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 contract.ancestry,
                 &lookup,
                 context.cursor.clone(),
-                crate::schema::value_validation::AssignmentCallbacks {
-                    ordinary: &check,
-                    authored: context.assignment.authored.map(|_| &authored as _),
+                {
+                    let callbacks = crate::schema::value_validation::CallbackSources::from(
+                        crate::schema::value_validation::RequiredAssignmentCallbacks {
+                            ordinary: &check,
+                            scope: context.scope,
+                            authored: crate::schema::value_validation::AuthoredChecks::Validation(
+                                &authored,
+                            ),
+                        },
+                    );
+                    #[cfg(test)]
+                    let callbacks =
+                        callbacks.observe(context.assignment.authored.map(|_| &observer as _));
+                    callbacks
                 },
                 &mut context.coverage.borrow_mut(),
             )
@@ -562,24 +594,28 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 contract.ancestry,
                 &lookup,
                 context.cursor.clone(),
-                crate::schema::value_validation::AssignmentCallbacks {
+                crate::schema::value_validation::RequiredAssignmentCallbacks {
                     ordinary: &|_, _, _, _| Ok(Default::default()),
-                    authored: None,
+                    scope: crate::schema::value_validation::AssignmentScope::Full,
+                    authored: crate::schema::value_validation::AuthoredChecks::Projected(
+                        crate::parser::retained::ProjectedPhase::plan(proof),
+                    ),
                 },
                 &mut context.coverage.borrow_mut(),
             )
         }
-        AdmissionProof::Apply(proof) => {
+        AdmissionProof::Apply { known, phase } => {
             crate::schema::value_validation::validate_authored_value_for_admission(
                 contract.attr(),
-                &crate::resource::knowledge::Classification::<P, B>::Known(proof.clone()),
+                &crate::resource::knowledge::Classification::<P, B>::Known(known.clone()),
                 contract.defs(),
                 contract.ancestry,
                 &lookup,
                 context.cursor.clone(),
-                crate::schema::value_validation::AssignmentCallbacks {
+                crate::schema::value_validation::RequiredAssignmentCallbacks {
                     ordinary: &|_, _, _, _| Ok(Default::default()),
-                    authored: None,
+                    scope: crate::schema::value_validation::AssignmentScope::Full,
+                    authored: crate::schema::value_validation::AuthoredChecks::Projected(*phase),
                 },
                 &mut context.coverage.borrow_mut(),
             )
@@ -602,6 +638,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
         });
     }
     if errors.is_empty()
+        && checked.conversions().findings().is_empty()
         && context.is_apply()
         && candidate
             .obligations
@@ -614,8 +651,8 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 .with_attribute(&destination.label),
         }]));
     }
-    if !errors.is_empty() {
-        let mut error = constraints(errors);
+    if !errors.is_empty() || !checked.conversions().findings().is_empty() {
+        let mut error = constraints_with_conversions(errors, checked.conversions().clone());
         error.findings = Some(Box::new(checked));
         return Err(error);
     }

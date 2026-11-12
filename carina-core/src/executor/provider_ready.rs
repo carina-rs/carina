@@ -952,8 +952,8 @@ impl ProviderValueConstraintErrors {
         self.0.error_slice()
     }
 
-    fn from_admission(report: crate::schema::ResourceValueValidation) -> Self {
-        Self(Box::new(report))
+    fn from_admission(report: impl Into<Box<crate::schema::ResourceValueValidation>>) -> Self {
+        Self(report.into())
     }
 }
 

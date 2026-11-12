@@ -203,11 +203,10 @@ fn conversion_source_declarations_do_not_promote_slot_member_bounds_to_read_boun
     );
     let source = ResolvedSchemaType::from_schema_declaration("mock", &declaration)
         .ok_or("projection fixture was not a scalar")?;
-    let declarations = source_declarations(&source, &location()?, &super::tests::catalog())
+    let declaration = source_declaration(&source, &location()?, &super::tests::catalog())
         .map_err(|e| e.to_string())?;
-    assert_eq!(declarations.len(), 1);
     assert_eq!(
-        DeclarationBounds::from_declaration(&declarations[0]),
+        DeclarationBounds::from_declaration(&declaration),
         Some(DeclarationBounds::String {
             min: 1,
             max: Some(8)
@@ -222,14 +221,71 @@ fn conversion_source_declarations_load_annotation_evidence() -> Result<(), Strin
     let location = location()?;
     let source = resolve_target(&ConversionTypePath::new("mock.Name"), &location, &catalog)
         .map_err(|e| e.to_string())?;
-    let declarations =
-        source_declarations(&source, &location, &catalog).map_err(|e| e.to_string())?;
-    assert_eq!(declarations.len(), 1);
+    let declaration =
+        source_declaration(&source, &location, &catalog).map_err(|e| e.to_string())?;
     assert_eq!(
-        DeclarationBounds::from_declaration(&declarations[0]),
+        DeclarationBounds::from_declaration(&declaration),
         Some(DeclarationBounds::String {
             min: 1,
             max: Some(8)
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn conversion_source_declarations_keep_all_annotation_owners() -> Result<(), String> {
+    use crate::parser::{IdentifiedCustomTypeDeclaration, OwnedTypeIdentity, ProviderCustomTypes};
+    let identity = TypeIdentity::from_dotted("shared.Name");
+    let declarations = std::collections::BTreeMap::from([
+        (
+            "first".to_owned(),
+            vec![T::refined_string(
+                Some(identity.clone()),
+                None,
+                Some((Some(1), Some(12))),
+                None,
+            )],
+        ),
+        (
+            "second".to_owned(),
+            vec![T::refined_string(
+                Some(identity.clone()),
+                None,
+                Some((Some(4), Some(10))),
+                None,
+            )],
+        ),
+    ]);
+    let known = declarations
+        .iter()
+        .flat_map(|(owner, declarations)| {
+            declarations.iter().map(move |declaration| {
+                OwnedTypeIdentity::from_declaration(
+                    owner,
+                    IdentifiedCustomTypeDeclaration::new(declaration).unwrap(),
+                )
+            })
+        })
+        .collect();
+    let catalog = ProviderContext {
+        custom_types: ProviderCustomTypes::loaded(known, Box::new(|_, _| Ok(())))
+            .with_declarations_for_test(declarations),
+        ..ProviderContext::new(crate::EnvironmentSnapshot::empty())
+    };
+    let owned = resolve_target(
+        &ConversionTypePath::new("shared.Name"),
+        &location()?,
+        &catalog,
+    )
+    .map_err(|error| error.to_string())?;
+    let declaration =
+        source_declaration(&owned, &location()?, &catalog).map_err(|error| error.to_string())?;
+    assert_eq!(
+        DeclarationBounds::from_declaration(&declaration),
+        Some(DeclarationBounds::String {
+            min: 4,
+            max: Some(10)
         })
     );
     Ok(())
@@ -245,7 +301,7 @@ fn conversion_source_declaration_resolution_errors_keep_the_source_kind() -> Res
     )
     .map_err(|e| e.to_string())?;
     let unloaded = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-    let error = source_declarations(&target, &location, &unloaded)
+    let error = source_declaration(&target, &location, &unloaded)
         .expect_err("unloaded source evidence was accepted");
     assert_eq!(error.kind(), ConversionErrorKind::Source);
     assert_eq!(error.location(), &location);

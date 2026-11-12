@@ -2005,21 +2005,18 @@ where
         };
         if let Ok(expression) = evidence {
             let fallback = INTERPOLATION_REF_SINK.clone();
-            let sink = expected.as_ref().unwrap_or(&fallback);
-            let sink_judged = expression.for_sink(sink, context.raw_provider_context());
-            if sink_judged.is_interpolation() {
-                // Suppress the operand check without claiming the enclosing
-                // destination: its resolved String still owes the slot check.
-                report.expression_owned_uses.push(record.authored.clone());
-                continue;
-            }
-            if sink_judged.is_single_string_construction()
-                && expected.as_ref().is_some_and(|sink| {
-                    crate::parser::retained::admit_expression(expression, sink).is_ok()
-                })
-            {
-                report.expression_owned_uses.push(record.authored.clone());
-                continue;
+            match expression.binding_diagnostic_owner(
+                expected.as_ref(),
+                &fallback,
+                context.raw_provider_context(),
+            ) {
+                crate::parser::retained::BindingDiagnosticOwner::AuthoredExpression => {
+                    // The authored walk still checks the complete destination;
+                    // source prechecking does not claim placement authority.
+                    report.expression_owned_uses.push(record.authored.clone());
+                    continue;
+                }
+                crate::parser::retained::BindingDiagnosticOwner::OrdinarySource => {}
             }
         }
         let mut result = match &record.authored.owner {
@@ -2883,7 +2880,8 @@ fn check_inferred_assignment<P: PlaceholderKind, B: BindingAddress>(
             });
         }
         Err(crate::static_type::InferenceIssue::Failed(
-            error @ (inference::InferenceError::InsideSecret { .. }
+            error @ (inference::InferenceError::Conversion(_)
+            | inference::InferenceError::InsideSecret { .. }
             | inference::InferenceError::SecretAssignmentMismatch { .. }
             | inference::InferenceError::InvalidIntegerArithmeticOperand { .. }
             | inference::InferenceError::HeterogeneousCollection { .. }
@@ -5329,6 +5327,8 @@ pub enum ResourceRefTypeValidationError {
     AnalysisInvariant(#[from] crate::parser::AnalysisTreeError),
     #[error("{0}")]
     Validation(String),
+    #[error("{0}")]
+    Conversions(#[source] crate::conversion::ConversionFindings),
 }
 
 pub fn validate_resource_ref_types<
@@ -5342,6 +5342,11 @@ pub fn validate_resource_ref_types<
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
 ) -> Result<(), ResourceRefTypeValidationError> {
     let report = resource_admission_report(judged, bindings, diagnostics)?;
+    if !report.conversions.findings().is_empty() {
+        return Err(ResourceRefTypeValidationError::Conversions(
+            report.conversions.with_ordinary(report.references),
+        ));
+    }
     validation_messages_result(report.references)
 }
 
@@ -5380,6 +5385,11 @@ pub fn validate_resource_admissions<
         errors.push(values);
     }
     errors.extend(report.references);
+    if !report.conversions.findings().is_empty() {
+        return Err(ResourceRefTypeValidationError::Conversions(
+            report.conversions.with_ordinary(errors),
+        ));
+    }
     validation_messages_result(errors)
 }
 
@@ -5393,6 +5403,7 @@ fn publish_admission_diagnostics<T>(
 struct ResourceAdmissionReport {
     attributes: HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>,
     references: Vec<String>,
+    conversions: crate::ConversionFindings,
 }
 
 /// Recover the lexical type of a bare value that became an entire reference
@@ -5622,9 +5633,15 @@ fn resource_admission_report<
         );
     }
 
+    let mut conversions = crate::ConversionFindings::default();
+    for values in attributes.values_mut() {
+        conversions.extend(values.take_conversions());
+    }
+    conversions.extend(judged.report().conversion_completeness(&coverage));
     Ok(ResourceAdmissionReport {
         attributes,
         references: all_errors,
+        conversions,
     })
 }
 
@@ -5907,7 +5924,8 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
     let inferred = match deferred_iterable_shape_for_phase(&judged) {
         Ok(inferred) => Some(inferred),
         Err(crate::static_type::InferenceIssue::Failed(
-            error @ (inference::InferenceError::InsideSecret { .. }
+            error @ (inference::InferenceError::Conversion(_)
+            | inference::InferenceError::InsideSecret { .. }
             | inference::InferenceError::SecretAssignmentMismatch { .. }
             | inference::InferenceError::MissingEvidence(_)
             | inference::InferenceError::IncompatibleCoalesceTypes { .. }

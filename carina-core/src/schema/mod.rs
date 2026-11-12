@@ -7769,6 +7769,7 @@ fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
         }
         | TypeError::StringLiteralExpectedEnum { .. }
         | TypeError::ValidationFailed { .. }
+        | TypeError::Conversion { .. }
         | TypeError::Knowledge { .. }
         | TypeError::Reference { .. }
         | TypeError::CustomTypeValidation { .. }
@@ -7809,6 +7810,12 @@ fn format_field_group_violation(path: &FieldPath, group: &FieldGroup) -> String 
 /// Type error
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TypeError {
+    #[error("{error}")]
+    Conversion {
+        #[source]
+        error: crate::conversion::ConversionError,
+        attribute: Option<String>,
+    },
     #[error("Type mismatch: {types}")]
     TypeMismatch { types: MismatchTypeNames },
 
@@ -7992,17 +7999,30 @@ pub enum TypeError {
     },
 
     #[error("List item at index {index}: {inner}")]
-    ListItemError { index: usize, inner: Box<TypeError> },
+    ListItemError {
+        index: usize,
+        #[source]
+        inner: Box<TypeError>,
+    },
 
     #[error("Map key '{}': {inner}", DiagnosticText::new(key))]
-    MapKeyError { key: String, inner: Box<TypeError> },
+    MapKeyError {
+        key: String,
+        #[source]
+        inner: Box<TypeError>,
+    },
 
     #[error("Map value for key '{}': {inner}", DiagnosticText::new(key))]
-    MapValueError { key: String, inner: Box<TypeError> },
+    MapValueError {
+        key: String,
+        #[source]
+        inner: Box<TypeError>,
+    },
 
     #[error("Struct field '{}': {inner}", DiagnosticText::new(field))]
     StructFieldError {
         field: String,
+        #[source]
         inner: Box<TypeError>,
     },
 
@@ -8011,6 +8031,15 @@ pub enum TypeError {
         DiagnosticText::new(attribute)
     )]
     BlockSyntaxNotAllowed { attribute: String },
+}
+
+impl From<crate::conversion::ConversionError> for TypeError {
+    fn from(error: crate::conversion::ConversionError) -> Self {
+        Self::Conversion {
+            error,
+            attribute: None,
+        }
+    }
 }
 
 impl<B: BindingAddress> From<crate::resource::knowledge::KnowledgeError<B>> for TypeError {
@@ -8239,7 +8268,9 @@ impl TypeError {
             }
             // Knowledge failures retain typed terminal metadata; their Display
             // already includes the complete diagnostic, without a logical child.
-            Self::Knowledge { .. } | Self::Reference { .. } => ValidationDiagnostic::Plain(self),
+            Self::Knowledge { .. } | Self::Reference { .. } | Self::Conversion { .. } => {
+                ValidationDiagnostic::Plain(self)
+            }
             Self::TypeMismatch { .. }
             | Self::BindingShadowsEnumMember(_)
             | Self::InvalidEnumVariant { .. }
@@ -8273,7 +8304,8 @@ impl TypeError {
             | TypeError::StringLiteralExpectedEnum { attribute, .. }
             | TypeError::ResourceValidationFailed { attribute, .. }
             | TypeError::Knowledge { attribute, .. }
-            | TypeError::Reference { attribute, .. } => attribute.as_deref(),
+            | TypeError::Reference { attribute, .. }
+            | TypeError::Conversion { attribute, .. } => attribute.as_deref(),
             TypeError::ReadOnlyAttribute { name }
             | TypeError::UnknownAttribute { name, .. }
             | TypeError::BlockSyntaxNotAllowed { attribute: name } => Some(name),
@@ -8315,6 +8347,13 @@ impl TypeError {
     pub fn with_attribute(self, attribute: impl Into<String>) -> Self {
         let attribute = attribute.into();
         match self {
+            TypeError::Conversion {
+                error,
+                attribute: existing,
+            } => TypeError::Conversion {
+                error,
+                attribute: existing.or(Some(attribute)),
+            },
             TypeError::FieldGroupViolation { path, group } => TypeError::FieldGroupViolation {
                 path: path.prepend_field(attribute),
                 group,
@@ -16393,9 +16432,9 @@ impl PatternResourceSchema<Compiled> {
                     })
                     .collect(),
             )
-            && let Err(mut validation_errors) = run_resource_validator(validator, &attributes)
+            && let Err(validation_errors) = run_resource_validator(validator, &attributes)
         {
-            report.errors.append(&mut validation_errors);
+            report.append_errors(validation_errors);
         }
 
         report
@@ -16441,7 +16480,7 @@ impl PatternResourceSchema<Compiled> {
         );
         if selected.is_none_or(|names| !names.is_empty())
             && let Some(validator) = self.validator()
-            && let Err(mut errors) = run_resource_validator(
+            && let Err(errors) = run_resource_validator(
                 validator,
                 &attributes
                     .iter()
@@ -16454,7 +16493,7 @@ impl PatternResourceSchema<Compiled> {
                     .collect(),
             )
         {
-            report.errors.append(&mut errors);
+            report.append_errors(errors);
         }
         report
     }
@@ -16513,7 +16552,7 @@ impl PatternResourceSchema<Compiled> {
                     continue;
                 }
 
-                let findings = (admission.known)(
+                let mut findings = (admission.known)(
                     name,
                     value_validation::SchemaAttribute {
                         ordinal,
@@ -16521,6 +16560,7 @@ impl PatternResourceSchema<Compiled> {
                     },
                     value,
                 );
+                report.conversions.append(findings.take_conversions());
                 for (index, error) in findings.local_errors().enumerate() {
                     let tagged = error.clone().with_attribute(name);
                     let reshaped = if is_string_literal(name.as_str())
@@ -16546,7 +16586,9 @@ impl PatternResourceSchema<Compiled> {
                 report.attributes.insert(name.clone(), findings);
             } else if mode == ValueEntryValidation::FullInput {
                 if let Some(admit) = admission.unknown {
-                    report.attributes.insert(name.clone(), admit(name, value));
+                    let mut findings = admit(name, value);
+                    report.conversions.append(findings.take_conversions());
+                    report.attributes.insert(name.clone(), findings);
                 }
                 let id_attribute = format!("{name}_id");
                 let suggestion = if known.contains(&id_attribute.as_str()) {
@@ -16626,6 +16668,10 @@ impl crate::resource::InsideSecret for FieldPath {
 impl crate::resource::InsideSecret for TypeError {
     fn inside_secret(self) -> Self {
         match self {
+            TypeError::Conversion { error, attribute } => TypeError::Conversion {
+                error: error.inside_secret(),
+                attribute,
+            },
             TypeError::InvalidEnumVariant {
                 value_kind,
                 attribute,

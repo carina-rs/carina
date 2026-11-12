@@ -168,6 +168,7 @@ pub(crate) fn enum_diagnostic_data_for_error(error: &TypeError) -> Option<EnumDi
         | TypeError::MapKeyError { .. }
         | TypeError::MapValueError { .. }
         | TypeError::StructFieldError { .. }
+        | TypeError::Conversion { .. }
         | TypeError::BlockSyntaxNotAllowed { .. } => None,
     }
 }

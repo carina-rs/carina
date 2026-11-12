@@ -133,6 +133,8 @@ pub(crate) fn parse_float_literal(text: &str, line: usize) -> Result<crate::Fini
 /// ```
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
+    #[error("{0}")]
+    CheckedConversion(#[source] crate::conversion::ConversionError),
     /// A live parser inventory lost a required authored correspondence.
     #[error(transparent)]
     RetainedEvidence(#[from] super::retained::MissingEvidence),
@@ -473,6 +475,7 @@ impl ParseError {
     }
     pub(crate) fn inside_secret_at(self, fallback_line: usize) -> Self {
         match self {
+            Self::CheckedConversion(error) => Self::CheckedConversion(error.inside_secret()),
             Self::Located { path, error } => Self::Located {
                 path,
                 error: Box::new(error.inside_secret_at(fallback_line)),

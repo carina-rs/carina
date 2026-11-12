@@ -1,0 +1,623 @@
+use super::*;
+use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity};
+use std::{collections::HashSet, path::Path};
+
+#[test]
+fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots() {
+    use crate::validation::admission::attributes::{
+        ResourceAttributeInputs, resource_attribute_admissions,
+    };
+    let schemas = schema();
+    let catalog = super::tests::catalog();
+    let source = "let converted = 42 as mock.Name\nlet first = mock.Sink { target = converted }\nlet second = mock.Sink { target = converted }";
+    let parsed = crate::parser::parse_file(source, Path::new("channels.crn"), &catalog)
+        .unwrap()
+        .resolve_root_for_test();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let judged = configuration.judged();
+    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let bindings =
+        crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+    let mut coverage = Default::default();
+    let mut conversions = ConversionFindings::default();
+    let mut resources = 0;
+    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+        for resource in tree.resources() {
+            let inputs = ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap();
+            let classified = inputs.classify(
+                &crate::resource::knowledge::KnowledgeContext::validation(),
+                |_, _| {},
+            );
+            let mut report = resource_attribute_admissions(
+                resource,
+                judged.file(),
+                resource.schema(&schemas).unwrap(),
+                &classified,
+                resource.quoted_string_attrs(),
+                &inputs,
+                &bindings,
+                session,
+                &schemas,
+                &mut coverage,
+            );
+            assert_eq!(report.errors().count(), 0, "conversion leaked into errors");
+            assert_eq!(
+                report.symbolic_errors().count(),
+                0,
+                "conversion leaked into symbolic errors"
+            );
+            assert_eq!(
+                report.diagnostic_errors().count(),
+                0,
+                "conversion leaked into diagnostic errors"
+            );
+            assert_eq!(
+                report.conversions().findings().len(),
+                1,
+                "one verdict per resource slot, without presentation copies"
+            );
+            conversions.extend(report.take_conversions());
+            assert!(
+                report
+                    .take_attribute("target")
+                    .unwrap()
+                    .symbolic_findings()
+                    .is_empty()
+            );
+            resources += 1;
+        }
+    });
+    assert_eq!(resources, 2);
+    conversions.extend(judged.report().conversion_completeness(&coverage));
+    assert_eq!(conversions.findings().len(), 1);
+    assert_eq!(
+        conversions.findings()[0].kind(),
+        ConversionErrorKind::ScalarKind
+    );
+    let report =
+        crate::schema::ResourceValueValidation::from_errors(vec![crate::schema::TypeError::from(
+            conversions.findings()[0].clone(),
+        )]);
+    assert_eq!(report.errors().count(), 0);
+    assert_eq!(report.symbolic_errors().count(), 0);
+    assert_eq!(
+        report.conversions().findings().len(),
+        1,
+        "non-symbolic conversion must survive"
+    );
+}
+
+#[test]
+fn conversion_rejected_mixed_parent_skips_destination_value_checks() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    for expression in [
+        "if true { 'ok' as mock.Name } else { 'ok' }",
+        "('ok' as mock.Name) ?? 'ok'",
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("Sink")
+                .attribute(
+                    AttributeSchema::optional(
+                        "target",
+                        AttributeType::refined_string_with_validator(
+                            TypeIdentity::from_dotted("mock.Name"),
+                            None,
+                            None,
+                            crate::schema::validator(move |_| {
+                                count.fetch_add(1, Ordering::SeqCst);
+                                Ok(())
+                            }),
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let error = check(&format!("mock.Sink {{ target = {expression} }}"), &schemas).unwrap_err();
+        assert_eq!(
+            ConversionError::from_error(&error).unwrap().kind(),
+            ConversionErrorKind::UnsupportedPosition
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "{expression}");
+    }
+}
+
+#[test]
+fn conversion_unrendered_coverage_does_not_repeat_native_map_key_or_value_checks() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let keys = Arc::new(AtomicUsize::new(0));
+    let values = Arc::new(AtomicUsize::new(0));
+    let native = |name: &str, count: Arc<AtomicUsize>| {
+        AttributeType::refined_string_with_validator(
+            TypeIdentity::from_dotted(name),
+            None,
+            None,
+            crate::schema::validator(move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+            None,
+        )
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "target",
+                    AttributeType::map_with_key(
+                        native("mock.Key", keys.clone()),
+                        native("mock.Value", values.clone()),
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let catalog = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = crate::parser::parse_file(
+        "mock.Sink { target = { ok = 'ok' } }",
+        Path::new("sibling.crn"),
+        &catalog,
+    )
+    .unwrap()
+    .resolve_root_for_test();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let judged = configuration.judged();
+    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let resource = tree.resources().next().unwrap();
+    let bindings =
+        crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+        crate::validation::admission::attributes::unrendered_resource_conversion_admissions(
+            resource,
+            judged,
+            &bindings,
+            session,
+            &mut Default::default(),
+        );
+    });
+    assert_eq!(
+        keys.load(Ordering::SeqCst),
+        0,
+        "unrendered ordinary keys keep main's callback count"
+    );
+    assert_eq!(
+        values.load(Ordering::SeqCst),
+        0,
+        "unrendered ordinary values keep main's callback count"
+    );
+}
+
+fn schema() -> SchemaRegistry {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(AttributeSchema::optional("target", named()).build())
+            .attribute(AttributeSchema::optional("plain", AttributeType::int()).build())
+            .validate()
+            .unwrap(),
+    );
+    schemas
+}
+fn named() -> AttributeType {
+    AttributeType::refined_string(
+        Some(TypeIdentity::from_dotted("mock.Name")),
+        None,
+        Some((Some(1), Some(8))),
+        None,
+    )
+}
+fn check(
+    source: &str,
+    schemas: &SchemaRegistry,
+) -> Result<(), crate::validation::ResourceRefTypeValidationError> {
+    let catalog = super::tests::catalog();
+    let parsed = crate::parser::parse_file(source, Path::new("b1.crn"), &catalog)
+        .unwrap()
+        .resolve_root_for_test();
+    let configuration = crate::config_loader::load_buffer_configuration(&parsed, schemas, &catalog);
+    let judged = configuration.judged();
+    let bindings =
+        crate::binding_index::BindingIndex::from_parsed(judged.file(), schemas, &catalog);
+    crate::validation::validate_resource_admissions(
+        judged,
+        &bindings,
+        &HashSet::from(["mock".into()]),
+        &mut Vec::new(),
+    )
+}
+
+#[test]
+fn conversion_boundaries_are_typed_b2_placeholders() {
+    for source in [
+        "provider mock { endpoint = 'ok' as mock.Name }",
+        "backend local { path = 'ok' as mock.Name }",
+        "exports { name = 'ok' as mock.Name }",
+        "attributes { name = 'ok' as mock.Name }",
+        "fn supply(): String { 'ok' as mock.Name }",
+        "fn supply(value: String = 'ok' as mock.Name) { value }",
+    ] {
+        let error = check(source, &schema())
+            .err()
+            .unwrap_or_else(|| panic!("boundary admitted: {source}"));
+        assert_eq!(
+            ConversionError::from_error(&error).unwrap().kind(),
+            ConversionErrorKind::UnsupportedPosition,
+            "{source}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn conversion_boundary_alias_use_takes_precedence_over_unused_definition() {
+    for source in [
+        "let converted = 'ok' as mock.Name\nexports { name = converted }",
+        "let converted = 'ok' as mock.Name\nlet alias = converted\nexports { name = alias }",
+        "let converted = 'ok' as mock.Name\nprovider mock { endpoint = converted }",
+    ] {
+        let error = check(source, &schema()).unwrap_err();
+        let crate::validation::ResourceRefTypeValidationError::Conversions(findings) = error else {
+            panic!("typed conversion finding required");
+        };
+        assert_eq!(findings.findings().len(), 1, "{source}: {findings:?}");
+        assert_eq!(
+            findings.findings()[0].kind(),
+            ConversionErrorKind::UnsupportedPosition,
+            "{source}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn conversion_claim_does_not_skip_ordinary_siblings_or_unknown_fields() {
+    for field in ["plain = 'wrong kind'", "unknown = 42"] {
+        let source = format!("mock.Sink {{ target = 'ok' as mock.Name {field} }}");
+        let error = check(&source, &schema()).unwrap_err();
+        assert!(ConversionError::from_error(&error).is_none(), "{error:?}");
+        assert!(
+            error.to_string().contains(if field.starts_with("plain") {
+                "Int"
+            } else {
+                "unknown"
+            }),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn conversion_wrappers_do_not_hide_secret_or_conversion_operand_placement() {
+    for expression in [
+        "secret(('ok' as mock.Name))",
+        "(('ok' as mock.Name)) as mock.Name",
+    ] {
+        let source = format!("mock.Sink {{ target = {expression} }}");
+        let error = check(&source, &schema()).unwrap_err();
+        assert_eq!(
+            ConversionError::from_error(&error).unwrap().kind(),
+            ConversionErrorKind::UnsupportedPosition,
+            "{error:?}"
+        );
+    }
+}
+
+#[test]
+fn conversion_discarded_union_rejects_ambiguous_identity() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(
+                AttributeSchema::optional("target", AttributeType::union(vec![named(), named()]))
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let error = check(
+        "mock.Sink { target = if false { 'ok' as mock.Name } else { 'ok' as mock.Name } }",
+        &schemas,
+    )
+    .unwrap_err();
+    assert_eq!(
+        ConversionError::from_error(&error).unwrap().kind(),
+        ConversionErrorKind::AmbiguousDestination
+    );
+    let crate::validation::ResourceRefTypeValidationError::Conversions(findings) = error else {
+        panic!("structured conversion errors required");
+    };
+    assert_eq!(
+        findings.findings().len(),
+        2,
+        "current and discarded conversions each need the union declaration"
+    );
+}
+
+#[test]
+fn conversion_no_authored_evidence_cannot_admit_a_converted_slot() {
+    let catalog = super::tests::catalog();
+    let schemas = schema();
+    let parsed = crate::parser::parse_file(
+        "let sink = mock.Sink { target = 'ok' as mock.Name }",
+        Path::new("b1.crn"),
+        &catalog,
+    )
+    .unwrap()
+    .resolve_root_for_test();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let judged = configuration.judged();
+    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let resource = tree.resources().next().unwrap();
+    let values = resource.resolved_attributes();
+    let inputs = crate::validation::admission::attributes::ResourceAttributeInputs::from_report(
+        resource,
+        &values,
+        judged.report(),
+    );
+    let classified = inputs.classify(
+        &crate::resource::knowledge::KnowledgeContext::validation(),
+        |_, _| {},
+    );
+    let bindings =
+        crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+        let report = crate::validation::admission::attributes::resource_attribute_admissions(
+            resource,
+            judged.file(),
+            resource.schema(&schemas).unwrap(),
+            &classified,
+            resource.quoted_string_attrs(),
+            &inputs,
+            &bindings,
+            session,
+            &schemas,
+            &mut Default::default(),
+        );
+        assert!(
+            report.errors().next().is_some() || report.symbolic_errors().next().is_some(),
+            "missing authored authority was admitted"
+        );
+    });
+}
+
+#[test]
+fn conversion_pending_mixed_branches_are_parent_owned_in_both_orders() {
+    for expression in [
+        "if choose { converted } else { 'ok' }",
+        "if choose { 'ok' } else { converted }",
+    ] {
+        let source = format!(
+            "arguments {{ choose: Bool }}\nlet converted = 'ok' as mock.Name\nmock.Sink {{ target = {expression} }}"
+        );
+        let error = check(&source, &schema()).unwrap_err();
+        let conversion = ConversionError::from_error(&error).unwrap();
+        assert_eq!(conversion.kind(), ConversionErrorKind::UnsupportedPosition);
+        assert_eq!(conversion.location().span().start_line(), 3);
+    }
+}
+
+#[test]
+fn conversion_borrows_the_resolved_ref_declaration() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .with_def("Target", named())
+            .attribute(AttributeSchema::optional("target", AttributeType::ref_("Target")).build())
+            .validate()
+            .unwrap(),
+    );
+    check("mock.Sink { target = 'ok' as mock.Name }", &schemas).unwrap();
+}
+
+#[test]
+fn conversion_union_ref_members_resolve_identity_and_bounds() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .with_def("Target", named())
+            .attribute(
+                AttributeSchema::optional(
+                    "target",
+                    AttributeType::union(vec![
+                        AttributeType::ref_("Target"),
+                        AttributeType::string(),
+                    ]),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    check("mock.Sink { target = 'ok' as mock.Name }", &schemas).unwrap();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Source")
+            .attribute(
+                AttributeSchema::optional(
+                    "output",
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::from_dotted("foreign.Name")),
+                        None,
+                        Some((Some(9), Some(16))),
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let error = check(
+        "let producer = mock.Source {}\nmock.Sink { target = producer.output as mock.Name }",
+        &schemas,
+    )
+    .unwrap_err();
+    assert_eq!(
+        ConversionError::from_error(&error).unwrap().kind(),
+        ConversionErrorKind::Disjoint
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .with_def("Target", named())
+            .attribute(
+                AttributeSchema::optional(
+                    "target",
+                    AttributeType::union(vec![
+                        AttributeType::ref_("Target"),
+                        AttributeType::ref_("Target"),
+                    ]),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    for expression in [
+        "'ok' as mock.Name",
+        "if false { 'ok' as mock.Name } else { 'ok' as mock.Name }",
+    ] {
+        let error = check(&format!("mock.Sink {{ target = {expression} }}"), &schemas).unwrap_err();
+        assert_eq!(
+            ConversionError::from_error(&error).unwrap().kind(),
+            ConversionErrorKind::AmbiguousDestination
+        );
+    }
+}
+
+#[test]
+fn conversion_union_failures_keep_matching_member_cause_and_skip_rejected_value_checks() {
+    use std::{
+        error::Error,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "target",
+                    AttributeType::union(vec![AttributeType::string(), named()]),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let error = check(
+        "mock.Sink { target = 'toolong-for-slot' as mock.Name }",
+        &schemas,
+    )
+    .unwrap_err();
+    let conversion = ConversionError::from_error(&error).unwrap();
+    assert!(
+        conversion.source().is_some_and(|cause| cause
+            .downcast_ref::<crate::schema::TypeError>()
+            .is_some_and(|error| matches!(
+                error,
+                crate::schema::TypeError::LengthOutOfRange { .. }
+            ))),
+        "the matching member owns the value failure: {error:?}"
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let member = AttributeType::refined_string_with_validator(
+        TypeIdentity::from_dotted("mock.Name"),
+        None,
+        None,
+        crate::schema::validator(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }),
+        None,
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "target",
+                    AttributeType::union(vec![member.clone(), member]),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let error = check("mock.Sink { target = 'ok' as mock.Name }", &schemas).unwrap_err();
+    assert_eq!(
+        ConversionError::from_error(&error).unwrap().kind(),
+        ConversionErrorKind::AmbiguousDestination
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a statically rejected scalar conversion cannot reach destination value checks"
+    );
+}
+
+#[test]
+fn conversion_known_destination_failure_retains_its_cause_and_convert_range() {
+    use std::error::Error;
+    let source = "mock.Sink { target = 'toolong-for-slot' as mock.Name }";
+    let error = check(source, &schema()).unwrap_err();
+    let conversion =
+        ConversionError::from_error(&error).expect("destination rejection needs the Convert owner");
+    assert_eq!(conversion.kind(), ConversionErrorKind::Destination);
+    assert_eq!(
+        conversion.location().span().start_column(),
+        source.find("'toolong").unwrap() + 1
+    );
+    assert!(conversion.source().is_some_and(|cause| {
+        cause
+            .downcast_ref::<crate::schema::TypeError>()
+            .is_some_and(|error| matches!(error, crate::schema::TypeError::LengthOutOfRange { .. }))
+    }));
+}
+
+#[test]
+fn conversion_covered_mixed_branches_report_the_convert_once() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(AttributeSchema::optional("target", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let source = "mock.Sink { target = \"${if true { 'ok' as mock.Name } else { 'ok' }}\" }";
+    let error = check(source, &schemas).unwrap_err();
+    let crate::validation::ResourceRefTypeValidationError::Conversions(findings) = error else {
+        panic!("typed conversion finding required");
+    };
+    assert_eq!(findings.findings().len(), 1, "{findings:?}");
+    assert_eq!(
+        findings.findings()[0].location().span().start_column(),
+        source.find("'ok' as").unwrap() + 1
+    );
+}

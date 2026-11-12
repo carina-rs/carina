@@ -265,6 +265,10 @@ compose_expr = { additive_expr ~ (">>" ~ additive_expr)* }
 // lowering can map exhaustively to the closed IntegerOp enum.
 additive_expr = { multiplicative_expr ~ (add_op ~ multiplicative_expr)* }
 multiplicative_expr = { postfix_expr ~ (multiplicative_op ~ postfix_expr)* }
+
+// Checked conversion is an authored wrapper; lowering preserves its operand.
+as_keyword = @{ "as" ~ !(ASCII_ALPHANUMERIC | "_") }
+conversion_type_path = @{ identifier ~ ("." ~ identifier)* }
 add_op = { plus_op | minus_op }
 multiplicative_op = { multiply_op | divide_op | remainder_op }
 plus_op = { "+" }
@@ -277,7 +281,7 @@ remainder_op = { "%" }
 // primaries keep consuming their own suffixes so resource references retain
 // their AccessPath shape and for-expanded addresses such as `subnets[0]`
 // remain binding names.
-postfix_expr = { primary ~ (index_access | field_access)* }
+postfix_expr = { primary ~ (index_access | field_access)* ~ (as_keyword ~ conversion_type_path)* }
 
 // Function call: func(args)
 function_call = { identifier ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }

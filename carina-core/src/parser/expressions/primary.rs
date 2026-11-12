@@ -12,7 +12,7 @@ use crate::parser::expressions::if_expr::parse_if_value_expr_with_mode;
 use crate::parser::expressions::string_literal::parse_string_value;
 use crate::parser::functions::{evaluate_user_function_eval, reject_builtin_handle_arguments};
 use crate::parser::{
-    ParseContext, ParseError, Rule, extract_key_string, first_inner, is_static_eval, next_pair,
+    ParseContext, ParseError, Rule, first_inner, is_static_eval, next_pair,
     parse_block_contents_with_mode, parse_expression, parse_expression_eval,
     parse_expression_eval_with_mode,
 };
@@ -347,8 +347,15 @@ pub(crate) fn parse_postfix_eval_with_mode(
     let syntax = pair.clone();
     let mut inner = pair.into_inner();
     let base = next_pair(&mut inner, "primary expression", context)?;
-    let steps = inner.collect::<Vec<_>>();
-    let untyped_mode = (!steps.is_empty()).then(ExpressionMode::untyped);
+    let parts = inner.collect::<Vec<_>>();
+    let converted = parts
+        .iter()
+        .any(|part| part.as_rule() == Rule::conversion_type_path);
+    let steps = parts
+        .into_iter()
+        .filter(|part| matches!(part.as_rule(), Rule::index_access | Rule::field_access))
+        .collect::<Vec<_>>();
+    let untyped_mode = (converted || !steps.is_empty()).then(ExpressionMode::untyped);
     // The expected sink describes the result of a postfix expression, not
     // values inside its intermediate base. In particular, `[resource][0].id`
     // must retain the established bare-handle rejection instead of treating
@@ -357,6 +364,9 @@ pub(crate) fn parse_postfix_eval_with_mode(
     let value = parse_primary_eval_with_mode(base, ctx, untyped_mode.as_ref().unwrap_or(mode))?;
     let has_steps = !steps.is_empty();
     let result = apply_postfix_steps(value, steps, ctx)?;
+    if converted {
+        ctx.record_retained_eval(&syntax, &result);
+    }
     Ok(match result {
         EvalValue::User(value) => EvalValue::User(with_access_provenance(
             value,
@@ -508,7 +518,15 @@ pub(crate) fn parse_primary_eval_with_mode(
     } else {
         pair.clone()
     };
-    let result = parse_primary_eval_with_mode_inner(pair, ctx, mode)?;
+    let result = match syntax.as_rule() {
+        Rule::list => parse_list_eval(syntax.clone(), ctx, mode),
+        Rule::map => parse_map_eval(syntax.clone(), ctx, mode),
+        Rule::if_expr if mode.integer_operand_context().is_none() => {
+            parse_if_value_expr_with_mode(syntax.clone(), ctx, mode)
+        }
+        Rule::expression => parse_expression_eval_with_mode(syntax.clone(), ctx, mode),
+        _ => parse_primary_eval_with_mode_inner(pair, ctx, mode),
+    }?;
     Ok(match result {
         EvalValue::User(value) => EvalValue::User(with_access_provenance(
             value,
@@ -517,6 +535,116 @@ pub(crate) fn parse_primary_eval_with_mode(
         )),
         other => other,
     })
+}
+
+fn parse_list_eval(
+    inner: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+    mode: &ExpressionMode<'_>,
+) -> Result<EvalValue, ParseError> {
+    let mut items = Vec::new();
+    let mut item_metadata = Vec::new();
+    let mut pending = None;
+    for (index, item) in inner.into_inner().enumerate() {
+        let line = item.line_col().0;
+        let item_mode = mode.at_list_index(index);
+        let eval = parse_expression_eval_with_mode(item, ctx, &item_mode)?;
+        if let EvalValue::PendingValue(slot) = eval {
+            pending.get_or_insert(slot);
+            continue;
+        }
+        let (value, metadata) = eval
+            .into_collection_element()
+            .map_err(|error| ParseError::from_eval_value(error, line))?;
+        items.push(value);
+        item_metadata.push(metadata);
+    }
+    if let Some(slot) = pending {
+        return Ok(EvalValue::pending_value(slot));
+    }
+    let metadata = item_metadata
+        .iter()
+        .any(Option::is_some)
+        .then_some(UnexpandedStructuralHandleMetadata::List(item_metadata));
+    Ok(EvalValue::computed(
+        Value::Concrete(ConcreteValue::List(items)),
+        metadata,
+    ))
+}
+
+fn parse_map_eval(
+    inner: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+    mode: &ExpressionMode<'_>,
+) -> Result<EvalValue, ParseError> {
+    let mut map: IndexMap<String, Value> = IndexMap::new();
+    let mut nested_blocks: IndexMap<String, Vec<Value>> = IndexMap::new();
+    let mut authored_nested_blocks: IndexMap<String, usize> = IndexMap::new();
+    let mut structural_handles = IndexMap::new();
+    let mut pending = None;
+    for entry in inner.into_inner() {
+        match entry.as_rule() {
+            Rule::map_entry => {
+                let mut entry_inner = entry.into_inner();
+                let key_pair = next_pair(&mut entry_inner, "map key", "map entry")?;
+                let key = ctx.key_string(key_pair)?;
+                let value_pair = next_pair(&mut entry_inner, "map value", "map entry")?;
+                let line = value_pair.line_col().0;
+                let entry_mode = mode.at_key(key.clone());
+                let value = parse_expression_eval_with_mode(value_pair, ctx, &entry_mode)?;
+                if let EvalValue::PendingValue(slot) = value {
+                    pending.get_or_insert(slot);
+                    continue;
+                }
+                let (value, metadata) = value
+                    .into_collection_element()
+                    .map_err(|error| ParseError::from_eval_value(error, line))?;
+                if let Some(metadata) = metadata {
+                    structural_handles.insert(key.clone(), metadata);
+                }
+                map.insert(key, value);
+            }
+            Rule::nested_block => {
+                let mut block_inner = entry.into_inner();
+                let block_name = next_pair(&mut block_inner, "block name", "nested block in map")?
+                    .as_str()
+                    .to_string();
+                let authored_count = authored_nested_blocks
+                    .entry(block_name.clone())
+                    .or_default();
+                let block_index = *authored_count;
+                *authored_count += 1;
+                let block_mode = mode
+                    .at_struct_field(block_name.clone())
+                    .at_list_index(block_index);
+                let block_attrs = parse_block_contents_with_mode(block_inner, ctx, &block_mode)?;
+                let Some(block_attrs) = block_attrs else {
+                    pending.get_or_insert_with(|| {
+                        mode.pending_slot()
+                            .expect("a pending nested block has a typed sink")
+                    });
+                    continue;
+                };
+                nested_blocks
+                    .entry(block_name)
+                    .or_default()
+                    .push(Value::Concrete(ConcreteValue::Map(block_attrs)));
+            }
+            _ => {}
+        }
+    }
+    if let Some(slot) = pending {
+        return Ok(EvalValue::pending_value(slot));
+    }
+    for (name, blocks) in nested_blocks {
+        map.insert(name, Value::Concrete(ConcreteValue::List(blocks)));
+    }
+    let metadata = (!structural_handles.is_empty())
+        .then_some(UnexpandedStructuralHandleMetadata::Map(structural_handles));
+    Ok(EvalValue::computed(
+        Value::Concrete(ConcreteValue::Map(map)),
+        metadata,
+    ))
 }
 
 fn parse_primary_eval_with_mode_inner(
@@ -559,108 +687,8 @@ fn parse_primary_eval_with_mode_inner(
                 message: "Resource expressions can only be used in let bindings".to_string(),
             })
         }
-        Rule::list => {
-            let mut items = Vec::new();
-            let mut item_metadata = Vec::new();
-            let mut pending = None;
-            for (index, item) in inner.into_inner().enumerate() {
-                let line = item.line_col().0;
-                let item_mode = mode.at_list_index(index);
-                let eval = parse_expression_eval_with_mode(item, ctx, &item_mode)?;
-                if let EvalValue::PendingValue(slot) = eval {
-                    pending.get_or_insert(slot);
-                    continue;
-                }
-                let (value, metadata) = eval
-                    .into_collection_element()
-                    .map_err(|error| ParseError::from_eval_value(error, line))?;
-                items.push(value);
-                item_metadata.push(metadata);
-            }
-            if let Some(slot) = pending {
-                return Ok(EvalValue::pending_value(slot));
-            }
-            let metadata = item_metadata
-                .iter()
-                .any(Option::is_some)
-                .then_some(UnexpandedStructuralHandleMetadata::List(item_metadata));
-            Ok(EvalValue::computed(
-                Value::Concrete(ConcreteValue::List(items)),
-                metadata,
-            ))
-        }
-        Rule::map => {
-            let mut map: IndexMap<String, Value> = IndexMap::new();
-            let mut nested_blocks: IndexMap<String, Vec<Value>> = IndexMap::new();
-            let mut authored_nested_blocks: IndexMap<String, usize> = IndexMap::new();
-            let mut structural_handles = IndexMap::new();
-            let mut pending = None;
-            for entry in inner.into_inner() {
-                match entry.as_rule() {
-                    Rule::map_entry => {
-                        let mut entry_inner = entry.into_inner();
-                        let key_pair = next_pair(&mut entry_inner, "map key", "map entry")?;
-                        let key = extract_key_string(key_pair)?;
-                        let value_pair = next_pair(&mut entry_inner, "map value", "map entry")?;
-                        let line = value_pair.line_col().0;
-                        let entry_mode = mode.at_key(key.clone());
-                        let value = parse_expression_eval_with_mode(value_pair, ctx, &entry_mode)?;
-                        if let EvalValue::PendingValue(slot) = value {
-                            pending.get_or_insert(slot);
-                            continue;
-                        }
-                        let (value, metadata) = value
-                            .into_collection_element()
-                            .map_err(|error| ParseError::from_eval_value(error, line))?;
-                        if let Some(metadata) = metadata {
-                            structural_handles.insert(key.clone(), metadata);
-                        }
-                        map.insert(key, value);
-                    }
-                    Rule::nested_block => {
-                        let mut block_inner = entry.into_inner();
-                        let block_name =
-                            next_pair(&mut block_inner, "block name", "nested block in map")?
-                                .as_str()
-                                .to_string();
-                        let authored_count = authored_nested_blocks
-                            .entry(block_name.clone())
-                            .or_default();
-                        let block_index = *authored_count;
-                        *authored_count += 1;
-                        let block_mode = mode
-                            .at_struct_field(block_name.clone())
-                            .at_list_index(block_index);
-                        let block_attrs =
-                            parse_block_contents_with_mode(block_inner, ctx, &block_mode)?;
-                        let Some(block_attrs) = block_attrs else {
-                            pending.get_or_insert_with(|| {
-                                mode.pending_slot()
-                                    .expect("a pending nested block has a typed sink")
-                            });
-                            continue;
-                        };
-                        nested_blocks
-                            .entry(block_name)
-                            .or_default()
-                            .push(Value::Concrete(ConcreteValue::Map(block_attrs)));
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(slot) = pending {
-                return Ok(EvalValue::pending_value(slot));
-            }
-            for (name, blocks) in nested_blocks {
-                map.insert(name, Value::Concrete(ConcreteValue::List(blocks)));
-            }
-            let metadata = (!structural_handles.is_empty())
-                .then_some(UnexpandedStructuralHandleMetadata::Map(structural_handles));
-            Ok(EvalValue::computed(
-                Value::Concrete(ConcreteValue::Map(map)),
-                metadata,
-            ))
-        }
+        Rule::list => parse_list_eval(inner, ctx, mode),
+        Rule::map => parse_map_eval(inner, ctx, mode),
         Rule::namespaced_id => parse_namespaced_id_value(inner, ctx, Vec::new()),
         Rule::subscripted_id => {
             // `binding.field[idx]`, `binding.field.subfield[idx]…`,

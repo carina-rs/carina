@@ -76,6 +76,22 @@ pub struct DeclarationLocation {
 }
 
 impl DeclarationLocation {
+    pub(in crate::parser) fn conversion_expression(
+        expression: &pest::iterators::Pair<'_, Rule>,
+        target: &pest::iterators::Pair<'_, Rule>,
+        file: &PreprocessedFile,
+        source_file: &Path,
+    ) -> Self {
+        Self {
+            file: SourceFileId::new(source_file.to_path_buf()),
+            span: SourceSpan::from_preprocessed_range(
+                expression.as_span().start(),
+                target.as_span().end(),
+                file,
+            ),
+        }
+    }
+
     pub(in crate::parser) fn expression_node(
         pair: &pest::iterators::Pair<'_, Rule>,
         file: &PreprocessedFile,

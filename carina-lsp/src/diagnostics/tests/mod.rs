@@ -8,6 +8,7 @@ use carina_core::resource::knowledge::collect_classified_attributes;
 use carina_core::schema::SchemaRegistry;
 
 mod basic;
+mod conversion;
 mod extended;
 mod located;
 mod seam_review;
