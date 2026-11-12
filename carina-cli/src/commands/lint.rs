@@ -315,8 +315,12 @@ fn lint_result(
     module_boundary_findings.extend(validate_no_upstream_states_in_modules(&module_walk));
     module_boundary_findings.extend(validate_no_exports_in_modules(&module_walk));
 
-    let (providers, provider_factory_error) =
-        ProviderLoad::load_reporting(runtime, &parsed.providers, base_dir)?;
+    let (providers, provider_factory_error) = ProviderLoad::load_reporting(
+        runtime,
+        &parsed.providers,
+        base_dir,
+        &mut crate::commands::human_provider_notices(runtime.color_mode()),
+    )?;
     let provider_factory_error = provider_factory_error.map(|error| error.to_string());
     let schemas = providers.schemas();
     let load_findings = providers.load_findings(&parsed.providers, false);
@@ -493,13 +497,10 @@ fn lint_result(
                 let duplicates = find_duplicate_attrs(source);
                 for dup in duplicates {
                     warnings.push(LintWarning {
-                file: file_path.clone(),
-                line: dup.line,
-                message: format!(
-                    "Duplicate attribute '{}' (first defined on line {}). The last value will be used.",
-                    dup.name, dup.first_line
-                ),
-            });
+                        file: file_path.clone(),
+                        line: dup.line,
+                        message: dup.message(),
+                    });
                 }
 
                 // Check for direct calls to pipe-preferred functions

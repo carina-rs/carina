@@ -252,9 +252,14 @@ pub(crate) fn apply_postfix_steps<'i>(
     ctx: &ParseContext,
 ) -> Result<EvalValue, ParseError> {
     for pair in steps {
+        let evaluation = ctx.evaluation_site(&pair);
         let line = pair.line_col().0;
-        let step = parse_postfix_path_segment(pair, ctx)?;
-        value = apply_postfix_path_segment(value, step, line)?;
+        value = evaluation
+            .evaluate(|| {
+                let step = parse_postfix_path_segment(pair, ctx)?;
+                apply_postfix_path_segment(value, step, line)
+            })
+            .map_err(ParseError::from)?;
     }
     Ok(value)
 }
@@ -335,36 +340,42 @@ pub(crate) fn parse_postfix_eval_with_mode(
     ctx: &ParseContext,
     mode: &ExpressionMode<'_>,
 ) -> Result<EvalValue, ParseError> {
-    if !matches!(pair.as_rule(), Rule::postfix_expr | Rule::for_iterable) {
-        return parse_primary_eval_with_mode(pair, ctx, mode);
-    }
+    let evaluation = ctx.evaluation_site(&pair);
+    evaluation
+        .evaluate(|| {
+            if !matches!(pair.as_rule(), Rule::postfix_expr | Rule::for_iterable) {
+                return parse_primary_eval_with_mode(pair, ctx, mode);
+            }
 
-    let context = if pair.as_rule() == Rule::for_iterable {
-        "for iterable"
-    } else {
-        "postfix expression"
-    };
-    let syntax = pair.clone();
-    let mut inner = pair.into_inner();
-    let base = next_pair(&mut inner, "primary expression", context)?;
-    let steps = inner.collect::<Vec<_>>();
-    let untyped_mode = (!steps.is_empty()).then(ExpressionMode::untyped);
-    // The expected sink describes the result of a postfix expression, not
-    // values inside its intermediate base. In particular, `[resource][0].id`
-    // must retain the established bare-handle rejection instead of treating
-    // the resource as an enum candidate merely because the final expression
-    // occurs in a typed attribute.
-    let value = parse_primary_eval_with_mode(base, ctx, untyped_mode.as_ref().unwrap_or(mode))?;
-    let has_steps = !steps.is_empty();
-    let result = apply_postfix_steps(value, steps, ctx)?;
-    Ok(match result {
-        EvalValue::User(value) => EvalValue::User(with_access_provenance(
-            value,
-            &|| ctx.access_locations(&syntax),
-            AccessProvenanceMode::Postfix { has_steps },
-        )),
-        other => other,
-    })
+            let context = if pair.as_rule() == Rule::for_iterable {
+                "for iterable"
+            } else {
+                "postfix expression"
+            };
+            let syntax = pair.clone();
+            let mut inner = pair.into_inner();
+            let base = next_pair(&mut inner, "primary expression", context)?;
+            let steps = inner.collect::<Vec<_>>();
+            let untyped_mode = (!steps.is_empty()).then(ExpressionMode::untyped);
+            // The expected sink describes the result of a postfix expression, not
+            // values inside its intermediate base. In particular, `[resource][0].id`
+            // must retain the established bare-handle rejection instead of treating
+            // the resource as an enum candidate merely because the final expression
+            // occurs in a typed attribute.
+            let value =
+                parse_primary_eval_with_mode(base, ctx, untyped_mode.as_ref().unwrap_or(mode))?;
+            let has_steps = !steps.is_empty();
+            let result = apply_postfix_steps(value, steps, ctx)?;
+            Ok(match result {
+                EvalValue::User(value) => EvalValue::User(with_access_provenance(
+                    value,
+                    &|| ctx.access_locations(&syntax),
+                    AccessProvenanceMode::Postfix { has_steps },
+                )),
+                other => other,
+            })
+        })
+        .map_err(Into::into)
 }
 
 /// Lower a `namespaced_id` pair to its `EvalValue`, attaching any
@@ -503,20 +514,25 @@ pub(crate) fn parse_primary_eval_with_mode(
     ctx: &ParseContext,
     mode: &ExpressionMode<'_>,
 ) -> Result<EvalValue, ParseError> {
-    let syntax = if pair.as_rule() == Rule::primary {
-        first_inner(pair.clone(), "value", "reference provenance")?
-    } else {
-        pair.clone()
-    };
-    let result = parse_primary_eval_with_mode_inner(pair, ctx, mode)?;
-    Ok(match result {
-        EvalValue::User(value) => EvalValue::User(with_access_provenance(
-            value,
-            &|| ctx.access_locations(&syntax),
-            AccessProvenanceMode::Primary(syntax.as_rule()),
-        )),
-        other => other,
-    })
+    let evaluation = ctx.evaluation_site(&pair);
+    evaluation
+        .evaluate(|| {
+            let syntax = if pair.as_rule() == Rule::primary {
+                first_inner(pair.clone(), "value", "reference provenance")?
+            } else {
+                pair.clone()
+            };
+            let result = parse_primary_eval_with_mode_inner(pair, ctx, mode)?;
+            Ok(match result {
+                EvalValue::User(value) => EvalValue::User(with_access_provenance(
+                    value,
+                    &|| ctx.access_locations(&syntax),
+                    AccessProvenanceMode::Primary(syntax.as_rule()),
+                )),
+                other => other,
+            })
+        })
+        .map_err(Into::into)
 }
 
 fn parse_primary_eval_with_mode_inner(
@@ -600,10 +616,10 @@ fn parse_primary_eval_with_mode_inner(
                     Rule::map_entry => {
                         let mut entry_inner = entry.into_inner();
                         let key_pair = next_pair(&mut entry_inner, "map key", "map entry")?;
-                        let key = extract_key_string(key_pair)?;
+                        let key = extract_key_string(key_pair.clone())?;
                         let value_pair = next_pair(&mut entry_inner, "map value", "map entry")?;
                         let line = value_pair.line_col().0;
-                        let entry_mode = mode.at_key(key.clone());
+                        let entry_mode = mode.at_key(key.clone(), &key_pair);
                         let value = parse_expression_eval_with_mode(value_pair, ctx, &entry_mode)?;
                         if let EvalValue::PendingValue(slot) = value {
                             pending.get_or_insert(slot);
@@ -619,17 +635,16 @@ fn parse_primary_eval_with_mode_inner(
                     }
                     Rule::nested_block => {
                         let mut block_inner = entry.into_inner();
-                        let block_name =
-                            next_pair(&mut block_inner, "block name", "nested block in map")?
-                                .as_str()
-                                .to_string();
+                        let block_name_pair =
+                            next_pair(&mut block_inner, "block name", "nested block in map")?;
+                        let block_name = block_name_pair.as_str().to_string();
                         let authored_count = authored_nested_blocks
                             .entry(block_name.clone())
                             .or_default();
                         let block_index = *authored_count;
                         *authored_count += 1;
                         let block_mode = mode
-                            .at_struct_field(block_name.clone())
+                            .at_struct_field(block_name.clone(), &block_name_pair)
                             .at_list_index(block_index);
                         let block_attrs =
                             parse_block_contents_with_mode(block_inner, ctx, &block_mode)?;

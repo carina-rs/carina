@@ -998,7 +998,10 @@ fn replaceable_attribute_range(doc: &crate::document::Document, name: &str) -> O
         .unwrap_or_else(|| panic!("document parse failed: {:?}", doc.parse_error()));
     let tree = carina_core::parser::AnalysisTree::try_from_file(parsed).unwrap();
     let resource = tree.project_resources().next()?;
-    parser_span_range(doc, resource.replaceable_attribute_value(name)?.span())
+    parser_span_range(
+        &doc.for_diagnostics().expect("public fixture"),
+        resource.replaceable_attribute_value(name)?.span(),
+    )
 }
 
 #[test]

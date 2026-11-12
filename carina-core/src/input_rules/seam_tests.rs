@@ -576,7 +576,7 @@ fn ignored_default_key_removed_from_exact_patch_is_not_reintroduced() {
     let config = crate::parser::ProviderConfig {
         name: "mock".into(),
         attributes: Default::default(),
-        default_tags: IndexMap::from([("aws:x".into(), text("default"))]),
+        default_tags: (IndexMap::<String, _>::from([("aws:x".into(), text("default"))])).into(),
         source: None,
         version: None,
         revision: None,

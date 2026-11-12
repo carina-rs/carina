@@ -90,7 +90,7 @@ use indexmap::IndexMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use crate::output_style::Colorize;
+use crate::output_style::{ColorMode, Colorize};
 use futures::stream::{self, StreamExt};
 
 use crate::runtime::CommandRuntime;
@@ -957,6 +957,58 @@ pub(crate) fn failed_configuration_report<T>(
     )
 }
 
+/// Validate's failed-load recovery retains the original error and typed sibling findings.
+pub(crate) fn failed_validate_configuration(
+    path: &ResolvedPath,
+    error: AppError,
+    environment: carina_core::EnvironmentSnapshot,
+) -> (
+    Vec<AppError>,
+    Vec<carina_core::parser::ParseWarning>,
+    Vec<carina_core::parser::ParseWarning>,
+) {
+    let checks = carina_core::validation::deferred_types::TypeCheckSession::run(
+        &carina_core::parser::ProviderContext::new(environment),
+        |session| {
+            let mut errors = vec![error];
+            let mut parser_warnings = Vec::new();
+            let files = if path.is_file() {
+                vec![path.clone()]
+            } else {
+                carina_core::config_loader::find_crn_files_in_dir(path).unwrap_or_default()
+            };
+            for file in files {
+                if let Ok(source) = file.read_to_string()
+                    && let Ok(mut parsed) = carina_core::parser::parse_file(
+                        &source,
+                        &file.source_label(),
+                        session.catalog(),
+                    )
+                {
+                    parser_warnings.extend(parsed.warnings.iter().cloned().map(|mut warning| {
+                        warning
+                            .file
+                            .get_or_insert_with(|| file.source_label().display().to_string());
+                        warning
+                    }));
+                    match validation::resolve_file_type_exprs(&mut parsed, session) {
+                        Ok(findings) => errors.extend(
+                            findings
+                                .into_iter()
+                                .map(|finding| AppError::TypeResolution(Box::new(finding))),
+                        ),
+                        Err(error) => errors.push(AppError::AnalysisInvariant(error)),
+                    }
+                }
+            }
+            (errors, parser_warnings)
+        },
+    );
+    let ((mut errors, parser_warnings), sink) = settle_provider_checks(checks);
+    errors.extend(sink.errors);
+    (errors, sink.warnings, parser_warnings)
+}
+
 impl carina_core::validation::deferred_types::ProviderTypeCheckSink for CliTypeCheckSink {
     fn record(
         &mut self,
@@ -1001,7 +1053,18 @@ pub(crate) struct ValidationReport<'a, T = carina_core::parser::ModuleResolvedIn
     authored_inputs: carina_core::input_rules::AuthoredInputs,
     warnings: Vec<carina_core::parser::ParseWarning>,
     input_warnings: Vec<carina_core::input_rules::InputFinding>,
+    early_warnings: Vec<crate::commands::ConfigurationWarning>,
+    parser_warnings: Vec<carina_core::parser::ParseWarning>,
     schemas: &'a SchemaRegistry,
+}
+
+pub(crate) struct ValidationReportParts<'a, T> {
+    pub result: Result<T, NonEmptyValidationErrors>,
+    pub schemas: &'a SchemaRegistry,
+    pub warnings: Vec<carina_core::parser::ParseWarning>,
+    pub input_warnings: Vec<carina_core::input_rules::InputFinding>,
+    pub early_warnings: Vec<crate::commands::ConfigurationWarning>,
+    pub parser_warnings: Vec<carina_core::parser::ParseWarning>,
 }
 
 impl ValidationReport<'_> {
@@ -1016,7 +1079,7 @@ impl ValidationReport<'_> {
                 carina_core::input_rules::AuthoredInputOutcome::Finding(finding) => {
                     match finding.severity() {
                         carina_core::input_rules::InputFindingSeverity::Error => {
-                            errors.push(AppError::Validation(finding.to_string()));
+                            errors.push(AppError::InputFinding(Box::new(finding)));
                         }
                         carina_core::input_rules::InputFindingSeverity::Warning => {
                             self.input_warnings.push(finding);
@@ -1025,7 +1088,7 @@ impl ValidationReport<'_> {
                 }
                 carina_core::input_rules::AuthoredInputOutcome::Pending(_) => {}
                 carina_core::input_rules::AuthoredInputOutcome::PreparationFailed(error) => {
-                    errors.push(AppError::Provider(error.into_host_error()));
+                    errors.push(AppError::InputPreparation(error));
                 }
             }
         }
@@ -1045,7 +1108,7 @@ impl carina_core::validation::deferred_types::ProviderTypeCheckSink for Validati
     ) {
         match diagnostic {
             carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning) => self.warnings.push(warning.into_warning()),
-            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => self.errors.push(AppError::Validation(error.into_warning().message)),
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => self.errors.push(AppError::ProviderTypeCheck(Box::new(error.into_warning()))),
         }
     }
 }
@@ -1071,39 +1134,47 @@ impl<'a, T> ValidationReport<'a, T> {
             crate::commands::ConfigurationValidation {
                 result,
                 authored_inputs,
+                warnings,
             },
             sink,
         ) = settle_provider_checks(checks);
         let result = append_load_findings(result, sink.errors);
+        let mut early_warnings = Vec::new();
+        let mut parser_warnings = Vec::new();
+        for warning in warnings {
+            match warning {
+                crate::commands::ConfigurationWarning::Parser(warning) => {
+                    parser_warnings.push(warning)
+                }
+                warning => early_warnings.push(warning),
+            }
+        }
         Self {
             result,
             authored_inputs,
             warnings: sink.warnings,
             input_warnings: Vec::new(),
+            early_warnings,
+            parser_warnings,
             schemas,
         }
     }
     #[cfg(test)]
     pub(crate) fn provider_type_warnings(&self) -> Vec<&carina_core::parser::ParseWarning> {
-        self.warnings.iter().collect()
+        self.early_warnings
+            .iter()
+            .filter_map(|warning| match warning {
+                crate::commands::ConfigurationWarning::Provider(warning) => Some(warning),
+                _ => None,
+            })
+            .chain(self.warnings.iter())
+            .collect()
     }
     #[cfg(test)]
     pub(crate) fn errors(&self) -> &[AppError] {
         match &self.result {
             Ok(_) => &[],
             Err(errors) => errors.as_slice(),
-        }
-    }
-    #[cfg(any(test, feature = "test-utils"))]
-    pub(crate) fn into_test_diagnostics(self) -> crate::commands::validate::ValidateDiagnostics {
-        let errors = match self.result {
-            Ok(_) => Vec::new(),
-            Err(errors) => errors.into_vec(),
-        };
-        crate::commands::validate::ValidateDiagnostics {
-            errors,
-            warnings: self.warnings,
-            input_warnings: self.input_warnings,
         }
     }
     #[cfg(any(test, feature = "test-utils"))]
@@ -1117,19 +1188,41 @@ impl<'a, T> ValidationReport<'a, T> {
     pub(crate) fn into_result(self) -> Result<T, NonEmptyValidationErrors> {
         self.into_parts().0
     }
+    pub(crate) fn print_warnings(&self) {
+        for warning in &self.early_warnings {
+            match warning {
+                crate::commands::ConfigurationWarning::Dependency(warning) => {
+                    eprintln!("warning: {warning}")
+                }
+                crate::commands::ConfigurationWarning::Provider(warning) => {
+                    crate::commands::validate::print_provider_type_warning(warning)
+                }
+                crate::commands::ConfigurationWarning::Parser(_) => {}
+            }
+        }
+        for warning in &self.warnings {
+            crate::commands::validate::print_provider_type_warning(warning);
+        }
+        for warning in &self.input_warnings {
+            crate::commands::validate::print_input_warning(warning);
+        }
+    }
+
     pub(crate) fn into_parts(self) -> (Result<T, NonEmptyValidationErrors>, &'a SchemaRegistry) {
-        for warning in self.warnings {
-            crate::commands::validate::print_provider_type_warning(&warning);
-        }
-        for warning in self.input_warnings {
-            crate::commands::validate::print_input_warning(&warning);
-        }
         (self.result, self.schemas)
     }
 
-    pub(crate) fn input_warnings(&self) -> &[carina_core::input_rules::InputFinding] {
-        &self.input_warnings
+    pub(crate) fn into_diagnostic_parts(self) -> ValidationReportParts<'a, T> {
+        ValidationReportParts {
+            result: self.result,
+            schemas: self.schemas,
+            warnings: self.warnings,
+            input_warnings: self.input_warnings,
+            early_warnings: self.early_warnings,
+            parser_warnings: self.parser_warnings,
+        }
     }
+
     #[cfg(test)]
     pub(crate) fn schemas(&self) -> &SchemaRegistry {
         self.schemas
@@ -1180,6 +1273,7 @@ fn validation_report_with<'a, T>(
             let crate::commands::ConfigurationValidation {
                 result,
                 authored_inputs,
+                warnings,
             } = crate::commands::validate_and_resolve_report_inner(
                 &ValidationPipelineAccess::new(),
                 parsed.clone(),
@@ -1206,6 +1300,7 @@ fn validation_report_with<'a, T>(
             crate::commands::ConfigurationValidation {
                 result: append_load_findings(result, load_findings),
                 authored_inputs,
+                warnings,
             }
         });
     ValidationReport::settle(checks, context.schemas())
@@ -1454,15 +1549,47 @@ fn resolve_pair_binding_uses<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
     Ok((parsed, unresolved))
 }
 
+/// Loader events keep their source type until command presentation. Successful
+/// trust/cache notices are informational; failure notices accompany an error.
+pub(crate) enum ProviderLoadEvent {
+    Failure(String),
+    Resolver(carina_provider_resolver::ProviderLoadNotice),
+    Cache(carina_plugin_host::WasmLoadNotice),
+}
+
+impl ProviderLoadEvent {
+    pub(crate) fn render_human(&self, color: ColorMode) -> String {
+        match self {
+            Self::Failure(message) => message.red(color).to_string(),
+            Self::Resolver(notice) => notice.to_string(),
+            Self::Cache(notice) => notice.to_string(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ProviderNoticeSink(std::sync::Arc<std::sync::Mutex<ProviderNoticeCallback>>);
+type ProviderNoticeCallback = Box<dyn FnMut(ProviderLoadEvent) + Send>;
+
+impl ProviderNoticeSink {
+    pub(crate) fn new(sink: impl FnMut(ProviderLoadEvent) + Send + 'static) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Box::new(sink))))
+    }
+    pub(crate) fn emit(&self, notice: ProviderLoadEvent) {
+        self.0.lock().expect("provider notice sink poisoned")(notice);
+    }
+}
+
 impl ProviderLoad {
     /// Load the providers declared by one command configuration.
     pub(crate) fn load<P: PlaceholderKind, B: BindingAddress>(
         runtime: &CommandRuntime,
         providers: &[ProviderConfig<P, B>],
         base_dir: &ResolvedPath,
+        notices: &mut ProviderNoticeSink,
     ) -> Result<Self, AppError> {
         let (factories, load_errors) =
-            build_factories_from_providers(runtime, providers, base_dir)?;
+            build_factories_from_providers(runtime, providers, base_dir, notices)?;
         Ok(Self {
             context: WiringContext::new(runtime, factories, providers)?,
             load_errors,
@@ -1478,9 +1605,10 @@ impl ProviderLoad {
         runtime: &CommandRuntime,
         providers: &[ProviderConfig<P, B>],
         base_dir: &ResolvedPath,
+        notices: &mut ProviderNoticeSink,
     ) -> Result<(ReportingProviderLoad, Option<AppError>), AppError> {
         Ok(
-            match build_schema_factories_from_providers(runtime, providers, base_dir) {
+            match build_schema_factories_from_providers(runtime, providers, base_dir, notices) {
                 Ok((factories, load_errors)) => (
                     ReportingProviderLoad {
                         context: WiringContext::new(runtime, factories, providers)?,
@@ -1513,6 +1641,14 @@ impl ProviderLoad {
         Err(crate::commands::collapse_errors(
             sorted_provider_load_errors(&load_errors),
         ))
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn into_reporting(self) -> ReportingProviderLoad {
+        ReportingProviderLoad {
+            context: self.context,
+            load_errors: self.load_errors,
+        }
     }
 
     /// Test-support report that validates without minting executable wiring.
@@ -1555,6 +1691,7 @@ impl ProviderLoad {
                 resolve_file_binding_uses(parsed, base_dir, &self.context, catalog)
             },
         );
+        report.print_warnings();
         let (result, schemas) = report.into_parts();
         debug_assert_eq!(schemas.len(), self.context.schemas().len());
         let parsed = match result {
@@ -1676,10 +1813,11 @@ impl MigrationCheckProviderLoad {
         >],
         base_dir: &ResolvedPath,
         schema_overrides: &HashMap<String, PathBuf>,
+        notices: &mut ProviderNoticeSink,
     ) -> Result<Self, AppError> {
         let effective = schema_check_provider_configs(providers, schema_overrides)?;
         let (factories, load_errors) =
-            build_schema_only_factories_from_providers(runtime, &effective, base_dir)?;
+            build_schema_only_factories_from_providers(runtime, &effective, base_dir, notices)?;
         Ok(Self {
             context: WiringContext::new(runtime, factories, &effective)?,
             load_errors,
@@ -1705,6 +1843,7 @@ impl MigrationCheckProviderLoad {
             duplicate_declarations,
             |parsed, session| resolve_file_binding_uses(parsed, base_dir, &context, session),
         );
+        report.print_warnings();
         let (result, _schemas) = report.into_parts();
         let parsed = result
             .map_err(|errors| crate::commands::collapse_errors(errors.into_vec()))?
@@ -2570,9 +2709,10 @@ impl FormattingProviderLoad {
         runtime: &CommandRuntime,
         providers: &[ProviderConfig<P, B>],
         base_dir: &ResolvedPath,
+        notices: &mut ProviderNoticeSink,
     ) -> Result<Self, AppError> {
         let (factories, load_errors) =
-            build_factories_from_providers_for_formatting(runtime, providers, base_dir)?;
+            build_factories_from_providers_for_formatting(runtime, providers, base_dir, notices)?;
         let context = WiringContext::new(runtime, factories, providers)?;
         Ok(Self {
             schemas: context.schemas().clone(),
@@ -2844,9 +2984,12 @@ fn build_factories_from_providers<P: PlaceholderKind, B: BindingAddress>(
     runtime: &CommandRuntime,
     providers: &[ProviderConfig<P, B>],
     base_dir: &ResolvedPath,
+    notices: &mut ProviderNoticeSink,
 ) -> Result<ProviderFactoryLoad, AppError> {
     let providers = provider_loading_configs(providers);
-    carina_provider_resolver::validate_lock_constraints(base_dir, &providers)?;
+    carina_provider_resolver::validate_lock_constraints(base_dir, &providers, &mut |notice| {
+        notices.emit(ProviderLoadEvent::Resolver(notice))
+    })?;
 
     build_factories_from_providers_impl(
         runtime,
@@ -2854,6 +2997,7 @@ fn build_factories_from_providers<P: PlaceholderKind, B: BindingAddress>(
         base_dir,
         true,
         ProviderFactoryNetwork::Runtime,
+        notices,
     )
 }
 
@@ -2861,9 +3005,12 @@ fn build_schema_factories_from_providers<P: PlaceholderKind, B: BindingAddress>(
     runtime: &CommandRuntime,
     providers: &[ProviderConfig<P, B>],
     base_dir: &ResolvedPath,
+    notices: &mut ProviderNoticeSink,
 ) -> Result<ProviderFactoryLoad, AppError> {
     let providers = provider_loading_configs(providers);
-    carina_provider_resolver::validate_lock_constraints(base_dir, &providers)?;
+    carina_provider_resolver::validate_lock_constraints(base_dir, &providers, &mut |notice| {
+        notices.emit(ProviderLoadEvent::Resolver(notice))
+    })?;
 
     build_factories_from_providers_impl(
         runtime,
@@ -2871,6 +3018,7 @@ fn build_schema_factories_from_providers<P: PlaceholderKind, B: BindingAddress>(
         base_dir,
         true,
         ProviderFactoryNetwork::SchemaOnly,
+        notices,
     )
 }
 
@@ -2885,9 +3033,14 @@ fn build_factories_from_providers_for_formatting<P: PlaceholderKind, B: BindingA
     runtime: &CommandRuntime,
     providers: &[ProviderConfig<P, B>],
     base_dir: &ResolvedPath,
+    notices: &mut ProviderNoticeSink,
 ) -> Result<FormattingFactoryLoad, AppError> {
     let providers = provider_loading_configs(providers);
-    if let Err(error) = carina_provider_resolver::validate_lock_constraints(base_dir, &providers) {
+    if let Err(error) =
+        carina_provider_resolver::validate_lock_constraints(base_dir, &providers, &mut |notice| {
+            notices.emit(ProviderLoadEvent::Resolver(notice))
+        })
+    {
         return Ok((
             Vec::new(),
             HashMap::from([(
@@ -2903,6 +3056,7 @@ fn build_factories_from_providers_for_formatting<P: PlaceholderKind, B: BindingA
         base_dir,
         false,
         ProviderFactoryNetwork::SchemaOnly,
+        notices,
     )?;
     Ok((
         factories,
@@ -2919,6 +3073,7 @@ fn build_factories_from_providers_impl<B: BindingAddress>(
     base_dir: &ResolvedPath,
     report_errors: bool,
     network: ProviderFactoryNetwork,
+    notices: &mut ProviderNoticeSink,
 ) -> Result<ProviderFactoryLoad, AppError> {
     #[cfg(any(test, feature = "test-utils"))]
     runtime.record_provider_load();
@@ -2927,46 +3082,68 @@ fn build_factories_from_providers_impl<B: BindingAddress>(
     let loader_user_dirs = runtime.user_dirs().clone();
     let loader_project_dir = base_dir.clone();
     let aws = Arc::new(CliAwsCredentialProvisioner::new());
+    let loader_notices = notices.clone();
     build_factories_from_providers_impl_using(
         runtime,
         providers,
         base_dir,
         report_errors,
         grant_inputs,
+        notices,
         move |verified| {
             let user_dirs = loader_user_dirs.clone();
             let project_dir = loader_project_dir.clone();
             let aws = Arc::clone(&aws);
+            let notices = loader_notices.clone();
             async move {
-                match network {
+                let events = notices.clone();
+                let mut host_notices = carina_plugin_host::WasmLoadNoticeSink::new(move |notice| {
+                    events.emit(ProviderLoadEvent::Cache(notice))
+                });
+                let result = match network {
                     ProviderFactoryNetwork::SchemaOnly => {
-                        carina_plugin_host::WasmProviderFactory::from_bytes(verified, &user_dirs)
-                            .await
-                    }
-                    ProviderFactoryNetwork::Runtime => {
-                        let locked_egress =
-                            carina_provider_resolver::load_locked_egress(&project_dir, &verified)?;
-                        carina_plugin_host::WasmProviderFactory::from_bytes_with_egress(
+                        carina_plugin_host::WasmProviderFactory::from_bytes(
                             verified,
                             &user_dirs,
-                            locked_egress.as_ref(),
-                            aws.as_ref(),
+                            &mut host_notices,
                         )
                         .await
                     }
-                }
+                    ProviderFactoryNetwork::Runtime => {
+                        match carina_provider_resolver::load_locked_egress(
+                            &project_dir,
+                            &verified,
+                            &mut |notice| notices.emit(ProviderLoadEvent::Resolver(notice)),
+                        ) {
+                            Ok(locked_egress) => {
+                                carina_plugin_host::WasmProviderFactory::from_bytes_with_egress(
+                                    verified,
+                                    &user_dirs,
+                                    locked_egress.as_ref(),
+                                    aws.as_ref(),
+                                    &mut host_notices,
+                                )
+                                .await
+                            }
+                            Err(error) => Err(error.into()),
+                        }
+                    }
+                };
+                (result, Vec::new())
             }
         },
     )
 }
 
-fn build_factories_from_providers_impl_using<B: BindingAddress, L, Fut>(
+#[cfg(test)]
+fn build_factories_from_providers_impl_using_for_test<B: BindingAddress, L, Fut>(
     runtime: &CommandRuntime,
     providers: &[ProviderConfig<carina_core::resource::NoPlaceholder, B>],
     base_dir: &ResolvedPath,
     report_errors: bool,
     grant_inputs: &TrustedLocalGrantInputs,
     mut loader: L,
+    notices: &mut ProviderNoticeSink,
 ) -> Result<ProviderFactoryLoad, AppError>
 where
     L: FnMut(carina_provider_resolver::VerifiedLoad) -> Fut,
@@ -2977,7 +3154,41 @@ where
             >,
         >,
 {
-    let color_mode = runtime.color_mode();
+    build_factories_from_providers_impl_using(
+        runtime,
+        providers,
+        base_dir,
+        report_errors,
+        grant_inputs,
+        notices,
+        move |verified| {
+            let loaded = loader(verified);
+            async move { (loaded.await, Vec::new()) }
+        },
+    )
+}
+
+fn build_factories_from_providers_impl_using<B: BindingAddress, L, Fut>(
+    runtime: &CommandRuntime,
+    providers: &[ProviderConfig<carina_core::resource::NoPlaceholder, B>],
+    base_dir: &ResolvedPath,
+    report_errors: bool,
+    grant_inputs: &TrustedLocalGrantInputs,
+    notices: &mut ProviderNoticeSink,
+    mut loader: L,
+) -> Result<ProviderFactoryLoad, AppError>
+where
+    L: FnMut(carina_provider_resolver::VerifiedLoad) -> Fut,
+    Fut: std::future::Future<
+            Output = (
+                Result<
+                    carina_plugin_host::WasmProviderFactory,
+                    carina_plugin_host::WasmProviderLoadError,
+                >,
+                Vec<ProviderLoadEvent>,
+            ),
+        >,
+{
     let mut factories = Vec::new();
     let mut load_errors: HashMap<String, String> = HashMap::new();
     let mut attempted_default_sources = HashSet::new();
@@ -2998,12 +3209,16 @@ where
             continue;
         }
 
-        let installed = match carina_provider_resolver::find_installed_provider(base_dir, config) {
+        let installed = match carina_provider_resolver::find_installed_provider(
+            base_dir,
+            config,
+            &mut |notice| notices.emit(ProviderLoadEvent::Resolver(notice)),
+        ) {
             Ok(installed) => installed,
             Err(e) => {
                 let reason = format!("Provider '{}' {}", config.name, e);
                 if report_errors {
-                    eprintln!("{}", reason.red(color_mode));
+                    notices.emit(ProviderLoadEvent::Failure(reason.clone()));
                 }
                 load_errors.insert(config.name.clone(), reason);
                 continue;
@@ -3011,17 +3226,27 @@ where
         };
 
         let grants = grant_inputs.get()?;
+        let mut cache_notices = Vec::new();
         let factory_result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(installed.load_with(
                 runtime.user_dirs(),
                 grants,
+                |notice| notices.emit(ProviderLoadEvent::Resolver(notice)),
                 |verified| {
                     let artifact = verified.artifact().clone();
                     let loaded = loader(verified);
-                    async move { loaded.await.map(|factory| (factory, artifact)) }
+                    let collected = &mut cache_notices;
+                    async move {
+                        let (result, events) = loaded.await;
+                        *collected = events;
+                        result.map(|factory| (factory, artifact))
+                    }
                 },
             ))
         });
+        for notice in cache_notices {
+            notices.emit(notice);
+        }
 
         match factory_result {
             Ok((factory, artifact)) => {
@@ -3034,7 +3259,7 @@ where
                         ))
                         .to_string();
                     if report_errors {
-                        eprintln!("{}", reason.red(color_mode));
+                        notices.emit(ProviderLoadEvent::Failure(reason.clone()));
                     }
                     load_errors.insert(config.name.clone(), reason);
                     continue;
@@ -3076,7 +3301,7 @@ where
                     error.to_string()
                 };
                 if report_errors {
-                    eprintln!("{}", reason.red(color_mode));
+                    notices.emit(ProviderLoadEvent::Failure(reason.clone()));
                 }
                 load_errors.insert(config.name.clone(), reason);
             }
@@ -3117,18 +3342,6 @@ fn block_name_errors<T: fmt::Display>(conflicts: impl IntoIterator<Item = T>) ->
         .collect()
 }
 
-fn prefixed_validation_messages(joined: &str, prefix: impl std::fmt::Display) -> Vec<AppError> {
-    split_validation_message(joined)
-        .into_iter()
-        .map(|error| {
-            let AppError::Validation(message) = error else {
-                unreachable!("split_validation_message only creates validation errors")
-            };
-            AppError::Validation(format!("{prefix}: {message}"))
-        })
-        .collect()
-}
-
 pub fn validate_resources_with_ctx<
     E,
     P: PlaceholderKind,
@@ -3162,23 +3375,42 @@ pub fn validate_resource_admissions_with_ctx<
     judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
     bindings: &carina_core::binding_index::BindingIndex<'_, B>,
 ) -> Vec<AppError> {
-    let mut sink = CliTypeCheckSink { errors: Vec::new() };
-    let mut errors = match validation::validate_resource_admissions(
+    let (errors, warnings) = resource_admission_report_with_ctx(ctx, judged, bindings);
+    for warning in warnings {
+        crate::commands::validate::print_provider_type_warning(&warning);
+    }
+    errors
+}
+
+pub(crate) fn resource_admission_report_with_ctx<
+    E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
+    B: BindingAddress,
+    D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+>(
+    ctx: &WiringContext,
+    judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    bindings: &carina_core::binding_index::BindingIndex<'_, B>,
+) -> (Vec<AppError>, Vec<carina_core::parser::ParseWarning>) {
+    let mut sink = ValidationReportSink {
+        errors: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let mut errors = match validation::resource_admission_findings(
         judged,
         bindings,
         ctx.known_providers(),
         &mut sink,
     ) {
-        Ok(()) => Vec::new(),
-        Err(validation::ResourceRefTypeValidationError::Validation(message)) => {
-            split_validation_message(&message)
-        }
-        Err(validation::ResourceRefTypeValidationError::AnalysisInvariant(error)) => {
+        Ok(findings) => findings
+            .into_iter()
+            .map(|finding| AppError::ResourceAdmission(Box::new(finding)))
+            .collect(),
+        Err(error) => {
             vec![AppError::AnalysisInvariant(error)]
         }
     };
-    errors.extend(sink.errors.into_iter().map(AppError::Validation));
-    errors
+    errors.extend(sink.errors);
+    (errors, sink.warnings)
 }
 
 /// Surface `directives.depends_on` analysis-pass error diagnostics as
@@ -3347,8 +3579,13 @@ fn resolve_config_names_with_ctx<E>(
 ) -> Result<ParserCanonicalResourcePair<E>, Vec<AppError>> {
     ParserCanonicalResourcePair::resolve_block_names(access, parsed, unresolved, ctx.schemas())
         .map_err(block_name_errors)?
-        .resolve_attr_prefixes(ctx.schemas())
-        .map_err(|error| split_validation_message(&error))
+        .resolve_attr_prefixes_report(ctx.schemas())
+        .map_err(|errors| {
+            errors
+                .into_iter()
+                .map(|error| AppError::AttributePrefix(Box::new(error)))
+                .collect()
+        })
 }
 
 /// Resolve block names for tests without running later validation-wiring
@@ -3374,7 +3611,10 @@ pub fn resolve_attr_prefixes_with_ctx<
     ctx: &WiringContext,
     resources: &mut [Resource<ModuleSource, P, B>],
 ) -> Vec<AppError> {
-    lift_validation_result(identifier::resolve_attr_prefixes(resources, ctx.schemas()))
+    identifier::resolve_attr_prefix_findings(resources, ctx.schemas())
+        .into_iter()
+        .map(|error| AppError::AttributePrefix(Box::new(error)))
+        .collect()
 }
 
 pub fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<StateFile>) {
@@ -4689,10 +4929,11 @@ pub fn validate_provider_region_with_ctx<E>(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
 ) -> Vec<AppError> {
-    lift_validation_result(validation::validate_provider_config(
-        parsed,
-        ctx.factories(),
-    ))
+    validation::validate_provider_config_report(parsed, ctx.factories())
+        .err()
+        .map(|error| AppError::ProviderConfiguration(Box::new(error)))
+        .into_iter()
+        .collect()
 }
 
 /// Preserve source-local module-output diagnostics when module expansion
@@ -4728,15 +4969,14 @@ pub(crate) fn validate_module_attribute_refs_after_expansion_failure(
         let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
             &parsed, ctx.schemas(), None, &signatures, config,
         );
-        if let Err(joined) = validation::validate_attribute_param_ref_types_with_bindings(
-            &parsed.attribute_params,
-            &bindings,
-        ) {
-            errors.extend(prefixed_validation_messages(
-                &joined,
-                module.diagnostic_label(),
-            ));
-        }
+        errors.extend(
+            validation::attribute_param_ref_findings(&parsed.attribute_params, &bindings)
+                .into_iter()
+                .map(|finding| AppError::ParameterReference {
+                    prefix: Some(module.diagnostic_label().to_string()),
+                    finding: Box::new(finding),
+                }),
+        );
     }
     errors
 }
@@ -4749,11 +4989,12 @@ pub(crate) fn validate_module_internal_ref_types(
     ctx: &WiringContext,
     module_walk: &ModuleWalk,
     config: &ValidationProviderCatalog<'_>,
+    warnings: &mut Vec<carina_core::parser::ParseWarning>,
 ) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {
         let mut parsed = module.loaded().parsed.clone();
-        let prefix = module.diagnostic_label();
+        let prefix = module.diagnostic_label().to_string();
         let configuration = carina_core::config_loader::load_buffer_configuration(
             &parsed,
             ctx.schemas(),
@@ -4798,34 +5039,37 @@ pub(crate) fn validate_module_internal_ref_types(
             ctx.schemas(),
             config.catalog(),
         );
-        let mut sink = CliTypeCheckSink { errors: Vec::new() };
-        if let Err(joined) = validation::validate_resource_ref_types(
-            configuration.judged(),
-            &HashSet::new(),
-            &bindings,
-            &mut sink,
-        ) {
-            match joined {
-                validation::ResourceRefTypeValidationError::Validation(message) => {
-                    errors.extend(prefixed_validation_messages(&message, &prefix))
-                }
-                validation::ResourceRefTypeValidationError::AnalysisInvariant(error) => {
-                    errors.push(AppError::AnalysisInvariant(error))
-                }
-            }
+        let mut sink = ValidationReportSink {
+            errors: Vec::new(),
+            warnings: Vec::new(),
+        };
+        match validation::resource_reference_findings(configuration.judged(), &bindings, &mut sink)
+        {
+            Ok(findings) => errors.extend(findings.into_iter().map(|finding| {
+                AppError::ResourceAdmission(Box::new(finding.with_context(&prefix)))
+            })),
+            Err(error) => errors.push(AppError::AnalysisInvariant(error)),
         }
-        for diagnostic in sink.errors {
-            errors.extend(prefixed_validation_messages(&diagnostic, &prefix));
-        }
+        errors.extend(sink.errors);
+        warnings.extend(sink.warnings);
         for parameter in &configuration.judged().file().attribute_params {
             let parameters = std::slice::from_ref(parameter);
-            let values = validation::validate_attribute_params_with_context(parameters, config);
-            let references =
-                validation::validate_attribute_param_ref_types_with_bindings(parameters, &bindings);
-            // Both checks run. A reference rejection already enforces this
-            // boundary and supplies its precise origin and nested failures.
-            if let Err(joined) = references.and(values) {
-                errors.extend(prefixed_validation_messages(&joined, &prefix));
+            let values = validation::attribute_value_findings(parameters, config);
+            let references = validation::attribute_param_ref_findings(parameters, &bindings);
+            if references.is_empty() {
+                errors.extend(values.into_iter().map(|finding| AppError::ParameterValue {
+                    prefix: Some(prefix.clone()),
+                    finding: Box::new(finding),
+                }));
+            } else {
+                errors.extend(
+                    references
+                        .into_iter()
+                        .map(|finding| AppError::ParameterReference {
+                            prefix: Some(prefix.clone()),
+                            finding: Box::new(finding),
+                        }),
+                );
             }
         }
     }
@@ -10764,6 +11008,7 @@ fn build_schema_only_factories_from_providers(
     runtime: &CommandRuntime,
     providers: &[ProviderConfig<ParserPlaceholder, carina_core::resource::RelativeBindingName>],
     base_dir: &ResolvedPath,
+    notices: &mut ProviderNoticeSink,
 ) -> Result<ProviderFactoryLoad, AppError> {
     #[cfg(any(test, feature = "test-utils"))]
     runtime.record_provider_load();
@@ -10793,10 +11038,13 @@ fn build_schema_only_factories_from_providers(
             ProviderSource::File(_) => carina_provider_resolver::find_file_provider_source(
                 base_dir,
                 &config.loading_projection(),
+                &mut |notice| notices.emit(ProviderLoadEvent::Resolver(notice)),
             )
             .map_err(carina_provider_resolver::FindInstalledProviderError::from),
             ProviderSource::Remote(_) => {
-                carina_provider_resolver::find_installed_provider(base_dir, config)
+                carina_provider_resolver::find_installed_provider(base_dir, config, &mut |notice| {
+                    notices.emit(ProviderLoadEvent::Resolver(notice))
+                })
             }
         };
         let installed = match installed {
@@ -10809,17 +11057,26 @@ fn build_schema_only_factories_from_providers(
                 continue;
             }
         };
+        let host_events = notices.clone();
         let loaded = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(installed.load_with(
                 user_dirs,
                 grants,
-                |verified| async move {
-                    let artifact = verified.artifact().clone();
-                    carina_plugin_host::SchemaOnlyWasmProviderFactory::from_bytes(
-                        verified, user_dirs,
-                    )
-                    .await
-                    .map(|factory| (factory, artifact))
+                |notice| notices.emit(ProviderLoadEvent::Resolver(notice)),
+                |verified| {
+                    let events = host_events.clone();
+                    async move {
+                        let artifact = verified.artifact().clone();
+                        carina_plugin_host::SchemaOnlyWasmProviderFactory::from_bytes(
+                            verified,
+                            user_dirs,
+                            &mut carina_plugin_host::WasmLoadNoticeSink::new(move |notice| {
+                                events.emit(ProviderLoadEvent::Cache(notice))
+                            }),
+                        )
+                        .await
+                        .map(|factory| (factory, artifact))
+                    }
                 },
             ))
         });

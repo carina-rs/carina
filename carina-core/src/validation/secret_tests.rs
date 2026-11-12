@@ -543,13 +543,8 @@ fn secret_origin_4275_deserializer_normalizes_secret_depth() {
 #[test]
 fn secret_origin_4275_non_pest_syntax_error_drops_argument_excerpt() {
     let source = "private-argument";
-    let span = pest::Span::new(source, 0, source.len()).unwrap();
-    let error = crate::parser::ParseError::Syntax(pest::error::Error::new_from_span(
-        pest::error::ErrorVariant::CustomError {
-            message: "argument error".into(),
-        },
-        span,
-    ))
-    .inside_secret_at(7);
+    let error = crate::parser::SourceSpanIndex::parse(source)
+        .unwrap_err()
+        .inside_secret_at(7);
     assert_safe(&error, source);
 }

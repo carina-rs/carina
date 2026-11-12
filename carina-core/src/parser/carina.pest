@@ -13,7 +13,8 @@ file = { SOI ~ statement* ~ EOI }
 statement = { backend_block | provider_block | arguments_block | attributes_block | exports_block | import_state_block | removed_block | moved_block | require_statement | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
 
 // Require statement: require <validate_expr>, "error message"
-require_statement = { "require" ~ validate_expr ~ "," ~ string }
+require_head = _{ require_keyword ~ validate_expr }
+require_statement = { require_head ~ "," ~ string }
 
 // Upstream state expression: upstream_state { source = "<dir>" }
 // Declares a read-only reference to another Carina configuration's state.
@@ -90,7 +91,7 @@ validate_primary = {
   | "(" ~ validate_expr ~ ")"
 }
 null_literal = { "null" ~ !(ASCII_ALPHANUMERIC | "_") }
-validate_function_call = { identifier ~ "(" ~ (validate_expr ~ ("," ~ validate_expr)*)? ~ ")" }
+validate_function_call = { call_open ~ (validate_expr ~ ("," ~ validate_expr)*)? ~ paren_close }
 
 // Attributes block: attributes { subnet_ids: list(string), ... }
 attributes_block = {
@@ -202,7 +203,8 @@ provider_expr = {
 // `use_expr` is allowed only here (not in `expression`/`primary`) because it is
 // not a value: it is a meta-statement handled specially by the let-binding
 // evaluator. See issue #2233.
-let_binding = { "let" ~ (discard_pattern | identifier) ~ "=" ~ (use_expr | expression) }
+let_head = _{ binding_keyword ~ (discard_pattern | identifier) }
+let_binding = { let_head ~ "=" ~ (use_expr | expression) }
 discard_pattern = @{ "_" }
 
 // Block content: a local let binding, an attribute (key = value), or a nested block (key { ... })
@@ -220,7 +222,7 @@ attribute = { (identifier | string) ~ "=" ~ expression }
 // Supports arbitrary nesting depth (block_content allows nested_block recursively)
 nested_block = { identifier ~ "{" ~ block_content* ~ "}" }
 
-identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+identifier = @{ ASCII_ALPHA ~ identifier_continue* }
 
 // Namespaced identifier: aws.s3_bucket, aws.Region.ap_northeast_1
 //
@@ -256,7 +258,7 @@ expression = { coalesce_expr }
 coalesce_expr = { pipe_expr ~ ("??" ~ pipe_expr)* }
 
 // Pipe operator: value |> func |> func
-pipe_expr = { compose_expr ~ ("|>" ~ function_call)* }
+pipe_expr = { compose_expr ~ pipe_step* }
 
 // Compose operator: f >> g (function composition, binds tighter than |>)
 compose_expr = { additive_expr ~ (">>" ~ additive_expr)* }
@@ -280,7 +282,7 @@ remainder_op = { "%" }
 postfix_expr = { primary ~ (index_access | field_access)* }
 
 // Function call: func(args)
-function_call = { identifier ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
+function_call = { call_open ~ (expression ~ ("," ~ expression)*)? ~ paren_close }
 
 // Primary value
 // Note: `use_expr` is intentionally NOT a primary. It is a meta-statement,
@@ -313,8 +315,9 @@ primary = {
 // For expression: for var in iterable { body }
 // Supports: for x in list, for (i, x) in list, for k, v in map
 for_expr = {
-    "for" ~ for_binding ~ "in" ~ for_iterable ~ "{" ~ for_body ~ "}"
+    for_head ~ "{" ~ for_body ~ "}"
 }
+for_head = _{ iteration_keyword ~ for_binding ~ iterable_keyword ~ for_iterable }
 
 // For binding: simple (x), indexed ((i, x)), or map (k, v).
 // `_` is accepted in any position as a discard pattern (same semantics as
@@ -336,7 +339,8 @@ for_body = { for_local_binding* ~ (read_resource_expr | resource_expr | module_c
 for_local_binding = { "let" ~ identifier ~ "=" ~ expression }
 
 // If expression: if condition { body } else { body }
-if_expr = { "if" ~ expression ~ "{" ~ if_body ~ "}" ~ else_clause? }
+if_head = _{ conditional_keyword ~ expression ~ &"{" }
+if_expr = { if_head ~ "{" ~ if_body ~ "}" ~ else_clause? }
 else_clause = { "else" ~ "{" ~ if_body ~ "}" }
 if_body = { if_local_binding* ~ (read_resource_expr | resource_expr | module_call | expression) }
 if_local_binding = { "let" ~ identifier ~ "=" ~ expression }
@@ -391,26 +395,26 @@ duration_unit = @{
     | "hours"   | "hour"   | "hr"  | "h"
 }
 string = ${ single_quoted_string | double_quoted_string }
-double_quoted_string = ${ "\"" ~ string_part* ~ "\"" }
+double_quoted_string = ${ double_quote ~ string_part* ~ double_quote }
 string_part = ${ interpolation | string_literal }
 // Non-empty interpolations use normal trivia at both edges. Empty forms
 // only admit spaces and tabs so `${\n}` remains a syntax error (#2480).
-interpolation = ${ "${" ~ (interpolation_expr | inline_ws*) ~ "}" }
+interpolation = ${ interpolation_open ~ (interpolation_expr | inline_ws*) ~ interpolation_close }
 interpolation_expr = !{ (WHITESPACE | COMMENT)* ~ expression ~ (WHITESPACE | COMMENT)* }
 inline_ws = _{ " " | "\t" }
 string_literal = @{ string_char+ }
 string_char = {
-    !("\"" | "\\" | "${") ~ ANY
-  | "\\" ~ ("\"" | "\\" | "n" | "r" | "t" | "$")
+    !(double_quote | escape_start | interpolation_open) ~ ANY
+  | escape_start ~ ("\"" | "\\" | "n" | "r" | "t" | "$")
   | "$" ~ !("{")
 }
 
 // Single-quoted strings: literal only, no interpolation
-single_quoted_string = ${ "'" ~ single_quoted_content ~ "'" }
+single_quoted_string = ${ single_quote ~ single_quoted_content ~ single_quote }
 single_quoted_content = @{ single_quoted_char* }
 single_quoted_char = {
-    !("'" | "\\") ~ ANY
-  | "\\" ~ ("'" | "\\")
+    !(single_quote | escape_start) ~ ANY
+  | escape_start ~ ("'" | "\\")
 }
 
 // Whitespace (auto-skip)
@@ -418,5 +422,5 @@ WHITESPACE = _{ " " | "\t" | NEWLINE }
 
 // Comment (auto-skip)
 COMMENT = _{ block_comment | line_comment }
-line_comment = _{ ("//" | "#") ~ (!NEWLINE ~ ANY)* }
-block_comment = _{ "/*" ~ (block_comment | (!"*/" ~ ANY))* ~ "*/" }
+line_comment = _{ line_comment_open ~ (!NEWLINE ~ ANY)* }
+block_comment = _{ block_comment_open ~ block_comment_content* ~ block_comment_close }

@@ -391,14 +391,18 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
         self.node.node.children.len()
     }
 
-    pub(crate) fn map_keys(&self) -> &[String] {
+    pub(crate) fn map_keys(&self) -> &[crate::parser::AttributeKey] {
         match &self.node.node.kind {
             ExprKind::Map(keys) => keys,
             _ => &[],
         }
     }
 
-    pub(crate) fn map_child(&self, key: &str, edge: EdgeRole) -> Result<Self, MissingEvidence> {
+    pub(crate) fn map_child(
+        &self,
+        key: &crate::parser::AttributeKey,
+        edge: EdgeRole,
+    ) -> Result<Self, MissingEvidence> {
         let ExprKind::Map(keys) = &self.node.node.kind else {
             return Err(MissingEvidence::new("authored map container"));
         };
@@ -822,7 +826,7 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
     }
     pub(crate) fn field_child(
         &self,
-        key: &str,
+        key: &crate::parser::AttributeKey,
         alias: Option<&str>,
     ) -> Result<Self, MissingEvidence> {
         let key = match &self.kind {
@@ -830,14 +834,26 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
                 if usage.form() == AuthoredForm::Map
                     && !usage.map_keys().iter().any(|candidate| candidate == key) =>
             {
-                alias.unwrap_or(key)
+                alias
+                    .map(|name| {
+                        std::borrow::Cow::Owned(crate::parser::AttributeKey::literal(
+                            name.to_owned(),
+                        ))
+                    })
+                    .unwrap_or(std::borrow::Cow::Borrowed(key))
             }
-            CursorKind::Authored(_) | CursorKind::CoveredBy(_) | CursorKind::Projected(_) => key,
+            CursorKind::Authored(_) | CursorKind::CoveredBy(_) | CursorKind::Projected(_) => {
+                std::borrow::Cow::Borrowed(key)
+            }
         };
-        self.map_child(key, EdgeRole::StructField)
+        self.map_child(&key, EdgeRole::StructField)
     }
 
-    pub(crate) fn map_child(&self, key: &str, edge: EdgeRole) -> Result<Self, MissingEvidence> {
+    pub(crate) fn map_child(
+        &self,
+        key: &crate::parser::AttributeKey,
+        edge: EdgeRole,
+    ) -> Result<Self, MissingEvidence> {
         match &self.kind {
             CursorKind::Authored(usage) => match usage.form() {
                 AuthoredForm::Map => usage.map_child(key, edge).map(Self::authored),
@@ -1045,7 +1061,7 @@ impl NoAuthoredEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UnreachedSlot {
     resource: crate::resource::ResourceId,
-    attribute: String,
+    attribute: crate::parser::AttributeKey,
     node: NodeId,
     occurrence: UseId,
     instance: ExpansionInstanceId,
@@ -1055,7 +1071,7 @@ impl UnreachedSlot {
     pub fn resource_id(&self) -> &crate::resource::ResourceId {
         &self.resource
     }
-    pub fn attribute(&self) -> &str {
+    pub fn attribute(&self) -> &crate::parser::AttributeKey {
         &self.attribute
     }
     pub fn node_id(&self) -> NodeId {
@@ -1222,7 +1238,7 @@ impl<B: BindingAddress> ExpressionReport<B> {
 /// for genuinely non-authored producers; a missing live slot is an error.
 #[derive(Clone)]
 pub struct AuthoredSlots<B: BindingAddress = RelativeBindingName> {
-    slots: indexmap::IndexMap<String, JudgedSlot<B>>,
+    slots: crate::parser::ConfigurationAttributes<JudgedSlot<B>>,
     aliases: std::collections::HashMap<String, String>,
     synthetic: indexmap::IndexMap<String, SyntheticSource>,
     declaration: Option<SlotDeclarationId>,
@@ -1294,10 +1310,10 @@ impl<B: BindingAddress> AuthoredSlots<B> {
         })
     }
 
-    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (&str, &mut JudgedSlot<B>)> {
-        self.slots
-            .iter_mut()
-            .map(|(name, slot)| (name.as_str(), slot))
+    pub(crate) fn iter_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (&crate::parser::AttributeKey, &mut JudgedSlot<B>)> {
+        self.slots.iter_mut()
     }
     pub(super) fn selected_schema_kind(&self) -> Option<crate::schema::SchemaKind> {
         self.slots.values().next().map(JudgedSlot::schema_kind)
@@ -1311,7 +1327,7 @@ impl<B: BindingAddress> AuthoredSlots<B> {
         }
     }
     fn authored_name<'n>(
-        slots: &indexmap::IndexMap<String, JudgedSlot<B>>,
+        slots: &crate::parser::ConfigurationAttributes<JudgedSlot<B>>,
         aliases: &'n std::collections::HashMap<String, String>,
         name: &'n str,
     ) -> &'n str {
@@ -1444,7 +1460,7 @@ impl<B: BindingAddress> AuthoredSlots<B> {
 impl AuthoredSlots {
     pub(in crate::parser) fn insert(
         &mut self,
-        name: String,
+        name: impl Into<crate::parser::AttributeKey>,
         expression: super::ExprValue,
         kind: crate::schema::SchemaKind,
         instance: ExpansionInstanceId,

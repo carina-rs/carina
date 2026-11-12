@@ -870,15 +870,15 @@ fn is_dynamic_dsl_member_segment(s: &str) -> bool {
 /// # Examples
 ///
 /// ```
-/// use carina_core::resource::{ConcreteValue, Value};
+/// use carina_core::parser::ConfigurationAttributes;
+/// use carina_core::resource::Value;
 /// use carina_core::utils::extract_region_from_attrs;
-/// use indexmap::IndexMap;
 ///
-/// let empty: IndexMap<String, Value> = IndexMap::new();
+/// let empty: ConfigurationAttributes<Value> = ConfigurationAttributes::new();
 /// assert_eq!(extract_region_from_attrs(&empty, "ap-northeast-1"), "ap-northeast-1");
 /// ```
 pub fn extract_region_from_attrs(
-    attributes: &indexmap::IndexMap<String, crate::resource::Value>,
+    attributes: &crate::parser::ConfigurationAttributes<crate::resource::Value>,
     default_region: &str,
 ) -> String {
     region_from_attrs(attributes).unwrap_or_else(|| default_region.to_string())
@@ -886,7 +886,7 @@ pub fn extract_region_from_attrs(
 
 /// Read a resolved provider region without supplying a default.
 pub(crate) fn region_from_attrs(
-    attributes: &indexmap::IndexMap<String, crate::resource::Value>,
+    attributes: &crate::parser::ConfigurationAttributes<crate::resource::Value>,
 ) -> Option<String> {
     match attributes.get("region") {
         Some(Value::Concrete(ConcreteValue::String(s))) => Some(s.expose_plaintext().to_string()),
@@ -1735,7 +1735,7 @@ mod tests {
                 "aws.Region.us_east_1".to_string(),
             )));
             assert_eq!(
-                extract_region_from_attrs(&attrs, "ap-northeast-1"),
+                extract_region_from_attrs(&((attrs.clone()).into()), "ap-northeast-1"),
                 "ap-northeast-1"
             );
         }
@@ -1749,7 +1749,7 @@ mod tests {
                 ),
             )));
             assert_eq!(
-                extract_region_from_attrs(&attrs, "ap-northeast-1"),
+                extract_region_from_attrs(&((attrs.clone()).into()), "ap-northeast-1"),
                 "us-east-1"
             );
         }
@@ -1759,7 +1759,7 @@ mod tests {
             let attrs =
                 attrs_with_region(Value::Concrete(ConcreteValue::String("us-east-1".into())));
             assert_eq!(
-                extract_region_from_attrs(&attrs, "ap-northeast-1"),
+                extract_region_from_attrs(&((attrs.clone()).into()), "ap-northeast-1"),
                 "us-east-1"
             );
         }
@@ -1772,7 +1772,7 @@ mod tests {
                 "aws.Region.us_east_1".into(),
             )));
             assert_eq!(
-                extract_region_from_attrs(&attrs, "ap-northeast-1"),
+                extract_region_from_attrs(&((attrs.clone()).into()), "ap-northeast-1"),
                 "aws.Region.us_east_1"
             );
         }
@@ -1781,7 +1781,7 @@ mod tests {
         fn missing_region_returns_default() {
             let attrs: IndexMap<String, Value> = IndexMap::new();
             assert_eq!(
-                extract_region_from_attrs(&attrs, "ap-northeast-1"),
+                extract_region_from_attrs(&((attrs.clone()).into()), "ap-northeast-1"),
                 "ap-northeast-1"
             );
         }

@@ -22,9 +22,8 @@ block_comment = @{ "/*" ~ (block_comment | (!"*/" ~ ANY))* ~ "*/" }
 statement = { backend_block | provider_block | arguments_block | attributes_block | exports_block | import_state_block | removed_block | moved_block | require_statement | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
 
 // Require statement: require <validate_expr>, "error message"
-require_statement = {
-    kw_require ~ trivia+ ~ validate_expr ~ trivia* ~ comma ~ trivia* ~ string
-}
+require_head = _{ kw_require ~ trivia+ ~ validate_expr }
+require_statement = { require_head ~ trivia* ~ comma ~ trivia* ~ string }
 
 // Backend block: backend s3 { ... }
 backend_block = {
@@ -215,9 +214,8 @@ discard_pattern = @{ "_" }
 // `module_call` must be tried before `expression` so the more specific
 // `name { ... }` shape commits before `expression` reaches `variable_ref`
 // and leaves `{ ... }` unconsumed.
-let_binding = {
-    kw_let ~ trivia+ ~ (discard_pattern | identifier) ~ trivia* ~ equals ~ trivia* ~ (use_expr | module_call | expression)
-}
+let_head = _{ kw_let ~ trivia+ ~ (discard_pattern | identifier) }
+let_binding = { let_head ~ trivia* ~ equals ~ trivia* ~ (use_expr | module_call | expression) }
 
 // Block content: local let bindings, attributes, trivia, nested blocks, or nested elements
 block_content = _{ trivia | local_binding | nested_block | attribute }
@@ -363,8 +361,9 @@ map_entry = { (identifier | string) ~ trivia* ~ equals ~ trivia* ~ expression ~ 
 
 // For expression: for var in iterable { body }
 for_expr = {
-    kw_for ~ trivia+ ~ for_binding ~ trivia+ ~ kw_in ~ trivia+ ~ for_iterable ~ trivia* ~ open_brace ~ for_body_content* ~ close_brace
+    for_head ~ trivia* ~ open_brace ~ for_body_content* ~ close_brace
 }
+for_head = _{ kw_for ~ trivia+ ~ for_binding ~ trivia+ ~ kw_in ~ trivia+ ~ for_iterable }
 
 // For binding: simple (x), indexed ((i, x)), or map (k, v)
 for_binding = { for_indexed_binding | for_map_binding | for_simple_binding }
@@ -389,8 +388,9 @@ for_local_binding = { kw_let ~ trivia+ ~ identifier ~ trivia* ~ equals ~ trivia*
 
 // If expression: if condition { body } else { body }
 if_expr = {
-    kw_if ~ trivia+ ~ expression ~ trivia* ~ open_brace ~ if_body_content* ~ close_brace ~ (trivia* ~ else_clause)?
+    if_head ~ open_brace ~ if_body_content* ~ close_brace ~ (trivia* ~ else_clause)?
 }
+if_head = _{ kw_if ~ trivia+ ~ expression ~ trivia* ~ &open_brace }
 else_clause = { kw_else ~ trivia* ~ open_brace ~ if_body_content* ~ close_brace }
 
 // If body content

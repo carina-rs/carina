@@ -1455,6 +1455,37 @@ pub(crate) fn identity_required_bindings<
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ResourcePrefixSource(());
 
+/// One prefix failure, retaining resource ownership and authored provenance.
+#[derive(Debug)]
+pub struct AttributePrefixError {
+    resource: ResourceId,
+    prefix: String,
+    conflict: Option<String>,
+    location: Option<crate::parser::DeclarationLocation>,
+}
+impl AttributePrefixError {
+    pub fn location(&self) -> Option<&crate::parser::DeclarationLocation> {
+        self.location.as_ref()
+    }
+}
+impl std::fmt::Display for AttributePrefixError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.conflict {
+            None => write!(
+                formatter,
+                "{}: '{}' cannot be empty",
+                self.resource, self.prefix
+            ),
+            Some(base) => write!(
+                formatter,
+                "{}: cannot specify both '{}' and '{}'",
+                self.resource, self.prefix, base
+            ),
+        }
+    }
+}
+impl std::error::Error for AttributePrefixError {}
+
 /// Resolve `<attr>_prefix` meta-attributes in resources.
 ///
 /// For each resource attribute ending in `_prefix`, checks if the base attribute
@@ -1468,6 +1499,22 @@ pub fn resolve_attr_prefixes<P: PlaceholderKind, B: BindingAddress>(
     resources: &mut [Resource<crate::resource::ModuleSource, P, B>],
     registry: &SchemaRegistry,
 ) -> Result<(), String> {
+    let errors = resolve_attr_prefix_findings(resources, registry);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+}
+
+pub fn resolve_attr_prefix_findings<P: PlaceholderKind, B: BindingAddress>(
+    resources: &mut [Resource<crate::resource::ModuleSource, P, B>],
+    registry: &SchemaRegistry,
+) -> Vec<AttributePrefixError> {
     let mut all_errors = Vec::new();
 
     for resource in resources.iter_mut() {
@@ -1497,16 +1544,23 @@ pub fn resolve_attr_prefixes<P: PlaceholderKind, B: BindingAddress>(
 
             // Error if prefix is empty
             if prefix_value.expose_plaintext().is_empty() {
-                all_errors.push(format!("{}: '{}' cannot be empty", resource.id, prefix_key));
+                all_errors.push(AttributePrefixError {
+                    resource: resource.id.clone(),
+                    prefix: prefix_key,
+                    conflict: None,
+                    location: resource.declaration.location().cloned(),
+                });
                 continue;
             }
 
             // Error if both prefix and base attribute are specified
             if resource.attributes.contains_key(&base_attr) {
-                all_errors.push(format!(
-                    "{}: cannot specify both '{}' and '{}'",
-                    resource.id, prefix_key, base_attr
-                ));
+                all_errors.push(AttributePrefixError {
+                    resource: resource.id.clone(),
+                    prefix: prefix_key,
+                    conflict: Some(base_attr),
+                    location: resource.declaration.location().cloned(),
+                });
                 continue;
             }
 
@@ -1545,11 +1599,7 @@ pub fn resolve_attr_prefixes<P: PlaceholderKind, B: BindingAddress>(
         }
     }
 
-    if all_errors.is_empty() {
-        Ok(())
-    } else {
-        Err(all_errors.join("\n"))
-    }
+    all_errors
 }
 
 /// State information needed for prefix reconciliation.

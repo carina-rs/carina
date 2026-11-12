@@ -27,11 +27,13 @@ pub(in crate::parser) fn parse_use_expr(
         let attr_span = attr.as_span();
         let attr_line = attr_span.start_pos().line_col().0;
         let mut attr_inner = attr.into_inner();
-        let key = next_pair(&mut attr_inner, "attribute name", "use expression")?
-            .as_str()
-            .to_string();
+        let key = ctx.authored_key(next_pair(
+            &mut attr_inner,
+            "attribute name",
+            "use expression",
+        )?);
         let value_pair = next_pair(&mut attr_inner, "attribute value", "use expression")?;
-        if key != "source" {
+        if !key.matches("source") {
             return Err(ParseError::InvalidExpression {
                 line: attr_line,
                 message: format!("`use` block only accepts a `source` attribute, got `{key}`"),
