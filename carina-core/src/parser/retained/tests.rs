@@ -11,6 +11,136 @@ fn config() -> ProviderContext {
 }
 
 #[test]
+fn round3_test_utils_constructor_cannot_mint_directory_completeness() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = "require false, 'partial guard'\n";
+    let guard = directory.path().join("guards.crn");
+    std::fs::write(&guard, source).unwrap();
+    std::fs::write(
+        directory.path().join("arguments.crn"),
+        "arguments { n: Int }\n",
+    )
+    .unwrap();
+    let parsed = crate::parser::parse_file(source, &guard, &config()).unwrap();
+    let root = crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed);
+    let schemas = SchemaRegistry::new();
+    let buffer =
+        crate::config_loader::load_buffer_configuration(root.parsed(), &schemas, &config());
+    assert!(matches!(
+        require_scope(buffer.parsed()),
+        RequireScope::Unknown
+    ));
+    assert!(buffer.judged().report().findings().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn round3_non_utf8_sibling_is_preserved_in_recovery_discovery() {
+    use std::os::unix::ffi::OsStringExt;
+    let directory = tempfile::tempdir().unwrap();
+    let source = "require false, 'guard'\n";
+    let guard = directory.path().join("guards.crn");
+    let arguments = directory
+        .path()
+        .join(std::ffi::OsString::from_vec(b"\xff.crn".to_vec()));
+    std::fs::write(&guard, source).unwrap();
+    // Unsaved buffers exercise raw Unix paths even on filesystems which
+    // cannot create non-UTF-8 names. Use the physical sibling when supported.
+    let physical = std::fs::write(&arguments, "arguments { n: Int }\n").is_ok();
+    let overrides = crate::config_loader::SourceOverrides::from([
+        (guard.clone(), source.to_string()),
+        (arguments, "arguments { n: Int }\n".to_string()),
+    ]);
+    let context = config();
+    let parsed = crate::parser::parse_file(source, &guard, &context).unwrap();
+    let schemas = SchemaRegistry::new();
+    let pinned = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let buffer = crate::config_loader::load_buffer_configuration_in_directory(
+        &parsed, &schemas, &context, &pinned, &overrides,
+    );
+    assert!(matches!(
+        require_scope(buffer.parsed()),
+        RequireScope::ModuleTemplate { .. }
+    ));
+    assert!(buffer.judged().report().findings().is_empty());
+    if physical {
+        let cli = crate::config_loader::load_configuration_with_config(&pinned, &context, &schemas)
+            .unwrap();
+        let lsp = crate::config_loader::parse_directory_with_overrides_and_diagnostics(
+            &pinned,
+            &context,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            require_scope(cli.parsed.parsed()),
+            RequireScope::ModuleTemplate { .. }
+        ));
+        assert!(matches!(
+            require_scope(lsp.parsed.parsed()),
+            RequireScope::ModuleTemplate { .. }
+        ));
+        let cli_buffer = crate::config_loader::load_buffer_configuration(
+            cli.parsed.parsed(),
+            &schemas,
+            &context,
+        );
+        let lsp_buffer = crate::config_loader::load_buffer_configuration(
+            lsp.parsed.parsed(),
+            &schemas,
+            &context,
+        );
+        assert!(cli_buffer.judged().report().findings().is_empty());
+        assert!(lsp_buffer.judged().report().findings().is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn round3_unreadable_sibling_has_a_typed_source_failure_and_no_witness() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let source = "require false, 'guard'\n";
+    let guard = directory.path().join("guards.crn");
+    let blocked = directory.path().join("blocked.crn");
+    std::fs::write(&guard, source).unwrap();
+    std::fs::write(&blocked, "let n = 1\n").unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Privileged Unix runners may read mode-000 files. Invalid UTF-8 still
+    // makes the source unreadable as configuration text on those runners.
+    if std::fs::read_to_string(&blocked).is_ok() {
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&blocked, [0xff]).unwrap();
+    }
+    let context = config();
+    let pinned = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let failure = crate::config_loader::parse_directory_for_metadata_report(
+        &pinned,
+        &context,
+        &Default::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect_err("an unreadable source must fail directory loading");
+    let parsed = crate::parser::parse_file(source, &guard, &context).unwrap();
+    let schemas = SchemaRegistry::new();
+    let buffer = crate::config_loader::load_buffer_configuration_in_directory(
+        &parsed,
+        &schemas,
+        &context,
+        &pinned,
+        &Default::default(),
+    );
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(matches!(
+        require_scope(buffer.parsed()),
+        RequireScope::Unknown
+    ));
+    assert!(buffer.judged().report().findings().is_empty());
+    assert_eq!(failure.source_file(), Some(blocked.as_path()));
+    assert!(std::error::Error::source(&failure).is_some());
+}
+
+#[test]
 fn round2_partial_declarations_cannot_grant_directory_require_admission() {
     let schemas = SchemaRegistry::new();
     for condition in ["false", "n > 0"] {

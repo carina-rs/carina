@@ -116,12 +116,12 @@ impl UpstreamDiscoveryContext<'_> {
     fn parse_source(
         &self,
         source: &ResolvedPath,
-        overrides: &HashMap<String, String>,
+        overrides: &crate::config_loader::SourceOverrides,
     ) -> Result<
         crate::config_loader::ParsedRootDirectory,
         crate::config_loader::DirectoryParseFailure,
     > {
-        crate::config_loader::parse_directory_for_metadata_report(
+        crate::config_loader::parse_directory_for_metadata_with_source_overrides_report(
             source,
             self.context.catalog(),
             overrides,
@@ -891,14 +891,12 @@ fn resolve_upstream_exports_context_report<B: BindingAddress>(
         if !source_abs.is_dir() {
             continue;
         }
-        if matches!(source_abs.crn_files(), Ok(files) if files.is_empty()) {
+        if matches!(crate::config_loader::DirectoryFiles::discover(&source_abs, overrides), Ok(files) if files.is_empty())
+        {
             out.insert(us.binding.clone(), HashMap::new());
             continue;
         }
-        match discovery.parse_source(
-            &source_abs,
-            &crate::config_loader::directory_source_overrides(&source_abs, overrides),
-        ) {
+        match discovery.parse_source(&source_abs, overrides) {
             Ok(parsed) => match resolve_upstream_exports_from_parsed(
                 parsed,
                 &source_abs,
@@ -1892,6 +1890,63 @@ fn visit_subscript_access<B: BindingAddress>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn round3_non_utf8_upstream_guard_is_not_omitted() {
+        use std::os::unix::ffi::OsStringExt;
+        let directory = tempfile::tempdir().unwrap();
+        let upstream_dir = directory.path().join("upstream");
+        std::fs::create_dir(&upstream_dir).unwrap();
+        std::fs::write(
+            upstream_dir.join("exports.crn"),
+            "exports { value: Int = 1 }\n",
+        )
+        .unwrap();
+        let guard = upstream_dir.join(std::ffi::OsString::from_vec(b"\xff.crn".to_vec()));
+        let physical = std::fs::write(&guard, "require false, 'upstream guard'\n").is_ok();
+        let overrides = crate::config_loader::SourceOverrides::from([(
+            guard.clone(),
+            "require false, 'upstream guard'\n".to_string(),
+        )]);
+        let project = upstream_project(&[upstream("prior", "./upstream")]);
+        let context = ctx();
+        crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            let (_, errors) = super::resolve_upstream_export_report_inner(
+                &ResolvedPath::new(directory.path()).unwrap(),
+                &AnalysisTree::try_from_file(&project).unwrap(),
+                session,
+                None,
+                &overrides,
+            )
+            .unwrap();
+            assert_eq!(errors.len(), 1, "upstream guard was omitted");
+            let (_, error) = errors[0].detail().module_failure().unwrap();
+            let crate::module_resolver::ModuleError::DirectoryConstraint(finding) =
+                error.root_cause()
+            else {
+                panic!("expected a located directory constraint: {error}");
+            };
+            assert_eq!(finding.location().file().path(), guard);
+            assert_eq!(finding.location().span().start_line(), 1);
+            assert_eq!(finding.location().span().start_column(), 9);
+            assert_eq!(finding.location().span().end_column(), 14);
+            assert_eq!(
+                finding.detail().to_string(),
+                "require failed: upstream guard"
+            );
+            if physical {
+                let (_, errors) = super::resolve_upstream_export_report_inner(
+                    &ResolvedPath::new(directory.path()).unwrap(),
+                    &AnalysisTree::try_from_file(&project).unwrap(),
+                    session,
+                    None,
+                    &Default::default(),
+                )
+                .unwrap();
+                assert_eq!(errors.len(), 1);
+            }
+        });
+    }
     use crate::schema::{
         PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
     };

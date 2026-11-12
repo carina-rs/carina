@@ -1,6 +1,52 @@
 use super::*;
 use tower_lsp::lsp_types::{Position, Range};
 
+#[cfg(unix)]
+#[test]
+fn round3_non_utf8_editor_file_keeps_its_authored_path() {
+    use std::os::unix::ffi::OsStringExt;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("guards.crn"),
+        "require false, 'template guard'\n",
+    )
+    .unwrap();
+    let path = directory
+        .path()
+        .join(std::ffi::OsString::from_vec(b"\xff.crn".to_vec()));
+    if std::fs::write(&path, "arguments { n: Int }\n").is_ok() {
+        let guard = directory.path().join("guards.crn");
+        let diagnostics = test_engine().analyze(
+            &create_document_at("require false, 'template guard'\n", guard.clone()),
+            Some(&guard),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+    let document = create_document_at("arguments { n: Int }\n", path.clone());
+    let pinned = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
+    let name = path.file_name().unwrap().to_string_lossy();
+    let merged = test_engine()
+        .with_run_for_test(|run| {
+            run.parse_and_resolve_merged_with_buffer(
+                &document.for_diagnostics().unwrap(),
+                Some(&name),
+                &pinned,
+            )
+        })
+        .unwrap();
+    let syntax =
+        carina_core::parser::AnalysisTree::try_from_file(merged.directory.parsed.parsed()).unwrap();
+    let argument = syntax
+        .syntax()
+        .declarations()
+        .iter()
+        .find(|declaration| {
+            declaration.detail().kind() == carina_core::config_loader::DeclarationKind::Argument
+        })
+        .unwrap();
+    assert_eq!(argument.location().file().path(), path);
+}
+
 fn assert_round1_buffer_guard(condition: &str, broken_sibling: bool) {
     let engine = test_engine();
     let directory = tempfile::tempdir().unwrap();
