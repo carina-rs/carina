@@ -788,7 +788,7 @@ impl std::error::Error for AdmissionFindings {
         if self.conversions.findings().is_empty() {
             self.findings.first().map(|finding| &finding.error as _)
         } else {
-            Some(&self.conversions)
+            None
         }
     }
 }
@@ -813,6 +813,9 @@ impl AdmissionFindings {
     }
     pub fn conversions(&self) -> &crate::ConversionChannel {
         &self.conversions
+    }
+    pub fn conversion_error(&self) -> Option<&crate::ConversionError> {
+        self.conversions.findings().first()
     }
 }
 impl std::fmt::Display for AdmissionFindings {

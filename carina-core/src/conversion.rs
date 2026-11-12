@@ -118,6 +118,71 @@ impl ConversionError {
             if let Some(conversion) = error.downcast_ref::<Self>() {
                 return Some(conversion);
             }
+            // Terminal diagnostics embed their causes in Display; transparent
+            // wrappers delegate source() past the wrapped ConversionError.
+            // Their typed accessors preserve metadata without rendering twice.
+            let conversion = error
+                .downcast_ref::<crate::parser::ParseError>()
+                .and_then(crate::parser::ParseError::conversion_error)
+                .or_else(|| {
+                    error
+                        .downcast_ref::<crate::schema::TypeError>()
+                        .and_then(crate::schema::TypeError::conversion_error)
+                })
+                .or_else(|| {
+                    error
+                        .downcast_ref::<crate::static_type::InferenceError>()
+                        .and_then(crate::static_type::InferenceError::conversion_error)
+                })
+                .or_else(|| {
+                    error
+                        .downcast_ref::<crate::static_type::InferenceIssue>()
+                        .and_then(crate::static_type::InferenceIssue::conversion_error)
+                })
+                .or_else(|| {
+                    error
+                        .downcast_ref::<crate::validation::ResourceRefTypeValidationError>()
+                        .and_then(
+                            crate::validation::ResourceRefTypeValidationError::conversion_error,
+                        )
+                })
+                .or_else(|| {
+                    error
+                        .downcast_ref::<ConversionFindings>()
+                        .and_then(|findings| findings.findings().first())
+                })
+                .or_else(|| {
+                    error
+                        .downcast_ref::<ConversionChannel>()
+                        .and_then(|channel| channel.findings().first())
+                })
+                .or_else(|| {
+                    error
+                        .downcast_ref::<crate::validation::admission::AdmissionFindings>()
+                        .and_then(crate::validation::admission::AdmissionFindings::conversion_error)
+                });
+            if conversion.is_some() {
+                return conversion;
+            }
+            if let Some(error) = error.downcast_ref::<crate::resolver::ResolutionError>() {
+                match error {
+                    crate::resolver::ResolutionError::AdmissionConstraints(findings) => {
+                        return findings.conversion_error();
+                    }
+                    crate::resolver::ResolutionError::Context { error, .. } => {
+                        return Self::from_error(error.as_ref());
+                    }
+                    crate::resolver::ResolutionError::InsideSecret {}
+                    | crate::resolver::ResolutionError::UnavailableSecret(_)
+                    | crate::resolver::ResolutionError::Message(_)
+                    | crate::resolver::ResolutionError::Knowledge(_) => {}
+                }
+            }
+            if let Some(crate::validation::admission::AdmissionReferenceError::Resolution(error)) =
+                error.downcast_ref::<crate::validation::admission::AdmissionReferenceError>()
+            {
+                return Self::from_error(error.as_ref());
+            }
             current = error.source();
         }
         None
@@ -233,7 +298,7 @@ impl InsideSecret for ConversionError {
 }
 
 /// Structured aggregate diagnostics; conversions keep their authored owner and
-/// range through CLI validation and the error source chain.
+/// range through CLI validation and the typed findings accessor.
 #[derive(Debug, Default)]
 pub struct ConversionFindings {
     findings: Vec<ConversionError>,
@@ -311,17 +376,13 @@ impl std::fmt::Display for ConversionChannel {
             write!(
                 f,
                 "{}",
-                crate::parser::Located::new(error.location().clone(), error)
+                crate::parser::Located::new(error.location().clone(), error.diagnostic_message())
             )?;
         }
         Ok(())
     }
 }
-impl std::error::Error for ConversionChannel {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.findings.first().map(|error| error as _)
-    }
-}
+impl std::error::Error for ConversionChannel {}
 impl std::fmt::Display for ConversionFindings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for (index, error) in self.findings.iter().enumerate() {
@@ -331,7 +392,7 @@ impl std::fmt::Display for ConversionFindings {
             write!(
                 f,
                 "{}",
-                crate::parser::Located::new(error.location().clone(), error)
+                crate::parser::Located::new(error.location().clone(), error.diagnostic_message())
             )?;
         }
         for error in &self.ordinary {
@@ -340,11 +401,7 @@ impl std::fmt::Display for ConversionFindings {
         Ok(())
     }
 }
-impl std::error::Error for ConversionFindings {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.findings.first().map(|error| error as _)
-    }
-}
+impl std::error::Error for ConversionFindings {}
 
 pub(crate) fn resolve_target(
     path: &ConversionTypePath,

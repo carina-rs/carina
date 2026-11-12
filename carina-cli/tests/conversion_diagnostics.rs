@@ -2,6 +2,48 @@
 use std::process::Command;
 
 #[test]
+fn conversion_cli_error_is_terminal_and_renders_the_cause_once() {
+    use std::error::Error;
+    let error = carina_core::parser::parse_file(
+        "let converted = if 42 as String { 'ok' } else { 'ok' }",
+        std::path::Path::new("terminal.crn"),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
+    let conversion = carina_core::ConversionError::from_error(&error)
+        .unwrap()
+        .clone();
+    let app = carina_cli::error::AppError::CheckedConversion {
+        error: conversion.clone(),
+    };
+    assert!(
+        app.source().is_none(),
+        "a located conversion is a terminal CLI diagnostic"
+    );
+    let typed = app
+        .conversion_error()
+        .expect("terminal errors retain typed metadata");
+    assert_eq!(typed.kind(), conversion.kind());
+    assert_eq!(typed.location(), conversion.location());
+    let rendered = carina_core::executor::render_error_chain(&app);
+    assert_eq!(
+        rendered.matches(&conversion.to_string()).count(),
+        1,
+        "{rendered}"
+    );
+    let mut cause = conversion.source();
+    while let Some(error) = cause {
+        assert_eq!(
+            rendered.matches(&error.to_string()).count(),
+            1,
+            "{rendered}"
+        );
+        cause = error.source();
+    }
+    assert!(rendered.contains("terminal.crn:1:20:"), "{rendered}");
+}
+
+#[test]
 fn conversion_cli_directory_alias_rejection_is_reported_once() {
     for count in [1, 8] {
         let directory = tempfile::tempdir().unwrap();

@@ -133,8 +133,8 @@ pub(crate) fn parse_float_literal(text: &str, line: usize) -> Result<crate::Fini
 /// ```
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
-    #[error("{0}")]
-    CheckedConversion(#[source] crate::conversion::ConversionError),
+    #[error(transparent)]
+    CheckedConversion(crate::conversion::ConversionError),
     /// A live parser inventory lost a required authored correspondence.
     #[error(transparent)]
     RetainedEvidence(#[from] super::retained::MissingEvidence),
@@ -459,6 +459,46 @@ pub struct ParseWarning {
 }
 
 impl ParseError {
+    /// Preserve typed conversion metadata through terminal parser context.
+    pub fn conversion_error(&self) -> Option<&crate::ConversionError> {
+        match self {
+            Self::CheckedConversion(error) => Some(error),
+            Self::Located { error, .. } | Self::DeferredForBodyTemplate { error, .. } => {
+                error.conversion_error()
+            }
+            Self::AtElement(finding) => finding.detail().conversion_error(),
+            Self::Evaluation { error, .. } => crate::ConversionError::from_error(error.as_ref()),
+            Self::ValueWalk(error) => crate::ConversionError::from_error(error),
+            Self::RetainedEvidence(_)
+            | Self::InsideSecret { .. }
+            | Self::SecretInConstraint { .. }
+            | Self::UnavailableSecret(_)
+            | Self::Syntax(_)
+            | Self::InvalidExpression { .. }
+            | Self::InvalidFloatLiteral { .. }
+            | Self::IntegerArithmetic { .. }
+            | Self::UnboundLoopRead { .. }
+            | Self::DeferredForBodyUnsupported(_)
+            | Self::UnresolvedDeclarationType { .. }
+            | Self::UnknownFunction { .. }
+            | Self::ReservedResourceAttribute { .. }
+            | Self::SecretDerivedBackendAttribute { .. }
+            | Self::InterpolationNotAllowedInLiteralString { .. }
+            | Self::InvalidResourceIdentity { .. }
+            | Self::UndefinedVariable(_)
+            | Self::InvalidResourceType(_)
+            | Self::DuplicateModule(_)
+            | Self::DuplicateBinding { .. }
+            | Self::UndefinedIdentifier { .. }
+            | Self::UndefinedDeferredIterable { .. }
+            | Self::ModuleNotFound(_)
+            | Self::InternalError { .. }
+            | Self::RecursiveFunction(_)
+            | Self::CyclicLetBinding { .. }
+            | Self::UserFunctionError(_) => None,
+        }
+    }
+
     pub(crate) fn from_resolution(error: crate::resolver::ResolutionError, line: usize) -> Self {
         use crate::resolver::ResolutionError;
         match error {

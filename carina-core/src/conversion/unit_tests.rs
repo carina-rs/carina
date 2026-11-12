@@ -24,6 +24,114 @@ fn location() -> Result<DeclarationLocation, String> {
 }
 
 #[test]
+fn conversion_error_wrappers_render_each_message_once() -> Result<(), String> {
+    use crate::{
+        parser::ParseError,
+        schema::TypeError,
+        static_type::{InferenceError, InferenceIssue},
+    };
+    let location = location()?;
+    let mut conversion = ConversionError::new(
+        ConversionErrorKind::Source,
+        &location,
+        "conversion-sentinel",
+    );
+    conversion.cause = Some(std::sync::Arc::new(ConversionCause::Destination(Box::new(
+        TypeError::ListItemError {
+            index: 2,
+            inner: Box::new(TypeError::StructFieldError {
+                field: "field-sentinel".into(),
+                inner: Box::new(TypeError::MissingRequired {
+                    name: "cause-sentinel".into(),
+                }),
+            }),
+        },
+    ))));
+    let wrappers: Vec<Box<dyn Error>> = vec![
+        Box::new(conversion.clone()),
+        Box::new(ParseError::CheckedConversion(conversion.clone())),
+        Box::new(InferenceError::Conversion(conversion.clone())),
+        Box::new(InferenceIssue::Failed(InferenceError::Conversion(
+            conversion.clone(),
+        ))),
+        Box::new(TypeError::from(conversion.clone())),
+        Box::new(TypeError::ListItemError {
+            index: 1,
+            inner: Box::new(TypeError::from(conversion.clone())),
+        }),
+        Box::new(TypeError::MapKeyError {
+            key: "key".into(),
+            inner: Box::new(TypeError::from(conversion.clone())),
+        }),
+        Box::new(TypeError::MapValueError {
+            key: "key".into(),
+            inner: Box::new(TypeError::from(conversion.clone())),
+        }),
+        Box::new(TypeError::StructFieldError {
+            field: "field".into(),
+            inner: Box::new(TypeError::from(conversion.clone())),
+        }),
+    ];
+    for wrapper in wrappers {
+        let rendered = crate::executor::render_error_chain(wrapper.as_ref());
+        for message in ["conversion-sentinel", "field-sentinel", "cause-sentinel"] {
+            assert_eq!(rendered.matches(message).count(), 1, "{rendered}");
+        }
+        let found = ConversionError::from_error(wrapper.as_ref())
+            .ok_or_else(|| format!("lost typed conversion: {wrapper:?}"))?;
+        assert_eq!(found.kind(), conversion.kind());
+        assert_eq!(found.location(), &location);
+    }
+    Ok(())
+}
+
+#[test]
+fn conversion_aggregate_wrappers_render_each_message_once() -> Result<(), String> {
+    let location = location()?;
+    let mut conversion = ConversionError::new(
+        ConversionErrorKind::Source,
+        &location,
+        "aggregate-conversion-sentinel",
+    );
+    conversion.cause = Some(std::sync::Arc::new(ConversionCause::Destination(Box::new(
+        crate::schema::TypeError::MissingRequired {
+            name: "aggregate-cause-sentinel".into(),
+        },
+    ))));
+    let mut findings = ConversionFindings::default();
+    findings.extend(std::iter::once(conversion.clone()).collect());
+    let wrappers: Vec<Box<dyn Error>> = vec![
+        Box::new(findings),
+        Box::new(std::iter::once(conversion.clone()).collect::<ConversionChannel>()),
+        Box::new({
+            let mut findings = ConversionFindings::default();
+            findings.extend(std::iter::once(conversion.clone()).collect());
+            crate::validation::ResourceRefTypeValidationError::Conversions(findings)
+        }),
+    ];
+    for wrapper in wrappers {
+        let rendered = crate::executor::render_error_chain(wrapper.as_ref());
+        assert_eq!(
+            rendered.matches("aggregate-conversion-sentinel").count(),
+            1,
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("aggregate-cause-sentinel").count(),
+            1,
+            "{rendered}"
+        );
+        assert_eq!(
+            ConversionError::from_error(wrapper.as_ref())
+                .ok_or("lost aggregate conversion")?
+                .location(),
+            &location
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn conversion_type_path_and_loaded_scalar_target() -> Result<(), String> {
     let path = ConversionTypePath::new("mock.Name");
     assert_eq!(path.as_str(), "mock.Name");

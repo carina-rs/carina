@@ -7810,9 +7810,8 @@ fn format_field_group_violation(path: &FieldPath, group: &FieldGroup) -> String 
 /// Type error
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TypeError {
-    #[error("{error}")]
+    #[error("{}", .error.diagnostic_message())]
     Conversion {
-        #[source]
         error: crate::conversion::ConversionError,
         attribute: Option<String>,
     },
@@ -7999,30 +7998,17 @@ pub enum TypeError {
     },
 
     #[error("List item at index {index}: {inner}")]
-    ListItemError {
-        index: usize,
-        #[source]
-        inner: Box<TypeError>,
-    },
+    ListItemError { index: usize, inner: Box<TypeError> },
 
     #[error("Map key '{}': {inner}", DiagnosticText::new(key))]
-    MapKeyError {
-        key: String,
-        #[source]
-        inner: Box<TypeError>,
-    },
+    MapKeyError { key: String, inner: Box<TypeError> },
 
     #[error("Map value for key '{}': {inner}", DiagnosticText::new(key))]
-    MapValueError {
-        key: String,
-        #[source]
-        inner: Box<TypeError>,
-    },
+    MapValueError { key: String, inner: Box<TypeError> },
 
     #[error("Struct field '{}': {inner}", DiagnosticText::new(field))]
     StructFieldError {
         field: String,
-        #[source]
         inner: Box<TypeError>,
     },
 
@@ -8038,6 +8024,36 @@ impl From<crate::conversion::ConversionError> for TypeError {
         Self::Conversion {
             error,
             attribute: None,
+        }
+    }
+}
+
+impl TypeError {
+    /// Typed metadata is independent of a terminal diagnostic's source chain.
+    pub fn conversion_error(&self) -> Option<&crate::ConversionError> {
+        if let Self::Conversion { error, .. } = self {
+            return Some(error);
+        }
+        if let Self::Reference { error, .. } = self {
+            return match error.as_ref() {
+                crate::resource::SecretDiagnosticError::Public(error) => {
+                    crate::ConversionError::from_error(error)
+                }
+                crate::resource::SecretDiagnosticError::InsideSecret => None,
+            };
+        }
+        match self.diagnostic_shape() {
+            ValidationDiagnostic::Reason { reason, .. } => {
+                crate::ConversionError::from_error(reason)
+            }
+            ValidationDiagnostic::Child { child, .. }
+            | ValidationDiagnostic::HiddenChild { child, .. } => {
+                crate::ConversionError::from_error(child)
+            }
+            ValidationDiagnostic::Alternatives(failures) => {
+                failures.iter().find_map(Self::conversion_error)
+            }
+            ValidationDiagnostic::Plain(_) => None,
         }
     }
 }

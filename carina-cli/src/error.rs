@@ -1414,12 +1414,9 @@ pub enum AppError {
         >,
     ),
 
-    /// The location is context; the typed source renders its message once.
-    #[error("{}:{}:{}:", .error.location().file().path().display(), .error.location().span().start_line(), .error.location().span().start_column())]
-    CheckedConversion {
-        #[source]
-        error: carina_core::ConversionError,
-    },
+    /// A complete located diagnostic, with typed metadata available separately.
+    #[error("{}:{}:{}: {}", .error.location().file().path().display(), .error.location().span().start_line(), .error.location().span().start_column(), .error.diagnostic_message())]
+    CheckedConversion { error: carina_core::ConversionError },
 
     /// Validation errors (schema mismatch, invalid config, etc.)
     #[error("{0}")]
@@ -1572,6 +1569,14 @@ impl From<carina_core::validation::ExportBoundaryError> for AppError {
 }
 
 impl AppError {
+    pub fn conversion_error(&self) -> Option<&carina_core::ConversionError> {
+        if let Self::CheckedConversion { error } = self {
+            Some(error)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn invalid_saved_plan_provider_evidence(
         path: carina_core::paths::DisplayPath,
         replan_command: Option<String>,

@@ -5327,8 +5327,17 @@ pub enum ResourceRefTypeValidationError {
     AnalysisInvariant(#[from] crate::parser::AnalysisTreeError),
     #[error("{0}")]
     Validation(String),
-    #[error("{0}")]
-    Conversions(#[source] crate::conversion::ConversionFindings),
+    #[error(transparent)]
+    Conversions(crate::conversion::ConversionFindings),
+}
+
+impl ResourceRefTypeValidationError {
+    pub fn conversion_error(&self) -> Option<&crate::ConversionError> {
+        match self {
+            Self::Conversions(findings) => findings.findings().first(),
+            Self::AnalysisInvariant(_) | Self::Validation(_) => None,
+        }
+    }
 }
 
 pub fn validate_resource_ref_types<

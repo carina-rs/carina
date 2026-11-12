@@ -2,6 +2,43 @@ use super::*;
 use crate::parser::retained::{AuthoredCursor, ProjectedPhase};
 use crate::schema::AttributeType;
 
+#[test]
+fn conversion_admission_error_renders_its_typed_channel_once() {
+    let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = crate::parser::parse_file(
+        "let source = 'ok'",
+        std::path::Path::new("terminal.crn"),
+        &catalog,
+    )
+    .unwrap();
+    let location = parsed
+        .parser_binding_metadata
+        .syntax()
+        .expressions()
+        .binding(&crate::resource::RelativeBindingName::new("source"))
+        .unwrap()
+        .location()
+        .clone();
+    let conversion = crate::ConversionError::new(
+        crate::ConversionErrorKind::Source,
+        &location,
+        "admission-conversion-sentinel",
+    );
+    let error = constraints_with_conversions(Vec::new(), std::iter::once(conversion).collect());
+    let rendered = crate::executor::render_error_chain(&error);
+    assert_eq!(
+        rendered.matches("admission-conversion-sentinel").count(),
+        1,
+        "{rendered}"
+    );
+    assert_eq!(
+        crate::ConversionError::from_error(&error)
+            .unwrap()
+            .location(),
+        &location
+    );
+}
+
 fn mismatched_cursor_is_rejected(apply: bool) {
     tests::fixture(
         AttributeType::string(),

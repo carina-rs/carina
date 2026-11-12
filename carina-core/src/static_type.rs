@@ -144,8 +144,8 @@ pub enum NotInferableReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InferenceError {
-    #[error("{0}")]
-    Conversion(#[source] crate::conversion::ConversionError),
+    #[error(transparent)]
+    Conversion(crate::conversion::ConversionError),
     #[error("{}", crate::resource::INSIDE_SECRET_MESSAGE)]
     InsideSecret {},
     #[error("Type mismatch: {types} (from {})", crate::schema::SECRET_VALUE_MASK)]
@@ -184,6 +184,25 @@ pub enum InferenceError {
     CyclicVirtualBinding { cycle: Vec<String> },
 }
 
+impl InferenceError {
+    pub fn conversion_error(&self) -> Option<&crate::ConversionError> {
+        match self {
+            Self::Conversion(error) => Some(error),
+            Self::InsideSecret { .. }
+            | Self::SecretAssignmentMismatch { .. }
+            | Self::MissingEvidence(_)
+            | Self::UnknownType { .. }
+            | Self::HeterogeneousCollection { .. }
+            | Self::IncompatibleCoalesceTypes { .. }
+            | Self::InvalidIntegerArithmeticOperand { .. }
+            | Self::UnknownBinding { .. }
+            | Self::UnknownAttribute { .. }
+            | Self::InvalidAccess { .. }
+            | Self::CyclicVirtualBinding { .. } => None,
+        }
+    }
+}
+
 /// Keep public type context and remove names, paths and value payloads.
 impl crate::resource::InsideSecret for InferenceError {
     fn inside_secret(self) -> Self {
@@ -205,6 +224,15 @@ pub enum InferenceIssue {
     Failed(InferenceError),
     #[error(transparent)]
     NotInferable(NotInferableReason),
+}
+
+impl InferenceIssue {
+    pub fn conversion_error(&self) -> Option<&crate::ConversionError> {
+        match self {
+            Self::Failed(error) => error.conversion_error(),
+            Self::NotInferable(_) => None,
+        }
+    }
 }
 
 impl From<InferenceError> for InferenceIssue {

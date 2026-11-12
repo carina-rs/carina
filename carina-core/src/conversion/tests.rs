@@ -32,32 +32,29 @@ struct Finding {
     rendered: String,
 }
 
-/// The only conversion-error extractor. In particular this compiles before
-/// InferenceError, ParseError and TypeError acquire conversion variants.
-/// Wrappers must expose the ConversionError itself through Error::source;
+/// Wrappers retain typed conversion metadata through a source or accessor;
 /// flattening it into a string loses both the kind and its authored location.
 fn finding(error: &(dyn Error + 'static)) -> Finding {
-    let mut conversion = None;
+    let conversion = ConversionError::from_error(error).map(|error| {
+        let location = error.location();
+        (
+            error.kind(),
+            (
+                location
+                    .file()
+                    .path()
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                location.span().start_line(),
+                location.span().start_column(),
+            ),
+        )
+    });
     let mut rendered = format!("{error}\n{error:?}");
     let mut current = Some(error);
     while let Some(error) = current {
-        if let Some(error) = error.downcast_ref::<ConversionError>() {
-            let location = error.location();
-            conversion = Some((
-                error.kind(),
-                (
-                    location
-                        .file()
-                        .path()
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned(),
-                    location.span().start_line(),
-                    location.span().start_column(),
-                ),
-            ));
-        }
         rendered.push_str(&format!("\n{error}\n{error:?}"));
         current = error.source();
     }
