@@ -1923,7 +1923,7 @@ impl DiagnosticRun<'_> {
                             let symbolic = attr_findings.symbolic_findings().to_vec();
                             let has_exact_findings =
                                 symbolic.iter().any(|finding| !finding.covers_path());
-                            let mut emitted_enum_diagnostic = false;
+                            let mut handled_enum_diagnostic = false;
                             if matches!(
                                 effective_type.shape(),
                                 carina_core::schema::Shape::Enum { .. }
@@ -1935,7 +1935,7 @@ impl DiagnosticRun<'_> {
                                 rref,
                             ) {
                                 diagnostics.push(diag);
-                                emitted_enum_diagnostic = true;
+                                handled_enum_diagnostic = true;
                                 reported_attribute_diagnostics.insert(canonical_name.to_string());
                                 // Continue past the generic match: this attribute
                                 // is already reported with the richer diagnostic.
@@ -1943,7 +1943,7 @@ impl DiagnosticRun<'_> {
                                     continue;
                                 }
                             }
-                            if !emitted_enum_diagnostic
+                            if !handled_enum_diagnostic
                                 && let Some(error) = attr_findings.local_error()
                             {
                                 let tagged = error.clone().with_attribute(attr_name);
@@ -1958,15 +1958,17 @@ impl DiagnosticRun<'_> {
                                         .clone(),
                                         tagged,
                                     );
-                                    if let Some(diagnostic) = render_schema_diagnostic(
+                                    if let Some(diagnostic) = render_local_enum_diagnostic(
                                         doc,
                                         &finding,
                                         rref.replaceable_attribute_value(attr_name),
                                     ) {
-                                        diagnostics.push(diagnostic);
-                                        emitted_enum_diagnostic = true;
-                                        reported_attribute_diagnostics
-                                            .insert(canonical_name.to_string());
+                                        if let Some(diagnostic) = diagnostic.rendered {
+                                            diagnostics.push(diagnostic);
+                                            reported_attribute_diagnostics
+                                                .insert(canonical_name.to_string());
+                                        }
+                                        handled_enum_diagnostic = true;
                                     }
                                     if !has_exact_findings {
                                         continue;
@@ -1976,7 +1978,7 @@ impl DiagnosticRun<'_> {
                             for finding in &symbolic {
                                 let covers_path = finding.covers_path();
                                 if !enum_diagnostic_retains_symbolic(
-                                    emitted_enum_diagnostic,
+                                    handled_enum_diagnostic,
                                     finding.origin(),
                                 ) {
                                     continue;
@@ -2074,7 +2076,7 @@ impl DiagnosticRun<'_> {
                                 }
                             }
 
-                            if emitted_enum_diagnostic {
+                            if handled_enum_diagnostic {
                                 continue;
                             }
 
@@ -2115,7 +2117,7 @@ impl DiagnosticRun<'_> {
                                 }
                                 diagnostics.extend(nested);
                             } else if !symbolic.iter().any(|finding| finding.covers_path())
-                                && !emitted_enum_diagnostic
+                                && !handled_enum_diagnostic
                             {
                                 let error = attr_findings.local_error();
                                 let message = match error {
@@ -2668,6 +2670,30 @@ impl DiagnosticEngine {
     }
 }
 
+fn enum_diagnostic_retains_symbolic(
+    emitted: bool,
+    origin: carina_core::validation::SymbolicFindingOrigin,
+) -> bool {
+    !emitted || !origin.covers_path()
+}
+
+struct HandledEnumDiagnostic {
+    rendered: Option<Diagnostic>,
+}
+
+fn render_local_enum_diagnostic(
+    doc: &Document,
+    finding: &carina_core::parser::Located<TypeError>,
+    replaceable: Option<&carina_core::parser::DeclarationLocation>,
+) -> Option<HandledEnumDiagnostic> {
+    crate::code_action::enum_diagnostic_data_for_error(finding.detail())?;
+    // A sibling-owned or unmappable enum location still owns the generic
+    // error path; only recovered reference findings may continue rendering.
+    Some(HandledEnumDiagnostic {
+        rendered: render_schema_diagnostic(doc, finding, replaceable),
+    })
+}
+
 /// Build a `Diagnostic` for a failed direct `Enum` attribute validation,
 /// carrying the structured candidate list on `Diagnostic.data` and a
 /// range over the offending value text. Returns `None` when validation
@@ -2677,13 +2703,6 @@ impl DiagnosticEngine {
 ///
 /// See #2309. The structured payload is consumed by
 /// [`crate::code_action::code_actions_for_diagnostic`].
-fn enum_diagnostic_retains_symbolic(
-    emitted: bool,
-    origin: carina_core::validation::SymbolicFindingOrigin,
-) -> bool {
-    !emitted || !origin.covers_path()
-}
-
 fn build_enum_diagnostic(
     error: Option<&TypeError>,
     attr_name: &str,

@@ -559,7 +559,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                  checked: crate::schema::value_validation::CheckValue<'_, P, B>,
                  relative_path: &LeafPath,
                  cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
-                    let mut findings = Default::default();
+                    let findings = Default::default();
                     if cursor.is_selection() {
                         return Ok(findings);
                     }
@@ -570,17 +570,11 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                     if !matches!(CandidateOrigin::of(value), CandidateOrigin::Expression) {
                         return Ok(findings);
                     }
-                    let Some(source) = cursor.source_reference().filter(|source| {
-                        reference_context.bindings.is_some_and(|bindings| {
-                            bindings
-                                .schema_attribute_ref_type(source.reference.as_ref())
-                                .is_some()
-                        })
-                    }) else {
+                    let Some(source) = cursor.source_reference() else {
                         return Ok(findings);
                     };
                     let reference = ReferenceCandidate {
-                        reference: source.reference,
+                        reference: source.into_path(),
                     };
                     reference
                         .judge_at::<K>(
@@ -588,7 +582,10 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                             attr,
                             &join(&contract.path, relative_path),
                             &reference_context,
-                            &mut findings,
+                            // The ordinary path already checked this concrete
+                            // value. Recovered source authority adds rejections,
+                            // never new local or schema deferrals.
+                            &mut Default::default(),
                         )
                         .map_err(|error| reference.error_with_origin(error))?;
                     Ok(findings)
@@ -604,7 +601,14 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                     ordinary: &check,
                     authored: context.assignment.authored.map(|_| &authored as _),
                 },
-                Some(&reference_check),
+                crate::schema::value_validation::ReferenceCheck {
+                    schema_source: &|binding: &B| {
+                        reference_context.bindings.is_some_and(|bindings| {
+                            bindings.is_schema_attribute_source(binding.as_str())
+                        })
+                    },
+                    check: &reference_check,
+                },
                 &mut context.coverage.borrow_mut(),
             )
         }

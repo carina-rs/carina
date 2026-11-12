@@ -18,6 +18,20 @@ struct AssignmentError {
 pub(crate) struct AssignmentErrors(Vec<AssignmentError>);
 
 impl AssignmentErrors {
+    #[inline(never)]
+    pub(super) fn owns_recovered(&self, error: &TypeError) -> bool {
+        self.0.iter().any(|entry| {
+            entry.origin == ErrorOrigin::RecoveredReference && &entry.diagnostic.1 == error
+        })
+    }
+
+    pub(super) fn protect_error(&self, error: TypeError) -> TypeError {
+        if self.owns_recovered(&error) {
+            protect_reference_error(error)
+        } else {
+            error.inside_secret()
+        }
+    }
     pub(crate) fn ordinary(errors: impl IntoIterator<Item = (LeafPath, TypeError)>) -> Self {
         Self(
             errors
@@ -68,11 +82,42 @@ impl InsideSecret for AssignmentErrors {
             self.0
                 .into_iter()
                 .map(|entry| AssignmentError {
-                    diagnostic: entry.diagnostic.inside_secret(),
+                    diagnostic: (
+                        entry.diagnostic.0.inside_secret(),
+                        match entry.origin {
+                            ErrorOrigin::Ordinary => entry.diagnostic.1.inside_secret(),
+                            ErrorOrigin::RecoveredReference => {
+                                protect_reference_error(entry.diagnostic.1)
+                            }
+                        },
+                    ),
                     origin: entry.origin,
                 })
                 .collect(),
         )
+    }
+}
+
+fn protect_reference_error(error: TypeError) -> TypeError {
+    use crate::resource::SecretDiagnosticError;
+    use crate::validation::admission::AdmissionReferenceError;
+    match error {
+        TypeError::Reference { error, attribute } => match *error {
+            SecretDiagnosticError::Public(AdmissionReferenceError::Computed(error)) => {
+                TypeError::Reference {
+                    error: Box::new(SecretDiagnosticError::Public(
+                        AdmissionReferenceError::Computed(error.inside_secret()),
+                    )),
+                    attribute,
+                }
+            }
+            error => TypeError::Reference {
+                error: Box::new(error),
+                attribute,
+            }
+            .inside_secret(),
+        },
+        error => error.inside_secret(),
     }
 }
 
@@ -99,6 +144,7 @@ impl<'a, P: ValueKind, B: BindingAddress> OrdinaryCheck<'a, P, B> {
 
 pub(super) struct ReferencePolicy<'a, P: ValueKind, B: BindingAddress> {
     ordinary: AssignmentCheck<'a, P, B>,
+    schema_source: &'a dyn Fn(&B) -> bool,
     reference: AssignmentCheck<'a, P, B>,
     scopes: std::cell::RefCell<Vec<ReferenceScope>>,
 }
@@ -110,11 +156,12 @@ struct ReferenceScope {
 impl<'a, P: ValueKind, B: BindingAddress> ReferencePolicy<'a, P, B> {
     pub(super) fn new(
         ordinary: AssignmentCheck<'a, P, B>,
-        reference: AssignmentCheck<'a, P, B>,
+        reference: ReferenceCheck<'a, P, B>,
     ) -> Self {
         Self {
             ordinary,
-            reference,
+            schema_source: reference.schema_source,
+            reference: reference.check,
             scopes: Default::default(),
         }
     }
@@ -157,28 +204,36 @@ impl<P: ValueKind, B: BindingAddress> Drop for ScopeGuard<'_, '_, P, B> {
     }
 }
 
-pub(super) struct ReferenceInput<'a, P: PlaceholderKind, B: BindingAddress>(
-    Box<ReferenceInputData<'a, P, B>>,
+pub(super) struct ReferenceInput<'w, 's, P: PlaceholderKind, B: BindingAddress>(
+    &'w AssignmentWalk<'s, P, B>,
 );
-struct ReferenceInputData<'a, P: PlaceholderKind, B: BindingAddress> {
-    walk: AssignmentWalk<'a, P, B>,
-    policy: &'a ReferencePolicy<'a, P, B>,
-    identity: UseIdentity,
-}
-impl<'a, P: PlaceholderKind, B: BindingAddress> ReferenceInput<'a, P, B> {
+impl<'w, 's, P: PlaceholderKind, B: BindingAddress> ReferenceInput<'w, 's, P, B> {
     #[inline(never)]
-    pub(super) fn take(assignment: &mut Option<AssignmentWalk<'a, P, B>>) -> Option<Self> {
+    pub(super) fn for_walk(
+        known: bool,
+        assignment: &'w Option<AssignmentWalk<'s, P, B>>,
+    ) -> Option<Self> {
+        if !known {
+            return None;
+        }
         let walk = assignment.as_ref()?;
         let OrdinaryCheck::References(policy) = walk.callbacks.ordinary else {
             return None;
         };
-        let identity = walk.cursor.source_reference()?.identity;
-        let walk = assignment.take()?;
-        Some(Self(Box::new(ReferenceInputData {
-            walk,
-            policy,
-            identity,
-        })))
+        let source = walk.cursor.source_reference()?;
+        let identity = source.identity;
+        // Member trials inherit the enclosing declaration's judgement. They
+        // keep the ordinary memo and never allocate reference state of their own.
+        if policy
+            .scopes
+            .borrow()
+            .iter()
+            .any(|scope| scope.identity == identity)
+            || !(policy.schema_source)(source.binding)
+        {
+            return None;
+        }
+        Some(Self(walk))
     }
 }
 
@@ -189,8 +244,16 @@ struct ReferenceNode<'a> {
 }
 #[derive(Default)]
 pub(super) struct ReferenceMemo<'a>(
-    std::cell::RefCell<HashMap<ReferenceNode<'a>, CheckedValue<'a>>>,
+    std::cell::RefCell<HashMap<ReferenceNode<'a>, std::rc::Rc<CheckedValue<'a>>>>,
 );
+
+pub(super) struct AppliedReferenceValue<'a>(std::rc::Rc<CheckedValue<'a>>);
+impl<'a> AppliedReferenceValue<'a> {
+    #[inline(never)]
+    pub(super) fn into_checked(self) -> CheckedValue<'a> {
+        std::rc::Rc::unwrap_or_clone(self.0)
+    }
+}
 
 /// Only this private state can carry an unapplied reference result. It cannot
 /// enter assignment merges; finishing applies it before returning CheckedValue.
@@ -202,7 +265,11 @@ struct ReferenceResult<'a> {
 }
 impl<'a> PendingReferencedValue<'a> {
     #[inline(never)]
-    pub(super) fn finish(self, path: &FieldPath, memo: &ReferenceMemo<'a>) -> CheckedValue<'a> {
+    pub(super) fn finish(
+        self,
+        path: &FieldPath,
+        memo: &ReferenceMemo<'a>,
+    ) -> AppliedReferenceValue<'a> {
         let ReferenceResult {
             mut value,
             reference,
@@ -240,10 +307,11 @@ impl<'a> PendingReferencedValue<'a> {
                 }
             }
         }
+        let value = std::rc::Rc::new(value);
         if let Some(key) = key {
             memo.0.borrow_mut().insert(key, value.clone());
         }
-        value
+        AppliedReferenceValue(value)
     }
 }
 
@@ -263,22 +331,31 @@ impl<'a> ValueValidator<'a, '_> {
         path: &FieldPath,
         ancestry: FieldAncestry,
         visited: &mut Vec<&'a str>,
-        input: ReferenceInput<'w, P, B>,
+        input: ReferenceInput<'_, 'w, P, B>,
         extra: &mut AssignmentProbe,
         wrappers: &mut Vec<AuthoredCursor<'w, B>>,
-    ) -> PendingReferencedValue<'a>
+    ) -> AppliedReferenceValue<'a>
     where
         'a: 'w,
     {
-        let ReferenceInputData {
-            walk,
-            policy,
-            identity,
-        } = *input.0;
+        let walk = input.0;
+        let (OrdinaryCheck::References(policy), Some(source)) =
+            (walk.callbacks.ordinary, walk.cursor.source_reference())
+        else {
+            // ReferenceInput borrows the immutable walk it qualified. Record
+            // missing evidence if that private construction invariant changes.
+            return AppliedReferenceValue(std::rc::Rc::new(CheckedValue::rejected(
+                path,
+                seam_error(crate::parser::retained::MissingEvidence::new(
+                    "qualified source reference",
+                )),
+            )));
+        };
+        let identity = source.identity;
         let scope = policy.enter(identity, attr);
         let key = match value {
             ClassifiedRef::Known(value) => Some(ReferenceNode {
-                node: CheckedNode::new(attr, value.node_id(), ancestry, visited, Some(&walk)),
+                node: CheckedNode::new(attr, value.node_id(), ancestry, visited, Some(walk)),
                 scope: scope.scope.clone(),
             }),
             _ => None,
@@ -287,34 +364,33 @@ impl<'a> ValueValidator<'a, '_> {
             .as_ref()
             .and_then(|key| self.reference_checked.0.borrow().get(key).cloned())
         {
-            return PendingReferencedValue(Box::new(ReferenceResult {
-                value: checked,
-                reference: None,
-                key: None,
-            }));
+            return AppliedReferenceValue(checked);
         }
         let reference = if scope.owner {
             let mut resolving = visited.clone();
-            resolve_refs_on_path(attr, self.defs, &mut resolving)
-                .ok()
-                .map(|resolved| {
-                    (policy.reference)(
-                        resolved.attr,
-                        CheckValue::Current(value.diagnostic_value()),
-                        &path.canonical(),
-                        walk.cursor.clone(),
-                    )
-                })
+            Some(
+                resolve_refs_on_path(attr, self.defs, &mut resolving)
+                    .map_err(|error| error.into_validation_error())
+                    .and_then(|resolved| {
+                        (policy.reference)(
+                            resolved.attr,
+                            CheckValue::Current(value.diagnostic_value()),
+                            &path.canonical(),
+                            walk.cursor.clone(),
+                        )
+                    }),
+            )
         } else {
             None
         };
-        let mut checked = self.walk_value(attr, value, path, ancestry, visited, Some(walk.clone()));
+        let mut checked =
+            self.walk_value(attr, value, path, ancestry, visited, Some((*walk).clone()));
         self.complete_authored_walk(
             &mut checked,
             attr,
             value,
             path,
-            Some(walk),
+            Some((*walk).clone()),
             std::mem::take(extra),
             std::mem::take(wrappers),
         );
@@ -324,6 +400,7 @@ impl<'a> ValueValidator<'a, '_> {
             reference,
             key,
         }))
+        .finish(path, &self.reference_checked)
     }
 }
 

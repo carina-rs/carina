@@ -725,10 +725,22 @@ pub struct AuthoredCursor<'s, B: BindingAddress = RelativeBindingName> {
     pub(crate) kind: CursorKind<'s, B>,
 }
 
-/// Reference syntax paired with the identity of its authored use.
-pub(crate) struct SourceReference<B: BindingAddress> {
-    pub(crate) reference: crate::resource::ReferencePath<B>,
+/// Borrowed reference syntax paired with the identity of its authored use.
+pub(crate) struct SourceReference<'s, B: BindingAddress> {
+    pub(crate) binding: &'s B,
+    attribute: &'s str,
+    segments: &'s [crate::resource::PathSegment],
     pub(crate) identity: AuthoredUseIdentity,
+}
+
+impl<B: BindingAddress> SourceReference<'_, B> {
+    pub(crate) fn into_path(self) -> crate::resource::ReferencePath<B> {
+        crate::resource::ReferencePath::Access(crate::resource::AccessPath::from_binding(
+            self.binding.clone(),
+            self.attribute.to_owned(),
+            self.segments.to_vec(),
+        ))
+    }
 }
 
 impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
@@ -779,7 +791,7 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
     /// The source reference survives directory substitution independently of
     /// the current value. Forwarding and selections have already advanced to
     /// their authored child before ordinary assignment asks for this origin.
-    pub(crate) fn source_reference(&self) -> Option<SourceReference<B>> {
+    pub(crate) fn source_reference(&self) -> Option<SourceReference<'_, B>> {
         let CursorKind::Authored(usage) = &self.kind else {
             return None;
         };
@@ -789,13 +801,9 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
                 attribute,
                 segments,
             } => Some(SourceReference {
-                reference: crate::resource::ReferencePath::Access(
-                    crate::resource::AccessPath::from_binding(
-                        binding.clone(),
-                        attribute.clone(),
-                        segments.clone(),
-                    ),
-                ),
+                binding,
+                attribute,
+                segments,
                 identity: usage.identity(),
             }),
             _ => None,

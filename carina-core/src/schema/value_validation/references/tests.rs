@@ -3,17 +3,35 @@ use super::*;
 fn with_source(
     test: impl FnOnce(AuthoredCursor<'_>, Classification<'_, ParserPlaceholder, RelativeBindingName>),
 ) {
+    with_files(
+        "let source = mock.Source { output = 'abc' }\n",
+        &[],
+        |cursor, knowledge, _| test(cursor, knowledge),
+    );
+}
+
+fn with_files(
+    source: &str,
+    files: &[(&str, &str)],
+    test: impl FnOnce(
+        AuthoredCursor<'_>,
+        Classification<'_, ParserPlaceholder, RelativeBindingName>,
+        &crate::binding_index::BindingIndex<'_, RelativeBindingName>,
+    ),
+) {
     let directory = tempfile::tempdir().unwrap();
     for (name, body) in [
         ("providers.crn", "provider mock {}\n"),
         ("backend.crn", "backend local { path = 'state.json' }\n"),
-        (
-            "sources.crn",
-            "let source = mock.Source { output = 'abc' }\n",
-        ),
+        ("sources.crn", source),
         ("main.crn", "mock.Sink { input = source.output }\n"),
     ] {
         std::fs::write(directory.path().join(name), body).unwrap();
+    }
+    for (name, body) in files {
+        let path = directory.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
     }
     let mut schemas = SchemaRegistry::new();
     for (kind, attribute) in [("Source", "output"), ("Sink", "input")] {
@@ -43,11 +61,184 @@ fn with_source(
         .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
         .unwrap()
         .into_classification();
-    assert!(matches!(
-        ClassifiedRef::from(&knowledge),
-        ClassifiedRef::Known(_)
-    ));
-    test(AuthoredCursor::authored(slot.cursor().unwrap()), knowledge);
+    let bindings =
+        crate::binding_index::BindingIndex::from_parsed(loaded.judged().file(), &schemas, &catalog);
+    test(
+        AuthoredCursor::authored(slot.cursor().unwrap()),
+        knowledge,
+        &bindings,
+    );
+}
+
+#[test]
+fn authored_reference_metadata_does_not_clone_a_reference_path() {
+    with_source(|cursor, _| {
+        assert_eq!(
+            cursor_allocations::count(|| {
+                for _ in 0..128 {
+                    std::hint::black_box(cursor.source_reference());
+                }
+            }),
+            0
+        );
+    });
+}
+
+#[test]
+fn unsubstituted_reference_uses_no_reference_state_or_allocations() {
+    with_files(
+        "let source = mock.Source {}\n",
+        &[],
+        |cursor, knowledge, _| {
+            assert!(!matches!(
+                ClassifiedRef::from(&knowledge),
+                ClassifiedRef::Known(_)
+            ));
+            let ordinary = |_: &CompiledAttributeType,
+                            _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                            _: &LeafPath,
+                            _: AuthoredCursor<'_>| Ok(Default::default());
+            let policy = ReferencePolicy::new(
+                &ordinary,
+                ReferenceCheck {
+                    schema_source: &|_| true,
+                    check: &ordinary,
+                },
+            );
+            let coverage = Default::default();
+            let mut callbacks = WalkCallbacks::new(AssignmentCallbacks {
+                ordinary: &ordinary,
+                authored: None,
+            });
+            callbacks.ordinary = OrdinaryCheck::References(&policy);
+            let assignment = Some(AssignmentWalk {
+                cursor,
+                callbacks,
+                coverage: &coverage,
+            });
+            let allocations = cursor_allocations::count(|| {
+                assert!(
+                    ReferenceInput::for_walk(
+                        matches!(ClassifiedRef::from(&knowledge), ClassifiedRef::Known(_)),
+                        &assignment
+                    )
+                    .is_none()
+                );
+            });
+            assert_eq!(allocations, 0);
+            assert!(assignment.is_some());
+        },
+    );
+}
+
+#[test]
+fn reference_member_trials_do_not_allocate_reference_state() {
+    with_source(|cursor, _| {
+        let ordinary = |_: &CompiledAttributeType,
+                        _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                        _: &LeafPath,
+                        _: AuthoredCursor<'_>| Ok(Default::default());
+        let policy = ReferencePolicy::new(
+            &ordinary,
+            ReferenceCheck {
+                schema_source: &|_| true,
+                check: &ordinary,
+            },
+        );
+        let attr = CompiledAttributeType::string();
+        let _scope = policy.enter(cursor.identity().unwrap(), &attr);
+        let coverage = Default::default();
+        let mut callbacks = WalkCallbacks::new(AssignmentCallbacks {
+            ordinary: &ordinary,
+            authored: None,
+        });
+        callbacks.ordinary = OrdinaryCheck::References(&policy);
+        let assignment = Some(AssignmentWalk {
+            cursor,
+            callbacks,
+            coverage: &coverage,
+        });
+        let allocations = cursor_allocations::count(|| {
+            assert!(ReferenceInput::for_walk(true, &assignment).is_none());
+        });
+        assert_eq!(allocations, 0);
+    });
+}
+
+#[test]
+fn substituted_module_output_keeps_ordinary_memo_and_skips_reference_callback() {
+    with_files(
+        "let child = use { source = './child' }\nlet source = child {}\n",
+        &[("child/exports.crn", "exports { output: String = 'abc' }\n")],
+        |cursor, knowledge, bindings| {
+            let attr = CompiledAttributeType::string();
+            assert!(!matches!(
+                ClassifiedRef::from(&knowledge),
+                ClassifiedRef::Known(_)
+            ));
+            // Module outputs currently stay pending. Exercise the known-value
+            // seam with that same non-schema authored source, independently of
+            // whether a future loader can substitute its concrete export.
+            let value = Value::<ParserPlaceholder, RelativeBindingName>::Concrete(
+                ConcreteValue::String("abc".into()),
+            );
+            let knowledge = value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .unwrap()
+                .into_classification();
+            let calls = std::cell::Cell::new(0);
+            let ordinary = |_: &CompiledAttributeType,
+                            _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                            _: &LeafPath,
+                            _: AuthoredCursor<'_>| Ok(Default::default());
+            let reference = |_: &CompiledAttributeType,
+                             _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                             _: &LeafPath,
+                             _: AuthoredCursor<'_>| {
+                calls.set(calls.get() + 1);
+                Ok(Default::default())
+            };
+            let schema_source = |binding: &RelativeBindingName| {
+                bindings.is_schema_attribute_source(binding.as_str())
+            };
+            let policy = ReferencePolicy::new(
+                &ordinary,
+                ReferenceCheck {
+                    schema_source: &schema_source,
+                    check: &reference,
+                },
+            );
+            let coverage = Default::default();
+            let mut callbacks = WalkCallbacks::new(AssignmentCallbacks {
+                ordinary: &ordinary,
+                authored: None,
+            });
+            callbacks.ordinary = OrdinaryCheck::References(&policy);
+            let walk = AssignmentWalk {
+                cursor,
+                callbacks,
+                coverage: &coverage,
+            };
+            let validator = ValueValidator::new(empty_defs_for_schema_walks(), None);
+            for _ in 0..2 {
+                assert!(
+                    validator
+                        .walk_with_assignment(
+                            &attr,
+                            (&knowledge).into(),
+                            &FieldPath::new(),
+                            FieldAncestry::WRITABLE,
+                            &mut Vec::new(),
+                            Some(walk.clone())
+                        )
+                        .accepts()
+                );
+            }
+            assert_eq!(calls.get(), 0);
+            assert_eq!(validator.checked.borrow().len(), 1);
+            assert!(validator.reference_checked.0.borrow().is_empty());
+        },
+    );
 }
 
 #[test]
@@ -74,7 +265,13 @@ fn reference_scope_does_not_reuse_member_trial_cache() {
             })
         };
         let coverage = Default::default();
-        let policy = ReferencePolicy::new(&ordinary, &reference);
+        let policy = ReferencePolicy::new(
+            &ordinary,
+            ReferenceCheck {
+                schema_source: &|_| true,
+                check: &reference,
+            },
+        );
         let mut callbacks = WalkCallbacks::new(AssignmentCallbacks {
             ordinary: &ordinary,
             authored: None,
@@ -129,7 +326,13 @@ fn reference_declaration_is_independent_of_union_trial_order() {
                         _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
                         _: &LeafPath,
                         _: AuthoredCursor<'_>| Ok(Default::default());
-        let policy = ReferencePolicy::new(&ordinary, &ordinary);
+        let policy = ReferencePolicy::new(
+            &ordinary,
+            ReferenceCheck {
+                schema_source: &|_| true,
+                check: &ordinary,
+            },
+        );
         let identity = cursor.source_reference().unwrap().identity;
         for member_first in [false, true] {
             let root = policy.enter(identity, &union);
@@ -160,7 +363,9 @@ fn pending_reference_is_applied_before_any_findings_can_merge() {
         reference: Some(Err(error)),
         key: None,
     }));
-    let checked = pending.finish(&FieldPath::new(), &ReferenceMemo::default());
+    let checked = pending
+        .finish(&FieldPath::new(), &ReferenceMemo::default())
+        .into_checked();
     assert!(!checked.accepts());
     let mut probe = AssignmentProbe::default();
     probe.extend(AssignmentProbe {
@@ -177,6 +382,121 @@ fn pending_reference_is_applied_before_any_findings_can_merge() {
         SymbolicFindingOrigin::RecoveredReference
     );
     assert_eq!(findings.into_located().len(), 1);
+}
+
+#[test]
+fn recovered_reference_memo_hits_allocate_only_what_the_ordinary_walk_does() {
+    with_source(|cursor, knowledge| {
+        let attr = CompiledAttributeType::string();
+        let calls = std::cell::Cell::new(0);
+        let ordinary = |_: &CompiledAttributeType,
+                        _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                        _: &LeafPath,
+                        _: AuthoredCursor<'_>| Ok(Default::default());
+        let reference = |_: &CompiledAttributeType,
+                         _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                         _: &LeafPath,
+                         _: AuthoredCursor<'_>| {
+            calls.set(calls.get() + 1);
+            Ok(Default::default())
+        };
+        let policy = ReferencePolicy::new(
+            &ordinary,
+            ReferenceCheck {
+                schema_source: &|_| true,
+                check: &reference,
+            },
+        );
+        let coverage = Default::default();
+        let callbacks = WalkCallbacks::new(AssignmentCallbacks {
+            ordinary: &ordinary,
+            authored: None,
+        });
+        let direct = AssignmentWalk {
+            cursor,
+            callbacks: callbacks.clone(),
+            coverage: &coverage,
+        };
+        let mut recovered = direct.clone();
+        recovered.callbacks.ordinary = OrdinaryCheck::References(&policy);
+        let validator = ValueValidator::new(empty_defs_for_schema_walks(), None);
+        let check = |walk| {
+            std::hint::black_box(validator.walk_with_assignment(
+                &attr,
+                (&knowledge).into(),
+                &FieldPath::new(),
+                FieldAncestry::WRITABLE,
+                &mut Vec::new(),
+                Some(walk),
+            ));
+        };
+        check(direct.clone());
+        check(recovered.clone());
+        let expected = cursor_allocations::count(|| check(direct));
+        let actual = cursor_allocations::count(|| check(recovered));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(actual, expected);
+    });
+}
+
+#[test]
+fn reference_resolution_failures_keep_the_ordinary_error_once() {
+    with_source(|cursor, knowledge| {
+        for (attr, defs) in [
+            (CompiledAttributeType::ref_("Missing"), BTreeMap::new()),
+            (
+                CompiledAttributeType::ref_("Cycle"),
+                BTreeMap::from([("Cycle".into(), CompiledAttributeType::ref_("Cycle"))]),
+            ),
+        ] {
+            let ordinary = |_: &CompiledAttributeType,
+                            _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                            _: &LeafPath,
+                            _: AuthoredCursor<'_>| Ok(Default::default());
+            let calls = std::cell::Cell::new(0);
+            let reference = |_: &CompiledAttributeType,
+                             _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
+                             _: &LeafPath,
+                             _: AuthoredCursor<'_>| {
+                calls.set(calls.get() + 1);
+                Ok(Default::default())
+            };
+            let lookup = no_lookup();
+            let callbacks = AssignmentCallbacks {
+                ordinary: &ordinary,
+                authored: None,
+            };
+            let expected = validate_authored_value_for_admission(
+                &attr,
+                &knowledge,
+                &defs,
+                FieldAncestry::WRITABLE,
+                lookup,
+                cursor.clone(),
+                callbacks,
+                &mut Default::default(),
+            )
+            .into_located();
+            assert_eq!(expected.len(), 1);
+            let actual = validate_authored_value_for_admission_with_references(
+                &attr,
+                &knowledge,
+                &defs,
+                FieldAncestry::WRITABLE,
+                lookup,
+                cursor.clone(),
+                callbacks,
+                ReferenceCheck {
+                    schema_source: &|_| true,
+                    check: &reference,
+                },
+                &mut Default::default(),
+            )
+            .into_located();
+            assert_eq!(actual, expected);
+            assert_eq!(calls.get(), 0);
+        }
+    });
 }
 
 #[test]

@@ -91,6 +91,151 @@ fn check_with_schemas(source: &str, consumer: &str, schemas: &SchemaRegistry) ->
     .unwrap_or_default()
 }
 
+#[test]
+fn substituted_concrete_references_do_not_add_local_or_schema_deferrals() {
+    use crate::schema::{AttrTypeKind, StringIdentityLayer, StringMemberConstraints, StructField};
+    let unloaded = AttributeType {
+        kind: AttrTypeKind::UnloadedSchemaType(
+            TypeIdentity::from_dotted("missing.Value")
+                .try_into()
+                .unwrap(),
+        ),
+    };
+    let invalid = ResourceSchema::new("UnloadedSource")
+        .attribute(AttributeSchema::optional("name", unloaded).build())
+        .validate();
+    assert!(
+        invalid
+            .unwrap_err()
+            .to_string()
+            .contains("schema is not loaded")
+    );
+    let union = AttributeType::union(vec![
+        AttributeType::struct_(
+            "First",
+            vec![StructField::required("field", AttributeType::string()).build()],
+        ),
+        AttributeType::struct_(
+            "Second",
+            vec![StructField::required("field", AttributeType::string()).build()],
+        ),
+    ]);
+    let constrained = AttributeType::string_member(
+        StringIdentityLayer::new(None, None, None, None),
+        StringMemberConstraints::new(None, Some((None, Some(8)))),
+    );
+    for (name, source_type, source_value, expression, sink_type) in [
+        (
+            "unchecked postfix",
+            union,
+            "{ field = 'abc' }",
+            "a.name.field",
+            AttributeType::string(),
+        ),
+        (
+            "needs local",
+            AttributeType::string(),
+            "'abc'",
+            "a.name",
+            constrained,
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        for (file, body) in [
+            ("providers.crn", "provider mock {}\n".into()),
+            (
+                "backend.crn",
+                "backend local { path = 'state.json' }\n".into(),
+            ),
+            (
+                "sources.crn",
+                format!("let a = mock.Source {{ name = {source_value} }}\n"),
+            ),
+            (
+                "main.crn",
+                format!("let sink = mock.Sink {{ value = {expression} }}\n"),
+            ),
+        ] {
+            std::fs::write(directory.path().join(file), body).unwrap();
+        }
+        let mut schemas = SchemaRegistry::new();
+        for (resource, attribute, ty) in [
+            ("Source", "name", source_type),
+            ("Sink", "value", sink_type),
+        ] {
+            schemas.insert(
+                "mock",
+                ResourceSchema::new(resource)
+                    .attribute(AttributeSchema::optional(attribute, ty).build())
+                    .validate()
+                    .unwrap(),
+            );
+        }
+        let catalog = crate::parser::LoadedProviderContext::empty_for_test();
+        let catalog = catalog.as_provider_context();
+        let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+        let parsed = crate::config_loader::parse_directory(&path, catalog)
+            .unwrap()
+            .into_parsed();
+        let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, catalog);
+        let judged = loaded.judged();
+        let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let resource = tree
+            .project_resources()
+            .find(|resource| resource.id().resource_type == "Sink")
+            .unwrap();
+        let slot = resource.authored_slot("value").unwrap();
+        let projected = slot
+            .projection()
+            .unwrap()
+            .knowledge(&KnowledgeContext::validation())
+            .unwrap()
+            .into_classification();
+        let bindings = BindingIndex::from_parsed(judged.file(), &schemas, catalog);
+        if name == "unchecked postfix" {
+            // Postfix access through a union currently stays pending and
+            // cannot enter the substituted-known-value policy.
+            assert!(!matches!(
+                projected,
+                crate::resource::knowledge::Classification::Known(_)
+            ));
+            let path = crate::resource::AccessPath::with_fields("a", "name", vec!["field".into()]);
+            assert!(matches!(
+                bindings.postfix_ref_type(&path),
+                crate::binding_index::RefType::Unchecked
+            ));
+            continue;
+        }
+        assert!(matches!(
+            projected,
+            crate::resource::knowledge::Classification::Known(_)
+        ));
+        let proof = projected;
+        let destination = schemas
+            .resource_attribute_destination(resource.id(), "value", catalog)
+            .unwrap();
+        with_session_for_test(catalog, |session| {
+            let (baseline, baseline_context) =
+                Candidate::validation_classified(proof.clone(), Some(&bindings), session);
+            let baseline =
+                assignment::judge_with_findings(&destination, &baseline, &baseline_context)
+                    .unwrap();
+            assert!(
+                matches!(baseline.verdict, AssignmentVerdict::Proven(_)),
+                "main concrete path: {name}"
+            );
+            let (candidate, context) =
+                Candidate::validation_slot(slot, proof, Some(&bindings), session).unwrap();
+            let actual =
+                assignment::judge_with_findings(&destination, &candidate, &context).unwrap();
+            assert!(
+                matches!(actual.verdict, AssignmentVerdict::Proven(_)),
+                "substituted {name} must keep the main concrete verdict"
+            );
+        });
+    }
+}
+
 fn with_ordinary_check(
     source_type: &str,
     expression: &str,
@@ -528,9 +673,9 @@ fn substituted_reference_source_always_carries_its_authored_use_identity() {
         let slot = resource.authored_slot("value").unwrap();
         let cursor = crate::parser::retained::AuthoredCursor::authored(slot.cursor().unwrap());
         let source = cursor.source_reference().unwrap();
-        assert_eq!(source.reference.as_ref().to_dot_string(), "a.name");
         assert_eq!(Some(source.identity), cursor.identity());
         assert!(identities.insert(source.identity));
+        assert_eq!(source.into_path().as_ref().to_dot_string(), "a.name");
         assert!(cursor.covered().source_reference().is_none());
     }
     assert_eq!(identities.len(), 2);

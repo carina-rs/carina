@@ -725,15 +725,33 @@ impl CheckedFindings {
 impl InsideSecret for CheckedFindings {
     fn inside_secret(self) -> Self {
         Self {
-            local: self.local.inside_secret(),
+            local: self
+                .local
+                .into_iter()
+                .map(|(path, error)| {
+                    (
+                        path.inside_secret(),
+                        self.assignment.errors.protect_error(error),
+                    )
+                })
+                .collect(),
             located: self
                 .located
                 .into_iter()
-                .map(|(path, error)| (path.inside_secret(), error.inside_secret()))
+                .map(|(path, error)| {
+                    (
+                        path.inside_secret(),
+                        self.assignment.errors.protect_error(error),
+                    )
+                })
+                .collect(),
+            additional_local_errors: self
+                .additional_local_errors
+                .into_iter()
+                .map(|error| self.assignment.errors.protect_error(error))
                 .collect(),
             assignment: self.assignment.inside_secret(),
             authored: self.authored.inside_secret(),
-            additional_local_errors: self.additional_local_errors.inside_secret(),
             provider: self.provider.inside_secret(),
         }
     }
@@ -752,7 +770,10 @@ impl InsideSecret for CheckedValue<'_> {
             local: match self.local {
                 LocalOutcome::Accepted(fit) => LocalOutcome::Accepted(fit.inside_secret()),
                 LocalOutcome::Rejected { primary } => LocalOutcome::Rejected {
-                    primary: primary.inside_secret(),
+                    primary: (
+                        primary.0.inside_secret(),
+                        self.findings.assignment.errors.protect_error(primary.1),
+                    ),
                 },
             },
             findings: self.findings.inside_secret(),
@@ -867,6 +888,7 @@ impl<'a> CheckedValue<'a> {
         if let LocalOutcome::Rejected {
             primary: (_, error),
         } = &mut self.local
+            && !self.findings.assignment.errors.owns_recovered(error)
         {
             *error = wrap(error.clone());
         }
@@ -874,7 +896,13 @@ impl<'a> CheckedValue<'a> {
             .findings
             .additional_local_errors
             .into_iter()
-            .map(wrap)
+            .map(|error| {
+                if self.findings.assignment.errors.owns_recovered(&error) {
+                    error
+                } else {
+                    wrap(error)
+                }
+            })
             .collect();
         self
     }
@@ -1267,6 +1295,11 @@ pub(crate) type AssignmentCheck<'a, P, B> = &'a dyn Fn(
     AuthoredCursor<'_, B>,
 ) -> Result<AssignmentFindings, TypeError>;
 
+pub(crate) struct ReferenceCheck<'a, P: ValueKind, B: BindingAddress> {
+    pub(crate) schema_source: &'a dyn Fn(&B) -> bool,
+    pub(crate) check: AssignmentCheck<'a, P, B>,
+}
+
 pub(crate) struct AssignmentCallbacks<'a, P: ValueKind, B: BindingAddress> {
     pub(crate) ordinary: AssignmentCheck<'a, P, B>,
     pub(crate) authored: Option<AssignmentCheck<'a, P, B>>,
@@ -1609,26 +1642,9 @@ pub(crate) fn validate_authored_value_for_admission<
     callbacks: AssignmentCallbacks<'_, P, B>,
     coverage: &mut WalkCoverage,
 ) -> ValueValidationFindings {
-    let visits = std::cell::RefCell::new(std::mem::take(coverage));
-    let callbacks = WalkCallbacks::new(callbacks);
-    let mut checked = ValueValidator::new(defs, Some(lookup)).walk_with_assignment(
-        attr,
-        value.into(),
-        &FieldPath::new(),
-        ancestry,
-        &mut Vec::new(),
-        Some(AssignmentWalk {
-            cursor,
-            callbacks: callbacks.clone(),
-            coverage: &visits,
-        }),
-    );
-    callbacks.finish(&mut checked.findings.authored);
-    drop(callbacks);
-    let mut findings = checked.into_findings();
-    *coverage = visits.into_inner();
-    findings.structure = value_structure(value);
-    findings
+    validate_authored_value_with_callbacks(
+        attr, value, defs, ancestry, lookup, cursor, callbacks, None, coverage,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1646,18 +1662,46 @@ pub(crate) fn validate_authored_value_for_admission_with_references<
     lookup: CustomTypeLookup<'_>,
     cursor: AuthoredCursor<'s, B>,
     callbacks: AssignmentCallbacks<'_, P, B>,
-    reference: Option<AssignmentCheck<'_, P, B>>,
+    reference: ReferenceCheck<'_, P, B>,
     coverage: &mut WalkCoverage,
 ) -> ValueValidationFindings {
-    if reference.is_none() || cursor.is_projection_only() {
-        return validate_authored_value_for_admission(
-            attr, value, defs, ancestry, lookup, cursor, callbacks, coverage,
-        );
-    }
+    validate_authored_value_with_callbacks(
+        attr,
+        value,
+        defs,
+        ancestry,
+        lookup,
+        cursor,
+        callbacks,
+        Some(reference),
+        coverage,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_authored_value_with_callbacks<
+    's,
+    'v,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    T: StructuralPending<'v, P, B>,
+>(
+    attr: &CompiledAttributeType,
+    value: &Classification<'v, P, B, T>,
+    defs: &BTreeMap<String, CompiledAttributeType>,
+    ancestry: FieldAncestry,
+    lookup: CustomTypeLookup<'_>,
+    cursor: AuthoredCursor<'s, B>,
+    callbacks: AssignmentCallbacks<'_, P, B>,
+    reference: Option<ReferenceCheck<'_, P, B>>,
+    coverage: &mut WalkCoverage,
+) -> ValueValidationFindings {
     let visits = std::cell::RefCell::new(std::mem::take(coverage));
     let policy = reference.map(|reference| ReferencePolicy::new(callbacks.ordinary, reference));
     let mut callbacks = WalkCallbacks::new(callbacks);
-    if let Some(policy) = &policy {
+    if !cursor.is_projection_only()
+        && let Some(policy) = &policy
+    {
         callbacks.ordinary = OrdinaryCheck::References(policy);
     }
     let mut checked = ValueValidator::new(defs, Some(lookup)).walk_with_assignment(
@@ -2133,14 +2177,16 @@ impl<'a> ValueValidator<'a, '_> {
     where
         'a: 'w,
     {
-        let (mut assignment, mut extra, mut wrappers) = match assignment {
+        let (assignment, mut extra, mut wrappers) = match assignment {
             Some(assignment) => match assignment.prepare(attr, self.defs, value, path, ancestry) {
                 Ok((assignment, findings, wrappers)) => (Some(assignment), findings, wrappers),
                 Err(error) => return CheckedValue::rejected(path, error),
             },
             None => (None, AssignmentProbe::default(), Vec::new()),
         };
-        if let Some(input) = ReferenceInput::take(&mut assignment) {
+        if let Some(input) =
+            ReferenceInput::for_walk(matches!(value, ClassifiedRef::Known(_)), &assignment)
+        {
             return self
                 .walk_reference_prepared(
                     attr,
@@ -2152,7 +2198,7 @@ impl<'a> ValueValidator<'a, '_> {
                     &mut extra,
                     &mut wrappers,
                 )
-                .finish(path, &self.reference_checked);
+                .into_checked();
         }
         let node = match value {
             ClassifiedRef::Known(value) => Some(CheckedNode::new(

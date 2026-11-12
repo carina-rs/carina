@@ -143,3 +143,26 @@ fn substituted_reference_validate_keeps_literals_aliases_and_discarded_sources_a
     let (output, text) = run(dir.path(), &["validate", "."]);
     assert!(output.status.success(), "{text}");
 }
+
+#[test]
+fn substituted_constrained_identityless_value_keeps_validate_and_plan_acceptance() {
+    let dir = fixture(
+        "let a = mock.test.estimated_input { name = 'abc' }\n",
+        "let sink = mock.test.pattern_modes { full = 'abc' }\n",
+    );
+    for value in ["'abc'", "a.name"] {
+        std::fs::write(
+            dir.path().join("main.crn"),
+            format!("let sink = mock.test.pattern_modes {{ full = {value} }}\n"),
+        )
+        .unwrap();
+        for command in ["validate", "plan"] {
+            let (output, text) = run(dir.path(), &[command, "."]);
+            assert!(output.status.success(), "{command} {value}: {text}");
+            assert!(
+                !text.lines().any(|line| line.starts_with("Error: ")),
+                "{text}"
+            );
+        }
+    }
+}
