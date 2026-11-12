@@ -10369,6 +10369,13 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
                 "test",
                 carina_core::schema::PatternResourceSchema::new("Lookup")
                     .as_data_source()
+                    .attribute(
+                        carina_core::schema::PatternAttributeSchema::optional(
+                            "filter",
+                            carina_core::schema::PatternAttributeType::string(),
+                        )
+                        .build(),
+                    )
                     .validate()
                     .unwrap(),
             );
@@ -14482,8 +14489,14 @@ mod resolved_value_constraint_gate {
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
-            let schema_drafts: Vec<carina_core::schema::ResourceSchema> =
-                vec![PatternResourceSchema::new("lookup").as_data_source()];
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> = vec![
+                PatternResourceSchema::new("lookup")
+                    .as_data_source()
+                    .attribute(
+                        PatternAttributeSchema::optional("query", PatternAttributeType::string())
+                            .build(),
+                    ),
+            ];
             schema_drafts
                 .into_iter()
                 .map(|schema| {

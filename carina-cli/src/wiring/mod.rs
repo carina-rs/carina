@@ -7275,17 +7275,19 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                     state_file,
                     override_aware_resources.resources(),
                 );
-                let plan_input_desired = carina_core::resource::plan_input_desired_resources(
-                    &resolved_resources,
+                let final_inputs = carina_core::validation::admission::final_input::FinalPlanInputs::admit(
+                    resolved_resources,
+                    resolved_data_sources_for_plan,
                     context.schemas(),
-                );
+                    override_aware_resources.bindings(),
+                    session,
+                )?;
                 let dependents =
                     CascadeDependents::new(&resolved_unresolved_resources, deferred_create_targets);
                 let prepared = reference_preparation
                     .plan_with_cascades(
-                        &plan_input_desired,
+                        &final_inputs,
                         &dependents,
-                        &resolved_data_sources_for_plan,
                         provider,
                         PlanPriorStates::new(&plan_input_current, &addressed.orphans),
                         &directives_map,
@@ -7383,7 +7385,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                 let resources = M::build_resources(PostExpansionResourceInputs {
                     override_aware: &override_aware_resources,
                     unresolved_override_aware: &unresolved_override_aware_resources,
-                    resolved: resolved_resources,
+                    resolved: final_inputs.into_resources(),
                     paired_unresolved: paired_unresolved_resources,
                 });
 

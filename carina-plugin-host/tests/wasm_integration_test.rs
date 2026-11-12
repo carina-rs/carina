@@ -300,6 +300,23 @@ async fn wire_boundary_default_tag_fails_before_native_and_guest_crud() {
             );
             let request = prepare_create_request(resource.clone(), &context)
                 .await
+                .expect_err("wire-encodable Duration still violates the tags declaration");
+            assert!(request.to_string().contains("provider default_tags"));
+            configs[0].default_tags.insert(
+                "unrelated".into(),
+                Value::Concrete(ConcreteValue::String("valid".into())),
+            );
+            let context = ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &configs,
+                normalizer.as_ref(),
+                &[],
+                &schemas,
+                type_checks,
+            );
+            let request = prepare_create_request(resource.clone(), &context)
+                .await
                 .unwrap();
             let inputs = carina_plugin_sdk::DesiredInputs::from_provider_ready(request.resource());
             assert!(matches!(
@@ -318,7 +335,7 @@ async fn wire_boundary_default_tag_fails_before_native_and_guest_crud() {
             };
             assert_eq!(
                 tags["unrelated"],
-                Value::Concrete(ConcreteValue::Int(i64::MAX))
+                Value::Concrete(ConcreteValue::String("valid".into()))
             );
             assert_eq!(crud_calls.load(Ordering::SeqCst), 1);
         },
@@ -426,23 +443,40 @@ fn fixture_schemas() -> carina_core::schema::SchemaRegistry {
     schemas
 }
 
-async fn create_request_for_test(resource: Resource) -> CreateRequest {
+async fn create_request_for_test(mut resource: Resource) -> CreateRequest {
+    // Transport fixtures still satisfy the real mock destination declaration.
+    if resource.id.resource_type == "test.resource" && !resource.attributes.contains_key("name") {
+        let name = resource
+            .id
+            .identity_str()
+            .expect("fixture identity")
+            .to_owned();
+        resource.attributes.insert(
+            "name".into(),
+            Value::Concrete(ConcreteValue::String(name.into())),
+        );
+    }
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let mut schemas = fixture_schemas();
     if schemas.get_for(&resource).is_none() {
         schemas
-            .extend(carina_core::test_utils::preparation_schemas(
-                &resource.id,
-                carina_core::schema::SchemaKind::Resource,
-            ))
+            .extend(
+                carina_core::test_utils::preparation_schemas_with_attributes(
+                    &resource.id,
+                    carina_core::schema::SchemaKind::Resource,
+                    &resource.attributes,
+                ),
+            )
             .expect("test preparation schema should extend the fixture registry");
     }
-    let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
-        Arc::new(Vec::new()),
-        schemas.clone(),
-        carina_core::EnvironmentSnapshot::empty(),
+    carina_core::test_utils::complete_fixture_schema(
+        &mut schemas,
+        &resource.id,
+        carina_core::schema::SchemaKind::Resource,
+        &resource.attributes,
     );
+    let provider_types = carina_core::test_utils::loaded_fixture_snapshot(schemas.clone());
     carina_core::validation::deferred_types::with_session_for_test_async(
         provider_types.provider_context(),
         async |type_checks| {
@@ -535,11 +569,13 @@ async fn update_request_for_test<P: StateValueLeaf>(
             .validate()
             .expect("test schema must be valid"),
     );
-    let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
-        Arc::new(Vec::new()),
-        schemas.clone(),
-        carina_core::EnvironmentSnapshot::empty(),
+    carina_core::test_utils::complete_fixture_schema(
+        &mut schemas,
+        &resource.id,
+        carina_core::schema::SchemaKind::Resource,
+        &resource.attributes,
     );
+    let provider_types = carina_core::test_utils::loaded_fixture_snapshot(schemas.clone());
     carina_core::validation::deferred_types::with_session_for_test_async(
         provider_types.provider_context(),
         async |type_checks| {
@@ -926,9 +962,10 @@ fn aws_credential_probe_data_source() -> carina_core::provider::ProviderReadyDat
     let resource = DataSource::with_provider("aws", "test.aws_credentials", "credentials", None);
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = carina_core::test_utils::preparation_schemas(
+    let schemas = carina_core::test_utils::preparation_schemas_with_attributes(
         &resource.id,
         carina_core::schema::SchemaKind::DataSource,
+        &resource.attributes,
     );
     let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(Vec::new()),
@@ -5554,6 +5591,102 @@ async fn test_wasm_mock_provider_normalizer() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn issue_4304_3a_wasm_normalization_reenters_final_input_admission() {
+    use carina_core::executor::{
+        ModuleConstraintGate, ProviderPreparationContext, prepare_create_request,
+    };
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+    };
+    use carina_core::validation::admission::final_input::FinalPlanInputs;
+
+    let path = wasm_path().expect("carina#4304 3a requires the mock WASM fixture");
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .unwrap();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.normalize_leaf")
+            .attribute(
+                AttributeSchema::optional(
+                    "alias_target",
+                    AttributeType::struct_(
+                        "Alias",
+                        vec![
+                            StructField::required(
+                                "dns_name",
+                                AttributeType::refined_string(
+                                    None,
+                                    None,
+                                    Some((Some(4), None)),
+                                    None,
+                                ),
+                            )
+                            .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    // The guest's existing normalization route strips the terminal dot.
+    // Authored length 4 passes; the exact returned length 3 must fail.
+    let resource = Resource::with_provider("mock", "test.normalize_leaf", "example", None)
+        .with_attribute(
+            "alias_target",
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                "dns_name".into(),
+                Value::Concrete(ConcreteValue::String("abc.".into())),
+            )]))),
+        );
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let gate = ModuleConstraintGate::from_live_compositions(&[]);
+    carina_core::validation::deferred_types::with_session_for_test_async(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        async |session| {
+            let normalized = carina_core::executor::normalized::apply_host_desired_normalization(
+                resource.clone(),
+                &[],
+                normalizer.as_ref(),
+                &schemas,
+            )
+            .await
+            .unwrap();
+            let planned = carina_core::resource::ResolvedResource::resolve_with_schemas(
+                normalized.as_resource().clone().into(),
+                &schemas,
+            )
+            .unwrap();
+            let plan_error =
+                FinalPlanInputs::admit(vec![planned], vec![], &schemas, &bindings, session)
+                    .expect_err("WASM normalization output must be admitted before planning");
+            let context = ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &[],
+                normalizer.as_ref(),
+                &[],
+                &schemas,
+                session,
+            );
+            let dispatch_error = prepare_create_request(resource, &context)
+                .await
+                .expect_err("WASM normalization must not mint an invalid dispatch request");
+            for rendered in [plan_error.to_string(), dispatch_error.to_string()] {
+                assert!(rendered.contains("alias_target.dns_name"), "{rendered}");
+                assert!(rendered.contains("provider normalization"), "{rendered}");
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn wasm_normalize_desired_echo_preserves_nested_enum_typing() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
@@ -7114,9 +7247,10 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     ]);
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = carina_core::test_utils::preparation_schemas(
+    let schemas = carina_core::test_utils::preparation_schemas_with_attributes(
         &resource.id,
         carina_core::schema::SchemaKind::DataSource,
+        &resource.attributes,
     );
     let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(Vec::new()),
@@ -7366,9 +7500,10 @@ async fn raw_data_source_floats_retain_resource_operation_and_constructor_source
         let resource = DataSource::with_provider("mock", "test.data_source", selector, None);
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = carina_core::test_utils::preparation_schemas(
+        let schemas = carina_core::test_utils::preparation_schemas_with_attributes(
             &resource.id,
             carina_core::schema::SchemaKind::DataSource,
+            &resource.attributes,
         );
         carina_core::validation::deferred_types::with_session_for_test_async(
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),

@@ -929,6 +929,13 @@ async fn provider_ready_inputs_are_infallible_and_preserve_checked_scalar_and_se
         let schema = PatternResourceSchema::new("sqs.Queue")
             .attribute(
                 PatternAttributeSchema::optional(
+                    "unread",
+                    PatternAttributeType::list(PatternAttributeType::duration()),
+                )
+                .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
                     "tags",
                     PatternAttributeType::map(PatternAttributeType::string()),
                 )
@@ -948,6 +955,10 @@ async fn provider_ready_inputs_are_infallible_and_preserve_checked_scalar_and_se
             "test",
             PatternResourceSchema::new("lookup")
                 .as_data_source()
+                .attribute(
+                    PatternAttributeSchema::optional("unread", PatternAttributeType::duration())
+                        .build(),
+                )
                 .validate()
                 .unwrap(),
         );
@@ -1050,9 +1061,10 @@ async fn provider_ready_inputs_preserve_env_string_diagnostic_sensitivity() {
             );
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let gate = ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = carina_core::test_utils::preparation_schemas(
+        let schemas = carina_core::test_utils::preparation_schemas_with_attributes(
             &resource.id,
             carina_core::schema::SchemaKind::Resource,
+            &resource.attributes,
         );
         let context = ProviderPreparationContext::new(
             &bindings,
@@ -1136,9 +1148,10 @@ async fn native_and_wasm_views_share_sorted_order_for_unsorted_authored_maps() {
         .unwrap();
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let gate = ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = carina_core::test_utils::preparation_schemas(
+    let schemas = carina_core::test_utils::preparation_schemas_with_attributes(
         &resource.id,
         carina_core::schema::SchemaKind::Resource,
+        &resource.attributes,
     );
     let request = with_type_checks(async |type_checks| {
         let context = ProviderPreparationContext::new(

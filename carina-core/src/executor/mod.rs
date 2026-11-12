@@ -2237,10 +2237,53 @@ async fn execute_test_runtime_plan(
     observer: &dyn ExecutionObserver,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome {
-    let (schemas, comparison_provider) = crate::provider::comparison_fixture_for_test(
+    let (mut schemas, comparison_provider) = crate::provider::comparison_fixture_for_test(
         input.schemas,
         input.plan.effects().iter().map(Effect::resource_id),
     );
+    for effect in input.plan.effects() {
+        if let Some(resource) = effect.as_resource_ref() {
+            let kind = if matches!(effect, Effect::Read { .. }) {
+                crate::schema::SchemaKind::DataSource
+            } else {
+                crate::schema::SchemaKind::Resource
+            };
+            match resource {
+                crate::parser::ResourceRef::Resource(resource) => {
+                    crate::test_utils::complete_fixture_schema(
+                        &mut schemas,
+                        &resource.id,
+                        kind,
+                        &resource.attributes,
+                    )
+                }
+                crate::parser::ResourceRef::DataSource(resource) => {
+                    crate::test_utils::complete_fixture_schema(
+                        &mut schemas,
+                        &resource.id,
+                        kind,
+                        &resource.attributes,
+                    )
+                }
+                _ => {}
+            }
+        }
+        match effect {
+            Effect::DeferredCreate(payload) => crate::test_utils::complete_fixture_schema(
+                &mut schemas,
+                payload.template.template_resource_id(),
+                crate::schema::SchemaKind::Resource,
+                payload.template.attributes(),
+            ),
+            Effect::DeferredReplace(payload) => crate::test_utils::complete_fixture_schema(
+                &mut schemas,
+                payload.template.template_resource_id(),
+                crate::schema::SchemaKind::Resource,
+                payload.template.attributes(),
+            ),
+            _ => {}
+        }
+    }
     let catalog = input.provider_context.clone();
     let checks =
         crate::validation::deferred_types::TypeCheckSession::run_async(&catalog, async |session| {

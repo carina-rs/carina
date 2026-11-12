@@ -6580,7 +6580,7 @@ pub(crate) enum UpstreamMissingStatePolicy {
 pub(crate) enum ProviderUpstreamScope {
     /// Load every upstream because resource resolution also consumes them.
     All,
-    /// Load only bindings referenced by construction-time provider attributes.
+    /// Load bindings referenced by construction-time attributes and default tags.
     ProviderReferences,
 }
 
@@ -6647,10 +6647,18 @@ pub(crate) async fn load_and_resolve_provider_configs<E>(
                         .await?
                     }
                 };
-                let configs = carina_core::parser::resolve_provider_attributes_with_remote(
-                    parsed,
-                    &remote_bindings,
-                    session,
+                let missing = if matches!(policy, UpstreamMissingStatePolicy::Lenient) {
+                    parsed.upstream_states.iter()
+                        .filter(|upstream| !remote_bindings.contains_key(upstream.binding.as_str()))
+                        .map(|upstream| upstream.binding.as_str().to_owned()).collect()
+                } else { HashSet::new() };
+                let configs = ResolvedProviderConfigs::resolve_with_remote(
+                    parsed, &remote_bindings, session, |key, value| {
+                        if ResolvedProviderConfigs::references_only(value, &missing) {
+                            log::error!("Skipping default_tag '{key}' with unresolvable value: upstream state is missing");
+                            false
+                        } else { true }
+                    },
                 )
                 .map_err(|error| match error {
                     carina_core::parser::ProviderConfigResolutionError::Parse(source) => {
@@ -6787,7 +6795,15 @@ fn provider_referenced_upstream_states<E>(
         .collect();
     let mut pending = VecDeque::new();
     for provider in &parsed.providers {
-        for (attribute, value) in &provider.attributes {
+        for (attribute, value) in
+            provider
+                .attributes
+                .iter()
+                .map(|(key, value)| (key.clone(), value))
+                .chain(provider.default_tags.iter().map(|(key, value)| {
+                    (ResolvedProviderConfigs::default_tag_attribute(key), value)
+                }))
+        {
             enqueue_value(
                 value,
                 &ProviderAttributeRequirement {
@@ -7285,7 +7301,7 @@ mod load_upstream_states_tests {
     }
 
     #[tokio::test]
-    async fn provider_reference_scope_excludes_default_tags() {
+    async fn provider_reference_scope_requires_default_tag_upstream_values() {
         let temp = tempfile::tempdir().unwrap();
         let referenced = temp.path().join("referenced");
         let unrelated = temp.path().join("unrelated");
@@ -7324,7 +7340,7 @@ mod load_upstream_states_tests {
         ]);
         let parsed = resolve_file_for_test(parsed, temp.path());
 
-        let inputs = load_and_resolve_provider_configs(
+        let error = load_and_resolve_provider_configs(
             &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
@@ -7333,15 +7349,15 @@ mod load_upstream_states_tests {
             ProviderUpstreamScope::ProviderReferences,
         )
         .await
-        .expect("default_tags must not cause provider-only upstream loading");
-
-        assert!(matches!(
-            inputs.configs().as_provider_configs()[0]
-                .default_tags
-                .get("Owner"),
-            Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
-        ));
-        assert!(inputs.remote_bindings().is_empty());
+        .err()
+        .expect("default_tags are construction-time inputs and require their upstream values");
+        let rendered = error.to_string();
+        assert!(rendered.contains("default_tags.Owner"), "{rendered}");
+        assert!(rendered.contains("mgmt"), "{rendered}");
+        assert!(
+            !rendered.contains("unrelated"),
+            "unreferenced upstreams must not be loaded: {rendered}"
+        );
     }
 
     #[tokio::test]

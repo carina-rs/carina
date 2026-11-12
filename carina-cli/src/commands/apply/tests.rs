@@ -5184,7 +5184,7 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
     .expect_err("saved plan with unresolved provider config must be rejected");
 
     assert!(
-        matches!(&error, AppError::SavedProviderConfig(_)),
+        matches!(&error, AppError::SavedProviderConfig { .. }),
         "ProviderConfigInvariantError must remain typed in AppError: {error:?}"
     );
     let rendered = error.to_string();
@@ -5193,7 +5193,7 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
 }
 
 #[tokio::test]
-async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
+async fn missing_upstream_default_tags_are_omitted_before_saved_plan_apply() {
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let (_provider_temp, downstream, _) =
@@ -5242,13 +5242,13 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
         ProviderUpstreamScope::All,
     )
     .await
-    .expect("plan must preserve deferred default_tags when upstream state is absent");
-    assert!(matches!(
+    .expect("lenient planning must omit only defaults whose upstream state is missing");
+    assert!(
         plan_inputs.configs().as_provider_configs()[0]
             .default_tags
-            .get("Owner"),
-        Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
-    ));
+            .get("Owner")
+            .is_none()
+    );
     let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),

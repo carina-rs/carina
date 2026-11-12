@@ -2240,9 +2240,10 @@ mod tests {
             async |type_checks| {
                 let bindings = carina_core::binding_index::ResolvedBindings::default();
                 let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-                let schemas = carina_core::test_utils::preparation_schemas(
+                let schemas = carina_core::test_utils::preparation_schemas_with_attributes(
                     &resource.id,
                     carina_core::schema::SchemaKind::Resource,
+                    &resource.attributes,
                 );
                 let context = carina_core::executor::ProviderPreparationContext::new(
                     &bindings,
@@ -5160,7 +5161,7 @@ mod tests {
                 .with_attribute("map", secret(CoreValue::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([("key".into(), CoreValue::Concrete(ConcreteValue::String("value".into())))])))));
             let bindings = carina_core::binding_index::ResolvedBindings::default();
             let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-            let schemas = carina_core::test_utils::preparation_schemas(&resource.id, carina_core::schema::SchemaKind::Resource);
+            let schemas = carina_core::test_utils::preparation_schemas_with_attributes(&resource.id, carina_core::schema::SchemaKind::Resource, &resource.attributes);
             let context = carina_core::executor::ProviderPreparationContext::new(&bindings, &gate, &[], &carina_core::provider::NoopNormalizer, &[], &schemas, type_checks);
             let request = carina_core::executor::prepare_create_request(resource, &context).await.unwrap();
             let wire = core_to_wit_create_request(&request).res;
@@ -5232,6 +5233,9 @@ mod tests {
         schemas.insert(
             "",
             PatternResourceSchema::new("test")
+                .attribute(PatternAttributeSchema::optional("nested", PatternAttributeType::struct_("Nested", vec![
+                    PatternStructField::optional("items", PatternAttributeType::list(PatternAttributeType::string())).build(),
+                ])).build())
                 .attribute(
                     PatternAttributeSchema::optional("top", PatternAttributeType::string())
                         .write_only()
@@ -5362,6 +5366,12 @@ mod tests {
                 )
                 .validate()
                 .expect("test schema must be valid"),
+        );
+        carina_core::test_utils::complete_fixture_schema(
+            &mut schemas,
+            &resource.id,
+            carina_core::schema::SchemaKind::Resource,
+            &resource.attributes,
         );
         let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
             std::sync::Arc::new(Vec::new()),

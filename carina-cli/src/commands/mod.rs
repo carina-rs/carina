@@ -910,6 +910,22 @@ fn validate_and_resolve_configuration(
         return Err(non_empty_validation_failure(errors));
     }
 
+    // Default-tag knownness uses the final composition graph, so a known
+    // module export is available to the same resolver as a local resource.
+    let upstream = parsed
+        .upstream_states
+        .iter()
+        .map(|upstream| upstream.binding.as_str().to_owned())
+        .collect();
+    if let Err(error) = carina_core::parser::ResolvedProviderConfigs::validate_default_tag_knownness(
+        &parsed.providers,
+        &upstream,
+        &carina_core::binding_index::ResolvedBindings::for_expanded_validation(&parsed),
+        enriched_context,
+    ) {
+        errors.push(AppError::ProviderConfigInvariant(Box::new(error)));
+    }
+
     // Expansion carries module-internal side data in parallel with each
     // expanded resource and remaps its owner. Re-run the report-only form of
     // the same authority over that final graph. The wiring transition later

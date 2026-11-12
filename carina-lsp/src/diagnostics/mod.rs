@@ -1059,6 +1059,24 @@ impl DiagnosticRun<'_> {
                 preferred_tree,
                 &provider_validation_deduplicator,
             ));
+            let default_tag_diagnostics = if let Some(graph) = expanded_graph {
+                self.check_provider_default_tags(
+                    doc,
+                    preferred_tree,
+                    &graph.providers,
+                    &carina_core::binding_index::ResolvedBindings::for_expanded_validation(graph),
+                )
+            } else {
+                self.check_provider_default_tags(
+                    doc,
+                    preferred_tree,
+                    preferred_tree.providers(),
+                    &carina_core::binding_index::ResolvedBindings::for_authored_validation(
+                        merged.unwrap_or(parsed),
+                    ),
+                )
+            };
+            diagnostics.extend(default_tag_diagnostics);
 
             // Check for unloaded providers
             diagnostics.extend(self.check_unloaded_providers(doc, preferred_tree));

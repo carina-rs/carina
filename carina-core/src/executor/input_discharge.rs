@@ -317,11 +317,10 @@ impl WriteCheck {
         changed: &[String],
         desired: ProviderReadyResource,
         writeback: SecretPreservingAttributes,
-        schemas: &SchemaRegistry,
+        context: &super::ProviderPreparationContext<'_>,
     ) -> Result<PreparedWrite<UpdateRequest>, EffectFailureKind> {
-        let schema = super::provider_ready::managed_update_schema(schemas, desired.as_resource())
-            .map_err(EffectFailureKind::execution)?;
-        let request = UpdateRequest::checked(from, changed, &desired, schema)
+        let schemas = context.schemas();
+        let request = UpdateRequest::checked(from, changed, &desired, context)
             .map_err(EffectFailureKind::execution)?;
         if let Some(admission) = &self.admission {
             let input = crate::input_rules::RuleInput::for_dispatch_update(
@@ -458,6 +457,7 @@ pub(super) struct ExecutionInputChecks {
     pub(super) checks: HashMap<usize, PendingInputObligation>,
     pub(super) paired: HashMap<usize, Vec<usize>>,
     pub(super) absorbed: HashMap<usize, HashSet<usize>>,
+    cohorts: HashSet<usize>,
     required_deletes: HashMap<usize, HashSet<usize>>,
     receipts: HashMap<(usize, usize), DeleteDischargeReceipt>,
     consumed: HashSet<usize>,
@@ -482,8 +482,12 @@ impl ExecutionInputChecks {
         self.delete_targets.insert(index, target);
         Ok(())
     }
-    pub(super) fn has_rules(&self, index: usize) -> bool {
-        self.checks.contains_key(&index)
+    pub(super) fn needs_cohort_preparation(&self, index: usize) -> bool {
+        self.checks.contains_key(&index) || self.cohorts.contains(&index)
+    }
+
+    pub(super) fn preparation_writes(&self) -> impl Iterator<Item = usize> + '_ {
+        self.checks.keys().chain(&self.cohorts).copied()
     }
 
     /// Deletes with no paired writes need no obligation-to-slot mapping.
@@ -493,6 +497,7 @@ impl ExecutionInputChecks {
             checks: HashMap::new(),
             paired: HashMap::new(),
             absorbed: HashMap::new(),
+            cohorts: HashSet::new(),
             required_deletes: HashMap::new(),
             receipts: HashMap::new(),
             consumed: HashSet::new(),
@@ -583,6 +588,42 @@ impl ExecutionInputChecks {
         Ok(result)
     }
 
+    /// Every replacement retains the exact prepared request before teardown,
+    /// including schemas with no authored input rules. The sealed graph owns
+    /// endpoint indices; resource names and id equality grant no authority.
+    pub(super) fn for_plan<S: Clone>(
+        checks: Vec<PendingInputObligation>,
+        admitted: &crate::replacement::AdmittedReplacementEffects<S>,
+        sources: &[usize],
+    ) -> Result<Self, InputCheckConstructionError> {
+        let effects = admitted.effects();
+        let mut result = Self::new(checks, effects, sources)?;
+        for (write, deletes, _) in admitted.input_replacement_sites() {
+            result.bind_materialized_deletes(write, deletes);
+        }
+        for (write, effect) in effects.iter().enumerate() {
+            if matches!(effect, Effect::DeferredReplace(_)) {
+                result.cohorts.insert(write);
+                let deletes = sources
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, source)| {
+                        (*source == sources[write]
+                            && matches!(effects[index], Effect::Delete { .. }))
+                        .then_some(index)
+                    })
+                    .collect::<HashSet<_>>();
+                result.bind_materialized_deletes(write, deletes.iter().copied());
+                result.absorbed.entry(write).or_default().extend(deletes);
+            } else if matches!(effect, Effect::DeferredCreate(_))
+                && !admitted.deferred_delete_candidates(write).is_empty()
+            {
+                result.cohorts.insert(write);
+            }
+        }
+        Ok(result)
+    }
+
     fn slot(&self, index: usize) -> EffectSlot {
         EffectSlot {
             run: Arc::clone(&self.run),
@@ -597,6 +638,7 @@ impl ExecutionInputChecks {
                 "prepared request missing for consumed write slot",
             ));
         }
+        self.cohorts.remove(&index);
         Ok(WriteCheck {
             slot: self.slot(index),
             admission: self.checks.remove(&index),
@@ -864,7 +906,7 @@ mod tests {
                             &["node".into()],
                             request.resource().clone(),
                             writeback,
-                            &schemas,
+                            &context,
                         )
                         .map(|_| ())
                 } else {
@@ -976,7 +1018,7 @@ mod tests {
                             &["name".into()],
                             request.resource().clone(),
                             writeback,
-                            &schemas,
+                            &context,
                         ) {
                             Err(error) => error,
                             Ok(_) => panic!("late update must fail"),
@@ -1176,17 +1218,9 @@ mod tests {
                             ),
                         )
                         .unwrap();
-                        let update = UpdateRequest::checked(
-                            from,
-                            &["name".into()],
-                            &desired,
-                            super::super::provider_ready::managed_update_schema(
-                                &schemas,
-                                desired.as_resource(),
-                            )
-                            .unwrap(),
-                        )
-                        .unwrap();
+                        let update =
+                            UpdateRequest::checked(from, &["name".into()], &desired, &context)
+                                .unwrap();
                         let planned = desired.as_resource().clone();
                         match admit(Effect::Update {
                             from: Box::new(update.from().clone()),
@@ -1211,7 +1245,7 @@ mod tests {
                                         &["name".into()],
                                         desired,
                                         writeback,
-                                        &schemas,
+                                        &context,
                                     )
                                     .unwrap();
                                 let super::super::scheduler::ScheduledBasicEffect::Update {

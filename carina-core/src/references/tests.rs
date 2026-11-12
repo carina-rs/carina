@@ -545,8 +545,19 @@ async fn round5_cascade_unordered_list_with_resource_ref_records_its_own_pairs()
         ResolvedResource::resolve_with_schemas(producer.into_value_snapshot(), &fixture.registry)
             .unwrap(),
     );
-    let desired =
-        crate::resource::plan_input_desired_resources(&fixture.desired, &fixture.registry);
+    let desired = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            crate::validation::admission::final_input::FinalPlanInputs::admit(
+                fixture.desired.clone(),
+                vec![],
+                &fixture.registry,
+                &crate::binding_index::ResolvedBindings::default(),
+                session,
+            )
+        },
+    )
+    .unwrap();
     let dependents = CascadeDependents::new(
         &unresolved,
         DeferredCreateTargets::partition_for_expansion(
@@ -563,7 +574,6 @@ async fn round5_cascade_unordered_list_with_resource_ref_records_its_own_pairs()
         .plan_with_cascades(
             &desired,
             &dependents,
-            &[],
             &fixture.router,
             crate::differ::PlanPriorStates::new(&fixture.current, &crate::differ::Orphans::new()),
             &HashMap::new(),

@@ -139,6 +139,7 @@ use crate::schema::{CompiledAttributeType, FieldAncestry, LeafPath, TypeError};
 
 mod assignment;
 pub mod attributes;
+pub mod final_input;
 #[cfg(test)]
 mod tests;
 

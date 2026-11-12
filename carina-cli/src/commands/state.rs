@@ -3563,39 +3563,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_refresh_allows_default_tags_referencing_local_computed_attributes() {
+    async fn state_refresh_rejects_default_tags_referencing_local_computed_attributes() {
         let runtime = crate::test_support::TestCommandRuntime::new();
         let (_temp, base_dir, parsed) = provider_default_tags_local_resource_fixture();
-        let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(
             &runtime,
             &parsed.providers,
             &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
         )
         .unwrap();
-        let validated_config = providers
+        let error = providers
             .validate_evaluated_config(
                 carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
                 &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
                 true,
                 &[],
             )
-            .unwrap();
-
-        run_state_refresh_locked(
-            validated_config,
-            &backend,
-            StateLock::disabled_for_test().as_ref(),
-            &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
-            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            ShutdownToken::running(),
-        )
-        .await
-        .expect("state refresh must defer provider default tags until resource normalization");
+            .unwrap_err();
+        assert!(error.to_string().contains("default_tags"), "{error}");
     }
 
     #[tokio::test]
-    async fn state_refresh_ignores_missing_upstream_referenced_only_by_default_tags() {
+    async fn state_refresh_rejects_missing_required_default_tag_upstream() {
         let runtime = crate::test_support::TestCommandRuntime::new();
         let (_temp, base_dir, parsed) = provider_default_tags_missing_upstream_fixture();
         let backend = non_empty_refresh_backend("mock");
@@ -3614,7 +3603,7 @@ mod tests {
             )
             .unwrap();
 
-        run_state_refresh_locked(
+        let error = run_state_refresh_locked(
             validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
@@ -3623,7 +3612,8 @@ mod tests {
             ShutdownToken::running(),
         )
         .await
-        .expect("state refresh must not load upstream state used only by default tags");
+        .expect_err("default tags must resolve before constructing refresh providers");
+        assert!(error.to_string().contains("default_tags"), "{error}");
     }
 
     #[tokio::test]
@@ -3920,7 +3910,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_bucket_delete_ignores_upstream_referenced_only_by_default_tags() {
+    async fn state_bucket_delete_rejects_missing_default_tag_upstream() {
         let (_temp, base_dir, _) = provider_default_tags_missing_upstream_fixture();
         let parsed = crate::test_support::inferred_fixture(
             "provider test { default_tags = { Owner = mgmt.owner } }\nlet mgmt = upstream_state { source = 'missing-upstream' }\n",
@@ -3929,33 +3919,16 @@ mod tests {
             parsed,
             &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
         );
-        let inputs = load_state_bucket_delete_provider_inputs(
+        let error = load_state_bucket_delete_provider_inputs(
             &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .await
-        .expect("bucket delete must not load tag-only upstream state");
-        let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
-            &crate::test_support::TestCommandRuntime::new(),
-            (),
-            vec![Box::new(ProviderConfigCaptureFactory {
-                received_role_arn: Arc::clone(&received_role_arn),
-            })],
-            inputs.configs().as_provider_configs(),
-        );
-
-        create_state_bucket_delete_provider(
-            &ctx,
-            inputs.configs(),
-            "test",
-            &provider_mod::ProviderPlan::state_only(),
-        )
-        .await
-        .expect("bucket delete must construct without resolving default tags");
-        assert_eq!(*received_role_arn.lock().unwrap(), None);
+        .err()
+        .expect("bucket delete provider defaults require known upstream values");
+        assert!(error.to_string().contains("default_tags"), "{error}");
     }
 
     #[tokio::test]
@@ -4089,7 +4062,13 @@ mod tests {
             let schema_drafts: Vec<carina_core::schema::ResourceSchema> = vec![
                 ResourceSchema::new("test.resource"),
                 ResourceSchema::new("orphan"),
-                ResourceSchema::new("lookup").as_data_source(),
+                ResourceSchema::new("lookup").as_data_source().attribute(
+                    carina_core::schema::AttributeSchema::optional(
+                        "query",
+                        carina_core::schema::AttributeType::string(),
+                    )
+                    .build(),
+                ),
             ];
             schema_drafts
                 .into_iter()
@@ -4231,7 +4210,13 @@ mod tests {
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
             let schema_drafts: Vec<carina_core::schema::ResourceSchema> = vec![
                 ResourceSchema::new("test.resource"),
-                ResourceSchema::new("lookup").as_data_source(),
+                ResourceSchema::new("lookup").as_data_source().attribute(
+                    carina_core::schema::AttributeSchema::optional(
+                        "query",
+                        carina_core::schema::AttributeType::string(),
+                    )
+                    .build(),
+                ),
             ];
             schema_drafts
                 .into_iter()

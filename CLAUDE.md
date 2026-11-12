@@ -581,6 +581,15 @@ A struct type represents a nested object with typed fields.
   `NativeDesiredNormalization`. Keep `ProviderWireError`
   terminal: render its typed conversion reason once, without input values,
   and access the typed reason through `conversion_error()`.
+  `FinalInput<T>` owns the exact immutable admitted payload; no receipt can be
+  detached or paired with a replacement. Dispatch binds that payload to its
+  protected diagnostic source, so admission cannot receive a mismatched map.
+  Final admission retains every finding across all attributes and leaves,
+  and rejects undeclared attributes introduced by normalization.
+  Plan comparison consumes `FinalPlanInputs` after normalization and identity
+  reconciliation. A changed payload must obtain a new aggregate through admission.
+  Update patches obtain their own aggregate after observed ignored leaves are
+  grafted; preparing a replacement must succeed before its paired delete is released.
 - **Refinement layers** (carina#4348): protocol 27 and later require
   separate `identity_layer` and `member_layer` records for String and Int.
   `StringIdentityLayer`/`IntIdentityLayer` own reusable definitions;
@@ -633,6 +642,14 @@ A struct type represents a nested object with typed fields.
   including Int-to-Float, reject only provably disjoint bounds (#4362). Reference
   admission records `NeedsLocal` for constrained identity-less sinks; provider slots
   check resolved values against the full destination declaration before dispatch.
+  Final admission follows canonicalization, provider normalization,
+  re-canonicalization and tag merging, using the same declaration validator.
+  It includes custom validators and merged tag keys, values and entry counts,
+  while authored-shape cross-attribute validators retain their authored scope.
+  Authored tag overrides win; overridden defaults do not participate in membership.
+  Every default tag must be known when provider configurations resolve; validate
+  and LSP reject local apply-time references. Only explicit lenient handling of
+  missing upstream state may omit a default before provider-config resolution.
   Anonymous scalar refinements occur only in provider schema slots; `TypeExpr`
   boundaries use identified refinements or unconstrained scalars. Adding overlapping
   source constraints never reduces assignability.

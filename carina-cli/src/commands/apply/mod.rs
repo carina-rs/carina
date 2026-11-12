@@ -4023,7 +4023,10 @@ async fn run_apply_from_plan_locked_owned(
 
             let resolved_provider_configs =
                 ResolvedProviderConfigs::try_from(validated_plan.provider_configs().clone())
-                    .map_err(|source| AppError::SavedProviderConfig(Box::new(source)))?;
+                    .map_err(|error| AppError::SavedProviderConfig {
+                        error: Box::new(error),
+                        replan_command: apply_target.replan_command().to_string(),
+                    })?;
             let raw_provider_configs = resolved_provider_configs.as_provider_configs();
 
             // Secret-bearing plans initialize once while reproducing the

@@ -6994,13 +6994,10 @@ async fn test_apply_renormalizes_after_resolution() {
     );
 }
 
-/// Plan-time normalization may deliberately transform a literal into a form
-/// that does not satisfy a constraint written for the authored DSL spelling.
-/// The literal already passed the plan-time gate in authored form, so apply
-/// must not re-check the normalized plan value merely because another
-/// attribute on the resource needs apply-time resolution.
+/// Normalization does not widen a destination declaration. An unchanged
+/// plan literal must still pass final membership when another slot resolves.
 #[tokio::test]
-async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
+async fn apply_gate_revalidates_plan_normalized_literal() {
     use crate::binding_index::BindingValueSource;
 
     let provider = MockProvider::new();
@@ -7091,22 +7088,12 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     let events = observer.events().join("\n");
 
+    assert!(events.contains("provider normalization"), "{events}");
+    assert_eq!(result.failure_count(), 1, "{events}");
+    assert_eq!(result.success_count, 0);
     assert!(
-        !events.contains("Invalid value 'CANONICAL'"),
-        "apply revalidated the plan-normalized literal instead of only the runtime value: {events}"
-    );
-    assert_eq!(
-        result.failure_count(),
-        0,
-        "normalized literals were checked in authored form during planning"
-    );
-    assert_eq!(result.success_count, 1);
-    let captured = provider.captured_create_resources();
-    assert_eq!(captured.len(), 1, "the provider must be called once");
-    assert_eq!(
-        captured[0].get_attr("marker"),
-        Some(&Value::Concrete(ConcreteValue::String("CANONICAL".into()))),
-        "the provider still receives the normalized representation"
+        provider.calls().is_empty(),
+        "invalid final literal reached dispatch"
     );
 }
 
@@ -7189,7 +7176,7 @@ async fn plan_normalized_resource_without_authored_origin_is_an_invariant_error(
 /// identify which attributes became known at apply. A literal canonicalized at
 /// plan time must not be rechecked merely because a sibling reference resolves.
 #[tokio::test]
-async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
+async fn apply_gate_revalidates_plan_normalized_data_source_literal() {
     use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
 
     let provider = MockProvider::new();
@@ -7311,9 +7298,13 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     let events = observer.events().join("\n");
 
-    assert_eq!(result.failure_count(), 0, "{events}");
-    assert_eq!(result.success_count, 2, "{events}");
-    assert_eq!(provider.captured_data_source_reads().len(), 1);
+    assert_eq!(result.failure_count(), 1, "{events}");
+    assert_eq!(
+        result.success_count, 1,
+        "the valid producer remains recoverable: {events}"
+    );
+    assert!(provider.captured_data_source_reads().is_empty());
+    assert!(events.contains("provider normalization"), "{events}");
 }
 
 /// carina#3063: the apply path must re-apply host schema canonicalization, not
@@ -8486,6 +8477,16 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
     let normalizer = LockHoldingNormalizer {
         store: AsyncMutex::new(0),
     };
+    let mut schemas = TEST_SCHEMAS.clone();
+    crate::test_utils::complete_fixture_schema(
+        &mut schemas,
+        &ra_id,
+        crate::schema::SchemaKind::Resource,
+        &indexmap::IndexMap::from([(
+            "normalize_count".into(),
+            Value::Concrete(ConcreteValue::String("0".into())),
+        )]),
+    );
     let input = ExecutionInput {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
@@ -8499,7 +8500,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
         normalizer: &crate::provider::ConfiguredNormalizer::fixture(&normalizer),
         provider_configs: &[],
         factories: &[],
-        schemas: &TEST_SCHEMAS,
+        schemas: &schemas,
         parallelism: crate::executor::TEST_UNCAPPED,
         precompleted_success_count: 0,
         checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
@@ -12686,6 +12687,20 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
         wait_aliases: &[],
     });
 
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        PatternResourceSchema::new("iam.Role")
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "assume_role_policy_document_arns",
+                    PatternAttributeType::list(PatternAttributeType::string()),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
     let input = ExecutionInput {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
@@ -12702,7 +12717,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
-        schemas: &TEST_SCHEMAS,
+        schemas: &schemas,
         parallelism: crate::executor::TEST_UNCAPPED,
         precompleted_success_count: 0,
         checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),

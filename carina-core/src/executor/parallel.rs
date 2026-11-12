@@ -384,9 +384,9 @@ pub(super) async fn execute_effects_sequential<
     let mut effects = admitted.effects().to_vec();
     let mut materialization_requirements = crate::replacement::create_first_requirements(&effects);
     let mut total = count_runtime_effects(&effects, &input.data_source_values);
-    let mut input_checks = match ExecutionInputChecks::new(
+    let mut input_checks = match ExecutionInputChecks::for_plan(
         std::mem::take(&mut input.input_checks),
-        &effects,
+        &admitted,
         &source_effect_indices,
     ) {
         Ok(checks) => checks,
@@ -750,7 +750,7 @@ pub(super) async fn execute_effects_sequential<
                         completed_synchronous_dispatch = true;
                         break;
                     }
-                    if input_checks.has_rules(idx) {
+                    if input_checks.needs_cohort_preparation(idx) {
                         let deletes = combined
                             .input_replacement_sites()
                             .into_iter()

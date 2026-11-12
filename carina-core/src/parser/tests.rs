@@ -5558,7 +5558,7 @@ fn resolve_provider_attributes_with_remote_preserves_function_call_line() {
 }
 
 #[test]
-fn provider_default_tags_remain_deferred_and_saved_plan_validation_accepts_them() {
+fn provider_default_tags_require_known_values_in_live_and_saved_configs() {
     use crate::parser::resolve_provider_attributes_with_remote;
     let parsed = parse(
         "let mgmt = upstream_state { source = '../mgmt' }\nprovider aws { default_tags = { Owner = mgmt.owner } }",
@@ -5572,28 +5572,22 @@ fn provider_default_tags_remain_deferred_and_saved_plan_validation_accepts_them(
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("provider config must contain no parser placeholders");
-    let resolved = crate::validation::deferred_types::with_session_for_test(
+    let error = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| resolve_provider_attributes_with_remote(&parsed, &remote, session),
     )
-    .expect("default_tags do not participate in the provider-ready invariant");
-    let saved = SavedProviderConfigs::from(&resolved);
-    assert!(matches!(
-        saved.as_provider_configs()[0].default_tags.get("Owner"),
-        Some(crate::resource::Value::Deferred(
-            crate::resource::DeferredValue::ResourceRef { .. }
-        ))
+    .unwrap_err();
+    assert!(matches!(error,
+        ProviderConfigResolutionError::Invariant(ProviderConfigInvariantError::UnresolvedAttribute { attribute, .. })
+            if attribute == "default_tags.Owner"
     ));
-    assert_eq!(
-        serde_json::to_value(&saved).unwrap(),
-        serde_json::to_value(resolved.as_provider_configs()).unwrap(),
-        "the saved-provider newtype must preserve the historical JSON array shape"
+    let encoded = serde_json::to_value(&parsed.providers).unwrap();
+    let decoded: SavedProviderConfigs = serde_json::from_value(encoded).unwrap();
+    let error = ResolvedProviderConfigs::try_from(decoded).unwrap_err();
+    assert!(
+        matches!(error, ProviderConfigInvariantError::UnresolvedAttribute { attribute, .. }
+        if attribute == "default_tags.Owner")
     );
-
-    let decoded: SavedProviderConfigs =
-        serde_json::from_value(serde_json::to_value(saved).unwrap()).unwrap();
-    ResolvedProviderConfigs::try_from(decoded)
-        .expect("saved plans may carry deferred default_tags for per-resource resolution");
 }
 
 #[test]

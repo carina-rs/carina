@@ -456,12 +456,17 @@ fn dispatch_fixture_create(
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let mut schemas = carina_core::schema::SchemaRegistry::new();
-    schemas.insert(
-        &id.provider,
-        carina_core::schema::PatternResourceSchema::new(&id.resource_type)
-            .validate()
-            .unwrap(),
-    );
+    let mut schema = carina_core::schema::PatternResourceSchema::new(&id.resource_type);
+    for name in resource.attributes.keys() {
+        schema = schema.attribute(
+            carina_core::schema::PatternAttributeSchema::optional(
+                name,
+                carina_core::schema::PatternAttributeType::string(),
+            )
+            .build(),
+        );
+    }
+    schemas.insert(&id.provider, schema.validate().unwrap());
     carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
         |type_checks| {

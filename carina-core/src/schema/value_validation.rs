@@ -752,6 +752,7 @@ struct ValueValidator<'a, 'lookup> {
     defs: &'a BTreeMap<String, CompiledAttributeType>,
     lookup: Option<CustomTypeLookup<'lookup>>,
     checked: std::cell::RefCell<HashMap<CheckedNode<'a>, CheckedValue<'a>>>,
+    final_provider_input: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -778,6 +779,7 @@ impl<'a, 'lookup> ValueValidator<'a, 'lookup> {
             defs,
             lookup,
             checked: Default::default(),
+            final_provider_input: false,
         }
     }
 }
@@ -928,6 +930,34 @@ pub(crate) fn validate_value_with_lookup<
         .into_findings();
     findings.structure = value_structure(value);
     findings
+}
+
+/// Final provider values use the same declaration walk, including provider
+/// callbacks for compact StringLists introduced by normalization. Authored and
+/// historical StringLists retain their established validation policy.
+pub(crate) fn validate_final_provider_value<
+    'v,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    T: StructuralPending<'v, P, B>,
+>(
+    attr: &CompiledAttributeType,
+    value: &Classification<'v, P, B, T>,
+    defs: &BTreeMap<String, CompiledAttributeType>,
+    ancestry: FieldAncestry,
+    lookup: CustomTypeLookup<'_>,
+) -> ValueValidationFindings {
+    let mut validator = ValueValidator::new(defs, Some(lookup));
+    validator.final_provider_input = true;
+    validator
+        .walk(
+            attr,
+            value.into(),
+            &FieldPath::new(),
+            ancestry,
+            &mut Vec::new(),
+        )
+        .into_findings()
 }
 
 /// Standalone declarations enter the same leaf validator as resource values.
@@ -2343,18 +2373,19 @@ impl<'a> ValueValidator<'a, '_> {
                     .iter()
                     .map(ClassifiedRef::from)
                     .collect::<Vec<_>>();
-                // The provider walk visits ordinary Lists only. State and
-                // provider StringLists retain their local element checks.
-                ValueValidator::new(self.defs, None).list(
-                    attr,
-                    element_type,
-                    *constraints,
-                    &cached,
-                    true,
-                    path,
-                    ancestry,
-                    None,
-                )
+                // Final inputs include semantic callbacks for compact lists;
+                // authored and historical StringLists retain local checks.
+                ValueValidator::new(self.defs, self.lookup.filter(|_| self.final_provider_input))
+                    .list(
+                        attr,
+                        element_type,
+                        *constraints,
+                        &cached,
+                        true,
+                        path,
+                        ancestry,
+                        None,
+                    )
             }
             (AttrTypeKind::Struct { .. }, ConcreteValueRef::Map(map)) => {
                 self.struct_value(attr, value, map, path, ancestry, assignment)
@@ -4265,5 +4296,42 @@ mod value_knowledge_failure_contract {
             findings.local_error().is_some(),
             "the known invalid sibling must still be checked"
         );
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl super::ValidatedResourceSchema {
+    /// Transport fixtures must declare their supplied fields too. Existing
+    /// destination declarations, callbacks and identity paths are preserved.
+    #[doc(hidden)]
+    pub fn with_fixture_attributes<
+        P: crate::resource::ValueKind,
+        B: crate::resource::BindingAddress,
+    >(
+        &self,
+        attributes: &indexmap::IndexMap<String, crate::resource::Value<P, B>>,
+    ) -> Self {
+        let missing = attributes
+            .iter()
+            .filter(|(key, _)| self.effective_attribute_by_authored_name(key).is_none())
+            .map(|(key, value)| (key, crate::test_utils::fixture_value_type(value)))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return self.clone();
+        }
+        let mut draft = super::PatternResourceSchema::new(self.as_schema().resource_type());
+        for (key, ty) in missing {
+            draft = draft.attribute(super::PatternAttributeSchema::optional(key, ty).build());
+        }
+        let extra = draft.validate().expect("fixture field declarations");
+        let mut result = self.clone();
+        let schema = std::sync::Arc::make_mut(&mut result.schema);
+        schema
+            .attributes
+            .extend(extra.as_schema().attributes.clone());
+        result.admission_identity = Default::default();
+        result.input_rule_declarations =
+            std::sync::Arc::new(crate::input_rules::InputRuleDeclarations::new(schema));
+        result
     }
 }

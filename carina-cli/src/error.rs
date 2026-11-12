@@ -1003,6 +1003,9 @@ impl std::error::Error for AwsCredentialStartupError {}
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error(transparent)]
+    FinalProviderInput(#[from] carina_core::validation::admission::final_input::FinalInputError),
+
+    #[error(transparent)]
     PlanPreparation(Box<crate::wiring::PlanPreparationError>),
 
     #[error(transparent)]
@@ -1245,8 +1248,13 @@ pub enum AppError {
     },
 
     /// A saved plan attempted to cross the provider boundary with unresolved config.
-    #[error("Invalid provider config in saved plan: {0}")]
-    SavedProviderConfig(Box<carina_core::parser::ProviderConfigInvariantError>),
+    #[error(
+        "Invalid provider config in saved plan: {error}. Re-run `{replan_command}` to create a new plan."
+    )]
+    SavedProviderConfig {
+        error: Box<carina_core::parser::ProviderConfigInvariantError>,
+        replan_command: String,
+    },
 
     /// An invariant failure while traversing a secret candidate retains its cause.
     #[error(

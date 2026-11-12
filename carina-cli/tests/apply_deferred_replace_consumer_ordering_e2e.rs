@@ -334,7 +334,11 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
     )
     .with_absolute_binding(carina_core::resource::absolute_binding_address_for_test(
         "validation_records",
-    ));
+    ))
+    .with_attribute(
+        "name",
+        Value::Concrete(ConcreteValue::String("new-validation-token".into())),
+    );
     let template = DeferredForExpression::new(
         Some("main.crn".to_string()),
         1,

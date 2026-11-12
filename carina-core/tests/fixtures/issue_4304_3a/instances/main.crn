@@ -1,0 +1,10 @@
+let default_resource = mock.test.Tagged {}
+
+let applicable = mock.test.Tagged {
+    directives { provider = west }
+}
+
+let overridden = mock.test.Tagged {
+    tags = { Owner = "mine" }
+    directives { provider = west }
+}

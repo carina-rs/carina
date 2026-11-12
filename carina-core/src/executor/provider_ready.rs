@@ -36,7 +36,11 @@ use crate::schema::{
     CompiledResourceSchema as ResourceSchema, SchemaKind, SchemaRegistry, TypeError,
     ValidatedConfigSchema,
 };
-use crate::validation::admission::{RechecksResolved, attributes::AdmittedAttributes, kind};
+use crate::validation::admission::{
+    RechecksResolved,
+    final_input::{FinalInput, admit_dispatch},
+    kind,
+};
 use crate::value::SerializationError;
 
 #[cfg(test)]
@@ -50,11 +54,10 @@ mod attribute_admission_tests;
 /// from [`prepare_provider_ready_resource`].
 ///
 /// ```compile_fail
-/// use carina_core::provider::ProviderReady;
-/// use carina_core::resource::{ResolvedResource, Resource};
-///
-/// let resolved = ResolvedResource::new(Resource::new("test", "example"));
-/// let _ready = ProviderReady { value: resolved }; // private fields
+/// use carina_core::provider::{ProviderReady, ProviderReadyResource};
+/// fn rebind(ready: ProviderReadyResource) -> ProviderReadyResource {
+///     ProviderReady { admission: ready.admission, ..ready } // private fields
+/// }
 /// ```
 ///
 /// ```compile_fail
@@ -72,47 +75,46 @@ mod attribute_admission_tests;
 ///     ready.as_resource().attributes.insert("unchecked".into(), value);
 /// }
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ProviderReady<T: ResourceWirePayload, K: RechecksResolved = kind::ResourceAttribute> {
-    value: WireReady<T>,
+    admission: FinalInput<DispatchPayload<WireReady<T>>>,
     directives: ProviderDirectives,
-    admission: AdmittedAttributes<K>,
-    // The same sent values before dispatch removes secret annotations. Keep
-    // scalar/container provenance available only to the ingestion boundary.
-    diagnostic_attributes: IndexMap<String, Value>,
+    selection: crate::input_rules::InputSelectionAuthority,
+    kind: std::marker::PhantomData<K>,
+}
+
+impl<T: ResourceWirePayload + PartialEq, K: RechecksResolved> PartialEq for ProviderReady<T, K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.admission == other.admission && self.directives == other.directives
+    }
 }
 
 impl<T: ResourceWirePayload, K: RechecksResolved> ProviderReady<T, K> {
     fn settled(
         pending: crate::validation::deferred_types::PendingProviderTypeChecks<
             '_,
-            (T, ProviderDirectives),
+            (
+                FinalInput<DispatchPayload<WireReady<T>>>,
+                ProviderDirectives,
+            ),
         >,
-        diagnostic_attributes: IndexMap<String, Value>,
-        admission: AdmittedAttributes<K>,
+        selection: crate::input_rules::InputSelectionAuthority,
     ) -> Result<Self, ProviderPreparationError> {
-        let mut diagnostics = Vec::new();
-        let (value, directives) = pending.publish(&mut diagnostics)?;
-        if !diagnostics.is_empty() {
-            let messages = diagnostics.into_iter().map(|diagnostic| match diagnostic {
-                crate::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning)
-                | crate::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(warning) => warning.into_warning().message,
-            }).collect::<Vec<_>>();
-            return Err(ProviderPreparationError::Provider(
-                crate::provider::HostError::invalid_input(messages.join("\n")),
-            ));
-        }
-        let target = ProviderWireTarget::Resource(value.resource_id().clone());
+        let (admission, directives) = settle_preparation(pending)?;
         Ok(Self {
-            value: WireReady::try_new(value, target)?,
             directives,
-            diagnostic_attributes,
             admission,
+            selection,
+            kind: std::marker::PhantomData,
         })
     }
 
+    fn diagnostic_attributes(&self) -> &IndexMap<String, Value> {
+        self.admission.payload().diagnostic_attributes()
+    }
+
     pub(crate) fn diagnostic_values(&self) -> impl Iterator<Item = &Value> {
-        self.diagnostic_attributes.values()
+        self.diagnostic_attributes().values()
     }
     pub(crate) fn diagnostic_value(&self, key: &str, sent: &Value) -> Value {
         fn annotate(sent: &Value, source: &Value) -> Value {
@@ -153,14 +155,14 @@ impl<T: ResourceWirePayload, K: RechecksResolved> ProviderReady<T, K> {
                 _ => sent.clone(),
             }
         }
-        self.diagnostic_attributes
+        self.diagnostic_attributes()
             .get(key)
             .map_or_else(|| sent.clone(), |source| annotate(sent, source))
     }
 
     /// Borrow the checked payload.
     pub fn as_inner(&self) -> &T {
-        self.value.as_inner()
+        self.admission.payload().payload().as_inner()
     }
 
     /// Borrow the schema-resolved directives paired with this payload.
@@ -170,7 +172,7 @@ impl<T: ResourceWirePayload, K: RechecksResolved> ProviderReady<T, K> {
 
     /// The complete projection checked before native or WASM dispatch.
     pub fn wire_attributes(&self) -> &WireAttributes {
-        self.value.wire()
+        self.admission.payload().payload().wire()
     }
 }
 
@@ -180,6 +182,99 @@ impl<T: ResourceWirePayload, K: RechecksResolved> Deref for ProviderReady<T, K> 
     fn deref(&self) -> &Self::Target {
         self.as_inner()
     }
+}
+
+/// Preparation binds the exact transport payload to its protected source.
+/// Only the two constructors below may strip annotations; callers of final
+/// admission cannot supply a separate, potentially mismatched diagnostic map.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DispatchPayload<T> {
+    payload: T,
+    diagnostic_attributes: IndexMap<String, Value>,
+}
+
+impl<T> DispatchPayload<T> {
+    pub(crate) fn payload(&self) -> &T {
+        &self.payload
+    }
+    pub(crate) fn diagnostic_attributes(&self) -> &IndexMap<String, Value> {
+        &self.diagnostic_attributes
+    }
+}
+
+impl DispatchPayload<ResolvedResource<ProviderModuleSource>> {
+    fn resource(
+        resource: ResolvedResource<ProviderModuleSource>,
+        restored: &super::normalized::RestoredSecrets,
+        schemas: &SchemaRegistry,
+    ) -> Result<Self, crate::resource::ResolvedResourceError> {
+        let diagnostic_attributes = resource.as_resource().attributes.clone();
+        let mut resource = resource.into_inner();
+        restored.remove(&mut resource.attributes);
+        Ok(Self {
+            payload: ResolvedResource::resolve_with_schemas(resource, schemas)?,
+            diagnostic_attributes,
+        })
+    }
+}
+
+impl DispatchPayload<ResolvedDataSource<ProviderModuleSource>> {
+    fn data_source(value: ResolvedDataSource<ProviderModuleSource>) -> Self {
+        let diagnostic_attributes = value.attributes.clone();
+        let mut value = value.into_inner();
+        for attribute in value.attributes.values_mut() {
+            *attribute = unwrap_secret(attribute);
+        }
+        Self {
+            payload: ResolvedDataSource::new(value),
+            diagnostic_attributes,
+        }
+    }
+}
+
+impl<T: ResourceWirePayload> DispatchPayload<T> {
+    pub(crate) fn into_wire(self) -> Result<DispatchPayload<WireReady<T>>, ProviderWireError> {
+        let target = ProviderWireTarget::Resource(self.payload.resource_id().clone());
+        Ok(DispatchPayload {
+            payload: WireReady::try_new(self.payload, target)?,
+            diagnostic_attributes: self.diagnostic_attributes,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct PreparationDiagnostics(Vec<crate::validation::deferred_types::ProviderTypeCheckDiagnostic>);
+impl fmt::Display for PreparationDiagnostics {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, diagnostic) in self.0.iter().enumerate() {
+            if index != 0 {
+                writeln!(f)?;
+            }
+            let (crate::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(finding)
+                | crate::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(finding)) = diagnostic;
+            write!(f, "{}", finding.message)?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for PreparationDiagnostics {}
+
+fn settle_preparation<T>(
+    pending: crate::validation::deferred_types::PendingProviderTypeChecks<'_, T>,
+) -> Result<T, ProviderPreparationError> {
+    let mut diagnostics = Vec::new();
+    let output = pending.publish(&mut diagnostics)?;
+    if diagnostics.is_empty() {
+        return Ok(output);
+    }
+    Err(ProviderPreparationError::Provider(
+        crate::provider::HostError::invalid_input_caused_by(
+            "provider type checks remain unsettled",
+            crate::provider_text::HostDiagnostic::capture_host_or_provider(PreparationDiagnostics(
+                diagnostics,
+            )),
+        ),
+    ))
 }
 
 /// A fully resolved managed resource whose known value constraints have run.
@@ -218,9 +313,9 @@ impl ProviderReadyResource {
     pub(crate) fn protected_desired_tree(&self) -> ProtectedDesiredTree<'_> {
         ProtectedDesiredTree {
             resource_id: &self.id,
-            attributes: &self.diagnostic_attributes,
+            attributes: self.diagnostic_attributes(),
             ignored: self.ignore_changes(),
-            selection: self.admission.selection_authority(),
+            selection: &self.selection,
         }
     }
 }
@@ -364,6 +459,40 @@ impl<'a> ProviderPreparationContext<'a> {
 
     pub(super) fn schemas(&self) -> &SchemaRegistry {
         self.schemas
+    }
+
+    pub(crate) fn prepare_update_patch(
+        &self,
+        changed: &[String],
+        resource: &ProviderReadyResource,
+        from: &crate::resource::SnapshotState,
+    ) -> Result<FinalInput<WireReady<crate::provider::UpdatePatch>>, ProviderPreparationError> {
+        let schema = self
+            .schemas
+            .get_for(resource.as_resource())
+            .ok_or_else(|| ProviderPreparationError::MissingManagedSchema {
+                resource: resource.id.clone(),
+            })?;
+        let patch = crate::provider::build_update_patch(
+            changed,
+            resource,
+            from,
+            schema.schema().as_schema(),
+        )?;
+        let admitted = crate::validation::admission::final_input::admit_update_patch(
+            patch,
+            resource,
+            schema,
+            self.bindings,
+            self.type_checks,
+        )
+        .map_err(|error| match error {
+            crate::validation::admission::final_input::FinalInputError::Wire(error) => {
+                ProviderPreparationError::Wire(Box::new(error))
+            }
+            error => ProviderPreparationError::FinalInput(error),
+        })?;
+        settle_preparation(self.type_checks.pending(admitted))
     }
 }
 
@@ -603,6 +732,8 @@ impl ProviderReadyDataSource {
 /// Failure while preparing a provider-facing resource.
 #[derive(Debug, Error)]
 pub enum ProviderPreparationError {
+    #[error(transparent)]
+    FinalInput(#[from] crate::validation::admission::final_input::FinalInputError),
     #[error("input discharge failed")] // error-chain: caller-renders-sources
     InputDischarge(#[source] super::EffectFailureKind),
     #[error("bootstrap create is waiting for scheduler dependencies")]
@@ -1073,7 +1204,7 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
         )?;
     }
     let schema = schema?;
-    let admitted = {
+    {
         let authored = match &value_check {
             ResourceValueCheck::All => None,
             ResourceValueCheck::ApplyResolved { attributes, names } => Some((attributes, names)),
@@ -1117,7 +1248,7 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
     super::normalized::reject_provider_boundary_block_aliases_with_authority(
         std::slice::from_ref(&resource),
         context.schemas,
-        admitted.selection_authority(),
+        &crate::input_rules::InputSelectionAuthority::in_catalog(context.type_checks.catalog()),
     )
     .map_err(ProviderPreparationError::Provider)?;
     crate::resource::assert_resource_known_for_apply(
@@ -1132,19 +1263,24 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
         resource.clone(),
         ProviderWireTarget::Resource(resource.id.clone()),
     )?;
-    let diagnostic_attributes = resource.as_resource().attributes.clone();
-    let mut resource = resource.into_inner();
-    restored.remove(&mut resource.attributes);
-    let resource = ResolvedResource::resolve_with_schemas(resource, context.schemas)?;
+    let input = DispatchPayload::resource(resource, &restored, context.schemas)?;
+    let resource = input.payload();
     let directives = context.schemas.resolve_directives(
         &resource.as_resource().id,
         SchemaKind::Resource,
         &resource.as_resource().directives,
     );
+    let defaults = resource.as_resource().default_tag_keys.clone();
+    let admitted = admit_dispatch(
+        input,
+        Some(&defaults),
+        schema,
+        context.bindings,
+        context.type_checks,
+    )?;
     ProviderReady::settled(
-        context.type_checks.pending((resource, directives)),
-        diagnostic_attributes,
-        admitted,
+        context.type_checks.pending((admitted, directives)),
+        crate::input_rules::InputSelectionAuthority::in_catalog(context.type_checks.catalog()),
     )
 }
 
@@ -1201,7 +1337,7 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
         }
     }
     let schema = schema?;
-    let admitted = {
+    {
         let authored = match &value_check {
             ResourceValueCheck::All => None,
             ResourceValueCheck::ApplyResolved { attributes, names } => Some((attributes, names)),
@@ -1230,23 +1366,22 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
             .map_err(crate::resource::knowledge_serialization_error)
             .and_then(crate::resource::require_known_for_apply)?;
     }
-    let mut value = value.into_provider_data_source();
-    let diagnostic_attributes = value.attributes.clone();
-    let protected = ResolvedDataSource::new(value.clone());
-    WireReady::try_new(protected, ProviderWireTarget::Resource(value.id.clone()))?;
-    for attribute in value.attributes.values_mut() {
-        *attribute = unwrap_secret(attribute);
-    }
-    let value = ResolvedDataSource::new(value);
+    let value = ResolvedDataSource::new(value.into_provider_data_source());
+    WireReady::try_new(
+        value.clone(),
+        ProviderWireTarget::Resource(value.id.clone()),
+    )?;
+    let input = DispatchPayload::data_source(value);
+    let value = input.payload();
     let directives = context.schemas.resolve_directives(
         &value.as_inner().id,
         SchemaKind::DataSource,
         &value.as_inner().directives,
     );
+    let admitted = admit_dispatch(input, None, schema, context.bindings, context.type_checks)?;
     ProviderReady::settled(
-        context.type_checks.pending((value, directives)),
-        diagnostic_attributes,
-        admitted,
+        context.type_checks.pending((admitted, directives)),
+        crate::input_rules::InputSelectionAuthority::in_catalog(context.type_checks.catalog()),
     )
 }
 
@@ -1285,18 +1420,13 @@ pub async fn prepare_update_request(
     context: &ProviderPreparationContext<'_>,
 ) -> Result<UpdateRequest, ProviderPreparationError> {
     let resource = prepare_provider_ready_resource(resource, context).await?;
-    let schema = managed_update_schema(context.schemas, resource.as_resource())?;
-    UpdateRequest::checked(from, changed_attributes, &resource, schema)
+    UpdateRequest::checked(from, changed_attributes, &resource, context)
 }
 
-fn validate_known_provider_values<K: crate::validation::admission::RechecksResolved>(
+fn validate_known_provider_values(
     id: &ResourceId,
-    result: Result<
-        crate::validation::admission::attributes::AdmittedAttributes<K>,
-        crate::validation::admission::attributes::ApplyAdmissionErrors,
-    >,
-) -> Result<crate::validation::admission::attributes::AdmittedAttributes<K>, ProviderPreparationError>
-{
+    result: Result<(), crate::validation::admission::attributes::ApplyAdmissionErrors>,
+) -> Result<(), ProviderPreparationError> {
     use crate::validation::admission::attributes::ApplyAdmissionErrors;
     result.map_err(|error| match error {
         ApplyAdmissionErrors::Admission(error) => {
@@ -1784,7 +1914,7 @@ mod provider_config_tests {
     }
 
     #[tokio::test]
-    async fn issue_4276_round2_d_provider_normalized_string_list_is_not_revalidated() {
+    async fn issue_4276_round2_d_provider_normalized_string_list_is_revalidated() {
         struct DefaultingNormalizer;
         impl ProviderNormalizer for DefaultingNormalizer {
             fn normalize_desired<'a>(
@@ -1850,20 +1980,14 @@ mod provider_config_tests {
                     type_checks,
                 );
                 let resource = Resource::with_provider("owner", "test.owner", "example", None);
-                let ready = prepare_provider_ready_resource(resource, &context)
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    ready.as_resource().resolved_attributes().get("value"),
-                    Some(&Value::Concrete(ConcreteValue::StringList(vec![
-                        "bad".into()
-                    ])))
-                );
-                assert_eq!(
-                    calls.load(Ordering::SeqCst),
-                    0,
-                    "normalizer-introduced values bypass authored validation"
-                );
+                let error = prepare_provider_ready_resource(resource, &context)
+                    .await.expect_err("normalizer output must satisfy the full declaration");
+                let ProviderPreparationError::FinalInput(
+                    crate::validation::admission::final_input::FinalInputError::Membership { path, origin, .. }
+                ) = error else { panic!("expected final-input membership failure: {error:?}"); };
+                assert!(path.to_string().starts_with("value"));
+                assert!(matches!(origin, crate::validation::admission::final_input::FinalInputOrigin::ProviderNormalization));
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
 
                 let authored = Resource::with_provider("owner", "test.owner", "example", None)
                     .with_attribute(
@@ -1886,7 +2010,7 @@ mod provider_config_tests {
                         .collect::<Vec<_>>(),
                     vec!["owner rejected `VpcId`: owner accepts `vpc-good`, not `bad`"]
                 );
-                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
             },
         )
         .await;
@@ -1899,7 +2023,7 @@ mod provider_config_tests {
             StringMemberConstraints,
         };
 
-        struct ReplacingNormalizer(Value);
+        struct ReplacingNormalizer(Option<Value>, &'static str);
 
         impl ProviderNormalizer for ReplacingNormalizer {
             fn normalize_desired<'a>(
@@ -1908,7 +2032,12 @@ mod provider_config_tests {
             ) -> BoxFuture<'a, ProviderResult<()>> {
                 Box::pin(async move {
                     for resource in resources {
-                        resource.set_attr("value", self.0.clone());
+                        match &self.0 {
+                            Some(value) => resource.set_attr(self.1, value.clone()),
+                            None => {
+                                resource.attributes.shift_remove(self.1);
+                            }
+                        }
                     }
                     Ok(())
                 })
@@ -1932,6 +2061,341 @@ mod provider_config_tests {
 
         fn text(value: &str) -> Value {
             Value::Concrete(ConcreteValue::String(value.into()))
+        }
+
+        async fn cleanup_candidate(unknown: bool, plan: bool) -> ProviderPreparationError {
+            let mut schemas = SchemaRegistry::new();
+            let slot = PatternAttributeType::struct_(
+                "Options",
+                vec![
+                    PatternStructField::required("first", PatternAttributeType::bool()).build(),
+                    PatternStructField::required("second", PatternAttributeType::bool()).build(),
+                ],
+            );
+            schemas.insert(
+                "mock",
+                PatternResourceSchema::new("test.Final")
+                    .attribute(PatternAttributeSchema::optional("value", slot).build())
+                    .attribute(
+                        PatternAttributeSchema::optional("other", PatternAttributeType::bool())
+                            .build(),
+                    )
+                    .validate()
+                    .unwrap(),
+            );
+            let bindings = ResolvedBindings::default();
+            let gate = ModuleConstraintGate::from_live_compositions(&[]);
+            crate::validation::deferred_types::with_session_for_test_async(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                async |session| {
+                    let invalid = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                        ("first".into(), text("invalid")),
+                        ("second".into(), text("invalid")),
+                    ])));
+                    let normalizer =
+                        crate::provider::ConfiguredNormalizer::fixture(ReplacingNormalizer(
+                            Some(invalid),
+                            if unknown { "undeclared" } else { "value" },
+                        ));
+                    let context = ProviderPreparationContext::new(
+                        &bindings,
+                        &gate,
+                        &[],
+                        &normalizer,
+                        &[],
+                        &schemas,
+                        session,
+                    );
+                    let resource = Resource::with_provider("mock", "test.Final", "example", None);
+                    if plan {
+                        // FinalPlanInputs receives the canonicalized, normalized plan payload.
+                        let mut candidate =
+                            crate::executor::normalized::apply_host_desired_normalization(
+                                resource,
+                                &[],
+                                &normalizer,
+                                &schemas,
+                            )
+                            .await
+                            .unwrap()
+                            .into_resource();
+                        if !unknown {
+                            candidate.set_attr("other", text("invalid"));
+                        }
+                        let resolved =
+                            ResolvedResource::resolve_with_schemas(candidate.into(), &schemas)
+                                .unwrap();
+                        let result =
+                            crate::validation::admission::final_input::FinalPlanInputs::admit(
+                                vec![resolved],
+                                vec![],
+                                &schemas,
+                                &bindings,
+                                session,
+                            );
+                        ProviderPreparationError::FinalInput(
+                            result.expect_err("final plan input must be rejected"),
+                        )
+                    } else {
+                        // Plan provenance bypasses authored-shape checking of the candidate.
+                        let mut resource = resource;
+                        if !unknown {
+                            resource.set_attr("other", text("invalid"));
+                        }
+                        prepare_provider_ready_resource_after_resolution(
+                            ResolvedCheckInput::plan_normalized(
+                                resource,
+                                HashMap::new(),
+                                HashSet::new(),
+                            ),
+                            &context,
+                        )
+                        .await
+                        .expect_err("final dispatch input must be rejected")
+                    }
+                },
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn issue_4304_3a_cleanup_plan_keeps_all_findings() {
+            let error = cleanup_candidate(false, true).await;
+            let ProviderPreparationError::FinalInput(error) = error else {
+                panic!("wrong error: {error:?}");
+            };
+            assert_eq!(error.findings().len(), 3);
+            let message = diagnostic(&error);
+            for path in ["value.first", "value.second", "other"] {
+                assert!(message.contains(path), "missing {path}: {message}");
+            }
+        }
+
+        #[tokio::test]
+        async fn issue_4304_3a_cleanup_dispatch_keeps_all_findings() {
+            let error = cleanup_candidate(false, false).await;
+            let ProviderPreparationError::FinalInput(error) = error else {
+                panic!("wrong error: {error:?}");
+            };
+            assert_eq!(error.findings().len(), 3);
+            let message = diagnostic(&error);
+            for path in ["value.first", "value.second", "other"] {
+                assert!(message.contains(path), "missing {path}: {message}");
+            }
+        }
+
+        #[tokio::test]
+        async fn issue_4304_3a_cleanup_plan_rejects_undeclared_normalizer_attribute() {
+            let message = diagnostic(&cleanup_candidate(true, true).await);
+            assert!(
+                message.contains("undeclared") && message.contains("provider normalization"),
+                "{message}"
+            );
+        }
+
+        #[tokio::test]
+        async fn issue_4304_3a_cleanup_dispatch_rejects_undeclared_normalizer_attribute() {
+            let message = diagnostic(&cleanup_candidate(true, false).await);
+            assert!(
+                message.contains("undeclared") && message.contains("provider normalization"),
+                "{message}"
+            );
+        }
+
+        #[tokio::test]
+        async fn issue_4304_3a_cleanup_update_patch_preserves_all_pending_diagnostics() {
+            let mut schemas = SchemaRegistry::new();
+            schemas.insert(
+                "mock",
+                PatternResourceSchema::new("test.Final")
+                    .attribute(
+                        PatternAttributeSchema::optional("value", PatternAttributeType::bool())
+                            .build(),
+                    )
+                    .validate()
+                    .unwrap(),
+            );
+            let bindings = ResolvedBindings::default();
+            let gate = ModuleConstraintGate::from_live_compositions(&[]);
+            let ready = crate::validation::deferred_types::with_session_for_test_async(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                async |session| {
+                    let context = ProviderPreparationContext::new(
+                        &bindings,
+                        &gate,
+                        &[],
+                        &crate::provider::NoopNormalizer,
+                        &[],
+                        &schemas,
+                        session,
+                    );
+                    prepare_provider_ready_resource(
+                        Resource::with_provider("mock", "test.Final", "example", None)
+                            .with_attribute("value", Value::Concrete(ConcreteValue::Bool(true))),
+                        &context,
+                    )
+                    .await
+                    .unwrap()
+                },
+            )
+            .await;
+            let catalog = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+            let result =
+                crate::validation::deferred_types::TypeCheckSession::run(&catalog, |session| {
+                    for (label, name) in [
+                        ("first pending check", "MissingFirst"),
+                        ("second pending check", "MissingSecond"),
+                    ] {
+                        let expected = crate::parser::parse_type_expr_str(name, &catalog).unwrap();
+                        session.record_type(&expected, label);
+                    }
+                    let context = ProviderPreparationContext::new(
+                        &bindings,
+                        &gate,
+                        &[],
+                        &crate::provider::NoopNormalizer,
+                        &[],
+                        &schemas,
+                        session,
+                    );
+                    let from = crate::resource::SnapshotState::existing(
+                        ready.id.clone(),
+                        crate::test_support::snapshot_attributes(HashMap::<String, Value>::new()),
+                    );
+                    context.prepare_update_patch(&["value".into()], &ready, &from)
+                })
+                .publish(&mut Vec::new());
+            let error = result.unwrap_err();
+            let message = diagnostic(&error);
+            assert!(
+                message.contains("first pending check") && message.contains("second pending check"),
+                "{message}"
+            );
+            let ProviderPreparationError::Provider(error) = error else {
+                panic!("wrong error: {error:?}")
+            };
+            assert!(
+                error
+                    .detail()
+                    .cause()
+                    .is_some_and(|cause| cause.is::<PreparationDiagnostics>()),
+                "pending diagnostics lost their typed cause"
+            );
+        }
+
+        #[tokio::test]
+        async fn issue_4304_3a_update_patch_readmits_observed_ignored_leaves() {
+            let mut schemas = SchemaRegistry::new();
+            schemas.insert(
+                "test",
+                PatternResourceSchema::new("widget")
+                    .attribute(
+                        PatternAttributeSchema::required(
+                            "config",
+                            PatternAttributeType::struct_(
+                                "Config",
+                                vec![
+                                    PatternStructField::required(
+                                        "version",
+                                        PatternAttributeType::refined_string(
+                                            None,
+                                            None,
+                                            Some((None, Some(3))),
+                                            None,
+                                        ),
+                                    )
+                                    .build(),
+                                    PatternStructField::required(
+                                        "memory",
+                                        PatternAttributeType::int(),
+                                    )
+                                    .build(),
+                                ],
+                            ),
+                        )
+                        .build(),
+                    )
+                    .validate()
+                    .unwrap(),
+            );
+            let config = |version: &str, memory| {
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    ("version".into(), text(version)),
+                    ("memory".into(), Value::Concrete(ConcreteValue::Int(memory))),
+                ])))
+            };
+            let mut resource = Resource::with_provider("test", "widget", "example", None)
+                .with_attribute("config", config("ok", 256));
+            resource.directives.ignore_changes = vec![ParsedIgnorePath::new(vec![
+                ParsedIgnorePathSegment::Attribute("config".into()),
+                ParsedIgnorePathSegment::Attribute("version".into()),
+            ])];
+            let bindings = ResolvedBindings::default();
+            let gate = ModuleConstraintGate::from_live_compositions(&[]);
+            crate::validation::deferred_types::with_session_for_test_async(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                async |session| {
+                    let context = ProviderPreparationContext::new(
+                        &bindings,
+                        &gate,
+                        &[],
+                        &crate::provider::NoopNormalizer,
+                        &[],
+                        &schemas,
+                        session,
+                    );
+                    for (observed, protected) in [
+                        ("old", false),
+                        ("invalid-observed", false),
+                        ("invalid-observed", true),
+                    ] {
+                        let mut resource = resource.clone();
+                        if protected {
+                            let Value::Concrete(ConcreteValue::Map(fields)) =
+                                resource.attributes.get_mut("config").unwrap()
+                            else {
+                                panic!("fixture config is a struct")
+                            };
+                            fields.insert("version".into(), text("ok").into_secret());
+                        }
+                        let from = crate::resource::SnapshotState::existing(
+                            resource.id.clone(),
+                            crate::test_support::snapshot_attributes(HashMap::from([(
+                                "config".into(),
+                                config(observed, 128),
+                            )])),
+                        );
+                        let result = prepare_update_request(
+                            resource.clone(),
+                            from,
+                            &["config".into()],
+                            &context,
+                        )
+                        .await;
+                        if observed == "old" {
+                            let request = result.expect("valid observed graft is admitted");
+                            assert_eq!(
+                                request.patch().ops[0].sent_value(),
+                                Some(&config(observed, 256)),
+                            );
+                        } else {
+                            let error = result
+                                .expect_err("resource evidence cannot authorize a different patch");
+                            let message = diagnostic(&error);
+                            if protected {
+                                for rendered in [&message, &format!("{error:?}")] {
+                                    assert!(!rendered.contains(observed), "{rendered}");
+                                }
+                            } else {
+                                assert!(message.contains("config.version"), "{message}");
+                            }
+                            assert!(message.contains("observed update patch"), "{message}");
+                            assert!(std::error::Error::source(&error).is_some());
+                        }
+                    }
+                },
+            )
+            .await;
         }
 
         fn diagnostic(error: &dyn std::error::Error) -> String {
@@ -2010,7 +2474,7 @@ mod provider_config_tests {
                 snapshot.provider_context(),
                 async |session| {
                     let normalizer = crate::provider::ConfiguredNormalizer::fixture(
-                        ReplacingNormalizer(normalized),
+                        ReplacingNormalizer(Some(normalized), "value"),
                     );
                     let context = ProviderPreparationContext::new(
                         &bindings,
@@ -2038,11 +2502,12 @@ mod provider_config_tests {
                         error,
                         ProviderPreparationError::ValueConstraint { .. }
                             | ProviderPreparationError::Admission { .. }
+                            | ProviderPreparationError::FinalInput(_)
                     ));
                     let rendered = diagnostic(&error);
                     assert!(rendered.contains(slot), "missing slot {slot}: {rendered}");
                     assert!(
-                        rendered.contains("provider") && rendered.contains("normaliz"),
+                        rendered.contains("provider") && rendered.to_ascii_lowercase().contains("normaliz"),
                         "missing provider normalization origin: {rendered}"
                     );
                 },
@@ -2051,15 +2516,96 @@ mod provider_config_tests {
         }
 
         #[tokio::test]
-        #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
         async fn issue_4304_3a_plan_rejects_provider_normalized_string_list() {
             assert_plan_rejects_normalized_value(false).await;
         }
 
         #[tokio::test]
-        #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
         async fn issue_4304_3a_plan_rejects_provider_normalized_nested_struct_field() {
             assert_plan_rejects_normalized_value(true).await;
+        }
+
+        async fn scalar_final_error(
+            normalized: Option<Value>,
+            authored: Value,
+            required: bool,
+        ) -> ProviderPreparationError {
+            let scalar =
+                PatternAttributeType::refined_string(None, None, Some((None, Some(4))), None);
+            let attribute = if required {
+                PatternAttributeSchema::required("value", scalar).build()
+            } else {
+                PatternAttributeSchema::optional("value", scalar).build()
+            };
+            let mut schemas = SchemaRegistry::new();
+            schemas.insert(
+                "mock",
+                PatternResourceSchema::new("test.Scalar")
+                    .attribute(attribute)
+                    .validate()
+                    .unwrap(),
+            );
+            let bindings = ResolvedBindings::default();
+            let gate = ModuleConstraintGate::from_live_compositions(&[]);
+            crate::validation::deferred_types::with_session_for_test_async(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                async |session| {
+                    let normalizer = crate::provider::ConfiguredNormalizer::fixture(
+                        ReplacingNormalizer(normalized, "value"),
+                    );
+                    let context = ProviderPreparationContext::new(
+                        &bindings,
+                        &gate,
+                        &[],
+                        &normalizer,
+                        &[],
+                        &schemas,
+                        session,
+                    );
+                    prepare_plan_input(
+                        Resource::with_provider("mock", "test.Scalar", "example", None)
+                            .with_attribute("value", authored),
+                        &context,
+                    )
+                    .await
+                    .expect_err("normalization output must satisfy the full scalar slot")
+                },
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn issue_4304_3a_plan_normalization_preserves_secret_diagnostic_protection() {
+            let private = "provider-created-private-value";
+            let error =
+                scalar_final_error(Some(text(private)), text("good").into_secret(), false).await;
+            for rendered in [diagnostic(&error), format!("{error:?}")] {
+                assert!(
+                    !rendered.contains(private),
+                    "secret normalization output leaked: {rendered}"
+                );
+                assert!(
+                    rendered.to_ascii_lowercase().contains("normaliz"),
+                    "missing normalization origin: {rendered}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn issue_4304_3a_normalizer_cannot_remove_required_slot() {
+            let error = scalar_final_error(None, text("good"), true).await;
+            let ProviderPreparationError::FinalInput(
+                crate::validation::admission::final_input::FinalInputError::Membership {
+                    path,
+                    error,
+                    ..
+                },
+            ) = error
+            else {
+                panic!("wrong failure: {error:?}");
+            };
+            assert_eq!(path.to_string(), "value");
+            assert!(matches!(*error, TypeError::MissingRequired { .. }));
         }
 
         #[derive(Clone, Copy)]
@@ -2101,10 +2647,17 @@ mod provider_config_tests {
             .expect("directory fixture must resolve")
             .into_expanded(&schemas, &provider_context)
             .expect("fixture has no module placeholders");
-            assert_eq!(expanded.providers.len(), 1);
+            assert_eq!(
+                expanded.providers.len(),
+                if name == "instances" { 2 } else { 1 }
+            );
             assert_eq!(
                 expanded.resources.len(),
-                if name == "key_pattern" { 1 } else { 2 }
+                match name {
+                    "key_pattern" => 1,
+                    "instances" => 3,
+                    _ => 2,
+                }
             );
             (expanded, schemas)
         }
@@ -2173,6 +2726,7 @@ mod provider_config_tests {
                         error,
                         ProviderPreparationError::ValueConstraint { .. }
                             | ProviderPreparationError::Admission { .. }
+                            | ProviderPreparationError::FinalInput(_)
                     ));
                     let rendered = diagnostic(&error);
                     for required in ["tags", key, "mock", "default_tags"] {
@@ -2212,13 +2766,11 @@ mod provider_config_tests {
         }
 
         #[tokio::test]
-        #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
         async fn issue_4304_3a_plan_default_tag_value_length_preserves_authored_override() {
             assert_tag_constraint("value_length", value_bounded_tags(), "Owner", Entry::Plan).await;
         }
 
         #[tokio::test]
-        #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
         async fn issue_4304_3a_dispatch_default_tag_value_length_preserves_authored_override() {
             assert_tag_constraint(
                 "value_length",
@@ -2230,7 +2782,6 @@ mod provider_config_tests {
         }
 
         #[tokio::test]
-        #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
         async fn issue_4304_3a_plan_default_tag_key_pattern() {
             assert_tag_constraint(
                 "key_pattern",
@@ -2242,7 +2793,6 @@ mod provider_config_tests {
         }
 
         #[tokio::test]
-        #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
         async fn issue_4304_3a_dispatch_default_tag_key_pattern() {
             assert_tag_constraint(
                 "key_pattern",
@@ -2254,20 +2804,121 @@ mod provider_config_tests {
         }
 
         #[tokio::test]
-        #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
         async fn issue_4304_3a_plan_merged_default_tags_entry_count() {
             assert_tag_constraint("entry_count", count_bounded_tags(), "Team", Entry::Plan).await;
         }
 
         #[tokio::test]
-        #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
         async fn issue_4304_3a_dispatch_merged_default_tags_entry_count() {
             assert_tag_constraint("entry_count", count_bounded_tags(), "Team", Entry::Dispatch)
                 .await;
         }
 
         #[tokio::test]
-        #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
+        async fn issue_4304_3a_named_provider_defaults_are_admitted_per_instance() {
+            let (file, schemas) = tag_fixture("instances", value_bounded_tags());
+            let bindings = ResolvedBindings::default();
+            let gate = ModuleConstraintGate::from_live_compositions(&[]);
+            crate::validation::deferred_types::with_session_for_test_async(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                async |session| {
+                    let context = ProviderPreparationContext::new(
+                        &bindings,
+                        &gate,
+                        &file.providers,
+                        &crate::provider::NoopNormalizer,
+                        &[],
+                        &schemas,
+                        session,
+                    );
+                    for entry in [Entry::Plan, Entry::Dispatch] {
+                        for (name, expected, instance) in [
+                            ("default_resource", "east", None),
+                            ("overridden", "mine", Some("west")),
+                        ] {
+                            let resource = file
+                                .resources
+                                .iter()
+                                .find(|resource| resource.id.identity_str() == Some(name))
+                                .unwrap()
+                                .clone();
+                            let ready = prepare_tags(resource, entry, &context).await.unwrap();
+                            assert_eq!(
+                                ready.as_resource().id.provider_instance.as_deref(),
+                                instance
+                            );
+                            let Some(Value::Concrete(ConcreteValue::Map(tags))) =
+                                ready.as_resource().get_attr("tags")
+                            else {
+                                panic!("expected tag map");
+                            };
+                            assert_eq!(tags.get("Owner"), Some(&text(expected)));
+                        }
+                        let resource = file
+                            .resources
+                            .iter()
+                            .find(|resource| resource.id.identity_str() == Some("applicable"))
+                            .unwrap()
+                            .clone();
+                        let error = prepare_tags(resource, entry, &context).await.unwrap_err();
+                        let rendered = diagnostic(&error);
+                        for part in ["west", "Owner", "default_tags"] {
+                            assert!(rendered.contains(part), "{rendered}");
+                        }
+                    }
+                },
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn issue_4304_3a_normalized_tag_keeps_its_origin_beside_valid_defaults() {
+            let (mut file, schemas) = tag_fixture("value_length", value_bounded_tags());
+            file.providers[0]
+                .default_tags
+                .insert("Owner".into(), text("core"));
+            let resource = file
+                .resources
+                .iter()
+                .find(|resource| resource.id.identity_str() == Some("applicable"))
+                .unwrap()
+                .clone()
+                .with_attribute(
+                    "tags",
+                    Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                        "Authored".into(),
+                        text("good"),
+                    )]))),
+                );
+            let normalizer = crate::provider::ConfiguredNormalizer::fixture(ReplacingNormalizer(
+                Some(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "Authored".into(),
+                    text("invalid-normalized-value"),
+                )])))),
+                "tags",
+            ));
+            let bindings = ResolvedBindings::default();
+            let gate = ModuleConstraintGate::from_live_compositions(&[]);
+            crate::validation::deferred_types::with_session_for_test_async(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                async |session| {
+                    let context = ProviderPreparationContext::new(
+                        &bindings, &gate, &file.providers, &normalizer, &[], &schemas, session,
+                    );
+                    for entry in [Entry::Plan, Entry::Dispatch] {
+                        let error = prepare_tags(resource.clone(), entry, &context)
+                            .await.expect_err("normalization must reject the authored key it changed");
+                        let ProviderPreparationError::FinalInput(
+                            crate::validation::admission::final_input::FinalInputError::Membership { origin, .. }
+                        ) = &error else { panic!("expected final membership error: {error:?}") };
+                        assert!(matches!(origin, crate::validation::admission::final_input::FinalInputOrigin::ProviderNormalization));
+                        assert!(diagnostic(&error).contains("Authored"));
+                    }
+                },
+            ).await;
+        }
+
+        #[tokio::test]
         async fn issue_4304_3a_admission_evidence_cannot_authorize_replacement_payload() {
             let mut schemas = SchemaRegistry::new();
             schemas.insert(
@@ -2312,18 +2963,10 @@ mod provider_config_tests {
                             text("invalid-replacement"),
                         )]))),
                     );
-                    // Intended type guarantee: evidence owns P, so detaching it
-                    // and pairing it with P' must be unexpressible. This uses
-                    // today's actual API to expose the hole; replace it with a
-                    // compile_fail test when the user chooses the owning API.
-                    let replacement =
-                        ResolvedResource::resolve_with_schemas(replacement, &schemas).unwrap();
-                    let diagnostic_attributes = replacement.as_resource().attributes.clone();
-                    let result = ProviderReady::settled(
-                        session.pending((replacement, *admitted.directives())),
-                        diagnostic_attributes,
-                        admitted.admission,
-                    );
+                    // FinalInput owns P and exposes no detachable evidence.
+                    // The compile_fail examples in final_input.rs forbid rebinding
+                    // or mutation; a cloned replacement must be admitted again.
+                    let result = prepare_provider_ready_resource(replacement, &context).await;
                     assert!(
                         result.is_err(),
                         "admission evidence for P authorized a different payload P': {result:?}"

@@ -214,7 +214,7 @@ impl ResolvedProviderConfigs {
     fn from_resolved(
         configs: Vec<RuntimeProviderConfig>,
     ) -> Result<Self, ProviderConfigInvariantError> {
-        validate_resolved_provider_configs(&configs)?;
+        Self::validate_known(&configs)?;
         let resolved = configs
             .iter()
             .cloned()
@@ -467,13 +467,43 @@ mod saved_provider_config_secret_tests {
     }
 
     #[test]
+    fn issue_4304_3a_cleanup_provider_knownness_has_one_error_shape() {
+        let mut config = provider("unused");
+        config.attributes.clear();
+        config.default_tags = IndexMap::from([(
+            "Owner".into(),
+            RuntimeValue::root_resource_ref("management", "owner", vec![]),
+        )]);
+        let live = ResolvedProviderConfigs::from_resolved(vec![config.clone()]).unwrap_err();
+        let editor = ResolvedProviderConfigs::validate_known(&[config]).unwrap_err();
+        assert_eq!(live.to_string(), editor.to_string());
+        assert!(
+            !live.to_string().to_ascii_lowercase().contains("wasm"),
+            "{live}"
+        );
+    }
+
+    #[test]
+    fn issue_4304_3a_cleanup_default_tag_resolution_includes_cause_once() {
+        let error = ProviderConfigInvariantError::DefaultTagResolution {
+            provider: "mock".into(),
+            key: "Owner".into(),
+            error: Box::new(crate::resolver::ResolutionError::Message(
+                "resolution cause".into(),
+            )),
+        };
+        assert_eq!(error.to_string().matches("resolution cause").count(), 1);
+    }
+
+    #[test]
     fn provider_config_gate_rejects_coalesce_with_known_collection_children() {
         for value in crate::resource::known_value_gate_tests::coalesces() {
             let mut config = provider("unused");
             config.attributes = IndexMap::from([("token".into(), value)]);
-            assert!(matches!(validate_resolved_provider_configs(&[config]),
-                Err(ProviderConfigInvariantError::UnresolvedAttribute { error, .. })
-                    if matches!(*error, crate::value::SerializationError::UnresolvedCoalesce { .. })));
+            assert!(matches!(
+                ResolvedProviderConfigs::validate_known(&[config]),
+                Err(ProviderConfigInvariantError::UnresolvedAttribute { .. })
+            ));
         }
     }
 
@@ -544,24 +574,63 @@ mod saved_provider_config_secret_tests {
     }
 }
 
-fn validate_resolved_provider_configs(
-    configs: &[RuntimeProviderConfig],
-) -> Result<(), ProviderConfigInvariantError> {
-    for config in configs {
-        for (attribute, value) in &config.attributes {
-            (value)
-                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-                .map(|proof| proof.into_classification())
-                .map_err(crate::resource::knowledge_serialization_error)
-                .and_then(crate::resource::require_known_value)
-                .map_err(|error| ProviderConfigInvariantError::UnresolvedAttribute {
-                    provider: config.name.clone(),
-                    attribute: attribute.clone(),
-                    error: Box::new(error),
-                })?;
+/// Provider construction has one knownness rule for live, saved and editor
+/// inputs. Diagnostics inspect cached Knowledge sites, never a second value walk.
+fn require_provider_config_known<P: crate::resource::PlaceholderKind, B: BindingAddress>(
+    value: &GenericValue<P, B>,
+) -> Result<(), ProviderConfigValueError> {
+    use crate::resource::knowledge::{KnowledgeContext, KnowledgeError, WaitOn};
+    let classification = value
+        .knowledge(&KnowledgeContext::validation())
+        .map_err(|error| ProviderConfigValueError::Knowledge(Box::new(error.into())))?
+        .into_classification();
+    classification.project_known(|classification| {
+        if let Some(error) = classification.failure() {
+            return ProviderConfigValueError::Knowledge(Box::new(error.into()));
         }
+        let sites = classification.sites().collect::<Vec<_>>();
+        let dependencies = sites.iter().filter_map(|site| {
+            site.inspect(|_, _, wait| -> Result<(), crate::resource::SecretDiagnosticError<String>> {
+                let dependency = match wait {
+                    WaitOn::Resource(path) => path.to_dot_string(),
+                    WaitOn::Binding(binding) => binding.to_string(),
+                    _ => return Ok(()),
+                };
+                Err(crate::resource::SecretDiagnosticError::Public(dependency))
+            }).err()
+        }).collect();
+        ProviderConfigValueError::Deferred {
+            dependencies: ProviderConfigDependencies(dependencies),
+            error: Box::new(KnowledgeError::UnresolvedAtBoundary { sites }.into()),
+        }
+    }).map(|_| ())
+}
+
+#[derive(Debug)]
+pub struct ProviderConfigDependencies(Vec<crate::resource::SecretDiagnosticError<String>>);
+impl std::fmt::Display for ProviderConfigDependencies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for dependency in &self.0 {
+            write!(
+                f,
+                "; unresolved reference {}",
+                crate::provider_text::DiagnosticText::new(dependency.to_string())
+            )?;
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+#[derive(Debug, Error)]
+pub enum ProviderConfigValueError {
+    #[error(transparent)]
+    Knowledge(Box<crate::resource::knowledge::KnowledgeDiagnostic>),
+    #[error("provider config is unresolved{dependencies}")] // error-chain: caller-renders-sources
+    Deferred {
+        dependencies: ProviderConfigDependencies,
+        #[source]
+        error: Box<crate::resource::knowledge::KnowledgeDiagnostic>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -569,12 +638,101 @@ pub enum ProviderConfigInvariantError {
     #[error(transparent)]
     UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
 
+    // Composite leaf: retain the typed knownness error and render it once.
     #[error("provider {provider}: {attribute}: {error}")]
     UnresolvedAttribute {
         provider: String,
         attribute: String,
-        error: Box<crate::value::SerializationError>,
+        error: Box<ProviderConfigValueError>,
     },
+
+    // Composite leaf, like UnresolvedAttribute: keep the typed cause and render it once.
+    #[error("provider {provider}: default_tags.{key}: {error}")]
+    DefaultTagResolution {
+        provider: String,
+        key: String,
+        error: Box<crate::resolver::ResolutionError>,
+    },
+}
+
+impl ResolvedProviderConfigs {
+    /// Canonical diagnostic slot for a provider default.
+    pub fn default_tag_attribute(key: &str) -> String {
+        format!("default_tags.{key}")
+    }
+
+    /// Shared upstream-only exception; mixed local/apply references are not exempt.
+    pub fn references_only<P: crate::resource::ValueKind, B: BindingAddress>(
+        value: &GenericValue<P, B>,
+        bindings: &HashSet<String>,
+    ) -> bool {
+        let mut references = HashSet::new();
+        value.visit_resource_refs(&mut |path, _| {
+            path.binding_key().record_graph_key(&mut references)
+        });
+        value.visit_binding_refs(&mut |binding| binding.record_graph_key(&mut references));
+        !references.is_empty()
+            && references
+                .iter()
+                .all(|binding| bindings.contains(binding.as_str()))
+    }
+
+    /// Frontends cannot fetch upstream state. Resolve local defaults only and
+    /// apply the same construction-time knownness rule used by the constructor.
+    pub fn validate_default_tag_knownness<
+        P: crate::resource::PlaceholderKind,
+        B: BindingAddress,
+    >(
+        providers: &[ProviderConfig<P, B>],
+        upstream: &HashSet<String>,
+        bindings: &crate::binding_index::ResolvedBindings<P, B>,
+        session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Result<(), ProviderConfigInvariantError> {
+        for provider in providers {
+            for (key, value) in &provider.default_tags {
+                if Self::references_only(value, upstream) {
+                    continue;
+                }
+                let resolved = crate::resolver::resolve_ref_value(value, bindings, session)
+                    .map_err(|error| ProviderConfigInvariantError::DefaultTagResolution {
+                        provider: provider.name.clone(),
+                        key: key.clone(),
+                        error: Box::new(error),
+                    })?;
+                Self::check_value(provider, &Self::default_tag_attribute(key), &resolved)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_value<P: crate::resource::PlaceholderKind, B: BindingAddress>(
+        provider: &ProviderConfig<P, B>,
+        attribute: &str,
+        value: &GenericValue<P, B>,
+    ) -> Result<(), ProviderConfigInvariantError> {
+        require_provider_config_known(value).map_err(|error| {
+            ProviderConfigInvariantError::UnresolvedAttribute {
+                provider: provider.name.clone(),
+                attribute: attribute.into(),
+                error: Box::new(error),
+            }
+        })
+    }
+
+    /// Check construction-time knownness without constructing provider instances.
+    pub fn validate_known<P: crate::resource::PlaceholderKind, B: BindingAddress>(
+        configs: &[ProviderConfig<P, B>],
+    ) -> Result<(), ProviderConfigInvariantError> {
+        for provider in configs {
+            for (attribute, value) in &provider.attributes {
+                Self::check_value(provider, attribute, value)?;
+            }
+            for (key, value) in &provider.default_tags {
+                Self::check_value(provider, &Self::default_tag_attribute(key), value)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Failure while resolving a parsed provider configuration.
@@ -2379,88 +2537,109 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
     remote_bindings: &HashMap<String, HashMap<String, RuntimeValue>>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<ResolvedProviderConfigs, ProviderConfigResolutionError> {
-    let mut bindings =
-        crate::binding_index::ResolvedBindings::<NoPlaceholder, AbsoluteBindingAddress>::default();
-    let mut parser_bindings = HashMap::new();
-    for rref in parsed.iter_top_level_resources() {
-        if let Some(binding_name) = rref.binding() {
-            let attributes = match rref {
-                super::TopLevelResourceRef::Resource(resource) => resource.resolved_attributes(),
-                super::TopLevelResourceRef::DataSource(data_source) => {
-                    crate::resource::attrs_to_hashmap(&data_source.attributes)
-                }
-                super::TopLevelResourceRef::LiveComposition(composition) => composition
-                    .signature
-                    .attributes
-                    .iter()
-                    .filter_map(|(name, attribute)| {
-                        attribute.value().map(|value| (name.clone(), value))
-                    })
-                    .collect(),
-            };
-            parser_bindings.insert(binding_name.to_string(), attributes.clone());
+    ResolvedProviderConfigs::resolve_with_remote(parsed, remote_bindings, config, |_, _| true)
+}
+
+impl ResolvedProviderConfigs {
+    /// Resolve provider attributes while the command selects which default tags
+    /// participate (for example, its established missing-upstream exception).
+    pub fn resolve_with_remote<E, D>(
+        parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>,
+        remote_bindings: &HashMap<String, HashMap<String, RuntimeValue>>,
+        config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+        retain_default_tag: impl Fn(&str, &RuntimeValue) -> bool,
+    ) -> Result<Self, ProviderConfigResolutionError> {
+        let mut bindings = crate::binding_index::ResolvedBindings::<
+            NoPlaceholder,
+            AbsoluteBindingAddress,
+        >::default();
+        let mut parser_bindings = HashMap::new();
+        for rref in parsed.iter_top_level_resources() {
+            if let Some(binding_name) = rref.binding() {
+                let attributes = match rref {
+                    super::TopLevelResourceRef::Resource(resource) => {
+                        resource.resolved_attributes()
+                    }
+                    super::TopLevelResourceRef::DataSource(data_source) => {
+                        crate::resource::attrs_to_hashmap(&data_source.attributes)
+                    }
+                    super::TopLevelResourceRef::LiveComposition(composition) => composition
+                        .signature
+                        .attributes
+                        .iter()
+                        .filter_map(|(name, attribute)| {
+                            attribute.value().map(|value| (name.clone(), value))
+                        })
+                        .collect(),
+                };
+                parser_bindings.insert(binding_name.to_string(), attributes.clone());
+                bindings.set_with_completeness(
+                    binding_name,
+                    attributes,
+                    crate::binding_index::BindingValueSource::Local,
+                    crate::binding_index::BindingCompleteness::Incomplete,
+                );
+            }
+        }
+        for (binding, attrs) in remote_bindings {
+            parser_bindings.insert(binding.clone(), attrs.clone());
             bindings.set_with_completeness(
-                binding_name,
-                attributes,
-                crate::binding_index::BindingValueSource::Local,
-                crate::binding_index::BindingCompleteness::Incomplete,
+                binding,
+                attrs.clone(),
+                crate::binding_index::BindingValueSource::Upstream,
+                crate::binding_index::BindingCompleteness::Complete,
             );
         }
-    }
-    for (binding, attrs) in remote_bindings {
-        parser_bindings.insert(binding.clone(), attrs.clone());
-        bindings.set_with_completeness(
-            binding,
-            attrs.clone(),
-            crate::binding_index::BindingValueSource::Upstream,
-            crate::binding_index::BindingCompleteness::Complete,
-        );
-    }
 
-    let mut providers = Vec::with_capacity(parsed.providers.len());
-    for provider in &parsed.providers {
-        let mut provider = provider.clone();
-        for section in [&mut provider.attributes, &mut provider.default_tags] {
-            let mut resolved = IndexMap::new();
-            for (key, expr) in section.iter() {
-                // Evaluate authored functions through the typed parse-error
-                // path before the runtime resolver's string diagnostic seam.
-                // Only the placeholder stage changes; addresses stay absolute.
-                let parser_expr = expr.clone().into_placeholder_type::<ParserPlaceholder>();
-                let parser_resolved = resolve_value_with_binding_lookup(
-                    &parser_expr,
-                    &|binding: &AbsoluteBindingAddress, attribute: &str| {
-                        parser_bindings
-                            .get(binding.as_str())
-                            .and_then(|attributes| attributes.get(attribute))
-                            .cloned()
-                            .map(RuntimeValue::into_placeholder_type)
-                    },
-                    config.catalog(),
-                    Some(config),
-                    strict_resolution_context(),
-                    DiagnosticScope::Public,
-                )?;
-                let expanded = parser_resolved.into_expanded().map_err(|error| {
-                    ParseError::InvalidExpression {
-                        line: 0,
-                        message: error.to_string(),
-                    }
-                })?;
-                let value =
-                    crate::resolver::resolve_ref_value_with_config(&expanded, &bindings, config)
-                        .map_err(|message| ParseError::InvalidExpression {
+        let mut providers = Vec::with_capacity(parsed.providers.len());
+        for provider in &parsed.providers {
+            let mut provider = provider.clone();
+            provider
+                .default_tags
+                .retain(|key, value| retain_default_tag(key, value));
+            for section in [&mut provider.attributes, &mut provider.default_tags] {
+                let mut resolved = IndexMap::new();
+                for (key, expr) in section.iter() {
+                    // Evaluate authored functions through the typed parse-error
+                    // path before the runtime resolver's string diagnostic seam.
+                    // Only the placeholder stage changes; addresses stay absolute.
+                    let parser_expr = expr.clone().into_placeholder_type::<ParserPlaceholder>();
+                    let parser_resolved = resolve_value_with_binding_lookup(
+                        &parser_expr,
+                        &|binding: &AbsoluteBindingAddress, attribute: &str| {
+                            parser_bindings
+                                .get(binding.as_str())
+                                .and_then(|attributes| attributes.get(attribute))
+                                .cloned()
+                                .map(RuntimeValue::into_placeholder_type)
+                        },
+                        config.catalog(),
+                        Some(config),
+                        strict_resolution_context(),
+                        DiagnosticScope::Public,
+                    )?;
+                    let expanded = parser_resolved.into_expanded().map_err(|error| {
+                        ParseError::InvalidExpression {
                             line: 0,
-                            message: message.to_string(),
-                        })?;
-                resolved.insert(key.clone(), value);
+                            message: error.to_string(),
+                        }
+                    })?;
+                    let value = crate::resolver::resolve_ref_value_with_config(
+                        &expanded, &bindings, config,
+                    )
+                    .map_err(|message| ParseError::InvalidExpression {
+                        line: 0,
+                        message: message.to_string(),
+                    })?;
+                    resolved.insert(key.clone(), value);
+                }
+                *section = resolved;
             }
-            *section = resolved;
-        }
 
-        providers.push(provider);
+            providers.push(provider);
+        }
+        ResolvedProviderConfigs::from_resolved(providers).map_err(Into::into)
     }
-    ResolvedProviderConfigs::from_resolved(providers).map_err(Into::into)
 }
 
 /// Drain `ProviderConfig.unresolved_attributes` and promote resolved

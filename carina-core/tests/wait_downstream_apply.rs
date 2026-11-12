@@ -175,6 +175,14 @@ fn fixture_schemas(resources: &[Resource]) -> SchemaRegistry {
             .insert_provider_witness(provider, &witness)
             .expect("fixture provider witness is consistent");
     }
+    for resource in resources {
+        carina_core::test_utils::complete_fixture_schema(
+            &mut schemas,
+            &resource.id,
+            carina_core::schema::SchemaKind::Resource,
+            &resource.attributes,
+        );
+    }
     schemas
 }
 

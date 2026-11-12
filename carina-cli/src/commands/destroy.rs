@@ -2836,12 +2836,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn destroy_allows_default_tags_referencing_local_computed_attributes() {
+    async fn destroy_rejects_default_tags_referencing_local_computed_attributes() {
         let color_mode = crate::output_style::ColorMode::Plain;
         let (_temp, base_dir, parsed) = provider_default_tags_local_resource_fixture();
         let backend = crate::commands::local_backend_for_test(base_dir.join("state.json"));
 
-        run_destroy_locked(
+        let error = run_destroy_locked(
             &crate::test_support::TestCommandRuntime::new(),
             color_mode,
             parsed,
@@ -2857,16 +2857,17 @@ mod tests {
             ShutdownToken::running(),
         )
         .await
-        .expect("destroy must defer provider default tags until resource normalization");
+        .expect_err("provider configuration must reject unresolved defaults before destroy");
+        assert!(error.to_string().contains("default_tags"), "{error}");
     }
 
     #[tokio::test]
-    async fn destroy_ignores_missing_upstream_referenced_only_by_default_tags() {
+    async fn destroy_rejects_missing_required_default_tag_upstream() {
         let color_mode = crate::output_style::ColorMode::Plain;
         let (_temp, base_dir, parsed) = provider_default_tags_missing_upstream_fixture();
         let backend = crate::commands::local_backend_for_test(base_dir.join("state.json"));
 
-        run_destroy_locked(
+        let error = run_destroy_locked(
             &crate::test_support::TestCommandRuntime::new(),
             color_mode,
             parsed,
@@ -2882,7 +2883,8 @@ mod tests {
             ShutdownToken::running(),
         )
         .await
-        .expect("destroy must not load upstream state used only by default tags");
+        .expect_err("provider configuration must reject unresolved defaults before destroy");
+        assert!(error.to_string().contains("default_tags"), "{error}");
     }
 
     #[test]

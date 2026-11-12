@@ -3,6 +3,8 @@
 //! A Provider defines operations for a specific infrastructure (AWS, GCP, etc.).
 //! It is responsible for converting Effects into actual API calls.
 
+pub(crate) const TAGS_ATTRIBUTE: &str = "tags";
+
 #[cfg(any(test, feature = "test-utils"))]
 use crate::schema::PatternResourceSchema;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -1211,7 +1213,7 @@ pub struct UpdateRequest {
     from: SnapshotState,
     /// Structured description of the user's intended change and any write-only
     /// values reasserted alongside it.
-    patch: WireReady<UpdatePatch>,
+    patch: crate::validation::admission::final_input::FinalInput<WireReady<UpdatePatch>>,
     /// Effective directives resolved from the managed resource schema.
     directives: ProviderDirectives,
     input: Arc<ProtectedUpdateInput>,
@@ -1224,13 +1226,13 @@ impl UpdateRequest {
         from: SnapshotState,
         changed_attributes: &[String],
         resource: &ProviderReadyResource,
-        schema: &ResourceSchema,
+        context: &crate::executor::ProviderPreparationContext<'_>,
     ) -> Result<Self, crate::executor::ProviderPreparationError> {
-        let patch = build_update_patch(changed_attributes, resource, &from, schema)?;
-        let patch = WireReady::try_new(patch, ProviderWireTarget::Resource(resource.id.clone()))?;
+        let patch = context.prepare_update_patch(changed_attributes, resource, &from)?;
         let protected = resource.protected_desired_tree();
         let annotated_patch = UpdatePatch {
             ops: patch
+                .payload()
                 .as_inner()
                 .ops
                 .iter()
@@ -1280,7 +1282,7 @@ impl UpdateRequest {
 
     /// Patch derived from the checked desired resource.
     pub fn patch(&self) -> &UpdatePatch {
-        self.patch.as_inner()
+        self.patch.payload().as_inner()
     }
 
     pub(crate) fn diagnostic_values(&self) -> impl Iterator<Item = &Value> {
@@ -1293,7 +1295,7 @@ impl UpdateRequest {
 
     /// The checked projection consumed by provider transport adapters.
     pub fn wire_patch(&self) -> &[WirePatchOp] {
-        self.patch.wire()
+        self.patch.payload().wire()
     }
 
     /// Effective directives resolved while the desired resource crossed the
@@ -6770,8 +6772,8 @@ impl From<&ResourceId> for ProviderInstanceKey {
     }
 }
 
-/// Check a default-tag value before host-owned merging. Unresolved values are
-/// skippable; redacted secrets are fatal.
+/// Check a default-tag value before host-owned merging. Unresolved values and
+/// unavailable redacted secrets are errors.
 pub(crate) fn assert_default_tag_value_encodable<P: crate::resource::PlaceholderKind>(
     value: &crate::resource::knowledge::Classification<'_, P>,
 ) -> Result<(), SerializationError> {
@@ -6853,15 +6855,18 @@ impl std::fmt::Display for DefaultTagEncodingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "key '{}' of provider '{}': {}",
+            "key '{}' of provider '{}': default_tags",
             DiagnosticText::new(&self.key),
-            DiagnosticText::new(&self.provider_name),
-            self.source
+            DiagnosticText::new(&self.provider_name)
         )
     }
 }
 
-impl std::error::Error for DefaultTagEncodingError {}
+impl std::error::Error for DefaultTagEncodingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 /// Merge one provider instance's default tags into resources routed to it.
 ///
@@ -6923,7 +6928,17 @@ pub(crate) fn merge_default_tags_with_placeholders<S, D, P: crate::resource::Pla
                 | SerializationError::SecretNotAllowed { .. }
                 | SerializationError::SavedPlanFieldSecretNotAllowed { .. }),
             ) => {
-                log::error!("Skipping default_tag '{key}' with unresolvable value: {error}");
+                return Err(HostError::invalid_input_caused_by(
+                    "provider default_tags must be known before planning",
+                    crate::provider_text::HostDiagnostic::capture_host_or_provider(
+                        DefaultTagEncodingError {
+                            key: key.clone(),
+                            provider_name: config.name.clone(),
+                            source: error,
+                        },
+                    ),
+                )
+                .for_provider(config.name.clone()));
             }
             Err(
                 source @ (SerializationError::NullProviderSecret
@@ -6961,7 +6976,7 @@ pub(crate) fn merge_default_tags_with_placeholders<S, D, P: crate::resource::Pla
         // presence alone is therefore not enough to opt a resource in.
         let has_tags = registry.get_for(resource).is_some_and(|schema| {
             let schema = schema.as_schema();
-            let Some(tags) = schema.attributes.get("tags") else {
+            let Some(tags) = schema.attributes.get(TAGS_ATTRIBUTE) else {
                 return false;
             };
             let Shape::Map {
@@ -6981,7 +6996,7 @@ pub(crate) fn merge_default_tags_with_placeholders<S, D, P: crate::resource::Pla
         }
 
         let default_tag_keys = &mut resource.default_tag_keys;
-        match resource.attributes.get_mut("tags") {
+        match resource.attributes.get_mut(TAGS_ATTRIBUTE) {
             Some(Value::Concrete(ConcreteValue::Map(existing_tags))) => {
                 for (key, value) in &default_tags {
                     if !existing_tags.contains_key(key) {
@@ -6995,7 +7010,7 @@ pub(crate) fn merge_default_tags_with_placeholders<S, D, P: crate::resource::Pla
                     default_tag_keys.insert(key.clone());
                 }
                 resource.attributes.insert(
-                    "tags".to_string(),
+                    TAGS_ATTRIBUTE.to_string(),
                     Value::Concrete(ConcreteValue::Map(default_tags.clone())),
                 );
             }
@@ -12395,7 +12410,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_default_tags_skips_unresolved_values() {
+    fn merge_default_tags_rejects_unresolved_values() {
         let config = ProviderConfig {
             name: "aws".to_string(),
             attributes: IndexMap::new(),
@@ -12441,35 +12456,19 @@ mod tests {
             .expect("schema fixture must be valid"),
         );
 
-        merge_default_tags(&config, &mut resources, &registry).unwrap();
-
+        let error = merge_default_tags(&config, &mut resources, &registry)
+            .expect_err("unresolved defaults must not be silently omitted");
+        assert!(error.detail().cause().is_some());
         assert_eq!(
             resources[0].get_attr("tags"),
-            Some(&Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-                "ManagedBy".to_string(),
-                Value::Concrete(ConcreteValue::String("carina".into())),
-            )]))))
+            None,
+            "failure must be atomic"
         );
-        assert!(resources[0].default_tag_keys.contains("ManagedBy"));
-        assert!(!resources[0].default_tag_keys.contains("Owner"));
-        assert!(!resources[0].default_tag_keys.contains("Count"));
-        assert!(
-            resources[0]
-                .attributes
-                .keys()
-                .all(|key| !key.starts_with('_')),
-            "host-owned default-tag provenance must not enter provider attributes"
-        );
+        assert!(resources[0].default_tag_keys.is_empty());
     }
 
-    #[tokio::test]
-    #[ignore = "carina#4304 3a: pending user decision on final-input admission"]
-    async fn issue_4304_3a_dispatch_rejects_unresolved_default_tag_instead_of_dropping_it() {
-        use crate::executor::provider_ready::{
-            ModuleConstraintGate, ProviderPreparationContext, ProviderPreparationError,
-            prepare_create_request,
-        };
-
+    #[test]
+    fn issue_4304_3a_validate_rejects_unresolved_default_tag_before_plan() {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
@@ -12521,41 +12520,12 @@ mod tests {
             file.providers[0].default_tags.get("Owner"),
             Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
         ));
-        let resource = file
-            .resources
-            .iter()
-            .find(|resource| resource.id.identity_str() == Some("target"))
-            .unwrap()
-            .clone();
-        let bindings = crate::binding_index::ResolvedBindings::default();
-        let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
-        crate::validation::deferred_types::with_session_for_test_async(
-            &crate::parser::LoadedProviderContext::empty_for_test(),
-            async |session| {
-                let context = ProviderPreparationContext::new(
-                    &bindings, &module_gate, &file.providers, &NoopNormalizer,
-                    &[], &schemas, session,
-                );
-                let error = prepare_create_request(resource, &context).await.expect_err(
-                    "an unresolved applicable default tag must reject dispatch, never mint a request with the tag silently omitted",
-                );
-                assert!(matches!(error,
-                    ProviderPreparationError::Serialization(_)
-                        | ProviderPreparationError::Admission { .. }
-                        | ProviderPreparationError::ValueConstraint { .. }
-                        | ProviderPreparationError::Provider(_)
-                ), "expected a typed unresolved-default input error: {error:?}");
-                let mut rendered = error.to_string();
-                let mut cause = std::error::Error::source(&error);
-                while let Some(error) = cause {
-                    rendered.push_str(&format!("\n{error}"));
-                    cause = error.source();
-                }
-                for required in ["Owner", "mock", "default_tags"] {
-                    assert!(rendered.contains(required), "missing {required}: {rendered}");
-                }
-            },
-        ).await;
+        let error = crate::parser::ResolvedProviderConfigs::validate_known(&file.providers)
+            .expect_err("a default tag depending on apply must fail provider-config validation");
+        assert!(matches!(&error,
+            crate::parser::ProviderConfigInvariantError::UnresolvedAttribute { provider, attribute, .. }
+                if provider == "mock" && attribute == "default_tags.Owner"
+        ));
     }
 
     #[test]
@@ -12625,6 +12595,17 @@ mod tests {
             "Team".to_string(),
             Value::Concrete(ConcreteValue::String("platform".into())),
         );
+        merge_default_tags(&config, &mut resources, &registry).expect_err(
+            "unresolved defaults cannot cross provider-config knownness, even on remerge",
+        );
+        assert_eq!(
+            resources[0], before_remerge,
+            "failed remerge must be atomic"
+        );
+        config.default_tags.insert(
+            "ManagedBy".into(),
+            Value::Concrete(ConcreteValue::String("new-default".into())),
+        );
         merge_default_tags(&config, &mut resources, &registry).unwrap();
 
         let Some(Value::Concrete(ConcreteValue::Map(tags))) = resources[0].get_attr("tags") else {
@@ -12635,7 +12616,7 @@ mod tests {
             Some(&Value::Concrete(ConcreteValue::String(
                 "rehydrated-carina".into()
             ))),
-            "a skipped default must not overwrite its existing tag"
+            "a remerged default must not overwrite its existing tag"
         );
         assert_eq!(
             tags.get("Name"),
@@ -12996,9 +12977,10 @@ mod tests {
     fn resolved_for_test(resource: Resource) -> ProviderReadyResource {
         let bindings = crate::binding_index::ResolvedBindings::default();
         let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = crate::test_utils::preparation_schemas(
+        let schemas = crate::test_utils::preparation_schemas_with_attributes(
             &resource.id,
             crate::schema::SchemaKind::Resource,
+            &resource.attributes,
         );
         crate::validation::deferred_types::with_session_for_test(
             &crate::parser::LoadedProviderContext::empty_for_test(),
@@ -13023,9 +13005,10 @@ mod tests {
     fn ready_data_source_for_test(resource: DataSource) -> ProviderReadyDataSource {
         let bindings = crate::binding_index::ResolvedBindings::default();
         let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = crate::test_utils::preparation_schemas(
+        let schemas = crate::test_utils::preparation_schemas_with_attributes(
             &resource.id,
             crate::schema::SchemaKind::DataSource,
+            &resource.attributes,
         );
         crate::validation::deferred_types::with_session_for_test(
             &crate::parser::LoadedProviderContext::empty_for_test(),
@@ -15569,10 +15552,32 @@ mod tests {
 
         let id = ResourceId::with_provider_identity("mock", "test", "example", None);
         let from = State::existing(id.clone(), HashMap::new());
-        let ready = resolved_for_test(Resource::with_provider("mock", "test", "example", None));
-        let schema = crate::schema::CompiledResourceSchema::new("test");
-        let request = UpdateRequest::checked(from, &[], &ready, &schema)
-            .expect("fixture has no ignored write-only paths");
+        let resource = Resource::with_provider("mock", "test", "example", None);
+        let bindings = crate::binding_index::ResolvedBindings::default();
+        let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
+        let schemas = crate::test_utils::preparation_schemas_with_attributes(
+            &resource.id,
+            crate::schema::SchemaKind::Resource,
+            &resource.attributes,
+        );
+        let request = crate::validation::deferred_types::with_session_for_test_async(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            async |session| {
+                let context = crate::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &NoopNormalizer,
+                    &[],
+                    &schemas,
+                    session,
+                );
+                crate::executor::prepare_update_request(resource, from, &[], &context)
+                    .await
+                    .expect("fixture has no ignored write-only paths")
+            },
+        )
+        .await;
         let identifier =
             AppliedIdentifier::new("mock-id-123").expect("fixture identifier is non-empty");
         let prepared = crate::replacement::update_permit_for_test(identifier.clone(), request);

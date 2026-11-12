@@ -2,7 +2,10 @@
 
 use super::*;
 
-struct FinalInputNormalizer(Value);
+struct FinalInputNormalizer {
+    value: Value,
+    operations: Arc<Mutex<Vec<&'static str>>>,
+}
 
 impl crate::provider::ProviderNormalizer for FinalInputNormalizer {
     fn normalize_desired<'a>(
@@ -10,8 +13,9 @@ impl crate::provider::ProviderNormalizer for FinalInputNormalizer {
         resources: &'a mut [crate::resource::ProviderResource],
     ) -> BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
+            self.operations.lock().unwrap().push("normalize");
             for resource in resources {
-                resource.set_attr("value", self.0.clone());
+                resource.set_attr("value", self.value.clone());
             }
             Ok(())
         })
@@ -33,7 +37,7 @@ impl crate::provider::ProviderNormalizer for FinalInputNormalizer {
     }
 }
 
-async fn assert_dispatch_rejects_normalized_value(nested: bool) {
+async fn assert_dispatch_rejects_normalized_value(nested: bool, replacement: bool) {
     let callbacks = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&callbacks);
     let list = PatternAttributeType::list(PatternAttributeType::string_member(
@@ -75,6 +79,7 @@ async fn assert_dispatch_rejects_normalized_value(nested: bool) {
     schemas.insert(
         "",
         PatternResourceSchema::new("test")
+            .with_coexisting_replacement()
             .attribute(PatternAttributeSchema::optional("value", declaration).build())
             .validate()
             .unwrap(),
@@ -82,11 +87,35 @@ async fn assert_dispatch_rejects_normalized_value(nested: bool) {
     let provider = MockProvider::new();
     let resource = make_resource("example", &[]);
     provider.push_create(Ok(ok_state(&resource.id)));
-    let plan = create_plan_from_fixture_resources(vec![resource]);
+    let mut plan = create_plan_from_fixture_resources(vec![resource.clone()]);
+    let mut current = HashMap::new();
+    if replacement {
+        plan.add(Effect::Delete {
+            id: ResolvedResourceId::new(resource.id.clone()),
+            identifier: fixture_applied_identifier("old-instance"),
+            generation: EffectGeneration::Current,
+            directives: Directives::default(),
+            binding: resource.binding.clone(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+        });
+        provider.push_delete(Ok(()));
+        current.insert(
+            resource.id.clone(),
+            Current::from_snapshot(
+                State::existing(resource.id.clone(), HashMap::new())
+                    .with_identifier("old-instance"),
+            ),
+        );
+    }
     let checked = checked_fixture_plan(&plan);
     let observer = MockObserver::new();
-    let normalizer =
-        crate::provider::ConfiguredNormalizer::fixture(FinalInputNormalizer(normalized));
+    let operations = Arc::new(Mutex::new(Vec::new()));
+    let normalizer = crate::provider::ConfiguredNormalizer::fixture(FinalInputNormalizer {
+        value: normalized,
+        operations: Arc::clone(&operations),
+    });
     let result = completed_result(
         execute_plan(
             &provider,
@@ -98,7 +127,7 @@ async fn assert_dispatch_rejects_normalized_value(nested: bool) {
                 provider_check_inputs: ProviderCheckInputs::Authored,
                 compositions: &[],
                 bindings: ResolvedBindings::default(),
-                managed_current: HashMap::new(),
+                managed_current: current,
                 data_source_values: ExecutableDataSourceValues::empty(),
                 normalizer: &normalizer,
                 provider_configs: &[],
@@ -113,6 +142,24 @@ async fn assert_dispatch_rejects_normalized_value(nested: bool) {
         )
         .await,
     );
+    assert!(
+        !operations.lock().unwrap().is_empty(),
+        "normalization must run before final admission"
+    );
+    if replacement {
+        assert!(result.successfully_deleted.is_empty());
+        assert_eq!(
+            result.replacement_writeback.len(),
+            1,
+            "retain the checked pair for recovery"
+        );
+        assert_eq!(
+            result.replacement_writeback[0].old_instances()[0]
+                .identifier
+                .as_str(),
+            "old-instance"
+        );
+    }
     assert_eq!(
         callbacks.load(Ordering::SeqCst),
         0,
@@ -134,15 +181,18 @@ async fn assert_dispatch_rejects_normalized_value(nested: bool) {
 }
 
 #[tokio::test]
-#[ignore = "carina#4304 3a: pending user decision on final-input admission"]
 async fn issue_4304_3a_dispatch_rejects_provider_normalized_string_list() {
-    assert_dispatch_rejects_normalized_value(false).await;
+    assert_dispatch_rejects_normalized_value(false, false).await;
 }
 
 #[tokio::test]
-#[ignore = "carina#4304 3a: pending user decision on final-input admission"]
 async fn issue_4304_3a_dispatch_rejects_provider_normalized_nested_struct_field() {
-    assert_dispatch_rejects_normalized_value(true).await;
+    assert_dispatch_rejects_normalized_value(true, false).await;
+}
+
+#[tokio::test]
+async fn issue_4304_3a_final_admission_precedes_replacement_delete_release() {
+    assert_dispatch_rejects_normalized_value(false, true).await;
 }
 
 fn text(value: &str) -> Value {
