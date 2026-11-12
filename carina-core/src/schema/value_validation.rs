@@ -10,7 +10,9 @@ use crate::resource::knowledge::{KnownView, ShapeView};
 use crate::validation::admission::assignment_seam_error as seam_error;
 
 mod references;
-use references::{AssignmentErrors, CheckedError, OrdinaryCheck, ReferenceMemo, ReferencePolicy};
+use references::{
+    OrdinaryCheck, ReferenceMemo, ReferencePolicy, SupplementalData, SupplementalFindings,
+};
 
 #[cfg(test)]
 mod cursor_allocations {
@@ -667,11 +669,11 @@ impl ResourceValueValidation {
 #[derive(Clone)]
 enum LocalOutcome<F> {
     Accepted(F),
-    Rejected { primary: (FieldPath, CheckedError) },
+    Rejected { primary: (FieldPath, TypeError) },
 }
 
 impl<F> LocalOutcome<F> {
-    fn error(&self) -> Option<&CheckedError> {
+    fn error(&self) -> Option<&TypeError> {
         match self {
             Self::Accepted(_) => None,
             Self::Rejected {
@@ -704,20 +706,19 @@ impl<F> LocalOutcome<F> {
 
 #[derive(Clone, Default)]
 struct CheckedFindings {
-    local: Vec<(FieldPath, CheckedError)>,
-    pub(super) located: Vec<(FieldPath, CheckedError)>,
+    local: Vec<(FieldPath, TypeError)>,
+    pub(super) located: Vec<(FieldPath, TypeError)>,
     assignment: AssignmentFindings,
     // Kept on the probe, separately from main's ordinary assignment work.
-    authored: AssignmentFindings,
+    authored: SupplementalFindings,
     // Other undecided branches have independent primary local errors. Ordinary
     // containers still retain their established first-error CLI precedence.
-    additional_local_errors: Vec<CheckedError>,
+    additional_local_errors: Vec<TypeError>,
     provider: Vec<(FieldPath, TypeError)>,
 }
 
 impl CheckedFindings {
-    fn push_local(&mut self, path: FieldPath, error: impl Into<CheckedError>) {
-        let error = error.into();
+    fn push_local(&mut self, path: FieldPath, error: TypeError) {
         self.located.push((path.clone(), error.clone()));
         self.local.push((path, error));
     }
@@ -727,10 +728,14 @@ impl InsideSecret for CheckedFindings {
     fn inside_secret(self) -> Self {
         Self {
             local: self.local.inside_secret(),
-            located: self.located.inside_secret(),
-            additional_local_errors: self.additional_local_errors.inside_secret(),
+            located: self
+                .located
+                .into_iter()
+                .map(|(path, error)| (path.inside_secret(), error.inside_secret()))
+                .collect(),
             assignment: self.assignment.inside_secret(),
             authored: self.authored.inside_secret(),
+            additional_local_errors: self.additional_local_errors.inside_secret(),
             provider: self.provider.inside_secret(),
         }
     }
@@ -767,7 +772,7 @@ struct UnionFailure<'a> {
 struct UnionProviderFailure<'a> {
     local_fit: UnionFit<'a>,
     provider: Vec<(FieldPath, TypeError)>,
-    authored: AssignmentFindings,
+    authored: SupplementalFindings,
 }
 
 impl<'a> CheckedValue<'a> {
@@ -820,8 +825,7 @@ impl<'a> CheckedValue<'a> {
         }
     }
 
-    fn rejected(path: &FieldPath, error: impl Into<CheckedError>) -> Self {
-        let error = error.into();
+    fn rejected(path: &FieldPath, error: TypeError) -> Self {
         let primary = (path.clone(), error);
         Self {
             local: LocalOutcome::Rejected {
@@ -840,20 +844,20 @@ impl<'a> CheckedValue<'a> {
         matches!(self.local, LocalOutcome::Accepted(_)) && self.findings.provider.is_empty()
     }
 
-    fn reject(&mut self, path: &FieldPath, error: impl Into<CheckedError>) {
+    fn reject(&mut self, path: &FieldPath, error: TypeError) {
         if matches!(self.local, LocalOutcome::Accepted(_)) {
             self.local = LocalOutcome::Rejected {
-                primary: (path.clone(), error.into()),
+                primary: (path.clone(), error),
             };
         }
     }
 
     fn extend_assignment(&mut self, path: &FieldPath, findings: AssignmentFindings) {
-        for (location, error) in findings.errors.checked() {
+        for (location, error) in &findings.errors {
             self.reject(path, error.clone());
             self.findings.located.push((
                 FieldPath::from_canonical_segments(location.segments().iter().cloned()),
-                error,
+                error.clone(),
             ));
         }
         self.findings.assignment.extend(findings);
@@ -866,13 +870,13 @@ impl<'a> CheckedValue<'a> {
             primary: (_, error),
         } = &mut self.local
         {
-            *error = error.clone().wrap(&wrap);
+            *error = wrap(error.clone());
         }
         self.findings.additional_local_errors = self
             .findings
             .additional_local_errors
             .into_iter()
-            .map(|error| error.wrap(&wrap))
+            .map(wrap)
             .collect();
         self
     }
@@ -898,68 +902,57 @@ impl<'a> CheckedValue<'a> {
     fn first_error(&self) -> Option<&TypeError> {
         self.local
             .error()
-            .map(CheckedError::diagnostic)
             .or_else(|| self.findings.provider.first().map(|(_, error)| error))
     }
 
     fn into_findings(mut self) -> ValueValidationFindings {
         self.retain_primary_finding();
-        // Preserve callback provenance while the two result streams are still
-        // separate. Admission must never infer it from equal diagnostics.
+        let SupplementalData {
+            authored,
+            references,
+        } = std::mem::take(&mut self.findings.authored).into_parts();
         let symbolic =
             self.findings
                 .assignment
                 .errors
-                .symbolic()
-                .chain(self.findings.authored.errors.iter().map(|(path, error)| {
+                .iter()
+                .map(|(path, error)| SymbolicFinding::ordinary(path.clone(), error.clone()))
+                .chain(authored.errors.iter().map(|(path, error)| {
                     SymbolicFinding::authored_hook(path.clone(), error.clone())
                 }))
                 .collect();
-
-        for (path, error) in self.findings.authored.errors.clone().into_diagnostics() {
+        for (path, error) in authored.errors.clone() {
             let path = FieldPath::from_canonical_segments(path.segments().iter().cloned());
             if self.local.error().is_some() {
-                self.findings
-                    .additional_local_errors
-                    .push(error.clone().into());
+                self.findings.additional_local_errors.push(error.clone());
             }
             self.reject(&path, error.clone());
-            self.findings
-                .local
-                .push((path.clone(), error.clone().into()));
-            self.findings.located.push((path, error.into()));
+            self.findings.local.push((path.clone(), error.clone()));
+            self.findings.located.push((path, error));
         }
-        self.findings.assignment.extend(self.findings.authored);
-        ValueValidationFindings {
+        self.findings.assignment.extend(authored);
+        let mut findings = ValueValidationFindings {
             structure: ValueStructure::Scalar,
             local_error: match self.local {
                 LocalOutcome::Accepted(_) => None,
                 LocalOutcome::Rejected {
                     primary: (_, error),
-                } => Some(error.into_diagnostic()),
+                } => Some(error),
             },
-            local: self
-                .findings
-                .local
-                .into_iter()
-                .map(|(path, error)| (path, error.into_diagnostic()))
-                .collect(),
+            local: self.findings.local,
             located: self
                 .findings
                 .located
                 .into_iter()
-                .map(|(path, error)| (path.canonical(), error.into_diagnostic()))
+                .map(|(path, error)| (path.canonical(), error))
                 .collect(),
             assignment: self.findings.assignment,
             symbolic,
-            additional_local_errors: self
-                .findings
-                .additional_local_errors
-                .into_iter()
-                .map(CheckedError::into_diagnostic)
-                .collect(),
+            additional_local_errors: self.findings.additional_local_errors,
             provider: self.findings.provider,
-        }
+        };
+        references.attach(&mut findings);
+        findings
     }
 }
 
@@ -1233,13 +1226,13 @@ struct CanonicalLeafError<'a> {
 pub(crate) struct AssignmentFindings {
     pub(crate) local: Vec<crate::validation::admission::LocalPath>,
     pub(crate) schema: crate::validation::admission::SchemaObligation,
-    pub(crate) errors: AssignmentErrors,
+    pub(crate) errors: Vec<(LeafPath, TypeError)>,
     pub(crate) deferred: Vec<DeferredHook>,
 }
 impl AssignmentFindings {
     pub(crate) fn from_errors(errors: impl IntoIterator<Item = (LeafPath, TypeError)>) -> Self {
         Self {
-            errors: AssignmentErrors::ordinary(errors),
+            errors: errors.into_iter().collect(),
             ..Default::default()
         }
     }
@@ -1284,7 +1277,7 @@ pub(crate) type ReferenceJudge<'a, B> = &'a dyn Fn(
     &CompiledAttributeType,
     &LeafPath,
     crate::parser::retained::SourceReference<'_, B>,
-) -> Result<AssignmentFindings, TypeError>;
+) -> Result<(), TypeError>;
 
 pub(crate) struct ReferenceCheck<'a, B: BindingAddress> {
     pub(crate) schema_source: &'a dyn Fn(&B) -> bool,
@@ -1481,12 +1474,14 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, P, B> {
         attr: &'a CompiledAttributeType,
         value: CheckValue<'a, P, B>,
         path: &FieldPath,
-    ) -> AssignmentFindings {
+    ) -> SupplementalFindings {
         if self.cursor.is_projection_only() {
             return Default::default();
         }
         match &self.callbacks.authored {
-            Some(hook) => hook.record(attr, value, &path.canonical(), self.cursor.clone()),
+            Some(hook) => hook
+                .record(attr, value, &path.canonical(), self.cursor.clone())
+                .into(),
             None => Default::default(),
         }
     }
@@ -1707,7 +1702,7 @@ fn validate_authored_value_with_callbacks<
             coverage: &visits,
         }),
     );
-    callbacks.finish(&mut checked.findings.authored);
+    checked.findings.authored.finish(&callbacks);
     drop(callbacks);
     let mut findings = checked.into_findings();
     *coverage = visits.into_inner();
@@ -2123,7 +2118,7 @@ pub(crate) struct AttributeAdmission<'a, 'v, P: PlaceholderKind, B: BindingAddre
 struct AdmittedUnion<'a> {
     selected: UnionFit<'a>,
     assignment: AssignmentFindings,
-    authored: AssignmentFindings,
+    authored: SupplementalFindings,
 }
 
 /// Compatibility for the schema's structural-only fixtures. Infallible makes
@@ -2241,7 +2236,7 @@ impl<'a> ValueValidator<'a, '_> {
     ) where
         'a: 'w,
     {
-        let mut authored = AssignmentFindings::default();
+        let mut authored = SupplementalFindings::default();
         if let Some(walk) = assignment {
             for cursor in wrappers {
                 let wrapper = AssignmentWalk {
@@ -2347,7 +2342,7 @@ impl<'a> ValueValidator<'a, '_> {
         // alternatives, including their provider callbacks.
         let parent_authored = match &assignment {
             Some(walk) => walk.authored(attr, CheckValue::Current(value.diagnostic_value()), path),
-            None => AssignmentFindings::default(),
+            None => SupplementalFindings::default(),
         };
         let parent_assignment = match &assignment {
             Some(walk) => walk.check(attr, CheckValue::Current(value.diagnostic_value()), path),
@@ -2610,22 +2605,25 @@ impl<'a> ValueValidator<'a, '_> {
             Some(walk) => {
                 match walk.check(attr, CheckValue::Current(value.diagnostic_value()), path) {
                     Ok(findings) if !findings.errors.is_empty() => {
-                        let mut checked = CheckedValue::rejected(path, findings.errors.primary());
-                        checked
-                            .findings
-                            .additional_local_errors
-                            .extend(findings.errors.checked().skip(1).map(|(_, error)| error));
-                        checked
-                            .findings
-                            .located
-                            .extend(findings.errors.checked().map(|(path, error)| {
+                        let mut checked =
+                            CheckedValue::rejected(path, findings.errors[0].1.clone());
+                        checked.findings.additional_local_errors.extend(
+                            findings
+                                .errors
+                                .iter()
+                                .skip(1)
+                                .map(|(_, error)| error.clone()),
+                        );
+                        checked.findings.located.extend(findings.errors.iter().map(
+                            |(path, error)| {
                                 (
                                     FieldPath::from_canonical_segments(
                                         path.segments().iter().cloned(),
                                     ),
-                                    error,
+                                    error.clone(),
                                 )
-                            }));
+                            },
+                        ));
                         checked.findings.assignment = findings;
                         checked.findings.authored = authored;
                         checked.selected = Some(attr);
@@ -3045,7 +3043,7 @@ impl<'a> ValueValidator<'a, '_> {
             if let Some(error) = key_checked.local.error().cloned() {
                 let error = TypeError::MapKeyError {
                     key: map_key.clone(),
-                    inner: Box::new(error.into_diagnostic()),
+                    inner: Box::new(error),
                 };
                 checked.reject(path, error.clone());
                 checked.findings.push_local(next_path.clone(), error);
@@ -3061,16 +3059,18 @@ impl<'a> ValueValidator<'a, '_> {
                     child_assignment,
                 ),
             };
-            let has_coarse_error = child.findings.local.iter().any(|(_, error)| {
-                !matches!(error.diagnostic(), TypeError::FieldGroupViolation { .. })
-            });
+            let has_coarse_error = child
+                .findings
+                .local
+                .iter()
+                .any(|(_, error)| !matches!(error, TypeError::FieldGroupViolation { .. }));
             if let Some(error) = child.local.error().cloned().filter(|_| has_coarse_error) {
                 // The collector's coarse diagnostic always uses
                 // MapValueError, even when the primary inner error
                 // is a field group with its own precise path.
                 first_value_error.get_or_insert(TypeError::MapValueError {
                     key: map_key.clone(),
-                    inner: Box::new(error.into_diagnostic()),
+                    inner: Box::new(error),
                 });
             }
             let child = child.wrap_local_errors(|error| error.at_map_value(map_key));
@@ -3082,9 +3082,7 @@ impl<'a> ValueValidator<'a, '_> {
                     .findings
                     .additional_local_errors
                     .iter()
-                    .filter(|error| {
-                        !matches!(error.diagnostic(), TypeError::FieldGroupViolation { .. })
-                    })
+                    .filter(|error| !matches!(error, TypeError::FieldGroupViolation { .. }))
                     .cloned(),
             );
             if let Some(error) = child.local.error().cloned() {
@@ -3096,12 +3094,13 @@ impl<'a> ValueValidator<'a, '_> {
                 .extend(child.findings.assignment);
             checked.findings.authored.extend(child.findings.authored);
             checked.findings.located.extend(child.findings.located);
-            checked
-                .findings
-                .local
-                .extend(child.findings.local.into_iter().filter(|(_, error)| {
-                    matches!(error.diagnostic(), TypeError::FieldGroupViolation { .. })
-                }));
+            checked.findings.local.extend(
+                child
+                    .findings
+                    .local
+                    .into_iter()
+                    .filter(|(_, error)| matches!(error, TypeError::FieldGroupViolation { .. })),
+            );
             checked.findings.provider.extend(child.findings.provider);
             checked
                 .findings
@@ -3119,7 +3118,7 @@ impl<'a> ValueValidator<'a, '_> {
             }
         }
         if let Some(error) = first_value_error {
-            checked.findings.local.push((path.clone(), error.into()));
+            checked.findings.local.push((path.clone(), error));
         }
         checked.findings.local.extend(
             additional_value_errors
@@ -3262,12 +3261,12 @@ impl<'a> ValueValidator<'a, '_> {
             walk
         });
         let mut best_accepted: Option<AdmittedUnion<'a>> = None;
-        let mut failure: Option<BestUnionMemberFailures<CheckedError>> = None;
+        let mut failure: Option<BestUnionMemberFailures> = None;
         let mut provider_failure: Option<UnionProviderFailure<'a>> = None;
         let mut sibling_provider_errors = Vec::new();
         let mut sibling_local_errors = Vec::new();
         let mut sibling_assignment = AssignmentFindings::default();
-        let mut sibling_authored = AssignmentFindings::default();
+        let mut sibling_authored = SupplementalFindings::default();
         let mut selected_failure = None;
         let mut unmatched = None;
         for member in members {
@@ -3396,14 +3395,14 @@ impl<'a> ValueValidator<'a, '_> {
                 UnionMembers::new_after_union_on_path(members, self.defs, visited.clone()),
                 ancestry,
             ),
-            _ => CheckedError::from(TypeError::value_type_mismatch(
+            _ => TypeError::value_type_mismatch(
                 members
                     .iter()
                     .map(CompiledAttributeType::type_name)
                     .collect::<Vec<_>>()
                     .join(" | "),
                 value.type_name(),
-            )),
+            ),
         };
         if selected_failure.is_none()
             && let Some((member, authored)) = unmatched
@@ -4075,15 +4074,7 @@ mod tests {
         let error = TypeError::ReadOnlyAttribute { name: "arn".into() };
         let checked = CheckedValue::rejected(&path, error.clone());
 
-        assert_eq!(
-            checked
-                .findings
-                .local
-                .into_iter()
-                .map(|(path, error)| (path, error.into_diagnostic()))
-                .collect::<Vec<_>>(),
-            vec![(path, error)]
-        );
+        assert_eq!(checked.findings.local, vec![(path, error)]);
     }
 
     #[test]

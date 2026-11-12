@@ -53,6 +53,7 @@ fn unrenderable_enum_error_still_owns_the_generic_diagnostic_path() {
     );
     let data = crate::code_action::enum_diagnostic_data_for_error(finding.detail());
     let handled = data.is_some();
+    let doc = doc.for_diagnostics().unwrap();
     let outcome = render_local_enum_diagnostic(&doc, &finding, None, data.unwrap());
     assert!(outcome.is_none());
     let retained: Vec<_> = [

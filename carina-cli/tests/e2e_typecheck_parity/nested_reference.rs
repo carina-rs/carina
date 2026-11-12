@@ -164,29 +164,55 @@ fn substituted_recursive_child_keeps_existing_cli_and_lsp_findings() {
     let schemas = schemas("recursive");
     let engine = engine_with_schemas(schemas.clone());
     let analyze = || {
-        let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        let report = carina_cli::commands::validate::validate_diagnostics_with_factories(
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            carina_cli::wiring::LoadedProviderFactory::for_test(factories_for(&schemas)),
+            Default::default(),
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .all(|error| matches!(error, carina_cli::error::AppError::ExpressionType(_))),
+            "{:#?}",
+            report.errors
+        );
+        let cli = report
+            .errors
+            .iter()
+            .map(|error| carina_cli::error::format_error_with_source_chain(error))
+            .collect::<Vec<_>>();
         let mut lsp = lsp_diagnostics(&engine, &fixture, "main.crn");
         lsp.retain(|diagnostic| !diagnostic.message.starts_with("Unused let binding"));
         (cli, lsp)
     };
     let unknown = analyze();
-    // Main's retained-expression admission rejects this pending recursive
-    // collection before the CLI reference pass. Keep those existing findings;
-    // the LSP additionally exposes the reference rule's own mismatch.
-    assert_eq!(unknown.0.len(), 2, "{unknown:#?}");
-    assert!(
-        unknown
-            .0
-            .iter()
-            .all(|message| message.ends_with("expected String, got collection")),
-        "{unknown:#?}"
+    // Retained expression checking fails first; this CLI/LSP difference predates R3.
+    let source_file = fixture.path().join("main.crn");
+    assert_eq!(
+        unknown.0,
+        [
+            format!(
+                "{} at line 2\nexpected String, got collection",
+                source_file.display()
+            ),
+            format!(
+                "{} at line 1\nexpected String, got collection",
+                source_file.display()
+            ),
+        ],
     );
-    assert_eq!(unknown.1.len(), 3, "{unknown:#?}");
-    assert!(
-        unknown.1.iter().any(|diagnostic| diagnostic
-            .message
-            .starts_with("cannot assign String to 'value'")),
-        "{unknown:#?}"
+    assert_eq!(
+        unknown
+            .1
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "expected String, got collection",
+            "expected String, got collection",
+            "cannot assign String to 'value': expected mock.RecoveryProbe, got String (from a.name)",
+        ],
     );
     std::fs::write(
         fixture.path().join("sources.crn"),

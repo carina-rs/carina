@@ -208,12 +208,15 @@ fn round5_union_best_failing_hook_is_retained_once_live_and_discarded() {
                 path: &crate::schema::LeafPath,
                 _: AuthoredCursor<'_>| {
         calls.set(calls.get() + 1);
-        Ok(AssignmentFindings::from_errors(vec![(
-            path.clone(),
-            crate::schema::TypeError::MissingRequired {
-                name: format!("hook: {}", attr.type_name()),
-            },
-        )]))
+        Ok(AssignmentFindings {
+            errors: vec![(
+                path.clone(),
+                crate::schema::TypeError::MissingRequired {
+                    name: format!("hook: {}", attr.type_name()),
+                },
+            )],
+            ..Default::default()
+        })
     };
     let callbacks = AssignmentCallbacks {
         ordinary: &|_, _, _, _| Ok(Default::default()),
@@ -246,7 +249,7 @@ fn round5_union_best_failing_hook_is_retained_once_live_and_discarded() {
     for findings in [current, discarded] {
         assert_eq!(findings.errors.len(), 1, "{findings:?}");
         assert_eq!(
-            findings.errors.iter().next().unwrap().1,
+            findings.errors[0].1,
             crate::schema::TypeError::MissingRequired {
                 name: "hook: String".into()
             }
@@ -300,7 +303,10 @@ fn round6_parent_hook_errors_preserve_ordinary_child_diagnostics() {
         if returns_error.get() {
             Err(error)
         } else {
-            Ok(AssignmentFindings::from_errors(vec![(path.clone(), error)]))
+            Ok(AssignmentFindings {
+                errors: vec![(path.clone(), error)],
+                ..Default::default()
+            })
         }
     };
     let validate = |authored| {
@@ -437,8 +443,8 @@ fn round6_union_hook_fires_once_for_best_ordinary_failure() {
                     _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
                     path: &crate::schema::LeafPath,
                     _: AuthoredCursor<'_>| {
-        Ok(AssignmentFindings::from_errors(
-            if attr.type_name() == "String" {
+        Ok(AssignmentFindings {
+            errors: if attr.type_name() == "String" {
                 vec![(
                     path.clone(),
                     crate::schema::TypeError::MissingRequired {
@@ -448,7 +454,8 @@ fn round6_union_hook_fires_once_for_best_ordinary_failure() {
             } else {
                 Vec::new()
             },
-        ))
+            ..Default::default()
+        })
     };
     let callbacks = AssignmentCallbacks {
         ordinary: &ordinary,

@@ -6604,8 +6604,8 @@ fn union_member_judgement_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
     judgement
 }
 
-struct UnionMemberFailure<E = TypeError> {
-    error: E,
+struct UnionMemberFailure {
+    error: TypeError,
     diagnostic_identity: UnionDiagnosticIdentity,
 }
 
@@ -6615,32 +6615,14 @@ struct UnionMemberFailure<E = TypeError> {
 /// contents are either consumed by the closed-Struct diagnostic from #3754 or
 /// passed to [`UnionArmFailures`], which owns deduplication and the at-least-two
 /// invariant for general Union diagnostics.
-struct BestUnionMemberFailures<E = TypeError> {
+struct BestUnionMemberFailures {
     failure_rank: UnionFailureRank,
-    first: UnionMemberFailure<E>,
-    tied: Vec<UnionMemberFailure<E>>,
+    first: UnionMemberFailure,
+    tied: Vec<UnionMemberFailure>,
 }
 
-trait UnionFailureError: Sized {
-    fn type_error(&self) -> &TypeError;
-    fn from_type_error(error: TypeError) -> Self;
-    fn from_errors(first: Self, rest: impl IntoIterator<Item = Self>) -> Self;
-}
-
-impl UnionFailureError for TypeError {
-    fn type_error(&self) -> &TypeError {
-        self
-    }
-    fn from_type_error(error: TypeError) -> Self {
-        error
-    }
-    fn from_errors(first: Self, rest: impl IntoIterator<Item = Self>) -> Self {
-        Self::from_union_arm_errors(first, rest)
-    }
-}
-
-impl<E: UnionFailureError> BestUnionMemberFailures<E> {
-    fn new(failure_rank: UnionFailureRank, first: UnionMemberFailure<E>) -> Self {
+impl BestUnionMemberFailures {
+    fn new(failure_rank: UnionFailureRank, first: UnionMemberFailure) -> Self {
         Self {
             failure_rank,
             first,
@@ -6653,7 +6635,7 @@ impl<E: UnionFailureError> BestUnionMemberFailures<E> {
         value: ConcreteValueRef<'_, P, B>,
         members: UnionMembers<'_, Compiled>,
         ancestry: FieldAncestry,
-    ) -> E {
+    ) -> TypeError {
         let BestUnionMemberFailures {
             failure_rank: _,
             first,
@@ -6691,11 +6673,7 @@ impl<E: UnionFailureError> BestUnionMemberFailures<E> {
             .iter()
             .enumerate()
             .filter_map(|(index, failure)| {
-                matches!(
-                    failure.error.type_error(),
-                    TypeError::FieldGroupViolation { .. }
-                )
-                .then_some(index)
+                matches!(failure.error, TypeError::FieldGroupViolation { .. }).then_some(index)
             })
             .collect::<Vec<_>>();
         if let [index] = group_failure_indices.as_slice() {
@@ -6755,11 +6733,11 @@ impl<E: UnionFailureError> BestUnionMemberFailures<E> {
             }
         };
 
-        E::from_type_error(TypeError::UnionStructMismatch {
+        TypeError::UnionStructMismatch {
             reason,
             supplied_fields: map.keys().cloned().collect(),
             alternatives,
-        })
+        }
     }
 }
 
@@ -8195,11 +8173,11 @@ impl TypeError {
         }
     }
 
-    fn from_union_member_failures<E: UnionFailureError>(
-        first: UnionMemberFailure<E>,
-        rest: impl IntoIterator<Item = UnionMemberFailure<E>>,
-    ) -> E {
-        E::from_errors(first.error, rest.into_iter().map(|failure| failure.error))
+    fn from_union_member_failures(
+        first: UnionMemberFailure,
+        rest: impl IntoIterator<Item = UnionMemberFailure>,
+    ) -> Self {
+        Self::from_union_arm_errors(first.error, rest.into_iter().map(|failure| failure.error))
     }
 
     fn from_union_arm_errors(first: TypeError, rest: impl IntoIterator<Item = TypeError>) -> Self {

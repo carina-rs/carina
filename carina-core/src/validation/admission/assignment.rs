@@ -573,7 +573,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                             &mut Default::default(),
                         )
                         .map_err(|error| reference.error_with_origin(error))?;
-                    Ok(Default::default())
+                    Ok(())
                 };
             crate::schema::value_validation::validate_authored_value_for_admission_with_references(
                 contract.attr(),

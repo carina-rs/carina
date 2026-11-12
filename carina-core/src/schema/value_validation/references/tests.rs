@@ -5,8 +5,8 @@ fn allow_reference(
     _: &CompiledAttributeType,
     _: &LeafPath,
     _: SourceReference<'_, RelativeBindingName>,
-) -> Result<AssignmentFindings, TypeError> {
-    Ok(Default::default())
+) -> Result<(), TypeError> {
+    Ok(())
 }
 
 fn with_source(
@@ -204,7 +204,7 @@ fn substituted_module_output_keeps_ordinary_memo_and_skips_reference_callback() 
                  _: &LeafPath,
                  _: SourceReference<'_, RelativeBindingName>| {
                     calls.set(calls.get() + 1);
-                    Ok(Default::default())
+                    Ok(())
                 };
             let schema_source = |binding: &RelativeBindingName| {
                 bindings.is_schema_attribute_source(binding.as_str())
@@ -309,7 +309,7 @@ fn reference_scope_does_not_reuse_member_trial_cache() {
                 );
                 drop(scope);
                 assert_eq!(
-                    checked.accepts(),
+                    checked.into_findings().into_located().is_empty(),
                     trial,
                     "member_first={member_first}, trial={trial}"
                 );
@@ -343,7 +343,7 @@ fn reference_declaration_is_independent_of_union_trial_order() {
                  _: SourceReference<'_, RelativeBindingName>| {
                     assert!(std::ptr::eq(attr, &union));
                     calls.set(calls.get() + 1);
-                    Ok(Default::default())
+                    Ok(())
                 };
             let findings = validate_authored_value_for_admission_with_references(
                 &union,
@@ -369,36 +369,30 @@ fn reference_declaration_is_independent_of_union_trial_order() {
 }
 
 #[test]
-fn pending_reference_is_applied_before_any_findings_can_merge() {
-    let attr = CompiledAttributeType::string();
-    let error = TypeError::ValidationFailed {
-        message: "reference rejection".into(),
-    };
-    let checked = CheckedValue::accepted(&attr, FitExactness::EXACT, FitKind::Failed);
-    let pending = PendingReferencedValue(Box::new(ReferenceResult {
-        value: checked,
-        reference: Err(error),
-        key: None,
-    }));
-    let checked = pending
+fn recovered_stream_survives_merges_without_changing_primary() {
+    with_source(|cursor, _| {
+        let attr = CompiledAttributeType::string();
+        let error = source_mismatch(&cursor);
+        let checked = PendingReferencedValue(Box::new(ReferenceResult {
+            value: CheckedValue::accepted(&attr, FitExactness::EXACT, FitKind::Failed),
+            reference: Err(error),
+            identity: cursor.identity().unwrap(),
+            key: None,
+        }))
         .finish(&FieldPath::new(), &ReferenceMemo::default())
         .into_checked();
-    assert!(!checked.accepts());
-    let mut probe = AssignmentProbe::default();
-    probe.extend(AssignmentProbe {
-        ordinary: checked.findings.assignment.clone(),
-        authored: Default::default(),
+        assert!(checked.accepts());
+        let mut parent = CheckedValue::accepted(&attr, FitExactness::EXACT, FitKind::Failed);
+        parent.findings.authored.extend(checked.findings.authored);
+        assert!(parent.accepts());
+        let findings = parent.into_findings();
+        assert_eq!(findings.symbolic_findings().len(), 1);
+        assert_eq!(
+            findings.symbolic_findings()[0].origin(),
+            SymbolicFindingOrigin::RecoveredReference
+        );
+        assert_eq!(findings.into_located().len(), 1);
     });
-    let mut parent = CheckedValue::accepted(&attr, FitExactness::EXACT, FitKind::Failed);
-    parent.extend_assignment(&FieldPath::new(), probe.ordinary);
-    assert!(!parent.accepts());
-    let findings = parent.into_findings();
-    assert_eq!(findings.symbolic_findings().len(), 1);
-    assert_eq!(
-        findings.symbolic_findings()[0].origin(),
-        SymbolicFindingOrigin::RecoveredReference
-    );
-    assert_eq!(findings.into_located().len(), 1);
 }
 
 #[test]
@@ -414,7 +408,7 @@ fn recovered_reference_memo_hits_allocate_only_what_the_ordinary_walk_does() {
                          _: &LeafPath,
                          _: SourceReference<'_, RelativeBindingName>| {
             calls.set(calls.get() + 1);
-            Ok(Default::default())
+            Ok(())
         };
         let policy = ReferencePolicy::new(
             &ordinary,
@@ -475,7 +469,7 @@ fn reference_resolution_failures_keep_the_ordinary_error_once() {
                  _: &LeafPath,
                  _: SourceReference<'_, RelativeBindingName>| {
                     calls.set(calls.get() + 1);
-                    Ok(Default::default())
+                    Ok(())
                 };
             let lookup = no_lookup();
             let callbacks = AssignmentCallbacks {
@@ -540,82 +534,100 @@ fn source_mismatch(cursor: &AuthoredCursor<'_>) -> TypeError {
 #[test]
 fn equal_ordinary_and_recovered_errors_keep_distinct_transformation_origins() {
     with_source(|cursor, _| {
-        let attr = CompiledAttributeType::string();
         let error = source_mismatch(&cursor);
         let path = FieldPath::new();
         let other = path.push_field("recovered");
-        let recovered = PendingReferencedValue(Box::new(ReferenceResult {
-            value: CheckedValue::accepted(&attr, FitExactness::EXACT, FitKind::Failed),
-            reference: Err(error.clone()),
-            key: None,
-        }))
-        .finish(&other, &ReferenceMemo::default())
-        .into_checked();
         let mut ordinary = CheckedValue::rejected(&path, error.clone());
         ordinary
             .findings
             .additional_local_errors
-            .push(error.clone().into());
-        ordinary.extend_assignment(&other, recovered.findings.assignment);
+            .push(error.clone());
+        ordinary
+            .findings
+            .authored
+            .recover(cursor.identity().unwrap(), &other, error);
         let wrapped = ordinary
             .clone()
             .wrap_local_errors(|error| error.at_struct_field("outer"));
         assert!(matches!(
-            wrapped.local.error().map(CheckedError::diagnostic),
+            wrapped.local.error(),
             Some(TypeError::StructFieldError { .. })
         ));
         assert!(matches!(
-            wrapped.findings.additional_local_errors[0].diagnostic(),
+            wrapped.findings.additional_local_errors[0],
             TypeError::StructFieldError { .. }
         ));
-        let protected = ordinary.inside_secret();
+        let protected = ordinary.inside_secret().into_findings();
         use crate::resource::SecretDiagnosticError;
+        for error in [
+            protected.local_error().unwrap(),
+            &protected.local[0].1,
+            &protected.located[0].1,
+            &protected.additional_local_errors[0],
+        ] {
+            assert!(
+                matches!(error, TypeError::Reference { error, .. } if matches!(error.as_ref(), SecretDiagnosticError::InsideSecret))
+            );
+        }
         assert!(
-            matches!(protected.local.error().map(CheckedError::diagnostic), Some(TypeError::Reference { error, .. }) if matches!(error.as_ref(), SecretDiagnosticError::InsideSecret))
-        );
-        assert!(
-            matches!(protected.findings.local[0].1.diagnostic(), TypeError::Reference { error, .. } if matches!(error.as_ref(), SecretDiagnosticError::InsideSecret))
-        );
-        assert!(
-            matches!(protected.findings.located[0].1.diagnostic(), TypeError::Reference { error, .. } if matches!(error.as_ref(), SecretDiagnosticError::InsideSecret))
-        );
-        assert!(
-            matches!(protected.findings.additional_local_errors[0].diagnostic(), TypeError::Reference { error, .. } if matches!(error.as_ref(), SecretDiagnosticError::InsideSecret))
-        );
-        assert!(
-            matches!(protected.findings.located[1].1.diagnostic(), TypeError::Reference { error, .. } if matches!(error.as_ref(), SecretDiagnosticError::Public(_)))
+            matches!(&protected.located[1].1, TypeError::Reference { error, .. } if matches!(error.as_ref(), SecretDiagnosticError::Public(_)))
         );
     });
 }
 
 #[test]
-fn deduplicated_union_error_keeps_the_first_errors_origin() {
+fn recovered_stream_deduplicates_authored_uses_after_ordinary_selection() {
     with_source(|cursor, _| {
+        let attr = CompiledAttributeType::string();
+        let mut checked = CheckedValue::accepted(&attr, FitExactness::EXACT, FitKind::Failed);
+        checked.findings.authored.recover(
+            cursor.identity().unwrap(),
+            &FieldPath::new(),
+            source_mismatch(&cursor),
+        );
+        checked
+            .findings
+            .authored
+            .extend(checked.findings.authored.clone());
+        assert!(checked.accepts());
+        let findings = checked.into_findings();
+        assert_eq!(findings.symbolic_findings().len(), 1);
+        assert_eq!(findings.clone().into_located().len(), 1);
+        assert_eq!(findings.local_errors().count(), 1);
+    });
+}
+
+#[test]
+fn recovered_reference_never_rejects_an_ordinary_value_or_changes_its_fit() {
+    with_source(|cursor, _| {
+        let attr = CompiledAttributeType::string();
+        let path = FieldPath::new();
         let error = source_mismatch(&cursor);
-        for origin in [ErrorOrigin::Ordinary, ErrorOrigin::RecoveredReference] {
-            let other = match origin {
-                ErrorOrigin::Ordinary => ErrorOrigin::RecoveredReference,
-                ErrorOrigin::RecoveredReference => ErrorOrigin::Ordinary,
-            };
-            let selected = CheckedError::from_errors(
-                CheckedError::new(error.clone(), origin),
-                [CheckedError::new(error.clone(), other)],
-            );
-            assert_eq!(selected.diagnostic(), &error);
-            let wrapped = selected
-                .clone()
-                .wrap(|error| error.at_struct_field("outer"));
-            assert_eq!(
-                matches!(wrapped.diagnostic(), TypeError::StructFieldError { .. }),
-                origin == ErrorOrigin::Ordinary,
-            );
-            use crate::resource::SecretDiagnosticError;
-            let protected = selected.inside_secret();
-            assert_eq!(
-                matches!(protected.diagnostic(), TypeError::Reference { error, .. } if matches!(error.as_ref(), SecretDiagnosticError::InsideSecret)),
-                origin == ErrorOrigin::Ordinary,
-            );
-        }
+        let ordinary = CheckedValue::accepted(&attr, FitExactness::EXACT, FitKind::Failed);
+        let checked = PendingReferencedValue(Box::new(ReferenceResult {
+            value: ordinary,
+            reference: Err(error.clone()),
+            identity: cursor.identity().unwrap(),
+            key: None,
+        }))
+        .finish(&path, &ReferenceMemo::default())
+        .into_checked();
+        assert!(
+            checked.accepts(),
+            "reference authority must not enter union fitting"
+        );
+        assert!(checked.local.error().is_none());
+        assert!(checked.findings.local.is_empty());
+        assert!(checked.findings.located.is_empty());
+        let findings = checked.into_findings();
+        assert_eq!(
+            findings.clone().into_located(),
+            vec![(path.canonical(), error.clone())]
+        );
+        assert_eq!(
+            findings.local_errors().cloned().collect::<Vec<_>>(),
+            vec![error]
+        );
     });
 }
 

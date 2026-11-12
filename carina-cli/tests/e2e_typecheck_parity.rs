@@ -55,6 +55,9 @@ mod substituted_reference;
 #[path = "e2e_typecheck_parity/nested_reference.rs"]
 mod nested_reference;
 
+#[path = "e2e_typecheck_parity/recovered_composition.rs"]
+mod recovered_composition;
+
 // ============================================================================
 // Fixture + helpers (mirror carina-lsp/tests/e2e_typecheck.rs)
 // ============================================================================

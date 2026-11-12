@@ -2,167 +2,119 @@ use super::*;
 
 type UseIdentity = (NodeId, UseId, ExpansionInstanceId, ProjectionGeneration);
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ErrorOrigin {
-    Ordinary,
-    RecoveredReference,
+/// Findings that follow ordinary member selection without participating in it.
+/// Keeping both streams in this bundle makes every existing container/union
+/// transfer carry them together. The empty case allocates nothing.
+#[derive(Clone, Default)]
+pub(super) struct SupplementalFindings(Option<Box<SupplementalData>>);
+
+#[derive(Clone, Default)]
+pub(super) struct SupplementalData {
+    pub(super) authored: AssignmentFindings,
+    pub(super) references: RecoveredReferences,
 }
 
-// Boxing keeps the origin attached to every error without enlarging a
-// recursive CheckedValue frame. Transformations use the attached mark;
-// projecting the diagnostic never determines its origin.
-#[derive(Debug, Clone)]
-pub(super) struct CheckedError(Box<ErrorDetail>);
-
-#[derive(Debug, Clone)]
-struct ErrorDetail {
-    error: TypeError,
-    origin: ErrorOrigin,
-}
-
-impl CheckedError {
-    fn new(error: TypeError, origin: ErrorOrigin) -> Self {
-        Self(Box::new(ErrorDetail { error, origin }))
-    }
-
-    pub(super) fn diagnostic(&self) -> &TypeError {
-        &self.0.error
-    }
-
-    pub(super) fn into_diagnostic(self) -> TypeError {
-        self.0.error
-    }
-
-    pub(super) fn wrap(self, wrap: impl FnOnce(TypeError) -> TypeError) -> Self {
-        match self.0.origin {
-            ErrorOrigin::Ordinary => Self::from(wrap(self.into_diagnostic())),
-            ErrorOrigin::RecoveredReference => self,
+impl From<AssignmentFindings> for SupplementalFindings {
+    fn from(authored: AssignmentFindings) -> Self {
+        if authored.local.is_empty()
+            && authored.schema.is_empty()
+            && authored.errors.is_empty()
+            && authored.deferred.is_empty()
+        {
+            return Self::default();
         }
+        Self(Some(Box::new(SupplementalData {
+            authored,
+            references: Default::default(),
+        })))
     }
 }
 
-impl From<TypeError> for CheckedError {
-    fn from(error: TypeError) -> Self {
-        Self::new(error, ErrorOrigin::Ordinary)
+impl SupplementalFindings {
+    fn data(&mut self) -> &mut SupplementalData {
+        self.0.get_or_insert_with(Default::default)
     }
-}
 
-impl InsideSecret for CheckedError {
-    fn inside_secret(self) -> Self {
-        let ErrorDetail { error, origin } = *self.0;
-        let error = match origin {
-            ErrorOrigin::Ordinary => error.inside_secret(),
-            ErrorOrigin::RecoveredReference => protect_reference_error(error),
+    pub(super) fn extend(&mut self, other: impl Into<Self>) {
+        let Some(other) = other.into().0 else {
+            return;
         };
-        Self::new(error, origin)
-    }
-}
-
-impl UnionFailureError for CheckedError {
-    fn type_error(&self) -> &TypeError {
-        self.diagnostic()
+        let data = self.data();
+        data.authored.extend(other.authored);
+        data.references.0.extend(other.references.0);
     }
 
-    fn from_type_error(error: TypeError) -> Self {
-        Self::from(error)
+    pub(super) fn into_parts(self) -> SupplementalData {
+        self.0.map(|data| *data).unwrap_or_default()
     }
 
-    fn from_errors(first: Self, rest: impl IntoIterator<Item = Self>) -> Self {
-        let ErrorDetail { error, origin } = *first.0;
-        match UnionArmFailures::new(error, rest.into_iter().map(Self::into_diagnostic)) {
-            Ok(failures) => Self::from(TypeError::UnionAlternativesMismatch { failures }),
-            // A collapsed diagnostic keeps its first candidate's origin;
-            // a newly generated multi-arm summary is an ordinary diagnostic.
-            Err(error) => Self::new(error, origin),
+    pub(super) fn finish<P: ValueKind, B: BindingAddress>(
+        &mut self,
+        callbacks: &WalkCallbacks<'_, P, B>,
+    ) {
+        if let Some(data) = &mut self.0 {
+            callbacks.finish(&mut data.authored);
         }
     }
-}
 
-#[derive(Debug, Clone, PartialEq)]
-struct AssignmentError {
-    diagnostic: (LeafPath, TypeError),
-    origin: ErrorOrigin,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct AssignmentErrors(Vec<AssignmentError>);
-
-impl AssignmentErrors {
-    pub(crate) fn ordinary(errors: impl IntoIterator<Item = (LeafPath, TypeError)>) -> Self {
-        Self(
-            errors
-                .into_iter()
-                .map(|diagnostic| AssignmentError {
-                    diagnostic,
-                    origin: ErrorOrigin::Ordinary,
-                })
-                .collect(),
-        )
-    }
-    pub(crate) fn push(&mut self, diagnostic: (LeafPath, TypeError)) {
-        self.0.push(AssignmentError {
-            diagnostic,
-            origin: ErrorOrigin::Ordinary,
+    fn recover(&mut self, identity: UseIdentity, path: &FieldPath, error: TypeError) {
+        self.data().references.0.push(RecoveredReference {
+            identity,
+            path: path.canonical(),
+            error,
         });
     }
-    pub(super) fn extend(&mut self, other: Self) {
-        self.0.extend(other.0);
-    }
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &(LeafPath, TypeError)> {
-        self.0.iter().map(|entry| &entry.diagnostic)
-    }
-    pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-    pub(crate) fn len(&self) -> usize {
-        self.0.len()
-    }
-    pub(super) fn primary(&self) -> CheckedError {
-        let entry = &self.0[0];
-        CheckedError::new(entry.diagnostic.1.clone(), entry.origin)
-    }
-    pub(super) fn checked(&self) -> impl Iterator<Item = (&LeafPath, CheckedError)> {
-        self.0.iter().map(|entry| {
-            (
-                &entry.diagnostic.0,
-                CheckedError::new(entry.diagnostic.1.clone(), entry.origin),
-            )
-        })
-    }
-    pub(super) fn into_diagnostics(self) -> impl Iterator<Item = (LeafPath, TypeError)> {
-        self.0.into_iter().map(|entry| entry.diagnostic)
-    }
-    pub(super) fn symbolic(&self) -> impl Iterator<Item = SymbolicFinding> {
-        self.0.iter().map(|entry| {
-            let (path, error) = &entry.diagnostic;
-            match entry.origin {
-                ErrorOrigin::Ordinary => SymbolicFinding::ordinary(path.clone(), error.clone()),
-                ErrorOrigin::RecoveredReference => {
-                    SymbolicFinding::recovered_reference(path.clone(), error.clone())
-                }
-            }
-        })
+}
+
+impl InsideSecret for SupplementalFindings {
+    fn inside_secret(self) -> Self {
+        Self(self.0.map(|data| {
+            Box::new(SupplementalData {
+                authored: data.authored.inside_secret(),
+                references: RecoveredReferences(
+                    data.references
+                        .0
+                        .into_iter()
+                        .map(|finding| RecoveredReference {
+                            identity: finding.identity,
+                            path: finding.path.inside_secret(),
+                            error: protect_reference_error(finding.error),
+                        })
+                        .collect(),
+                ),
+            })
+        }))
     }
 }
-impl InsideSecret for AssignmentErrors {
-    fn inside_secret(self) -> Self {
-        Self(
-            self.0
-                .into_iter()
-                .map(|entry| AssignmentError {
-                    diagnostic: (
-                        entry.diagnostic.0.inside_secret(),
-                        match entry.origin {
-                            ErrorOrigin::Ordinary => entry.diagnostic.1.inside_secret(),
-                            ErrorOrigin::RecoveredReference => {
-                                protect_reference_error(entry.diagnostic.1)
-                            }
-                        },
-                    ),
-                    origin: entry.origin,
-                })
-                .collect(),
-        )
+
+#[derive(Clone)]
+struct RecoveredReference {
+    identity: UseIdentity,
+    path: LeafPath,
+    error: TypeError,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct RecoveredReferences(Vec<RecoveredReference>);
+
+impl RecoveredReferences {
+    pub(super) fn attach(self, findings: &mut ValueValidationFindings) {
+        let mut seen = std::collections::HashSet::new();
+        for RecoveredReference {
+            identity,
+            path,
+            error,
+        } in self.0
+        {
+            if !seen.insert(identity) {
+                continue;
+            }
+            findings.additional_local_errors.push(error.clone());
+            findings.located.push((path.clone(), error.clone()));
+            findings
+                .symbolic
+                .push(SymbolicFinding::recovered_reference(path, error));
+        }
     }
 }
 
@@ -298,7 +250,8 @@ impl<'a> AppliedReferenceValue<'a> {
 pub(super) struct PendingReferencedValue<'a>(Box<ReferenceResult<'a>>);
 struct ReferenceResult<'a> {
     value: CheckedValue<'a>,
-    reference: Result<AssignmentFindings, TypeError>,
+    reference: Result<(), TypeError>,
+    identity: UseIdentity,
     key: Option<CheckedNode<'a>>,
 }
 impl<'a> PendingReferencedValue<'a> {
@@ -311,47 +264,37 @@ impl<'a> PendingReferencedValue<'a> {
         let ReferenceResult {
             mut value,
             reference,
+            identity,
             key,
         } = *self.0;
-        match reference {
-            Ok(findings) => value.extend_assignment(path, findings),
-            Err(error) => {
-                use crate::resource::SecretDiagnosticError;
-                use crate::validation::admission::AdmissionReferenceError;
-                value.retain_primary_finding();
-                // Equality only suppresses a duplicate diagnostic here; every
-                // retained error carries its own origin through transformations.
-                let same = |ordinary: &TypeError| {
-                    ordinary == &error
-                        || matches!((ordinary, &error),
-                            (TypeError::TypeMismatch { types: ordinary }, TypeError::Reference { error, .. })
-                            if matches!(error.as_ref(), SecretDiagnosticError::Public(AdmissionReferenceError::Computed(
-                                crate::validation::DeferredAccessTypeError::TypeMismatch { types, .. }
-                            )) if types == ordinary)
-                        )
-                };
-                if !value
+        if let Err(error) = reference {
+            use crate::resource::SecretDiagnosticError;
+            use crate::validation::admission::AdmissionReferenceError;
+            value.retain_primary_finding();
+            // Intentionally leaf-only: suppress a direct ordinary duplicate.
+            // Container summaries wrap child errors and keep their own paths;
+            // they are never equated with a recovered source judgement.
+            let same = |ordinary: &TypeError| {
+                ordinary == &error
+                    || matches!((ordinary, &error),
+                        (TypeError::TypeMismatch { types: ordinary }, TypeError::Reference { error, .. })
+                        if matches!(error.as_ref(), SecretDiagnosticError::Public(AdmissionReferenceError::Computed(
+                            crate::validation::DeferredAccessTypeError::TypeMismatch { types, .. }
+                        )) if types == ordinary)
+                    )
+            };
+            if !value
+                .findings
+                .located
+                .iter()
+                .any(|(ordinary_path, ordinary)| ordinary_path == path && same(ordinary))
+                && !value
                     .findings
-                    .located
+                    .provider
                     .iter()
-                    .any(|(ordinary_path, ordinary)| {
-                        ordinary_path == path && same(ordinary.diagnostic())
-                    })
-                    && !value
-                        .findings
-                        .provider
-                        .iter()
-                        .any(|(ordinary_path, ordinary)| ordinary_path == path && same(ordinary))
-                {
-                    let checked_error =
-                        CheckedError::new(error.clone(), ErrorOrigin::RecoveredReference);
-                    value.reject(path, checked_error.clone());
-                    value.findings.located.push((path.clone(), checked_error));
-                    value.findings.assignment.errors.0.push(AssignmentError {
-                        diagnostic: (path.canonical(), error),
-                        origin: ErrorOrigin::RecoveredReference,
-                    });
-                }
+                    .any(|(ordinary_path, ordinary)| ordinary_path == path && same(ordinary))
+            {
+                value.findings.authored.recover(identity, path, error);
             }
         }
         let value = std::rc::Rc::new(value);
@@ -391,7 +334,8 @@ impl<'a> ValueValidator<'a, '_> {
             policy,
             source,
         } = input;
-        let _scope = policy.enter(source.identity);
+        let identity = source.identity;
+        let _scope = policy.enter(identity);
         let key = match value {
             ClassifiedRef::Known(value) => Some(CheckedNode::new(
                 attr,
@@ -408,12 +352,6 @@ impl<'a> ValueValidator<'a, '_> {
         {
             return Some(AppliedReferenceValue(checked));
         }
-        let reference = {
-            let mut resolving = visited.clone();
-            resolve_refs_on_path(attr, self.defs, &mut resolving)
-                .map_err(|error| error.into_validation_error())
-                .and_then(|resolved| (policy.reference)(resolved.attr, &path.canonical(), source))
-        };
         let mut checked =
             self.walk_value(attr, value, path, ancestry, visited, Some((*walk).clone()));
         self.complete_authored_walk(
@@ -426,10 +364,17 @@ impl<'a> ValueValidator<'a, '_> {
             std::mem::take(wrappers),
         );
         checked.retain_primary_finding();
+        let reference = {
+            let mut resolving = visited.clone();
+            resolve_refs_on_path(attr, self.defs, &mut resolving)
+                .map_err(|error| error.into_validation_error())
+                .and_then(|resolved| (policy.reference)(resolved.attr, &path.canonical(), source))
+        };
         Some(
             PendingReferencedValue(Box::new(ReferenceResult {
                 value: checked,
                 reference,
+                identity,
                 key,
             }))
             .finish(path, &self.reference_checked),
