@@ -635,6 +635,7 @@ fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
         }
         | ParseError::InsideSecret { .. }
         | ParseError::SecretInConstraint { .. }
+        | ParseError::InterpolationInConstraintString { .. }
         | ParseError::Syntax(_)
         | ParseError::ProtectedFile(_)
         | ParseError::UnavailableSecret(_)

@@ -170,6 +170,16 @@ pub enum ParseError {
     )]
     SecretInConstraint { line: usize },
 
+    #[error(
+        "Invalid constraint at line {line}, column {column}: interpolation is not supported in a {kind}"
+    )]
+    InterpolationInConstraintString {
+        kind: super::ConstraintStringPosition,
+        line: usize,
+        column: usize,
+        span: SourceSpan,
+    },
+
     /// A runtime function selected historical evidence without its plaintext.
     #[error(transparent)]
     UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
@@ -503,6 +513,7 @@ impl ParseError {
             Self::Located { error, .. } => error.diagnostic_range(),
             Self::AtElement(finding) => Some(from_span(finding.location().span())),
             Self::InvalidAuthoredExpression { diagnostic, .. } => diagnostic.range(),
+            Self::InterpolationInConstraintString { span, .. } => Some(from_span(*span)),
             Self::ProtectedFile(failure) => Some(failure.range().clone()),
             Self::Syntax(error) => {
                 let (start, end) = match error.line_col {
@@ -580,6 +591,9 @@ impl ParseError {
             Self::Syntax(error) => format!("Syntax error: {}", error.variant.message()),
             Self::ProtectedFile(failure) => failure.kind().to_string(),
             Self::InsideSecret { .. } => crate::resource::INSIDE_SECRET_MESSAGE.to_string(),
+            Self::InterpolationInConstraintString { kind, .. } => {
+                format!("interpolation is not supported in a {kind}")
+            }
             Self::InvalidAuthoredExpression { diagnostic, .. } => diagnostic.to_string(),
             Self::InvalidExpression { message, .. }
             | Self::IntegerArithmetic { message, .. }

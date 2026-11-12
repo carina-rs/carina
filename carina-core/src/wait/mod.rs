@@ -7,7 +7,7 @@ mod observation;
 pub mod predicate;
 pub use observation::WaitObservation;
 pub(crate) use observation::evaluation_inputs;
-pub use predicate::{AttrPath, AttrPathError, WaitPredicate};
+pub use predicate::{AttrPath, AttrPathError, WaitPredicate, WaitRhs};
 
 use serde::{Deserialize, Serialize};
 

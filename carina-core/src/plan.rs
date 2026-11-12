@@ -2177,7 +2177,6 @@ mod tests {
 
     #[test]
     fn plan_summary_counts_wait() {
-        use crate::resource::{ConcreteValue, Value};
         use crate::wait::predicate::{AttrPath, WaitPredicate};
         use std::time::Duration;
 
@@ -2194,7 +2193,10 @@ mod tests {
             ))),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
-                Value::Concrete(ConcreteValue::String("ISSUED".into())),
+                serde_json::from_value::<crate::wait::WaitRhs>(
+                    serde_json::json!({"String": "'ISSUED'"}),
+                )
+                .unwrap(),
             )
             .unwrap(),
             until_surface: "cert.status == ISSUED".to_string(),

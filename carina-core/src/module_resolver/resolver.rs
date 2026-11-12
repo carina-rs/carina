@@ -15,7 +15,7 @@ use crate::parser::{
 };
 use crate::resource::{
     AbsoluteBindingAddress, BindingAddress, ModuleConstraintId, ParserPlaceholder,
-    RelativeBindingName, RootScope, Value,
+    RelativeBindingName, RootScope,
 };
 use crate::schema::SchemaRegistry;
 
@@ -514,6 +514,7 @@ impl ResidualModuleResolutionError {
                 | ParseError::CyclicLetBinding { chain: _ }
                 | ParseError::InsideSecret { .. }
                 | ParseError::SecretInConstraint { .. }
+                | ParseError::InterpolationInConstraintString { .. }
                 | ParseError::ValueWalk(_)
                 | ParseError::UserFunctionError(_)
                 | ParseError::RetainedEvidence(_) => false,
@@ -2294,9 +2295,7 @@ where
         }
         audit(&function.body.value, "function body")?;
     }
-    for wait in &file.wait_bindings {
-        reject_unexpanded_module_if(&wait.until_predicate.rhs, "wait predicate")?;
-    }
+    // Wait operands are closed scalars and cannot contain module-if expressions.
     for requirement in &file.requires {
         audit_validate_expr(
             requirement.condition_for_module_if_audit(),
@@ -2311,22 +2310,6 @@ where
         .try_visit_values(&mut |value| audit(value, "parser binding metadata"))?;
     file.try_visit_bare_binding_values(&mut |value| audit(value, "bare binding value"))?;
     Ok(())
-}
-
-fn reject_unexpanded_module_if<
-    P: super::deferred_if::ModuleIfAuditPlaceholder,
-    B: BindingAddress,
->(
-    value: &Value<P, B>,
-    context: &'static str,
-) -> Result<(), ModuleError> {
-    if super::deferred_if::value_contains_module_if(value) {
-        Err(ModuleError::UnexpandedModuleTemplate {
-            context: context.to_string(),
-        })
-    } else {
-        Ok(())
-    }
 }
 
 fn audit_validate_expr(

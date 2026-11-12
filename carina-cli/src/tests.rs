@@ -94,8 +94,8 @@ fn absolute_binding(spelling: &str) -> carina_core::resource::AbsoluteBindingAdd
 }
 
 #[test]
-fn saved_plan_version_is_44_for_refinement_layers() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 44);
+fn saved_plan_version_is_45_for_checked_validation_strings() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 45);
 }
 
 #[test]
@@ -1416,7 +1416,10 @@ fn test_detailed_exitcode_wait_only_no_changes() {
         target_id: ManagedWaitTarget::for_test(&resolved(Resource::new("acm.Certificate", "cert"))),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
-            Value::Concrete(ConcreteValue::String("ISSUED".into())),
+            serde_json::from_value::<carina_core::wait::WaitRhs>(
+                serde_json::json!({"String": "'ISSUED'"}),
+            )
+            .unwrap(),
         )
         .unwrap(),
         until_surface: "cert.status == ISSUED".to_string(),
@@ -4529,7 +4532,10 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
         target_id: ManagedWaitTarget::for_test(&managed_target),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
-            Value::Concrete(ConcreteValue::String("ready".into())),
+            serde_json::from_value::<carina_core::wait::WaitRhs>(
+                serde_json::json!({"String": "'ready'"}),
+            )
+            .unwrap(),
         )
         .unwrap(),
         until_surface: "managed.status == \"ready\"".to_string(),

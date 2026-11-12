@@ -76,6 +76,27 @@ pub struct DeclarationLocation {
 }
 
 impl DeclarationLocation {
+    pub(in crate::parser) fn literal_string(
+        pair: &pest::iterators::Pair<'_, Rule>,
+        interpolation: Option<std::ops::Range<usize>>,
+        file: &PreprocessedFile,
+        source_file: &Path,
+    ) -> Self {
+        let authored = pair.as_span();
+        let span = match interpolation {
+            Some(range) => SourceSpan::from_interpolation_range(
+                authored.start() + range.start,
+                authored.start() + range.end,
+                file,
+            ),
+            None => SourceSpan::from_preprocessed_range(authored.start(), authored.end(), file),
+        };
+        Self {
+            file: SourceFileId::new(source_file.to_path_buf()),
+            span,
+        }
+    }
+
     pub(in crate::parser) fn expression_node(
         pair: &pest::iterators::Pair<'_, Rule>,
         file: &PreprocessedFile,
