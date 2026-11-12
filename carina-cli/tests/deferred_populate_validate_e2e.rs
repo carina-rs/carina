@@ -60,6 +60,7 @@ impl ProviderFactory for DeferredPopulateTestFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }

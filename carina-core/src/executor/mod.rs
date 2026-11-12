@@ -2131,7 +2131,7 @@ async fn execute_plan(
     let session = input
         .plan
         .provider_plan()
-        .session(provider.name(), None, None);
+        .test_session(provider.name(), None, None);
     boundary.set_fixture_session(session, input.schemas);
     execute_test_runtime_plan(&boundary, input, observer, shutdown).await
 }

@@ -999,6 +999,7 @@ impl ProviderFactory for RawEnumStateFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async {
             Ok(Box::new(carina_core::provider::NoopNormalizer) as Box<dyn ProviderNormalizer>)
@@ -4093,6 +4094,7 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
         fn create_normalizer(
             &self,
             _config: &carina_core::provider::ProviderSession,
+            _: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
             Box::pin(async { Err(ProviderError::internal("normalizer initialization failed")) })
         }
@@ -5056,6 +5058,7 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async {
             Ok(Box::new(SavedAttrsHydratingNormalizer) as Box<dyn ProviderNormalizer>)
@@ -5638,6 +5641,10 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
     let ready = prepare_default_provider_ready_config(&CaptureFactory, "capture", &configs)
         .expect("the default provider instance must win");
     assert_eq!(
+        ready.instance(),
+        &provider_mod::ProviderInstanceKey::new("capture", None)
+    );
+    assert_eq!(
         ready.attributes().get("region"),
         Some(&Value::Concrete(ConcreteValue::String(
             "default-region".into()
@@ -5651,6 +5658,10 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
     let ready = prepare_default_provider_ready_config(&CaptureFactory, "capture", &configs)
         .expect("the first named provider instance must supply backend config");
     assert_eq!(
+        ready.instance(),
+        &provider_mod::ProviderInstanceKey::new("capture", None)
+    );
+    assert_eq!(
         ready.attributes().get("region"),
         Some(&Value::Concrete(ConcreteValue::String(
             "first-named-region".into()
@@ -5661,6 +5672,10 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
     let ready = prepare_default_provider_ready_config(&CaptureFactory, "capture", &configs)
         .expect("an undeclared provider kind must retain the empty fallback");
     assert!(ready.attributes().is_empty());
+    assert_eq!(
+        ready.instance(),
+        &provider_mod::ProviderInstanceKey::new("capture", None)
+    );
 }
 
 /// Verify that host default-tag merging prevents false diffs when default_tags are
@@ -7811,6 +7826,7 @@ impl ProviderFactory for DeferredForCollisionFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
         carina_core::provider::ProviderResult<Box<dyn carina_core::provider::ProviderNormalizer>>,
@@ -7947,6 +7963,7 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
         carina_core::provider::ProviderResult<Box<dyn carina_core::provider::ProviderNormalizer>>,
@@ -11362,6 +11379,7 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
         carina_core::provider::ProviderResult<Box<dyn carina_core::provider::ProviderNormalizer>>,
@@ -14699,6 +14717,7 @@ mod resolved_value_constraint_gate {
         fn create_normalizer(
             &self,
             _config: &carina_core::provider::ProviderSession,
+            _: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
             Box::pin(async {
                 Ok(Box::new(carina_core::provider::NoopNormalizer) as Box<dyn ProviderNormalizer>)
@@ -16203,4 +16222,70 @@ fn retry_policy_inherits_transient_causes_and_respects_explicit_overrides() {
             .into_host_for_test()
             .is_transient()
     );
+}
+
+#[tokio::test]
+async fn provider_config_directory_builtin_keeps_ignored_opaque_values() {
+    for declaration in ["provider mock", "let east = provider mock"] {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("providers.crn"),
+            format!(
+                "{}{declaration} {{ opaque = Opaque }}\n",
+                if declaration.starts_with("let ") {
+                    "provider mock {}\n"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("values.crn"),
+            "let Opaque = 18446744073709551615s\n",
+        )
+        .unwrap();
+        let context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let schemas = carina_core::schema::SchemaRegistry::new();
+        let loaded = carina_core::config_loader::load_configuration_with_config(
+            &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+            &context,
+            &schemas,
+        )
+        .unwrap();
+        let providers = (*loaded.parsed)
+            .clone()
+            .into_expanded(&schemas, &context)
+            .unwrap()
+            .providers;
+        let resolved = validated_provider_configs(providers);
+        let runtime = crate::test_support::TestCommandRuntime::with_mock(
+            Default::default(),
+            carina_provider_mock::MockScope::memory(),
+        );
+        let load = ProviderLoad::load(
+            &runtime,
+            resolved.as_provider_configs(),
+            &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+            &mut crate::commands::human_provider_notices(runtime.color_mode()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+        let router = get_provider_with_ctx(
+            &load.context,
+            &resolved,
+            ProgressSink::Human,
+            &carina_core::provider::ProviderPlan::state_only(),
+        )
+        .await
+        .unwrap();
+        assert!(!router.is_empty());
+        if declaration.starts_with("let ") {
+            assert!(router.provider_scopes().contains_key(
+                &provider_mod::ProviderInstanceKey::new("mock", Some("east".into()))
+            ));
+        }
+    }
 }

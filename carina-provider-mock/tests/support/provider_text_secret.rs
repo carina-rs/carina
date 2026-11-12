@@ -349,9 +349,8 @@ impl ProviderFactory for EchoFactory {
         _: InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         let provider = EchoMock::new(self.0);
-        if let Some(config) = config.configuration()
-            && config.wire_attributes().get("password").is_some()
-        {
+        let config = config.configuration();
+        if config.wire_attributes().get("password").is_some() {
             *provider.password.lock().unwrap() = Some(password(config.wire_attributes()));
         }
         Box::pin(async { Ok(InitializeOutcome::unavailable().with_provider(Box::new(provider))) })

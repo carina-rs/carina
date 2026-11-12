@@ -2020,6 +2020,7 @@ impl RootlessType {
     /// Validate a rootless value with the same recursive local/provider walk
     /// used by resource values. Rootless configuration retains only its primary
     /// local error; resource validation also reports sibling provider findings.
+    #[cfg(test)]
     pub(crate) fn validate_with_lookup<P: PlaceholderKind, B: BindingAddress>(
         &self,
         value: &Value<P, B>,
@@ -15626,7 +15627,7 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 ///
 /// A rootless config type likewise cannot accept an arbitrary lookup:
 ///
-/// ```compile_fail,E0624
+/// ```compile_fail,E0599
 /// use std::collections::BTreeMap;
 /// use carina_core::resource::{ConcreteValue, Value};
 /// use carina_core::schema::{AttributeType, ValidatedConfigSchema};

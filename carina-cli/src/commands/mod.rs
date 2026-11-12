@@ -2076,6 +2076,7 @@ child { values = [source] }
         fn create_normalizer(
             &self,
             _config: &carina_core::provider::ProviderSession,
+            _: carina_core::provider::InitializeOutcomeMint,
         ) -> carina_core::provider::BoxFuture<
             '_,
             carina_core::provider::ProviderResult<

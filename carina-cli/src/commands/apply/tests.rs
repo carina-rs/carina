@@ -518,9 +518,13 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
         .expect("load mock HTTP WASM provider")
         .with_http_test_route("phase-test.invalid", server_address);
     let fresh_ready = mock_http_ready_config(&fresh_factory);
-    let fresh_initialized = carina_core::provider::ProviderBoundary::initialize(
+    let fresh_initialized = carina_core::provider::ProviderBoundary::initialize_for_test(
         &fresh_factory,
-        &carina_core::provider::ProviderPlan::state_only().session("aws", None, Some(&fresh_ready)),
+        &carina_core::provider::ProviderPlan::state_only().test_session(
+            "aws",
+            None,
+            Some(&fresh_ready),
+        ),
     )
     .await
     .expect("initialize mock HTTP provider");
@@ -598,9 +602,9 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
         .expect("load replacement mock HTTP WASM provider")
         .with_http_test_route("phase-test.invalid", server_address);
     let replacement_ready = mock_http_ready_config(&replacement_factory);
-    let replacement_initialized = carina_core::provider::ProviderBoundary::initialize(
+    let replacement_initialized = carina_core::provider::ProviderBoundary::initialize_for_test(
         &replacement_factory,
-        &carina_core::provider::ProviderPlan::state_only().session(
+        &carina_core::provider::ProviderPlan::state_only().test_session(
             "aws",
             None,
             Some(&replacement_ready),
@@ -2483,6 +2487,7 @@ impl ProviderFactory for FailBCreateFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -3302,6 +3307,7 @@ impl ProviderFactory for ApplyTimeReadFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -3509,6 +3515,7 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }

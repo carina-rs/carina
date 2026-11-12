@@ -139,6 +139,7 @@ use crate::schema::{CompiledAttributeType, FieldAncestry, LeafPath, TypeError};
 
 mod assignment;
 pub mod attributes;
+pub mod configuration;
 pub mod final_input;
 #[cfg(test)]
 mod tests;
@@ -277,6 +278,7 @@ struct DeclarationIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InstanceIdentity {
     Resource(crate::resource::ResourceId),
+    Provider(crate::provider::ProviderInstanceKey),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DestinationIdentity {
@@ -289,19 +291,46 @@ struct DestinationIdentity {
 
 #[derive(Debug, Clone)]
 pub(crate) struct DestinationContract {
-    schema: std::sync::Arc<crate::schema::CompiledResourceSchema>,
+    schema: ContractSchema,
     attribute: String,
     owner: crate::parser::SchemaTypeOwner,
     ancestry: FieldAncestry,
     path: LeafPath,
 }
+#[derive(Debug, Clone)]
+enum ContractSchema {
+    Resource(std::sync::Arc<crate::schema::CompiledResourceSchema>),
+    Configuration(std::sync::Arc<crate::schema::ValidatedConfigSchema>),
+}
 impl DestinationContract {
+    fn resource(
+        schema: std::sync::Arc<crate::schema::CompiledResourceSchema>,
+        attribute: String,
+        owner: crate::parser::SchemaTypeOwner,
+        ancestry: FieldAncestry,
+        path: LeafPath,
+    ) -> Self {
+        Self {
+            schema: ContractSchema::Resource(schema),
+            attribute,
+            owner,
+            ancestry,
+            path,
+        }
+    }
+
     fn attr(&self) -> &CompiledAttributeType {
-        &self.schema.attributes()[&self.attribute].attr_type
+        match &self.schema {
+            ContractSchema::Resource(schema) => &schema.attributes()[&self.attribute].attr_type,
+            ContractSchema::Configuration(schema) => &schema.parts()[&self.attribute],
+        }
     }
 
     fn defs(&self) -> &std::collections::BTreeMap<String, CompiledAttributeType> {
-        self.schema.defs()
+        match &self.schema {
+            ContractSchema::Resource(schema) => schema.defs(),
+            ContractSchema::Configuration(_) => crate::schema::empty_defs_for_schema_walks(),
+        }
     }
 
     fn lookup<'a>(
@@ -377,6 +406,11 @@ enum AdmissionProof<'a, P: PlaceholderKind, B: BindingAddress> {
     Apply(KnownValue<'a, P, B>),
 }
 
+enum AdmissionLookup<'a> {
+    Catalog,
+    Configuration(&'a dyn crate::schema::ValidatedCustomTypeLookup),
+}
+
 /// Main's ordinary assignment work requires a current, expression-origin value.
 /// Authored policy instead uses AssignmentCheck, including discarded positions.
 type OrdinaryAssignmentCheck<'a, P, B> =
@@ -410,6 +444,7 @@ pub struct AdmissionContext<
     proof: AdmissionProof<'a, P, B>,
     bindings: Option<&'a BindingIndex<'a, B>>,
     provider: &'a dyn ProviderTypeCheckContext,
+    lookup: AdmissionLookup<'a>,
     assignment: AssignmentChecks<'a, P, B>,
     cursor: crate::parser::retained::AuthoredCursor<'a, B>,
     coverage: std::cell::RefCell<crate::schema::value_validation::WalkCoverage>,
@@ -507,6 +542,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
             proof: AdmissionProof::Apply(proof.clone()),
             bindings: None,
             provider,
+            lookup: AdmissionLookup::Catalog,
             assignment: Default::default(),
             cursor: crate::parser::retained::AuthoredCursor::projected(phase),
             coverage: Default::default(),
@@ -545,6 +581,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
                 proof,
                 bindings,
                 provider,
+                lookup: AdmissionLookup::Catalog,
                 assignment: Default::default(),
                 cursor,
                 coverage: Default::default(),
@@ -929,6 +966,13 @@ pub fn admit<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
     candidate: Candidate<P, B>,
     context: &AdmissionContext<'_, P, B>,
 ) -> Result<Admission<K, P, B>, AdmissionErrors> {
+    if destination
+        .contract
+        .as_ref()
+        .is_some_and(|contract| matches!(contract.schema, ContractSchema::Configuration(_)))
+    {
+        return configuration::admit_field(destination, candidate, context);
+    }
     if context.is_apply() {
         return admit_apply(destination, candidate, context).map(Admission::Ready);
     }
@@ -968,6 +1012,19 @@ fn admit_apply<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
             operation: "apply admission",
         }
         .into());
+    }
+    if destination
+        .contract
+        .as_ref()
+        .is_some_and(|contract| matches!(contract.schema, ContractSchema::Configuration(_)))
+    {
+        return match configuration::admit_field(destination, candidate, context)? {
+            Admission::Ready(value) => Ok(value),
+            Admission::Pending(_) => Err(KnowledgeError::<B>::UnresolvedAtBoundary {
+                sites: context.sites(),
+            }
+            .into()),
+        };
     }
     let assignment::AssignmentJudgement { verdict, findings } =
         assignment::judge_with_findings(destination, &candidate, context)?;

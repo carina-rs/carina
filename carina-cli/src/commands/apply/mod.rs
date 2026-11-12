@@ -85,7 +85,7 @@ use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     AddressedDataSourceReadInputs, ProjectedPhase1RefreshInputs, ProviderLoad, ValidatedConfig,
     create_normalizers_from_configs_with_ctx, create_providers_from_configs_with_ctx,
-    get_provider_with_ctx, module_constraint_plan_errors, prepare_default_provider_ready_config,
+    get_provider_with_ctx, module_constraint_plan_errors, prepare_default_provider_construction,
     read_managed_state_with_retry, refresh_loaded_orphan_with_retry,
 };
 #[cfg(test)]
@@ -2287,11 +2287,11 @@ async fn create_state_bucket_bootstrap_provider<R>(
     let ctx = validated_config.context();
     let factory = provider_mod::find_factory(ctx.factories(), provider_name)
         .ok_or_else(|| format!("No provider factory found for '{provider_name}'"))?;
-    let config = prepare_default_provider_ready_config(factory, provider_name, provider_configs)?;
-    let session = plan.session(provider_name, None, Some(&config));
-    let provider = provider_mod::ProviderBoundary::initialize(factory, &session).await?;
+    let construction =
+        prepare_default_provider_construction(factory, provider_name, provider_configs, plan)?;
+    let provider = provider_mod::ProviderBoundary::initialize(&construction).await?;
     let normalizer =
-        Box::new(provider_mod::ProviderBoundary::initialize_normalizer(factory, &session).await?)
+        Box::new(provider_mod::ProviderBoundary::initialize_normalizer(&construction).await?)
             as Box<dyn carina_core::provider::HostNormalizer>;
     let mut router = ProviderRouter::new();
     router.add_provider(provider_name.to_string(), provider);

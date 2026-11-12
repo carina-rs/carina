@@ -41,10 +41,8 @@ impl ProviderFactory for ProviderConfigCaptureFactory {
         '_,
         carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
     > {
-        *self.received_role_arn.lock().unwrap() = config
-            .configuration()
-            .and_then(|config| config.attributes().get("role_arn"))
-            .cloned();
+        *self.received_role_arn.lock().unwrap() =
+            config.configuration().attributes().get("role_arn").cloned();
         Box::pin(async {
             Ok(
                 carina_core::provider::InitializeOutcome::unavailable().with_provider(Box::new(

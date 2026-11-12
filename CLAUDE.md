@@ -568,9 +568,9 @@ A struct type represents a nested object with typed fields.
   (carina#3981, carina#3984). Accepted write-only values, including nested
   leaves, are recorded in state (since state v18; secrets as hashes) so plans
   converge.
-- **Provider input wire checks**: `WireReady<T>::try_new` is the sole admission
-  constructor for complete desired resources, data sources, final update
-  patches and provider configuration. It caches the checked projection after
+- **Provider input wire checks**: `WireReady<T>::try_new` checks and caches the
+  transport projection of complete desired resources, data sources, final update
+  patches and admitted provider configuration. It does not mint declaration admission. It caches the checked projection after
   host rewrites, including default tags and observed ignored patch leaves.
   Each final payload is projected once. Wire failures remain
   `ProviderPreparationError::Wire`, with protected diagnostic paths retained.
@@ -703,9 +703,13 @@ A struct type represents a nested object with typed fields.
   `NeedsLocal` exists only in the admission-facing reference relation, requiring
   a `ReferenceCandidate`; it cannot convert back into general type compatibility.
   Resource/data-source attributes use `admit_apply_resource`/`admit_apply_data_source`
-  in `executor/provider_ready.rs`; provider config uses
-  `validate_provider_config_attributes` on resolved values. These validate the full
-  destination declaration before dispatch. Function parameters/returns additionally
+  in `executor/provider_ready.rs`. Provider configuration enters `admit()` through
+  `validation/admission/configuration/`, including compact-list custom-type callbacks.
+  Its immutable aggregate owns the exact canonical payload and field placements.
+  Sessions require admitted configuration, including empty built-in configurations;
+  initialization consumes a construction owner pairing that session with its selected
+  factory. Declaration-loading diagnostics use `ProviderValidationInputs`, which
+  cannot initialize a provider. These validate the full destination before dispatch. Function parameters/returns additionally
   use runtime `check_resolved_constraints_at`; backend schemas have no anonymous
   refinements. Member String failures keep their structured pattern/
   length category and label the slot's member constraint; identity failures run first.

@@ -46,6 +46,7 @@ impl ProviderFactory for NamedFactory {
     fn create_normalizer(
         &self,
         session: &ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         self.0
             .lock()

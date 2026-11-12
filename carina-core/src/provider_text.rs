@@ -13,6 +13,8 @@ macro_rules! host_api {
     };
 }
 
+pub(crate) use host_api;
+
 pub mod boundary;
 mod events;
 pub(crate) use events::DiagnosticOwner;

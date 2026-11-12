@@ -6738,12 +6738,12 @@ async fn test_wasm_normalize_state_trap_is_an_error_and_does_not_mutate_state() 
     let attributes = indexmap::IndexMap::new();
     let config = ready_config(&factory, &attributes);
     let session =
-        carina_core::provider::ProviderPlan::state_only().session("mock", None, Some(&config));
-    let provider = carina_core::provider::ProviderBoundary::initialize(&factory, &session)
+        carina_core::provider::ProviderPlan::state_only().test_session("mock", None, Some(&config));
+    let provider = carina_core::provider::ProviderBoundary::initialize_for_test(&factory, &session)
         .await
         .expect("provider should initialize");
     let normalizer =
-        carina_core::provider::ProviderBoundary::initialize_normalizer(&factory, &session)
+        carina_core::provider::ProviderBoundary::initialize_normalizer_for_test(&factory, &session)
             .await
             .expect("normalizer should initialize");
     let id = ResourceId::with_provider_identity(
@@ -6921,12 +6921,12 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
     let attributes = indexmap::IndexMap::new();
     let config = ready_config(&factory, &attributes);
     let session =
-        carina_core::provider::ProviderPlan::state_only().session("mock", None, Some(&config));
-    let provider = carina_core::provider::ProviderBoundary::initialize(&factory, &session)
+        carina_core::provider::ProviderPlan::state_only().test_session("mock", None, Some(&config));
+    let provider = carina_core::provider::ProviderBoundary::initialize_for_test(&factory, &session)
         .await
         .expect("provider should initialize");
     let normalizer =
-        carina_core::provider::ProviderBoundary::initialize_normalizer(&factory, &session)
+        carina_core::provider::ProviderBoundary::initialize_normalizer_for_test(&factory, &session)
             .await
             .expect("normalizer should initialize");
 

@@ -413,6 +413,7 @@ impl ValueValidationFindings {
         self.local_error.iter().chain(&self.additional_local_errors)
     }
 
+    #[cfg(test)]
     pub(super) fn into_errors(self) -> Vec<TypeError> {
         self.local_error
             .into_iter()
@@ -1060,6 +1061,7 @@ pub(super) fn select_union_member_on_path<'a>(
     select_union_member_from_knowledge_on_path(members, &knowledge, defs, visited)
 }
 
+#[cfg(test)]
 pub(crate) fn validate_value_with_lookup<
     'v,
     P: PlaceholderKind,

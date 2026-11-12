@@ -16,10 +16,10 @@ use carina_provider_protocol::diagnostics as wire;
 /// let _ = carina_plugin_sdk::ProviderDiagnostics::new(std::io::sink());
 /// ```
 /// ```
-/// use carina_core::provider::ProviderPlan;
+/// use carina_core::provider::ProviderValidationInputs;
 /// use carina_plugin_sdk::ProviderDiagnostics;
-/// let session = ProviderPlan::state_only().session("example", None, None);
-/// let diagnostics = ProviderDiagnostics::from_session(&session);
+/// let inputs = ProviderValidationInputs::for_schema("example");
+/// let diagnostics = ProviderDiagnostics::for_validation(&inputs);
 /// ```
 #[derive(Clone)]
 pub struct ProviderDiagnostics {

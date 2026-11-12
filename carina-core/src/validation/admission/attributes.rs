@@ -132,13 +132,13 @@ impl crate::schema::OwnerBoundResourceSchema<'_> {
         destination.identity.path.push(ordinal);
         #[cfg(test)]
         super::tests::contract_constructed();
-        destination.contract = Some(Box::new(DestinationContract {
-            schema: self.schema().shared_schema(),
-            attribute: effective.name().into(),
-            owner: self.schema_type_owner().clone(),
-            ancestry: FieldAncestry::from_input_mode(effective.effective_input_mode()),
-            path: LeafPath::from_segments([LeafPathSegment::StructField(attribute.into())]),
-        }));
+        destination.contract = Some(Box::new(DestinationContract::resource(
+            self.schema().shared_schema(),
+            effective.name().into(),
+            self.schema_type_owner().clone(),
+            FieldAncestry::from_input_mode(effective.effective_input_mode()),
+            LeafPath::from_segments([LeafPathSegment::StructField(attribute.into())]),
+        )));
         destination
     }
 }

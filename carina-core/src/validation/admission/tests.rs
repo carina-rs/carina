@@ -163,8 +163,11 @@ fn destination_contracts_share_the_registered_schema_allocation() {
             .unwrap();
         for destination in [&destination, &destination.clone()] {
             let contract = destination.contract.as_deref().unwrap();
+            let ContractSchema::Resource(schema) = &contract.schema else {
+                panic!("resource destination")
+            };
             assert!(std::ptr::eq(
-                contract.schema.as_ref(),
+                schema.as_ref(),
                 registered.schema().as_schema()
             ));
             assert!(std::ptr::eq(

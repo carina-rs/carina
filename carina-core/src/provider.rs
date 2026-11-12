@@ -7068,8 +7068,8 @@ impl InitializeOutcome {
     }
 }
 
-/// One-shot capability supplied only while a provider factory initializes an
-/// instance. Its private field prevents callers from minting an available
+/// One-shot capability supplied only while the admitted construction owner
+/// initializes a provider or its normalizer. Its private field prevents callers from minting an available
 /// initialization outcome outside that transition.
 #[doc(hidden)]
 pub struct InitializeOutcomeMint {
@@ -7165,12 +7165,12 @@ impl InitializedProvider {
                 })
             }
         }
-        futures::executor::block_on(ProviderBoundary::initialize(
+        futures::executor::block_on(ProviderBoundary::initialize_for_test(
             &Factory {
                 provider: std::sync::Mutex::new(Some(provider)),
                 scope: reference_scope,
             },
-            &ProviderPlan::state_only().session("", None, None),
+            &ProviderPlan::state_only().test_session("", None, None),
         ))
         .unwrap()
     }
@@ -7227,7 +7227,7 @@ impl NormalizerRouter {
 #[cfg(test)]
 impl<N> ConfiguredNormalizer<N> {
     pub(crate) fn fixture(ext: N) -> Self {
-        let session = ProviderPlan::state_only().session("", None, None);
+        let session = ProviderPlan::state_only().test_session("", None, None);
         Self {
             diagnostic_inputs: session.guest_inputs(),
             route: None,
@@ -7260,7 +7260,7 @@ impl NormalizerRouter {
         ext: Box<dyn ProviderNormalizer>,
     ) {
         let provider_name = provider_name.into();
-        let session = ProviderPlan::state_only().session(&provider_name, None, None);
+        let session = ProviderPlan::state_only().test_session(&provider_name, None, None);
         self.add_initialized_normalizer(ConfiguredNormalizer {
             diagnostic_inputs: session.guest_inputs(),
             route: None,
@@ -8624,6 +8624,7 @@ pub trait ProviderFactory: Send + Sync {
     fn create_normalizer(
         &self,
         _config: &crate::provider::ProviderSession,
+        _: crate::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -11175,7 +11176,7 @@ mod tests {
                 Box::pin(async { Err(ProviderError::internal("not used")) })
             }
         }
-        let (session, events) = captured_session(ProviderPlan::state_only().session_builder(
+        let (session, events) = captured_session(ProviderPlan::state_only().test_session_builder(
             "config-owner",
             None,
             None,
@@ -13244,7 +13245,7 @@ mod tests {
         Arc<std::sync::Mutex<Vec<crate::provider_text::BoundProviderEvent>>>,
     ) {
         let (session, events) =
-            captured_session(ProviderPlan::state_only().session_builder("mock", None, None));
+            captured_session(ProviderPlan::state_only().test_session_builder("mock", None, None));
         let mut boundary = ProviderBoundary::fixture(AsyncDiagnosticFloodProvider {
             diagnostics: session.diagnostics(),
             emission,
@@ -13422,7 +13423,7 @@ mod tests {
     #[tokio::test]
     async fn native_calls_have_independent_budgets_and_one_notice_each() {
         let (session, events) =
-            captured_session(ProviderPlan::state_only().session_builder("mock", None, None));
+            captured_session(ProviderPlan::state_only().test_session_builder("mock", None, None));
         let mut boundary = ProviderBoundary::fixture(DiagnosticFloodProvider {
             diagnostics: session.diagnostics(),
             inner: MockProvider,
@@ -16139,7 +16140,7 @@ mod tests {
         let config =
             crate::executor::prepare_provider_ready_config(&factory, resolved_config.as_ref())
                 .unwrap();
-        let result = ProviderBoundary::initialize(
+        let result = ProviderBoundary::initialize_for_test(
             &factory,
             &crate::provider::prepare_provider_session::<
                 crate::resource::ModuleSource,
@@ -16240,7 +16241,7 @@ mod tests {
         let config =
             crate::executor::prepare_provider_ready_config(&factory, resolved_config.as_ref())
                 .unwrap();
-        let _ = ProviderBoundary::initialize(
+        let _ = ProviderBoundary::initialize_for_test(
             &factory,
             &crate::provider::prepare_provider_session::<
                 crate::resource::ModuleSource,
@@ -16249,7 +16250,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let _ = ProviderBoundary::initialize(
+        let _ = ProviderBoundary::initialize_for_test(
             &factory,
             &crate::provider::prepare_provider_session::<
                 crate::resource::ModuleSource,
@@ -16258,7 +16259,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let _ = ProviderBoundary::initialize(
+        let _ = ProviderBoundary::initialize_for_test(
             &factory,
             &crate::provider::prepare_provider_session::<
                 crate::resource::ModuleSource,
@@ -16633,6 +16634,7 @@ mod provider_text_route_tests {
         fn create_normalizer(
             &self,
             _: &ProviderSession,
+            _: crate::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
             let probe = Probe(self.0.clone());
             Box::pin(async move { Ok(Box::new(probe) as Box<dyn ProviderNormalizer>) })
@@ -16654,9 +16656,10 @@ mod provider_text_route_tests {
         }
         let session = prepare_provider_session("route-probe", Some("first"), None, &desired, &[]);
         let seen = Arc::new(Seen::default());
-        let normalizer = ProviderBoundary::initialize_normalizer(&Factory(seen.clone()), &session)
-            .await
-            .unwrap();
+        let normalizer =
+            ProviderBoundary::initialize_normalizer_for_test(&Factory(seen.clone()), &session)
+                .await
+                .unwrap();
         let mut router = NormalizerRouter::new();
         router.add_initialized_normalizer(normalizer);
         let mut resources = desired

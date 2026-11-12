@@ -119,8 +119,8 @@ async fn guest_stderr_round5_deferred_ref_grows_during_and_after_create() {
         )),
     );
     let session =
-        plan_for_desired(std::slice::from_ref(&desired)).session("stderr-test", None, None);
-    let provider = ProviderBoundary::initialize(&LateFactory(stderr.clone()), &session)
+        plan_for_desired(std::slice::from_ref(&desired)).test_session("stderr-test", None, None);
+    let provider = ProviderBoundary::initialize_for_test(&LateFactory(stderr.clone()), &session)
         .await
         .unwrap();
     let _writer = stderr.begin_call(&session.guest_inputs());
