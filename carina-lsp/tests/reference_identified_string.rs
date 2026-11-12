@@ -54,6 +54,30 @@ shape_test!(issue_4384_map_in_union, "union_map");
 shape_test!(issue_4384_struct_in_union, "union_struct");
 
 #[test]
+fn issue_4384_differently_identified_string_and_reference_inputs_have_no_diagnostics() {
+    for (kind, source_type) in fixture::differently_identified_reference_input_sources() {
+        let engine = engine_with_schemas(fixture::differently_identified_reference_input_schemas(
+            source_type,
+        ));
+        let main = fixture::consumer("source.value");
+        let directory = fixture::directory(&main, "");
+        for source in [
+            "let source = mock.InputSource {}\n",
+            "let source = mock.InputSource { value = 'k' }\n",
+        ] {
+            std::fs::write(directory.path().join("sources.crn"), source).unwrap();
+            for file in ["main.crn", "sources.crn", "providers.crn", "backend.crn"] {
+                assert_eq!(
+                    analyze(&engine, &directory, file),
+                    [],
+                    "{kind}: {file}: {source}{main}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn issue_4384_reference_identityless_same_identity_and_reference_sinks_have_no_diagnostics() {
     for (control, target, reference) in fixture::accepted_targets() {
         for (shape, ty, expression) in fixture::shapes_for(target.clone()) {

@@ -90,6 +90,34 @@ fn issue_4384_same_identity_identityless_and_reference_sinks_stay_accepted() {
 }
 
 #[test]
+fn issue_4384_differently_identified_string_and_reference_inputs_stay_accepted() {
+    for (kind, source_type) in fixture::differently_identified_reference_input_sources() {
+        let schemas = fixture::differently_identified_reference_input_schemas(source_type);
+        let engine = engine_with_schemas(schemas.clone());
+        let main = fixture::consumer("source.value");
+        let directory = fixture::directory(&main, "");
+        for source in [
+            "let source = mock.InputSource {}\n",
+            "let source = mock.InputSource { value = 'k' }\n",
+        ] {
+            std::fs::write(directory.path().join("sources.crn"), source).unwrap();
+            assert_eq!(
+                cli_diagnostics(factories_for(&schemas), &directory),
+                Vec::<String>::new(),
+                "{kind}: {source}{main}"
+            );
+            for file in ["main.crn", "sources.crn", "providers.crn", "backend.crn"] {
+                assert_eq!(
+                    lsp_diagnostics(&engine, &directory, file),
+                    [],
+                    "{kind}: {file}: {source}{main}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn issue_4384_reference_identity_admission_at_annotated_boundaries() {
     let schemas = fixture::schemas(fixture::identified_string(
         carina_core::schema::TypeIdentity::from_dotted("mock.RecoveryProbe"),

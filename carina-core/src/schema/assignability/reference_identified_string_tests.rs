@@ -75,6 +75,54 @@ fn issue_4384_reference_to_identified_string_requires_identity_admission() {
 }
 
 #[test]
+fn issue_4384_multi_owner_string_annotation_treats_reference_and_string_sources_equally() {
+    use crate::parser::{ResolvedSchemaType, TypeExpr};
+    use crate::schema::CompiledAttributeType;
+
+    let identity = TypeIdentity::from_dotted("mock.Reference");
+    let broad_length = Some((Some(1), Some(32)));
+    let source_string =
+        CompiledAttributeType::refined_string(Some(identity.clone()), None, broad_length, None);
+    let source_reference = CompiledAttributeType::reference(identity.clone(), None, broad_length);
+    let narrower =
+        CompiledAttributeType::refined_string(Some(identity), None, Some((Some(1), Some(8))), None);
+    let first = ResolvedSchemaType::from_annotation_declaration("a", &source_string).unwrap();
+    let second = ResolvedSchemaType::from_annotation_declaration("b", &narrower).unwrap();
+    let owned = first.conjoin(&second);
+    assert_eq!(owned.owners().iter().len(), 2);
+    let target = crate::validation::lift_type_expr(&TypeExpr::SchemaType { owned }).unwrap();
+    let AttrTypeKind::String { identity_layer, .. } = target.kind() else {
+        panic!("the conjoined annotation must remain a String");
+    };
+    assert_eq!(identity_layer.parts().length, Some((Some(1), Some(8))));
+    let catalog = catalog();
+    let sink = target.assignment_sink(&catalog);
+
+    // Declaration compatibility retains identity-bound containment, even for
+    // equal identities; the broad source is not contained by the conjoined sink.
+    let string_declaration = TypeInSchema::schemaless(&source_string).assignment_to(sink);
+    assert_eq!(string_declaration, TypeAssignability::Mismatch);
+    assert_eq!(
+        TypeInSchema::schemaless(&source_reference).assignment_to(sink),
+        string_declaration
+    );
+
+    // Same-identity reference admission instead retains the destination check
+    // for these overlapping bounds, regardless of the source's scalar form.
+    for source in [&source_string, &source_reference] {
+        assert!(matches!(
+            TypeInSchema::schemaless(source).assignment_on_paths(
+                sink,
+                ReferenceAssignmentCheck::Full,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            ),
+            AssignmentRelation::NeedsLocal(None)
+        ));
+    }
+}
+
+#[test]
 fn issue_4384_original_reference_identity_evidence_is_rechecked() {
     let catalog = catalog();
     let owner = crate::parser::SchemaTypeOwner::Provider("mock".into());

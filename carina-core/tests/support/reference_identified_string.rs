@@ -154,6 +154,37 @@ pub fn accepted_targets() -> Vec<(&'static str, AttributeType, &'static str)> {
     ]
 }
 
+pub fn differently_identified_reference_input_sources() -> Vec<(&'static str, AttributeType)> {
+    vec![
+        (
+            "String",
+            identified_string(TypeIdentity::from_dotted("mock.StringSource")),
+        ),
+        (
+            "Reference",
+            AttributeType::reference(key_identity(), None, None),
+        ),
+    ]
+}
+
+pub fn differently_identified_reference_input_schemas(
+    source_type: AttributeType,
+) -> SchemaRegistry {
+    let mut schemas = schemas(AttributeType::reference(
+        TypeIdentity::from_dotted("mock.OtherReference"),
+        None,
+        None,
+    ));
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("InputSource")
+            .attribute(AttributeSchema::optional("value", source_type).build())
+            .validate()
+            .unwrap(),
+    );
+    schemas
+}
+
 pub fn directory(main: &str, source: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     for (file, text) in [

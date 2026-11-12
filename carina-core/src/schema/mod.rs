@@ -4443,9 +4443,9 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     range: _,
                 },
             ) if target.identity().is_none() => KnownAssignment::DeferToSinkValue,
-            // A resolver identity selects comparison behavior, not a different
-            // wire scalar. Reference inputs accept string outputs; constraints
-            // are checked on the materialized value before planning.
+            // Reference slots deliberately accept any string-based source (reference
+            // inputs accept string outputs; constraints are checked on the materialized
+            // value), and #4384 changed only Reference -> identified String admission.
             (
                 String {
                     identity_layer: _,

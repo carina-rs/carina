@@ -68,19 +68,25 @@ fn substituted_reference_validate_matches_unknown_source_verdicts_and_messages()
     let (control, text) = run(dir.path(), &["validate", "."]);
     assert!(!control.status.success(), "{text}");
     let control_errors = errors(&text);
-    assert_eq!(control_errors.len(), 1, "{text}");
-    for (unknown_source, known_source, reference, accepted) in [
+    assert_eq!(
+        control_errors,
+        [
+            "mock.test.recovery_probe.sink: cannot assign String to 'value': expected mock.RecoveryProbe, got String (from a.computed)"
+        ],
+        "{text}"
+    );
+    for (unknown_source, known_source, reference, expected_message) in [
         (
             "let a = mock.test.estimated_input {}",
             "let a = mock.test.estimated_input { name = 'abc' }",
             "a.name",
-            false,
+            "mock.test.recovery_probe.sink: cannot assign String to 'value': expected mock.RecoveryProbe, got String (from a.name)",
         ),
         (
             "let r = mock.test.reference { name = 'r' }",
             "let r = mock.test.reference { name = 'r' key = 'k' }",
             "r.key",
-            false,
+            "mock.test.recovery_probe.sink: cannot assign mock.keys.Key.Reference to 'value': expected mock.RecoveryProbe, got mock.keys.Key.Reference (from r.key)",
         ),
     ] {
         for sibling in [false, true] {
@@ -104,26 +110,12 @@ fn substituted_reference_validate_matches_unknown_source_verdicts_and_messages()
             };
             write(unknown_source);
             let (unknown, text) = run(dir.path(), &["validate", "."]);
-            assert_eq!(
-                unknown.status.success(),
-                accepted,
+            assert!(
+                !unknown.status.success(),
                 "{reference}, sibling={sibling}: {text}"
             );
             let unknown_errors = errors(&text);
-            if !accepted {
-                let expected: Vec<_> = control_errors
-                    .iter()
-                    .map(|message| {
-                        let message = message.replace("a.computed", reference);
-                        if reference == "r.key" {
-                            message.replace("String", "mock.keys.Key.Reference")
-                        } else {
-                            message
-                        }
-                    })
-                    .collect();
-                assert_eq!(unknown_errors, expected);
-            }
+            assert_eq!(unknown_errors, [expected_message]);
             write(known_source);
             let (output, text) = run(dir.path(), &["validate", "."]);
             assert_eq!(
