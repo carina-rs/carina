@@ -3570,10 +3570,10 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![
                     format!(
-                        "{context}: Invalid value 'aaaaaa': length 6 is outside allowed range [, 5]"
+                        "{context}: Invalid value 'aaaaaa': length 6 is outside allowed range unbounded..=5"
                     ),
                     format!(
-                        "{context}: Invalid value 'bbbbbbb': length 7 is outside allowed range [, 5]"
+                        "{context}: Invalid value 'bbbbbbb': length 7 is outside allowed range unbounded..=5"
                     ),
                 ]
             );
@@ -3669,7 +3669,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "test rejected `Short`: Invalid Short value 'aaaaaa': length 6 is outside allowed range [, 5]"
+            "test rejected `Short`: Invalid Short value 'aaaaaa': length 6 is outside allowed range unbounded..=5"
         );
         assert!(resolver.0.lock().unwrap().is_empty());
         crate::parser::validate_custom_type_value(
@@ -4149,7 +4149,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(
                 String::new(),
-                "Invalid Short value 'too long': length 8 is outside allowed range [, 3]".into()
+                "Invalid Short value 'too long': length 8 is outside allowed range unbounded..=3"
+                    .into()
             ),]
         );
         assert_eq!(
@@ -4158,7 +4159,7 @@ mod tests {
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
-            vec!["Invalid Short value 'too long': length 8 is outside allowed range [, 3]",]
+            vec!["Invalid Short value 'too long': length 8 is outside allowed range unbounded..=3",]
         );
     }
 
@@ -4208,12 +4209,12 @@ mod tests {
                     .collect::<Vec<_>>(),
                 if both_local {
                     vec![
-                        "Invalid VpcId value 'bad-long': length 8 is outside allowed range [, 5]",
-                        "Invalid VpcId value 'vpc-123': length 7 is outside allowed range [, 5]",
+                        "Invalid VpcId value 'bad-long': length 8 is outside allowed range unbounded..=5",
+                        "Invalid VpcId value 'vpc-123': length 7 is outside allowed range unbounded..=5",
                     ]
                 } else {
                     vec![
-                        "Invalid VpcId value 'vpc-123': length 7 is outside allowed range [, 5]",
+                        "Invalid VpcId value 'vpc-123': length 7 is outside allowed range unbounded..=5",
                         "Validation failed: VpcId rejects bad",
                     ]
                 }

@@ -11313,7 +11313,7 @@ fn issue_4282_deferred_builtin_results_use_existing_resolved_value_checks() {
                 } else {
                     assert!(
                         message.contains(if input == "abcd" {
-                            "length 4 is outside allowed range [1, 3]"
+                            "length 4 is outside allowed range 1..=3"
                         } else {
                             "does not match required pattern /^[a-z]+$/"
                         }),

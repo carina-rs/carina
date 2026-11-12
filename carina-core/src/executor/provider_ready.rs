@@ -2589,7 +2589,7 @@ mod provider_config_tests {
         ));
         assert_eq!(
             error.to_string(),
-            "provider owner: values: List item at index 0: Invalid Short value 'abcd': length 4 is outside allowed range [, 3]"
+            "provider owner: values: List item at index 0: Invalid Short value 'abcd': length 4 is outside allowed range unbounded..=3"
         );
     }
 

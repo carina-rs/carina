@@ -2718,6 +2718,12 @@ fn is_duplicate_list_error(error: &TypeError) -> bool {
             attribute: _,
             type_name: _,
         }
+        | TypeError::ValueOutOfRange {
+            value: _,
+            bounds: _,
+            attribute: _,
+            type_name: _,
+        }
         | TypeError::StringLiteralExpectedEnum {
             user_typed: _,
             attribute: _,

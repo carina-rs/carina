@@ -194,9 +194,9 @@ fn assert_nested_module_if_lsp(container: &str) {
     };
     let expected = [("aaaaaa", 6), ("bbbbbbb", 7)].map(|(value, len)| {
         let message = match container {
-            "struct" => format!("Invalid value '{value}': length {len} is outside allowed range [, 5]"),
-            "map" => format!("Map value for key 'name': Invalid value '{value}' for 'value': length {len} is outside allowed range [, 5]"),
-            _ => format!("Invalid value '{value}' for 'value[0]': length {len} is outside allowed range [, 5]"),
+            "struct" => format!("Invalid value '{value}': length {len} is outside allowed range unbounded..=5"),
+            "map" => format!("Map value for key 'name': Invalid value '{value}' for 'value': length {len} is outside allowed range unbounded..=5"),
+            _ => format!("Invalid value '{value}' for 'value[0]': length {len} is outside allowed range unbounded..=5"),
         };
         (message, Some(DiagnosticSeverity::WARNING), Range::new(Position::new(1, start), Position::new(1, end)))
     });

@@ -1314,7 +1314,7 @@ fn issue_4282_module_join_reports_named_string_length_rule() {
     assert_module_constructed_string(
         "join('', ['carina-', '360000', '-role'])",
         "role_name",
-        Some("length 18 is outside allowed range [1, 16]"),
+        Some("length 18 is outside allowed range 1..=16"),
     );
 }
 
@@ -1323,7 +1323,7 @@ fn issue_4282_module_interpolation_reports_named_string_length_rule() {
     assert_module_constructed_string(
         r#""carina-${'360000'}-role""#,
         "role_name",
-        Some("length 18 is outside allowed range [1, 16]"),
+        Some("length 18 is outside allowed range 1..=16"),
     );
 }
 
@@ -1343,7 +1343,7 @@ fn issue_4282_module_trim_at_named_string_uses_interpolation_rules() {
     assert_module_constructed_string(
         "trim(' carina-360000-role ')",
         "role_name",
-        Some("length 18 is outside allowed range [1, 16]"),
+        Some("length 18 is outside allowed range 1..=16"),
     );
 }
 
@@ -1413,7 +1413,7 @@ fn issue_4282_split_at_named_string_list_checks_values_in_cli_and_lsp() {
     for (input, expected_rule) in [
         ("abc,def", None),
         ("A,b", Some("does not match required pattern /^[a-z]+$/")),
-        ("abc,abcd", Some("length 4 is outside allowed range [1, 3]")),
+        ("abc,abcd", Some("length 4 is outside allowed range 1..=3")),
         (
             "abc,123",
             Some("does not match required pattern /^[a-z]+$/"),
@@ -6351,7 +6351,7 @@ fn assert_single_value_walk_f03_errors(errors: &[String]) {
     );
     assert!(
         errors[0].contains("Invalid value 'abcd' for 'params' (VpcId)")
-            && errors[0].contains("length 4 is outside allowed range [, 3]"),
+            && errors[0].contains("length 4 is outside allowed range unbounded..=3"),
         "F03 must retain the local length diagnostic: {errors:#?}",
     );
     assert!(
@@ -6812,7 +6812,9 @@ fn issue_4276_round1_module_if_reports_undecided_branch_constraints() {
             .iter()
             .map(|d| d.message.as_str())
             .collect::<Vec<_>>(),
-        vec!["Invalid value 'too long' for 'params': length 8 is outside allowed range [, 3]",]
+        vec![
+            "Invalid value 'too long' for 'params': length 8 is outside allowed range unbounded..=3",
+        ]
     );
 }
 
@@ -6878,7 +6880,7 @@ fn issue_4276_round2_c_identified_module_if_cli_checks_expanded_value_once() {
             Vec::new()
         } else {
             vec![
-                "awsccmock.test.Sink.<pending>: Invalid value 'vpc-123' for 'params' (VpcId): length 7 is outside allowed range [, 5]",
+                "awsccmock.test.Sink.<pending>: Invalid value 'vpc-123' for 'params' (VpcId): length 7 is outside allowed range unbounded..=5",
             ]
         };
         assert_eq!(
@@ -6905,7 +6907,7 @@ fn issue_4276_round2_c_identified_module_if_lsp_reports_local_branch_error() {
             .map(|d| d.message.as_str())
             .collect::<Vec<_>>(),
         vec![
-            "Invalid value 'vpc-123' for 'params' (VpcId): length 7 is outside allowed range [, 5]",
+            "Invalid value 'vpc-123' for 'params' (VpcId): length 7 is outside allowed range unbounded..=5",
         ]
     );
     assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
@@ -6957,7 +6959,7 @@ fn issue_4276_round1_module_if_expansion_reports_chosen_branch_once() {
         if !flag {
             assert_eq!(
                 cli[0],
-                "awsccmock.test.Sink.<pending>: Invalid value 'too long' for 'params': length 8 is outside allowed range [, 3]"
+                "awsccmock.test.Sink.<pending>: Invalid value 'too long' for 'params': length 8 is outside allowed range unbounded..=3"
             );
         }
     }
@@ -7154,7 +7156,7 @@ fn issue_4276_round1_provider_config_keeps_main_local_error_text() {
     assert_eq!(
         cli,
         vec![
-            "provider awsccmock: params: List item at index 0: Invalid VpcId value 'abcd': length 4 is outside allowed range [, 3]"
+            "provider awsccmock: params: List item at index 0: Invalid VpcId value 'abcd': length 4 is outside allowed range unbounded..=3"
         ]
     );
     let diagnostics =
@@ -7174,7 +7176,7 @@ fn issue_4276_round1_provider_config_keeps_main_local_error_text() {
     assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
     assert_eq!(
         diagnostics[0].message,
-        "provider awsccmock: params: List item at index 0: Invalid VpcId value 'abcd': length 4 is outside allowed range [, 3]"
+        "provider awsccmock: params: List item at index 0: Invalid VpcId value 'abcd': length 4 is outside allowed range unbounded..=3"
     );
     assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
     assert_eq!(
@@ -7288,7 +7290,7 @@ fn single_value_walk_nested_local_failure_skips_provider_rejection() {
         let errors = diagnostics(single_value_walk_m01_factories(params.clone()), &fixture);
         assert_eq!(errors.len(), 1, "one nested local failure: {errors:#?}");
         assert!(
-            errors[0].contains("length 4 is outside allowed range [, 3]"),
+            errors[0].contains("length 4 is outside allowed range unbounded..=3"),
             "{errors:#?}"
         );
         assert!(!errors[0].contains("rejected `VpcId`"), "{errors:#?}");
@@ -7311,7 +7313,7 @@ fn single_value_walk_valid_sibling_still_reports_provider_rejection() {
         assert_eq!(
             errors
                 .iter()
-                .filter(|error| error.contains("length 4 is outside allowed range [, 3]"))
+                .filter(|error| error.contains("length 4 is outside allowed range unbounded..=3"))
                 .count(),
             1,
             "{errors:#?}"
