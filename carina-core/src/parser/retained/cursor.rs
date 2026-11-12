@@ -1002,10 +1002,16 @@ pub struct NoAuthoredEvidence {
 }
 
 impl NoAuthoredEvidence {
-    pub(crate) fn for_resource<B: BindingAddress>(
-        resource: &crate::resource::ResourceId,
-        slots: Option<&AuthoredSlots<B>>,
-    ) -> Self {
+    /// Identify unchecked source slots without granting admission authority.
+    /// The evidence owner may differ from the resource whose values are checked.
+    pub fn for_resource<B: BindingAddress, D>(
+        source: &crate::parser::AnalysisResourceRef<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        let resource = source.id();
+        let slots = source.authored_slots();
         Self {
             resource: resource.clone(),
             slots: slots

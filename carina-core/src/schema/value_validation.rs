@@ -403,6 +403,23 @@ pub struct ResourceValueValidation {
     pub(super) attributes: HashMap<String, ValueValidationFindings>,
 }
 
+/// Symbolic rendering owns either the destination path or this exact finding.
+/// CLI preserves path ownership; LSP keeps distinct ordinary findings at a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolicDiagnosticCoverage {
+    Unowned,
+    Path,
+    Finding,
+}
+impl SymbolicDiagnosticCoverage {
+    pub fn owns_path(self) -> bool {
+        !matches!(self, Self::Unowned)
+    }
+    pub fn owns_finding(self) -> bool {
+        matches!(self, Self::Finding)
+    }
+}
+
 impl ResourceValueValidation {
     pub(crate) fn from_errors(errors: Vec<TypeError>) -> Self {
         Self {
@@ -425,6 +442,39 @@ impl ResourceValueValidation {
                     .get(&index)
                     .map(|(name, path)| (name.as_str(), path)),
             )
+        })
+    }
+
+    /// Match report errors to their symbolic owner before consuming attributes.
+    /// Diagnostic adapters share this index while retaining their rendering rules.
+    pub fn diagnostic_errors(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &TypeError,
+            Option<(&str, &LeafPath)>,
+            SymbolicDiagnosticCoverage,
+        ),
+    > {
+        let mut symbolic = HashMap::<_, Vec<_>>::new();
+        for (name, path, error) in self.symbolic_errors() {
+            symbolic.entry((name, path)).or_default().push(error);
+        }
+        self.errors_with_paths().map(move |(error, path)| {
+            let coverage = path
+                .and_then(|(name, path)| {
+                    symbolic.get(&(name, path)).map(|findings| {
+                        if findings.iter().any(|finding| {
+                            error == *finding || *error == (*finding).clone().with_attribute(name)
+                        }) {
+                            SymbolicDiagnosticCoverage::Finding
+                        } else {
+                            SymbolicDiagnosticCoverage::Path
+                        }
+                    })
+                })
+                .unwrap_or(SymbolicDiagnosticCoverage::Unowned);
+            (error, path, coverage)
         })
     }
 
@@ -3262,6 +3312,50 @@ fn has_native_validator(attr: &CompiledAttributeType) -> bool {
 mod tests {
     use super::super::CompiledAttributeType as AT;
     use super::*;
+
+    #[test]
+    fn round7_symbolic_coverage_preserves_distinct_ordinary_findings() {
+        let path = LeafPath::from_segments([]);
+        let ordinary = TypeError::MissingRequired {
+            name: "ordinary finding".into(),
+        };
+        let hook = TypeError::MissingRequired {
+            name: "hook finding".into(),
+        };
+        let report = ResourceValueValidation {
+            errors: vec![ordinary, hook.clone()],
+            error_paths: HashMap::from([
+                (0, ("input".into(), path.clone())),
+                (1, ("input".into(), path.clone())),
+            ]),
+            attributes: HashMap::from([(
+                "input".into(),
+                ValueValidationFindings {
+                    symbolic: vec![(path, hook)],
+                    ..Default::default()
+                },
+            )]),
+        };
+        let coverage = report
+            .diagnostic_errors()
+            .map(|(_, _, coverage)| coverage)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            coverage,
+            [
+                SymbolicDiagnosticCoverage::Path,
+                SymbolicDiagnosticCoverage::Finding
+            ]
+        );
+        assert!(
+            coverage[0].owns_path(),
+            "preserve CLI's established path ownership"
+        );
+        assert!(
+            !coverage[0].owns_finding(),
+            "LSP must retain a different ordinary finding"
+        );
+    }
 
     fn text(value: &str) -> Value {
         Value::Concrete(ConcreteValue::String(value.into()))
