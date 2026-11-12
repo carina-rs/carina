@@ -125,11 +125,11 @@ rule: all alternatives must infer identical `TypeExpr`s. Slot reads differing
 only in member layers therefore compare equal. An explicit compatible annotation
 accepts otherwise mixed declarations; inference does not widen their types.
 
-Schema fingerprint encoding is v13. Saved-plan format 44 supersedes 43 because
-the schema fingerprint encoding changed. Saved module `pending_constraints`
-contain value expressions (`ValidateExpr`), not retained type records. Saved-plan
+Schema fingerprint encoding is v13. Saved-plan format 45 supersedes 44 and
+retains quoted validation string literals, checked for interpolation on decode.
+Saved module `pending_constraints` contain value expressions (`ValidateExpr`), not retained type records. Saved-plan
 replay reloads identity/member constraints from fingerprint-checked provider
-schemas. Format-43 plans must be regenerated; their version gate fails
+schemas. Format-44 plans must be regenerated; their version gate fails
 before payload decoding or fingerprint verification.
 
 Every typed destination uses one String/Int identity rule: same identity

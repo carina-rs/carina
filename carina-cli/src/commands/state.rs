@@ -4430,7 +4430,9 @@ mod tests {
                     expression: ValidateExpr::Compare {
                         lhs: Box::new(ValidateExpr::Var("value".to_string())),
                         op: CompareOp::Ne,
-                        rhs: Box::new(ValidateExpr::String("bad".to_string())),
+                        rhs: Box::new(ValidateExpr::String(
+                            serde_json::from_value(serde_json::json!("'bad'")).unwrap(),
+                        )),
                     },
                     message: "value must not be bad".to_string(),
                 }],
@@ -4520,7 +4522,9 @@ mod tests {
                     expression: ValidateExpr::Compare {
                         lhs: Box::new(ValidateExpr::Var("value".to_string())),
                         op: CompareOp::Ne,
-                        rhs: Box::new(ValidateExpr::String("bad".to_string())),
+                        rhs: Box::new(ValidateExpr::String(
+                            serde_json::from_value(serde_json::json!("'bad'")).unwrap(),
+                        )),
                     },
                     message: "value must not be bad".to_string(),
                 }],

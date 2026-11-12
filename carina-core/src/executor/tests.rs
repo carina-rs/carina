@@ -5150,7 +5150,9 @@ fn module_not_bad_constraint(argument: &str) -> crate::resource::PendingModuleCo
         expression: ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::Var(argument.to_string())),
             op: CompareOp::Ne,
-            rhs: Box::new(ValidateExpr::String("bad".to_string())),
+            rhs: Box::new(ValidateExpr::String(
+                serde_json::from_value(serde_json::json!("'bad'")).unwrap(),
+            )),
         },
         message: format!("{argument} must not be bad"),
     }

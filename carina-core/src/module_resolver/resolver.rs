@@ -514,6 +514,7 @@ impl ResidualModuleResolutionError {
                 | ParseError::CyclicLetBinding { chain: _ }
                 | ParseError::InsideSecret { .. }
                 | ParseError::SecretInConstraint { .. }
+                | ParseError::InterpolationInConstraintString { .. }
                 | ParseError::ValueWalk(_)
                 | ParseError::UserFunctionError(_)
                 | ParseError::RetainedEvidence(_) => false,

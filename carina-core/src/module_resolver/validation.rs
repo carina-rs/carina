@@ -947,7 +947,7 @@ fn eval_expr<P: PlaceholderKind, B: BindingAddress>(
         ValidateExpr::Int(value) => Ok(value_from(ConcreteValue::Int(*value))),
         ValidateExpr::Float(value) => Ok(value_from(ConcreteValue::Float(*value))),
         ValidateExpr::Duration(value) => Ok(value_from(ConcreteValue::Duration(*value))),
-        ValidateExpr::String(value) => Ok(value_from(ConcreteValue::String(value.clone().into()))),
+        ValidateExpr::String(value) => Ok(value_from(ConcreteValue::String(value.as_str().into()))),
         ValidateExpr::Null => Ok(EvalValue::Null),
         ValidateExpr::Var(name) => arguments
             .get(name)
@@ -1598,7 +1598,9 @@ mod tests {
         let expression = ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::Var("password".to_string())),
             op: CompareOp::Eq,
-            rhs: Box::new(ValidateExpr::String("expected".to_string())),
+            rhs: Box::new(ValidateExpr::String(
+                serde_json::from_value(serde_json::json!("'expected'")).unwrap(),
+            )),
         };
         let arguments = HashMap::from([(
             "password".to_string(),

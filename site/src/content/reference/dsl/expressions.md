@@ -423,6 +423,13 @@ fn cidr_for_env(env: String): String {
 
 Validate expressions are boolean expressions used in `arguments` blocks for input validation and in `require` statements. They support comparison and logical operators.
 
+Strings in these conditions must be literals. Double-quoted interpolation
+(`${...}`) is rejected, including in function arguments. Single-quoted `${...}`
+text and escaped `\${` in double-quoted strings remain literal text. Condition
+strings retain their authored escape sequences without unescaping them.
+The message following a `require` condition must also be a literal without
+interpolation; a message is required.
+
 ### Comparison Operators
 
 | Operator | Meaning |

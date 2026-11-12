@@ -2539,7 +2539,7 @@ pub enum ValidateExpr<P: ValueKind = NoPlaceholder, B: BindingAddress = Absolute
     /// Duration literal (`75min`, `1h`, `30s`).
     Duration(std::time::Duration),
     /// String literal
-    String(String),
+    String(super::ValidateStringLiteral),
     /// Variable reference (argument name)
     Var(String),
     /// Attribute/index access rooted at a module argument. The path remains

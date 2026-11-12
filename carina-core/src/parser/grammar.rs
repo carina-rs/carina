@@ -42,6 +42,17 @@ pub(super) fn literal_key_pair(source: &str) -> pest::iterators::Pair<'_, Rule> 
         .unwrap()
 }
 
+pub(super) fn complete_string_pair(source: &str) -> Result<pest::iterators::Pair<'_, Rule>, ()> {
+    let pair = CarinaParser::parse(Rule::string, source)
+        .map_err(|_| ())?
+        .next()
+        .ok_or(())?;
+    if pair.as_span().start() != 0 || pair.as_span().end() != source.len() {
+        return Err(());
+    }
+    Ok(pair)
+}
+
 /// An identifier or binding name whose spelling is guaranteed by the parser grammar.
 ///
 /// Construction is limited to grammar-produced identifiers/binding names and the

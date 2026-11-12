@@ -15030,7 +15030,9 @@ mod resolved_value_constraint_gate {
         ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::Var(variable.to_string())),
             op: CompareOp::Ne,
-            rhs: Box::new(ValidateExpr::String("bad".to_string())),
+            rhs: Box::new(ValidateExpr::String(
+                serde_json::from_value(serde_json::json!("'bad'")).unwrap(),
+            )),
         }
     }
 

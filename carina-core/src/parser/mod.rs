@@ -42,6 +42,7 @@ pub(crate) use entry::{AuthoredParse, scope_parse_failure};
 mod error;
 mod evaluation;
 mod expressions;
+pub use expressions::validate_expr::{ConstraintStringPosition, ValidateStringLiteral};
 mod functions;
 mod grammar;
 mod let_binding;

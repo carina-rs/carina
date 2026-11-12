@@ -14,6 +14,67 @@ use carina_core::value::{PERSISTED_SECRET_KEY, PersistedValue};
 
 const V2_SECRET_PREFIX: &str = "$argon2id$";
 
+#[test]
+fn saved_plan_rejects_legacy_or_interpolated_constraint_strings_before_apply() {
+    let scenario =
+        Scenario::new("backend local { path = 'carina.state.json' }\nprovider mock {}\n");
+    scenario.write_root_file("main.crn", "backend local { path = 'carina.state.json' }\nprovider mock {}\nlet vpc = mock.test.resource { name = 'vpc' }\nlet checked = use { source = './checked' }\nchecked { r = vpc }\n");
+    scenario.write_module(
+        "checked",
+        "arguments { r: mock.test.resource }\nrequire r.identifier != 'x', 'bad identifier'\n",
+    );
+    assert_success("save literal constraint", &scenario.plan());
+    let original = read_json(&scenario.project.join("plan.json"));
+    let current_version = original["version"].clone();
+    assert_eq!(current_version, 45);
+    let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
+    let provider_before = fs::read(&scenario.mock_state).ok();
+
+    for (version, string, expected) in [
+        (
+            Value::from(44),
+            "${secret('CANARY_4386')}",
+            "Unsupported plan file version: 44",
+        ),
+        (
+            current_version.clone(),
+            "${secret('CANARY_4386')}",
+            "invalid validation string literal",
+        ),
+        (
+            current_version,
+            "\"${secret('CANARY_4386')}\"",
+            "invalid validation string literal",
+        ),
+    ] {
+        let mut document = original.clone();
+        document["version"] = version;
+        document["compositions"][0]["pending_constraints"][0]["expression"]["Compare"]["rhs"]["String"] =
+            Value::from(string);
+        let decode =
+            serde_json::from_value::<carina_cli::commands::plan::PlanFile>(document.clone())
+                .unwrap_err();
+        assert!(decode.to_string().contains("re-run `carina plan --out`"));
+        assert!(!format!("{decode:?} {decode}").contains("CANARY_4386"));
+        fs::write(
+            scenario.project.join("plan.json"),
+            serde_json::to_vec_pretty(&document).unwrap(),
+        )
+        .unwrap();
+        let output = scenario.apply_plan();
+        let rendered = output_text(&output);
+        assert!(!output.status.success());
+        assert!(rendered.contains(expected), "{rendered}");
+        assert!(rendered.contains("carina plan --out"), "{rendered}");
+        assert!(!rendered.contains("CANARY_4386"));
+        assert_eq!(
+            fs::read(scenario.project.join("carina.state.json")).ok(),
+            state_before
+        );
+        assert_eq!(fs::read(&scenario.mock_state).ok(), provider_before);
+    }
+}
+
 struct Scenario {
     _temp: TempDir,
     project: PathBuf,
@@ -3309,8 +3370,8 @@ fn current_saved_plan_root_and_nested_hashes_round_trip_byte_for_byte() {
     use carina_core::resource::{
         ConcreteValue, DeferredValue, SnapshotLeaf, Value as SnapshotTree,
     };
-    assert_eq!(PlanFile::CURRENT_VERSION, 44);
-    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v44.plan.json");
+    assert_eq!(PlanFile::CURRENT_VERSION, 45);
+    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v45.plan.json");
     let plan: PlanFile = serde_json::from_str(fixture).unwrap();
     assert_eq!(
         carina_core::utils::pretty_with_newline(&plan).unwrap(),
