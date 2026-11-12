@@ -1165,6 +1165,15 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         )
     }
 
+    /// Schema-backed attribute authority for a restored source reference.
+    /// Resource-handle recognition alone does not prove a schema.
+    pub(crate) fn is_schema_attribute_source(&self, binding: &str) -> bool {
+        matches!(
+            self.entries.get(binding).map(|entry| entry.target),
+            Some(BindingTarget::Schema(_))
+        )
+    }
+
     fn ref_type_inner(
         &self,
         reference: ReferencePathRef<'_, B>,

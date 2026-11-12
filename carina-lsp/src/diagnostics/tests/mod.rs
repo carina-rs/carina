@@ -8,6 +8,7 @@ use carina_core::resource::knowledge::collect_classified_attributes;
 use carina_core::schema::SchemaRegistry;
 
 mod basic;
+mod enum_continuation;
 mod extended;
 mod located;
 mod root_requires;

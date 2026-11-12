@@ -52,7 +52,9 @@ pub use cursor::{
     JudgedNodeRef, JudgedSlot, NoAuthoredEvidence, NodeId, ProjectedPhase, ProjectionGeneration,
     SlotDeclarationId, UnreachedSlot, UseId,
 };
-pub(crate) use cursor::{AuthoredForm, AuthoredNavigation, CursorKind, SyntheticSource};
+pub(crate) use cursor::{
+    AuthoredForm, AuthoredNavigation, CursorKind, SourceReference, SyntheticSource,
+};
 
 /// The expansion scope is part of expression identity, even when two module
 /// instances originate at the same authored source location.
