@@ -195,11 +195,32 @@ impl<E, P: PlaceholderKind, T: PlaceholderKind> CanonicalResourcePair<E, P, T> {
     /// Resolve `<attribute>_prefix` meta-attributes without releasing the
     /// canonical configuration back into an untyped `File`.
     pub fn resolve_attr_prefixes(
-        mut self,
+        self,
         registry: &carina_core::schema::SchemaRegistry,
     ) -> Result<Self, String> {
-        carina_core::identifier::resolve_attr_prefixes(&mut self.parsed.resources, registry)?;
-        Ok(self)
+        self.resolve_attr_prefixes_report(registry)
+            .map_err(|errors| {
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+    }
+
+    pub(crate) fn resolve_attr_prefixes_report(
+        mut self,
+        registry: &carina_core::schema::SchemaRegistry,
+    ) -> Result<Self, Vec<carina_core::identifier::AttributePrefixError>> {
+        let errors = carina_core::identifier::resolve_attr_prefix_findings(
+            &mut self.parsed.resources,
+            registry,
+        );
+        if errors.is_empty() {
+            Ok(self)
+        } else {
+            Err(errors)
+        }
     }
 
     /// Canonicalize values and assign anonymous identities without exposing

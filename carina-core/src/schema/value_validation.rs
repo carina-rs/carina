@@ -1542,31 +1542,31 @@ fn step_assignment<'a, P: PlaceholderKind, B: BindingAddress>(
 
 /// One container edge owns its role, correspondence and diagnostic path in
 /// both walks. A map key can never acquire a struct-field path by accident.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ChildRoute<'k> {
     ListItem(usize),
-    MapValue(&'k str),
+    MapValue(std::borrow::Cow<'k, crate::parser::AttributeKey>),
     StructField {
-        key: &'k str,
+        key: std::borrow::Cow<'k, crate::parser::AttributeKey>,
         alias: Option<&'k str>,
     },
 }
 impl ChildRoute<'_> {
-    fn path(self, parent: &FieldPath) -> FieldPath {
+    fn path(&self, parent: &FieldPath) -> FieldPath {
         match self {
-            Self::ListItem(index) => parent.push_index(index),
-            Self::MapValue(key) => parent.push_map_key(key.to_owned()),
-            Self::StructField { key, .. } => parent.push_field(key.to_owned()),
+            Self::ListItem(index) => parent.push_index(*index),
+            Self::MapValue(key) => parent.push_map_key(key.to_string()),
+            Self::StructField { key, .. } => parent.push_field(key.to_string()),
         }
     }
     fn step<'s, B: BindingAddress>(
-        self,
+        &self,
         cursor: &AuthoredCursor<'s, B>,
     ) -> Result<AuthoredCursor<'s, B>, crate::parser::retained::MissingEvidence> {
         match self {
-            Self::ListItem(index) => cursor.child(index, EdgeRole::ListItem),
+            Self::ListItem(index) => cursor.child(*index, EdgeRole::ListItem),
             Self::MapValue(key) => cursor.map_child(key, EdgeRole::MapValue),
-            Self::StructField { key, alias } => cursor.field_child(key, alias),
+            Self::StructField { key, alias } => cursor.field_child(key, *alias),
         }
     }
 }
@@ -1813,26 +1813,36 @@ fn visit_syntax<'w, 's: 'w, P: PlaceholderKind, B: BindingAddress>(
             AuthoredNavigation::Map => {
                 for key in cursor.map_keys() {
                     let (declaration, route, ancestry) = match &attr.kind {
-                        AttrTypeKind::Map { value, .. } => {
-                            (value.as_ref(), ChildRoute::MapValue(key), ancestry)
-                        }
+                        AttrTypeKind::Map { value, .. } => (
+                            value.as_ref(),
+                            ChildRoute::MapValue(std::borrow::Cow::Borrowed(key)),
+                            ancestry,
+                        ),
                         AttrTypeKind::Struct { fields, .. } => {
-                            let Some(field) = struct_field_for_key(fields, key, ancestry) else {
+                            let Some(field) =
+                                struct_field_for_key(fields, key.transport_identity(), ancestry)
+                            else {
                                 continue;
                             };
-                            if validate_struct_field_assignment(field, key, ancestry).is_some() {
+                            if validate_struct_field_assignment(field, &key.to_string(), ancestry)
+                                .is_some()
+                            {
                                 continue;
                             }
                             (
                                 &field.field_type,
                                 ChildRoute::StructField {
-                                    key,
+                                    key: std::borrow::Cow::Borrowed(key),
                                     alias: ancestry.block_name(field),
                                 },
                                 ancestry.descend(field),
                             )
                         }
-                        _ => (attr, ChildRoute::MapValue(key), ancestry),
+                        _ => (
+                            attr,
+                            ChildRoute::MapValue(std::borrow::Cow::Borrowed(key)),
+                            ancestry,
+                        ),
                     };
                     let CursorKind::Authored(next) = route
                         .step(&AuthoredCursor::authored(cursor.clone()))
@@ -2728,7 +2738,10 @@ impl<'a> ValueValidator<'a, '_> {
         let cached = value.map().expect("classified map membership");
         for (key, _value) in map {
             let value = cached[key.as_str()];
-            let route = ChildRoute::StructField { key, alias: None };
+            let route = ChildRoute::StructField {
+                key: std::borrow::Cow::Owned(crate::parser::AttributeKey::literal(key.to_owned())),
+                alias: None,
+            };
             let child_path = route.path(path);
             let field = struct_field_for_key(fields, key, ancestry);
             let child = match field {
@@ -2736,7 +2749,9 @@ impl<'a> ValueValidator<'a, '_> {
                     Some(error) => CheckedValue::rejected(&child_path, error),
                     None => match step_assignment(assignment.as_ref(), |cursor| {
                         ChildRoute::StructField {
-                            key,
+                            key: std::borrow::Cow::Owned(crate::parser::AttributeKey::literal(
+                                key.to_owned(),
+                            )),
                             alias: ancestry.block_name(field),
                         }
                         .step(cursor)
@@ -2847,7 +2862,9 @@ impl<'a> ValueValidator<'a, '_> {
         let cached = value.map().expect("classified map membership");
         for (map_key, _map_value) in map {
             let map_value = cached[map_key.as_str()];
-            let route = ChildRoute::MapValue(map_key);
+            let route = ChildRoute::MapValue(std::borrow::Cow::Owned(
+                crate::parser::AttributeKey::literal(map_key.to_owned()),
+            ));
             let next_path = route.path(path);
             let key_value: Value<P, B> = lift_map_key(key, map_key, self.defs);
             let key_proof = match key_value

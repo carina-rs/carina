@@ -2676,6 +2676,7 @@ fn plan_snapshot_exports_multifile_string_let_attr_access_rejected() {
         &user_dirs,
         &parsed.providers,
         &carina_core::paths::ResolvedPath::new(&fixture_path).unwrap(),
+        &mut crate::commands::human_provider_notices(user_dirs.color_mode()),
     )
     .unwrap();
     let errors = crate::commands::validate_and_resolve_errors(

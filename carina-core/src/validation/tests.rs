@@ -34,6 +34,63 @@ type RuntimeInferredExportParam =
 type RelativeRuntimeValue = GenericValue<NoPlaceholder, RelativeBindingName>;
 
 #[test]
+fn round9_admission_locations_use_linear_resource_work() {
+    fn run(count: usize) -> usize {
+        let catalog = LoadedProviderContext::empty_for_test();
+        let config = catalog.as_provider_context();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            PatternResourceSchema::new("test.resource")
+                .attribute(
+                    PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                        .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let source = format!(
+            "provider mock {{}}\n{}",
+            (0..count)
+                .map(|i| format!("let r{i} = mock.test.resource {{ name = true }}\n"))
+                .collect::<String>()
+        );
+        let parsed = crate::parser::parse(&source, config).unwrap();
+        let bindings = BindingIndex::from_parsed(&parsed, &schemas, config);
+        let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, config);
+        let (findings, work) = crate::test_work::measure(|| {
+            resource_admission_findings(
+                loaded.judged(),
+                &bindings,
+                &HashSet::from(["mock".into()]),
+                &mut Vec::new(),
+            )
+            .unwrap()
+        });
+        assert_eq!(findings.len(), count);
+        let tree = crate::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+        for (finding, resource) in findings.iter().zip(tree.project_resources()) {
+            assert_eq!(finding.resource_id(), Some(resource.id()));
+            assert_eq!(
+                finding.location(),
+                Some(resource.attribute_key_location("name"))
+            );
+            assert_eq!(
+                finding.message(),
+                "Type mismatch: expected String, got Bool"
+            );
+        }
+        work.get(crate::test_work::Operation::ProjectResource)
+    }
+    let small = run(128);
+    let large = run(256);
+    assert!(
+        large <= 2 * small + 16,
+        "resource work must grow linearly: {small} -> {large}"
+    );
+}
+
+#[test]
 fn export_inference_preserves_authored_failure() {
     let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     for rhs in [
@@ -4068,12 +4125,12 @@ fn provider_in_module_with_arguments_errors() {
     let mut parsed = empty_parsed();
     parsed.providers.push(crate::parser::ProviderConfig {
         name: "awscc".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     });
     parsed.arguments.push(crate::parser::ArgumentParameter {
@@ -4097,12 +4154,12 @@ fn provider_in_module_with_attributes_errors() {
     let mut parsed = empty_parsed();
     parsed.providers.push(crate::parser::ProviderConfig {
         name: "awscc".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     });
     parsed
@@ -4122,12 +4179,12 @@ fn provider_without_module_markers_ok() {
     let mut parsed = empty_parsed();
     parsed.providers.push(crate::parser::ProviderConfig {
         name: "awscc".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     });
 
@@ -4270,8 +4327,8 @@ fn backend_in_module_with_arguments_errors() {
     parsed.arguments.push(argument_param("name"));
     parsed.backend = Some(crate::parser::BackendConfig {
         backend_type: "local".to_string(),
-        attributes: HashMap::new(),
-        attribute_spans: HashMap::new(),
+        attributes: Default::default(),
+        attribute_spans: Default::default(),
     });
 
     let result = validate_no_backend_in_module(&parsed);
@@ -4294,8 +4351,8 @@ fn backend_in_module_with_attributes_errors() {
         ));
     parsed.backend = Some(crate::parser::BackendConfig {
         backend_type: "local".to_string(),
-        attributes: HashMap::new(),
-        attribute_spans: HashMap::new(),
+        attributes: Default::default(),
+        attribute_spans: Default::default(),
     });
 
     let result = validate_no_backend_in_module(&parsed);
@@ -4308,8 +4365,8 @@ fn backend_without_module_markers_ok() {
     let mut parsed = empty_parsed();
     parsed.backend = Some(crate::parser::BackendConfig {
         backend_type: "local".to_string(),
-        attributes: HashMap::new(),
-        attribute_spans: HashMap::new(),
+        attributes: Default::default(),
+        attribute_spans: Default::default(),
     });
 
     let result = validate_no_backend_in_module(&parsed);
@@ -4448,12 +4505,12 @@ fn argument_param(name: &str) -> crate::parser::ArgumentParameter {
 fn provider(name: &str) -> crate::parser::ProviderConfig<ParserPlaceholder> {
     crate::parser::ProviderConfig {
         name: name.to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     }
 }
@@ -4464,8 +4521,8 @@ fn arguments_with_backend_errors() {
     parsed.arguments.push(argument_param("state_path"));
     parsed.backend = Some(crate::parser::BackendConfig {
         backend_type: "local".to_string(),
-        attributes: HashMap::new(),
-        attribute_spans: HashMap::new(),
+        attributes: Default::default(),
+        attribute_spans: Default::default(),
     });
 
     let result = validate_no_arguments_in_root(&parsed);
@@ -9473,7 +9530,8 @@ fn ref_with_chained_field_on_struct_flags_unknown_field() {
     );
 }
 
-type ValidateConfigCallLog = std::sync::Arc<std::sync::Mutex<Vec<IndexMap<String, RuntimeValue>>>>;
+type ValidateConfigCallLog =
+    std::sync::Arc<std::sync::Mutex<Vec<crate::parser::ConfigurationAttributes<RuntimeValue>>>>;
 
 /// Test-only factory that records every call to `validate_config` so a
 /// test can assert what attributes did or didn't cross the WASM-equivalent
@@ -9578,12 +9636,12 @@ fn validate_provider_config_skips_attributes_with_deferred_refs() {
 
     let pc = ProviderConfig {
         name: "aws".to_string(),
-        attributes: attrs,
-        default_tags: IndexMap::new(),
+        attributes: (attrs).into(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     };
     let mut parsed = empty_parsed();
@@ -9682,17 +9740,18 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
     let mut parsed = empty_parsed();
     parsed.providers.push(ProviderConfig {
         name: "awscc".to_string(),
-        attributes: IndexMap::from([(
+        attributes: (IndexMap::<String, _>::from([(
             "region".to_string(),
             Value::Concrete(ConcreteValue::enum_identifier(
                 "awscc.Region.ap_northeast_1",
             )),
-        )]),
-        default_tags: IndexMap::new(),
+        )]))
+        .into(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     });
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));

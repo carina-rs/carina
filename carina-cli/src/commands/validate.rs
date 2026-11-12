@@ -1,32 +1,36 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::output_style::Colorize;
-use serde::Serialize;
-
-use carina_core::config_loader::{find_crn_files_in_dir, load_configuration_with_config};
-use carina_core::lint::find_duplicate_attrs;
-use carina_core::parser::{ProviderContext, ResourceRef, UpstreamState};
+#[cfg(test)]
+use carina_core::config_loader::load_configuration_with_config;
+#[cfg(test)]
+use carina_core::parser::UpstreamState;
+use carina_core::parser::{ProviderContext, ResourceRef};
 use carina_core::resource::{BindingAddress, ResourceId};
 
 use crate::error::AppError;
+#[cfg(any(test, feature = "test-utils"))]
 use crate::wiring::ProviderLoad;
 
-#[derive(Serialize)]
-struct ValidateOutput {
-    status: &'static str,
-    resource_count: usize,
-    resources: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    warnings: Vec<ValidateWarning>,
+mod report;
+pub use report::ValidateReport;
+#[cfg(test)]
+use report::{Diagnostic as ValidateWarning, ValidateOutput};
+
+/// Collect setup and validation failures through the same command report.
+pub fn collect_validate(
+    runtime: Result<&crate::runtime::CommandRuntime, AppError>,
+    path: &Path,
+    context: Option<&ProviderContext>,
+) -> ValidateReport {
+    report::collect_production(runtime, path, context)
 }
 
-#[derive(Serialize)]
-struct ValidateWarning {
-    #[serde(rename = "type")]
-    warning_type: &'static str,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    file: Option<String>,
+pub fn render_validate(
+    report: &ValidateReport,
+    json: bool,
+    color: crate::output_style::ColorMode,
+) -> i32 {
+    report.render(json, color)
 }
 
 pub(crate) fn print_provider_type_warning(warning: &carina_core::parser::ParseWarning) {
@@ -84,6 +88,7 @@ pub struct ValidateDiagnostics {
     pub errors: Vec<AppError>,
     pub warnings: Vec<carina_core::parser::ParseWarning>,
     pub input_warnings: Vec<carina_core::input_rules::InputFinding>,
+    pub json: serde_json::Value,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -92,42 +97,34 @@ pub fn validate_diagnostics_with_factories(
     factories: Vec<crate::wiring::LoadedProviderFactory>,
     load_errors: std::collections::HashMap<String, String>,
 ) -> ValidateDiagnostics {
-    let runtime = crate::test_support::TestCommandRuntime::new();
-    let provider_context = ProviderContext::new(runtime.environment().clone());
-    let loaded = match load_configuration_with_config(
-        path,
-        &provider_context,
-        &carina_core::schema::SchemaRegistry::new(),
-    ) {
-        Ok(l) => l,
-        Err(e) => {
-            return ValidateDiagnostics {
-                errors: vec![AppError::Config(e.to_string())],
-                warnings: Vec::new(),
-                input_warnings: Vec::new(),
-            };
-        }
-    };
-    let parsed = loaded.parsed;
-    let base_dir = path;
-    let providers = ProviderLoad::for_test_with_load_errors(
-        &runtime,
-        factories,
-        &parsed.providers,
-        load_errors,
-    );
+    report::test_diagnostics(collect_with_factories(path, factories, load_errors))
+}
 
-    providers
-        .validation_report(&parsed, base_dir, false, &loaded.duplicate_declarations)
-        .check_authored_inputs()
-        .into_test_diagnostics()
+#[cfg(any(test, feature = "test-utils"))]
+fn collect_with_factories(
+    path: &carina_core::paths::ResolvedPath,
+    factories: Vec<crate::wiring::LoadedProviderFactory>,
+    load_errors: std::collections::HashMap<String, String>,
+) -> ValidateReport {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    report::collect(
+        Ok(&runtime),
+        &path.source_label(),
+        None,
+        move |runtime, providers, _path, _notices| {
+            Ok((
+                ProviderLoad::for_test_with_load_errors(runtime, factories, providers, load_errors)
+                    .into_reporting(),
+                None,
+            ))
+        },
+    )
 }
 
 /// Test-support twin of [`validate_with_factories`] that returns the
 /// rendered resource list `run_validate` would display, instead of
-/// the error strings. Runs the identical load + resolve pipeline, then
-/// derives the list via `validated_entries` and renders each through
-/// the same `Display` boundary the CLI uses — so e2e tests assert on
+/// the error strings. Consumes the production collector's success inventory,
+/// so e2e tests assert on
 /// exactly what the user sees (including deferred-for loop bodies,
 /// carina#3121).
 ///
@@ -137,33 +134,7 @@ pub fn validated_resource_ids_with_factories(
     path: &carina_core::paths::ResolvedPath,
     factories: Vec<crate::wiring::LoadedProviderFactory>,
 ) -> Vec<String> {
-    let runtime = crate::test_support::TestCommandRuntime::new();
-    let provider_context = ProviderContext::new(runtime.environment().clone());
-    let loaded = match load_configuration_with_config(
-        path,
-        &provider_context,
-        &carina_core::schema::SchemaRegistry::new(),
-    ) {
-        Ok(l) => l,
-        Err(e) => panic!("fixture failed to load: {e}"),
-    };
-    let parsed = loaded.parsed;
-    let base_dir = path;
-    let providers =
-        ProviderLoad::for_test_with_provider_phase(&runtime, factories, &parsed.providers);
-
-    // This adapter exercises only the resource-enumeration half of validate.
-    // Keep the identical module/name-resolution seam, but do not reject a
-    // fixture before enumeration for an unrelated provider-schema diagnostic.
-    let parsed = providers
-        .validation_report(&parsed, base_dir, true, &loaded.duplicate_declarations)
-        .into_result()
-        .unwrap_or_else(|errors| panic!("fixture failed validation: {:?}", errors.as_slice()));
-
-    validated_entries(&parsed)
-        .iter()
-        .map(ToString::to_string)
-        .collect()
+    report::test_inventory(collect_with_factories(path, factories, Default::default()))
 }
 
 /// One entry in `validate`'s resource enumeration, kept as a typed
@@ -289,183 +260,16 @@ fn validated_entries<E>(
         .collect()
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 pub fn run_validate(
     runtime: &crate::runtime::CommandRuntime,
     path: &Path,
     json: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let project = carina_core::paths::ResolvedPath::new(path)
-        .map_err(|error| AppError::Config(error.to_string()))?;
-    let base_dir = &project;
-    let color_mode = runtime.color_mode();
-    let loaded = match load_configuration_with_config(
-        base_dir,
-        provider_context,
-        &carina_core::schema::SchemaRegistry::new(),
-    ) {
-        Ok(loaded) => loaded,
-        Err(error) => {
-            return crate::wiring::settle_type_checks(
-                crate::wiring::failed_configuration_report(
-                    base_dir,
-                    error.into(),
-                    runtime.environment().clone(),
-                ),
-                AppError::Validation,
-            );
-        }
-    };
-    let parsed = loaded.parsed;
-
-    // Collect every static error before reporting, so the user sees
-    // them all in one pass instead of fixing one, re-running, and
-    // finding the next. See #2102 / #2105.
-    let mut error_reports: Vec<String> = Vec::new();
-    if let Err(AppError::Validation(msg)) =
-        check_upstream_state_sources(base_dir, &parsed.upstream_states)
-    {
-        error_reports.push(msg);
-    }
-
-    let printed_warning_count = parsed.warnings.len();
-    parsed.print_warnings();
-
-    if !json {
-        println!("{}", "Validating...".cyan(color_mode));
-    }
-
-    let (providers, provider_load_error) =
-        ProviderLoad::load_reporting(runtime, &parsed.providers, base_dir)?;
-    error_reports.extend(provider_load_error.iter().map(ToString::to_string));
-    let validation_report = providers
-        .validation_report(&parsed, base_dir, false, &loaded.duplicate_declarations)
-        .check_authored_inputs();
-    let input_warnings = validation_report.input_warnings().to_vec();
-    // Publish unresolved provider checks even if another validation/load error
-    // prevents a resolved file from being returned.
-    let (validation_result, schemas) = validation_report.into_parts();
-    let parsed = match validation_result {
-        Ok(parsed) => {
-            parsed.print_warnings_from(printed_warning_count);
-            parsed
-        }
-        Err(errors) => {
-            error_reports.extend(
-                errors
-                    .as_slice()
-                    .iter()
-                    .map(|error| crate::error::format_error_with_source_chain(error)),
-            );
-            return Err(AppError::Validation(error_reports.join("\n")));
-        }
-    };
-
-    if !error_reports.is_empty() {
-        return Err(AppError::Validation(error_reports.join("\n")));
-    }
-
-    // Check for unused let bindings (warnings, not errors)
-    let unused_warnings = carina_core::validation::check_unused_bindings_with_identity_requirements(
-        &loaded.authored_bindings,
-        schemas,
-    );
-
-    // Check for duplicate attribute keys
-    let source_files: Vec<(PathBuf, String)> = {
-        let files = find_crn_files_in_dir(base_dir)?;
-        let mut texts = Vec::new();
-        for file in files {
-            let content = file
-                .read_to_string()
-                .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
-            texts.push((file.source_label(), content));
-        }
-        texts
-    };
-
-    let mut duplicate_warnings: Vec<(PathBuf, String)> = Vec::new();
-    for (file_path, source) in &source_files {
-        for dup in find_duplicate_attrs(source) {
-            duplicate_warnings.push((
-                file_path.clone(),
-                format!(
-                    "Duplicate attribute '{}' at line {} (first defined on line {}). The last value will be used.",
-                    dup.name, dup.line, dup.first_line
-                ),
-            ));
-        }
-    }
-
-    if json {
-        let mut warnings = Vec::new();
-        for finding in input_warnings {
-            warnings.push(ValidateWarning {
-                warning_type: "input_rule",
-                message: finding.to_string(),
-                file: None,
-            });
-        }
-        for binding in &unused_warnings {
-            warnings.push(ValidateWarning {
-                warning_type: "unused_binding",
-                message: format!("Unused let binding '{}'", binding),
-                file: None,
-            });
-        }
-        for (file_path, message) in &duplicate_warnings {
-            warnings.push(ValidateWarning {
-                warning_type: "duplicate_attribute",
-                message: message.clone(),
-                file: Some(file_path.display().to_string()),
-            });
-        }
-        let entries = validated_entries(&parsed);
-        let output = ValidateOutput {
-            status: "ok",
-            resource_count: entries.len(),
-            resources: entries.iter().map(ToString::to_string).collect(),
-            warnings,
-        };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&output)
-                .map_err(|e| format!("Failed to serialize: {}", e))?
-        );
-        return Ok(());
-    }
-
-    let entries = validated_entries(&parsed);
-    println!(
-        "{}",
-        format!("✓ {} resources validated successfully.", entries.len())
-            .green(color_mode)
-            .bold(color_mode)
-    );
-
-    for entry in &entries {
-        println!("  • {}", entry);
-    }
-
-    for binding in &unused_warnings {
-        println!(
-            "{}",
-            format!(
-                "⚠ Unused let binding '{}'. Consider using an anonymous resource instead.",
-                binding
-            )
-            .yellow(color_mode)
-        );
-    }
-
-    for (file_path, message) in &duplicate_warnings {
-        println!(
-            "{}",
-            format!("⚠ {}:{}", file_path.display(), message).yellow(color_mode)
-        );
-    }
-
-    Ok(())
+    let report = collect_validate(Ok(runtime), path, Some(provider_context));
+    let exit_code = render_validate(&report, json, runtime.color_mode());
+    report.into_result(exit_code)
 }
 
 /// Verify that every `upstream_state.source` resolves to an existing directory.
@@ -473,23 +277,32 @@ pub fn run_validate(
 /// Cheaper than plan-time `load_upstream_states` (no canonicalize, no backend
 /// I/O) — this is a lightweight early signal run during `validate`. All
 /// failures are accumulated so the user sees every bad path at once.
+fn upstream_source_findings(
+    base_dir: &carina_core::paths::ResolvedPath,
+    parsed: &carina_core::config_loader::InferredRootDirectory,
+) -> Result<
+    Vec<carina_core::parser::Located<carina_core::upstream_exports::MissingUpstreamDirectory>>,
+    carina_core::parser::AnalysisTreeError,
+> {
+    let tree = carina_core::parser::AnalysisTree::try_from_file(parsed.parsed())?;
+    Ok(carina_core::upstream_exports::check_upstream_state_sources(
+        base_dir, &tree,
+    ))
+}
+
+/// Compatibility projection for the original source-preflight unit tests.
+#[cfg(test)]
 fn check_upstream_state_sources(
     base_dir: &carina_core::paths::ResolvedPath,
     upstream_states: &[UpstreamState],
 ) -> Result<(), AppError> {
-    let mut errors = Vec::new();
-    for us in upstream_states {
-        if !base_dir
-            .join(&us.source)
-            .is_ok_and(|source| source.is_dir())
-        {
-            errors.push(format!(
-                "upstream_state '{}': source '{}' does not exist",
-                us.binding,
-                us.source.display()
-            ));
-        }
-    }
+    let errors: Vec<_> = upstream_states
+        .iter()
+        .filter_map(|upstream| {
+            carina_core::upstream_exports::MissingUpstreamDirectory::check(base_dir, upstream)
+        })
+        .map(|error| error.to_string())
+        .collect();
     if errors.is_empty() {
         Ok(())
     } else {
@@ -884,6 +697,7 @@ let observed_names = roles.names
                 "aws.ec2.Vpc.main".to_string(),
             ],
             warnings: vec![],
+            errors: vec![],
         };
         let json = serde_json::to_string(&output).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1078,6 +892,7 @@ let observed_names = roles.names
             resource_count: entries.len(),
             resources: entries.iter().map(ToString::to_string).collect(),
             warnings: vec![],
+            errors: vec![],
         };
         let json = serde_json::to_string(&output).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1235,16 +1050,23 @@ let observed_names = roles.names
             resources: vec!["aws.s3.Bucket.test".to_string()],
             warnings: vec![
                 ValidateWarning {
-                    warning_type: "unused_binding",
+                    warning_type: Some("unused_binding"),
                     message: "Unused let binding 'temp'".to_string(),
+                    severity: "warning",
+                    code: None,
+                    location: None,
                     file: None,
                 },
                 ValidateWarning {
-                    warning_type: "duplicate_attribute",
+                    warning_type: Some("duplicate_attribute"),
                     message: "Duplicate attribute 'tags'".to_string(),
+                    severity: "warning",
+                    code: None,
+                    location: None,
                     file: Some("main.crn".to_string()),
                 },
             ],
+            errors: vec![],
         };
         let json = serde_json::to_string(&output).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();

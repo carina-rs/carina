@@ -43,6 +43,52 @@ impl Eq for TrustedLocalGrant {}
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrustedLocalGrants(Vec<TrustedLocalGrant>);
 
+/// A resolver-owned informational event. It contains authored paths and trust
+/// decisions, never provider payloads, and is rendered only by the caller.
+#[derive(Debug, Clone)]
+pub struct ProviderLoadNotice(LoaderNotice);
+
+#[derive(Debug, Clone)]
+enum LoaderNotice {
+    Trusted(TrustedLocalGrant),
+    ChangedArtifact {
+        path: DisplayPath,
+        project: DisplayPath,
+    },
+    LockMigration(Box<crate::provider_resolver::LockFileMigration>),
+}
+
+impl ProviderLoadNotice {
+    pub(crate) fn changed_artifact(path: DisplayPath, project: DisplayPath) -> Self {
+        Self(LoaderNotice::ChangedArtifact { path, project })
+    }
+
+    pub(crate) fn migration(migration: crate::provider_resolver::LockFileMigration) -> Self {
+        Self(LoaderNotice::LockMigration(Box::new(migration)))
+    }
+}
+
+impl fmt::Display for ProviderLoadNotice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            LoaderNotice::Trusted(grant) => write!(
+                f,
+                "carina: trusting local provider {} as {} ({})",
+                grant.display_path,
+                trust_class_name(grant.class),
+                grant.origin.label()
+            ),
+            LoaderNotice::ChangedArtifact { path, project } => write!(
+                f,
+                "carina: local provider {} does not match the installed bytes; re-run `{}` before trusting it",
+                path,
+                carina_core::hint::ProjectCommand::for_display_path("init", project)
+            ),
+            LoaderNotice::LockMigration(migration) => fmt::Display::fmt(migration, f),
+        }
+    }
+}
+
 impl TrustedLocalGrants {
     pub fn parse(cli_values: &[String], env_value: Option<&str>) -> Result<Self, GrantParseError> {
         Self::parse_os(cli_values, env_value.map(OsStr::new))
@@ -80,13 +126,8 @@ impl TrustedLocalGrant {
         ProviderTrust::trusted_local(self.class)
     }
 
-    pub(crate) fn notice(&self) -> String {
-        format!(
-            "carina: trusting local provider {} as {} ({})",
-            self.display_path,
-            trust_class_name(self.class),
-            self.origin.label(),
-        )
+    pub(crate) fn notice(&self) -> ProviderLoadNotice {
+        ProviderLoadNotice(LoaderNotice::Trusted(self.clone()))
     }
 }
 
@@ -304,7 +345,7 @@ mod tests {
         let provider = link.join("provider.wasm");
         std::fs::write(&provider, b"provider").unwrap();
         let grants = TrustedLocalGrants::parse(&[grant(&provider, "aws")], None).unwrap();
-        let notice = grants.0[0].notice();
+        let notice = grants.0[0].notice().to_string();
         assert!(notice.contains(&provider.display().to_string()), "{notice}");
         assert!(!notice.contains(&real.display().to_string()), "{notice}");
 
@@ -460,7 +501,7 @@ mod tests {
         let grants = TrustedLocalGrants::parse(&[grant(&provider, "aws")], None).unwrap();
 
         assert_eq!(
-            grants.matching(&canonical).unwrap().notice(),
+            grants.matching(&canonical).unwrap().notice().to_string(),
             format!(
                 "carina: trusting local provider {} as aws (--trust-local-provider)",
                 provider.display()
@@ -478,7 +519,7 @@ mod tests {
         let grants = TrustedLocalGrants::parse(&[], Some(&value)).unwrap();
 
         assert_eq!(
-            grants.matching(&canonical).unwrap().notice(),
+            grants.matching(&canonical).unwrap().notice().to_string(),
             format!(
                 "carina: trusting local provider {} as github (CARINA_TRUST_LOCAL_PROVIDER)",
                 provider.display()

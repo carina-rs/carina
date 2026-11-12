@@ -56,12 +56,12 @@ async fn saved_plan_unknown_role_arn_is_checked_before_schedule_dispatch() {
             .into_iter()
             .map(|name| ProviderConfig {
                 name: name.into(),
-                attributes: IndexMap::new(),
-                default_tags: IndexMap::new(),
+                attributes: Default::default(),
+                default_tags: Default::default(),
                 source: Some("file:///admission-fixture.wasm".parse().unwrap()),
                 version: None,
                 revision: None,
-                unresolved_attributes: IndexMap::new(),
+                unresolved_attributes: Default::default(),
                 binding: None,
             })
             .collect();
@@ -296,12 +296,12 @@ fn saved_plan_layered_scalars_reload_and_validate_both_layers() {
             state_serial: None,
             provider_configs: deserialize_saved_provider_configs(vec![ProviderConfig {
                 name: "mock".into(),
-                attributes: IndexMap::new(),
-                default_tags: IndexMap::new(),
+                attributes: Default::default(),
+                default_tags: Default::default(),
                 source: None,
                 version: None,
                 revision: None,
-                unresolved_attributes: IndexMap::new(),
+                unresolved_attributes: Default::default(),
                 binding: None,
             }]),
             backend_config: None,

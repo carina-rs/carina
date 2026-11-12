@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
-use crate::document::Document;
+use crate::document::DiagnosticDocument as Document;
 use crate::position;
 use carina_core::parser::retained::JudgedExpr;
 use carina_core::parser::{
@@ -193,9 +193,13 @@ fn parser_span_range(doc: &Document, span: SourceSpan) -> Option<Range> {
     let position = |line: usize, column: usize| {
         let line = u32::try_from(line.checked_sub(1)?).ok()?;
         let column = column.checked_sub(1)?;
-        let text = doc.line_at(line)?;
-        (column <= text.chars().count())
-            .then(|| Position::new(line, position::char_offset_to_utf16_offset(&text, column)))
+        (column <= doc.line_scalar_len(line)?).then(|| {
+            Position::new(
+                line,
+                doc.scalar_utf16_column(line, column)
+                    .expect("line was checked"),
+            )
+        })
     };
     Some(Range {
         start: position(span.start_line(), span.start_column())?,
@@ -519,7 +523,7 @@ struct DirectoryProviderDeclarations {
 }
 
 struct LspTypeCheckSink<'a> {
-    doc: &'a Document,
+    doc: &'a Document<'a>,
     diagnostics: Vec<Diagnostic>,
 }
 impl carina_core::validation::deferred_types::ProviderTypeCheckSink for LspTypeCheckSink<'_> {
@@ -1382,23 +1386,38 @@ impl DiagnosticRun<'_> {
                                 error.to_string(),
                             ),
                         };
+                        let code = match &outcome {
+                            AuthoredInputOutcome::Finding(finding) => {
+                                Some(tower_lsp::lsp_types::NumberOrString::String(
+                                    finding.violation().code().to_string(),
+                                ))
+                            }
+                            _ => None,
+                        };
                         let location = location.or_else(|| {
                             input_owners
                                 .get(resource_id)
                                 .map(|resource| resource.type_location())
                         });
                         if let Some(location) = location {
-                            diagnostics.extend(render_merged(
-                                doc,
-                                &carina_core::parser::Located::new(location.clone(), ()),
-                                severity,
-                                message,
-                            ));
+                            diagnostics.extend(
+                                render_merged(
+                                    doc,
+                                    &carina_core::parser::Located::new(location.clone(), ()),
+                                    severity,
+                                    message,
+                                )
+                                .map(|mut diagnostic| {
+                                    diagnostic.code = code.clone();
+                                    diagnostic
+                                }),
+                            );
                         } else {
                             diagnostics.push(Diagnostic {
                                 range: Range::default(),
                                 severity: Some(severity),
                                 source: Some("carina".into()),
+                                code,
                                 message,
                                 ..Default::default()
                             });
@@ -2491,17 +2510,28 @@ impl DiagnosticEngine {
     /// `current_file_path` is the document's full path. It is the sole source
     /// of file identity; the directory and basename used for merged parsing
     /// are derived from it rather than inferred from buffer contents.
-    pub fn analyze(&self, doc: &Document, current_file_path: Option<&Path>) -> Vec<Diagnostic> {
-        let context = self.catalog_for_document(doc, current_file_path);
+    pub fn analyze(
+        &self,
+        raw: &crate::document::Document,
+        current_file_path: Option<&Path>,
+    ) -> Vec<Diagnostic> {
+        let doc = match raw.for_diagnostics() {
+            Ok(doc) => doc,
+            Err(protected) => return vec![buffer::protected_parse_error(protected)],
+        };
+        let context = self.catalog_for_public_document(&doc, current_file_path);
         let reparsed;
         let doc = if doc.provider_context().custom_types_loaded() && !context.custom_types_loaded()
         {
-            reparsed = Document::new_with_path(
+            reparsed = crate::document::Document::new_with_path(
                 doc.text(),
                 doc.source_file().to_path_buf(),
                 Arc::new(context.clone()),
             );
-            &reparsed
+            match reparsed.for_diagnostics() {
+                Ok(doc) => doc,
+                Err(protected) => return vec![buffer::protected_parse_error(protected)],
+            }
         } else {
             doc
         };
@@ -2511,12 +2541,25 @@ impl DiagnosticEngine {
                     engine: self,
                     provider_context: session,
                 }
-                .collect_diagnostics(doc, current_file_path)
+                .collect_diagnostics(&doc, current_file_path)
             });
-        Self::publish_type_diagnostics(terminal, doc)
+        Self::publish_type_diagnostics(terminal, &doc)
     }
 
     pub(crate) fn catalog_for_document(
+        &self,
+        doc: &crate::document::Document,
+        current_file_path: Option<&Path>,
+    ) -> carina_core::parser::ProviderContext {
+        match doc.for_diagnostics() {
+            Ok(doc) => self.catalog_for_public_document(&doc, current_file_path),
+            Err(_) => carina_core::parser::ProviderContext::new(
+                doc.provider_context().environment.clone(),
+            ),
+        }
+    }
+
+    fn catalog_for_public_document(
         &self,
         doc: &Document,
         current_file_path: Option<&Path>,

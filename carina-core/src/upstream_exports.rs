@@ -117,8 +117,11 @@ impl UpstreamDiscoveryContext<'_> {
         &self,
         source: &ResolvedPath,
         overrides: &HashMap<String, String>,
-    ) -> Result<crate::config_loader::ParsedRootDirectory, String> {
-        crate::config_loader::parse_directory_for_metadata(
+    ) -> Result<
+        crate::config_loader::ParsedRootDirectory,
+        crate::config_loader::DirectoryParseFailure,
+    > {
+        crate::config_loader::parse_directory_for_metadata_report(
             source,
             self.context.catalog(),
             overrides,
@@ -261,8 +264,8 @@ fn resolve_upstream_source_surface(
             &Default::default(),
         ) {
             Ok(entries) => Ok(entries),
-            Err(UpstreamExportSourceError::Unavailable(reason)) => Err(reason),
             Err(UpstreamExportSourceError::Invariant(error)) => return Err(error),
+            Err(reason) => Err(reason.to_string()),
         },
         Err(reason) => Err(reason),
     };
@@ -477,6 +480,115 @@ impl std::fmt::Display for UpstreamResolveError {
 
 impl std::error::Error for UpstreamResolveError {}
 
+/// Typed source failures retained separately from their legacy combined display.
+#[derive(Debug, Clone)]
+pub struct UpstreamResolveFailure {
+    legacy: UpstreamResolveError,
+    cause: UpstreamResolveCause,
+}
+#[derive(Debug, Clone)]
+enum UpstreamResolveCause {
+    Message,
+    Boundaries(Vec<crate::validation::ExportBoundaryError>),
+    Parse(std::sync::Arc<crate::config_loader::DirectoryParseFailure>),
+    Module {
+        base: std::path::PathBuf,
+        error: std::sync::Arc<crate::module_resolver::ModuleError>,
+    },
+}
+impl UpstreamResolveFailure {
+    fn message(binding: String, source: std::path::PathBuf, reason: String) -> Self {
+        Self {
+            legacy: UpstreamResolveError {
+                binding,
+                source,
+                reason,
+            },
+            cause: UpstreamResolveCause::Message,
+        }
+    }
+    fn boundaries(
+        binding: String,
+        source: std::path::PathBuf,
+        boundaries: Vec<crate::validation::ExportBoundaryError>,
+    ) -> Self {
+        let reason = boundaries
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self {
+            legacy: UpstreamResolveError {
+                binding,
+                source,
+                reason,
+            },
+            cause: UpstreamResolveCause::Boundaries(boundaries),
+        }
+    }
+    fn parse(
+        binding: String,
+        source: std::path::PathBuf,
+        error: crate::config_loader::DirectoryParseFailure,
+    ) -> Self {
+        Self {
+            legacy: UpstreamResolveError {
+                binding,
+                source,
+                reason: error.to_string(),
+            },
+            cause: UpstreamResolveCause::Parse(std::sync::Arc::new(error)),
+        }
+    }
+    fn module(
+        binding: String,
+        source: std::path::PathBuf,
+        base: std::path::PathBuf,
+        error: crate::module_resolver::ModuleError,
+    ) -> Self {
+        Self {
+            legacy: UpstreamResolveError {
+                binding,
+                source,
+                reason: error.to_string(),
+            },
+            cause: UpstreamResolveCause::Module {
+                base,
+                error: std::sync::Arc::new(error),
+            },
+        }
+    }
+    pub fn boundary_errors(&self) -> &[crate::validation::ExportBoundaryError] {
+        match &self.cause {
+            UpstreamResolveCause::Boundaries(errors) => errors,
+            _ => &[],
+        }
+    }
+    pub fn parse_failure(&self) -> Option<&crate::config_loader::DirectoryParseFailure> {
+        match &self.cause {
+            UpstreamResolveCause::Parse(error) => Some(error),
+            _ => None,
+        }
+    }
+    pub fn module_failure(
+        &self,
+    ) -> Option<(&std::path::Path, &crate::module_resolver::ModuleError)> {
+        match &self.cause {
+            UpstreamResolveCause::Module { base, error } => Some((base, error)),
+            _ => None,
+        }
+    }
+    fn into_legacy(self) -> UpstreamResolveError {
+        self.legacy
+    }
+}
+impl std::fmt::Display for UpstreamResolveFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.legacy.fmt(formatter)
+    }
+}
+impl std::error::Error for UpstreamResolveFailure {}
+
 /// A reference in the downstream project whose field isn't declared by the
 /// upstream's `exports { }` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -591,10 +703,52 @@ pub fn resolve_upstream_exports_with_schemas_and_overrides<D, B: BindingAddress,
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
+    let (exports, findings) =
+        resolve_upstream_export_report_inner(base_dir, tree, config, schemas, overrides)?;
+    Ok((
+        exports,
+        findings
+            .into_iter()
+            .map(|finding| {
+                let (location, error) = finding.into_parts();
+                Located::new(location, error.into_legacy())
+            })
+            .collect(),
+    ))
+}
+
+pub fn resolve_upstream_exports_report<D, B: BindingAddress, E>(
+    base_dir: &ResolvedPath,
+    tree: &UpstreamAnalysis<'_, D, B, E>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    schemas: Option<&crate::schema::SchemaRegistry>,
+) -> Result<
+    (UpstreamExports<B>, Vec<Located<UpstreamResolveFailure>>),
+    crate::parser::AnalysisTreeError,
+>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    resolve_upstream_export_report_inner(base_dir, tree, config, schemas, &Default::default())
+}
+
+fn resolve_upstream_export_report_inner<D, B: BindingAddress, E>(
+    base_dir: &ResolvedPath,
+    tree: &UpstreamAnalysis<'_, D, B, E>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    schemas: Option<&crate::schema::SchemaRegistry>,
+    overrides: &crate::config_loader::SourceOverrides,
+) -> Result<
+    (UpstreamExports<B>, Vec<Located<UpstreamResolveFailure>>),
+    crate::parser::AnalysisTreeError,
+>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
     let mut exports = HashMap::new();
     let mut findings = Vec::new();
     for state in tree.upstream_states() {
-        let (resolved, errors) = resolve_upstream_exports_with_context(
+        let (resolved, errors) = resolve_upstream_exports_context_report(
             base_dir,
             std::slice::from_ref(*state.detail()),
             config,
@@ -618,6 +772,15 @@ pub struct MissingUpstreamDirectory {
     source_path: String,
 }
 
+impl MissingUpstreamDirectory {
+    pub fn check<B: BindingAddress>(base: &ResolvedPath, state: &UpstreamState<B>) -> Option<Self> {
+        (!base.join(&state.source).is_ok_and(|source| source.is_dir())).then(|| Self {
+            binding: state.binding.to_string(),
+            source_path: state.source.to_string_lossy().into_owned(),
+        })
+    }
+}
+
 pub fn check_upstream_state_sources<D, B: BindingAddress, E>(
     base: &ResolvedPath,
     tree: &UpstreamAnalysis<'_, D, B, E>,
@@ -627,15 +790,9 @@ where
 {
     tree.upstream_states()
         .iter()
-        .filter(|state| !base.join(&state.source).is_ok_and(|source| source.is_dir()))
-        .map(|state| {
-            Located::new(
-                state.location().clone(),
-                MissingUpstreamDirectory {
-                    binding: state.binding.to_string(),
-                    source_path: state.source.to_string_lossy().into_owned(),
-                },
-            )
+        .filter_map(|state| {
+            MissingUpstreamDirectory::check(base, state.detail())
+                .map(|error| Located::new(state.location().clone(), error))
         })
         .collect()
 }
@@ -666,8 +823,27 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
     schemas: Option<&crate::schema::SchemaRegistry>,
     overrides: &crate::config_loader::SourceOverrides,
 ) -> Result<(UpstreamExports<B>, Vec<UpstreamResolveError>), crate::parser::AnalysisTreeError> {
+    resolve_upstream_exports_context_report(base_dir, upstream_states, config, schemas, overrides)
+        .map(|(exports, errors)| {
+            (
+                exports,
+                errors
+                    .into_iter()
+                    .map(UpstreamResolveFailure::into_legacy)
+                    .collect(),
+            )
+        })
+}
+
+fn resolve_upstream_exports_context_report<B: BindingAddress>(
+    base_dir: &ResolvedPath,
+    upstream_states: &[UpstreamState<B>],
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    schemas: Option<&crate::schema::SchemaRegistry>,
+    overrides: &crate::config_loader::SourceOverrides,
+) -> Result<(UpstreamExports<B>, Vec<UpstreamResolveFailure>), crate::parser::AnalysisTreeError> {
     let mut out: UpstreamExports<B> = HashMap::new();
-    let mut errors: Vec<UpstreamResolveError> = Vec::new();
+    let mut errors: Vec<UpstreamResolveFailure> = Vec::new();
     let discovery = UpstreamDiscoveryContext {
         context: config,
         schemas,
@@ -676,11 +852,11 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
         let source_abs = match base_dir.join(&us.source) {
             Ok(source) => source,
             Err(error) => {
-                errors.push(UpstreamResolveError {
-                    binding: us.binding.to_string(),
-                    source: us.source.clone(),
-                    reason: error.to_string(),
-                });
+                errors.push(UpstreamResolveFailure::message(
+                    us.binding.to_string(),
+                    us.source.clone(),
+                    error.to_string(),
+                ));
                 continue;
             }
         };
@@ -706,20 +882,15 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
                     out.insert(us.binding.clone(), entries);
                 }
                 Err(UpstreamExportSourceError::Invariant(error)) => return Err(error),
-                Err(UpstreamExportSourceError::Unavailable(reason)) => {
-                    errors.push(UpstreamResolveError {
-                        binding: us.binding.to_string(),
-                        source: us.source.clone(),
-                        reason,
-                    })
-                }
+                Err(reason) => errors
+                    .push(reason.into_resolve_failure(us.binding.to_string(), us.source.clone())),
             },
             Err(reason) => {
-                errors.push(UpstreamResolveError {
-                    binding: us.binding.to_string(),
-                    source: us.source.clone(),
+                errors.push(UpstreamResolveFailure::parse(
+                    us.binding.to_string(),
+                    us.source.clone(),
                     reason,
-                });
+                ));
             }
         }
     }
@@ -733,6 +904,30 @@ pub enum UpstreamExportSourceError {
     Invariant(#[from] crate::parser::AnalysisTreeError),
     #[error("{0}")]
     Unavailable(String),
+    #[error("{error}")]
+    Module {
+        base: std::path::PathBuf,
+        error: Box<crate::module_resolver::ModuleError>,
+    },
+    #[error("{}", .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"))]
+    Boundaries(Vec<crate::validation::ExportBoundaryError>),
+}
+
+impl UpstreamExportSourceError {
+    fn into_resolve_failure(
+        self,
+        binding: String,
+        source: std::path::PathBuf,
+    ) -> UpstreamResolveFailure {
+        match self {
+            Self::Unavailable(reason) => UpstreamResolveFailure::message(binding, source, reason),
+            Self::Module { base, error } => {
+                UpstreamResolveFailure::module(binding, source, base, *error)
+            }
+            Self::Boundaries(errors) => UpstreamResolveFailure::boundaries(binding, source, errors),
+            Self::Invariant(_) => unreachable!("analysis invariants propagate separately"),
+        }
+    }
 }
 
 /// Reuse a loader-owned source parse for export discovery. This performs the
@@ -793,7 +988,10 @@ pub fn resolve_upstream_exports_from_parsed(
             {
                 return Err(UpstreamExportSourceError::Invariant(error.clone()));
             }
-            return Err(UpstreamExportSourceError::Unavailable(reason.to_string()));
+            return Err(UpstreamExportSourceError::Module {
+                base: source_abs.source_label(),
+                error: Box::new(reason),
+            });
         }
     };
     // Declarations were resolved before expansion so inference
@@ -816,13 +1014,7 @@ pub fn resolve_upstream_exports_from_parsed(
         if let Err(boundary_errors) =
             crate::validation::validate_export_handle_boundaries(inferred.parameters())
         {
-            return Err(UpstreamExportSourceError::Unavailable(
-                boundary_errors
-                    .into_iter()
-                    .map(|error| error.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ));
+            return Err(UpstreamExportSourceError::Boundaries(boundary_errors));
         }
     }
     let entries: UpstreamExportEntries = match schemas {
@@ -832,13 +1024,7 @@ pub fn resolve_upstream_exports_from_parsed(
             if let Err(boundary_errors) =
                 crate::validation::validate_export_handle_boundaries(&inferred.export_params)
             {
-                return Err(UpstreamExportSourceError::Unavailable(
-                    boundary_errors
-                        .into_iter()
-                        .map(|error| error.to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                ));
+                return Err(UpstreamExportSourceError::Boundaries(boundary_errors));
             }
             inferred
                 .export_params

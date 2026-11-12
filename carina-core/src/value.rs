@@ -6805,7 +6805,7 @@ impl<'a, S, H: PlaceholderKind, B: BindingAddress, D> CanonicalizedResources<'a,
 /// The structured [`crate::schema::TypeError`] is retained as typed data while
 /// this terminal diagnostic renders it exactly once.
 #[derive(Debug, Error)]
-#[error("{resource}: failed to canonicalize enum attribute `{attribute}`: {error}", resource = crate::provider_text::DiagnosticText::new(resource.to_string()), attribute = crate::provider_text::DiagnosticText::new(attribute))]
+#[error("{resource}: failed to canonicalize enum attribute `{attribute}`: {error}", resource = crate::provider_text::DiagnosticText::new(resource.to_string()), attribute = crate::provider_text::DiagnosticText::new(attribute.to_string()))]
 pub struct EnumCanonicalizationError {
     resource: Box<crate::resource::ResourceId>,
     attribute: String,
@@ -7054,10 +7054,10 @@ pub(crate) fn canonicalize_provider_config_with_type_and_ancestry<
 /// A provider configuration value could not be resolved through the
 /// provider-declared attribute type.
 #[derive(Debug, Error)]
-#[error("provider {provider}: failed to canonicalize enum attribute `{attribute}`: {error}", provider = crate::provider_text::DiagnosticText::new(provider), attribute = crate::provider_text::DiagnosticText::new(attribute))]
+#[error("provider {provider}: failed to canonicalize enum attribute `{attribute}`: {error}", provider = crate::provider_text::DiagnosticText::new(provider), attribute = crate::provider_text::DiagnosticText::new(attribute.to_string()))]
 pub struct ProviderConfigCanonicalizationError {
     provider: String,
-    attribute: String,
+    attribute: crate::parser::AttributeKey,
     error: Box<crate::schema::TypeError>,
 }
 
@@ -7066,7 +7066,7 @@ impl ProviderConfigCanonicalizationError {
         &self.provider
     }
 
-    pub fn attribute(&self) -> &str {
+    pub fn attribute(&self) -> &crate::parser::AttributeKey {
         &self.attribute
     }
 
@@ -7075,7 +7075,13 @@ impl ProviderConfigCanonicalizationError {
         &self.error
     }
 
-    pub(crate) fn into_parts(self) -> (String, String, crate::schema::TypeError) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        String,
+        crate::parser::AttributeKey,
+        crate::schema::TypeError,
+    ) {
         (self.provider, self.attribute, *self.error)
     }
 }
@@ -7088,12 +7094,13 @@ pub(crate) fn canonicalize_provider_config_attributes_with_types<
     B: BindingAddress,
 >(
     provider_name: &str,
-    attributes: &IndexMap<String, Value<H, B>>,
+    attributes: &crate::parser::ConfigurationAttributes<Value<H, B>>,
     attr_types: &BTreeMap<String, AttributeType>,
-) -> Result<IndexMap<String, Value<H, B>>, ProviderConfigCanonicalizationError> {
-    let mut canonical = IndexMap::with_capacity(attributes.len());
+) -> Result<crate::parser::ConfigurationAttributes<Value<H, B>>, ProviderConfigCanonicalizationError>
+{
+    let mut canonical = crate::parser::ConfigurationAttributes::with_capacity(attributes.len());
     for (attribute, value) in attributes {
-        let value = match attr_types.get(attribute) {
+        let value = match attribute.lookup(attr_types) {
             Some(attr_type) => canonicalize_provider_config_with_type_and_ancestry(
                 provider_name,
                 value.clone(),
@@ -10598,30 +10605,36 @@ mod tests {
         let providers = vec![
             ProviderConfig {
                 name: "aws".to_string(),
-                attributes: indexmap::indexmap! {
-                    "region".to_string() => Value::Concrete(ConcreteValue::enum_identifier(
-                        "aws.Region.ap_northeast_1",
-                    )),
+                attributes: {
+                    let attributes: IndexMap<String, Value> = indexmap::indexmap! {
+                        "region".to_string() => Value::Concrete(ConcreteValue::enum_identifier(
+                            "aws.Region.ap_northeast_1",
+                        )),
+                    };
+                    attributes.into()
                 },
-                default_tags: indexmap::IndexMap::new(),
+                default_tags: Default::default(),
                 source: None,
                 version: None,
                 revision: None,
-                unresolved_attributes: indexmap::IndexMap::new(),
+                unresolved_attributes: Default::default(),
                 binding: None,
             },
             ProviderConfig {
                 name: "awscc".to_string(),
-                attributes: indexmap::indexmap! {
-                    "region".to_string() => Value::Concrete(ConcreteValue::enum_identifier(
-                        "awscc.Region.ap_northeast_1",
-                    )),
+                attributes: {
+                    let attributes: IndexMap<String, Value> = indexmap::indexmap! {
+                        "region".to_string() => Value::Concrete(ConcreteValue::enum_identifier(
+                            "awscc.Region.ap_northeast_1",
+                        )),
+                    };
+                    attributes.into()
                 },
-                default_tags: indexmap::IndexMap::new(),
+                default_tags: Default::default(),
                 source: None,
                 version: None,
                 revision: None,
-                unresolved_attributes: indexmap::IndexMap::new(),
+                unresolved_attributes: Default::default(),
                 binding: None,
             },
         ];
@@ -10671,10 +10684,11 @@ mod tests {
         let canonicalize = |provider_name: &str, raw: &str| {
             canonicalize_provider_config_attributes_with_types(
                 provider_name,
-                &IndexMap::from([(
+                &((IndexMap::<String, _>::from([(
                     "region".to_string(),
                     Value::Concrete(ConcreteValue::enum_identifier(raw)),
-                )]),
+                )]))
+                .into()),
                 &attr_types,
             )
         };
@@ -10717,10 +10731,11 @@ mod tests {
         let canonicalize = |raw: &str| {
             canonicalize_provider_config_attributes_with_types(
                 "configured",
-                &IndexMap::from([(
+                &((IndexMap::<String, _>::from([(
                     "state".to_string(),
                     Value::Concrete(ConcreteValue::enum_identifier(raw)),
-                )]),
+                )]))
+                .into()),
                 &attr_types,
             )
         };
@@ -10792,7 +10807,7 @@ mod tests {
         let attributes = IndexMap::from([("unknown".to_string(), secret())]);
         let untyped = canonicalize_provider_config_attributes_with_types(
             "test",
-            &attributes,
+            &((attributes.clone()).into()),
             &BTreeMap::new(),
         )
         .expect_err("an untyped provider config must reject the unresolved enum");

@@ -52,9 +52,9 @@ impl AnalysisResolutionError {
 }
 
 fn provider_analysis_failure(
-    locations: &[HashMap<String, super::DeclarationLocation>],
+    locations: &[HashMap<super::AttributeKey, super::DeclarationLocation>],
     index: usize,
-    key: &str,
+    key: &super::AttributeKey,
     error: ParseError,
 ) -> AnalysisResolutionError {
     if let ParseError::AtElement(finding) = error {
@@ -151,12 +151,12 @@ impl ResolvedProviderConfig {
         Self {
             config: ProviderConfig {
                 name: name.into(),
-                attributes: IndexMap::new(),
-                default_tags: IndexMap::new(),
+                attributes: crate::parser::ConfigurationAttributes::new(),
+                default_tags: crate::parser::ConfigurationAttributes::new(),
                 source: None,
                 version: None,
                 revision: None,
-                unresolved_attributes: IndexMap::new(),
+                unresolved_attributes: crate::parser::ConfigurationAttributes::new(),
                 binding: None,
             },
         }
@@ -166,7 +166,7 @@ impl ResolvedProviderConfig {
         &self.config.name
     }
 
-    pub fn attributes(&self) -> &IndexMap<String, RuntimeValue> {
+    pub fn attributes(&self) -> &super::ConfigurationAttributes<RuntimeValue> {
         &self.config.attributes
     }
 
@@ -295,7 +295,7 @@ const PROVIDER_CONFIG_SECTIONS: [ProviderConfigSection; 2] = [
 fn provider_config_section<P: crate::resource::ValueKind>(
     config: &ProviderConfig<P, AbsoluteBindingAddress>,
     section: ProviderConfigSection,
-) -> &IndexMap<String, GenericValue<P>> {
+) -> &super::ConfigurationAttributes<GenericValue<P>> {
     match section {
         ProviderConfigSection::Attribute => &config.attributes,
         ProviderConfigSection::DefaultTag => &config.default_tags,
@@ -305,7 +305,7 @@ fn provider_config_section<P: crate::resource::ValueKind>(
 fn provider_config_section_mut<P: crate::resource::ValueKind>(
     config: &mut ProviderConfig<P, AbsoluteBindingAddress>,
     section: ProviderConfigSection,
-) -> &mut IndexMap<String, GenericValue<P>> {
+) -> &mut super::ConfigurationAttributes<GenericValue<P>> {
     match section {
         ProviderConfigSection::Attribute => &mut config.attributes,
         ProviderConfigSection::DefaultTag => &mut config.default_tags,
@@ -315,7 +315,7 @@ fn provider_config_section_mut<P: crate::resource::ValueKind>(
 fn provider_config_secret_location<P: crate::resource::ValueKind>(
     config: &ProviderConfig<P, AbsoluteBindingAddress>,
     section: ProviderConfigSection,
-    key: &str,
+    key: &super::AttributeKey,
 ) -> String {
     match section {
         ProviderConfigSection::Attribute => {
@@ -456,12 +456,14 @@ mod saved_provider_config_secret_tests {
     fn provider(token: &str) -> RuntimeProviderConfig {
         ProviderConfig {
             name: "mock".to_string(),
-            attributes: IndexMap::from([("token".to_string(), secret(token))]),
-            default_tags: IndexMap::from([("Token".to_string(), secret(token))]),
+            attributes: (IndexMap::<String, _>::from([("token".to_string(), secret(token))]))
+                .into(),
+            default_tags: (IndexMap::<String, _>::from([("Token".to_string(), secret(token))]))
+                .into(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: crate::parser::ConfigurationAttributes::new(),
             binding: Some("secondary".to_string()),
         }
     }
@@ -470,7 +472,7 @@ mod saved_provider_config_secret_tests {
     fn provider_config_gate_rejects_coalesce_with_known_collection_children() {
         for value in crate::resource::known_value_gate_tests::coalesces() {
             let mut config = provider("unused");
-            config.attributes = IndexMap::from([("token".into(), value)]);
+            config.attributes = (IndexMap::<String, _>::from([("token".into(), value)])).into();
             assert!(matches!(validate_resolved_provider_configs(&[config]),
                 Err(ProviderConfigInvariantError::UnresolvedAttribute { error, .. })
                     if matches!(*error, crate::value::SerializationError::UnresolvedCoalesce { .. })));
@@ -572,7 +574,7 @@ pub enum ProviderConfigInvariantError {
     #[error("provider {provider}: {attribute}: {error}")]
     UnresolvedAttribute {
         provider: String,
-        attribute: String,
+        attribute: super::AttributeKey,
         error: Box<crate::value::SerializationError>,
     },
 }
@@ -2282,7 +2284,7 @@ where
 fn resolve_provider_unresolved_attributes_mapped<E, B: ProviderAttributeBindingPhase, D, Failure>(
     parsed: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &ProviderContext,
-    mut map_error: impl FnMut(usize, &str, ParseError) -> Failure,
+    mut map_error: impl FnMut(usize, &super::AttributeKey, ParseError) -> Failure,
 ) -> Result<(), Failure>
 where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -2300,7 +2302,11 @@ fn resolve_provider_unresolved_attributes_reporting<
 >(
     parsed: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &ProviderContext,
-    mut report_error: impl FnMut(usize, &str, ParseError) -> std::ops::ControlFlow<Failure>,
+    mut report_error: impl FnMut(
+        usize,
+        &super::AttributeKey,
+        ParseError,
+    ) -> std::ops::ControlFlow<Failure>,
 ) -> Result<(), Failure>
 where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -2350,7 +2356,7 @@ where
             };
             resolved.insert(key.clone(), r);
         }
-        provider.unresolved_attributes = resolved;
+        provider.unresolved_attributes = resolved.into();
     }
     Ok(())
 }
@@ -2450,7 +2456,7 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
                         })?;
                 resolved.insert(key.clone(), value);
             }
-            *section = resolved;
+            *section = resolved.into();
         }
 
         providers.push(provider);
@@ -2489,13 +2495,15 @@ fn finalize_provider_configs_mapped<E, B: BindingAddress, D, Failure>(
         D,
         B,
     >,
-    mut map_error: impl FnMut(usize, &str, ParseError) -> Failure,
+    mut map_error: impl FnMut(usize, &super::AttributeKey, ParseError) -> Failure,
 ) -> Result<(), Failure> {
     for (index, provider) in parsed.providers.iter_mut().enumerate() {
         if let Some(value) = provider.unresolved_attributes.shift_remove("default_tags") {
-            provider.default_tags = provider_default_tags_map(&provider.name, &value)
-                .map_err(|error| map_error(index, "default_tags", error))?
-                .clone();
+            provider.default_tags = super::ConfigurationAttributes::from_literal_map(
+                provider_default_tags_map(&provider.name, &value)
+                    .map_err(|error| map_error(index, &"default_tags".into(), error))?
+                    .clone(),
+            );
         }
         debug_assert!(
             provider.unresolved_attributes.is_empty(),
@@ -2570,12 +2578,13 @@ where
     for (index, provider) in file.providers.iter_mut().enumerate() {
         if let Some(value) = provider.unresolved_attributes.shift_remove("default_tags") {
             match provider_default_tags_map(&provider.name, &value) {
-                Ok(tags) => provider.default_tags = tags.clone(),
+                Ok(tags) => {
+                    provider.default_tags =
+                        super::ConfigurationAttributes::from_literal_map(tags.clone())
+                }
                 Err(_error) => {
                     statuses[index] = ProviderInputStatus::Failed;
-                    provider
-                        .unresolved_attributes
-                        .insert("default_tags".into(), value);
+                    provider.unresolved_attributes.insert("default_tags", value);
                 }
             }
         }

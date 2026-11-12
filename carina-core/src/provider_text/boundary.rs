@@ -137,6 +137,16 @@ pub struct ProviderSessionBuilder {
     sink: super::events::EventSink,
 }
 impl ProviderSessionBuilder {
+    /// Route events to an output owner while preserving the human command's
+    /// normal severity filter and its event-budget accounting.
+    pub fn with_filtered_diagnostic_sink(
+        mut self,
+        sink: impl Fn(super::BoundProviderEvent) + Send + Sync + 'static,
+    ) -> Self {
+        self.sink = super::events::EventSink::Filtered(std::sync::Arc::new(sink));
+        self
+    }
+
     pub fn with_diagnostic_sink(
         mut self,
         sink: impl Fn(super::BoundProviderEvent) + Send + Sync + 'static,

@@ -241,181 +241,200 @@ fn parse_expression_with_resource_or_module(
     preprocessed_file: &PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<LetBindingRhs, ParseError> {
-    let descent = descend_expression(pair, false).ok_or_else(|| ParseError::InternalError {
-        expected: "expression precedence chain ending in a primary".to_string(),
-        context: "let-binding right-hand side".to_string(),
-    })?;
-    let primary = descent.primary();
-    let let_mode = ExpressionMode::with_source(source_file, preprocessed_file);
-    let integer_operand = let_mode.for_integer_operand();
-    let primary_is_integer_operand = [Rule::multiplicative_expr, Rule::additive_expr]
-        .into_iter()
-        .filter_map(|rule| descent.wrapper(rule))
-        .any(|wrapper| wrapper.into_inner().nth(1).is_some());
-    let primary_mode = if primary_is_integer_operand {
-        &integer_operand
-    } else {
-        &let_mode
-    };
-    let parsed_primary = parse_primary_with_resource_or_module(
-        primary,
-        ctx,
-        binding_name,
-        preprocessed_file,
-        source_file,
-        primary_mode,
-    )?;
-    let is_declaration = parsed_rhs_is_declaration(&parsed_primary);
-    let (mut value, expanded_resources, data_sources, module_calls, maybe_import, mut binding_kind) =
-        parsed_primary;
-    let postfix = descent
-        .wrapper(Rule::postfix_expr)
-        .expect("expression descent contains a postfix wrapper");
-    let postfix_line = ctx.original_position(&postfix)?.line();
-    let mut postfix_inner = postfix.into_inner();
-    let _primary = next_pair(
-        &mut postfix_inner,
-        "primary expression",
-        "postfix expression",
-    )?;
-    let postfix_steps = postfix_inner.collect::<Vec<_>>();
-    if !postfix_steps.is_empty() {
-        if is_declaration || matches!(binding_kind, LetBindingKind::StructuralAlias) {
-            return Err(ParseError::InvalidExpression {
-                line: postfix_line,
-                message: "postfix access cannot be applied to a resource or module declaration"
-                    .to_string(),
-            });
-        }
-        value = apply_postfix_steps(value, postfix_steps, ctx)?;
-    }
+    let evaluation = ctx.evaluation_site(&pair);
+    evaluation
+        .evaluate(|| {
+            let descent =
+                descend_expression(pair, false).ok_or_else(|| ParseError::InternalError {
+                    expected: "expression precedence chain ending in a primary".to_string(),
+                    context: "let-binding right-hand side".to_string(),
+                })?;
+            let primary = descent.primary();
+            let let_mode = ExpressionMode::with_source(source_file, preprocessed_file);
+            let integer_operand = let_mode.for_integer_operand();
+            let primary_is_integer_operand = [Rule::multiplicative_expr, Rule::additive_expr]
+                .into_iter()
+                .filter_map(|rule| descent.wrapper(rule))
+                .any(|wrapper| wrapper.into_inner().nth(1).is_some());
+            let primary_mode = if primary_is_integer_operand {
+                &integer_operand
+            } else {
+                &let_mode
+            };
+            let parsed_primary = parse_primary_with_resource_or_module(
+                primary,
+                ctx,
+                binding_name,
+                preprocessed_file,
+                source_file,
+                primary_mode,
+            )?;
+            let is_declaration = parsed_rhs_is_declaration(&parsed_primary);
+            let (
+                mut value,
+                expanded_resources,
+                data_sources,
+                module_calls,
+                maybe_import,
+                mut binding_kind,
+            ) = parsed_primary;
+            let postfix = descent
+                .wrapper(Rule::postfix_expr)
+                .expect("expression descent contains a postfix wrapper");
+            let postfix_line = ctx.original_position(&postfix)?.line();
+            let mut postfix_inner = postfix.into_inner();
+            let _primary = next_pair(
+                &mut postfix_inner,
+                "primary expression",
+                "postfix expression",
+            )?;
+            let postfix_steps = postfix_inner.collect::<Vec<_>>();
+            if !postfix_steps.is_empty() {
+                if is_declaration || matches!(binding_kind, LetBindingKind::StructuralAlias) {
+                    return Err(ParseError::InvalidExpression {
+                        line: postfix_line,
+                        message:
+                            "postfix access cannot be applied to a resource or module declaration"
+                                .to_string(),
+                    });
+                }
+                value = apply_postfix_steps(value, postfix_steps, ctx)?;
+            }
 
-    let multiplicative = descent
-        .wrapper(Rule::multiplicative_expr)
-        .expect("expression descent contains a multiplicative wrapper");
-    let mut multiplicative_inner = multiplicative.into_inner();
-    let _postfix = next_pair(
-        &mut multiplicative_inner,
-        "postfix expression",
-        "multiplicative expression",
-    )?;
-    while let Some(operator) = multiplicative_inner.next() {
-        let operator_line = ctx.original_position(&operator)?.line();
-        if is_declaration {
-            return Err(arithmetic_on_declaration_error(operator_line));
-        }
-        let rhs = next_pair(
-            &mut multiplicative_inner,
-            "postfix expression",
-            "multiplicative expression rhs",
-        )?;
-        let (op, span) = parse_integer_operator(operator, ctx)?;
-        value = combine_integer_operands(
-            value,
-            op,
-            parse_postfix_eval_with_mode(rhs, ctx, &integer_operand)?,
-            span,
-        )?;
-        binding_kind = LetBindingKind::Value;
-    }
+            let multiplicative = descent
+                .wrapper(Rule::multiplicative_expr)
+                .expect("expression descent contains a multiplicative wrapper");
+            let mut multiplicative_inner = multiplicative.into_inner();
+            let _postfix = next_pair(
+                &mut multiplicative_inner,
+                "postfix expression",
+                "multiplicative expression",
+            )?;
+            while let Some(operator) = multiplicative_inner.next() {
+                let operator_line = ctx.original_position(&operator)?.line();
+                if is_declaration {
+                    return Err(arithmetic_on_declaration_error(operator_line));
+                }
+                let rhs = next_pair(
+                    &mut multiplicative_inner,
+                    "postfix expression",
+                    "multiplicative expression rhs",
+                )?;
+                let (op, span) = parse_integer_operator(operator, ctx)?;
+                value = combine_integer_operands(
+                    value,
+                    op,
+                    parse_postfix_eval_with_mode(rhs, ctx, &integer_operand)?,
+                    span,
+                    ctx,
+                )?;
+                binding_kind = LetBindingKind::Value;
+            }
 
-    let additive = descent
-        .wrapper(Rule::additive_expr)
-        .expect("expression descent contains an additive wrapper");
-    let mut additive_inner = additive.into_inner();
-    let _multiplicative = next_pair(
-        &mut additive_inner,
-        "multiplicative expression",
-        "additive expression",
-    )?;
-    while let Some(operator) = additive_inner.next() {
-        let operator_line = ctx.original_position(&operator)?.line();
-        if is_declaration {
-            return Err(arithmetic_on_declaration_error(operator_line));
-        }
-        let rhs = next_pair(
-            &mut additive_inner,
-            "multiplicative expression",
-            "additive expression rhs",
-        )?;
-        let (op, span) = parse_integer_operator(operator, ctx)?;
-        let rhs = parse_multiplicative_expr_with_mode(rhs, ctx, &integer_operand)?;
-        value = combine_integer_operands(value, op, rhs, span)?;
-        binding_kind = LetBindingKind::Value;
-    }
+            let additive = descent
+                .wrapper(Rule::additive_expr)
+                .expect("expression descent contains an additive wrapper");
+            let mut additive_inner = additive.into_inner();
+            let _multiplicative = next_pair(
+                &mut additive_inner,
+                "multiplicative expression",
+                "additive expression",
+            )?;
+            while let Some(operator) = additive_inner.next() {
+                let operator_line = ctx.original_position(&operator)?.line();
+                if is_declaration {
+                    return Err(arithmetic_on_declaration_error(operator_line));
+                }
+                let rhs = next_pair(
+                    &mut additive_inner,
+                    "multiplicative expression",
+                    "additive expression rhs",
+                )?;
+                let (op, span) = parse_integer_operator(operator, ctx)?;
+                let rhs = parse_multiplicative_expr_with_mode(rhs, ctx, &integer_operand)?;
+                value = combine_integer_operands(value, op, rhs, span, ctx)?;
+                binding_kind = LetBindingKind::Value;
+            }
 
-    let compose = descent
-        .wrapper(Rule::compose_expr)
-        .expect("expression descent contains a compose wrapper");
-    let mut compose_inner = compose.into_inner();
-    let _additive = next_pair(
-        &mut compose_inner,
-        "additive expression",
-        "compose expression",
-    )?;
-    for rhs in compose_inner {
-        value =
-            combine_compose_operands(value, parse_additive_expr_with_mode(rhs, ctx, &let_mode)?)?;
-        binding_kind = LetBindingKind::Value;
-    }
+            let compose = descent
+                .wrapper(Rule::compose_expr)
+                .expect("expression descent contains a compose wrapper");
+            let compose_evaluation = ctx.evaluation_site(&compose);
+            let mut compose_inner = compose.into_inner();
+            let _additive = next_pair(
+                &mut compose_inner,
+                "additive expression",
+                "compose expression",
+            )?;
+            for rhs in compose_inner {
+                value = combine_compose_operands(
+                    value,
+                    parse_additive_expr_with_mode(rhs, ctx, &let_mode)?,
+                    &compose_evaluation,
+                )?;
+                binding_kind = LetBindingKind::Value;
+            }
 
-    let pipe = descent
-        .wrapper(Rule::pipe_expr)
-        .expect("expression descent contains a pipe wrapper");
-    let mut pipe_inner = pipe.into_inner();
-    let _compose = next_pair(&mut pipe_inner, "compose expression", "pipe expression")?;
-    for function_call in pipe_inner {
-        let location = ctx.declaration_location(&function_call);
-        let position = ctx.original_position(&function_call)?;
-        let (line, column) = (position.line(), position.column());
-        let mut function_inner = function_call.into_inner();
-        let function_name = next_pair(&mut function_inner, "function name", "pipe function call")?
-            .as_str()
-            .to_string();
-        let extra_args = function_inner
-            .map(|argument| parse_expression_eval(argument, ctx))
-            .collect::<Result<Vec<_>, _>>()?;
-        value = apply_pipe_step(
-            value,
-            function_name,
-            extra_args,
-            ctx,
-            line,
-            column,
-            location,
-        )?;
-        binding_kind = LetBindingKind::Value;
-    }
+            let pipe = descent
+                .wrapper(Rule::pipe_expr)
+                .expect("expression descent contains a pipe wrapper");
+            let mut pipe_inner = pipe.into_inner();
+            let _compose = next_pair(&mut pipe_inner, "compose expression", "pipe expression")?;
+            for function_call in pipe_inner {
+                let location = ctx.declaration_location(&function_call);
+                let position = ctx.original_position(&function_call)?;
+                let (line, column) = (position.line(), position.column());
+                let mut function_inner = function_call.into_inner();
+                let function_name =
+                    next_pair(&mut function_inner, "function name", "pipe function call")?
+                        .as_str()
+                        .to_string();
+                let extra_args = function_inner
+                    .map(|argument| parse_expression_eval(argument, ctx))
+                    .collect::<Result<Vec<_>, _>>()?;
+                value = apply_pipe_step(
+                    value,
+                    function_name,
+                    extra_args,
+                    ctx,
+                    line,
+                    column,
+                    location,
+                )?;
+                binding_kind = LetBindingKind::Value;
+            }
 
-    let coalesce = descent
-        .wrapper(Rule::coalesce_expr)
-        .expect("expression descent contains a coalesce wrapper");
-    let coalesce_line = ctx.original_position(&coalesce)?.line();
-    let mut coalesce_inner = coalesce.into_inner();
-    let _pipe = next_pair(
-        &mut coalesce_inner,
-        "pipe expression",
-        "coalesce expression",
-    )?;
-    let mut defaults = coalesce_inner
-        .map(|default| parse_pipe_expr_with_mode(default, ctx, &let_mode))
-        .collect::<Result<Vec<_>, _>>()?;
-    if let Some(mut default) = defaults.pop() {
-        while let Some(previous) = defaults.pop() {
-            default = combine_coalesce_operands(previous, default, coalesce_line)?;
-        }
-        value = combine_coalesce_operands(value, default, coalesce_line)?;
-        binding_kind = LetBindingKind::Value;
-    }
+            let coalesce = descent
+                .wrapper(Rule::coalesce_expr)
+                .expect("expression descent contains a coalesce wrapper");
+            let coalesce_line = ctx.original_position(&coalesce)?.line();
+            let mut coalesce_inner = coalesce.into_inner();
+            let _pipe = next_pair(
+                &mut coalesce_inner,
+                "pipe expression",
+                "coalesce expression",
+            )?;
+            let mut defaults = coalesce_inner
+                .map(|default| parse_pipe_expr_with_mode(default, ctx, &let_mode))
+                .collect::<Result<Vec<_>, _>>()?;
+            if let Some(mut default) = defaults.pop() {
+                while let Some(previous) = defaults.pop() {
+                    default = combine_coalesce_operands(previous, default, coalesce_line)?;
+                }
+                value = combine_coalesce_operands(value, default, coalesce_line)?;
+                binding_kind = LetBindingKind::Value;
+            }
 
-    Ok((
-        value,
-        expanded_resources,
-        data_sources,
-        module_calls,
-        maybe_import,
-        binding_kind,
-    ))
+            Ok((
+                value,
+                expanded_resources,
+                data_sources,
+                module_calls,
+                maybe_import,
+                binding_kind,
+            ))
+        })
+        .map_err(Into::into)
 }
 
 fn parse_primary_with_resource_or_module(
@@ -426,15 +445,20 @@ fn parse_primary_with_resource_or_module(
     source_file: &std::path::Path,
     fallback_mode: &ExpressionMode<'_>,
 ) -> Result<LetBindingRhs, ParseError> {
-    let inner = first_inner(pair, "value", "primary expression")?;
-    parse_primary_inner_with_resource_or_module(
-        inner,
-        ctx,
-        binding_name,
-        preprocessed_file,
-        source_file,
-        fallback_mode,
-    )
+    let evaluation = ctx.evaluation_site(&pair);
+    evaluation
+        .evaluate(|| {
+            let inner = first_inner(pair, "value", "primary expression")?;
+            parse_primary_inner_with_resource_or_module(
+                inner,
+                ctx,
+                binding_name,
+                preprocessed_file,
+                source_file,
+                fallback_mode,
+            )
+        })
+        .map_err(Into::into)
 }
 
 pub(crate) fn parse_integer_operand_primary(
@@ -517,7 +541,7 @@ fn parse_primary_inner_with_resource_or_module(
         }
         Rule::upstream_state_expr => {
             let line = ctx.original_position(&inner)?.line();
-            let us = parse_upstream_state_expr(inner, binding_name_str)?;
+            let us = parse_upstream_state_expr(inner, binding_name_str, ctx)?;
             if ctx.upstream_states.contains_key(us.binding.as_str()) {
                 return Err(ParseError::DuplicateBinding {
                     name: us.binding.to_string(),
@@ -536,7 +560,7 @@ fn parse_primary_inner_with_resource_or_module(
         }
         Rule::provider_expr => {
             let line = ctx.original_position(&inner)?.line();
-            let config = parse_provider_expr(inner, ctx, binding_name_str)?;
+            let config = parse_provider_expr(inner, ctx, binding_name)?;
             if ctx
                 .named_provider_instances
                 .iter()

@@ -13516,6 +13516,15 @@ impl BlockNamePath {
                     let nested = !text.is_empty();
                     write_path_field(&mut text, name, nested).expect("write String");
                 }
+                Segment::ProtectedKey { key, kind } => match kind {
+                    crate::parser::ProtectedPathKind::Key => {
+                        write!(text, "[{key:?}]").expect("write String");
+                    }
+                    _ => {
+                        let nested = !text.is_empty();
+                        write_path_field(&mut text, "<redacted>", nested).expect("write String");
+                    }
+                },
                 Segment::ListIndex(index) => write!(text, "[{index}]").expect("write String"),
                 Segment::Key(key) => {
                     if protected.peek() == Some(&index) {

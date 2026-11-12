@@ -905,6 +905,34 @@ fn plan_json_is_the_only_stdout_document_when_both_streams_are_piped() {
 }
 
 #[test]
+fn validate_json_never_controls_the_terminal_cursor() {
+    let fixture = Fixture::new();
+    for valid in [true, false] {
+        if !valid {
+            fs::write(fixture.project.join("resources.crn"), "let = {\n").unwrap();
+        }
+        let output = fixture.run_with_streams(&["validate", "--json", "."], false, true, &[]);
+        assert_eq!(output.success, valid, "{}", output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(json["status"], if valid { "ok" } else { "error" });
+        assert!(
+            output.pty_raw.is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&output.pty_raw)
+        );
+    }
+    let human = fixture.run_with_streams(&["validate", "."], false, true, &[]);
+    for control in [b"\x1b[?25l", b"\x1b[?25h"] {
+        assert!(
+            human
+                .pty_raw
+                .windows(control.len())
+                .any(|bytes| bytes == control)
+        );
+    }
+}
+
+#[test]
 fn plan_json_is_the_only_stdout_document_when_stderr_is_a_tty() {
     let fixture = Fixture::new();
     fixture.apply();

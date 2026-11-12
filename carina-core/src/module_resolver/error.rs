@@ -47,6 +47,13 @@ pub enum ModuleErrorCallSource<'a> {
     Unavailable,
 }
 
+/// One semantic leaf with the outermost call ownership retained during
+/// decomposition. Removing a multiple-error container cannot erase its anchor.
+pub struct ModuleErrorDiagnostic<'a> {
+    pub error: &'a ModuleError,
+    pub call_source: ModuleErrorCallSource<'a>,
+}
+
 /// Module resolution error
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleError {
@@ -377,6 +384,40 @@ impl ModuleError {
         }
     }
 
+    /// Individual semantic failures before any terminal newline joining.
+    pub fn individual_errors(&self) -> Vec<ModuleErrorDiagnostic<'_>> {
+        fn collect<'a>(
+            error: &'a ModuleError,
+            owners: ModuleErrorCallSource<'a>,
+            findings: &mut Vec<ModuleErrorDiagnostic<'a>>,
+        ) {
+            let owners = if matches!(owners, ModuleErrorCallSource::Unavailable) {
+                error.call_source()
+            } else {
+                owners
+            };
+            match error {
+                ModuleError::Multiple(errors) => {
+                    for error in errors.iter() {
+                        collect(error, owners, findings);
+                    }
+                }
+                ModuleError::OwnedByCalls { error, .. }
+                | ModuleError::AtCall { error, .. }
+                | ModuleError::WithProviderTypeWarnings { error, .. } => {
+                    collect(error, owners, findings)
+                }
+                error => findings.push(ModuleErrorDiagnostic {
+                    error,
+                    call_source: owners,
+                }),
+            }
+        }
+        let mut findings = Vec::new();
+        collect(self, ModuleErrorCallSource::Unavailable, &mut findings);
+        findings
+    }
+
     /// Semantic leaf after removing typed import ownership wrappers.
     pub fn root_cause(&self) -> &Self {
         match self {
@@ -595,9 +636,11 @@ fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
         | ParseError::InsideSecret { .. }
         | ParseError::SecretInConstraint { .. }
         | ParseError::Syntax(_)
+        | ParseError::ProtectedFile(_)
         | ParseError::UnavailableSecret(_)
         | ParseError::InvalidFloatLiteral { .. }
         | ParseError::InvalidExpression { .. }
+        | ParseError::InvalidAuthoredExpression { .. }
         | ParseError::Evaluation { .. }
         | ParseError::IntegerArithmetic { .. }
         | ParseError::UnboundLoopRead { .. }

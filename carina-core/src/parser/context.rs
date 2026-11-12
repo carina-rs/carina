@@ -36,6 +36,33 @@ pub(crate) struct AuthoredDiagnosticSource {
 #[derive(Clone)]
 pub(super) struct EvaluationOnly;
 
+pub(crate) trait EvaluationSource: Clone {
+    fn evaluation_site_at(
+        &self,
+        location: &super::DeclarationLocation,
+    ) -> super::evaluation::EvaluationSite;
+}
+impl EvaluationSource for AuthoredDiagnosticSource {
+    fn evaluation_site_at(
+        &self,
+        location: &super::DeclarationLocation,
+    ) -> super::evaluation::EvaluationSite {
+        if location.file().path() == self.path {
+            super::evaluation::EvaluationSite::from_location(location, &self.file)
+        } else {
+            Default::default()
+        }
+    }
+}
+impl EvaluationSource for EvaluationOnly {
+    fn evaluation_site_at(
+        &self,
+        _location: &super::DeclarationLocation,
+    ) -> super::evaluation::EvaluationSite {
+        Default::default()
+    }
+}
+
 /// Parser-local lexical binding kind.
 ///
 /// Structural bindings (resources, module calls, `for` results, waits,
@@ -146,9 +173,28 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
     /// lowered. Shared ownership lets nested parser contexts preserve authored
     /// positions without exposing a raw line/column constructor.
     source_position_map: Option<Arc<crate::heredoc::PreprocessResult>>,
+    evaluation_scopes: super::evaluation::EvaluationScopes,
 }
 
 impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
+    pub(super) fn evaluation_site(
+        &self,
+        pair: &pest::iterators::Pair<'_, Rule>,
+    ) -> super::evaluation::ScopedEvaluation {
+        self.evaluation_scopes
+            .attach(super::evaluation::EvaluationSite::from_pair(
+                pair,
+                &self.diagnostic_source.file,
+            ))
+    }
+
+    pub(super) fn authored_key(
+        &self,
+        pair: pest::iterators::Pair<'_, Rule>,
+    ) -> super::AttributeKey {
+        super::AttributeKey::authored_in_file(pair, &self.diagnostic_source.file)
+    }
+
     pub(super) fn diagnostic_source_text(
         &self,
         pair: pest::iterators::Pair<'_, Rule>,
@@ -196,6 +242,7 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         );
         context.session = self.session;
         context.authored_nodes = self.authored_nodes.clone();
+        context.evaluation_scopes = self.evaluation_scopes.clone();
         context
     }
 
@@ -351,7 +398,22 @@ impl<'cfg> ParseContext<'cfg, EvaluationOnly> {
     }
 }
 
-impl<'cfg, Source: Clone> ParseContext<'cfg, Source> {
+impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
+    pub(super) fn evaluation_site_at(
+        &self,
+        location: &super::DeclarationLocation,
+    ) -> super::evaluation::EvaluationSite {
+        self.evaluation_scopes
+            .capture(self.diagnostic_source.evaluation_site_at(location))
+    }
+
+    pub(super) fn resume_evaluation(
+        &self,
+        site: &super::evaluation::EvaluationSite,
+    ) -> super::evaluation::ScopedEvaluation {
+        self.evaluation_scopes.attach(site.clone())
+    }
+
     pub(super) fn typecheck_provider_context(
         &self,
     ) -> crate::validation::typecheck::TypecheckProviderContext<'cfg> {
@@ -395,6 +457,7 @@ impl<'cfg, Source: Clone> ParseContext<'cfg, Source> {
             authored_nodes: Arc::default(),
             next_binding_scope: Rc::new(Cell::new(1)),
             source_position_map: None,
+            evaluation_scopes: Default::default(),
         }
     }
 
@@ -448,7 +511,8 @@ impl<'cfg, Source: Clone> ParseContext<'cfg, Source> {
             .remap_module_call_owner(from, to);
     }
 
-    pub(super) fn record_pending_function_type_check(&self, check: PendingFunctionTypeCheck) {
+    pub(super) fn record_pending_function_type_check(&self, mut check: PendingFunctionTypeCheck) {
+        check.evaluation = self.evaluation_scopes.capture(check.evaluation);
         let mut checks = self.pending_function_type_checks.borrow_mut();
         if !checks.contains(&check) {
             checks.push(check);
@@ -791,41 +855,55 @@ impl<'a> ExpressionMode<'a> {
         }
     }
 
-    pub(super) fn at_attribute(&self, name: impl Into<String>) -> Self {
-        let Some(sink) = &self.sink else {
-            return self.clone();
+    fn authored_segment(
+        &self,
+        name: String,
+        pair: &pest::iterators::Pair<'_, Rule>,
+        kind: super::ProtectedPathKind,
+    ) -> AttributePathSegment {
+        let file = self
+            .source
+            .map(|source| source.preprocessed_file)
+            .or_else(|| self.sink.as_ref().map(|sink| sink.preprocessed_file));
+        let key = match file {
+            Some(file) => super::AttributeKey::provenance(name, pair, file),
+            None => super::AttributeKey::literal(name),
         };
-        let path = AttributePath::root(name);
-        Self {
-            sink: Some(ExpressionSink {
-                root_path: path.clone(),
-                path,
-                ..sink.clone()
-            }),
-            source: self.source,
-            is_integer_operand: self.is_integer_operand,
-        }
+        key.into_provenance_segment(kind)
     }
-
-    pub(super) fn at_named_child(&self, name: impl Into<String>) -> Self {
-        let name = name.into();
+    pub(super) fn at_named_child(
+        &self,
+        name: String,
+        pair: &pest::iterators::Pair<'_, Rule>,
+    ) -> Self {
         match self.sink.as_ref() {
-            Some(sink) if sink.root_path.root_name() == "<resource>" => self.at_attribute(name),
-            Some(_) => self.at_struct_field(name),
+            Some(sink) if sink.root_path.root_name() == "<resource>" => {
+                let segment =
+                    self.authored_segment(name, pair, super::ProtectedPathKind::Attribute);
+                let path = AttributePath::root_segment(segment);
+                let mut mode = self.clone();
+                if let Some(sink) = &mut mode.sink {
+                    sink.root_path = path.clone();
+                    sink.path = path;
+                }
+                mode
+            }
+            Some(_) => self.at_struct_field(name, pair),
             None => self.clone(),
         }
     }
-
     pub(super) fn at_list_index(&self, index: usize) -> Self {
         self.with_segment(AttributePathSegment::ListIndex(index))
     }
-
-    pub(super) fn at_key(&self, key: impl Into<String>) -> Self {
-        self.with_segment(AttributePathSegment::Key(key.into()))
+    pub(super) fn at_key(&self, key: String, pair: &pest::iterators::Pair<'_, Rule>) -> Self {
+        self.with_segment(self.authored_segment(key, pair, super::ProtectedPathKind::Key))
     }
-
-    pub(super) fn at_struct_field(&self, name: impl Into<String>) -> Self {
-        self.with_segment(AttributePathSegment::StructField(name.into()))
+    pub(super) fn at_struct_field(
+        &self,
+        name: String,
+        pair: &pest::iterators::Pair<'_, Rule>,
+    ) -> Self {
+        self.with_segment(self.authored_segment(name, pair, super::ProtectedPathKind::StructField))
     }
 
     fn with_segment(&self, segment: AttributePathSegment) -> Self {
@@ -960,6 +1038,8 @@ pub(crate) fn next_pair<'a>(
 /// Extract a key string from either an identifier or a quoted string pair.
 /// For identifiers, returns the raw text. For strings, extracts the content
 /// without quotes (supports both single-quoted and double-quoted strings).
+/// This legacy value-model projection accepts only literal keys. Authored
+/// configuration keys and diagnostic consumers retain `AttributeKey` instead.
 pub(crate) fn extract_key_string(
     pair: pest::iterators::Pair<'_, Rule>,
 ) -> Result<String, ParseError> {
@@ -1006,10 +1086,16 @@ pub(crate) fn extract_key_string(
                     }
                     Ok(result)
                 }
-                _ => Ok(inner.as_str().to_string()),
+                _ => Err(ParseError::InternalError {
+                    expected: "quoted literal string".to_string(),
+                    context: "map/attribute key".to_string(),
+                }),
             }
         }
-        _ => Ok(pair.as_str().to_string()),
+        _ => Err(ParseError::InternalError {
+            expected: "identifier or literal string".to_string(),
+            context: "map/attribute key".to_string(),
+        }),
     }
 }
 

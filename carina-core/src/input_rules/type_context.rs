@@ -52,10 +52,18 @@ impl DefaultTagEvidence {
     pub fn for_config<P: crate::resource::PlaceholderKind, B: crate::resource::BindingAddress>(
         config: &crate::parser::ProviderConfig<P, B>,
     ) -> Self {
+        let (values, public) = match config.default_tags.public_value_map() {
+            Ok(values) => (project_attributes(&values), true),
+            Err(_) => (Default::default(), false),
+        };
         Self {
             route: crate::provider::ProviderInstanceKey::from(config),
-            values: project_attributes(&config.default_tags),
-            completeness: if config.unresolved_attributes.contains_key("default_tags") {
+            values,
+            completeness: if !public {
+                DefaultTagCompleteness::Unavailable(
+                    DefaultTagUnavailable::ProviderConfigurationFailed,
+                )
+            } else if config.unresolved_attributes.contains_key("default_tags") {
                 DefaultTagCompleteness::Unavailable(DefaultTagUnavailable::Unresolved)
             } else {
                 DefaultTagCompleteness::Complete

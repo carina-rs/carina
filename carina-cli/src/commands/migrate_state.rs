@@ -291,13 +291,14 @@ mod tests {
     fn local_config(path: &Path) -> carina_core::parser::BackendConfig {
         carina_core::parser::BackendConfig {
             backend_type: "local".to_string(),
-            attributes: HashMap::from([(
+            attributes: (HashMap::<String, _>::from([(
                 "path".to_string(),
                 Value::Concrete(ConcreteValue::String(
                     path.to_string_lossy().into_owned().into(),
                 )),
-            )]),
-            attribute_spans: HashMap::new(),
+            )]))
+            .into(),
+            attribute_spans: Default::default(),
         }
     }
 
@@ -564,9 +565,9 @@ mod tests {
                         dst_path.to_string_lossy().into_owned().into(),
                     )),
                 );
-                m
+                (m).into()
             },
-            attribute_spans: HashMap::new(),
+            attribute_spans: Default::default(),
         };
 
         let outcome = run_init_migrate_state(
@@ -638,9 +639,9 @@ mod tests {
                         dst_path.to_string_lossy().into_owned().into(),
                     )),
                 );
-                m
+                (m).into()
             },
-            attribute_spans: HashMap::new(),
+            attribute_spans: Default::default(),
         };
 
         run_init_migrate_state(

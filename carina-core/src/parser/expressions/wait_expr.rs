@@ -67,7 +67,8 @@ pub(crate) fn parse_wait_expr(
                     });
                 }
                 let attr_line = child.as_span().start_pos().line_col().0;
-                let raw = child.as_str();
+                let authored = crate::parser::AuthoredExpressionText::redact(child.clone(), None);
+                let raw = authored.as_str();
                 // Strip leading `until` and `=` so the surface form starts
                 // with the predicate itself (e.g.
                 // `cert.status == aws.acm.Certificate.Status.Issued`).
@@ -449,7 +450,13 @@ mod tests {
 
     fn parse_wait_pair(pair: Pair<'_, Rule>) -> Result<WaitBinding, ParseError> {
         let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
-        let source = std::sync::Arc::new(preprocess_file(pair.as_str())?);
+        let input = format!("let cert_issued = {}", pair.as_str());
+        let source = std::sync::Arc::new(preprocess_file(&input)?);
+        let pair = source
+            .parse()?
+            .flatten()
+            .find(|pair| pair.as_rule() == Rule::wait_expr)
+            .expect("fixture contains a wait expression in a complete authored file");
         let source_file = std::path::Path::new("wait.crn");
         let ctx = ParseContext::new(&config, source_file, std::sync::Arc::clone(&source));
         parse_wait_expr(pair, "cert_issued", &ctx, &source, source_file)

@@ -144,6 +144,16 @@ impl AttributeRenames {
                     node.fields.entry(name.clone()).or_default()
                 }
                 Segment::ListIndex(index) => node.indices.entry(*index).or_default(),
+                Segment::ProtectedKey { kind, key } => match kind {
+                    super::ProtectedPathKind::Attribute => node
+                        .attributes
+                        .entry(key.transport_identity().to_owned())
+                        .or_default(),
+                    _ => node
+                        .fields
+                        .entry(key.transport_identity().to_owned())
+                        .or_default(),
+                },
             };
         }
         match last {
@@ -154,6 +164,16 @@ impl AttributeRenames {
                 node.field_names.insert(from.clone(), name);
             }
             Segment::ListIndex(_) => unreachable!("an attribute rename cannot rename an index"),
+            Segment::ProtectedKey { kind, key } => match kind {
+                super::ProtectedPathKind::Attribute => {
+                    node.attribute_names
+                        .insert(key.transport_identity().to_owned(), name);
+                }
+                _ => {
+                    node.field_names
+                        .insert(key.transport_identity().to_owned(), name);
+                }
+            },
         }
     }
     fn rewrite(&self, path: &mut [super::AttributePathSegment]) {
@@ -179,6 +199,19 @@ impl AttributeRenames {
                     current.fields.get(name)
                 }
                 Segment::ListIndex(index) => current.indices.get(index),
+                Segment::ProtectedKey { kind, key } => {
+                    let (names, children) = match kind {
+                        super::ProtectedPathKind::Attribute => {
+                            (&current.attribute_names, &current.attributes)
+                        }
+                        _ => (&current.field_names, &current.fields),
+                    };
+                    let authored = key.transport_identity().to_owned();
+                    if let Some(canonical) = names.get(&authored) {
+                        *key = key.renamed(canonical.clone());
+                    }
+                    children.get(&authored)
+                }
             };
         }
     }
@@ -383,13 +416,17 @@ fn collect_keys(
                     continue;
                 }
                 let mut path = parent.to_vec();
-                path.push(if parent.is_empty() {
-                    Segment::Attribute(key.clone())
+                let kind = if parent.is_empty() {
+                    super::ProtectedPathKind::Attribute
                 } else if is_map_entry {
-                    Segment::Key(key.clone())
+                    super::ProtectedPathKind::Key
                 } else {
-                    Segment::StructField(key.clone())
-                });
+                    super::ProtectedPathKind::StructField
+                };
+                path.push(
+                    super::AttributeKey::provenance(key.clone(), &key_pair, file)
+                        .into_provenance_segment(kind),
+                );
                 out.keys.push(AttributeKeyLocation {
                     path: path.clone(),
                     location: DeclarationLocation::from_pair(&key_pair, file, source),
@@ -607,7 +644,7 @@ pub(in crate::parser) fn function_type_annotations(
 pub struct ReferenceLocations {
     occurrence: DeclarationLocation,
     prefix: DeclarationLocation,
-    fields: Arc<[Located<String>]>,
+    fields: Arc<[Located<super::AttributeKey>]>,
 }
 impl ReferenceLocations {
     pub fn occurrence(&self) -> &DeclarationLocation {
@@ -624,14 +661,14 @@ impl ReferenceLocations {
         let path = format!("{binding}.{attribute}");
         self.fields
             .iter()
-            .find(|field| field.detail() == &path)
+            .find(|field| field.detail().matches(&path))
             .or_else(|| {
                 // Expansion can rename the binding while retaining the authored
                 // field. Select that grammar token, rather than searching text.
                 self.fields
                     .iter()
                     .rev()
-                    .find(|field| field.detail().rsplit('.').next() == Some(attribute))
+                    .find(|field| field.detail().matches_terminal(attribute))
             })
             // A computed/aliased access may have no authored token for the
             // resolved field. Its complete authored occurrence still owns it.
@@ -683,7 +720,7 @@ impl ReferenceLocations {
 fn collect_reference_fields(
     pair: &Pair<'_, Rule>,
     path: &mut Option<String>,
-    fields: &mut Vec<Located<String>>,
+    fields: &mut Vec<Located<super::AttributeKey>>,
     file: &PreprocessedFile,
     source: &Path,
 ) {
@@ -706,7 +743,7 @@ fn collect_reference_fields(
             };
             fields.push(Located::new(
                 DeclarationLocation::from_pair(&token, file, source),
-                selected.clone(),
+                super::AttributeKey::provenance(selected.clone(), &token, file),
             ));
             *path = Some(selected);
         }
@@ -879,7 +916,7 @@ impl std::hash::Hash for ReferenceProvenance {
 pub(crate) struct ProviderDeclaration {
     pub(crate) name: String,
     pub(crate) binding: Option<String>,
-    pub(crate) attributes: Vec<Located<String>>,
+    pub(crate) attributes: Vec<Located<super::AttributeKey>>,
 }
 
 fn provider_declaration(
@@ -893,11 +930,10 @@ fn provider_declaration(
     let mut attributes = Vec::new();
     for attribute in parts.filter(|pair| pair.as_rule() == Rule::attribute) {
         let mut parts = attribute.into_inner();
-        let key = parts
-            .next()
-            .expect("provider attribute key")
-            .as_str()
-            .to_string();
+        let key = super::AttributeKey::authored_in_file(
+            parts.next().expect("provider attribute key"),
+            file,
+        );
         let value = parts.next().expect("provider attribute value");
         attributes.push(Located::new(
             DeclarationLocation::from_pair(&value, file, source),
@@ -939,7 +975,7 @@ pub struct SyntaxInventory<
     providers: Vec<Located<ProviderDeclaration>>,
     upstream_sources: Vec<Located<B>>,
     configuration_blocks: Vec<Located<ConfigurationBlock>>,
-    backend_keys: Vec<Located<String>>,
+    backend_keys: Vec<Located<super::AttributeKey>>,
     anonymous_headers: Vec<DeclarationLocation>,
     loops: Vec<DeclarationLocation>,
     state_targets: Vec<DeclarationLocation>,
@@ -982,7 +1018,7 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
     pub fn configuration_blocks(&self) -> &[Located<ConfigurationBlock>] {
         &self.configuration_blocks
     }
-    pub(crate) fn backend_keys(&self) -> &[Located<String>] {
+    pub(crate) fn backend_keys(&self) -> &[Located<super::AttributeKey>] {
         &self.backend_keys
     }
     pub(crate) fn anonymous_headers(&self) -> &[DeclarationLocation] {
@@ -1141,7 +1177,7 @@ impl SyntaxInventory {
                             .expect("backend attribute key");
                         out.backend_keys.push(Located::new(
                             DeclarationLocation::from_pair(&key, file, source),
-                            key.as_str().to_string(),
+                            super::AttributeKey::authored_in_file(key, file),
                         ));
                     }
                     Some(ConfigurationBlock::Backend)

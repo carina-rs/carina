@@ -797,8 +797,16 @@ pub fn load_configuration_with_config(
     config: &ProviderContext,
     schemas: &SchemaRegistry,
 ) -> Result<LoadedConfig, String> {
+    load_configuration_report(path, config, schemas).map_err(|error| error.to_string())
+}
+
+/// Strict loading with the original findings retained for diagnostic clients.
+pub fn load_configuration_report(
+    path: &ResolvedPath,
+    config: &ProviderContext,
+    schemas: &SchemaRegistry,
+) -> Result<LoadedConfig, ConfigurationLoadFailure> {
     load_configuration_in_context(path, config, schemas, strict_resolution_context())
-        .map_err(|error| error.to_string())
 }
 
 /// Load installation/discovery metadata, deferring unconsumed value roots.
@@ -856,6 +864,20 @@ impl LoadedConfig {
 pub struct ConfigurationLoadFailure {
     kind: ConfigurationLoadFailureKind,
     message: String,
+    diagnostics: Vec<ConfigurationLoadDiagnostic>,
+}
+
+/// Original parse failures and file-only I/O failures, without terminal parsing.
+#[derive(Debug)]
+pub enum ConfigurationLoadDiagnostic {
+    Parse {
+        file: Option<PathBuf>,
+        error: Box<parser::ParseError>,
+    },
+    Message {
+        file: Option<PathBuf>,
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -865,20 +887,67 @@ pub enum ConfigurationLoadFailureKind {
 }
 
 impl ConfigurationLoadFailure {
-    pub fn kind(&self) -> ConfigurationLoadFailureKind {
-        self.kind
+    pub fn diagnostics(&self) -> &[ConfigurationLoadDiagnostic] {
+        &self.diagnostics
     }
-    fn backend(message: String) -> Self {
+
+    fn located(located: LocatedParseError, fallback: &Path) -> Self {
         Self {
-            kind: ConfigurationLoadFailureKind::BackendInput,
+            kind: if located.backend {
+                ConfigurationLoadFailureKind::BackendInput
+            } else {
+                ConfigurationLoadFailureKind::Configuration
+            },
+            message: located.render(fallback),
+            diagnostics: vec![ConfigurationLoadDiagnostic::Parse {
+                file: located.source_file,
+                error: located.error,
+            }],
+        }
+    }
+
+    fn parse(error: parser::ParseError, backend: bool) -> Self {
+        Self {
+            kind: if backend {
+                ConfigurationLoadFailureKind::BackendInput
+            } else {
+                ConfigurationLoadFailureKind::Configuration
+            },
+            message: error.to_string(),
+            diagnostics: vec![ConfigurationLoadDiagnostic::Parse {
+                file: error.source_file().map(Path::to_path_buf),
+                error: Box::new(error),
+            }],
+        }
+    }
+
+    fn file(message: String, file: &Path) -> Self {
+        Self::file_diagnostic(message.clone(), message, file)
+    }
+
+    fn file_diagnostic(message: String, diagnostic: String, file: &Path) -> Self {
+        Self {
+            kind: ConfigurationLoadFailureKind::Configuration,
+            diagnostics: vec![ConfigurationLoadDiagnostic::Message {
+                file: Some(file.to_path_buf()),
+                message: diagnostic,
+            }],
             message,
         }
+    }
+
+    pub fn kind(&self) -> ConfigurationLoadFailureKind {
+        self.kind
     }
 }
 impl From<String> for ConfigurationLoadFailure {
     fn from(message: String) -> Self {
         Self {
             kind: ConfigurationLoadFailureKind::Configuration,
+            diagnostics: vec![ConfigurationLoadDiagnostic::Message {
+                file: None,
+                message: message.clone(),
+            }],
             message,
         }
     }
@@ -909,14 +978,23 @@ fn load_configuration_in_context(
     let path_label = resolved.source_label();
     let path = path_label.as_path();
     if resolved.is_file() {
-        Err(format!("expected directory, got file: {}", path.display()).into())
+        Err(ConfigurationLoadFailure::file(
+            format!("expected directory, got file: {}", path.display()),
+            path,
+        ))
     } else if resolved.is_dir() {
         // Directory mode
-        let files = resolved
-            .crn_files()
-            .map_err(|error| format!("Failed to read directory {}: {error}", resolved.display()))?;
+        let files = resolved.crn_files().map_err(|error| {
+            ConfigurationLoadFailure::file(
+                format!("Failed to read directory {}: {error}", resolved.display()),
+                path,
+            )
+        })?;
         if files.is_empty() {
-            return Err(format!("No .crn files found in {}", path.display()).into());
+            return Err(ConfigurationLoadFailure::file(
+                format!("No .crn files found in {}", path.display()),
+                path,
+            ));
         }
 
         // Read every file once and run the directory-aware parse so
@@ -926,19 +1004,18 @@ fn load_configuration_in_context(
         // interpolations in sibling `role.crn` (#2815, #2817).
         let mut file_inputs: Vec<(PathBuf, String)> = Vec::with_capacity(files.len());
         for file in &files {
-            let content = file
-                .read_to_string()
-                .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
+            let content = file.read_to_string().map_err(|e| {
+                ConfigurationLoadFailure::file(
+                    format!("Failed to read {}: {}", file.display(), e),
+                    &file.source_label(),
+                )
+            })?;
             file_inputs.push((file.source_label(), content));
         }
         let parsed_files = match parse_directory_files_located(&file_inputs, config) {
             Ok(v) => v,
             Err(located) => {
-                return Err(if located.backend {
-                    ConfigurationLoadFailure::backend(located.render(path))
-                } else {
-                    located.render(path).into()
-                });
+                return Err(ConfigurationLoadFailure::located(located, path));
             }
         };
         let authored_bindings = AuthoredBindingView::from_directory_files(&parsed_files);
@@ -960,12 +1037,9 @@ fn load_configuration_in_context(
                 snapshot_resolution_context(resolution),
             ) {
                 let is_backend = e.is_backend();
-                let message = LocatedParseError::in_file(&file, e.into_parse_error()).render(path);
-                parse_errors.push(if is_backend {
-                    ConfigurationLoadFailure::backend(message)
-                } else {
-                    message.into()
-                });
+                let mut located = LocatedParseError::in_file(&file, e.into_parse_error());
+                located.backend = is_backend;
+                parse_errors.push(ConfigurationLoadFailure::located(located, path));
                 continue;
             }
 
@@ -985,9 +1059,11 @@ fn load_configuration_in_context(
             merge_parsed_file(&mut merged, parsed);
             if let Some(backend) = backend {
                 if merged.backend.is_some() {
-                    parse_errors.push(
-                        format!("{}: multiple backend blocks defined", file.display()).into(),
-                    );
+                    parse_errors.push(ConfigurationLoadFailure::file_diagnostic(
+                        format!("{}: multiple backend blocks defined", file.display()),
+                        "multiple backend blocks defined".to_string(),
+                        &file,
+                    ));
                 } else {
                     merged.backend = Some(backend);
                     backend_file = Some(io_file);
@@ -1004,10 +1080,17 @@ fn load_configuration_in_context(
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join("\n");
-            return Err(if backend {
-                ConfigurationLoadFailure::backend(message)
-            } else {
-                message.into()
+            return Err(ConfigurationLoadFailure {
+                kind: if backend {
+                    ConfigurationLoadFailureKind::BackendInput
+                } else {
+                    ConfigurationLoadFailureKind::Configuration
+                },
+                message,
+                diagnostics: parse_errors
+                    .into_iter()
+                    .flat_map(|error| error.diagnostics)
+                    .collect(),
             });
         }
 
@@ -1019,18 +1102,18 @@ fn load_configuration_in_context(
             None,
             resolution,
         ) {
-            return Err(if e.is_backend() {
-                ConfigurationLoadFailure::backend(e.into_parse_error().to_string())
-            } else {
-                e.into_parse_error().to_string().into()
-            });
+            let backend = e.is_backend();
+            return Err(ConfigurationLoadFailure::parse(
+                e.into_parse_error(),
+                backend,
+            ));
         }
         if let Err(e) = parser::resolve_snapshot_function_calls_in_context(
             &mut unresolved_merged,
             config,
             snapshot_resolution_context(resolution),
         ) {
-            return Err(e.to_string().into());
+            return Err(ConfigurationLoadFailure::parse(e, false));
         }
 
         // `finalize_provider_configs` is intentionally NOT called here.
@@ -1094,6 +1177,17 @@ pub fn parse_directory_for_metadata(
     overrides: &HashMap<String, String>,
     schemas: &SchemaRegistry,
 ) -> Result<ParsedRootDirectory, String> {
+    parse_directory_for_metadata_report(dir, config, overrides, schemas)
+        .map_err(|error| error.to_string())
+}
+
+/// Metadata loading with the original parser failure retained for diagnostics.
+pub fn parse_directory_for_metadata_report(
+    dir: &ResolvedPath,
+    config: &ProviderContext,
+    overrides: &HashMap<String, String>,
+    schemas: &SchemaRegistry,
+) -> Result<ParsedRootDirectory, DirectoryParseFailure> {
     parse_directory_with_overrides_impl(
         dir,
         config,
@@ -1102,7 +1196,6 @@ pub fn parse_directory_for_metadata(
         schemas,
     )
     .map(|result| result.parsed)
-    .map_err(|error| error.to_string())
 }
 
 /// Like [`parse_directory`] but takes an `overrides` map from **file name**

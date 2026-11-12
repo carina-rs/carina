@@ -68,8 +68,8 @@ impl BackendConfig {
                 }
                 parser::BackendConfig {
                     backend_type: S3_BACKEND_TYPE.to_string(),
-                    attributes,
-                    attribute_spans: HashMap::new(),
+                    attributes: attributes.into(),
+                    attribute_spans: Default::default(),
                 }
             }
             Self::Local(settings) => {
@@ -82,7 +82,7 @@ impl BackendConfig {
                 parser::BackendConfig {
                     backend_type: LOCAL_BACKEND_TYPE.to_string(),
                     attributes: attributes.collect(),
-                    attribute_spans: HashMap::new(),
+                    attribute_spans: Default::default(),
                 }
             }
         }
@@ -179,7 +179,7 @@ impl BackendConfigErrors {
         debug_assert!(!errors.is_empty());
         errors.sort_by(|left, right| {
             left.attribute()
-                .cmp(right.attribute())
+                .diagnostic_cmp(right.attribute())
                 .then_with(|| left.sort_rank().cmp(&right.sort_rank()))
         });
         Self { errors }
@@ -211,23 +211,23 @@ pub enum BackendAttributeError {
     #[error("Unknown attribute '{attribute}' for backend type '{backend_type}'")]
     UnknownAttribute {
         backend_type: String,
-        attribute: String,
+        attribute: carina_core::parser::AttributeKey,
     },
     #[error("Missing required attribute: {attribute}")]
     MissingRequiredAttribute {
         backend_type: String,
-        attribute: String,
+        attribute: carina_core::parser::AttributeKey,
     },
     #[error("Invalid attribute '{attribute}' for backend type '{backend_type}': {error}")]
     InvalidAttribute {
         backend_type: String,
-        attribute: String,
+        attribute: carina_core::parser::AttributeKey,
         error: Box<TypeError>,
     },
 }
 
 impl BackendAttributeError {
-    pub fn attribute(&self) -> &str {
+    pub fn attribute(&self) -> &carina_core::parser::AttributeKey {
         match self {
             Self::UnknownAttribute { attribute, .. }
             | Self::MissingRequiredAttribute { attribute, .. }
@@ -276,20 +276,23 @@ fn canonicalize_attributes<P: PlaceholderKind, B: BindingAddress>(
     config: &parser::BackendConfig<P, B>,
     schema: &ValidatedConfigSchema,
     required: &[&'static str],
-) -> (HashMap<String, Value<P, B>>, Vec<BackendAttributeError>) {
+) -> (
+    carina_core::parser::ConfigurationAttributes<Value<P, B>>,
+    Vec<BackendAttributeError>,
+) {
     let mut errors = Vec::new();
     for attribute in required {
         if !config.attributes.contains_key(*attribute) {
             errors.push(BackendAttributeError::MissingRequiredAttribute {
                 backend_type: config.backend_type.clone(),
-                attribute: (*attribute).to_string(),
+                attribute: (*attribute).into(),
             });
         }
     }
 
-    let mut canonicalized = HashMap::new();
+    let mut canonicalized = carina_core::parser::ConfigurationAttributes::new();
     for (attribute, value) in &config.attributes {
-        let Some(rootless_type) = schema.rootless_type(attribute) else {
+        let Some(rootless_type) = attribute.schema_type(schema) else {
             errors.push(BackendAttributeError::UnknownAttribute {
                 backend_type: config.backend_type.clone(),
                 attribute: attribute.clone(),
@@ -333,7 +336,7 @@ fn invalid_resolved_shape<P: PlaceholderKind, B: BindingAddress>(
 ) -> BackendAttributeError {
     BackendAttributeError::InvalidAttribute {
         backend_type: backend_type.to_string(),
-        attribute: attribute.to_string(),
+        attribute: attribute.into(),
         error: Box::new(TypeError::value_type_mismatch(
             expected.to_string(),
             value.type_name(),
@@ -342,11 +345,11 @@ fn invalid_resolved_shape<P: PlaceholderKind, B: BindingAddress>(
 }
 
 fn take_string<P: PlaceholderKind, B: BindingAddress>(
-    attributes: &mut HashMap<String, Value<P, B>>,
+    attributes: &mut carina_core::parser::ConfigurationAttributes<Value<P, B>>,
     backend_type: &str,
     attribute: &str,
 ) -> Result<Option<ValueString>, BackendAttributeError> {
-    let Some(value) = attributes.remove(attribute) else {
+    let Some(value) = attributes.shift_remove(attribute) else {
         return Ok(None);
     };
     match value {
@@ -361,11 +364,11 @@ fn take_string<P: PlaceholderKind, B: BindingAddress>(
 }
 
 fn take_bool<P: PlaceholderKind, B: BindingAddress>(
-    attributes: &mut HashMap<String, Value<P, B>>,
+    attributes: &mut carina_core::parser::ConfigurationAttributes<Value<P, B>>,
     backend_type: &str,
     attribute: &str,
 ) -> Result<Option<bool>, BackendAttributeError> {
-    let Some(value) = attributes.remove(attribute) else {
+    let Some(value) = attributes.shift_remove(attribute) else {
         return Ok(None);
     };
     match value {
@@ -405,7 +408,7 @@ fn resolve_s3_backend<P: PlaceholderKind, B: BindingAddress>(
         take_string(&mut attributes, S3_BACKEND_TYPE, "key"),
         &mut errors,
     );
-    let region = match attributes.remove("region") {
+    let region = match attributes.shift_remove("region") {
         Some(Value::Concrete(ConcreteValue::CanonicalEnum(value))) => {
             Some(value.api_value().to_string())
         }

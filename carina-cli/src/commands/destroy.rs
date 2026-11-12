@@ -149,7 +149,12 @@ pub async fn run_destroy(
     let parsed = loaded.parsed;
 
     super::apply::symlink_retarget_test_barrier("CARINA_TEST_DESTROY_CONFIG_HANDSHAKE_DIR").await;
-    let providers = ProviderLoad::load(runtime, &parsed.providers, base_dir)?;
+    let providers = ProviderLoad::load(
+        runtime,
+        &parsed.providers,
+        base_dir,
+        &mut crate::commands::human_provider_notices(runtime.color_mode()),
+    )?;
     let validated_config =
         providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
 
@@ -1686,7 +1691,12 @@ async fn run_destroy_locked(
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
-    let providers = match ProviderLoad::load(runtime, &parsed.providers, base_dir) {
+    let providers = match ProviderLoad::load(
+        runtime,
+        &parsed.providers,
+        base_dir,
+        &mut crate::commands::human_provider_notices(runtime.color_mode()),
+    ) {
         Ok(providers) => providers,
         Err(error) => {
             return finish_lock_command(
@@ -3221,8 +3231,13 @@ mod tests {
         let parsed = loaded.parsed;
         let base_dir =
             carina_core::paths::ResolvedPath::new(get_base_dir(fixture.config_path())).unwrap();
-        let providers = ProviderLoad::load(fixture.runtime(), &parsed.providers, &base_dir)
-            .expect("mock provider must load");
+        let providers = ProviderLoad::load(
+            fixture.runtime(),
+            &parsed.providers,
+            &base_dir,
+            &mut crate::commands::human_provider_notices(fixture.runtime().color_mode()),
+        )
+        .expect("mock provider must load");
         let validated_config = providers
             .validate_evaluated_config(parsed, &base_dir, true, &loaded.duplicate_declarations)
             .expect("fixture must validate");
