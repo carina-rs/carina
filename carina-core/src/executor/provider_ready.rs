@@ -21,7 +21,7 @@ pub use crate::module_resolver::ModuleConstraintFailure;
 use crate::module_resolver::{
     evaluate_live_pending_constraints, evaluate_saved_pending_constraints,
 };
-use crate::parser::{ProviderConfig, ResolvedProviderConfig};
+use crate::parser::{ProviderConfig, ProviderConfiguration};
 use crate::provider::{
     CreateRequest, HostNormalizer, ProviderDirectives, ProviderFactory, ProviderWireError,
     ProviderWireTarget, ResourceWirePayload, UpdateRequest, WireAttributes, WireReady,
@@ -998,9 +998,9 @@ pub fn validate_parser_provider_config(
 
 /// Prepare provider configuration for construction and normalization.
 ///
-/// [`ResolvedProviderConfig`] carries the guarantee that every construction-
-/// time attribute is fully resolved. This boundary therefore checks each
-/// attribute against the provider's host-side schema, replaces enum spellings
+/// The sealed [`ProviderConfiguration`] view guarantees that every construction-
+/// time attribute is fully resolved for either desired or read/delete use.
+/// This boundary checks each attribute against the provider's host-side schema, replaces enum spellings
 /// with canonical API values, and only then runs the provider-specific
 /// configuration validator. This is the sole constructor for
 /// [`ProviderReadyConfig`].
@@ -1018,7 +1018,7 @@ pub fn validate_parser_provider_config(
 /// ```
 pub fn prepare_provider_ready_config(
     factory: &dyn ProviderFactory,
-    config: &ResolvedProviderConfig,
+    config: &dyn ProviderConfiguration,
 ) -> Result<ProviderReadyConfig, ProviderConfigPreparationError> {
     let provider_name = config.name();
     let attributes = config.attributes();

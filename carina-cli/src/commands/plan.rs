@@ -6363,7 +6363,6 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs(
             .with_runtime(provider_context),
         validated_config.context().schemas(),
         upstream_policy,
-        ProviderUpstreamScope::All,
     )
     .await?;
 
@@ -6580,42 +6579,40 @@ pub(crate) enum UpstreamMissingStatePolicy {
     Lenient,
 }
 
-/// Which upstream declarations a command needs before provider construction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ProviderUpstreamScope {
-    /// Load every upstream because resource resolution also consumes them.
-    All,
-    /// Read/delete commands load only provider attributes and omit default tags.
-    ProviderConfigurationOnly,
-}
-
-/// Upstream values and the provider configs resolved from the same snapshot.
-///
-/// Commands that need both resource-reference resolution and provider
-/// construction carry this value together so they cannot accidentally load
-/// upstream state for one step and construct providers from raw parser data in
-/// another.
-pub(crate) struct ResolvedProviderInputs {
-    configs: ResolvedProviderConfigs,
+/// Provider configs and upstream values from one admitted snapshot. The config
+/// parameter keeps read/delete results distinct from desired-input results.
+pub(crate) struct ResolvedProviderInputs<C = ResolvedProviderConfigs> {
+    configs: C,
     remote_bindings: AdmittedRemoteBindings,
 }
 
-impl ResolvedProviderInputs {
-    pub(crate) fn configs(&self) -> &ResolvedProviderConfigs {
+pub(crate) type ReadOnlyProviderInputs =
+    ResolvedProviderInputs<carina_core::parser::ReadOnlyProviderConfigs>;
+
+impl<C> ResolvedProviderInputs<C> {
+    pub(crate) fn configs(&self) -> &C {
         &self.configs
     }
-
     pub(crate) fn remote_bindings(&self) -> &AdmittedRemoteBindings {
         &self.remote_bindings
     }
 }
 
-/// Load upstream exports and resolve every provider attribute against them.
-///
-/// This is the sole CLI seam for project-based provider resolution. The
-/// command chooses both missing-state policy and load scope; provider
-/// construction then requires the returned typed configs.
-#[allow(clippy::too_many_arguments)]
+fn provider_config_resolution_error(
+    error: carina_core::parser::ProviderConfigResolutionError,
+) -> AppError {
+    match error {
+        carina_core::parser::ProviderConfigResolutionError::Parse(source) => {
+            AppError::ProviderAttributeResolution(Box::new(source))
+        }
+        carina_core::parser::ProviderConfigResolutionError::Invariant(source) => {
+            AppError::ProviderConfigInvariant(Box::new(source))
+        }
+        source => AppError::ProviderInputResolution(Box::new(source)),
+    }
+}
+
+/// Desired commands load all upstreams and receive configurations carrying tags.
 pub(crate) async fn load_and_resolve_provider_configs<E>(
     runtime: &crate::runtime::CommandRuntime,
     parsed: &carina_core::parser::ExpandedFile<E>,
@@ -6623,63 +6620,77 @@ pub(crate) async fn load_and_resolve_provider_configs<E>(
     provider_context: &ProviderContext,
     schemas: &carina_core::schema::SchemaRegistry,
     policy: UpstreamMissingStatePolicy,
-    scope: ProviderUpstreamScope,
 ) -> Result<ResolvedProviderInputs, AppError> {
     crate::wiring::settle_type_checks(
         carina_core::validation::deferred_types::TypeCheckSession::run_async(
             provider_context,
             async |session| {
-                let mut cycle_guard = seed_cycle_guard(base_dir);
-                let remote_bindings = match scope {
-                    ProviderUpstreamScope::All => {
-                        load_selected_upstream_states(
-                            runtime,
-                            &parsed.upstream_states,
-                            base_dir,
-                            provider_context,
-                            &mut cycle_guard,
-                            schemas,
-                            policy,
-                            None,
-                        )
-                        .await?
+                let remote_bindings = load_selected_upstream_states(
+                    runtime,
+                    &parsed.upstream_states,
+                    base_dir,
+                    provider_context,
+                    &mut seed_cycle_guard(base_dir),
+                    schemas,
+                    policy,
+                    None,
+                )
+                .await?;
+                let policy = match policy {
+                    UpstreamMissingStatePolicy::Strict => {
+                        carina_core::parser::DefaultTagResolutionPolicy::RequireKnown
                     }
-                    ProviderUpstreamScope::ProviderConfigurationOnly => {
-                        load_provider_referenced_upstream_states(
-                            runtime,
-                            parsed,
-                            base_dir,
-                            provider_context,
-                            &mut cycle_guard,
-                            schemas,
-                            policy,
-                        )
-                        .await?
+                    UpstreamMissingStatePolicy::Lenient => {
+                        carina_core::parser::DefaultTagResolutionPolicy::PlanWithMissingUpstream
                     }
                 };
-                let missing = if matches!(policy, UpstreamMissingStatePolicy::Lenient) {
-                    parsed.upstream_states.iter()
-                        .filter(|upstream| !remote_bindings.contains_key(upstream.binding.as_str()))
-                        .map(|upstream| upstream.binding.as_str().to_owned()).collect()
-                } else { HashSet::new() };
                 let configs = ResolvedProviderConfigs::resolve_with_remote(
-                    parsed, &remote_bindings, session, |key, value| {
-                        if matches!(scope, ProviderUpstreamScope::ProviderConfigurationOnly) {
-                            false
-                        } else if ResolvedProviderConfigs::references_only(value, &missing) {
-                            log::error!("Skipping default_tag '{key}' with unresolvable value: upstream state is missing");
-                            false
-                        } else { true }
-                    },
+                    parsed,
+                    &remote_bindings,
+                    session,
+                    policy,
                 )
-                .map_err(|error| match error {
-                    carina_core::parser::ProviderConfigResolutionError::Parse(source) => {
-                        AppError::ProviderAttributeResolution(Box::new(source))
-                    }
-                    carina_core::parser::ProviderConfigResolutionError::Invariant(source) => {
-                        AppError::ProviderConfigInvariant(Box::new(source))
-                    }
-                })?;
+                .map_err(provider_config_resolution_error)?;
+                Ok(ResolvedProviderInputs {
+                    configs,
+                    remote_bindings,
+                })
+            },
+        )
+        .await,
+        AppError::Validation,
+    )
+}
+
+/// Read/delete commands load only construction-attribute upstreams. This entry
+/// cannot return desired configurations or select the plan omission policy.
+pub(crate) async fn load_and_resolve_read_only_provider_configs<E>(
+    runtime: &crate::runtime::CommandRuntime,
+    parsed: &carina_core::parser::ExpandedFile<E>,
+    base_dir: &ResolvedPath,
+    provider_context: &ProviderContext,
+    schemas: &carina_core::schema::SchemaRegistry,
+) -> Result<ReadOnlyProviderInputs, AppError> {
+    crate::wiring::settle_type_checks(
+        carina_core::validation::deferred_types::TypeCheckSession::run_async(
+            provider_context,
+            async |session| {
+                let remote_bindings = load_provider_referenced_upstream_states(
+                    runtime,
+                    parsed,
+                    base_dir,
+                    provider_context,
+                    &mut seed_cycle_guard(base_dir),
+                    schemas,
+                    UpstreamMissingStatePolicy::Strict,
+                )
+                .await?;
+                let configs = carina_core::parser::ReadOnlyProviderConfigs::resolve_with_remote(
+                    parsed,
+                    &remote_bindings,
+                    session,
+                )
+                .map_err(provider_config_resolution_error)?;
                 Ok(ResolvedProviderInputs {
                     configs,
                     remote_bindings,
@@ -7252,6 +7263,7 @@ fn resolve_file_for_test<E>(
 #[cfg(test)]
 mod load_upstream_states_tests {
     use super::*;
+    use carina_core::parser::{ProviderConfiguration, ProviderConfigurations};
     #[cfg(test)]
     use std::fs;
 
@@ -7549,20 +7561,70 @@ mod load_upstream_states_tests {
             .attributes
             .insert("region".into(), root_resource_ref("mgmt", "region"));
 
-        let loaded = load_and_resolve_provider_configs(
+        let loaded = load_and_resolve_read_only_provider_configs(
             &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &ResolvedPath::new(&downstream).unwrap(),
             &context,
             &schemas,
-            UpstreamMissingStatePolicy::Strict,
-            ProviderUpstreamScope::ProviderConfigurationOnly,
         )
         .await
         .expect("unrelated invalid exports must not block provider-only commands");
         assert_eq!(loaded.remote_bindings()["mgmt"].len(), 2);
         assert!(loaded.remote_bindings()["mgmt"].contains_key("region"));
         assert!(!loaded.remote_bindings()["mgmt"].contains_key("unrelated"));
+    }
+
+    #[tokio::test]
+    async fn issue_4304_3a_review2_read_only_and_desired_provider_inputs_are_distinct() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+        parsed.providers.push(ProviderConfig {
+            name: "test".into(),
+            attributes: indexmap::IndexMap::new(),
+            default_tags: indexmap::IndexMap::from([(
+                "Owner".into(),
+                Value::Concrete(ConcreteValue::String("carina".into())),
+            )]),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: indexmap::IndexMap::new(),
+            binding: None,
+        });
+        let parsed = resolve_file_for_test(parsed, temp.path());
+        let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let schemas = carina_core::schema::SchemaRegistry::new();
+        let base = ResolvedPath::new(temp.path()).unwrap();
+        let desired = load_and_resolve_provider_configs(
+            &crate::test_support::TestCommandRuntime::new(),
+            &parsed,
+            &base,
+            &context,
+            &schemas,
+            UpstreamMissingStatePolicy::Strict,
+        )
+        .await
+        .unwrap();
+        let read_only = load_and_resolve_read_only_provider_configs(
+            &crate::test_support::TestCommandRuntime::new(),
+            &parsed,
+            &base,
+            &context,
+            &schemas,
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            std::any::type_name_of_val(desired.configs()),
+            std::any::type_name_of_val(read_only.configs()),
+            "read/delete configs must not authorize desired inputs",
+        );
+        assert!(
+            desired.configs().as_provider_configs()[0]
+                .default_tags
+                .contains_key("Owner")
+        );
     }
 
     struct EnumMetadataFactory;
@@ -7920,7 +7982,6 @@ mod load_upstream_states_tests {
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
             UpstreamMissingStatePolicy::Strict,
-            ProviderUpstreamScope::All,
         )
         .await
         {
@@ -7969,7 +8030,6 @@ mod load_upstream_states_tests {
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
             UpstreamMissingStatePolicy::Strict,
-            ProviderUpstreamScope::All,
         )
         .await
         {
@@ -8023,24 +8083,16 @@ mod load_upstream_states_tests {
         ]);
         let parsed = resolve_file_for_test(parsed, temp.path());
 
-        let inputs = load_and_resolve_provider_configs(
+        let inputs = load_and_resolve_read_only_provider_configs(
             &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
-            UpstreamMissingStatePolicy::Strict,
-            ProviderUpstreamScope::ProviderConfigurationOnly,
         )
         .await
         .expect("read/delete provider construction must not load tag-only upstreams");
-        assert!(
-            inputs
-                .configs()
-                .as_provider_configs()
-                .iter()
-                .all(|config| config.default_tags.is_empty())
-        );
+        assert!(!inputs.configs().configurations().is_empty());
     }
 
     #[tokio::test]
@@ -8075,21 +8127,19 @@ mod load_upstream_states_tests {
         parsed.resources.push(relay); // allow: direct — fixture test inspection
         let parsed = resolve_file_for_test(parsed, &downstream);
 
-        let inputs = load_and_resolve_provider_configs(
+        let inputs = load_and_resolve_read_only_provider_configs(
             &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
-            UpstreamMissingStatePolicy::Strict,
-            ProviderUpstreamScope::ProviderConfigurationOnly,
         )
         .await
         .expect("provider scope must load upstreams reached through resource attributes");
 
         assert_eq!(
-            inputs.configs().as_provider_configs()[0]
-                .attributes
+            inputs.configs().configurations()[0]
+                .attributes()
                 .get("role_arn"),
             Some(&Value::Concrete(ConcreteValue::String(
                 "arn:aws:iam::123456789012:role/upstream".into()

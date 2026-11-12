@@ -1307,6 +1307,10 @@ pub enum AppError {
     #[error("Provider attribute resolution error: {0}")]
     ProviderAttributeResolution(Box<carina_core::parser::ParseError>),
 
+    /// Runtime provider resolution retains its typed resolution cause.
+    #[error("Provider attribute resolution error")] // error-chain: caller-renders-sources
+    ProviderInputResolution(#[source] Box<carina_core::parser::ProviderConfigResolutionError>),
+
     /// Provider resolution completed but left a value outside the resolved invariant.
     #[error("Provider configuration did not fully resolve: {0}")]
     ProviderConfigInvariant(Box<carina_core::parser::ProviderConfigInvariantError>),

@@ -647,9 +647,13 @@ A struct type represents a nested object with typed fields.
   It includes custom validators and merged tag keys, values and entry counts,
   while authored-shape cross-attribute validators retain their authored scope.
   Authored tag overrides win; overridden defaults do not participate in membership.
-  Every default tag must be known when provider configurations resolve; validate
-  and LSP reject local apply-time references. Only explicit lenient handling of
-  missing upstream state may omit a default before provider-config resolution.
+  Default tags for desired inputs must be known when provider configurations resolve; validate
+  and LSP reject local apply-time references. Desired configurations retain
+  defaults except for the closed plan policy that omits defaults referring only
+  to missing upstream state. Destroy, state refresh and state bucket deletion use
+  `ReadOnlyProviderConfigs`, which has no default tags or projection into desired
+  inputs. Their validation retains authored defaults without demanding them;
+  only the typed read/delete provider path excludes those inputs.
   Anonymous scalar refinements occur only in provider schema slots; `TypeExpr`
   boundaries use identified refinements or unconstrained scalars. Adding overlapping
   source constraints never reduces assignability.

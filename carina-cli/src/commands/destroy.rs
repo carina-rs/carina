@@ -53,9 +53,7 @@ use carina_core::parser::ProviderContext;
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::collect_historical_display_attributes;
-use crate::commands::plan::{
-    ProviderUpstreamScope, UpstreamMissingStatePolicy, load_and_resolve_provider_configs,
-};
+use crate::commands::plan::load_and_resolve_read_only_provider_configs;
 use crate::commands::shared::finalize::{
     LockCommandOutcome, StatePersistence, finalize_after_execute, finish_lock_command,
 };
@@ -77,8 +75,8 @@ use crate::cursor::CursorReveal;
 use crate::display::{format_destroy_plan_with_delete_instances, format_effect};
 use crate::error::{AppError, DestroyDependencyAnalysisError};
 use crate::wiring::{
-    ProviderLoad, ValidatedConfig, get_provider_with_ctx, refresh_loaded_orphan_with_retry,
-    refresh_loaded_resource_with_retry,
+    ProviderLoad, ValidatedConfig, get_read_only_provider_with_ctx,
+    refresh_loaded_orphan_with_retry, refresh_loaded_resource_with_retry,
 };
 
 struct DestroyInFlight<'a, F> {
@@ -438,19 +436,17 @@ async fn run_destroy_locked_owned(
     let state_block_claims = &state_blocks.claims;
     let (ctx, parsed) = validated_config.context_and_resources();
 
-    let provider_inputs = load_and_resolve_provider_configs(&runtime,
+    let provider_inputs = load_and_resolve_read_only_provider_configs(&runtime,
         parsed,
         base_dir,
         &ctx.provider_context().with_runtime(provider_context),
         ctx.schemas(),
-        UpstreamMissingStatePolicy::Strict,
-        ProviderUpstreamScope::ProviderConfigurationOnly,
     )
     .await?;
 
     // Select the initialized provider before address reconciliation so every
     // create-only comparison uses the owning instance's reference scope.
-    let provider = get_provider_with_ctx(ctx,
+    let provider = get_read_only_provider_with_ctx(ctx,
 provider_inputs.configs(),
 ProgressSink::Human,
 validated_config.provider_plan())
@@ -464,11 +460,12 @@ validated_config.provider_plan())
         &state_file,
         ctx.schemas(),
     )?
-    .detect_moves(
+    .detect_moves_for_read_only(
         ctx,
         &provider,
         &parsed.data_sources,
-        provider_inputs.configs().as_provider_configs(),
+        provider_inputs.configs(),
+        &parsed.providers,
         state_block_claims,
     )?;
     let moved_pairs = crate::wiring::resolve_moved_pairs(

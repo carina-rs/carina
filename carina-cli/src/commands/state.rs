@@ -48,10 +48,7 @@ use super::{
     BackendLockRequirement, DriftCommand, ReadBackendWarningPolicy, resolve_backend_for_read,
     verify_for_mutation,
 };
-use crate::commands::plan::{
-    ProviderUpstreamScope, ResolvedProviderInputs, UpstreamMissingStatePolicy,
-    load_and_resolve_provider_configs,
-};
+use crate::commands::plan::{ReadOnlyProviderInputs, load_and_resolve_read_only_provider_configs};
 use crate::commands::shared::finalize::release_lock_after_execute;
 use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef};
 use crate::commands::shared::progress::{
@@ -62,7 +59,7 @@ use crate::commands::state_output::{StateShowCurrentKind, StateShowDocument, Sta
 use crate::cursor::CursorReveal;
 use crate::error::AppError;
 use crate::wiring::{
-    MigrationCheckProviderLoad, ProviderLoad, ValidatedConfig, get_provider_with_ctx,
+    MigrationCheckProviderLoad, ProviderLoad, ValidatedConfig, get_read_only_provider_with_ctx,
     prepare_default_provider_ready_config, refresh_loaded_orphan_with_retry,
 };
 use carina_core::hint::ProjectCommand;
@@ -1678,22 +1675,20 @@ async fn load_state_bucket_delete_provider_inputs<E>(
     base_dir: &carina_core::paths::ResolvedPath,
     provider_context: &ProviderContext,
     schemas: &carina_core::schema::SchemaRegistry,
-) -> Result<ResolvedProviderInputs, AppError> {
-    load_and_resolve_provider_configs(
+) -> Result<ReadOnlyProviderInputs, AppError> {
+    load_and_resolve_read_only_provider_configs(
         runtime,
         parsed,
         base_dir,
         provider_context,
         schemas,
-        UpstreamMissingStatePolicy::Strict,
-        ProviderUpstreamScope::ProviderConfigurationOnly,
     )
     .await
 }
 
 async fn create_state_bucket_delete_provider<R>(
     validated_config: &ValidatedConfig<R>,
-    provider_configs: &carina_core::parser::ResolvedProviderConfigs,
+    provider_configs: &carina_core::parser::ReadOnlyProviderConfigs,
     provider_name: &str,
     plan: &provider_mod::ProviderPlan,
 ) -> Result<carina_core::provider::InitializedProvider, AppError> {
@@ -1826,14 +1821,12 @@ pub(crate) async fn run_state_refresh_locked(
     let state_blocks = validated_config.reconcile_for_state_refresh(&state_file);
     let (ctx, parsed) = validated_config.context_and_resources();
 
-    let provider_inputs = load_and_resolve_provider_configs(
+    let provider_inputs = load_and_resolve_read_only_provider_configs(
         validated_config.context().runtime(),
         parsed,
         base_dir,
         &ctx.provider_context().with_runtime(provider_context),
         ctx.schemas(),
-        UpstreamMissingStatePolicy::Strict,
-        ProviderUpstreamScope::ProviderConfigurationOnly,
     )
     .await?;
 
@@ -1847,7 +1840,7 @@ pub(crate) async fn run_state_refresh_locked(
     let sorted_resources = expansion_prelude.sorted_resources();
 
     // Select provider
-    let provider = get_provider_with_ctx(
+    let provider = get_read_only_provider_with_ctx(
         ctx,
         provider_inputs.configs(),
         ProgressSink::Human,
@@ -3653,7 +3646,7 @@ mod tests {
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
-            inputs.configs().as_provider_configs(),
+            &parsed.providers,
         );
         create_state_bucket_delete_provider(
             &ctx,
@@ -3951,7 +3944,7 @@ mod tests {
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
-            inputs.configs().as_provider_configs(),
+            &parsed.providers,
         );
 
         create_state_bucket_delete_provider(
@@ -4018,7 +4011,7 @@ mod tests {
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
-            inputs.configs().as_provider_configs(),
+            &parsed.providers,
         );
 
         create_state_bucket_delete_provider(

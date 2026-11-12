@@ -51,8 +51,8 @@ use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::{
     CheckExportsPreApplyInput, LivePlanFileValues, PlanFile, PlanFileDecodeError,
-    PreparedPlanIdentityData, ProviderUpstreamScope, ReloadedPlanFile, ResolvedProviderInputs,
-    SavedDataSourceValue, UpstreamMissingStatePolicy, collect_historical_display_attributes,
+    PreparedPlanIdentityData, ReloadedPlanFile, ResolvedProviderInputs, SavedDataSourceValue,
+    UpstreamMissingStatePolicy, collect_historical_display_attributes,
     load_and_resolve_provider_configs, prepare_plan_identity_and_provider_inputs,
 };
 use crate::commands::shared::effect_execution::{
@@ -2270,7 +2270,6 @@ async fn load_apply_provider_inputs<E>(
         provider_context,
         schemas,
         UpstreamMissingStatePolicy::Strict,
-        ProviderUpstreamScope::All,
     )
     .await
 }

@@ -760,8 +760,11 @@ impl DiagnosticRun<'_> {
             {
                 for error in error.into_findings() {
                     let finding = carina_core::parser::Located::new(
-                        tree.provider_attribute_location(index, "default_tags")
-                            .clone(),
+                        tree.provider_attribute_location(
+                            index,
+                            carina_core::parser::DEFAULT_TAGS_ATTRIBUTE,
+                        )
+                        .clone(),
                         error,
                     );
                     diagnostics.extend(render_merged(

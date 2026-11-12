@@ -6855,9 +6855,10 @@ impl std::fmt::Display for DefaultTagEncodingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "key '{}' of provider '{}': default_tags",
-            DiagnosticText::new(&self.key),
-            DiagnosticText::new(&self.provider_name)
+            "provider '{}': {}.{} could not be encoded",
+            DiagnosticText::new(&self.provider_name),
+            crate::parser::DEFAULT_TAGS_ATTRIBUTE,
+            DiagnosticText::new(&self.key)
         )
     }
 }
@@ -12465,6 +12466,25 @@ mod tests {
             "failure must be atomic"
         );
         assert!(resources[0].default_tag_keys.is_empty());
+    }
+
+    #[test]
+    fn issue_4304_3a_review2_default_tag_encoding_names_provider_and_key() {
+        let error = DefaultTagEncodingError {
+            key: "Owner".into(),
+            provider_name: "mock".into(),
+            source: SerializationError::NullProviderSecret,
+        };
+        assert_eq!(
+            error.to_string(),
+            "provider 'mock': default_tags.Owner could not be encoded"
+        );
+        assert!(matches!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<SerializationError>(),
+            Some(SerializationError::NullProviderSecret)
+        ));
     }
 
     #[test]

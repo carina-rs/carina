@@ -1872,7 +1872,6 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         &carina_core::schema::SchemaRegistry::new(),
         UpstreamMissingStatePolicy::Strict,
-        ProviderUpstreamScope::All,
     )
     .await
     .expect("resolve empty provider config");
@@ -5249,7 +5248,6 @@ async fn missing_upstream_default_tags_are_omitted_before_saved_plan_apply() {
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         &carina_core::schema::SchemaRegistry::new(),
         UpstreamMissingStatePolicy::Lenient,
-        ProviderUpstreamScope::All,
     )
     .await
     .expect("lenient planning must omit only defaults whose upstream state is missing");

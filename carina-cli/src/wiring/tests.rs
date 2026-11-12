@@ -1,5 +1,63 @@
 use super::*;
 
+#[tokio::test]
+async fn issue_4304_3a_review2_read_only_validation_preserves_authored_defaults() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("providers.crn"),
+        "provider mock { default_tags = { Owner = 'carina' } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("main.crn"),
+        "let example = mock.test.resource {}\n",
+    )
+    .unwrap();
+    let project = ResolvedPath::new(project.path()).unwrap();
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let context =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let loaded = carina_core::config_loader::load_configuration_with_config(
+        &project,
+        &context,
+        &SchemaRegistry::new(),
+    )
+    .unwrap();
+    let validated = ProviderLoad::load(&runtime, &loaded.parsed.providers, &project)
+        .unwrap()
+        .validate_read_only_config(loaded.parsed, &project, &loaded.duplicate_declarations)
+        .unwrap();
+    let read_only = crate::commands::plan::load_and_resolve_read_only_provider_configs(
+        &runtime,
+        validated.resources(),
+        &project,
+        &context,
+        validated.context().schemas(),
+    )
+    .await
+    .unwrap();
+    let desired = crate::commands::plan::load_and_resolve_provider_configs(
+        &runtime,
+        validated.resources(),
+        &project,
+        &context,
+        validated.context().schemas(),
+        crate::commands::plan::UpstreamMissingStatePolicy::Strict,
+    )
+    .await
+    .unwrap();
+    let authored = &validated.resources().providers[0].default_tags;
+    assert_eq!(
+        authored.get("Owner"),
+        Some(&Value::Concrete(ConcreteValue::String("carina".into())))
+    );
+    assert_eq!(
+        &desired.configs().as_provider_configs()[0].default_tags,
+        authored
+    );
+    assert_eq!(read_only.configs().configurations().len(), 1);
+}
+
 #[test]
 fn round2_1_validate_load_error_precedes_unsettled_checks_with_main_variant() {
     let runtime = crate::test_support::TestCommandRuntime::new();
@@ -2005,6 +2063,7 @@ fn settlement_includes_checks_from_binding_readiness() {
         &carina_core::paths::ResolvedPath::new(".").unwrap(),
         true,
         &[],
+        crate::commands::ConfigNameResolution::EvaluatedOnly,
         |_parsed, catalog| {
             catalog.record(
                 &expected,

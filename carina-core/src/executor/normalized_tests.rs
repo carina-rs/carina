@@ -284,8 +284,7 @@ async fn invalid_default_tag_fails_normalization_without_mutating_resources() {
 
     let rendered = error.to_string();
     assert!(
-        rendered
-            .starts_with("failed to encode default tag: key 'InvalidEnum' of provider 'test': "),
+        rendered.starts_with("failed to encode default tag: provider 'test': default_tags.InvalidEnum could not be encoded: "),
         "{rendered}"
     );
     assert!(rendered.contains("provider 'test'"), "{rendered}");
