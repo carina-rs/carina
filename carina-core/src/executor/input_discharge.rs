@@ -848,7 +848,6 @@ mod tests {
                 &gate,
                 &[],
                 &crate::provider::NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -963,7 +962,6 @@ mod tests {
                     &gate,
                     &[],
                     &crate::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -1147,7 +1145,6 @@ mod tests {
                         &gate,
                         &[],
                         &crate::provider::NoopNormalizer,
-                        &[],
                         &schemas,
                         type_checks,
                     );

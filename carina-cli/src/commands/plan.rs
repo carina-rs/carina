@@ -5803,6 +5803,18 @@ pub async fn run_plan(
     .await
 }
 
+/// The output request is carried through provider resolution: only saveable
+/// output acquires strict configurations. Formatting and file destinations
+/// remain attached to those configurations through both save branches.
+enum PlanOutput<'a, C = ResolvedProviderConfigs> {
+    Preview,
+    Saveable {
+        provider_configs: C,
+        json: bool,
+        file: Option<(&'a Path, ResolvedPath)>,
+    },
+}
+
 /// The full plan command body, with only provider loading supplied by the caller.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_plan_using(
@@ -5832,9 +5844,17 @@ pub(crate) async fn run_plan_using(
     };
     let project = ResolvedPath::new(path).map_err(|error| AppError::Config(error.to_string()))?;
     let pinned_out = out
-        .map(ResolvedPath::new)
+        .map(|path| ResolvedPath::new(path).map(|pinned| (path, pinned)))
         .transpose()
         .map_err(|error| AppError::Config(format!("Failed to locate plan file: {error}")))?;
+    let output_request = match (json, pinned_out) {
+        (false, None) => PlanOutput::Preview,
+        (json, file) => PlanOutput::Saveable {
+            provider_configs: (),
+            json,
+            file,
+        },
+    };
     let loaded = load_configuration_with_config(
         &project,
         provider_context,
@@ -5990,30 +6010,35 @@ pub(crate) async fn run_plan_using(
         .context()
         .provider_context()
         .with_runtime(provider_context);
-    // Both --out and --json emit applicable saved plans. Only human display
-    // may receive the preview type that omits missing-upstream defaults.
-    let (provider_inputs, saved_provider_configs) = if out.is_some() || json {
-        let ResolvedProviderInputs {
-            configs,
-            remote_bindings,
-        } = load_and_resolve_provider_configs(
-            validated_config.context().runtime(),
-            validated_config.resources().parsed(),
-            base_dir,
-            &catalog,
-            validated_config.context().schemas(),
-            UpstreamMissingStatePolicy::Lenient,
-        )
-        .await?;
-        (
-            ResolvedProviderInputs {
-                configs: carina_core::parser::PlanPreviewProviderConfigs::from(&configs),
+    // Resolve the single output decision. Preview resolution has a distinct
+    // result type; the resolved saveable variant carries strict configs.
+    let (provider_inputs, output): (_, PlanOutput<'_>) = match output_request {
+        PlanOutput::Saveable { json, file, .. } => {
+            let ResolvedProviderInputs {
+                configs,
                 remote_bindings,
-            },
-            Some(configs),
-        )
-    } else {
-        (
+            } = load_and_resolve_provider_configs(
+                validated_config.context().runtime(),
+                validated_config.resources().parsed(),
+                base_dir,
+                &catalog,
+                validated_config.context().schemas(),
+                UpstreamMissingStatePolicy::Lenient,
+            )
+            .await?;
+            (
+                ResolvedProviderInputs {
+                    configs: carina_core::parser::PlanPreviewProviderConfigs::from(&configs),
+                    remote_bindings,
+                },
+                PlanOutput::Saveable {
+                    provider_configs: configs,
+                    json,
+                    file,
+                },
+            )
+        }
+        PlanOutput::Preview => (
             load_and_resolve_plan_preview_provider_configs(
                 validated_config.context().runtime(),
                 validated_config.resources().parsed(),
@@ -6022,8 +6047,8 @@ pub(crate) async fn run_plan_using(
                 validated_config.context().schemas(),
             )
             .await?,
-            None,
-        )
+            PlanOutput::Preview,
+        ),
     };
     if !refresh {
         eprintln!(
@@ -6172,7 +6197,12 @@ pub(crate) async fn run_plan_using(
         &ctx.provider,
     )?;
 
-    if json {
+    if let PlanOutput::Saveable {
+        provider_configs,
+        json: true,
+        ..
+    } = &output
+    {
         if let Some(note) = drift_note.as_ref() {
             eprintln!("{}", note.yellow(color_mode));
         }
@@ -6181,9 +6211,7 @@ pub(crate) async fn run_plan_using(
         // instead of a panic backtrace.
         let plan_file = build_plan_file(
             &project,
-            saved_provider_configs
-                .as_ref()
-                .expect("saved-plan output requires strict provider configs"),
+            provider_configs,
             plan_file_backend_config.clone(),
             &state_file,
             directive_changes.clone(),
@@ -6263,12 +6291,15 @@ pub(crate) async fn run_plan_using(
         ));
     }
 
-    let plan_output = if out.is_some() {
+    let plan_output = if let PlanOutput::Saveable {
+        provider_configs,
+        file: Some((authored, pinned)),
+        ..
+    } = &output
+    {
         let plan_file = build_plan_file(
             &project,
-            saved_provider_configs
-                .as_ref()
-                .expect("saved-plan output requires strict provider configs"),
+            provider_configs,
             plan_file_backend_config.clone(),
             &state_file,
             directive_changes.clone(),
@@ -6278,7 +6309,7 @@ pub(crate) async fn run_plan_using(
         .map_err(|error| map_plan_save_error(error, "--out"))?;
         let json_out = carina_core::utils::pretty_with_newline(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
-        Some(json_out)
+        Some((pinned, json_out, *authored))
     } else {
         None
     };
@@ -6288,7 +6319,9 @@ pub(crate) async fn run_plan_using(
         serial: state.serial,
     });
     let rendered_inline_image = write_plan_artifacts(
-        pinned_out.as_ref().zip(plan_output.as_deref()),
+        plan_output
+            .as_ref()
+            .map(|(path, contents, _)| (*path, contents.as_str())),
         (image.is_some() || inline_image.is_some()).then_some(PlanImageArtifactRequest {
             file: image,
             inline: inline_image,
@@ -6304,7 +6337,7 @@ pub(crate) async fn run_plan_using(
         }),
     )?;
 
-    if let Some(out_path) = out {
+    if let Some((_, _, out_path)) = plan_output {
         progress_sink.blank_line();
         progress_sink.line(
             format!("Plan saved to {}", out_path.display())

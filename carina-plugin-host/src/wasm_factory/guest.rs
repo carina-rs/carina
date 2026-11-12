@@ -5094,7 +5094,6 @@ pub(super) mod tests {
                     &gate,
                     &[],
                     &carina_core::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -5368,7 +5367,6 @@ pub(super) mod tests {
                     &gate,
                     &[],
                     &carina_core::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -5433,7 +5431,6 @@ pub(super) mod tests {
                     &module_gate,
                     &[],
                     &carina_core::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -5553,7 +5550,6 @@ pub(super) mod tests {
         let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let provider_configs = [];
         let normalizer = carina_core::provider::NoopNormalizer;
-        let factories = [];
         let schemas = carina_core::test_utils::preparation_schemas_with_attributes(
             &resource.id,
             carina_core::schema::SchemaKind::Resource,
@@ -5572,7 +5568,6 @@ pub(super) mod tests {
                     &gate,
                     &provider_configs,
                     &normalizer,
-                    &factories,
                     &schemas,
                     type_checks,
                 );

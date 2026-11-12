@@ -1908,7 +1908,6 @@ mod tests {
                         &gate,
                         &[],
                         &carina_core::provider::NoopNormalizer,
-                        &[],
                         &schemas,
                         type_checks,
                     );

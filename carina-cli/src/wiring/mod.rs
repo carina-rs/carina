@@ -6217,7 +6217,6 @@ pub(crate) struct AddressedDataSourceReadInputs<'a, 'backend> {
     pub schemas: &'a SchemaRegistry,
     pub saved_dep_bindings:
         &'a HashMap<ResourceId, carina_core::resource::PersistedDestroyDependencies>,
-    pub factories: &'a [Box<dyn ProviderFactory>],
     pub cancel: Option<&'a ShutdownToken>,
 }
 
@@ -6280,7 +6279,6 @@ async fn read_addressed_data_sources_phase2(
             schemas: inputs.schemas,
             wait_aliases: &addressed.wait_aliases,
             saved_dep_bindings: inputs.saved_dep_bindings,
-            factories: inputs.factories,
             cancel: inputs.cancel,
         },
         Phase2DataSourceStart::Unread,
@@ -8785,7 +8783,6 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<
             remote_bindings,
             schemas: ctx.schemas(),
             saved_dep_bindings: &saved_dep_bindings,
-            factories: ctx.factories(),
             cancel: None,
         })
         .await?;
@@ -9879,7 +9876,6 @@ pub async fn read_data_source_with_retry(
     resource: &carina_core::resource::DataSource,
     bindings: &ResolvedBindings,
     module_gate: &carina_core::executor::ModuleConstraintGate,
-    _factories: &[Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &carina_core::schema::SchemaRegistry,
     session: &ValidationProviderCatalog<'_>,
 ) -> Result<State, AppError> {
@@ -9920,7 +9916,6 @@ pub(crate) struct ReadDataSourcesInputs<'a, 'backend> {
     pub wait_aliases: &'a [WaitAliasSpec],
     pub saved_dep_bindings:
         &'a HashMap<ResourceId, carina_core::resource::PersistedDestroyDependencies>,
-    pub factories: &'a [Box<dyn ProviderFactory>],
     /// When present, stop dispatching new provider reads as soon as the
     /// command enters graceful shutdown. Reads already in flight are drained.
     pub cancel: Option<&'a ShutdownToken>,
@@ -10008,7 +10003,6 @@ pub(crate) struct ExpandedDataSourceReadInputs<'a, 'backend> {
     pub wait_aliases: &'a [WaitAliasSpec],
     pub saved_dep_bindings:
         &'a HashMap<ResourceId, carina_core::resource::PersistedDestroyDependencies>,
-    pub factories: &'a [Box<dyn ProviderFactory>],
     pub cancel: Option<&'a ShutdownToken>,
 }
 
@@ -10039,7 +10033,6 @@ pub(crate) async fn read_expanded_data_sources_phase2(
             schemas: inputs.schemas,
             wait_aliases: inputs.wait_aliases,
             saved_dep_bindings: inputs.saved_dep_bindings,
-            factories: inputs.factories,
             cancel: inputs.cancel,
         },
         Phase2DataSourceStart::Outcomes(values),
@@ -10346,7 +10339,6 @@ async fn read_data_sources_phase2_pass(
                                 &resource,
                                 bindings,
                                 module_gate,
-                                inputs.factories,
                                 inputs.schemas,
                                 session,
                             )
@@ -11344,7 +11336,6 @@ impl<E: Clone> ValidatedConfig<ExpandedFile<E>> {
                 remote_bindings,
                 schemas: ctx.schemas(),
                 saved_dep_bindings: &saved_dep_bindings,
-                factories: ctx.factories(),
                 cancel: Some(cancel),
             })
             .await?
@@ -11385,7 +11376,6 @@ impl<E: Clone> ValidatedConfig<ExpandedFile<E>> {
                 schemas: ctx.schemas(),
                 wait_aliases: &parts.wait_aliases,
                 saved_dep_bindings: &saved_dep_bindings,
-                factories: ctx.factories(),
                 cancel: Some(cancel),
             },
         )

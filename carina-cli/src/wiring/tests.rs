@@ -10724,7 +10724,6 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
                             &resource,
                             &bindings,
                             &module_gate,
-                            &[],
                             &schemas,
                             session,
                         )
@@ -10785,7 +10784,6 @@ async fn invalid_data_source_preparation_keeps_complete_typed_diagnostic() {
         &lookup,
         &ResolvedBindings::default(),
         &module_gate,
-        &[],
         &schemas,
         session,
     )
@@ -15938,7 +15936,6 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                     &gate,
                     &[],
                     &carina_core::provider::NoopNormalizer,
-                    &[],
                     ctx.schemas(),
                     session,
                 );

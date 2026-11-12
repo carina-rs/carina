@@ -91,7 +91,6 @@ async fn wire_error_renders_a_top_level_attribute_once() {
                 &gate,
                 &[],
                 &NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -137,7 +136,6 @@ async fn wire_error_paths_quote_non_identifier_map_keys() {
                     &gate,
                     &[],
                     &NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -207,7 +205,6 @@ async fn default_tag_duration_checks_wire_range_then_destination_membership() {
                     &gate,
                     &configs,
                     &NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -247,7 +244,6 @@ async fn native_create_rejects_a_non_wire_default_tag_before_dispatch() {
                 &gate,
                 &configs,
                 &NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -290,7 +286,6 @@ async fn native_update_checks_default_tags_outside_changed_attributes() {
                 &gate,
                 &configs,
                 &NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -335,7 +330,6 @@ async fn native_update_checks_observed_ignored_leaves_after_patch_substitution()
                 &gate,
                 &[],
                 &NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -378,7 +372,6 @@ fn native_data_source_rejects_non_wire_declared_attribute_values() {
                 &gate,
                 &[],
                 &NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -540,7 +533,6 @@ async fn checked_projection_preserves_native_scalars_and_late_secret_provenance(
                 &gate,
                 &configs,
                 &NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -599,7 +591,6 @@ async fn nested_wire_failures_retain_list_indices_and_never_values() {
                 &gate,
                 &[],
                 &NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -692,7 +683,6 @@ async fn review2_f4_dispatch_and_native_normalizer_receive_main_plaintext_shapes
                 &gate,
                 &[],
                 &normalizer_boundary,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -743,7 +733,6 @@ async fn review2_f4_secret_tag_maps_receive_main_default_tags() {
                 &gate,
                 &configs,
                 &NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );

@@ -763,7 +763,6 @@ pub(super) async fn execute_effects_sequential<
                         let module_gate = &module_gate;
                         let configs = input.provider_configs;
                         let normalizer = input.normalizer;
-                        let factories = input.factories;
                         let schemas = input.schemas;
                         in_flight.push_non_wait(idx, move |_start| async move {
                             let context = ProviderPreparationContext::new(
@@ -771,7 +770,6 @@ pub(super) async fn execute_effects_sequential<
                                 module_gate,
                                 configs,
                                 normalizer,
-                                factories,
                                 schemas,
                                 type_checks,
                             );
@@ -860,7 +858,6 @@ pub(super) async fn execute_effects_sequential<
             let module_gate = &module_gate;
             let normalizer = input.normalizer;
             let provider_configs = input.provider_configs;
-            let factories = input.factories;
             let schemas = input.schemas;
             let preparation_write = preparation_nodes.write(idx);
             let basic = ready.and_then(|ready| ready.into_basic());
@@ -883,7 +880,6 @@ pub(super) async fn execute_effects_sequential<
                     module_gate,
                     provider_configs,
                     normalizer,
-                    factories,
                     schemas,
                     type_checks,
                 );

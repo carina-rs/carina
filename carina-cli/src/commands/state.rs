@@ -1994,7 +1994,6 @@ pub(crate) async fn run_state_refresh_locked(
             remote_bindings: &empty_remote_bindings,
             schemas: ctx.schemas(),
             saved_dep_bindings: &saved_dep_bindings,
-            factories: ctx.factories(),
             cancel: Some(&cancel),
         })
         .await?
@@ -2048,7 +2047,6 @@ pub(crate) async fn run_state_refresh_locked(
             schemas: ctx.schemas(),
             wait_aliases: &wait_aliases,
             saved_dep_bindings: &saved_dep_bindings,
-            factories: ctx.factories(),
             cancel: Some(&cancel),
         },
     )

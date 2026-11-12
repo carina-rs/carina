@@ -1865,7 +1865,6 @@ fn provider_apply_and_discharge_use_catalog_when_factory_arguments_differ() {
                     &gate,
                     &[],
                     &crate::provider::NoopNormalizer,
-                    &[],
                     schemas,
                     session,
                 );

@@ -233,7 +233,6 @@ async fn wire_boundary_default_tag_fails_before_native_and_guest_crud() {
                     &gate,
                     &configs,
                     normalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -294,7 +293,6 @@ async fn wire_boundary_default_tag_fails_before_native_and_guest_crud() {
                 &gate,
                 &configs,
                 normalizer.as_ref(),
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -311,7 +309,6 @@ async fn wire_boundary_default_tag_fails_before_native_and_guest_crud() {
                 &gate,
                 &configs,
                 normalizer.as_ref(),
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -485,7 +482,6 @@ async fn create_request_for_test(mut resource: Resource) -> CreateRequest {
                 &module_gate,
                 &[],
                 &carina_core::provider::NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -584,7 +580,6 @@ async fn update_request_for_test<P: StateValueLeaf>(
                 &module_gate,
                 &[],
                 &carina_core::provider::NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -980,7 +975,6 @@ fn aws_credential_probe_data_source() -> carina_core::provider::ProviderReadyDat
                 &module_gate,
                 &[],
                 &carina_core::provider::NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -5670,7 +5664,6 @@ async fn issue_4304_3a_wasm_normalization_reenters_final_input_admission() {
                 &gate,
                 &[],
                 normalizer.as_ref(),
-                &[],
                 &schemas,
                 session,
             );
@@ -7265,7 +7258,6 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
                 &module_gate,
                 &[],
                 &carina_core::provider::NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -7513,7 +7505,6 @@ async fn raw_data_source_floats_retain_resource_operation_and_constructor_source
                     &gate,
                     &[],
                     &carina_core::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );

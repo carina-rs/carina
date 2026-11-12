@@ -345,7 +345,6 @@ async fn round2_initial_create_after_normalization(
                 &gate,
                 &[],
                 &host_normalizer,
-                &[],
                 &runtime_schemas,
                 session,
             );

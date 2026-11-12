@@ -2250,7 +2250,6 @@ mod tests {
                     &gate,
                     &[],
                     &carina_core::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -5162,7 +5161,7 @@ mod tests {
             let bindings = carina_core::binding_index::ResolvedBindings::default();
             let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
             let schemas = carina_core::test_utils::preparation_schemas_with_attributes(&resource.id, carina_core::schema::SchemaKind::Resource, &resource.attributes);
-            let context = carina_core::executor::ProviderPreparationContext::for_test(&bindings, &gate, &[], &carina_core::provider::NoopNormalizer, &[], &schemas, type_checks);
+            let context = carina_core::executor::ProviderPreparationContext::for_test(&bindings, &gate, &[], &carina_core::provider::NoopNormalizer, &schemas, type_checks);
             let request = carina_core::executor::prepare_create_request(resource, &context).await.unwrap();
             let wire = core_to_wit_create_request(&request).res;
             let values: std::collections::HashMap<_, _> = wire.attributes.into_iter().collect();
@@ -5255,7 +5254,6 @@ mod tests {
             &gate,
             &[],
             &normalizer_boundary,
-            &[],
             &schemas,
  type_checks,
 );
@@ -5384,7 +5382,6 @@ mod tests {
             &module_gate,
             &[],
             &carina_core::provider::NoopNormalizer,
-            &[],
             &schemas,
             type_checks,
         );

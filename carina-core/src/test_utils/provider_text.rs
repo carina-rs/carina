@@ -395,7 +395,6 @@ fn create_request_for(id: ResourceId) -> CreateRequest {
                     &gate,
                     &[],
                     &NoopNormalizer,
-                    &[],
                     &schemas,
                     checks,
                 );
@@ -528,7 +527,6 @@ impl BindProviderText for UpdateOutcome {
                         &gate,
                         &[],
                         &NoopNormalizer,
-                        &[],
                         &schemas,
                         checks,
                     );

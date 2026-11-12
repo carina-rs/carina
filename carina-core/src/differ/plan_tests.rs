@@ -761,7 +761,6 @@ fn provider_ready<S: Clone, D: Clone + Default>(
                 &gate,
                 &[],
                 &crate::provider::NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );

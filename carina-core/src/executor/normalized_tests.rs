@@ -1118,7 +1118,6 @@ async fn review_a2_guest_enum_error_is_bound_by_executor_preparation() {
                 &gate,
                 &[],
                 &normalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -1212,7 +1211,6 @@ async fn round5_dispatch_normalizer_collects_a_late_scalar_secret_before_ingress
                 &gate,
                 &[],
                 &normalizer,
-                &[],
                 &schemas,
                 checks,
             );

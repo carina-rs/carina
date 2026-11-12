@@ -13010,7 +13010,6 @@ mod tests {
                     &gate,
                     &[],
                     &NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -13038,7 +13037,6 @@ mod tests {
                     &gate,
                     &[],
                     &NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -14993,7 +14991,6 @@ mod tests {
                     &gate,
                     &[],
                     &NoopNormalizer,
-                    &[],
                     &registry,
                     type_checks,
                 );
@@ -15588,7 +15585,6 @@ mod tests {
                     &gate,
                     &[],
                     &NoopNormalizer,
-                    &[],
                     &schemas,
                     session,
                 );

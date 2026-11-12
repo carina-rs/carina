@@ -2196,7 +2196,6 @@ mod tests {
                     &module_gate,
                     &[],
                     &carina_core::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -2634,7 +2633,6 @@ mod tests {
                                 &module_gate,
                                 &[],
                                 &carina_core::provider::NoopNormalizer,
-                                &[],
                                 &schemas,
                                 type_checks,
                             );
@@ -3213,7 +3211,6 @@ mod tests {
                         &module_gate,
                         &[],
                         &carina_core::provider::NoopNormalizer,
-                        &[],
                         &schemas,
                         type_checks,
                     );

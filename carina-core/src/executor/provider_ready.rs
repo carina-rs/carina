@@ -433,7 +433,6 @@ impl<'a> ProviderPreparationContext<'a> {
         module_gate: &'a ModuleConstraintGate,
         provider_configs: &'a crate::parser::ResolvedProviderConfigs,
         normalizer: &'a dyn HostNormalizer,
-        _factories: &'a [Box<dyn ProviderFactory>],
         schemas: &'a SchemaRegistry,
         type_checks: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Self {
@@ -453,7 +452,6 @@ impl<'a> ProviderPreparationContext<'a> {
         module_gate: &'a ModuleConstraintGate,
         provider_configs: &'a [ProviderConfig<NoPlaceholder, AbsoluteBindingAddress>],
         normalizer: &'a dyn HostNormalizer,
-        _factories: &'a [Box<dyn ProviderFactory>],
         schemas: &'a SchemaRegistry,
         type_checks: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Self {
@@ -1632,7 +1630,6 @@ mod provider_config_tests {
                     &gate,
                     &[],
                     &crate::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     session,
                 );
@@ -1672,7 +1669,6 @@ mod provider_config_tests {
                     &gate,
                     &[],
                     &crate::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     session,
                 );
@@ -1716,7 +1712,6 @@ mod provider_config_tests {
                     &gate,
                     &[],
                     &crate::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     session,
                 );
@@ -1766,7 +1761,6 @@ mod provider_config_tests {
                     &module_gate,
                     &[],
                     &crate::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -1819,7 +1813,6 @@ mod provider_config_tests {
                     &module_gate,
                     &[],
                     &crate::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -1857,7 +1850,6 @@ mod provider_config_tests {
                     &module_gate,
                     &[],
                     &crate::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -1888,7 +1880,6 @@ mod provider_config_tests {
                     &module_gate,
                     &[],
                     &crate::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -2163,7 +2154,6 @@ mod provider_config_tests {
                     &module_gate,
                     &[],
                     &crate::provider::NoopNormalizer,
-                    &factories,
                     &schemas,
                     type_checks,
                 );
@@ -2249,7 +2239,6 @@ mod provider_config_tests {
                     &module_gate,
                     &[],
                     &normalizer_boundary,
-                    &factories,
                     snapshot.schemas().schemas(),
                     type_checks,
                 );
@@ -2376,7 +2365,6 @@ mod provider_config_tests {
                         &gate,
                         &[],
                         &normalizer,
-                        &[],
                         &schemas,
                         session,
                     );
@@ -2548,7 +2536,6 @@ mod provider_config_tests {
                         &gate,
                         &[],
                         &crate::provider::NoopNormalizer,
-                        &[],
                         &schemas,
                         session,
                     );
@@ -2577,7 +2564,6 @@ mod provider_config_tests {
                         &gate,
                         &[],
                         &crate::provider::NoopNormalizer,
-                        &[],
                         &schemas,
                         session,
                     );
@@ -2663,7 +2649,6 @@ mod provider_config_tests {
                         &gate,
                         &[],
                         &crate::provider::NoopNormalizer,
-                        &[],
                         &schemas,
                         session,
                     );
@@ -2804,7 +2789,6 @@ mod provider_config_tests {
                         &module_gate,
                         &[],
                         &normalizer,
-                        &factories,
                         snapshot.schemas().schemas(),
                         session,
                     );
@@ -2881,7 +2865,6 @@ mod provider_config_tests {
                         &gate,
                         &[],
                         &normalizer,
-                        &[],
                         &schemas,
                         session,
                     );
@@ -3015,7 +2998,6 @@ mod provider_config_tests {
                         &module_gate,
                         &file.providers,
                         &crate::provider::NoopNormalizer,
-                        &[],
                         &schemas,
                         session,
                     );
@@ -3150,7 +3132,6 @@ mod provider_config_tests {
                         &gate,
                         &file.providers,
                         &crate::provider::NoopNormalizer,
-                        &[],
                         &schemas,
                         session,
                     );
@@ -3226,7 +3207,7 @@ mod provider_config_tests {
                 &crate::parser::LoadedProviderContext::empty_for_test(),
                 async |session| {
                     let context = ProviderPreparationContext::for_test(
-                        &bindings, &gate, &file.providers, &normalizer, &[], &schemas, session,
+                        &bindings, &gate, &file.providers, &normalizer, &schemas, session,
                     );
                     for entry in [Entry::Plan, Entry::Dispatch] {
                         let error = prepare_tags(resource.clone(), entry, &context)
@@ -3263,7 +3244,6 @@ mod provider_config_tests {
                         &module_gate,
                         &[],
                         &crate::provider::NoopNormalizer,
-                        &[],
                         &schemas,
                         session,
                     );
@@ -4710,7 +4690,6 @@ mod provider_config_tests {
                     &module_gate,
                     &[],
                     &crate::provider::NoopNormalizer,
-                    &[],
                     &schemas,
                     type_checks,
                 );
@@ -4745,8 +4724,7 @@ mod provider_config_tests {
             &crate::parser::LoadedProviderContext::empty_for_test(),
             async |type_checks| {
                 let context = ProviderPreparationContext::for_test(
-                    &bindings, &module_gate, &[], &crate::provider::NoopNormalizer,
-                    &[], &schemas, type_checks,
+                    &bindings, &module_gate, &[], &crate::provider::NoopNormalizer, &schemas, type_checks,
                 );
                 let managed = Resource::with_provider("test", "widget", "example", None)
                     .with_attribute("value", value.clone());

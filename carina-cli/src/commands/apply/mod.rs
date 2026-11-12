@@ -223,7 +223,6 @@ struct BootstrapCreateContext<'a> {
     parsed: &'a carina_core::parser::ExpandedInferredFile,
     provider_configs: &'a ResolvedProviderConfigs,
     normalizer: &'a dyn HostNormalizer,
-    factories: &'a [Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &'a carina_core::schema::SchemaRegistry,
 }
 
@@ -281,7 +280,6 @@ async fn prepare_bootstrap_creation(
         &module_gate,
         context.provider_configs,
         context.normalizer,
-        context.factories,
         context.schemas,
         session,
     );
@@ -327,7 +325,6 @@ async fn create_checked_bootstrap_resource(
                     parsed: _,
                     provider_configs: _,
                     normalizer: _,
-                    factories: _,
                     schemas,
                 } = context;
                 let resolved = request.resource().as_inner().clone();
@@ -467,7 +464,6 @@ async fn create_checked_bootstrap_resource_for_test(
         parsed,
         provider_configs,
         normalizer,
-        factories,
         schemas: _schemas,
     } = context;
     let mut parsed = parsed.clone();
@@ -489,7 +485,6 @@ async fn create_checked_bootstrap_resource_for_test(
             parsed: &parsed,
             provider_configs,
             normalizer,
-            factories,
             schemas: &schemas,
         },
     )
@@ -2054,7 +2049,6 @@ async fn run_apply_with_observer_factory(
                         parsed: validated_config.resources().parsed(),
                         provider_configs: bootstrap_provider_inputs.configs(),
                         normalizer: bucket_normalizer.as_ref(),
-                        factories: validated_config.context().factories(),
                         schemas: validated_config.context().schemas(),
                     },
                 )
@@ -2583,7 +2577,6 @@ async fn run_apply_locked_owned(
                     remote_bindings,
                     schemas: ctx.schemas(),
                     saved_dep_bindings: &saved_dep_bindings,
-                    factories: ctx.factories(),
                     cancel: Some(&cancel),
                 })
                 .await?;

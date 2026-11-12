@@ -307,7 +307,6 @@ fn create_attempt_for_test(id: ResourceId) -> carina_core::provider::CreateAttem
                 &gate,
                 &[],
                 &NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );

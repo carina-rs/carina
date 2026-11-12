@@ -368,7 +368,7 @@ impl PlanProviderConfigurations for ResolvedProviderConfigs {
 ///     validation::deferred_types::ProviderTypeCheckContext};
 /// fn prepare(preview: &PlanPreviewProviderConfigs, bindings: &ResolvedBindings,
 ///     gate: &ModuleConstraintGate, schemas: &SchemaRegistry, session: &dyn ProviderTypeCheckContext) {
-///     let _ = ProviderPreparationContext::new(bindings, gate, preview, &NoopNormalizer, &[], schemas, session);
+///     let _ = ProviderPreparationContext::new(bindings, gate, preview, &NoopNormalizer, schemas, session);
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq)]
@@ -1019,15 +1019,25 @@ impl ResolvedProviderConfigs {
         value: &GenericValue<P, B>,
         bindings: &HashSet<String>,
     ) -> bool {
+        Self::references_within(value, bindings).is_some()
+    }
+
+    /// Retain the references that justify the upstream-only exception so its
+    /// diagnostic does not name unrelated missing bindings.
+    fn references_within<P: crate::resource::ValueKind, B: BindingAddress>(
+        value: &GenericValue<P, B>,
+        bindings: &HashSet<String>,
+    ) -> Option<HashSet<B>> {
         let mut references = HashSet::new();
         value.visit_resource_refs(&mut |path, _| {
             path.binding_key().record_graph_key(&mut references)
         });
         value.visit_binding_refs(&mut |binding| binding.record_graph_key(&mut references));
-        !references.is_empty()
+        (!references.is_empty()
             && references
                 .iter()
-                .all(|binding| bindings.contains(binding.as_str()))
+                .all(|binding| bindings.contains(binding.as_str())))
+        .then_some(references)
     }
 
     /// Frontends cannot fetch upstream state. Resolve local defaults only and
@@ -3087,7 +3097,7 @@ fn resolve_desired_provider_configs<E, D>(
         }
         let mut tags = IndexMap::new();
         for (key, value) in &provider.default_tags {
-            if ResolvedProviderConfigs::references_only(value, &missing) {
+            if let Some(references) = ResolvedProviderConfigs::references_within(value, &missing) {
                 log::warn!(
                     "provider {}: omitting {} from plan preview because upstream state is missing ({})",
                     crate::provider_text::DiagnosticText::new(
@@ -3097,9 +3107,9 @@ fn resolve_desired_provider_configs<E, D>(
                         ResolvedProviderConfigs::default_tag_attribute(key)
                     ),
                     crate::provider_text::DiagnosticText::new(
-                        missing
-                            .iter()
-                            .cloned()
+                        references
+                            .into_iter()
+                            .map(|binding| binding.as_str().to_owned())
                             .collect::<BTreeSet<_>>()
                             .into_iter()
                             .collect::<Vec<_>>()

@@ -3380,7 +3380,6 @@ async fn resume_dispatch_validates_resent_sent_against_checked_request() {
                 &module_gate,
                 &[],
                 &NoopNormalizer,
-                &[],
                 &TEST_SCHEMAS,
                 type_checks,
             );

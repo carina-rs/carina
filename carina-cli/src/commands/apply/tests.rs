@@ -7562,7 +7562,6 @@ async fn bootstrap_declared_state_bucket(
             parsed: &parsed,
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
-            factories: &[],
             schemas: &schemas,
         },
     )
@@ -7865,7 +7864,6 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
             parsed: &parsed,
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
-            factories: &[],
             schemas: &schemas,
         },
     )
@@ -7945,7 +7943,6 @@ async fn creation_constrained_state_bucket_bootstrap_is_admitted_before_dispatch
             parsed: &parsed,
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
-            factories: &[],
             schemas: &schemas,
         },
     )
@@ -7990,7 +7987,6 @@ async fn state_bucket_provider_error_keeps_typed_terminal_error() {
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
-            factories: &[],
             schemas: &schemas,
         },
     )
@@ -8048,7 +8044,6 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
             parsed: &parsed,
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
-            factories: &[],
             schemas: &schemas,
         },
     )
@@ -8104,7 +8099,6 @@ async fn bootstrap_create_identified_seeds_observed_state_before_error() {
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
-            factories: &[],
             schemas: &schemas,
         },
     )
@@ -8193,7 +8187,6 @@ async fn bootstrap_unobserved_create_identified_seeds_identifier_and_partial_rea
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
-            factories: &[],
             schemas: &schemas,
         },
     )
@@ -8287,7 +8280,6 @@ async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
-            factories: &[],
             schemas: &schemas,
         },
     )
@@ -8356,7 +8348,6 @@ async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
-            factories: &[],
             schemas: &schemas,
         },
     )
@@ -12429,7 +12420,6 @@ async fn round3_bootstrap_default_tag_keys_are_plan_diagnostics() {
             parsed: &parsed,
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
-            factories: &[],
             schemas: &schemas,
         },
     )
@@ -12506,7 +12496,6 @@ async fn round2_bootstrap_rejects_unknown_dependency_before_dispatch() {
                     &gate,
                     &[],
                     &NoopNormalizer,
-                    &[],
                     &schemas,
                     session,
                 );
@@ -12567,7 +12556,6 @@ async fn bootstrap_rejects_unknown_authored_binding_through_real_entrypoint() {
             parsed: &parsed,
             provider_configs: &configs,
             normalizer: &NoopNormalizer,
-            factories: &[],
             schemas: &schemas,
         },
     )
@@ -12634,7 +12622,6 @@ async fn bootstrap_unresolved_reference_returns_typed_preparation_error() {
             parsed: &parsed,
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
-            factories: &[],
             schemas: &schemas,
         },
     )

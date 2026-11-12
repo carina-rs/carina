@@ -2483,7 +2483,7 @@ mod final_prefix_input_tests {
         crate::validation::deferred_types::with_session_for_test_async(
             &crate::parser::LoadedProviderContext::empty_for_test(), async |session| {
                 let context = ProviderPreparationContext::for_test(&bindings, &gate, &[],
-                    &crate::provider::NoopNormalizer, &[], &schemas, session);
+                    &crate::provider::NoopNormalizer, &schemas, session);
                 let (ready, _) = resolve_resource(Ok(CheckInput::PlanNormalized { resolved: target.into(), authored: source.into() }), &context)
                     .await.expect("the canonical name is the provider input; the authored prefix is host metadata");
                 assert!(!ready.attributes.contains_key("name_prefix"));

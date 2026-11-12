@@ -982,7 +982,6 @@ async fn provider_ready_inputs_are_infallible_and_preserve_checked_scalar_and_se
             &gate,
             &configs,
             &NoopNormalizer,
-            &[],
             &schemas,
             type_checks,
         );
@@ -1071,7 +1070,6 @@ async fn provider_ready_inputs_preserve_env_string_diagnostic_sensitivity() {
             &gate,
             &[],
             &carina_core::provider::NoopNormalizer,
-            &[],
             &schemas,
             type_checks,
         );
@@ -1159,7 +1157,6 @@ async fn native_and_wasm_views_share_sorted_order_for_unsorted_authored_maps() {
             &gate,
             &[],
             &carina_core::provider::NoopNormalizer,
-            &[],
             &schemas,
             type_checks,
         );

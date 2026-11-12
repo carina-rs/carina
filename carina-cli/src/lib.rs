@@ -475,7 +475,6 @@ fn dispatch_fixture_create(
                 &module_gate,
                 &[],
                 &carina_core::provider::NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );
@@ -568,7 +567,6 @@ pub(crate) fn fixture_repend_in_flight_create(
                 &module_gate,
                 &[],
                 &carina_core::provider::NoopNormalizer,
-                &[],
                 &schemas,
                 type_checks,
             );

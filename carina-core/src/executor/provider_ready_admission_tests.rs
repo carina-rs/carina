@@ -74,7 +74,6 @@ async fn check_apply_errors(attr: AttributeType, authored: Value) {
                 &module_gate,
                 &[],
                 &crate::provider::NoopNormalizer,
-                &[],
                 &schemas,
                 session,
             );

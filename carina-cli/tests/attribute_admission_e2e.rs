@@ -229,8 +229,7 @@ fn timing_matrix(name: &str) {
     tokio::runtime::Runtime::new().unwrap().block_on(carina_core::validation::deferred_types::with_session_for_test_async(loaded.provider_context(), async |session| {
         let bindings = ResolvedBindings::default();
         let gate = ModuleConstraintGate::from_live_compositions(&pending.compositions);
-        let native_factories = factories();
-        let context = ProviderPreparationContext::for_test(&bindings, &gate, &[], &carina_core::provider::NoopNormalizer, &native_factories, &pending.schemas, session);
+        let context = ProviderPreparationContext::for_test(&bindings, &gate, &[], &carina_core::provider::NoopNormalizer, &pending.schemas, session);
         let saved: SavedResource = sink.clone().into();
         let live = prepare_provider_ready_resource(sink.clone(), &context).await;
         let saved = prepare_provider_ready_resource(saved, &context).await;
@@ -316,13 +315,11 @@ fn timing_matrix(name: &str) {
                         BindingValueSource::Local,
                     );
                     let gate = ModuleConstraintGate::from_live_compositions(&pending.compositions);
-                    let native_factories = factories();
                     let context = ProviderPreparationContext::for_test(
                         &bindings,
                         &gate,
                         &[],
                         &carina_core::provider::NoopNormalizer,
-                        &native_factories,
                         &pending.schemas,
                         session,
                     );

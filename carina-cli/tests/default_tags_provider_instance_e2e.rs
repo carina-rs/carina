@@ -419,6 +419,94 @@ mock.test.resource {
 }
 
 #[test]
+fn issue_4304_3a_review4_default_tag_diagnostics_only_name_referenced_missing_upstream() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    fs::create_dir(&project).unwrap();
+    for upstream in ["used", "unrelated"] {
+        let directory = root.path().join(upstream);
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("main.crn"),
+            "backend local { path = 'carina.state.json' }\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        project.join("providers.crn"),
+        "provider mock { default_tags = { Owner = mgmt.owner } }\n",
+    )
+    .unwrap();
+    fs::write(project.join("main.crn"), "backend local { path = 'carina.state.json' }\nlet mgmt = upstream_state { source = '../used' }\nlet unrelated = upstream_state { source = '../unrelated' }\nmock.test.resource { name = 'tagged' }\n").unwrap();
+    assert_success(&run_cli(&project, &["init", "."]), "init");
+
+    let preview = run_cli(&project, &["plan", "."]);
+    assert_success(&preview, "plain plan");
+    let stderr = String::from_utf8_lossy(&preview.stderr);
+    let warning = stderr
+        .lines()
+        .find(|line| line.contains("omitting default_tags.Owner"))
+        .expect("preview must report the omitted default");
+    assert!(warning.contains("mgmt"), "{warning}");
+    assert!(
+        !warning.contains("unrelated"),
+        "tag warning named an unrelated upstream: {warning}"
+    );
+
+    let saved = run_cli(&project, &["plan", "--out", "plan.json", "."]);
+    assert!(
+        !saved.status.success(),
+        "missing default must prevent saving"
+    );
+    let stderr = String::from_utf8_lossy(&saved.stderr);
+    let diagnostic = stderr
+        .lines()
+        .find(|line| line.contains("default_tags.Owner"))
+        .expect("strict plan must name the unresolved default");
+    assert!(diagnostic.contains("mgmt"), "{diagnostic}");
+    assert!(
+        !diagnostic.contains("unrelated"),
+        "tag error named an unrelated upstream: {diagnostic}"
+    );
+    assert!(!project.join("plan.json").exists());
+}
+
+#[test]
+fn issue_4304_3a_review4_json_and_out_keep_the_same_provider_inputs() {
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("providers.crn"),
+        "provider mock { default_tags = { ManagedBy = 'carina' } }\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("main.crn"),
+        "backend local { path = 'carina.state.json' }\nmock.test.resource { name = 'tagged' }\n",
+    )
+    .unwrap();
+    assert_success(&run_cli(project.path(), &["init", "."]), "init");
+    let output = run_cli(
+        project.path(),
+        &["plan", "--json", "--out", "plan.json", "."],
+    );
+    assert_success(&output, "combined JSON and file output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout_plan: serde_json::Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("saved-plan JSON on stdout")..])
+            .unwrap();
+    let file_plan: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(project.path().join("plan.json")).unwrap())
+            .unwrap();
+    for field in ["provider_configs", "sorted_resources"] {
+        assert_eq!(stdout_plan[field], file_plan[field], "{field}");
+    }
+    assert_eq!(
+        file_plan["provider_configs"][0]["default_tags"]["ManagedBy"],
+        serde_json::json!({"String": "carina"})
+    );
+}
+
+#[test]
 fn issue_4304_3a_validate_and_plan_reject_default_tag_from_same_config_computed_value() {
     let project = tempfile::tempdir().unwrap();
     fs::write(
