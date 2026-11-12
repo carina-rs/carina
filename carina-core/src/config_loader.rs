@@ -1745,9 +1745,6 @@ impl LocatedParseError {
     }
 
     fn render(&self, fallback: &Path) -> String {
-        if let Some(error) = crate::ConversionError::from_error(self.error.as_ref()) {
-            return error.diagnostic().to_string();
-        }
         if let Some(finding) = self.error.element_diagnostic() {
             let location = finding.location();
             let span = location.span();
@@ -2184,20 +2181,26 @@ mod tests {
     fn conversion_parse_diagnostic_uses_the_shared_message_shape() {
         let path = Path::new("conversion-shape.crn");
         let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-        let error = parser::parse_file(
+        let parsed = parser::parse_file(
             "let converted = if 42 as String { 'ok' } else { 'ok' }",
             path,
             &catalog,
         )
-        .unwrap_err();
-        let conversion = crate::ConversionError::from_error(&error).unwrap();
-        let expected = parser::Located::new(
-            conversion.location().clone(),
-            conversion.diagnostic_message(),
+        .unwrap();
+        let presented = crate::validation::ConversionValidation::<std::convert::Infallible>::new(
+            parsed.expression_report(),
         )
-        .to_string();
-        let located = LocatedParseError::in_file(path, error);
-        assert_eq!(located.render(path), expected);
+        .complete()
+        .into_presented();
+        assert_eq!(presented.len(), 1);
+        let crate::validation::PresentedFinding::Conversion(conversion) =
+            presented.iter().next().unwrap()
+        else {
+            panic!("typed conversion exit");
+        };
+        let expected =
+            parser::Located::new(conversion.location().clone(), conversion.message()).to_string();
+        assert_eq!(conversion.to_string(), expected);
     }
 
     // macOS APFS rejects non-UTF-8 names.

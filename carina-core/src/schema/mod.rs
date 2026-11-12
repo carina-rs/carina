@@ -16582,7 +16582,7 @@ impl PatternResourceSchema<Compiled> {
                     continue;
                 }
 
-                let mut findings = (admission.known)(
+                let findings = (admission.known)(
                     name,
                     value_validation::SchemaAttribute {
                         ordinal,
@@ -16590,7 +16590,6 @@ impl PatternResourceSchema<Compiled> {
                     },
                     value,
                 );
-                report.conversions.append(findings.take_conversions());
                 for (index, error) in findings.local_errors().enumerate() {
                     let tagged = error.clone().with_attribute(name);
                     let reshaped = if is_string_literal(name.as_str())
@@ -16616,8 +16615,7 @@ impl PatternResourceSchema<Compiled> {
                 report.attributes.insert(name.clone(), findings);
             } else if mode == ValueEntryValidation::FullInput {
                 if let Some(admit) = admission.unknown {
-                    let mut findings = admit(name, value);
-                    report.conversions.append(findings.take_conversions());
+                    let findings = admit(name, value);
                     report.attributes.insert(name.clone(), findings);
                 }
                 let id_attribute = format!("{name}_id");

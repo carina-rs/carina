@@ -177,12 +177,9 @@ fn forwarded_postfix<'i>(
 ) -> Option<pest::iterators::Pair<'i, Rule>> {
     let mut pair = pair.clone();
     loop {
-        match pair.as_rule() {
-            Rule::coalesce_expr
-            | Rule::pipe_expr
-            | Rule::compose_expr
-            | Rule::additive_expr
-            | Rule::multiplicative_expr => {
+        use super::EvaluationForm;
+        match super::evaluation_form(pair.as_rule()) {
+            EvaluationForm::Forwarding => {
                 let mut children = pair.into_inner();
                 let child = children.next()?;
                 if children.next().is_some() {
@@ -190,8 +187,12 @@ fn forwarded_postfix<'i>(
                 }
                 pair = child;
             }
-            Rule::postfix_expr => return Some(pair),
-            _ => return None,
+            EvaluationForm::Postfix => return Some(pair),
+            EvaluationForm::List
+            | EvaluationForm::Map
+            | EvaluationForm::If
+            | EvaluationForm::Expression
+            | EvaluationForm::Other => return None,
         }
     }
 }

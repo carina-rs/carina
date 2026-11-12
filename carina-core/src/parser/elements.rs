@@ -395,7 +395,11 @@ fn collect_keys(
                 let syntax = pair.clone();
                 let mut inner = pair.into_inner();
                 let key_pair = inner.next().expect("attribute grammar has a key");
-                let key = super::extract_key_string(key_pair.clone()).expect("grammar key");
+                // Rejected authored keys remain in the syntax inventory but
+                // have no evaluated map entry or element path to locate.
+                let Ok(key) = super::extract_key_string(key_pair.clone()) else {
+                    continue;
+                };
                 if is_block && parent.is_empty() && key == "directives" {
                     for attribute in inner.flatten().filter(|p| p.as_rule() == Rule::attribute) {
                         let mut parts = attribute.into_inner();
@@ -1106,9 +1110,6 @@ impl SyntaxInventory {
         source: &Path,
     ) -> Result<Self, super::ParseError> {
         let expressions = super::retained::Expressions::from_pairs(pairs.clone(), file, source);
-        if let Some(error) = expressions.parse_error() {
-            return Err(error);
-        }
         let declarations = declaration_inventory(pairs.clone(), file, source);
         use crate::validation::{
             TypeResolutionContext as Context, TypeResolutionDeclarationKind as Kind,

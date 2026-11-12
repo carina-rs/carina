@@ -182,7 +182,19 @@ pub(super) fn parse_let_binding_extended(
             preprocessed_file,
             source_file,
         )
-        .map_err(|error| ctx.conversion_expression_error(&rhs_syntax, error))?;
+        .or_else(|error| {
+            ctx.recover_converted_evaluation(&rhs_syntax, Err(error))
+                .map(|value| {
+                    (
+                        value,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        LetBindingKind::Value,
+                    )
+                })
+        })?;
 
     Ok((
         name.into_string(),

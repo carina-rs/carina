@@ -661,7 +661,6 @@ fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
         | ParseError::CyclicLetBinding { .. }
         | ParseError::ValueWalk(_)
         | ParseError::UserFunctionError(_)
-        | ParseError::CheckedConversion(_)
         | ParseError::RetainedEvidence(_) => false,
     }
 }

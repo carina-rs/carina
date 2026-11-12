@@ -155,8 +155,6 @@ pub(crate) fn parse_float_literal(text: &str, line: usize) -> Result<crate::Fini
 /// ```
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
-    #[error(transparent)]
-    CheckedConversion(crate::conversion::ConversionError),
     /// A live parser inventory lost a required authored correspondence.
     #[error(transparent)]
     RetainedEvidence(#[from] super::retained::MissingEvidence),
@@ -484,48 +482,6 @@ pub struct ParseWarning {
 }
 
 impl ParseError {
-    /// Preserve typed conversion metadata through terminal parser context.
-    pub fn conversion_error(&self) -> Option<&crate::ConversionError> {
-        match self {
-            Self::CheckedConversion(error) => Some(error),
-            Self::Located { error, .. } | Self::DeferredForBodyTemplate { error, .. } => {
-                error.conversion_error()
-            }
-            Self::AtElement(finding) => finding.detail().conversion_error(),
-            Self::Evaluation { error, .. } => crate::ConversionError::from_error(error.as_ref()),
-            Self::ValueWalk(error) => crate::ConversionError::from_error(error),
-            Self::ProtectedFile(_)
-            | Self::InvalidAuthoredExpression { .. }
-            | Self::RetainedEvidence(_)
-            | Self::InsideSecret { .. }
-            | Self::SecretInConstraint { .. }
-            | Self::UnavailableSecret(_)
-            | Self::Syntax(_)
-            | Self::InvalidExpression { .. }
-            | Self::InvalidFloatLiteral { .. }
-            | Self::IntegerArithmetic { .. }
-            | Self::UnboundLoopRead { .. }
-            | Self::DeferredForBodyUnsupported(_)
-            | Self::UnresolvedDeclarationType { .. }
-            | Self::UnknownFunction { .. }
-            | Self::ReservedResourceAttribute { .. }
-            | Self::SecretDerivedBackendAttribute { .. }
-            | Self::InterpolationNotAllowedInLiteralString { .. }
-            | Self::InvalidResourceIdentity { .. }
-            | Self::UndefinedVariable(_)
-            | Self::InvalidResourceType(_)
-            | Self::DuplicateModule(_)
-            | Self::DuplicateBinding { .. }
-            | Self::UndefinedIdentifier { .. }
-            | Self::UndefinedDeferredIterable { .. }
-            | Self::ModuleNotFound(_)
-            | Self::InternalError { .. }
-            | Self::RecursiveFunction(_)
-            | Self::CyclicLetBinding { .. }
-            | Self::UserFunctionError(_) => None,
-        }
-    }
-
     pub fn protected_failure(&self) -> Option<&super::ProtectedParseFailure> {
         match self {
             Self::ProtectedFile(failure) => Some(failure),
@@ -544,7 +500,6 @@ impl ParseError {
             end_column: span.end_column(),
         };
         match self {
-            Self::CheckedConversion(error) => Some(from_span(error.location().span())),
             Self::Located { error, .. } => error.diagnostic_range(),
             Self::AtElement(finding) => Some(from_span(finding.location().span())),
             Self::InvalidAuthoredExpression { diagnostic, .. } => diagnostic.range(),
@@ -618,7 +573,6 @@ impl ParseError {
     /// Safe diagnostic wording, separate from terminal location presentation.
     pub fn diagnostic_message(&self) -> String {
         match self {
-            Self::CheckedConversion(error) => error.diagnostic_message(),
             Self::Located { error, .. } => error.diagnostic_message(),
             Self::AtElement(finding) => finding.detail().diagnostic_message(),
             // Pest's Display includes the source line. Keep authored text out
@@ -666,7 +620,6 @@ impl ParseError {
     }
     pub(crate) fn inside_secret_at(self, fallback_line: usize) -> Self {
         match self {
-            Self::CheckedConversion(error) => Self::CheckedConversion(error.inside_secret()),
             Self::Located { path, error } => Self::Located {
                 path,
                 error: Box::new(error.inside_secret_at(fallback_line)),

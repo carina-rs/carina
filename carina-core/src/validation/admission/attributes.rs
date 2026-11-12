@@ -215,6 +215,7 @@ impl<K: RechecksResolved> AdmittedAttributes<K> {
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum ApplyAdmissionErrors {
     Admission(AdmissionErrors),
     Constraints(Box<crate::schema::ResourceValueValidation>),
@@ -1031,8 +1032,7 @@ pub fn unrendered_resource_conversion_admissions<E, D, B: BindingAddress>(
     bindings: &BindingIndex<'_, B>,
     session: &dyn ProviderTypeCheckContext,
     coverage: &mut WalkCoverage,
-) -> crate::ConversionChannel
-where
+) where
     E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
     D: crate::parser::DeferredForPhaseTraversal<
             crate::resource::ParserPlaceholder,
@@ -1041,7 +1041,7 @@ where
         >,
 {
     let Some(schema) = resource.schema(judged.schemas()) else {
-        return Default::default();
+        return;
     };
     let values = resource.resolved_attributes();
     let mut inputs = ResourceAttributeInputs::for_resource(resource, judged.report())
@@ -1050,7 +1050,7 @@ where
         });
     inputs.scope = crate::schema::value_validation::AssignmentScope::ClaimedValues;
     let attributes = inputs.classify(&KnowledgeContext::validation(), |_, _| {});
-    let mut findings = resource_attribute_admissions(
+    resource_attribute_admissions(
         resource,
         judged.file(),
         schema,
@@ -1062,7 +1062,6 @@ where
         judged.schemas(),
         coverage,
     );
-    findings.take_conversions()
 }
 
 #[cfg(test)]

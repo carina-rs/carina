@@ -261,7 +261,10 @@ fn parse_block_contents_with_quoted(
                         let key_pair =
                             next_pair(&mut attr_inner, "attribute name", "block content")?;
                         let key_span = key_pair.as_span();
-                        let key = ctx.key_string(key_pair.clone())?;
+                        let key = match ctx.key_string(key_pair.clone())? {
+                            crate::parser::context::ParsedKey::Literal(key) => key,
+                            crate::parser::context::ParsedKey::Rejected => continue,
+                        };
                         reject_reserved_resource_attribute(
                             &key,
                             key_span,
@@ -332,7 +335,10 @@ fn parse_block_contents_with_quoted(
                 let mut attr_inner = content_pair.into_inner();
                 let key_pair = next_pair(&mut attr_inner, "attribute name", "block content")?;
                 let key_span = key_pair.as_span();
-                let key = ctx.key_string(key_pair.clone())?;
+                let key = match ctx.key_string(key_pair.clone())? {
+                    crate::parser::context::ParsedKey::Literal(key) => key,
+                    crate::parser::context::ParsedKey::Rejected => continue,
+                };
                 reject_reserved_resource_attribute(&key, key_span, reserved_attribute_names)?;
                 let value_pair = next_pair(&mut attr_inner, "attribute value", "block content")?;
                 record_quoted_if_literal(quoted_out, &key, &value_pair);

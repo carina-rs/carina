@@ -293,6 +293,10 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
         AppError::ProviderRouting(finding) => {
             Diagnostic::located(finding.detail().to_string(), finding.location())
         }
+        AppError::PresentedConversion(finding) => Diagnostic {
+            code: Some(finding.code().to_owned()),
+            ..Diagnostic::located(finding.message().to_owned(), finding.location())
+        },
         AppError::ResourceAdmission(finding) => Diagnostic {
             code: finding.code().map(str::to_owned),
             location: finding.location().map(Location::authored),
@@ -365,18 +369,8 @@ fn module_error_diagnostics(
         .collect()
 }
 
-fn conversion_diagnostic(error: &carina_core::ConversionError) -> Diagnostic {
-    Diagnostic {
-        code: Some(error.kind().code().to_owned()),
-        ..Diagnostic::located(error.diagnostic_message(), error.location())
-    }
-}
-
 fn parse_diagnostic(error: &carina_core::parser::ParseError, file: Option<&Path>) -> Diagnostic {
     use carina_core::parser::ParseError;
-    if let Some(conversion) = error.conversion_error() {
-        return conversion_diagnostic(conversion);
-    }
     if let ParseError::Located { path, error, .. } = error {
         return parse_diagnostic(error, Some(path));
     }

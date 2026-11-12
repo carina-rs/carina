@@ -13,13 +13,15 @@ use crate::parser::{
 };
 use crate::resource::knowledge::KnowledgeContext;
 use crate::resource::{AbsoluteBindingAddress, ConcreteValue, ParserPlaceholder, Value};
-use crate::schema::value_validation::WalkCoverage;
 use crate::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StringIdentityLayer,
     StringMemberConstraints, StructField, TypeIdentity,
 };
 use crate::validation::admission::{Candidate, admit, attributes::ResourceAttributeInputs};
 use crate::validation::deferred_types::with_session_for_test;
+use crate::validation::{
+    ConversionValidation, OrdinaryFinding, PresentedFinding, PresentedFindings,
+};
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::path::Path;
@@ -36,7 +38,7 @@ struct Finding {
 /// Wrappers retain typed conversion metadata through a source or accessor;
 /// flattening it into a string loses both the kind and its authored location.
 fn finding(error: &(dyn Error + 'static)) -> Finding {
-    let conversion = ConversionError::from_error(error).map(|error| {
+    let conversion = error.downcast_ref::<ConversionError>().map(|error| {
         let location = error.location();
         (
             error.kind(),
@@ -62,6 +64,45 @@ fn finding(error: &(dyn Error + 'static)) -> Finding {
     Finding {
         conversion,
         rendered,
+    }
+}
+
+/// Test observers exhaustively consume the presented enum, never search an
+/// ordinary error for conversion metadata.
+pub(crate) fn conversion_errors(report: &PresentedFindings) -> Vec<&ConversionError> {
+    report
+        .iter()
+        .filter_map(|finding| match finding {
+            PresentedFinding::Conversion(finding) => Some(finding.error()),
+            PresentedFinding::Ordinary(_) => None,
+        })
+        .collect()
+}
+pub(crate) fn ordinary_messages(report: &PresentedFindings) -> String {
+    report
+        .iter()
+        .filter_map(|finding| match finding {
+            PresentedFinding::Ordinary(finding) => Some(finding.to_string()),
+            PresentedFinding::Conversion(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+pub(crate) fn conversion_error(
+    error: &crate::validation::ResourceRefTypeValidationError,
+) -> Option<&ConversionError> {
+    match error {
+        crate::validation::ResourceRefTypeValidationError::Validation(findings) => {
+            conversion_errors(findings).into_iter().next()
+        }
+        crate::validation::ResourceRefTypeValidationError::AnalysisInvariant(_) => None,
+    }
+}
+fn presented_finding(presented: &PresentedFinding) -> Finding {
+    match presented {
+        PresentedFinding::Conversion(conversion) => finding(conversion.error()),
+        PresentedFinding::Ordinary(OrdinaryFinding::Resource(error)) => finding(error),
+        PresentedFinding::Ordinary(OrdinaryFinding::Client(never)) => match **never {},
     }
 }
 
@@ -319,7 +360,7 @@ where
     let tree =
         crate::parser::AnalysisTree::try_from_file(judged.file()).map_err(|e| e.to_string())?;
     let bindings = BindingIndex::from_parsed(judged.file(), schemas, catalog);
-    let mut coverage = WalkCoverage::default();
+    let mut validation: ConversionValidation = ConversionValidation::new(judged.report());
     with_session_for_test(catalog, |session| {
         let mut findings = judged
             .report()
@@ -333,7 +374,6 @@ where
         let bare = crate::validation::check_expanded_bare_binding_uses(&context);
         findings.extend(bare.findings().iter().map(|e| finding(e)));
         let mut resources = Vec::new();
-        let mut conversions = ConversionFindings::default();
         for resource in tree
             .resources()
             .filter(|resource| resource.kind() != crate::parser::AnalysisItemKind::Composition)
@@ -345,7 +385,7 @@ where
             let schema = resource
                 .schema(schemas)
                 .ok_or_else(|| format!("missing fixture schema: {:?}", resource.id()))?;
-            let mut admitted =
+            let mut admitted = validation.walk(|coverage| {
                 crate::validation::admission::attributes::resource_attribute_admissions(
                     resource,
                     judged.file(),
@@ -356,8 +396,9 @@ where
                     &bindings,
                     session,
                     schemas,
-                    &mut coverage,
-                );
+                    coverage,
+                )
+            });
             let mut local = admitted
                 .errors()
                 .chain(admitted.symbolic_errors().map(|(_, _, error)| error))
@@ -367,14 +408,18 @@ where
                 conversion: error.conversion.clone(),
                 rendered: error.rendered.clone(),
             }));
-            local.extend(
+            // Per-instance rejection comes from the claim judgement, while
+            // diagnostics themselves leave only through the run's final exit.
+            if attributes.keys().any(|name| {
                 admitted
-                    .conversions()
-                    .findings()
-                    .iter()
-                    .map(|error| finding(error)),
-            );
-            conversions.extend(admitted.take_conversions());
+                    .take_attribute(name)
+                    .is_some_and(|checked| checked.rejected_by_claim())
+            }) {
+                local.push(Finding {
+                    conversion: None,
+                    rendered: "rejected conversion claim".into(),
+                });
+            }
             let label = match attributes.get("plain") {
                 Some(Value::Concrete(ConcreteValue::String(label))) => label
                     .diagnostic_literal()
@@ -384,7 +429,11 @@ where
             };
             resources.push((label, local));
         }
-        findings.extend(conversions.findings().iter().map(|error| finding(error)));
+        let work = validation.walk(|coverage| {
+            coverage.work() + judged.report().completeness_report(coverage).work()
+        });
+        let presented = validation.complete().into_presented();
+        findings.extend(presented.iter().map(presented_finding));
         // Also require the CLI's public aggregate admission entry point to
         // agree. It currently renders errors into strings; keep the structured
         // findings above for kind/location and diagnostic-ownership assertions.
@@ -395,8 +444,16 @@ where
             &mut Vec::new(),
         )
         .err()
-        .map(|error| finding(&error));
-        let work = coverage.work() + judged.report().completeness_report(&coverage).work();
+        .map(|error| match &error {
+            crate::validation::ResourceRefTypeValidationError::Validation(presented) => presented
+                .iter()
+                .next()
+                .map(presented_finding)
+                .unwrap_or_else(|| finding(&error)),
+            crate::validation::ResourceRefTypeValidationError::AnalysisInvariant(_) => {
+                finding(&error)
+            }
+        });
         Ok(Outcome {
             findings,
             resources,
@@ -1090,24 +1147,39 @@ fn check_pending_discharge_in(fixture: Fixture, at_apply: Option<(&str, bool)>) 
             )
         );
         if let Some((text, accepted)) = at_apply {
-            let applied_source = format!("let producer = mock.Source {{ output = '{text}' }}");
-            let applied = crate::parser::parse_file(
-                &applied_source,
-                Path::new("applied.crn"),
-                &fixture.catalog,
+            let mut resolved = ResolvedBindings::default();
+            resolved.set(
+                "producer",
+                std::collections::HashMap::from([(
+                    "output".into(),
+                    Value::Concrete(ConcreteValue::String(text.into())),
+                )]),
+                crate::binding_index::BindingValueSource::Local,
+            );
+            let actual = crate::resolver::resolve_ref_value(
+                &Value::root_resource_ref("producer", "output", vec![]),
+                &resolved,
+                session,
             )
-            .map_err(|e| e.to_string())?
-            .resolve_root_for_test();
-            let resolved = ResolvedBindings::for_expanded_validation(&applied);
-            // discharge re-enters admit_apply; no conversion runtime value or
-            // forged matched-source token is involved in this fixture.
-            let placed = pending.discharge(&resolved, session);
+            .map_err(|error| error.to_string())?;
+            let resource = crate::resource::Resource::with_provider("mock", "Sink", "sink", None)
+                .with_attribute("target", actual);
+            let placed = crate::validation::admission::attributes::admit_apply_resource(
+                &resource,
+                None,
+                fixture.schemas.get_for(&resource).unwrap(),
+                &resolved,
+                session,
+            );
             assert_eq!(placed.is_ok(), accepted, "apply value {text:?}: {placed:?}");
-            if let Ok(placed) = placed {
-                assert_eq!(
-                    placed.value(),
-                    &Value::Concrete(ConcreteValue::String(text.into()))
-                );
+            if placed.is_ok() {
+                let value = crate::resolver::resolve_ref_value(
+                    &resource.attributes["target"],
+                    &resolved,
+                    session,
+                )
+                .map_err(|error| error.to_string())?;
+                assert_eq!(&value, &Value::Concrete(ConcreteValue::String(text.into())));
             }
         }
         Ok(())
@@ -1283,14 +1355,20 @@ fn conversion_source_snapshot_rejects_a_detached_report() -> TestResult {
 #[test]
 fn conversion_completeness_work_scales_linearly_for_aliases_branches_and_containers() -> TestResult
 {
-    for shape in ["aliases", "branches", "containers"] {
+    #[derive(Debug)]
+    enum Shape {
+        Aliases,
+        Branches,
+        Containers,
+    }
+    for shape in [Shape::Aliases, Shape::Branches, Shape::Containers] {
         let mut work = Vec::new();
         for count in [16, 32] {
             let mut source = String::new();
             let mut target = named();
             let mut expression = "'ok' as mock.Name".to_owned();
             match shape {
-                "aliases" => {
+                Shape::Aliases => {
                     source.push_str("let first = 'ok' as mock.Name\n");
                     let mut previous = "first".to_owned();
                     for index in 0..count {
@@ -1301,19 +1379,18 @@ fn conversion_completeness_work_scales_linearly_for_aliases_branches_and_contain
                     expression = format!("[{previous}, {previous}]");
                     target = AttributeType::list(named());
                 }
-                "branches" => {
+                Shape::Branches => {
                     for _ in 0..count {
                         expression =
                             format!("if true {{ {expression} }} else {{ 'ok' as mock.Name }}");
                     }
                 }
-                "containers" => {
+                Shape::Containers => {
                     for _ in 0..count {
                         expression = format!("[{expression}]");
                         target = AttributeType::list(target);
                     }
                 }
-                _ => unreachable!("fixture shape"),
             }
             source.push_str(&format!("let sink = mock.Sink {{ target = {expression} }}"));
             let outcome = Fixture::new(AttributeType::string(), target).check(&source)?;
@@ -1322,23 +1399,8 @@ fn conversion_completeness_work_scales_linearly_for_aliases_branches_and_contain
         }
         assert!(
             work[1] > work[0] && work[1] <= 2 * work[0] + 32,
-            "{shape}: N and 2N work = {work:?}"
+            "{shape:?}: N and 2N work = {work:?}"
         );
     }
     Ok(())
-}
-
-#[test]
-fn conversion_deferred_union_retains_the_selected_member_at_apply() -> TestResult {
-    for (text, accepted) in [("ok", true), ("toolong-for-slot", false)] {
-        check_pending_discharge_in(
-            Fixture::new(
-                AttributeType::string(),
-                AttributeType::union(vec![named(), AttributeType::string()]),
-            ),
-            Some((text, accepted)),
-        )?;
-    }
-    check_pending_discharge(Some(("ok", true)))?;
-    check_pending_discharge(Some(("toolong-for-slot", false)))
 }

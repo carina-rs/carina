@@ -9,6 +9,11 @@ pub mod deferred_populate;
 pub mod deferred_types;
 pub mod depends_on;
 mod parameter_findings;
+mod presentation;
+pub use presentation::{
+    ConversionValidation, FindingSubject, OrdinaryFinding, PresentedConversion, PresentedFinding,
+    PresentedFindings, ResourceValidationReport, ValidationClientError,
+};
 pub mod routing;
 pub mod typecheck;
 pub use parameter_findings::{ParameterValueError, ParameterValueFinding};
@@ -5160,7 +5165,6 @@ pub struct ResourceAdmissionFinding {
 
 #[derive(Debug)]
 enum ResourceAdmissionDetail {
-    Conversion(crate::ConversionError),
     Schema {
         resource: crate::resource::ResourceId,
         attribute: Option<String>,
@@ -5175,7 +5179,7 @@ enum ResourceAdmissionDetail {
 
 impl ResourceAdmissionFinding {
     /// Add CLI module context as presentation without changing the finding.
-    pub fn with_context(mut self, prefix: &str) -> Self {
+    fn with_context(mut self, prefix: &str) -> Self {
         self.human = self
             .human
             .split('\n')
@@ -5204,8 +5208,7 @@ impl ResourceAdmissionFinding {
     pub fn type_error(&self) -> Option<&TypeError> {
         match &self.detail {
             ResourceAdmissionDetail::Schema { error, .. } => Some(error),
-            ResourceAdmissionDetail::Conversion(_)
-            | ResourceAdmissionDetail::Arithmetic(_)
+            ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
             | ResourceAdmissionDetail::Message => None,
@@ -5214,18 +5217,7 @@ impl ResourceAdmissionFinding {
     pub fn resource_id(&self) -> Option<&crate::resource::ResourceId> {
         match &self.detail {
             ResourceAdmissionDetail::Schema { resource, .. } => Some(resource),
-            ResourceAdmissionDetail::Conversion(_)
-            | ResourceAdmissionDetail::Arithmetic(_)
-            | ResourceAdmissionDetail::Iterable(_)
-            | ResourceAdmissionDetail::UnavailableSchema(_)
-            | ResourceAdmissionDetail::Message => None,
-        }
-    }
-    pub fn conversion_error(&self) -> Option<&crate::ConversionError> {
-        match &self.detail {
-            ResourceAdmissionDetail::Conversion(error) => Some(error),
-            ResourceAdmissionDetail::Schema { .. }
-            | ResourceAdmissionDetail::Arithmetic(_)
+            ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
             | ResourceAdmissionDetail::Message => None,
@@ -5233,7 +5225,6 @@ impl ResourceAdmissionFinding {
     }
     pub fn code(&self) -> Option<&'static str> {
         match &self.detail {
-            ResourceAdmissionDetail::Conversion(error) => Some(error.kind().code()),
             ResourceAdmissionDetail::Schema { .. }
             | ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
@@ -5246,7 +5237,6 @@ impl ResourceAdmissionFinding {
     }
     pub fn message(&self) -> String {
         match &self.detail {
-            ResourceAdmissionDetail::Conversion(error) => error.diagnostic_message(),
             ResourceAdmissionDetail::Schema {
                 mismatch: Some(mismatch),
                 ..
@@ -5305,21 +5295,9 @@ impl From<AnonymousResourceSchemaError> for ResourceAdmissionFinding {
     }
 }
 
-impl From<crate::ConversionError> for ResourceAdmissionFinding {
-    fn from(error: crate::ConversionError) -> Self {
-        Self {
-            human: String::new(),
-            location: Some(error.location().clone()),
-            detail: ResourceAdmissionDetail::Conversion(error),
-        }
-    }
-}
 impl std::fmt::Display for ResourceAdmissionFinding {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.detail {
-            ResourceAdmissionDetail::Conversion(error) => {
-                write!(formatter, "{}", error.diagnostic())
-            }
             ResourceAdmissionDetail::Schema { .. }
             | ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
@@ -5665,49 +5643,7 @@ pub enum ResourceRefTypeValidationError {
     #[error(transparent)]
     AnalysisInvariant(#[from] crate::parser::AnalysisTreeError),
     #[error(transparent)]
-    Validation(ResourceValidationReport),
-}
-
-/// Both diagnostic channels survive independently through the core/CLI boundary.
-#[derive(Debug)]
-pub struct ResourceValidationReport {
-    pub(crate) ordinary: String,
-    pub(crate) conversions: crate::ConversionFindings,
-}
-impl ResourceValidationReport {
-    pub fn ordinary(&self) -> &str {
-        &self.ordinary
-    }
-    pub fn conversions(&self) -> &crate::ConversionFindings {
-        &self.conversions
-    }
-    pub fn into_parts(self) -> (String, crate::ConversionFindings) {
-        (self.ordinary, self.conversions)
-    }
-    pub fn lines(&self) -> std::str::Lines<'_> {
-        self.ordinary.lines()
-    }
-}
-impl std::fmt::Display for ResourceValidationReport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.conversions)?;
-        if !self.ordinary.is_empty() {
-            if !self.conversions.findings().is_empty() {
-                writeln!(f)?;
-            }
-            f.write_str(&self.ordinary)?;
-        }
-        Ok(())
-    }
-}
-impl std::error::Error for ResourceValidationReport {}
-impl ResourceRefTypeValidationError {
-    pub fn conversion_error(&self) -> Option<&crate::ConversionError> {
-        match self {
-            Self::Validation(report) => report.conversions.findings().first(),
-            Self::AnalysisInvariant(_) => None,
-        }
-    }
+    Validation(PresentedFindings),
 }
 
 pub fn validate_resource_ref_types<
@@ -5720,7 +5656,15 @@ pub fn validate_resource_ref_types<
     bindings: &BindingIndex<'_, B>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
 ) -> Result<(), ResourceRefTypeValidationError> {
-    resource_admission_report(judged, bindings, diagnostics)?.into_legacy_result()
+    let mut run = ConversionValidation::default();
+    resource_reference_findings_in(
+        &mut run,
+        judged,
+        bindings,
+        diagnostics,
+        FindingSubject::Root,
+    )?;
+    run.complete().into_legacy_result()
 }
 
 pub fn resource_reference_findings<
@@ -5731,29 +5675,36 @@ pub fn resource_reference_findings<
     judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     bindings: &BindingIndex<'_, B>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
-) -> Result<Vec<ResourceAdmissionFinding>, crate::parser::AnalysisTreeError> {
-    Ok(resource_admission_report(judged, bindings, diagnostics)?.into_findings())
+) -> Result<PresentedFindings, crate::parser::AnalysisTreeError> {
+    let mut run = ConversionValidation::default();
+    resource_reference_findings_in(
+        &mut run,
+        judged,
+        bindings,
+        diagnostics,
+        FindingSubject::Root,
+    )?;
+    Ok(run.complete().into_presented())
 }
 
-fn validation_findings_result(
-    errors: Vec<String>,
-    conversions: crate::ConversionFindings,
-) -> Result<(), ResourceRefTypeValidationError> {
-    let ordinary = errors.join("\n");
-    if ordinary.is_empty() && conversions.findings().is_empty() {
-        Ok(())
-    } else {
-        Err(ResourceRefTypeValidationError::Validation(
-            ResourceValidationReport {
-                ordinary,
-                conversions,
-            },
-        ))
-    }
+/// Add a module definition to the same run that owns the root admission pass.
+pub fn resource_reference_findings_in<
+    E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
+    B: BindingAddress,
+    F: ValidationClientError,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+>(
+    run: &mut ConversionValidation<F>,
+    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    bindings: &BindingIndex<'_, B>,
+    diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
+    subject: FindingSubject,
+) -> Result<(), crate::parser::AnalysisTreeError> {
+    let report = resource_admission_report(judged, bindings, diagnostics, run, &subject)?;
+    run.ordinary(report.references.0, subject);
+    Ok(())
 }
 
-/// Validate resource/data-source attributes once, then render value and
-/// reference findings from that report for CLI callers.
 pub fn validate_resource_admissions<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
@@ -5764,11 +5715,18 @@ pub fn validate_resource_admissions<
     known_providers: &HashSet<String>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
 ) -> Result<(), ResourceRefTypeValidationError> {
-    complete_resource_admission_report(judged, bindings, known_providers, diagnostics)?
-        .into_legacy_result()
+    let mut run = ConversionValidation::default();
+    resource_admission_findings_in(
+        &mut run,
+        judged,
+        bindings,
+        known_providers,
+        diagnostics,
+        FindingSubject::Root,
+    )?;
+    run.complete().into_legacy_result()
 }
 
-/// Typed counterpart to the execution-facing string wrapper above.
 pub fn resource_admission_findings<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
@@ -5778,24 +5736,59 @@ pub fn resource_admission_findings<
     bindings: &BindingIndex<'_, B>,
     known_providers: &HashSet<String>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
-) -> Result<Vec<ResourceAdmissionFinding>, crate::parser::AnalysisTreeError> {
-    Ok(
-        complete_resource_admission_report(judged, bindings, known_providers, diagnostics)?
-            .into_findings(),
-    )
+) -> Result<PresentedFindings, crate::parser::AnalysisTreeError> {
+    let mut run = ConversionValidation::default();
+    resource_admission_findings_in(
+        &mut run,
+        judged,
+        bindings,
+        known_providers,
+        diagnostics,
+        FindingSubject::Root,
+    )?;
+    Ok(run.complete().into_presented())
+}
+
+/// Append a root/expanded pass without exposing either unfinished channel.
+pub fn resource_admission_findings_in<
+    E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
+    B: BindingAddress,
+    F: ValidationClientError,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+>(
+    run: &mut ConversionValidation<F>,
+    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    bindings: &BindingIndex<'_, B>,
+    known_providers: &HashSet<String>,
+    diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
+    subject: FindingSubject,
+) -> Result<(), crate::parser::AnalysisTreeError> {
+    let report = complete_resource_admission_report(
+        judged,
+        bindings,
+        known_providers,
+        diagnostics,
+        run,
+        &subject,
+    )?;
+    run.ordinary(report.references.0, subject);
+    Ok(())
 }
 
 fn complete_resource_admission_report<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
+    F: ValidationClientError,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     bindings: &BindingIndex<'_, B>,
     known_providers: &HashSet<String>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
+    run: &mut ConversionValidation<F>,
+    subject: &FindingSubject,
 ) -> Result<ResourceAdmissionReport, crate::parser::AnalysisTreeError> {
-    let mut report = resource_admission_report(judged, bindings, diagnostics)?;
+    let mut report = resource_admission_report(judged, bindings, diagnostics, run, subject)?;
     let mut findings = resource_values_report(
         judged.file(),
         judged.schemas(),
@@ -5843,31 +5836,7 @@ fn publish_admission_diagnostics<T>(
 struct ResourceAdmissionReport {
     attributes: HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>,
     references: ResourceAdmissionFindings,
-    conversions: crate::ConversionFindings,
 }
-impl ResourceAdmissionReport {
-    fn into_findings(self) -> Vec<ResourceAdmissionFinding> {
-        let mut findings = self.references.0;
-        findings.extend(
-            self.conversions
-                .into_findings()
-                .into_iter()
-                .map(ResourceAdmissionFinding::from),
-        );
-        findings
-    }
-    fn into_legacy_result(self) -> Result<(), ResourceRefTypeValidationError> {
-        validation_findings_result(
-            self.references
-                .0
-                .into_iter()
-                .map(|finding| finding.to_string())
-                .collect(),
-            self.conversions,
-        )
-    }
-}
-
 /// Recover the lexical type of a bare value that became an entire reference
 /// attribute during expansion. The runtime reference stays absolute; only its
 /// module-body type retains the declaration and the original source together.
@@ -5921,18 +5890,20 @@ fn module_resource_ref_declaration<'a, E, D, B: BindingAddress>(
 fn resource_admission_report<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
+    F: ValidationClientError,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     bindings: &BindingIndex<'_, B>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
+    conversion_validation: &mut ConversionValidation<F>,
+    subject: &FindingSubject,
 ) -> Result<ResourceAdmissionReport, crate::parser::AnalysisTreeError> {
     let parsed = judged.file();
     let registry = judged.schemas();
     let mut all_errors = ResourceAdmissionFindings::default();
     let mut attributes = HashMap::new();
-    let mut conversion_validation =
-        crate::parser::retained::ConversionValidation::new(judged.report());
+    conversion_validation.include_in(judged.report(), subject.clone());
     let inference_bindings = inference::bindings_from_parsed(parsed);
     let tree = crate::parser::AnalysisTree::try_from_file(parsed)?;
 
@@ -5972,7 +5943,24 @@ fn resource_admission_report<
                         &crate::resource::knowledge::KnowledgeContext::validation(),
                         |_, _| {},
                     );
-                    let mut values = conversion_validation.walk(|coverage| {
+                    let source = resource.module_source();
+                    let resource_subject = match subject {
+                        FindingSubject::Module(_) => subject.clone(),
+                        FindingSubject::Root => source.and_then(ModuleSource::module_call).map_or(
+                            FindingSubject::Root,
+                            |module| {
+                                FindingSubject::Module(
+                                    module
+                                        .module_call_path()
+                                        .calls()
+                                        .map(|call| call.display_label())
+                                        .collect::<Vec<_>>()
+                                        .join(" -> "),
+                                )
+                            },
+                        ),
+                    };
+                    let values = conversion_validation.walk_in(resource_subject, |coverage| {
                         admission::attributes::resource_attribute_admissions(
                             resource,
                             parsed,
@@ -5986,7 +5974,6 @@ fn resource_admission_report<
                             coverage,
                         )
                     });
-                    conversion_validation.record(values.take_conversions());
                     let location = resource.diagnostic_label();
                     for (attribute, path, error) in values.symbolic_errors() {
                         let start = all_errors.0.len();
@@ -6079,11 +6066,9 @@ fn resource_admission_report<
         ));
     }
 
-    let conversions = conversion_validation.complete();
     Ok(ResourceAdmissionReport {
         attributes,
         references: all_errors,
-        conversions,
     })
 }
 

@@ -84,6 +84,15 @@ pub(crate) fn cursor_step_allocations(cursor: AuthoredCursor<'_>) -> usize {
     })
 }
 
+pub(crate) fn resolve_assignment_declaration<'a>(
+    attr: &'a CompiledAttributeType,
+    defs: &'a BTreeMap<String, CompiledAttributeType>,
+) -> Result<&'a CompiledAttributeType, TypeError> {
+    resolve_refs_on_path(attr, defs, &mut Vec::new())
+        .map(|resolved| resolved.attr)
+        .map_err(|error| error.into_validation_error())
+}
+
 /// Assignment checks distinguish a current projection from authored syntax
 /// discarded by selection. Discarded syntax never supplies a fabricated Value.
 #[derive(Debug)]
@@ -105,6 +114,8 @@ impl<P: ValueKind, B: BindingAddress> Clone for CheckValue<'_, P, B> {
 /// Visits belong to use edges, even when several uses share a syntax node.
 #[derive(Debug, Default)]
 pub struct WalkCoverage {
+    conversions: crate::ConversionChannel,
+    subject: crate::validation::FindingSubject,
     visits: std::collections::HashSet<(NodeId, UseId, ExpansionInstanceId, ProjectionGeneration)>,
     work: usize,
     conversion_verdicts:
@@ -115,6 +126,26 @@ pub struct WalkCoverage {
 }
 
 impl WalkCoverage {
+    pub(crate) fn record_conversions(&mut self, findings: crate::ConversionChannel) {
+        self.conversions
+            .append(findings.in_subject(self.subject.clone()));
+    }
+    pub(crate) fn has_conversion_findings(&self) -> bool {
+        !self.conversions.findings().is_empty()
+    }
+    pub(crate) fn take_conversions(&mut self) -> crate::ConversionChannel {
+        std::mem::take(&mut self.conversions)
+    }
+    pub(crate) fn in_subject<T>(
+        &mut self,
+        subject: crate::validation::FindingSubject,
+        walk: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = std::mem::replace(&mut self.subject, subject);
+        let output = walk(self);
+        self.subject = previous;
+        output
+    }
     fn bump(&mut self, identity: (UseId, ExpansionInstanceId), generation: ProjectionGeneration) {
         self.generations
             .entry(identity)
@@ -123,6 +154,7 @@ impl WalkCoverage {
     }
 
     pub(crate) fn extend(&mut self, other: Self) {
+        self.record_conversions(other.conversions);
         self.visits.extend(other.visits);
         self.conversion_verdicts.extend(other.conversion_verdicts);
         self.nodes.extend(other.nodes);
@@ -384,28 +416,55 @@ impl InsideSecret for SymbolicFinding {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+struct OrdinaryAssignmentFindings {
+    errors: Vec<(LeafPath, TypeError)>,
+    #[cfg(test)]
+    deferred: Vec<DeferredHook>,
+    local: Vec<crate::validation::admission::LocalPath>,
+    schema: crate::validation::admission::SchemaObligation,
+}
+impl InsideSecret for OrdinaryAssignmentFindings {
+    fn inside_secret(self) -> Self {
+        Self {
+            local: self.local.inside_secret(),
+            schema: self.schema,
+            errors: self
+                .errors
+                .into_iter()
+                .map(|(path, error)| (path.inside_secret(), error.inside_secret()))
+                .collect(),
+            #[cfg(test)]
+            deferred: self
+                .deferred
+                .into_iter()
+                .map(|mut hook| {
+                    hook.secret = true;
+                    hook
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Cached findings for one attribute. The primary error retains the CLI's
 /// established nesting; paths retain the LSP's established element locations.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ValueValidationFindings {
-    conversions: crate::ConversionChannel,
+    claim_effect: ClaimEffect,
     structure: ValueStructure,
     local_error: Option<TypeError>,
     additional_local_errors: Vec<TypeError>,
     local: Vec<(FieldPath, TypeError)>,
     pub(super) located: Vec<(LeafPath, TypeError)>,
-    assignment: AssignmentFindings,
+    assignment: OrdinaryAssignmentFindings,
     pub(crate) symbolic: Vec<SymbolicFinding>,
     pub(super) provider: Vec<(FieldPath, TypeError)>,
 }
 
 impl ValueValidationFindings {
-    pub fn conversions(&self) -> &crate::ConversionChannel {
-        &self.conversions
-    }
-
-    pub(crate) fn take_conversions(&mut self) -> crate::ConversionChannel {
-        std::mem::take(&mut self.conversions)
+    pub(crate) fn rejected_by_claim(&self) -> bool {
+        self.claim_effect == ClaimEffect::Rejected
     }
 
     pub(crate) fn retained_failure(mut self) -> Self {
@@ -414,7 +473,15 @@ impl ValueValidationFindings {
     }
 
     pub(crate) fn take_assignment(&mut self) -> AssignmentFindings {
-        std::mem::take(&mut self.assignment)
+        let obligations = std::mem::take(&mut self.assignment);
+        AssignmentFindings {
+            local: obligations.local,
+            schema: obligations.schema,
+            errors: obligations.errors,
+            #[cfg(test)]
+            deferred: obligations.deferred,
+            ..Default::default()
+        }
     }
 
     pub(crate) fn into_located(self) -> Vec<(LeafPath, TypeError)> {
@@ -472,7 +539,7 @@ impl ValueValidationFindings {
 impl InsideSecret for ValueValidationFindings {
     fn inside_secret(self) -> Self {
         Self {
-            conversions: self.conversions.inside_secret(),
+            claim_effect: self.claim_effect,
             structure: ValueStructure::Protected,
             local_error: self.local_error.map(InsideSecret::inside_secret),
             additional_local_errors: self.additional_local_errors.inside_secret(),
@@ -492,7 +559,6 @@ impl InsideSecret for ValueValidationFindings {
 /// One validation report, usable by both CLI and LSP without revalidation.
 #[derive(Debug, Default)]
 pub struct ResourceValueValidation {
-    pub(super) conversions: crate::ConversionChannel,
     pub(super) errors: Vec<TypeError>,
     pub(super) error_paths: HashMap<usize, (String, LeafPath)>,
     pub(super) attributes: HashMap<String, ValueValidationFindings>,
@@ -522,14 +588,6 @@ impl ResourceValueValidation {
             ..Default::default()
         }
     }
-    pub fn conversions(&self) -> &crate::ConversionChannel {
-        &self.conversions
-    }
-
-    pub fn take_conversions(&mut self) -> crate::ConversionChannel {
-        std::mem::take(&mut self.conversions)
-    }
-
     pub(crate) fn error_slice(&self) -> &[TypeError] {
         &self.errors
     }
@@ -596,7 +654,6 @@ impl ResourceValueValidation {
     }
 
     pub(super) fn append_values(&mut self, values: Self) {
-        self.conversions.append(values.conversions);
         let offset = self.errors.len();
         self.error_paths.extend(
             values
@@ -893,7 +950,15 @@ impl<'a> CheckedValue<'a> {
             .or_else(|| self.findings.provider.first().map(|(_, error)| error))
     }
 
-    fn into_findings(mut self) -> ValueValidationFindings {
+    #[cfg(test)]
+    fn into_findings(self) -> ValueValidationFindings {
+        self.into_findings_with_coverage(&mut WalkCoverage::default())
+    }
+
+    fn into_findings_with_coverage(
+        mut self,
+        coverage: &mut WalkCoverage,
+    ) -> ValueValidationFindings {
         self.retain_primary_finding();
         // Preserve callback provenance while the two result streams are still
         // separate. Admission must never infer it from equal diagnostics.
@@ -918,8 +983,9 @@ impl<'a> CheckedValue<'a> {
             self.findings.located.push((path, error));
         }
         self.findings.assignment.extend(self.findings.authored);
+        coverage.record_conversions(std::mem::take(&mut self.findings.assignment.conversions));
         ValueValidationFindings {
-            conversions: std::mem::take(&mut self.findings.assignment.conversions),
+            claim_effect: self.findings.assignment.claim_effect,
             structure: ValueStructure::Scalar,
             local_error: match self.local {
                 LocalOutcome::Accepted(_) => None,
@@ -934,7 +1000,13 @@ impl<'a> CheckedValue<'a> {
                 .into_iter()
                 .map(|(path, error)| (path.canonical(), error))
                 .collect(),
-            assignment: self.findings.assignment,
+            assignment: OrdinaryAssignmentFindings {
+                local: self.findings.assignment.local,
+                schema: self.findings.assignment.schema,
+                errors: self.findings.assignment.errors,
+                #[cfg(test)]
+                deferred: self.findings.assignment.deferred,
+            },
             symbolic,
             additional_local_errors: self.findings.additional_local_errors,
             provider: self.findings.provider,
@@ -946,10 +1018,6 @@ struct ValueValidator<'a, 'lookup> {
     defs: &'a BTreeMap<String, CompiledAttributeType>,
     lookup: Option<CustomTypeLookup<'lookup>>,
     scope: AssignmentScope,
-    rechecks: Option<(
-        &'a crate::validation::admission::ConversionRechecks,
-        &'a LeafPath,
-    )>,
     checked: std::cell::RefCell<HashMap<CheckedNode<'a>, CheckedValue<'a>>>,
 }
 
@@ -977,21 +1045,10 @@ impl<'a, 'lookup> ValueValidator<'a, 'lookup> {
             defs,
             lookup,
             scope: AssignmentScope::Full,
-            rechecks: None,
             checked: Default::default(),
         }
     }
 
-    fn with_rechecks(
-        mut self,
-        rechecks: Option<(
-            &'a crate::validation::admission::ConversionRechecks,
-            &'a LeafPath,
-        )>,
-    ) -> Self {
-        self.rechecks = rechecks;
-        self
-    }
     fn with_scope(mut self, scope: AssignmentScope) -> Self {
         self.scope = scope;
         self
@@ -1019,7 +1076,8 @@ pub(crate) fn untyped_symbolic_errors(errors: Vec<TypeError>) -> ValueValidation
 }
 
 pub(crate) fn classification_error(error: TypeError) -> ValueValidationFindings {
-    CheckedValue::rejected(&FieldPath::new(), error).into_findings()
+    CheckedValue::rejected(&FieldPath::new(), error)
+        .into_findings_with_coverage(&mut WalkCoverage::default())
 }
 pub(super) fn validate_value_locally<
     'v,
@@ -1040,7 +1098,7 @@ pub(super) fn validate_value_locally<
             ancestry,
             &mut Vec::new(),
         )
-        .into_findings();
+        .into_findings_with_coverage(&mut WalkCoverage::default());
     findings.structure = value_structure(value);
     findings
 }
@@ -1142,7 +1200,7 @@ pub(crate) fn validate_value_with_lookup<
             ancestry,
             &mut Vec::new(),
         )
-        .into_findings();
+        .into_findings_with_coverage(&mut WalkCoverage::default());
     findings.structure = value_structure(value);
     findings
 }
@@ -1195,10 +1253,18 @@ struct CanonicalLeafError<'a> {
     error: Box<TypeError>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ClaimEffect {
+    #[default]
+    None,
+    Rejected,
+}
+
 /// An admission callback participates in this traversal and its Union choice.
 /// It never classifies a value or walks children.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct AssignmentFindings {
+    pub(crate) claim_effect: ClaimEffect,
     pub(crate) conversions: crate::ConversionChannel,
     pub(crate) local: Vec<crate::validation::admission::LocalPath>,
     pub(crate) schema: crate::validation::admission::SchemaObligation,
@@ -1218,6 +1284,9 @@ impl AssignmentFindings {
         #[cfg(test)]
         self.deferred.extend(other.deferred);
         self.matched_destination |= other.matched_destination;
+        if other.claim_effect == ClaimEffect::Rejected {
+            self.claim_effect = ClaimEffect::Rejected;
+        }
     }
 }
 impl InsideSecret for AssignmentFindings {
@@ -1240,6 +1309,7 @@ impl InsideSecret for AssignmentFindings {
                 .collect(),
             schema: self.schema,
             matched_destination: self.matched_destination,
+            claim_effect: self.claim_effect,
             errors: self
                 .errors
                 .into_iter()
@@ -1425,10 +1495,6 @@ pub(crate) struct WalkCallbacks<'a, P: ValueKind, B: BindingAddress> {
     ordinary: AssignmentCheck<'a, P, B>,
     policy: AuthoredChecks<'a, P, B>,
     scope: AssignmentScope,
-    rechecks: Option<(
-        &'a crate::validation::admission::ConversionRechecks,
-        &'a LeafPath,
-    )>,
     #[cfg(test)]
     authored: Option<AuthoredHook<'a, P, B>>,
 }
@@ -1443,7 +1509,6 @@ impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
             ordinary: self.ordinary,
             policy: self.policy,
             scope: self.scope,
-            rechecks: self.rechecks,
             #[cfg(test)]
             authored: self.authored.map(|hook| AuthoredHook {
                 callback: hook.callback,
@@ -1451,14 +1516,6 @@ impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
                 execution: HookExecution::Immediate,
             }),
         }
-    }
-    pub(crate) fn rechecking(
-        mut self,
-        rechecks: &'a crate::validation::admission::ConversionRechecks,
-        root: &'a LeafPath,
-    ) -> Self {
-        self.rechecks = Some((rechecks, root));
-        self
     }
     fn has_observer(&self) -> bool {
         #[cfg(test)]
@@ -1547,7 +1604,6 @@ impl<'a, P: ValueKind, B: BindingAddress> From<RequiredAssignmentCallbacks<'a, P
             ordinary: callbacks.ordinary,
             policy: callbacks.authored,
             scope: callbacks.scope,
-            rechecks: None,
             #[cfg(test)]
             authored: None,
         }
@@ -1564,7 +1620,6 @@ impl<'a, P: ValueKind, B: BindingAddress> From<AssignmentCallbacks<'a, P, B>>
                 Ok(AuthoredOutcome::Continue(Default::default()))
             }),
             scope: AssignmentScope::Full,
-            rechecks: None,
             authored: None,
         }
         .observe(callbacks.authored)
@@ -1631,7 +1686,8 @@ impl<'a, B: BindingAddress> Claim<'a, B> {
                             findings,
                         )
                     },
-                    |findings| {
+                    |mut findings| {
+                        findings.claim_effect = ClaimEffect::Rejected;
                         (
                             Self::Rejected {
                                 owner: std::rc::Rc::new(cursor.clone()),
@@ -1779,10 +1835,6 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> AssignmentWalk<'a, P, B> {
         path: &FieldPath,
         ancestry: FieldAncestry,
     ) -> Result<(Self, AssignmentProbe, Vec<AuthoredCursor<'a, B>>), TypeError> {
-        let mut resolved_path = Vec::new();
-        let attr = resolve_refs_on_path(attr, defs, &mut resolved_path)
-            .map_err(|error| error.into_validation_error())?
-            .attr;
         let mut findings = AssignmentProbe::default();
         let mut wrappers = Vec::new();
         let mut followed = std::collections::HashSet::new();
@@ -1908,7 +1960,6 @@ pub(crate) fn validate_authored_value_for_admission<
         let callbacks = callbacks.into().for_walk();
         let mut checked = ValueValidator::new(defs, Some(lookup))
             .with_scope(callbacks.scope)
-            .with_rechecks(callbacks.rechecks)
             .walk_with_assignment(
                 attr,
                 value.into(),
@@ -1925,8 +1976,8 @@ pub(crate) fn validate_authored_value_for_admission<
         callbacks.finish(&mut checked.findings.authored);
         checked
     };
-    let mut findings = checked.into_findings();
     *coverage = visits.into_inner();
+    let mut findings = checked.into_findings_with_coverage(coverage);
     findings.structure = value_structure(value);
     findings
 }
@@ -2462,21 +2513,6 @@ impl<'a> ValueValidator<'a, '_> {
     where
         'a: 'w,
     {
-        let selected = self
-            .rechecks
-            .and_then(|(rechecks, root)| rechecks.selected(root, &path.canonical()));
-        let attr = selected.map_or(attr, |selected| selected.declaration());
-        let assignment = assignment.map(|mut walk| {
-            if let Some(selected) = selected {
-                walk.claim = Claim::Accepted {
-                    owner: std::rc::Rc::new(AcceptedClaim {
-                        cursor: walk.cursor.clone(),
-                        conversion: selected.owner().clone(),
-                    }),
-                };
-            }
-            walk
-        });
         let (assignment, extra, wrappers) = match assignment {
             Some(assignment) => match assignment.prepare(attr, self.defs, value, path, ancestry) {
                 Ok((assignment, findings, wrappers)) => (Some(assignment), findings, wrappers),
@@ -3011,6 +3047,7 @@ impl<'a> ValueValidator<'a, '_> {
                     .authored
                     .conversions
                     .append(std::iter::once(conversion.reject_destination(cause)).collect());
+                checked.findings.authored.claim_effect = ClaimEffect::Rejected;
             }
             if !checked.findings.authored.errors.is_empty()
                 || !checked.findings.authored.conversions.findings().is_empty()
@@ -3708,6 +3745,7 @@ impl<'a> ValueValidator<'a, '_> {
         let mut sibling_authored = AssignmentFindings::default();
         let mut selected_failure = None;
         let mut unmatched: Option<(&CompiledAttributeType, AssignmentFindings)> = None;
+        let mut claimed_failure: Option<UnionFailure<'a>> = None;
         for member in members {
             let member_assignment = assignment.clone().map(|mut walk| {
                 if let Some(owner) = walk.claim.owner() {
@@ -3724,13 +3762,16 @@ impl<'a> ValueValidator<'a, '_> {
                 visited,
                 member_assignment,
             );
-            if !checked.findings.authored.errors.is_empty()
-                || !checked.findings.authored.conversions.findings().is_empty()
-            {
-                if unmatched.as_ref().is_none_or(|(_, current)| {
-                    checked.findings.authored.matched_destination && !current.matched_destination
+            if checked.findings.authored.claim_effect == ClaimEffect::Rejected {
+                if claimed_failure.as_ref().is_none_or(|current| {
+                    checked.findings.authored.matched_destination
+                        && !current.findings.authored.matched_destination
                 }) {
-                    unmatched = Some((member, checked.findings.authored));
+                    claimed_failure = Some(UnionFailure {
+                        selected: Some(member),
+                        local: checked.local.map(|fit| UnionFit { member, fit }),
+                        findings: checked.findings,
+                    });
                 }
                 continue;
             }
@@ -3831,6 +3872,9 @@ impl<'a> ValueValidator<'a, '_> {
         }
         if let Some(best) = best_accepted {
             return Ok(best);
+        }
+        if let Some(failure) = claimed_failure {
+            return Err(Box::new(failure));
         }
         // A locally rejected arm's diagnostic rank cannot replace the
         // provider findings of a locally accepted arm, including at a tie.
@@ -4033,7 +4077,6 @@ mod tests {
             name: "hook finding".into(),
         };
         let report = ResourceValueValidation {
-            conversions: Default::default(),
             errors: vec![ordinary, hook.clone()],
             error_paths: HashMap::from([
                 (0, ("input".into(), path.clone())),
@@ -4086,7 +4129,6 @@ mod tests {
         ] {
             let origin = finding.origin();
             let report = ResourceValueValidation {
-                conversions: Default::default(),
                 errors: vec![error.clone()],
                 error_paths: HashMap::from([(0, ("input".into(), path.clone()))]),
                 attributes: HashMap::from([(

@@ -33,42 +33,31 @@ fn conversion_admission_error_renders_its_typed_channel_once() {
             .resolve_root_for_test();
             let configuration =
                 crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
-            let tree =
-                crate::parser::AnalysisTree::try_from_file(configuration.judged().file()).unwrap();
-            let resource = tree.resources().next().unwrap();
-            let slot = resource.authored_slot("target").unwrap();
-            let value = slot.projection().unwrap();
-            let proof = value
-                .knowledge(&KnowledgeContext::validation())
-                .unwrap()
-                .into_classification();
             let bindings =
                 BindingIndex::from_parsed(configuration.judged().file(), schemas, catalog);
-            let destination = schemas
-                .resource_attribute_destination(resource.id(), "target", catalog)
-                .unwrap();
-            crate::validation::deferred_types::with_session_for_test(catalog, |session| {
-                let (candidate, context) =
-                    Candidate::validation_slot(slot, proof, Some(&bindings), session).unwrap();
-                let error = admit(&destination, candidate, &context).unwrap_err();
-                let conversion = error.conversion_error().unwrap();
-                let rendered = crate::executor::render_error_chain(&error);
-                assert_eq!(
-                    rendered.matches(&conversion.to_string()).count(),
-                    1,
-                    "{rendered}"
-                );
-                assert_eq!(
-                    crate::ConversionError::from_error(&error)
-                        .unwrap()
-                        .location(),
-                    conversion.location()
-                );
-                assert!(
-                    crate::ConversionError::from_error(error.resolution_error()).is_none(),
-                    "ordinary resolution errors cannot retain a conversion channel"
-                );
-            });
+            let presented = crate::validation::resource_admission_findings(
+                configuration.judged(),
+                &bindings,
+                &std::collections::HashSet::from(["test".into()]),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            assert_eq!(presented.len(), 1);
+            let crate::validation::PresentedFinding::Conversion(conversion) =
+                presented.iter().next().unwrap()
+            else {
+                panic!("typed presentation required");
+            };
+            let rendered = crate::executor::render_error_chain(&presented);
+            assert_eq!(
+                rendered.matches(&conversion.error().to_string()).count(),
+                1,
+                "{rendered}"
+            );
+            assert_eq!(
+                conversion.location().file().path(),
+                std::path::Path::new("terminal.crn")
+            );
         },
     );
 }

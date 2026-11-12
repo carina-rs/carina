@@ -1255,6 +1255,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         let module = self
             .module_cache
             .get(&directory.identity())
+            .and_then(super::resolver::CachedModule::resolved)
             .ok_or_else(|| ModuleError::UnknownModule(call.module_name.clone()))?;
         Ok((module, import.path.clone(), directory.clone()))
     }

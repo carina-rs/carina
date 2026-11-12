@@ -63,6 +63,11 @@ impl EvaluationSource for EvaluationOnly {
     }
 }
 
+pub(super) enum ParsedKey {
+    Literal(String),
+    Rejected,
+}
+
 /// Parser-local lexical binding kind.
 ///
 /// Structural bindings (resources, module calls, `for` results, waits,
@@ -326,26 +331,33 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         )
     }
 
-    pub(super) fn conversion_expression_error(
+    pub(super) fn reject_conversion_boundary(
         &self,
         pair: &pest::iterators::Pair<'_, Rule>,
-        error: ParseError,
-    ) -> ParseError {
-        self.authored_nodes.expression_failure(pair, error)
+    ) -> bool {
+        self.authored_nodes.reject_boundary(pair)
     }
-    pub(super) fn conversion_boundary_error(
+    pub(super) fn recover_converted_evaluation(
         &self,
         pair: &pest::iterators::Pair<'_, Rule>,
-        error: ParseError,
-    ) -> ParseError {
-        self.authored_nodes.boundary_failure(pair, error)
+        value: Result<crate::eval_value::EvalValue, ParseError>,
+    ) -> Result<crate::eval_value::EvalValue, ParseError> {
+        self.authored_nodes.recover_evaluation(pair, value)
     }
     pub(super) fn key_string(
         &self,
         pair: pest::iterators::Pair<'_, Rule>,
-    ) -> Result<String, ParseError> {
-        extract_key_string(pair.clone())
-            .map_err(|error| self.conversion_boundary_error(&pair, error))
+    ) -> Result<ParsedKey, ParseError> {
+        match extract_key_string(pair.clone()) {
+            Ok(key) => Ok(ParsedKey::Literal(key)),
+            Err(error) => {
+                if self.reject_conversion_boundary(&pair) {
+                    Ok(ParsedKey::Rejected)
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     pub(super) fn authored_node_id(

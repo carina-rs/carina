@@ -414,12 +414,14 @@ impl ExpandedDiagnosticValidationInputs<'_> {
     }
     fn resource_admissions_in(
         &mut self,
-        validation: &mut carina_core::parser::retained::ConversionValidation,
+        validation: &mut carina_core::validation::ConversionValidation,
         resource_id: &carina_core::resource::ResourceId,
         session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Option<carina_core::schema::ResourceValueValidation> {
-        validation
-            .walk(|coverage| self.resource_admissions_with_coverage(resource_id, session, coverage))
+        let resource = *self.resources.get(resource_id)?;
+        validation.walk_resource(resource, |coverage| {
+            self.resource_admissions_with_coverage(resource_id, session, coverage)
+        })
     }
     fn resource_admissions_with_coverage(
         &mut self,
@@ -1551,8 +1553,8 @@ impl DiagnosticRun<'_> {
                     );
                 }
             }
-            let mut conversion_validation =
-                carina_core::parser::retained::ConversionValidation::new(expression_report);
+            let mut conversion_validation: carina_core::validation::ConversionValidation =
+                carina_core::validation::ConversionValidation::new(expression_report);
             if let Some(configuration) = &expanded_configuration {
                 conversion_validation.include(configuration.judged().report());
             }
@@ -1579,14 +1581,13 @@ impl DiagnosticRun<'_> {
                         continue;
                     };
                     let call = &origin.module_call_path().root().id;
-                    let Some(mut report) = inputs.resource_admissions_in(
+                    let Some(report) = inputs.resource_admissions_in(
                         &mut conversion_validation,
                         &resource.id,
                         self.provider_context,
                     ) else {
                         continue;
                     };
-                    conversion_validation.record(report.take_conversions());
                     for error in report.errors() {
                         let finding = carina_core::parser::Located::new(
                             call.declaration_location().clone(),
@@ -1815,11 +1816,10 @@ impl DiagnosticRun<'_> {
                     let mut value_validation = expanded_validation_inputs.as_mut()
                         .filter(|_| uses_composition_output)
                         .and_then(|inputs| inputs.resource_admissions_in(&mut conversion_validation, admission_resource.id(), self.provider_context))
-                        .unwrap_or_else(|| conversion_validation.walk(|coverage| carina_core::validation::admission::attributes::resource_attribute_admissions(
+                        .unwrap_or_else(|| conversion_validation.walk_resource(admission_resource, |coverage| carina_core::validation::admission::attributes::resource_attribute_admissions(
                             admission_resource, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, evaluated_inputs, &binding_index, self.provider_context, &self.schemas, coverage,
                         )));
                     admitted_resources.insert(admission_resource.id().clone());
-                    conversion_validation.record(value_validation.take_conversions());
                     // Attribute rendering consumes its report entries. Preserve
                     // core's diagnostic ownership before taking those entries.
                     let resource_diagnostic_errors = value_validation
@@ -2351,18 +2351,45 @@ impl DiagnosticRun<'_> {
                     .project_resources()
                     .filter(|resource| !admitted_resources.contains(resource.id()))
                 {
-                    let findings = conversion_validation.walk(|coverage| carina_core::validation::admission::attributes::unrendered_resource_conversion_admissions(resource, pre_expansion_configuration.judged(), &binding_index, self.provider_context, coverage));
-                    conversion_validation.record(findings);
+                    conversion_validation.walk_resource(resource, |coverage| carina_core::validation::admission::attributes::unrendered_resource_conversion_admissions(resource, pre_expansion_configuration.judged(), &binding_index, self.provider_context, coverage));
                 }
             }
-            for error in conversion_validation.complete().into_findings() {
-                let finding = carina_core::parser::Located::new(error.location().clone(), error);
-                diagnostics.extend(render_merged(
-                    doc,
-                    &finding,
-                    DiagnosticSeverity::ERROR,
-                    finding.detail().diagnostic_message(),
-                ));
+            for finding in conversion_validation.complete().into_presented() {
+                use carina_core::validation::{OrdinaryFinding, PresentedFinding};
+                match finding {
+                    PresentedFinding::Ordinary(OrdinaryFinding::Resource(error)) => {
+                        if let Some(location) = error.location() {
+                            let finding = carina_core::parser::Located::new(
+                                location.clone(),
+                                error.message(),
+                            );
+                            diagnostics.extend(render_merged(
+                                doc,
+                                &finding,
+                                DiagnosticSeverity::ERROR,
+                                finding.detail().clone(),
+                            ));
+                        }
+                    }
+                    PresentedFinding::Ordinary(OrdinaryFinding::Client(never)) => match *never {},
+                    PresentedFinding::Conversion(error) => {
+                        let finding = carina_core::parser::Located::new(
+                            error.location().clone(),
+                            error.message().to_owned(),
+                        );
+                        if let Some(mut diagnostic) = render_merged(
+                            doc,
+                            &finding,
+                            DiagnosticSeverity::ERROR,
+                            finding.detail().clone(),
+                        ) {
+                            diagnostic.code = Some(tower_lsp::lsp_types::NumberOrString::String(
+                                error.code().to_owned(),
+                            ));
+                            diagnostics.push(diagnostic);
+                        }
+                    }
+                }
             }
 
             // Check the current buffer's attributes against directory-wide

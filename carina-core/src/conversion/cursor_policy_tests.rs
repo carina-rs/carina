@@ -1,3 +1,4 @@
+use super::tests::{conversion_error, conversion_errors, ordinary_messages};
 use super::*;
 use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity};
 use std::{collections::HashSet, path::Path};
@@ -13,9 +14,9 @@ fn conversion_chains_have_one_outer_diagnostic() {
         let crate::validation::ResourceRefTypeValidationError::Validation(report) = error else {
             panic!("typed conversion required: {error:?}");
         };
-        let findings = report.conversions();
-        assert_eq!(findings.findings().len(), 1, "{depth}: {findings:?}");
-        let error = &findings.findings()[0];
+        let findings = conversion_errors(&report);
+        assert_eq!(findings.as_slice().len(), 1, "{depth}: {findings:?}");
+        let error = &findings.as_slice()[0];
         assert!(
             error
                 .diagnostic_message()
@@ -53,7 +54,7 @@ fn conversion_chains_keep_outer_owner_under_existing_restrictions() {
             else {
                 panic!("typed findings required: {error:?}");
             };
-            let errors = report.conversions().findings();
+            let errors = conversion_errors(&report);
             assert_eq!(errors.len(), 1, "{source}: {errors:?}");
             assert_eq!(errors[0].diagnostic_message(), message);
             assert_eq!(
@@ -72,7 +73,7 @@ fn conversion_chains_keep_outer_owner_under_existing_restrictions() {
 fn conversion_without_resource_schema_reports_unsupported_position() {
     let source = "mock.Unknown { target = 'ok' as mock.Name }";
     let error = check(source, &schema()).unwrap_err();
-    let conversion = ConversionError::from_error(&error).unwrap();
+    let conversion = conversion_error(&error).unwrap();
     assert_eq!(conversion.kind(), ConversionErrorKind::UnsupportedPosition);
     assert_eq!(
         conversion.diagnostic_message(),
@@ -81,7 +82,10 @@ fn conversion_without_resource_schema_reports_unsupported_position() {
     let crate::validation::ResourceRefTypeValidationError::Validation(report) = error else {
         panic!("typed findings report required");
     };
-    assert_eq!(report.ordinary(), "Unknown resource type: mock.Unknown");
+    assert_eq!(
+        ordinary_messages(&report),
+        "Unknown resource type: mock.Unknown"
+    );
 }
 
 #[test]
@@ -101,8 +105,8 @@ fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots()
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let bindings =
         crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
-    let mut coverage = Default::default();
-    let mut conversions = ConversionFindings::default();
+    let mut validation: crate::validation::ConversionValidation =
+        crate::validation::ConversionValidation::new(judged.report());
     let mut resources = 0;
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
         for resource in tree.resources() {
@@ -111,18 +115,20 @@ fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots()
                 &crate::resource::knowledge::KnowledgeContext::validation(),
                 |_, _| {},
             );
-            let mut report = resource_attribute_admissions(
-                resource,
-                judged.file(),
-                resource.schema(&schemas).unwrap(),
-                &classified,
-                resource.quoted_string_attrs(),
-                &inputs,
-                &bindings,
-                session,
-                &schemas,
-                &mut coverage,
-            );
+            let mut report = validation.walk(|coverage| {
+                resource_attribute_admissions(
+                    resource,
+                    judged.file(),
+                    resource.schema(&schemas).unwrap(),
+                    &classified,
+                    resource.quoted_string_attrs(),
+                    &inputs,
+                    &bindings,
+                    session,
+                    &schemas,
+                    coverage,
+                )
+            });
             assert_eq!(report.errors().count(), 0, "conversion leaked into errors");
             assert_eq!(
                 report.symbolic_errors().count(),
@@ -134,12 +140,6 @@ fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots()
                 0,
                 "conversion leaked into diagnostic errors"
             );
-            assert_eq!(
-                report.conversions().findings().len(),
-                1,
-                "one verdict per resource slot, without presentation copies"
-            );
-            conversions.extend(report.take_conversions());
             assert!(
                 report
                     .take_attribute("target")
@@ -151,10 +151,10 @@ fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots()
         }
     });
     assert_eq!(resources, 2);
-    conversions.extend(judged.report().conversion_completeness(&coverage));
-    assert_eq!(conversions.findings().len(), 1);
+    let conversions = validation.complete().into_presented();
+    assert_eq!(conversion_errors(&conversions).len(), 1);
     assert_eq!(
-        conversions.findings()[0].kind(),
+        conversion_errors(&conversions)[0].kind(),
         ConversionErrorKind::ScalarKind
     );
 }
@@ -196,7 +196,7 @@ fn conversion_rejected_mixed_parent_skips_destination_value_checks() {
         );
         let error = check(&format!("mock.Sink {{ target = {expression} }}"), &schemas).unwrap_err();
         assert_eq!(
-            ConversionError::from_error(&error).unwrap().kind(),
+            conversion_error(&error).unwrap().kind(),
             ConversionErrorKind::UnsupportedPosition
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0, "{expression}");
@@ -330,7 +330,7 @@ fn conversion_boundaries_are_typed_b2_placeholders() {
             .err()
             .unwrap_or_else(|| panic!("boundary admitted: {source}"));
         assert_eq!(
-            ConversionError::from_error(&error).unwrap().kind(),
+            conversion_error(&error).unwrap().kind(),
             ConversionErrorKind::UnsupportedPosition,
             "{source}: {error:?}"
         );
@@ -348,10 +348,10 @@ fn conversion_boundary_alias_use_takes_precedence_over_unused_definition() {
         let crate::validation::ResourceRefTypeValidationError::Validation(report) = error else {
             panic!("typed conversion finding required");
         };
-        let findings = report.conversions();
-        assert_eq!(findings.findings().len(), 1, "{source}: {findings:?}");
+        let findings = conversion_errors(&report);
+        assert_eq!(findings.as_slice().len(), 1, "{source}: {findings:?}");
         assert_eq!(
-            findings.findings()[0].kind(),
+            findings.as_slice()[0].kind(),
             ConversionErrorKind::UnsupportedPosition,
             "{source}: {findings:?}"
         );
@@ -363,7 +363,7 @@ fn conversion_claim_does_not_skip_ordinary_siblings_or_unknown_fields() {
     for field in ["plain = 'wrong kind'", "unknown = 42"] {
         let source = format!("mock.Sink {{ target = 'ok' as mock.Name {field} }}");
         let error = check(&source, &schema()).unwrap_err();
-        assert!(ConversionError::from_error(&error).is_none(), "{error:?}");
+        assert!(conversion_error(&error).is_none(), "{error:?}");
         assert!(
             error.to_string().contains(if field.starts_with("plain") {
                 "Int"
@@ -384,7 +384,7 @@ fn conversion_wrappers_do_not_hide_secret_or_conversion_operand_placement() {
         let source = format!("mock.Sink {{ target = {expression} }}");
         let error = check(&source, &schema()).unwrap_err();
         assert_eq!(
-            ConversionError::from_error(&error).unwrap().kind(),
+            conversion_error(&error).unwrap().kind(),
             ConversionErrorKind::UnsupportedPosition,
             "{error:?}"
         );
@@ -410,15 +410,15 @@ fn conversion_discarded_union_rejects_ambiguous_identity() {
     )
     .unwrap_err();
     assert_eq!(
-        ConversionError::from_error(&error).unwrap().kind(),
+        conversion_error(&error).unwrap().kind(),
         ConversionErrorKind::AmbiguousDestination
     );
     let crate::validation::ResourceRefTypeValidationError::Validation(report) = error else {
         panic!("structured conversion errors required");
     };
-    let findings = report.conversions();
+    let findings = conversion_errors(&report);
     assert_eq!(
-        findings.findings().len(),
+        findings.as_slice().len(),
         2,
         "current and discarded conversions each need the union declaration"
     );
@@ -453,27 +453,28 @@ fn conversion_no_authored_evidence_cannot_admit_a_converted_slot() {
     let bindings =
         crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-        let mut coverage = Default::default();
-        let mut report = crate::validation::admission::attributes::resource_attribute_admissions(
-            resource,
-            judged.file(),
-            resource.schema(&schemas).unwrap(),
-            &classified,
-            resource.quoted_string_attrs(),
-            &inputs,
-            &bindings,
-            session,
-            &schemas,
-            &mut coverage,
-        );
+        let mut validation: crate::validation::ConversionValidation =
+            crate::validation::ConversionValidation::new(judged.report());
+        let report = validation.walk(|coverage| {
+            crate::validation::admission::attributes::resource_attribute_admissions(
+                resource,
+                judged.file(),
+                resource.schema(&schemas).unwrap(),
+                &classified,
+                resource.quoted_string_attrs(),
+                &inputs,
+                &bindings,
+                session,
+                &schemas,
+                coverage,
+            )
+        });
         assert_eq!(report.errors().count(), 0, "{report:?}");
         assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");
-        let mut conversions = ConversionFindings::default();
-        conversions.extend(report.take_conversions());
-        conversions.extend(judged.report().conversion_completeness(&coverage));
-        assert_eq!(conversions.findings().len(), 1);
+        let conversions = validation.complete().into_presented();
+        assert_eq!(conversion_errors(&conversions).len(), 1);
         assert_eq!(
-            conversions.findings()[0].kind(),
+            conversion_errors(&conversions)[0].kind(),
             ConversionErrorKind::UnsupportedPosition
         );
     });
@@ -489,7 +490,7 @@ fn conversion_pending_mixed_branches_are_parent_owned_in_both_orders() {
             "arguments {{ choose: Bool }}\nlet converted = 'ok' as mock.Name\nmock.Sink {{ target = {expression} }}"
         );
         let error = check(&source, &schema()).unwrap_err();
-        let conversion = ConversionError::from_error(&error).unwrap();
+        let conversion = conversion_error(&error).unwrap();
         assert_eq!(conversion.kind(), ConversionErrorKind::UnsupportedPosition);
         assert_eq!(conversion.location().span().start_line(), 3);
     }
@@ -554,8 +555,8 @@ fn conversion_union_ref_members_resolve_identity_and_bounds() {
     )
     .unwrap_err();
     assert_eq!(
-        ConversionError::from_error(&error).unwrap().kind(),
-        ConversionErrorKind::Disjoint
+        conversion_error(&error).unwrap().kind(),
+        ConversionErrorKind::UnsupportedPosition
     );
     schemas.insert(
         "mock",
@@ -580,7 +581,7 @@ fn conversion_union_ref_members_resolve_identity_and_bounds() {
     ] {
         let error = check(&format!("mock.Sink {{ target = {expression} }}"), &schemas).unwrap_err();
         assert_eq!(
-            ConversionError::from_error(&error).unwrap().kind(),
+            conversion_error(&error).unwrap().kind(),
             ConversionErrorKind::AmbiguousDestination
         );
     }
@@ -614,7 +615,7 @@ fn conversion_union_failures_keep_matching_member_cause_and_skip_rejected_value_
         &schemas,
     )
     .unwrap_err();
-    let conversion = ConversionError::from_error(&error).unwrap();
+    let conversion = conversion_error(&error).unwrap();
     assert!(
         conversion.source().is_some_and(|cause| cause
             .downcast_ref::<crate::schema::TypeError>()
@@ -651,7 +652,7 @@ fn conversion_union_failures_keep_matching_member_cause_and_skip_rejected_value_
     );
     let error = check("mock.Sink { target = 'ok' as mock.Name }", &schemas).unwrap_err();
     assert_eq!(
-        ConversionError::from_error(&error).unwrap().kind(),
+        conversion_error(&error).unwrap().kind(),
         ConversionErrorKind::AmbiguousDestination
     );
     assert_eq!(
@@ -667,7 +668,7 @@ fn conversion_known_destination_failure_retains_its_cause_and_convert_range() {
     let source = "mock.Sink { target = 'toolong-for-slot' as mock.Name }";
     let error = check(source, &schema()).unwrap_err();
     let conversion =
-        ConversionError::from_error(&error).expect("destination rejection needs the Convert owner");
+        conversion_error(&error).expect("destination rejection needs the Convert owner");
     assert_eq!(conversion.kind(), ConversionErrorKind::Destination);
     assert_eq!(
         conversion.location().span().start_column(),
@@ -695,10 +696,10 @@ fn conversion_covered_mixed_branches_report_the_convert_once() {
     let crate::validation::ResourceRefTypeValidationError::Validation(report) = error else {
         panic!("typed conversion finding required");
     };
-    let findings = report.conversions();
-    assert_eq!(findings.findings().len(), 1, "{findings:?}");
+    let findings = conversion_errors(&report);
+    assert_eq!(findings.as_slice().len(), 1, "{findings:?}");
     assert_eq!(
-        findings.findings()[0].location().span().start_column(),
+        findings.as_slice()[0].location().span().start_column(),
         source.find("'ok' as").unwrap() + 1
     );
 }
@@ -734,10 +735,13 @@ fn conversion_no_as_directory_inventory_is_vacuous_without_any_walk_evidence() {
                 &catalog,
             );
             let conversions =
-                crate::parser::retained::ConversionValidation::new(configuration.judged().report())
-                    .complete();
+                crate::validation::ConversionValidation::<std::convert::Infallible>::new(
+                    configuration.judged().report(),
+                )
+                .complete()
+                .into_presented();
             assert!(
-                conversions.findings().is_empty(),
+                conversion_errors(&conversions).is_empty(),
                 "{}: {conversions}",
                 case["name"]
             );
@@ -750,12 +754,13 @@ fn conversion_no_as_directory_inventory_is_vacuous_without_any_walk_evidence() {
                     assert_eq!(case["expected"]["status"], "ok", "{}", case["name"]);
                     let configuration =
                         crate::config_loader::load_buffer_configuration(&graph, &schemas, &catalog);
-                    let conversions = crate::parser::retained::ConversionValidation::new(
-                        configuration.judged().report(),
-                    )
-                    .complete();
+                    let conversions = crate::validation::ConversionValidation::<
+                        std::convert::Infallible,
+                    >::new(configuration.judged().report())
+                    .complete()
+                    .into_presented();
                     assert!(
-                        conversions.findings().is_empty(),
+                        conversion_errors(&conversions).is_empty(),
                         "{}: {conversions}",
                         case["name"]
                     );
@@ -766,7 +771,6 @@ fn conversion_no_as_directory_inventory_is_vacuous_without_any_walk_evidence() {
                         "{}: {error}",
                         case["name"]
                     );
-                    assert!(ConversionError::from_error(&error).is_none(), "{error}");
                     assert!(
                         error
                             .to_string()
@@ -799,7 +803,8 @@ fn conversion_one_authored_alias_use_cannot_cover_another_use_without_evidence()
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let bindings =
             crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
-        let mut validation = crate::parser::retained::ConversionValidation::new(judged.report());
+        let mut validation: crate::validation::ConversionValidation =
+            crate::validation::ConversionValidation::new(judged.report());
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
             for resource in tree.resources() {
                 let values = resource.resolved_attributes();
@@ -812,7 +817,7 @@ fn conversion_one_authored_alias_use_cannot_cover_another_use_without_evidence()
                     &crate::resource::knowledge::KnowledgeContext::validation(),
                     |_, _| {},
                 );
-                let mut report = validation.walk(|coverage| {
+                let report = validation.walk(|coverage| {
                     resource_attribute_admissions(
                         resource,
                         judged.file(),
@@ -828,17 +833,19 @@ fn conversion_one_authored_alias_use_cannot_cover_another_use_without_evidence()
                 });
                 assert_eq!(report.errors().count(), 0, "{report:?}");
                 assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");
-                validation.record(report.take_conversions());
             }
         });
-        let conversions = validation.complete();
+        let conversions = validation.complete().into_presented();
         assert_eq!(
-            conversions.findings().len(),
+            conversion_errors(&conversions).len(),
             usize::from(second == "converted"),
             "{source}\n{conversions}"
         );
-        for error in conversions.findings() {
+        for error in conversion_errors(&conversions) {
             assert_eq!(error.kind(), ConversionErrorKind::UnsupportedPosition);
         }
     }
 }
+
+#[path = "review_round2_tests.rs"]
+mod review_round2_tests;

@@ -1195,6 +1195,8 @@ pub enum AppError {
 
     #[error(transparent)]
     ResourceAdmission(Box<carina_core::validation::ResourceAdmissionFinding>),
+    #[error("{0}")]
+    PresentedConversion(Box<carina_core::validation::PresentedConversion>),
 
     #[error("{0}")]
     Parse(Box<carina_core::parser::ParseError>),
@@ -1713,7 +1715,23 @@ impl From<carina_core::validation::ExportBoundaryError> for AppError {
     }
 }
 
+impl carina_core::validation::ValidationClientError for AppError {}
+
 impl AppError {
+    pub(crate) fn from_presented<E: carina_core::validation::ValidationClientError>(
+        finding: carina_core::validation::PresentedFinding<E>,
+        client: impl FnOnce(E) -> Self,
+    ) -> Self {
+        use carina_core::validation::{OrdinaryFinding, PresentedFinding};
+        match finding {
+            PresentedFinding::Ordinary(OrdinaryFinding::Resource(error)) => {
+                Self::ResourceAdmission(error)
+            }
+            PresentedFinding::Ordinary(OrdinaryFinding::Client(error)) => client(*error),
+            PresentedFinding::Conversion(error) => Self::PresentedConversion(Box::new(error)),
+        }
+    }
+
     pub(crate) fn invalid_saved_plan_provider_evidence(
         path: carina_core::paths::DisplayPath,
         replan_command: Option<String>,

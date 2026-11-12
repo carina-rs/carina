@@ -51,7 +51,8 @@ pub use resolver::{
     ResolvedModuleConstraintStatus, ensure_expanded_root_graph, prepare_root_export_validation,
     resolve_module_template_with_config, resolve_module_template_with_providerless_config,
     resolve_modules_providerless, resolve_modules_with_config, resolve_modules_with_diagnostics,
-    resolve_modules_with_diagnostics_and_overrides, resolve_modules_with_providerless_config,
+    resolve_modules_with_diagnostics_and_overrides,
+    resolve_modules_with_diagnostics_from_loaded_modules, resolve_modules_with_providerless_config,
     resolve_modules_with_providerless_diagnostics,
 };
 pub use signature::{

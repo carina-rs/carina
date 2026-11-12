@@ -1405,6 +1405,15 @@ where
         }
     }
 
+    pub(crate) fn module_source(&self) -> Option<&'a ModuleSource> {
+        match self.resource {
+            ResourceRef::Resource(resource) => resource.module_source.as_ref(),
+            ResourceRef::DataSource(source) => source.module_source.as_ref(),
+            ResourceRef::Deferred { resource, .. } => resource.as_resource().module_source.as_ref(),
+            ResourceRef::LiveComposition(_) => None,
+        }
+    }
+
     pub(crate) fn authored_slots(&self) -> Option<&'a super::retained::AuthoredSlots<B>> {
         match self.resource {
             ResourceRef::Resource(resource) => Some(&resource.authored_slots),

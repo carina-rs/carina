@@ -1,4 +1,5 @@
 use super::*;
+use crate::validation::ConversionValidation;
 
 #[test]
 fn conversion_completion_uses_syntax_inventory_when_judgements_are_missing() {
@@ -10,9 +11,14 @@ fn conversion_completion_uses_syntax_inventory_when_judgements_are_missing() {
         let parsed = super::super::parse_file(source, Path::new("missing.crn"), &catalog).unwrap();
         let mut report = parsed.expression_report().clone();
         Arc::make_mut(&mut report.nodes).clear();
-        let conversions = report.conversion_completeness(&Default::default());
-        assert_eq!(conversions.findings().len(), count);
-        for error in conversions.findings() {
+        let conversions = ConversionValidation::<std::convert::Infallible>::new(&report)
+            .complete()
+            .into_presented();
+        assert_eq!(
+            crate::conversion::tests::conversion_errors(&conversions).len(),
+            count
+        );
+        for error in crate::conversion::tests::conversion_errors(&conversions) {
             assert_eq!(
                 error.kind(),
                 crate::ConversionErrorKind::UnsupportedPosition
@@ -187,57 +193,61 @@ fn conversion_live_covered_and_discarded_uses_each_supply_a_verdict() {
             .unwrap()
             .into_classification();
         let verdicts = std::cell::Cell::new([0; 3]);
-        let result = crate::schema::value_validation::validate_authored_value_for_admission(
-            &schema.schema().as_schema().attributes()["input"].attr_type,
-            &proof,
-            schema.schema().as_schema().defs(),
-            crate::schema::FieldAncestry::WRITABLE,
-            &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
-            AuthoredCursor::authored(slot.cursor().unwrap()),
-            RequiredAssignmentCallbacks {
-                ordinary: &|_, _, _, _| Ok(Default::default()),
-                authored: AuthoredChecks::Validation(&|attr, checked, path, cursor| {
-                    let is_convert = match &cursor.kind {
-                        CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => {
-                            usage.form() == AuthoredForm::Convert
-                        }
-                        CursorKind::Projected(_) => false,
-                    };
-                    let outcome = check_conversion::<
-                        crate::validation::admission::kind::ResourceAttribute,
-                        ParserPlaceholder,
-                        RelativeBindingName,
-                    >(
-                        attr,
-                        checked,
-                        path,
-                        cursor,
-                        schema.schema().as_schema().defs(),
-                        &catalog,
-                    )?;
-                    if is_convert {
-                        assert!(
-                            matches!(outcome, AuthoredOutcome::Claimed(_)),
-                            "a Convert requires its own verdict"
-                        );
-                        let index = match checked {
-                            CheckValue::Current(_) => 0,
-                            CheckValue::Covered => 1,
-                            CheckValue::Discarded => 2,
+        let mut validation: ConversionValidation = ConversionValidation::new(judged.report());
+        let result = validation.walk(|coverage| {
+            crate::schema::value_validation::validate_authored_value_for_admission(
+                &schema.schema().as_schema().attributes()["input"].attr_type,
+                &proof,
+                schema.schema().as_schema().defs(),
+                crate::schema::FieldAncestry::WRITABLE,
+                &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
+                AuthoredCursor::authored(slot.cursor().unwrap()),
+                RequiredAssignmentCallbacks {
+                    ordinary: &|_, _, _, _| Ok(Default::default()),
+                    authored: AuthoredChecks::Validation(&|attr, checked, path, cursor| {
+                        let is_convert = match &cursor.kind {
+                            CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => {
+                                usage.form() == AuthoredForm::Convert
+                            }
+                            CursorKind::Projected(_) => false,
                         };
-                        let mut counts = verdicts.get();
-                        counts[index] += 1;
-                        verdicts.set(counts);
-                    }
-                    Ok(outcome)
-                }),
-                scope: AssignmentScope::Full,
-            },
-            &mut Default::default(),
-        );
+                        let outcome = check_conversion::<
+                            crate::validation::admission::kind::ResourceAttribute,
+                            ParserPlaceholder,
+                            RelativeBindingName,
+                        >(
+                            attr,
+                            checked,
+                            path,
+                            cursor,
+                            schema.schema().as_schema().defs(),
+                            &catalog,
+                        )?;
+                        if is_convert {
+                            assert!(
+                                matches!(outcome, AuthoredOutcome::Claimed(_)),
+                                "a Convert requires its own verdict"
+                            );
+                            let index = match checked {
+                                CheckValue::Current(_) => 0,
+                                CheckValue::Covered => 1,
+                                CheckValue::Discarded => 2,
+                            };
+                            let mut counts = verdicts.get();
+                            counts[index] += 1;
+                            verdicts.set(counts);
+                        }
+                        Ok(outcome)
+                    }),
+                    scope: AssignmentScope::Full,
+                },
+                coverage,
+            )
+        });
+        let presented = validation.complete().into_presented();
         assert!(result.local_error().is_none());
         assert_eq!(
-            result.conversions().findings().len(),
+            crate::conversion::tests::conversion_errors(&presented).len(),
             expected.iter().sum::<usize>()
         );
         assert_eq!(verdicts.get(), expected, "{expression}");
@@ -282,38 +292,45 @@ fn conversion_claim_preserves_ordinary_checks_below_a_rejected_wrapper() {
         .unwrap()
         .into_classification();
     let ordinary = std::cell::RefCell::new(Vec::new());
-    let result = crate::schema::value_validation::validate_authored_value_for_admission(
-        &schema.schema().as_schema().attributes()["input"].attr_type,
-        &proof,
-        schema.schema().as_schema().defs(),
-        crate::schema::FieldAncestry::WRITABLE,
-        &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
-        AuthoredCursor::authored(slot.cursor().unwrap()),
-        RequiredAssignmentCallbacks {
-            ordinary: &|_, _, path, _| {
-                ordinary.borrow_mut().push(path.clone());
-                Ok(Default::default())
+    let mut validation: ConversionValidation = ConversionValidation::new(judged.report());
+    let result = validation.walk(|coverage| {
+        crate::schema::value_validation::validate_authored_value_for_admission(
+            &schema.schema().as_schema().attributes()["input"].attr_type,
+            &proof,
+            schema.schema().as_schema().defs(),
+            crate::schema::FieldAncestry::WRITABLE,
+            &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
+            AuthoredCursor::authored(slot.cursor().unwrap()),
+            RequiredAssignmentCallbacks {
+                ordinary: &|_, _, path, _| {
+                    ordinary.borrow_mut().push(path.clone());
+                    Ok(Default::default())
+                },
+                authored: AuthoredChecks::Validation(&|attr, checked, path, cursor| {
+                    check_conversion::<
+                        crate::validation::admission::kind::ResourceAttribute,
+                        ParserPlaceholder,
+                        RelativeBindingName,
+                    >(
+                        attr,
+                        checked,
+                        path,
+                        cursor,
+                        schema.schema().as_schema().defs(),
+                        &catalog,
+                    )
+                }),
+                scope: AssignmentScope::Full,
             },
-            authored: AuthoredChecks::Validation(&|attr, checked, path, cursor| {
-                check_conversion::<
-                    crate::validation::admission::kind::ResourceAttribute,
-                    ParserPlaceholder,
-                    RelativeBindingName,
-                >(
-                    attr,
-                    checked,
-                    path,
-                    cursor,
-                    schema.schema().as_schema().defs(),
-                    &catalog,
-                )
-            }),
-            scope: AssignmentScope::Full,
-        },
-        &mut Default::default(),
-    );
+            coverage,
+        )
+    });
+    let presented = validation.complete().into_presented();
     assert!(result.local_error().is_none());
-    assert_eq!(result.conversions().findings().len(), 1);
+    assert_eq!(
+        crate::conversion::tests::conversion_errors(&presented).len(),
+        1
+    );
     let paths = ordinary.into_inner();
     assert_eq!(
         paths.len(),
@@ -348,7 +365,7 @@ fn conversion_cursor_wrapper_keeps_typed_path_and_operand_value() {
     while matches!(node.kind, ExprKind::Alias) {
         node = &node.children[0].authored;
     }
-    let ExprKind::Convert { target } = &node.kind else {
+    let ExprKind::Convert { target, .. } = &node.kind else {
         panic!("missing Convert");
     };
     assert_eq!(target.detail().as_str(), "mock.Name");
@@ -415,19 +432,23 @@ fn conversion_parser_failures_keep_unsupported_placement_and_the_convert_range()
         "let value = does_not_exist(42 as String)",
         "let value = ('ok' as String) + 1",
     ] {
-        let error = super::super::parse_file(
+        let parsed = super::super::parse_file(
             source,
             Path::new("convert.crn"),
             &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
-        .unwrap_err();
-        let conversion = crate::ConversionError::from_error(&error).unwrap_or_else(|| {
-            panic!("parser rejection must retain the Convert: {source}: {error:?}")
-        });
+        .unwrap();
+        let presented =
+            ConversionValidation::<std::convert::Infallible>::new(parsed.expression_report())
+                .complete()
+                .into_presented();
+        let errors = crate::conversion::tests::conversion_errors(&presented);
+        assert_eq!(errors.len(), 1, "{source}: {presented}");
+        let conversion = errors[0];
         assert_eq!(
             conversion.kind(),
             crate::ConversionErrorKind::UnsupportedPosition,
-            "{error:?}"
+            "{presented:?}"
         );
         assert!(conversion.location().span().start_column() > 1);
     }
@@ -440,8 +461,14 @@ fn conversion_quoted_keys_own_the_convert_range_and_one_typed_error() {
         r#"let value = { "${'key' as mock.Name}" = 'ok' }"#,
     ] {
         let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
-        let error = super::super::parse_file(source, Path::new("keys.crn"), &catalog).unwrap_err();
-        let conversion = crate::ConversionError::from_error(&error).unwrap();
+        let parsed = super::super::parse_file(source, Path::new("keys.crn"), &catalog).unwrap();
+        let presented =
+            ConversionValidation::<std::convert::Infallible>::new(parsed.expression_report())
+                .complete()
+                .into_presented();
+        let errors = crate::conversion::tests::conversion_errors(&presented);
+        assert_eq!(errors.len(), 1);
+        let conversion = errors[0];
         assert_eq!(
             conversion.kind(),
             crate::ConversionErrorKind::UnsupportedPosition
@@ -451,7 +478,7 @@ fn conversion_quoted_keys_own_the_convert_range_and_one_typed_error() {
             source.find("'").unwrap() + 1
         );
         assert_eq!(
-            crate::executor::render_error_chain(&error)
+            crate::executor::render_error_chain(&presented)
                 .matches(&conversion.to_string())
                 .count(),
             1

@@ -70,74 +70,21 @@ pub struct AssignmentProof<K: DestinationKind> {
 /// The shared value traversal may collect and protect tokens, but cannot
 /// manufacture one from a path or a strict destination kind.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LocalPath {
-    path: LeafPath,
-    selected: Option<Box<crate::parser::retained::conversion::MatchedDestination>>,
-}
+pub struct LocalPath(LeafPath);
+
 impl LocalPath {
     pub(super) fn for_recheck<K: RechecksResolved>(_: K, path: LeafPath) -> Self {
-        Self {
-            path,
-            selected: None,
-        }
+        Self(path)
     }
-    #[cfg(test)]
+
     pub(super) fn into_path(self) -> LeafPath {
-        self.path
-    }
-    pub(super) fn selected(
-        mut self,
-        selected: crate::parser::retained::conversion::MatchedDestination,
-    ) -> Self {
-        self.selected = Some(Box::new(selected));
-        self
-    }
-    pub(super) fn collect(paths: Vec<Self>) -> (Vec<LeafPath>, ConversionRechecks) {
-        let mut all = Vec::with_capacity(paths.len());
-        let mut rechecks = Vec::new();
-        for local in paths {
-            if let Some(selected) = local.selected {
-                rechecks.push((local.path.clone(), *selected));
-            }
-            all.push(local.path);
-        }
-        rechecks.sort_by(|(a, _), (b, _)| a.segments().cmp(b.segments()));
-        (all, ConversionRechecks(rechecks))
-    }
-}
-impl crate::resource::InsideSecret for LocalPath {
-    fn inside_secret(self) -> Self {
-        Self {
-            path: self.path.inside_secret(),
-            ..self
-        }
+        self.0
     }
 }
 
-/// Existing local-path obligations with their sealed declaration payloads.
-/// Paths address local work; member identity is never looked up at discharge.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ConversionRechecks(
-    Vec<(
-        LeafPath,
-        crate::parser::retained::conversion::MatchedDestination,
-    )>,
-);
-impl ConversionRechecks {
-    pub(crate) fn selected(
-        &self,
-        root: &LeafPath,
-        path: &LeafPath,
-    ) -> Option<&crate::parser::retained::conversion::MatchedDestination> {
-        self.0
-            .binary_search_by(|(candidate, _)| {
-                candidate
-                    .segments()
-                    .iter()
-                    .cmp(root.segments().iter().chain(path.segments()))
-            })
-            .ok()
-            .map(|index| &self.0[index].1)
+impl crate::resource::InsideSecret for LocalPath {
+    fn inside_secret(self) -> Self {
+        Self(self.0.inside_secret())
     }
 }
 
@@ -485,6 +432,7 @@ fn verdict<K: DestinationKind>(
         #[cfg(test)]
             deferred: _,
         matched_destination: _,
+        claim_effect: _,
         conversions: _,
     } = findings;
     match K::local(destination, paths, schema) {
@@ -657,8 +605,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                             crate::parser::retained::ProjectedPhase::plan(proof),
                         ),
                     },
-                )
-                .rechecking(&candidate.obligations.rechecks, &contract.path),
+                ),
                 &mut context.coverage.borrow_mut(),
             )
         }
@@ -678,8 +625,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                             *phase,
                         ),
                     },
-                )
-                .rechecking(&candidate.obligations.rechecks, &contract.path),
+                ),
                 &mut context.coverage.borrow_mut(),
             )
         }
@@ -701,7 +647,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
         });
     }
     if errors.is_empty()
-        && checked.conversions().findings().is_empty()
+        && !checked.rejected_by_claim()
         && context.is_apply()
         && candidate
             .obligations
@@ -714,7 +660,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 .with_attribute(&destination.label),
         }]));
     }
-    if !errors.is_empty() || !checked.conversions().findings().is_empty() {
+    if !errors.is_empty() || checked.rejected_by_claim() {
         return Err(checked_constraints(errors, checked));
     }
     Ok(AssignmentJudgement {

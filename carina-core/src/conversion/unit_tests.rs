@@ -25,7 +25,7 @@ fn location() -> Result<DeclarationLocation, String> {
 
 #[test]
 fn conversion_error_wrappers_render_each_message_once() -> Result<(), String> {
-    use crate::{parser::ParseError, schema::TypeError};
+    use crate::schema::TypeError;
     let location = location()?;
     let mut conversion = ConversionError::new(
         ConversionErrorKind::Source,
@@ -43,73 +43,11 @@ fn conversion_error_wrappers_render_each_message_once() -> Result<(), String> {
             }),
         },
     ))));
-    let wrappers: Vec<Box<dyn Error>> = vec![
-        Box::new(conversion.clone()),
-        Box::new(ParseError::CheckedConversion(conversion.clone())),
-    ];
-    for wrapper in wrappers {
-        let rendered = crate::executor::render_error_chain(wrapper.as_ref());
-        for message in ["conversion-sentinel", "field-sentinel", "cause-sentinel"] {
-            assert_eq!(rendered.matches(message).count(), 1, "{rendered}");
-        }
-        let found = ConversionError::from_error(wrapper.as_ref())
-            .ok_or_else(|| format!("lost typed conversion: {wrapper:?}"))?;
-        assert_eq!(found.kind(), conversion.kind());
-        assert_eq!(found.location(), &location);
+    let rendered = crate::executor::render_error_chain(&conversion);
+    for message in ["conversion-sentinel", "field-sentinel", "cause-sentinel"] {
+        assert_eq!(rendered.matches(message).count(), 1, "{rendered}");
     }
-    Ok(())
-}
-
-#[test]
-fn conversion_aggregate_wrappers_render_each_message_once() -> Result<(), String> {
-    let location = location()?;
-    let mut conversion = ConversionError::new(
-        ConversionErrorKind::Source,
-        &location,
-        "aggregate-conversion-sentinel",
-    );
-    conversion.cause = Some(std::sync::Arc::new(ConversionCause::Destination(Box::new(
-        crate::schema::TypeError::MissingRequired {
-            name: "aggregate-cause-sentinel".into(),
-        },
-    ))));
-    let mut findings = ConversionFindings::default();
-    findings.extend(std::iter::once(conversion.clone()).collect());
-    let wrappers: Vec<Box<dyn Error>> = vec![
-        Box::new(crate::validation::ResourceValidationReport {
-            ordinary: String::new(),
-            conversions: findings,
-        }),
-        Box::new({
-            let mut findings = ConversionFindings::default();
-            findings.extend(std::iter::once(conversion.clone()).collect());
-            crate::validation::ResourceRefTypeValidationError::Validation(
-                crate::validation::ResourceValidationReport {
-                    ordinary: String::new(),
-                    conversions: findings,
-                },
-            )
-        }),
-    ];
-    for wrapper in wrappers {
-        let rendered = crate::executor::render_error_chain(wrapper.as_ref());
-        assert_eq!(
-            rendered.matches("aggregate-conversion-sentinel").count(),
-            1,
-            "{rendered}"
-        );
-        assert_eq!(
-            rendered.matches("aggregate-cause-sentinel").count(),
-            1,
-            "{rendered}"
-        );
-        assert_eq!(
-            ConversionError::from_error(wrapper.as_ref())
-                .ok_or("lost aggregate conversion")?
-                .location(),
-            &location
-        );
-    }
+    assert_eq!(conversion.location(), &location);
     Ok(())
 }
 

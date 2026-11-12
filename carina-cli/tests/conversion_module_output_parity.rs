@@ -43,21 +43,40 @@ impl ProviderFactory for ConversionFactory {
         .unwrap()
     }
     fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+        let name = || {
+            AttributeType::refined_string(
+                Some(TypeIdentity::from_dotted("mock.Name")),
+                None,
+                Some((Some(1), Some(8))),
+                None,
+            )
+        };
         vec![
             ResourceSchema::new("Sink")
+                .attribute(AttributeSchema::optional("attr", name()).build())
                 .attribute(
                     AttributeSchema::optional(
-                        "attr",
+                        "ambiguous",
+                        AttributeType::union(vec![name(), name()]),
+                    )
+                    .build(),
+                )
+                .attribute(AttributeSchema::optional("plain", AttributeType::string()).build())
+                .validate()
+                .unwrap(),
+            ResourceSchema::new("Source")
+                .attribute(
+                    AttributeSchema::optional(
+                        "output",
                         AttributeType::refined_string(
-                            Some(TypeIdentity::from_dotted("mock.Name")),
+                            Some(TypeIdentity::from_dotted("mock.LongName")),
                             None,
-                            Some((Some(1), Some(8))),
+                            Some((Some(20), Some(32))),
                             None,
                         ),
                     )
                     .build(),
                 )
-                .attribute(AttributeSchema::optional("plain", AttributeType::string()).build())
                 .validate()
                 .unwrap(),
         ]
@@ -131,4 +150,173 @@ fn conversion_module_output_cli_and_lsp_use_the_same_admission_and_completion() 
             );
         }
     }
+}
+
+#[test]
+fn conversion_unresolved_roots_do_not_poison_for_and_module_siblings() {
+    #[derive(Debug)]
+    enum Shape {
+        For,
+        Module,
+    }
+    for shape in [Shape::For, Shape::Module] {
+        for sibling_file in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+            let mut source = match shape {
+                Shape::For => {
+                    "for item in ['ok', 'fine'] { mock.Sink { attr = item as mock.Name } }\n"
+                        .to_owned()
+                }
+                Shape::Module => {
+                    std::fs::create_dir(directory.path().join("child")).unwrap();
+                    std::fs::write(
+                        directory.path().join("child/main.crn"),
+                        "arguments { input: String }\nmock.Sink { attr = input as mock.Name }\n",
+                    )
+                    .unwrap();
+                    "let child = use { source = './child' }\nlet one = child { input = 'ok' }\nlet two = child { input = 'fine' }\n".to_owned()
+                }
+            };
+            let unknown = "let unknown = mock.Unknown { plain = 'unrelated' }\n";
+            if sibling_file {
+                std::fs::write(directory.path().join("sibling.crn"), unknown).unwrap();
+            } else {
+                source.push_str(unknown);
+            }
+            std::fs::write(directory.path().join("main.crn"), &source).unwrap();
+            let report = carina_cli::commands::validate::validate_diagnostics_with_factories(
+                &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+                carina_cli::wiring::LoadedProviderFactory::for_test(factories()),
+                HashMap::new(),
+            );
+            let errors = report.json["errors"].as_array().unwrap();
+            assert_eq!(errors.len(), 1, "{shape:?}/{sibling_file}: {}", report.json);
+            assert!(errors[0]["code"].is_null(), "{}", report.json);
+            assert!(
+                errors[0]["message"].as_str().unwrap().contains("Unknown"),
+                "{}",
+                report.json
+            );
+        }
+    }
+}
+
+#[test]
+fn conversion_module_body_kinds_have_one_presented_owner_and_context() {
+    for (body, code) in [
+        ("mock.Sink { attr = 'ok' as String }", "conversion_target"),
+        (
+            "mock.Sink { plain = 'ok' as mock.Name }",
+            "conversion_destination",
+        ),
+        (
+            "mock.Sink { attr = 'toolong-for-slot' as mock.Name }",
+            "conversion_destination",
+        ),
+        (
+            "mock.Sink { attr = 42 as mock.Name }",
+            "conversion_scalar_kind",
+        ),
+        (
+            "mock.Sink { attr = ['ok'] as mock.Name }",
+            "conversion_source",
+        ),
+        (
+            "mock.Sink { ambiguous = 'ok' as mock.Name }",
+            "conversion_ambiguous_destination",
+        ),
+        (
+            "let producer = mock.Source {}\nmock.Sink { attr = producer.output as mock.Name }",
+            "conversion_disjoint",
+        ),
+        ("let abandoned = 'ok' as mock.Name", "conversion_unused"),
+        (
+            "mock.Sink { plain = upper('ok' as mock.Name) }",
+            "conversion_unsupported_position",
+        ),
+        (
+            "let rejected = if 42 as String { 'ok' } else { 'ok' }",
+            "conversion_unsupported_position",
+        ),
+        (
+            r#"mock.Sink { "${'attr' as mock.Name}" = 'ok' }"#,
+            "conversion_unsupported_position",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("child")).unwrap();
+        std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        std::fs::write(
+            directory.path().join("main.crn"),
+            "let child = use { source = './child' }\nlet net = child { unused = 'ok' }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("child/main.crn"),
+            format!("arguments {{ unused: String }}\n{body}\n"),
+        )
+        .unwrap();
+        let report = carina_cli::commands::validate::validate_diagnostics_with_factories(
+            &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+            carina_cli::wiring::LoadedProviderFactory::for_test(factories()),
+            HashMap::new(),
+        );
+        let errors = report.json["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{body}: {}", report.json);
+        assert_eq!(errors[0]["code"], code, "{body}: {}", report.json);
+        assert!(
+            errors[0]["message"].as_str().unwrap().contains("child"),
+            "module context is part of the presented finding: {}",
+            report.json
+        );
+        assert!(
+            errors[0]["location"]["file"]
+                .as_str()
+                .unwrap()
+                .ends_with("child/main.crn"),
+            "{}",
+            report.json
+        );
+    }
+}
+
+#[test]
+fn conversion_root_inventory_survives_an_ordinary_early_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
+    let mut ordinary = Vec::new();
+    for converted in [false, true] {
+        let expression = if converted {
+            "'ok' as mock.Name"
+        } else {
+            "'ok'"
+        };
+        std::fs::write(directory.path().join("main.crn"), format!("provider mock {{}}\nlet abandoned = {expression}\nmock.Sink {{ attr = missing.output }}\n")).unwrap();
+        let report = carina_cli::commands::validate::validate_diagnostics_with_factories(
+            &path,
+            carina_cli::wiring::LoadedProviderFactory::for_test(factories()),
+            HashMap::new(),
+        );
+        let mut conversions = Vec::new();
+        let mut others = Vec::new();
+        for error in report.json["errors"].as_array().unwrap() {
+            if error["code"]
+                .as_str()
+                .is_some_and(|code| code.starts_with("conversion_"))
+            {
+                conversions.push(error);
+            } else {
+                others.push(error.clone());
+            }
+        }
+        assert_eq!(conversions.len(), usize::from(converted), "{}", report.json);
+        if converted {
+            assert_eq!(conversions[0]["code"], "conversion_unused");
+            assert_eq!(conversions[0]["location"]["range"]["start"]["line"], 2);
+        }
+        ordinary.push(others);
+    }
+    assert!(!ordinary[0].is_empty());
+    assert_eq!(ordinary[0], ordinary[1]);
 }

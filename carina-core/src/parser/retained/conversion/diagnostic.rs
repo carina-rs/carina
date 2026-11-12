@@ -51,24 +51,15 @@ impl ConversionErrorKind {
 enum ConversionCause {
     Validation(crate::parser::CustomTypeValidationError),
     TypeResolution(crate::static_type::StaticTypeResolutionError),
-    Parse(ParseCause),
     Destination(Box<crate::schema::TypeError>),
     Evidence(crate::parser::retained::MissingEvidence),
 }
 
-#[derive(Clone)]
-struct ParseCause(std::sync::Arc<crate::parser::ParseError>);
-impl PartialEq for ParseCause {
-    fn eq(&self, other: &Self) -> bool {
-        std::sync::Arc::ptr_eq(&self.0, &other.0)
-    }
-}
 impl ConversionCause {
     fn error(&self) -> &(dyn std::error::Error + 'static) {
         match self {
             Self::Validation(error) => error,
             Self::TypeResolution(error) => error,
-            Self::Parse(error) => error.0.as_ref(),
             Self::Destination(error) => error.as_ref(),
             Self::Evidence(error) => error,
         }
@@ -78,11 +69,11 @@ impl ConversionCause {
 /// A located, structured error; it holds no runtime value or admission receipt.
 /// Only conversion policy, completion, and conversion parsing can construct one.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0624
 /// use carina_core::ConversionError;
 /// let error = ConversionError::new(unreachable!(), unreachable!(), "forged");
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::{ConversionError, schema::TypeError};
 /// fn ordinary(error: ConversionError, errors: &mut Vec<TypeError>) {
 ///     errors.push(error.into());
@@ -95,6 +86,7 @@ pub struct ConversionError(std::sync::Arc<ConversionErrorData>);
 #[derive(Clone, PartialEq)]
 pub struct ConversionErrorData {
     kind: ConversionErrorKind,
+    subject: crate::validation::FindingSubject,
     owner: Option<crate::parser::retained::NodeId>,
     location: DeclarationLocation,
     message: String,
@@ -133,53 +125,21 @@ impl std::error::Error for ConversionError {
     }
 }
 impl ConversionError {
+    pub(crate) fn subject(&self) -> &crate::validation::FindingSubject {
+        &self.subject
+    }
+    pub(crate) fn in_subject(mut self, subject: crate::validation::FindingSubject) -> Self {
+        if self.subject == crate::validation::FindingSubject::Root {
+            self.subject = subject;
+        }
+        self
+    }
     pub(super) fn owned_by(mut self, node: crate::parser::retained::NodeId) -> Self {
         self.owner = Some(node);
         self
     }
     pub fn owner(&self) -> Option<crate::parser::retained::NodeId> {
         self.owner
-    }
-    pub fn from_error<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a Self> {
-        let mut current = Some(error);
-        while let Some(error) = current {
-            if let Some(conversion) = error.downcast_ref::<Self>() {
-                return Some(conversion);
-            }
-            // Terminal diagnostics embed their causes in Display; transparent
-            // wrappers delegate source() past the wrapped ConversionError.
-            // Their typed accessors preserve metadata without rendering twice.
-            let conversion = error
-                .downcast_ref::<crate::parser::ParseError>()
-                .and_then(crate::parser::ParseError::conversion_error)
-                .or_else(|| {
-                    error
-                        .downcast_ref::<crate::validation::ResourceRefTypeValidationError>()
-                        .and_then(
-                            crate::validation::ResourceRefTypeValidationError::conversion_error,
-                        )
-                })
-                .or_else(|| {
-                    error
-                        .downcast_ref::<crate::validation::ResourceAdmissionFinding>()
-                        .and_then(crate::validation::ResourceAdmissionFinding::conversion_error)
-                })
-                .or_else(|| {
-                    error
-                        .downcast_ref::<crate::validation::ResourceValidationReport>()
-                        .and_then(|report| report.conversions().findings().first())
-                })
-                .or_else(|| {
-                    error
-                        .downcast_ref::<crate::validation::admission::AdmissionErrors>()
-                        .and_then(crate::validation::admission::AdmissionErrors::conversion_error)
-                });
-            if conversion.is_some() {
-                return conversion;
-            }
-            current = error.source();
-        }
-        None
     }
     pub fn kind(&self) -> ConversionErrorKind {
         self.kind
@@ -194,6 +154,7 @@ impl ConversionError {
     ) -> Self {
         Self(std::sync::Arc::new(ConversionErrorData {
             kind,
+            subject: Default::default(),
             owner: None,
             location: location.clone(),
             message: message.into(),
@@ -206,34 +167,6 @@ impl ConversionError {
     ) -> Self {
         self.cause = Some(std::sync::Arc::new(ConversionCause::Evidence(evidence)));
         self
-    }
-    pub(super) fn parse_failure(
-        kind: ConversionErrorKind,
-        location: &DeclarationLocation,
-        node: crate::parser::retained::NodeId,
-        cause: crate::parser::ParseError,
-    ) -> Self {
-        let mut error = Self::new(
-            kind,
-            location,
-            match kind {
-                ConversionErrorKind::UnsupportedPosition => {
-                    "conversion is not supported inside this expression"
-                }
-                ConversionErrorKind::Source => "conversion operand could not be evaluated",
-                ConversionErrorKind::Destination
-                | ConversionErrorKind::AmbiguousDestination
-                | ConversionErrorKind::Unused
-                | ConversionErrorKind::Target
-                | ConversionErrorKind::ScalarKind
-                | ConversionErrorKind::Disjoint => "checked conversion failed",
-            },
-        )
-        .owned_by(node);
-        error.cause = Some(std::sync::Arc::new(ConversionCause::Parse(ParseCause(
-            std::sync::Arc::new(cause),
-        ))));
-        error
     }
     pub(super) fn destination(
         location: &DeclarationLocation,
@@ -287,11 +220,6 @@ impl InsideSecret for ConversionError {
                     ConversionCause::Validation(error.inside_secret())
                 }
                 error @ ConversionCause::TypeResolution(_) => error,
-                ConversionCause::Parse(_) => ConversionCause::Parse(ParseCause(
-                    std::sync::Arc::new(crate::parser::ParseError::InsideSecret {
-                        line: self.location.span().start_line(),
-                    }),
-                )),
                 ConversionCause::Destination(error) => {
                     ConversionCause::Destination(error.inside_secret())
                 }
@@ -308,8 +236,8 @@ impl InsideSecret for ConversionError {
 
 /// Structured aggregate diagnostics; conversions keep their authored owner and
 /// range through CLI validation and the typed findings accessor.
-#[derive(Debug, Default)]
-pub struct ConversionFindings {
+#[derive(Default)]
+pub(crate) struct ConversionFindings {
     findings: Vec<ConversionError>,
     owners: std::collections::HashSet<crate::parser::retained::NodeId>,
 }
@@ -322,9 +250,6 @@ impl ConversionFindings {
             }
         }
     }
-    pub fn findings(&self) -> &[ConversionError] {
-        &self.findings
-    }
     pub fn into_findings(self) -> Vec<ConversionError> {
         self.findings
     }
@@ -332,8 +257,8 @@ impl ConversionFindings {
 
 /// Uncollected conversion output from one walk or completeness report. It
 /// cannot carry an ordinary error and does not deduplicate per-use evidence.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ConversionChannel {
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct ConversionChannel {
     // Empty successful walks allocate nothing, and every cached findings value
     // carries only this pointer rather than another inline Vec.
     findings: Option<Box<ConversionChannelData>>,
@@ -343,12 +268,18 @@ struct ConversionChannelData {
     findings: Vec<ConversionError>,
 }
 impl ConversionChannel {
+    pub(crate) fn in_subject(self, subject: crate::validation::FindingSubject) -> Self {
+        self.into_findings()
+            .into_iter()
+            .map(|error| error.in_subject(subject.clone()))
+            .collect()
+    }
     pub fn findings(&self) -> &[ConversionError] {
         self.findings
             .as_deref()
             .map_or(&[], |data| data.findings.as_slice())
     }
-    fn into_findings(self) -> Vec<ConversionError> {
+    pub(crate) fn into_findings(self) -> Vec<ConversionError> {
         self.findings.map_or_else(Vec::new, |data| data.findings)
     }
     pub(crate) fn append(&mut self, other: Self) {
@@ -373,29 +304,6 @@ impl InsideSecret for ConversionChannel {
         self.into_findings().inside_secret().into_iter().collect()
     }
 }
-fn fmt_conversions(
-    findings: &[ConversionError],
-    f: &mut std::fmt::Formatter<'_>,
-) -> std::fmt::Result {
-    for (index, error) in findings.iter().enumerate() {
-        if index != 0 {
-            writeln!(f)?;
-        }
-        write!(f, "{}", error.diagnostic())?;
-    }
-    Ok(())
-}
-impl std::fmt::Display for ConversionChannel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fmt_conversions(self.findings(), f)
-    }
-}
-impl std::fmt::Display for ConversionFindings {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fmt_conversions(self.findings(), f)
-    }
-}
-
 pub(super) fn resolve_target(
     path: &ConversionTypePath,
     location: &DeclarationLocation,
@@ -603,3 +511,18 @@ impl DeclarationBounds {
 #[cfg(test)]
 #[path = "../../../conversion/unit_tests.rs"]
 mod unit_tests;
+
+impl std::fmt::Debug for ConversionChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConversionChannel")
+            .field("count", &self.findings().len())
+            .finish()
+    }
+}
+impl std::fmt::Debug for ConversionFindings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConversionFindings")
+            .field("count", &self.findings.len())
+            .finish()
+    }
+}

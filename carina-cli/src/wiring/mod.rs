@@ -3403,7 +3403,7 @@ pub(crate) fn resource_admission_report_with_ctx<
     ) {
         Ok(findings) => findings
             .into_iter()
-            .map(|finding| AppError::ResourceAdmission(Box::new(finding)))
+            .map(|finding| AppError::from_presented(finding, |never| match never {}))
             .collect(),
         Err(error) => {
             vec![AppError::AnalysisInvariant(error)]
@@ -3411,6 +3411,34 @@ pub(crate) fn resource_admission_report_with_ctx<
     };
     errors.extend(sink.errors);
     (errors, sink.warnings)
+}
+
+pub(crate) fn resource_admission_report_in_run<
+    E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
+    B: BindingAddress,
+    D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+>(
+    ctx: &WiringContext,
+    judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    bindings: &carina_core::binding_index::BindingIndex<'_, B>,
+    run: &mut validation::ConversionValidation<AppError>,
+) -> Vec<carina_core::parser::ParseWarning> {
+    let mut sink = ValidationReportSink {
+        errors: Vec::new(),
+        warnings: Vec::new(),
+    };
+    if let Err(error) = validation::resource_admission_findings_in(
+        run,
+        judged,
+        bindings,
+        ctx.known_providers(),
+        &mut sink,
+        validation::FindingSubject::Root,
+    ) {
+        run.push(AppError::AnalysisInvariant(error));
+    }
+    run.extend(sink.errors);
+    sink.warnings
 }
 
 /// Surface `directives.depends_on` analysis-pass error diagnostics as
@@ -4990,8 +5018,8 @@ pub(crate) fn validate_module_internal_ref_types(
     module_walk: &ModuleWalk,
     config: &ValidationProviderCatalog<'_>,
     warnings: &mut Vec<carina_core::parser::ParseWarning>,
-) -> Vec<AppError> {
-    let mut errors = Vec::new();
+    errors: &mut validation::ConversionValidation<AppError>,
+) {
     for module in module_walk.iter() {
         let mut parsed = module.loaded().parsed.clone();
         let prefix = module.diagnostic_label().to_string();
@@ -5043,12 +5071,14 @@ pub(crate) fn validate_module_internal_ref_types(
             errors: Vec::new(),
             warnings: Vec::new(),
         };
-        match validation::resource_reference_findings(configuration.judged(), &bindings, &mut sink)
-        {
-            Ok(findings) => errors.extend(findings.into_iter().map(|finding| {
-                AppError::ResourceAdmission(Box::new(finding.with_context(&prefix)))
-            })),
-            Err(error) => errors.push(AppError::AnalysisInvariant(error)),
+        if let Err(error) = validation::resource_reference_findings_in(
+            errors,
+            configuration.judged(),
+            &bindings,
+            &mut sink,
+            validation::FindingSubject::Module(prefix.clone()),
+        ) {
+            errors.push(AppError::AnalysisInvariant(error));
         }
         errors.extend(sink.errors);
         warnings.extend(sink.warnings);
@@ -5073,7 +5103,6 @@ pub(crate) fn validate_module_internal_ref_types(
             }
         }
     }
-    errors
 }
 
 /// Reject providers in every recursively loaded module and preserve each

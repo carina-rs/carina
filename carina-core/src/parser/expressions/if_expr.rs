@@ -231,12 +231,21 @@ pub(crate) fn parse_if_expr(
             &condition_value,
             condition_source,
         );
-    let decision = decide_if_condition(&condition_value, ctx.config).map_err(|error| {
-        ctx.conversion_boundary_error(&condition_token, error.into_parse_error(condition_line))
-    })?;
-    if let Some(selected) = decision {
-        ctx.record_selected_condition(&condition_token, selected);
-    }
+    let decision = match decide_if_condition(&condition_value, ctx.config) {
+        Ok(decision) => {
+            if let Some(selected) = decision {
+                ctx.record_selected_condition(&condition_token, selected);
+            }
+            decision
+        }
+        Err(error) => {
+            if ctx.reject_conversion_boundary(&condition_token) {
+                Some(true)
+            } else {
+                return Err(error.into_parse_error(condition_line));
+            }
+        }
+    };
     let if_body = classify_if_body(next_pair(&mut inner, "if body", "if expression")?)?;
     let else_body = inner
         .next()
@@ -510,12 +519,21 @@ pub(crate) fn parse_if_value_expr_with_mode(
             &condition_value,
             condition_source,
         );
-    let decision = decide_if_condition(&condition_value, ctx.config).map_err(|error| {
-        ctx.conversion_boundary_error(&condition_token, error.into_parse_error(condition_line))
-    })?;
-    if let Some(selected) = decision {
-        ctx.record_selected_condition(&condition_token, selected);
-    }
+    let decision = match decide_if_condition(&condition_value, ctx.config) {
+        Ok(decision) => {
+            if let Some(selected) = decision {
+                ctx.record_selected_condition(&condition_token, selected);
+            }
+            decision
+        }
+        Err(error) => {
+            if ctx.reject_conversion_boundary(&condition_token) {
+                Some(true)
+            } else {
+                return Err(error.into_parse_error(condition_line));
+            }
+        }
+    };
 
     let if_body = classify_if_body(next_pair(&mut inner, "if body", "if value expression")?)?;
     let else_body = inner

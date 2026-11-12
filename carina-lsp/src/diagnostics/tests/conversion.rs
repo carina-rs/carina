@@ -118,7 +118,7 @@ fn conversion_lsp_parse_rejection_keeps_the_convert_range_and_cause() {
             .validate()
             .unwrap(),
     );
-    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas.clone()), vec!["mock".into()]);
     let document = create_document_at(source, path.clone());
     let diagnostics = engine.analyze(&document, Some(&path));
     let errors = diagnostics
@@ -137,9 +137,25 @@ fn conversion_lsp_parse_rejection_keeps_the_convert_range_and_cause() {
         &path,
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
-    .unwrap_err();
-    let conversion = carina_core::ConversionError::from_error(&parsed).unwrap();
-    assert_eq!(errors[0].message, conversion.diagnostic_message());
+    .unwrap();
+    let catalog =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let configuration =
+        carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let presented = carina_core::validation::ConversionValidation::<std::convert::Infallible>::new(
+        configuration.judged().report(),
+    )
+    .complete()
+    .into_presented();
+    let conversions = presented
+        .iter()
+        .filter_map(|finding| match finding {
+            carina_core::validation::PresentedFinding::Conversion(finding) => Some(finding),
+            carina_core::validation::PresentedFinding::Ordinary(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(conversions.len(), 1);
+    assert_eq!(errors[0].message, conversions[0].message());
 }
 
 #[test]
@@ -231,7 +247,7 @@ fn conversion_report_fallback_keeps_ordinary_diagnostics_in_current_and_sibling_
         ResourceAttributeInputs, resource_attribute_admissions,
         unrendered_resource_conversion_admissions,
     };
-    use carina_core::{binding_index::BindingIndex, parser::retained::ConversionValidation};
+    use carina_core::{binding_index::BindingIndex, validation::ConversionValidation};
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
@@ -266,9 +282,9 @@ fn conversion_report_fallback_keeps_ordinary_diagnostics_in_current_and_sibling_
                 |_, _| {},
             );
             let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
-            let mut validation = ConversionValidation::new(judged.report());
+            let mut validation: ConversionValidation = ConversionValidation::new(judged.report());
             carina_core::validation::deferred_types::with_session_for_test(&catalog, |session| {
-                let mut findings = validation.walk(|coverage| {
+                let findings = validation.walk(|coverage| {
                     resource_attribute_admissions(
                         resource,
                         judged.file(),
@@ -289,7 +305,6 @@ fn conversion_report_fallback_keeps_ordinary_diagnostics_in_current_and_sibling_
                         .map(ToString::to_string)
                         .collect::<Vec<_>>(),
                 );
-                validation.record(findings.take_conversions());
                 if file == "sibling.crn" {
                     // Missing owner in the unrendered report exercises the same
                     // fallback as a sibling omitted from the buffer's tree.
@@ -299,7 +314,7 @@ fn conversion_report_fallback_keeps_ordinary_diagnostics_in_current_and_sibling_
                     let empty_configuration = carina_core::config_loader::load_buffer_configuration(
                         &empty, &schemas, &catalog,
                     );
-                    let missing = validation.walk(|coverage| {
+                    validation.walk(|coverage| {
                         unrendered_resource_conversion_admissions(
                             resource,
                             empty_configuration.judged(),
@@ -308,19 +323,25 @@ fn conversion_report_fallback_keeps_ordinary_diagnostics_in_current_and_sibling_
                             coverage,
                         )
                     });
-                    validation.record(missing);
                 }
             });
-            let conversions = validation.complete();
+            let presented = validation.complete().into_presented();
+            let conversions = presented
+                .iter()
+                .filter_map(|finding| match finding {
+                    carina_core::validation::PresentedFinding::Conversion(finding) => Some(finding),
+                    carina_core::validation::PresentedFinding::Ordinary(_) => None,
+                })
+                .collect::<Vec<_>>();
             assert_eq!(
-                conversions.findings().len(),
+                conversions.as_slice().len(),
                 usize::from(converted),
-                "{conversions}"
+                "{conversions:?}"
             );
             if converted {
-                let error = &conversions.findings()[0];
+                let error = &conversions.as_slice()[0];
                 assert_eq!(
-                    error.kind(),
+                    error.error().kind(),
                     carina_core::ConversionErrorKind::UnsupportedPosition
                 );
                 let document = create_document_at(&source, path.clone());
@@ -330,7 +351,7 @@ fn conversion_report_fallback_keeps_ordinary_diagnostics_in_current_and_sibling_
                     &view,
                     &located,
                     DiagnosticSeverity::ERROR,
-                    error.diagnostic_message(),
+                    error.message().to_owned(),
                 )
                 .unwrap();
                 assert_eq!(

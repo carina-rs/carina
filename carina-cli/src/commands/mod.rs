@@ -455,7 +455,7 @@ impl ResolvedConfig {
 }
 
 fn extend_binding_use_errors(
-    errors: &mut Vec<AppError>,
+    errors: &mut impl Extend<AppError>,
     report: &carina_core::validation::BindingUseReport,
 ) {
     errors.extend(
@@ -467,7 +467,7 @@ fn extend_binding_use_errors(
 }
 
 fn extend_module_call_errors(
-    errors: &mut Vec<AppError>,
+    errors: &mut impl Extend<AppError>,
     findings: Vec<carina_core::validation::ModuleCallFinding>,
 ) {
     errors.extend(
@@ -478,18 +478,18 @@ fn extend_module_call_errors(
 }
 
 fn extend_module_resolution_errors(
-    errors: &mut Vec<AppError>,
+    errors: &mut impl Extend<AppError>,
     residuals: Vec<carina_core::module_resolver::ResidualModuleResolutionError>,
     base_dir: &ResolvedPath,
 ) {
     for residual in residuals {
         if let Some(error) = residual.analysis_invariant() {
-            errors.push(AppError::AnalysisInvariant(error.clone()));
+            errors.extend([AppError::AnalysisInvariant(error.clone())]);
             continue;
         }
-        errors.push(AppError::ModuleResolution(Box::new(
+        errors.extend([AppError::ModuleResolution(Box::new(
             crate::error::ModuleResolutionFailure::new(residual, base_dir.clone()),
-        )));
+        ))]);
     }
 }
 
@@ -506,7 +506,7 @@ pub(crate) fn validate_root_backend<E>(parsed: &carina_core::parser::File<E>) ->
 }
 
 fn extend_expanded_binding_use_errors<P: carina_core::resource::PlaceholderKind>(
-    errors: &mut Vec<AppError>,
+    errors: &mut impl Extend<AppError>,
     report: &carina_core::validation::BindingUseReport,
     compositions: &[carina_core::resource::LiveComposition<
         P,
@@ -594,6 +594,8 @@ pub(crate) fn validate_and_resolve_report_inner(
         &parsed,
         enriched_context,
     );
+    let mut validation =
+        carina_core::validation::ConversionValidation::<AppError>::for_directory(&parsed);
     let result = validate_and_resolve_configuration(
         access,
         parsed,
@@ -606,13 +608,29 @@ pub(crate) fn validate_and_resolve_report_inner(
         name_resolution,
         &mut authored_inputs,
         &mut warnings,
+        &mut validation,
     );
+    let errors = validation
+        .complete()
+        .into_presented()
+        .into_iter()
+        .map(|finding| AppError::from_presented(finding, |error| error))
+        .collect::<Vec<_>>();
+    let result = match result {
+        Ok(config) => match NonEmptyValidationErrors::try_from(errors) {
+            Ok(errors) => Err(errors),
+            Err(_empty) => Ok(config),
+        },
+        Err(ValidationStopped) => Err(non_empty_validation_failure(errors)),
+    };
     ConfigurationValidation {
         result,
         authored_inputs,
         warnings,
     }
 }
+
+struct ValidationStopped;
 
 #[allow(clippy::too_many_arguments)]
 fn validate_and_resolve_configuration(
@@ -627,7 +645,8 @@ fn validate_and_resolve_configuration(
     name_resolution: ConfigNameResolution,
     authored_inputs: &mut carina_core::input_rules::AuthoredInputs,
     warnings: &mut Vec<ConfigurationWarning>,
-) -> Result<ResolvedConfig, NonEmptyValidationErrors> {
+    validation: &mut carina_core::validation::ConversionValidation<AppError>,
+) -> Result<ResolvedConfig, ValidationStopped> {
     let initial_warning_count = parsed.warnings.len();
     let resolved_base = base_dir.clone();
     let base_dir = &resolved_base;
@@ -635,14 +654,14 @@ fn validate_and_resolve_configuration(
     // resource-validation preference. Keep the recursive module snapshots
     // available even on destroy/state recovery paths; the later optional
     // policy checks remain gated by `skip_resource_validation`.
-    let module_walk = ModuleWalk::load(
+    let module_walk = ModuleWalk::load_with_context(
         parsed.parsed(),
         base_dir,
-        &enriched_context.catalog().environment,
+        enriched_context.catalog(),
         ctx.schemas(),
     );
 
-    let mut errors: Vec<AppError> = Vec::new();
+    let errors = validation;
     if !skip_resource_validation {
         errors.extend(
             carina_core::parser::check_identifier_scope(parsed.parsed())
@@ -659,7 +678,7 @@ fn validate_and_resolve_configuration(
             ),
             Err(error) => {
                 errors.push(AppError::AnalysisInvariant(error));
-                return Err(non_empty_validation_failure(errors));
+                return Err(ValidationStopped);
             }
         }
     }
@@ -679,7 +698,7 @@ fn validate_and_resolve_configuration(
             Ok(checked) => checked,
             Err(error) => {
                 errors.push(AppError::AnalysisInvariant(error));
-                return Err(non_empty_validation_failure(errors));
+                return Err(ValidationStopped);
             }
         };
         errors.extend(
@@ -722,7 +741,7 @@ fn validate_and_resolve_configuration(
         Ok(report) => report,
         Err(error) => {
             errors.push(AppError::AnalysisInvariant(error));
-            return Err(non_empty_validation_failure(errors));
+            return Err(ValidationStopped);
         }
     };
     let resolved_argument_types = type_resolution.resolved_argument_types().clone();
@@ -730,7 +749,7 @@ fn validate_and_resolve_configuration(
         root_type_resolution_findings
             .push(carina_core::validation::ModuleCallFinding::from_type_resolution(diagnostic));
     }
-    extend_module_call_errors(&mut errors, root_type_resolution_findings);
+    extend_module_call_errors(errors, root_type_resolution_findings);
     let configuration = carina_core::config_loader::load_buffer_configuration(
         parsed.parsed(),
         ctx.schemas(),
@@ -749,12 +768,13 @@ fn validate_and_resolve_configuration(
     }
     if !skip_resource_validation {
         let mut module_warnings = Vec::new();
-        errors.extend(validate_module_internal_ref_types(
+        validate_module_internal_ref_types(
             ctx,
             &module_walk,
             enriched_context,
             &mut module_warnings,
-        ));
+            errors,
+        );
         warnings.extend(
             module_warnings
                 .into_iter()
@@ -784,7 +804,7 @@ fn validate_and_resolve_configuration(
     let binding_use_report = carina_core::validation::check_bare_binding_uses(
         &enriched_context.type_context(binding_configuration.judged(), &imported_module_signatures),
     );
-    extend_binding_use_errors(&mut errors, &binding_use_report);
+    extend_binding_use_errors(errors, &binding_use_report);
     for module in module_walk.iter() {
         let module_parsed = &module.loaded().parsed;
         let module_signatures = module_resolver::load_resolved_module_signatures(
@@ -800,7 +820,7 @@ fn validate_and_resolve_configuration(
         let report = carina_core::validation::check_bare_binding_uses(
             &enriched_context.type_context(configuration.judged(), &module_signatures),
         );
-        extend_binding_use_errors(&mut errors, &report);
+        extend_binding_use_errors(errors, &report);
     }
 
     let authored_module_call_findings = {
@@ -830,7 +850,7 @@ fn validate_and_resolve_configuration(
         Ok(findings) => findings,
         Err(error) => {
             errors.push(AppError::AnalysisInvariant(error));
-            return Err(non_empty_validation_failure(errors));
+            return Err(ValidationStopped);
         }
     };
 
@@ -882,28 +902,30 @@ fn validate_and_resolve_configuration(
                 Err(error) => errors.push(AppError::AnalysisInvariant(error)),
             }
         }
-        extend_module_call_errors(&mut errors, authored_module_call_findings);
-        return Err(non_empty_validation_failure(errors));
+        extend_module_call_errors(errors, authored_module_call_findings);
+        return Err(ValidationStopped);
     }
 
-    let module_resolution = module_resolver::resolve_modules_with_diagnostics(
+    let module_resolution = module_resolver::resolve_modules_with_diagnostics_from_loaded_modules(
         &parsed,
         base_dir,
         enriched_context,
         ctx.schemas(),
         &authored_module_call_findings,
+        module_walk.iter().map(|module| module.loaded()),
     );
     let mut parsed = match module_resolution {
         module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
             *authored_inputs = graph
                 .authored_inputs()
                 .map_err(|error| {
-                    non_empty_validation_failure(vec![AppError::Provider(error.into())])
+                    errors.push(AppError::Provider(error.into()));
+                    ValidationStopped
                 })?
                 .clone();
-            extend_module_call_errors(&mut errors, authored_module_call_findings);
+            extend_module_call_errors(errors, authored_module_call_findings);
             if !errors.is_empty() {
-                return Err(non_empty_validation_failure(errors));
+                return Err(ValidationStopped);
             }
             *graph
         }
@@ -916,7 +938,7 @@ fn validate_and_resolve_configuration(
                 constraint_findings,
             ]);
             let has_uncovered_residual = !residuals.is_empty();
-            extend_module_call_errors(&mut errors, findings);
+            extend_module_call_errors(errors, findings);
             if has_uncovered_residual {
                 errors.extend(validate_module_attribute_refs_after_expansion_failure(
                     ctx,
@@ -924,13 +946,13 @@ fn validate_and_resolve_configuration(
                     enriched_context,
                 ));
             }
-            extend_module_resolution_errors(&mut errors, residuals, base_dir);
-            return Err(non_empty_validation_failure(errors));
+            extend_module_resolution_errors(errors, residuals, base_dir);
+            return Err(ValidationStopped);
         }
         module_resolver::ModuleResolutionDiagnosticResult::Unowned { errors: residuals } => {
             let findings = authored_module_call_findings;
             let has_uncovered_residual = !residuals.is_empty();
-            extend_module_call_errors(&mut errors, findings);
+            extend_module_call_errors(errors, findings);
             if has_uncovered_residual {
                 errors.extend(validate_module_attribute_refs_after_expansion_failure(
                     ctx,
@@ -938,8 +960,8 @@ fn validate_and_resolve_configuration(
                     enriched_context,
                 ));
             }
-            extend_module_resolution_errors(&mut errors, residuals, base_dir);
-            return Err(non_empty_validation_failure(errors));
+            extend_module_resolution_errors(errors, residuals, base_dir);
+            return Err(ValidationStopped);
         }
     };
 
@@ -965,11 +987,11 @@ fn validate_and_resolve_configuration(
             "Provider attribute resolution error: {}",
             e
         )));
-        return Err(non_empty_validation_failure(errors));
+        return Err(ValidationStopped);
     }
     if let Err(e) = carina_core::parser::finalize_provider_configs(&mut parsed) {
         errors.push(AppError::Config(format!("Finalize error: {}", e)));
-        return Err(non_empty_validation_failure(errors));
+        return Err(ValidationStopped);
     }
 
     // Expansion carries module-internal side data in parallel with each
@@ -985,15 +1007,15 @@ fn validate_and_resolve_configuration(
     let binding_use_report = carina_core::validation::check_expanded_bare_binding_uses(
         &enriched_context.type_context(configuration.judged(), &imported_module_signatures),
     );
-    extend_binding_use_errors(&mut errors, &binding_use_report);
+    extend_binding_use_errors(errors, &binding_use_report);
     extend_expanded_binding_use_errors(
-        &mut errors,
+        errors,
         &binding_use_report,
         &parsed.compositions,
         enriched_context.catalog(),
     );
     if !binding_use_report.is_ready() {
-        return Err(non_empty_validation_failure(errors));
+        return Err(ValidationStopped);
     }
 
     // Resolve names (let bindings -> resource names) — must succeed
@@ -1004,7 +1026,7 @@ fn validate_and_resolve_configuration(
             let name_errors = resolve_file_names_with_ctx(ctx, &mut parsed);
             if !name_errors.is_empty() {
                 errors.extend(name_errors);
-                return Err(non_empty_validation_failure(errors));
+                return Err(ValidationStopped);
             }
             ResolvedConfig::Evaluated {
                 parsed: Box::new(parsed),
@@ -1017,7 +1039,7 @@ fn validate_and_resolve_configuration(
                 },
                 Err(name_errors) => {
                     errors.extend(name_errors);
-                    return Err(non_empty_validation_failure(errors));
+                    return Err(ValidationStopped);
                 }
             }
         }
@@ -1051,7 +1073,7 @@ fn validate_and_resolve_configuration(
     }
     if let Err(leftovers) = parsed.validate_expansion_boundary(placeholder_boundary) {
         errors.extend(leftovers.into_errors().into_iter().map(AppError::from));
-        return Err(non_empty_validation_failure(errors));
+        return Err(ValidationStopped);
     }
 
     let expanded_analysis = if !skip_resource_validation {
@@ -1059,7 +1081,7 @@ fn validate_and_resolve_configuration(
             Ok(tree) => tree,
             Err(error) => {
                 errors.push(AppError::AnalysisInvariant(error));
-                return Err(non_empty_validation_failure(errors));
+                return Err(ValidationStopped);
             }
         };
 
@@ -1077,7 +1099,7 @@ fn validate_and_resolve_configuration(
             Ok(resolved) => resolved,
             Err(error) => {
                 errors.push(AppError::AnalysisInvariant(error));
-                return Err(non_empty_validation_failure(errors));
+                return Err(ValidationStopped);
             }
         }
     } else {
@@ -1131,7 +1153,7 @@ fn validate_and_resolve_configuration(
         // Expansion-only boundary checks consume the final composition graph
         // without reloading the authored module walk.
         extend_module_call_errors(
-            &mut errors,
+            errors,
             carina_core::validation::check_expanded_module_calls(
                 carina_core::validation::ExpandedModuleCallCheckInput::References {
                     compositions: &parsed.compositions,
@@ -1145,13 +1167,12 @@ fn validate_and_resolve_configuration(
             ctx.schemas(),
             enriched_context.catalog(),
         );
-        let (admission_errors, admission_warnings) =
-            crate::wiring::resource_admission_report_with_ctx(
-                ctx,
-                configuration.judged(),
-                &bindings,
-            );
-        errors.extend(admission_errors);
+        let admission_warnings = crate::wiring::resource_admission_report_in_run(
+            ctx,
+            configuration.judged(),
+            &bindings,
+            errors,
+        );
         warnings.extend(
             admission_warnings
                 .into_iter()
@@ -1190,7 +1211,7 @@ fn validate_and_resolve_configuration(
             );
         }
         if !errors.is_empty() {
-            return Err(non_empty_validation_failure(errors));
+            return Err(ValidationStopped);
         }
     }
 
@@ -1219,7 +1240,7 @@ fn validate_and_resolve_configuration(
     // Downstream plan code assumes every resource has a stable id, so any
     // identity or move-target error must stop the pipeline here.
     if !errors.is_empty() {
-        return Err(non_empty_validation_failure(errors));
+        return Err(ValidationStopped);
     }
 
     // Reject references to `upstream_state` fields that the upstream's
@@ -1236,7 +1257,7 @@ fn validate_and_resolve_configuration(
             Ok(tree) => tree,
             Err(error) => {
                 errors.push(AppError::AnalysisInvariant(error));
-                return Err(non_empty_validation_failure(errors));
+                return Err(ValidationStopped);
             }
         };
         let field_errors =
@@ -1288,9 +1309,10 @@ fn validate_and_resolve_configuration(
         );
     }
 
-    match NonEmptyValidationErrors::try_from(errors) {
-        Ok(errors) => Err(errors),
-        Err(_empty) => Ok(resolved_config),
+    if errors.is_empty() {
+        Ok(resolved_config)
+    } else {
+        Err(ValidationStopped)
     }
 }
 
@@ -1319,17 +1341,20 @@ impl ValidationMessages for String {
         self.as_str().validation_errors()
     }
 }
-impl ValidationMessages for carina_core::validation::ResourceValidationReport {
+impl ValidationMessages for carina_core::validation::PresentedFindings {
     fn validation_errors(&self) -> Vec<AppError> {
-        let mut errors = self.ordinary().validation_errors();
-        errors.extend(
-            self.conversions()
-                .findings()
-                .iter()
-                .cloned()
-                .map(|error| AppError::ResourceAdmission(Box::new(error.into()))),
-        );
-        errors
+        use carina_core::validation::{OrdinaryFinding, PresentedFinding};
+        self.iter()
+            .flat_map(|finding| match finding {
+                PresentedFinding::Ordinary(OrdinaryFinding::Resource(finding)) => {
+                    finding.to_string().validation_errors()
+                }
+                PresentedFinding::Ordinary(OrdinaryFinding::Client(never)) => match **never {},
+                PresentedFinding::Conversion(finding) => {
+                    vec![AppError::PresentedConversion(Box::new(finding.clone()))]
+                }
+            })
+            .collect()
     }
 }
 pub(crate) fn split_validation_message(

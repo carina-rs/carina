@@ -1690,7 +1690,8 @@ pub(crate) fn parse_expression_eval(
         .evaluate(|| {
             let syntax = pair.clone();
             let inner = first_inner(pair, "expression body", "expression")?;
-            let value = parse_coalesce_expr(inner, ctx)?;
+            let value =
+                ctx.recover_converted_evaluation(&syntax, parse_coalesce_expr(inner, ctx))?;
             ctx.record_retained_eval(&syntax, &value);
             Ok(value)
         })
@@ -1707,7 +1708,10 @@ pub(crate) fn parse_expression_eval_with_mode(
         .evaluate(|| {
             let syntax = pair.clone();
             let inner = first_inner(pair, "expression body", "expression")?;
-            let value = parse_coalesce_expr_with_mode(inner, ctx, mode)?;
+            let value = ctx.recover_converted_evaluation(
+                &syntax,
+                parse_coalesce_expr_with_mode(inner, ctx, mode),
+            )?;
             ctx.record_retained_eval(&syntax, &value);
             Ok(value)
         })

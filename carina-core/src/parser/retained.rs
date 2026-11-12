@@ -18,6 +18,8 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 #[cfg(test)]
 mod conversion_tests;
 #[cfg(test)]
+mod review_round2_tests;
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]
@@ -49,9 +51,9 @@ fn record_projection_copy(value: &Value<ParserPlaceholder, RelativeBindingName>)
 }
 
 pub(crate) mod conversion;
+pub use conversion::ConversionJudgement;
 pub(crate) use conversion::ConversionVerdict;
 pub(crate) use conversion::check as check_conversion;
-pub use conversion::{ConversionJudgement, ConversionValidation, MatchedConversionSource};
 
 mod cursor;
 pub use cursor::{
@@ -288,9 +290,18 @@ struct AuthoredExpr<P: ValueKind, B: BindingAddress> {
     definition_use: UseId,
     location: ExpressionLocation,
     kind: ExprKind<B>,
+    roles: AuthoredChildRoles,
     first_conversion: Option<Arc<ConversionSite>>,
     parse_ownership: ParseOwnership,
     children: Vec<ExprValue<P, B>>,
+}
+
+// Named child handles are identity metadata, independent of syntax equality.
+#[derive(Clone)]
+enum AuthoredChildRoles {
+    Positional,
+    Function { body: NodeId },
+    Sink { value: NodeId, key: Option<NodeId> },
 }
 
 // Constant-size diagnostic summaries are computed while the parser constructs
@@ -299,6 +310,7 @@ struct AuthoredExpr<P: ValueKind, B: BindingAddress> {
 struct ConversionSite {
     node: NodeId,
     location: DeclarationLocation,
+    parsing: conversion::ConversionParsing,
 }
 #[derive(Debug, Clone, Copy)]
 enum ParseOwnership {
@@ -307,13 +319,27 @@ enum ParseOwnership {
     Ordinary,
 }
 impl<P: ValueKind, B: BindingAddress> AuthoredExpr<P, B> {
-    fn parse_failure(&self, ordinary: super::ParseError) -> super::ParseError {
-        let kind = match self.parse_ownership {
-            ParseOwnership::Conversion => crate::conversion::ConversionErrorKind::Source,
-            ParseOwnership::Covered => crate::conversion::ConversionErrorKind::UnsupportedPosition,
-            ParseOwnership::Ordinary => return ordinary,
+    fn sink_value(&self) -> Option<&ExprValue<P, B>> {
+        let AuthoredChildRoles::Sink { value, .. } = self.roles else {
+            return None;
         };
-        conversion::parse_failure(self.first_conversion.as_deref(), kind, ordinary)
+        self.children.iter().find(|child| child.node_id() == value)
+    }
+    fn parse_rejection(&self) -> Option<&crate::ConversionError> {
+        self.first_conversion
+            .as_ref()
+            .and_then(|site| match site.parsing.judgement() {
+                Some(conversion::ParseJudgement::Rejected(error)) => Some(error),
+                Some(conversion::ParseJudgement::OperandFailed) | None => None,
+            })
+    }
+    fn parse_failure(&self, ordinary: super::ParseError) -> super::ParseError {
+        if matches!(self.parse_ownership, ParseOwnership::Conversion)
+            && let Some(site) = &self.first_conversion
+        {
+            site.parsing.operand_failed();
+        }
+        ordinary
     }
 }
 
@@ -347,6 +373,7 @@ impl<P: ValueKind, B: BindingAddress> std::fmt::Debug for AuthoredExpr<P, B> {
 pub(crate) enum ExprKind<B: BindingAddress> {
     Convert {
         target: Box<Located<crate::conversion::ConversionTypePath>>,
+        parsing: conversion::ConversionParsing,
     },
     Scalar(TypeExpr),
     Parameter(TypeExpr),
@@ -391,7 +418,9 @@ pub(crate) enum ExprKind<B: BindingAddress> {
         resource_type: String,
         read: bool,
     },
-    Sink(super::AttributeKey),
+    Sink {
+        name: super::AttributeKey,
+    },
     If,
     For,
     Wait,
@@ -440,7 +469,7 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
         }
         let authored = Arc::unwrap_or_clone(self.authored);
         let kind = match authored.kind {
-            ExprKind::Convert { target } => ExprKind::Convert { target },
+            ExprKind::Convert { target, parsing } => ExprKind::Convert { target, parsing },
             ExprKind::Binding(binding) => ExprKind::Binding(map(binding)),
             ExprKind::Reference {
                 binding,
@@ -483,7 +512,7 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
                 resource_type,
                 read,
             },
-            ExprKind::Sink(name) => ExprKind::Sink(name),
+            ExprKind::Sink { name } => ExprKind::Sink { name },
             ExprKind::If => ExprKind::If,
             ExprKind::For => ExprKind::For,
             ExprKind::Wait => ExprKind::Wait,
@@ -500,6 +529,7 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
             definition_use: authored.definition_use,
             location: authored.location,
             kind,
+            roles: authored.roles,
             first_conversion: authored.first_conversion,
             parse_ownership: authored.parse_ownership,
             children: authored
@@ -610,7 +640,7 @@ pub(in crate::parser) fn resource_slots(
             .clone(),
     );
     for child in &root.authored.children {
-        let ExprKind::Sink(name) = &child.authored.kind else {
+        let ExprKind::Sink { name, .. } = &child.authored.kind else {
             continue;
         };
         if let Some(sink) = name.lookup_hash(sinks) {
@@ -625,7 +655,11 @@ pub(in crate::parser) fn resource_slots(
         } else {
             // Grouped blocks have explicit compiler-owned container handles,
             // including when a pending child prevents a provisional Value.
-            let mut expression = child.authored.children[0].clone();
+            let mut expression = child
+                .authored
+                .sink_value()
+                .ok_or_else(|| MissingEvidence::new("named sink value"))?
+                .clone();
             if let Some(value) = values.get(name) {
                 expression.payload = Projection::Value(value.clone());
             }
@@ -704,12 +738,6 @@ impl<B: BindingAddress> Default for Expressions<B> {
 impl<B: BindingAddress> Expressions<B> {
     pub fn binding(&self, name: &B) -> Option<&ExprValue<ParserPlaceholder, B>> {
         self.definitions.get(name)
-    }
-    pub(in crate::parser) fn parse_error(&self) -> Option<super::ParseError> {
-        self.captures
-            .parse_error
-            .clone()
-            .map(super::ParseError::CheckedConversion)
     }
     pub(in crate::parser) fn captured_nodes(&self) -> Arc<CapturedNodes> {
         self.captures.clone()
@@ -1068,16 +1096,60 @@ fn node(
     )
 }
 
+fn sink_node(
+    pair: &Pair<'_, Rule>,
+    name: super::AttributeKey,
+    value: ExprValue,
+    key: Option<ExprValue>,
+    file: &PreprocessedFile,
+    source: &Path,
+) -> ExprValue {
+    let roles = AuthoredChildRoles::Sink {
+        value: value.node_id(),
+        key: key.as_ref().map(ExprValue::node_id),
+    };
+    let kind = ExprKind::Sink { name };
+    let mut children = vec![value];
+    children.extend(key);
+    node_with_roles(pair, kind, children, roles, file, source)
+}
+
+fn node_with_roles(
+    pair: &Pair<'_, Rule>,
+    kind: ExprKind<RelativeBindingName>,
+    children: Vec<ExprValue>,
+    roles: AuthoredChildRoles,
+    file: &PreprocessedFile,
+    source: &Path,
+) -> ExprValue {
+    node_at_with_roles(
+        DeclarationLocation::expression_node(pair, file, source),
+        kind,
+        children,
+        roles,
+    )
+}
+
 fn node_at(
     location: DeclarationLocation,
     kind: ExprKind<RelativeBindingName>,
     children: Vec<ExprValue>,
 ) -> ExprValue {
+    node_at_with_roles(location, kind, children, AuthoredChildRoles::Positional)
+}
+
+fn node_at_with_roles(
+    location: DeclarationLocation,
+    kind: ExprKind<RelativeBindingName>,
+    children: Vec<ExprValue>,
+    roles: AuthoredChildRoles,
+) -> ExprValue {
     let id = NodeId::fresh();
-    let first_conversion = if matches!(kind, ExprKind::Convert { .. }) {
+    let first_conversion = if let ExprKind::Convert { parsing, .. } = &kind {
         Some(Arc::new(ConversionSite {
             node: id,
             location: location.clone(),
+            parsing: parsing.clone(),
         }))
     } else {
         children
@@ -1092,7 +1164,18 @@ fn node_at(
         | ExprKind::Access(_)
         | ExprKind::DynamicAccess
         | ExprKind::Secret => ParseOwnership::Covered,
-        ExprKind::Alias | ExprKind::Parens | ExprKind::Definition | ExprKind::Sink(_) => {
+        ExprKind::Sink { .. } => match &roles {
+            AuthoredChildRoles::Sink { value, .. } => children
+                .iter()
+                .find(|child| child.node_id() == *value)
+                .map_or(ParseOwnership::Ordinary, |child| {
+                    child.authored.parse_ownership
+                }),
+            AuthoredChildRoles::Function { .. } | AuthoredChildRoles::Positional => {
+                ParseOwnership::Ordinary
+            }
+        },
+        ExprKind::Alias | ExprKind::Parens | ExprKind::Definition => {
             children.first().map_or(ParseOwnership::Ordinary, |child| {
                 child.authored.parse_ownership
             })
@@ -1131,6 +1214,7 @@ fn node_at(
             definition_use: UseId::fresh(),
             location: ExpressionLocation::new(ExpressionInstance::Root, &location),
             kind,
+            roles,
             first_conversion,
             parse_ownership,
             children,
@@ -1162,6 +1246,7 @@ fn lower_blocks(children: Vec<ExprValue>) -> Vec<ExprValue> {
                     definition_use: UseId::fresh(),
                     location: ExpressionLocation::new(ExpressionInstance::Root, &headers[&name]),
                     kind: ExprKind::List,
+                    roles: AuthoredChildRoles::Positional,
                     first_conversion: records
                         .iter()
                         .find_map(|child| child.authored.first_conversion.clone()),
@@ -1182,7 +1267,11 @@ fn lower_blocks(children: Vec<ExprValue>) -> Vec<ExprValue> {
                         id: NodeId::fresh(),
                         definition_use: UseId::fresh(),
                         location: ExpressionLocation::new(ExpressionInstance::Root, header),
-                        kind: ExprKind::Sink(name.clone()),
+                        kind: ExprKind::Sink { name: name.clone() },
+                        roles: AuthoredChildRoles::Sink {
+                            value: groups[name].node_id(),
+                            key: None,
+                        },
                         first_conversion: groups[name].authored.first_conversion.clone(),
                         parse_ownership: ParseOwnership::Ordinary,
                         children: vec![groups[name].clone()],
@@ -1227,7 +1316,6 @@ pub(in crate::parser) struct CapturedNodes {
     resource_declarations: HashMap<NodeId, SlotDeclarationId>,
     values: std::sync::RwLock<HashMap<NodeId, Value<ParserPlaceholder, RelativeBindingName>>>,
     conditions: ConditionRecorder,
-    parse_error: Option<crate::ConversionError>,
 }
 impl std::fmt::Debug for CapturedNodes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1254,27 +1342,47 @@ impl CapturedNodes {
     fn get(&self, key: &ParseNodeKey) -> Option<&ExprValue> {
         self.nodes.get(key)
     }
-    pub(in crate::parser) fn expression_failure(
-        &self,
-        pair: &Pair<'_, Rule>,
-        ordinary: super::ParseError,
-    ) -> super::ParseError {
-        match self.get(&ParseNodeKey::of(pair)) {
-            Some(expression) => expression.authored.parse_failure(ordinary),
-            None => ordinary,
-        }
+    pub(in crate::parser) fn reject_boundary(&self, pair: &Pair<'_, Rule>) -> bool {
+        self.get(&ParseNodeKey::of(pair))
+            .and_then(|node| node.authored.first_conversion.as_ref())
+            .is_some_and(|site| site.parsing.reject(site))
     }
-    pub(in crate::parser) fn boundary_failure(
+    pub(in crate::parser) fn recover_evaluation(
         &self,
         pair: &Pair<'_, Rule>,
-        ordinary: super::ParseError,
-    ) -> super::ParseError {
-        conversion::parse_failure(
-            self.get(&ParseNodeKey::of(pair))
-                .and_then(|node| node.authored.first_conversion.as_deref()),
-            crate::conversion::ConversionErrorKind::UnsupportedPosition,
-            ordinary,
-        )
+        result: Result<crate::eval_value::EvalValue, super::ParseError>,
+    ) -> Result<crate::eval_value::EvalValue, super::ParseError> {
+        let error = match result {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let Some(expression) = self.get(&ParseNodeKey::of(pair)) else {
+            return Err(error);
+        };
+        let Some(site) = expression.authored.first_conversion.as_ref() else {
+            return Err(error);
+        };
+        match expression.authored.parse_ownership {
+            ParseOwnership::Conversion => {
+                site.parsing.operand_failed();
+                Err(error)
+            }
+            ParseOwnership::Ordinary => Err(error),
+            ParseOwnership::Covered => {
+                let value = self
+                    .values
+                    .read()
+                    .expect("retained projections lock")
+                    .get(&site.node)
+                    .cloned();
+                match value {
+                    Some(value) if site.parsing.reject(site) => {
+                        Ok(crate::eval_value::EvalValue::from_value(value))
+                    }
+                    Some(_) | None => Err(error),
+                }
+            }
+        }
     }
     pub(in crate::parser) fn node_id(&self, pair: &Pair<'_, Rule>) -> Option<NodeId> {
         self.get(&ParseNodeKey::of(pair)).map(ExprValue::node_id)
@@ -1583,12 +1691,9 @@ fn compile_map(
                     .then(|| compile(key.clone(), file, source, scope, captures));
                 if let Some(key_syntax) = &key_syntax
                     && let Some(site) = key_syntax.authored.first_conversion.as_deref()
-                    && let Err(ordinary) = super::extract_key_string(key.clone())
+                    && super::extract_key_string(key.clone()).is_err()
                 {
-                    captures
-                        .parse_error
-                        .get_or_insert_with(|| conversion::rejected_key(site, ordinary));
-                    return Err(Box::new(key_syntax.clone()));
+                    site.parsing.reject(site);
                 }
                 let name = super::AttributeKey::literal_in_file(key, file);
                 let value = compile(
@@ -1598,34 +1703,18 @@ fn compile_map(
                     scope,
                     captures,
                 );
-                let mut values = vec![value];
-                if let Some(key_syntax) = key_syntax
-                    && key_syntax.authored.first_conversion.is_some()
-                {
-                    values.push(key_syntax);
-                }
-                Ok(node(&entry, ExprKind::Sink(name), values, file, source))
+                let key = key_syntax.filter(|key| key.authored.first_conversion.is_some());
+                sink_node(&entry, name, value, key, file, source)
             } else {
-                Ok(compile(entry, file, source, scope, captures))
+                compile(entry, file, source, scope, captures)
             }
         })
-        .collect::<Result<Vec<_>, _>>();
-    let entries = match entries {
-        Ok(entries) => lower_blocks(entries),
-        Err(key) => {
-            return node(
-                &pair,
-                ExprKind::Unsupported("map with rejected key".into()),
-                vec![*key],
-                file,
-                source,
-            );
-        }
-    };
+        .collect::<Vec<_>>();
+    let entries = lower_blocks(entries);
     let keys = entries
         .iter()
         .map(|entry| {
-            let ExprKind::Sink(name) = &entry.authored.kind else {
+            let ExprKind::Sink { name, .. } = &entry.authored.kind else {
                 unreachable!("compiled map entry");
             };
             name.clone()
@@ -1752,6 +1841,10 @@ fn compile_remaining_form(
                         DeclarationLocation::conversion_expression(&pair, &step, file, source),
                         ExprKind::Convert {
                             target: Box::new(target),
+                            parsing: conversion::ConversionParsing::new(
+                                file.protected_regions()
+                                    .owns(step.as_span().start()..step.as_span().end()),
+                            ),
                         },
                         vec![value],
                     );
@@ -1995,14 +2088,16 @@ fn compile_remaining_form(
                     );
                 }
             }
-            let mut children: Vec<_> = pair
+            let body_syntax = pair
                 .clone()
                 .into_inner()
-                .filter(|part| part.as_rule() == Rule::fn_body)
-                .map(|body| compile(body, file, source, &scope, captures))
-                .collect();
+                .find(|part| part.as_rule() == Rule::fn_body)
+                .expect("function body grammar");
+            let body_expression = compile(body_syntax, file, source, &scope, captures);
+            let body = body_expression.node_id();
+            let mut children = vec![body_expression];
             children.extend(defaults);
-            node(
+            node_with_roles(
                 &pair,
                 ExprKind::Function {
                     name: pair
@@ -2018,6 +2113,7 @@ fn compile_remaining_form(
                     }),
                 },
                 children,
+                AuthoredChildRoles::Function { body },
                 file,
                 source,
             )
@@ -2104,18 +2200,9 @@ fn compile_remaining_form(
                 .then(|| compile(name.clone(), file, source, scope, captures));
             if let Some(key_syntax) = &key_syntax
                 && let Some(site) = key_syntax.authored.first_conversion.as_deref()
-                && let Err(ordinary) = super::extract_key_string(name.clone())
+                && super::extract_key_string(name.clone()).is_err()
             {
-                captures
-                    .parse_error
-                    .get_or_insert_with(|| conversion::rejected_key(site, ordinary));
-                return node(
-                    &pair,
-                    ExprKind::Unsupported("attribute with rejected key".into()),
-                    vec![key_syntax.clone()],
-                    file,
-                    source,
-                );
+                site.parsing.reject(site);
             }
             let name = super::AttributeKey::literal_in_file(name, file);
             let value = compile(
@@ -2125,13 +2212,8 @@ fn compile_remaining_form(
                 scope,
                 captures,
             );
-            let mut values = vec![value];
-            if let Some(key_syntax) = key_syntax
-                && key_syntax.authored.first_conversion.is_some()
-            {
-                values.push(key_syntax);
-            }
-            node(&pair, ExprKind::Sink(name), values, file, source)
+            let key = key_syntax.filter(|key| key.authored.first_conversion.is_some());
+            sink_node(&pair, name, value, key, file, source)
         }
         Rule::wait_expr => {
             let mut parts = pair.clone().into_inner();
@@ -2199,11 +2281,11 @@ fn compile_remaining_form(
             let members = children().into_iter().skip(1).collect::<Vec<_>>();
             let (fields, mut locals): (Vec<_>, Vec<_>) = members
                 .into_iter()
-                .partition(|member| matches!(member.authored.kind, ExprKind::Sink(_)));
+                .partition(|member| matches!(member.authored.kind, ExprKind::Sink { .. }));
             let keys = fields
                 .iter()
                 .map(|field| match &field.authored.kind {
-                    ExprKind::Sink(name) => name.clone(),
+                    ExprKind::Sink { name, .. } => name.clone(),
                     _ => unreachable!(),
                 })
                 .collect();
@@ -2762,7 +2844,7 @@ mod judgement {
                 };
             }
         }
-        fn concrete(&self) -> bool {
+        pub(crate) fn concrete(&self) -> bool {
             matches!(self.judgement, ExprJudgement::Typed { kind, .. }
                 if kind.knowledge() == Classification::Known)
                 || matches!(
@@ -3997,6 +4079,9 @@ mod judgement {
                 .ok_or_else(|| MissingEvidence::new("access location"))?;
             self.expression(location.expression_location())
         }
+        pub(crate) fn conversion_inventory(&self) -> Arc<super::conversion::ConversionInventory> {
+            self.conversions.clone()
+        }
         pub fn findings(&self) -> &[Located<InferenceError>] {
             &self.findings
         }
@@ -4097,7 +4182,7 @@ mod judgement {
                 | ExprKind::Element
                 | ExprKind::Iterable
                 | ExprKind::Resource { .. }
-                | ExprKind::Sink(_)
+                | ExprKind::Sink { .. }
                 | ExprKind::For
                 | ExprKind::Wait
                 | ExprKind::Compose
@@ -4114,8 +4199,15 @@ mod judgement {
             state
                 .visited
                 .insert(key, conversion::ConversionOrigins::Empty);
-            let mut origins = if matches!(node.kind, ExprKind::Convert { .. }) {
-                conversion::inventory_entry(node, context, secret, owner, &mut state.conversions)
+            let mut origins = if let ExprKind::Convert { parsing, .. } = &node.kind {
+                conversion::inventory_entry(
+                    node,
+                    parsing,
+                    context,
+                    secret,
+                    owner,
+                    &mut state.conversions,
+                )
             } else {
                 conversion::ConversionOrigins::Empty
             };
@@ -4154,7 +4246,7 @@ mod judgement {
                 let context = if matches!(node.kind, ExprKind::Resource { .. }) {
                     if matches!(
                         child.authored.kind,
-                        ExprKind::Sink(_) | ExprKind::NestedBlock { .. }
+                        ExprKind::Sink { .. } | ExprKind::NestedBlock { .. }
                     ) {
                         Value
                     } else {
@@ -4233,7 +4325,10 @@ mod judgement {
         let functions = authored
             .values()
             .filter_map(|expression| {
-                if let ExprKind::Function { name, signature } = &expression.authored.kind {
+                if let ExprKind::Function {
+                    name, signature, ..
+                } = &expression.authored.kind
+                {
                     Some((
                         (expression.authored.location.instance.clone(), name.clone()),
                         signature.clone(),
@@ -4484,7 +4579,16 @@ mod judgement {
                     owner: FailureOwner::Boundary,
                 };
             }
-            let mut result = self.infer(expression, &children);
+            let mut result = if root.parse_rejection().is_some()
+                && (matches!(root.parse_ownership, ParseOwnership::Covered)
+                    || matches!(root.kind, ExprKind::If))
+            {
+                let mut rejected = value_dependent("authored operation has a rejected conversion");
+                rejected.data_mut().conversion_output = true;
+                rejected
+            } else {
+                self.infer(expression, &children)
+            };
             result.data_mut().any_conversion |= matches!(root.kind, ExprKind::Convert { .. })
                 || children.iter().any(JudgedExpr::contains_any_conversion);
             let eligible = match &root.kind {
@@ -4495,7 +4599,7 @@ mod judgement {
                 | ExprKind::Parens
                 | ExprKind::Definition
                 | ExprKind::Sequence
-                | ExprKind::Sink(_)
+                | ExprKind::Sink { .. }
                 | ExprKind::List
                 | ExprKind::Map(_)
                 | ExprKind::NestedBlock { .. }
@@ -5104,13 +5208,24 @@ mod judgement {
                     result
                 }
                 ExprKind::Function { name, signature } => {
-                    let body = authored_child(children.last());
+                    let AuthoredChildRoles::Function { body } = root.roles else {
+                        return incomplete("named function body");
+                    };
+                    let Some((syntax, body)) = root
+                        .children
+                        .iter()
+                        .zip(children)
+                        .find(|(syntax, _)| syntax.node_id() == body)
+                    else {
+                        return incomplete("named function body judgement");
+                    };
+                    let body = authored_child(Some(body));
                     if let Some(sink) = &signature.return_type
                         && let Some(failure) = self.check_function_sink(
                             &body,
                             sink,
-                            root.children.last().unwrap().location(),
-                            root.children.last().unwrap().location(),
+                            syntax.location(),
+                            syntax.location(),
                             &format!("function '{name}': return value"),
                         )
                     {
@@ -5221,11 +5336,17 @@ mod judgement {
                         .cloned()
                         .unwrap_or_else(|| incomplete("iterable operand"))
                 }
-                ExprKind::Alias
-                | ExprKind::Parens
-                | ExprKind::Definition
-                | ExprKind::Wait
-                | ExprKind::Sink(_) => authored_child(children.first()),
+                ExprKind::Alias | ExprKind::Parens | ExprKind::Definition | ExprKind::Wait => {
+                    authored_child(children.first())
+                }
+                ExprKind::Sink { .. } => authored_child(root.sink_value().and_then(|value| {
+                    root.children
+                        .iter()
+                        .zip(children)
+                        .find_map(|(syntax, judged)| {
+                            (syntax.node_id() == value.node_id()).then_some(judged)
+                        })
+                })),
                 ExprKind::Element => {
                     let collection = &children[0];
                     if collection.is_value_dependent() {
@@ -5418,7 +5539,7 @@ mod judgement {
             let mut failure = None;
             for child in children {
                 match &child.authored.kind {
-                    ExprKind::Sink(name) => {
+                    ExprKind::Sink { name, .. } => {
                         if let Some(attribute) = name.effective_attribute(schema.schema()) {
                             if attribute.is_read_only() {
                                 continue;
@@ -5428,7 +5549,7 @@ mod judgement {
                                 schema.owner(),
                                 schema.schema().as_schema().defs(),
                             );
-                            let value = &child.authored.children[0];
+                            let value = child.authored.sink_value().expect("named sink value");
                             let judged = self.judge(value);
                             let admission = admit_with_context(
                                 &judged,

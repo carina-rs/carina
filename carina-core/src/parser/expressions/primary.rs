@@ -532,14 +532,20 @@ pub(crate) fn parse_primary_eval_with_mode(
             } else {
                 pair.clone()
             };
-            let result = match syntax.as_rule() {
-                Rule::list => parse_list_eval(syntax.clone(), ctx, mode),
-                Rule::map => parse_map_eval(syntax.clone(), ctx, mode),
-                Rule::if_expr if mode.integer_operand_context().is_none() => {
+            use super::EvaluationForm;
+            let result = match super::evaluation_form(syntax.as_rule()) {
+                EvaluationForm::List => parse_list_eval(syntax.clone(), ctx, mode),
+                EvaluationForm::Map => parse_map_eval(syntax.clone(), ctx, mode),
+                EvaluationForm::If if mode.integer_operand_context().is_none() => {
                     parse_if_value_expr_with_mode(syntax.clone(), ctx, mode)
                 }
-                Rule::expression => parse_expression_eval_with_mode(syntax.clone(), ctx, mode),
-                _ => parse_primary_eval_with_mode_inner(pair, ctx, mode),
+                EvaluationForm::Expression => {
+                    parse_expression_eval_with_mode(syntax.clone(), ctx, mode)
+                }
+                EvaluationForm::Forwarding
+                | EvaluationForm::Postfix
+                | EvaluationForm::If
+                | EvaluationForm::Other => parse_primary_eval_with_mode_inner(pair, ctx, mode),
             }?;
             Ok(match result {
                 EvalValue::User(value) => EvalValue::User(with_access_provenance(
@@ -603,7 +609,10 @@ fn parse_map_eval(
             Rule::map_entry => {
                 let mut entry_inner = entry.into_inner();
                 let key_pair = next_pair(&mut entry_inner, "map key", "map entry")?;
-                let key = ctx.key_string(key_pair.clone())?;
+                let key = match ctx.key_string(key_pair.clone())? {
+                    crate::parser::context::ParsedKey::Literal(key) => key,
+                    crate::parser::context::ParsedKey::Rejected => continue,
+                };
                 let value_pair = next_pair(&mut entry_inner, "map value", "map entry")?;
                 let line = value_pair.line_col().0;
                 let entry_mode = mode.at_key(key.clone(), &key_pair);

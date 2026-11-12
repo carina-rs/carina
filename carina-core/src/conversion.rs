@@ -1,9 +1,10 @@
 //! Checked conversion diagnostics and pure declaration policy.
 //! Construction is private to the authored conversion policy and completion.
 pub(crate) use crate::parser::retained::conversion::diagnostic::ConversionTypePath;
-pub use crate::parser::retained::conversion::diagnostic::{
-    ConversionChannel, ConversionError, ConversionErrorKind, ConversionFindings,
+pub(crate) use crate::parser::retained::conversion::diagnostic::{
+    ConversionChannel, ConversionFindings,
 };
+pub use crate::parser::retained::conversion::diagnostic::{ConversionError, ConversionErrorKind};
 
 #[cfg(test)]
 mod cursor_policy_tests;

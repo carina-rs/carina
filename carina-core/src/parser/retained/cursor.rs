@@ -1,8 +1,8 @@
 //! Closed authored inputs, shared syntax/judgement snapshots and per-use coverage.
 
 use super::{
-    AuthoredExpr, ConditionSnapshot, ExprKind, ExpressionInstance, ExpressionLocation,
-    ExpressionReport, JudgedExpr, MissingEvidence, Projection,
+    AuthoredChildRoles, AuthoredExpr, ConditionSnapshot, ExprKind, ExpressionInstance,
+    ExpressionLocation, ExpressionReport, JudgedExpr, MissingEvidence, Projection,
 };
 use crate::resource::knowledge::{Apply, Knowledge, PlanResolved};
 use crate::resource::{
@@ -147,6 +147,7 @@ pub(crate) enum AuthoredForm {
     If,
     Coalesce,
     Computed,
+    Sink,
 }
 
 /// Syntax navigation shared by current and discarded assignment walks.
@@ -270,6 +271,9 @@ pub(super) fn canonical_root_id<B: BindingAddress>(
 }
 
 impl<'s, B: BindingAddress> JudgedNodeRef<'s, B> {
+    pub(super) fn parse_rejected(&self) -> bool {
+        self.node.parse_rejection().is_some()
+    }
     fn canonical(mut self) -> Result<Self, MissingEvidence> {
         // Alias nodes are pass-through grammar levels, not authored syntax.
         // Retain them in the expression report for diagnostic compatibility.
@@ -375,7 +379,7 @@ pub struct AuthoredUse<'s, B: BindingAddress = RelativeBindingName> {
     instance: ExpansionInstanceId,
     edge: EdgeRole,
     visit: ProjectionVisit,
-    definition_only: bool,
+
     restriction: Option<std::rc::Rc<ConversionRestriction<'s, B>>>,
 }
 
@@ -392,7 +396,8 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
 
     pub(crate) fn form(&self) -> AuthoredForm {
         match self.node.kind() {
-            ExprKind::Alias | ExprKind::Sink(_) | ExprKind::Sequence => AuthoredForm::Forward,
+            ExprKind::Alias | ExprKind::Sequence => AuthoredForm::Forward,
+            ExprKind::Sink { .. } => AuthoredForm::Sink,
             ExprKind::Parens => AuthoredForm::Parens,
             ExprKind::Convert { .. } => AuthoredForm::Convert,
             ExprKind::Definition => AuthoredForm::Definition,
@@ -490,7 +495,6 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
                 edge: EdgeRole::AliasDefinition,
                 restriction: self.inherited_restriction(EdgeRole::AliasDefinition),
                 visit: ProjectionVisit::Value,
-                definition_only: self.definition_only,
             }
             .canonical()?,
         ))
@@ -501,11 +505,32 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
     }
 
     pub(crate) fn navigation(&self) -> Result<AuthoredNavigation<'s, B>, MissingEvidence> {
+        if self.node.node.parse_rejection().is_some() {
+            return Ok(AuthoredNavigation::Leaf);
+        }
         Ok(match self.form() {
             AuthoredForm::Forward if self.child_count() != 0 => AuthoredNavigation::Forward {
                 child: self.child(self.child_count() - 1, self.edge())?,
                 authored: !matches!(self.node.kind(), ExprKind::Alias),
             },
+            AuthoredForm::Sink => {
+                let child = self
+                    .node
+                    .node
+                    .sink_value()
+                    .ok_or_else(|| MissingEvidence::new("named sink value"))?;
+                let index = self
+                    .node
+                    .node
+                    .children
+                    .iter()
+                    .position(|candidate| candidate.node_id() == child.node_id())
+                    .ok_or_else(|| MissingEvidence::new("named sink child"))?;
+                AuthoredNavigation::Forward {
+                    child: self.child(index, self.edge())?,
+                    authored: true,
+                }
+            }
             AuthoredForm::Convert => AuthoredNavigation::Forward {
                 child: self.child(0, EdgeRole::ConvertOperand)?,
                 authored: true,
@@ -659,7 +684,6 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             edge,
             restriction: self.inherited_restriction(edge),
             visit: ProjectionVisit::Value,
-            definition_only: self.definition_only,
         }
         .canonical()
     }
@@ -1055,7 +1079,7 @@ impl<B: BindingAddress> JudgedSlot<B> {
             instance: self.instance,
             edge: EdgeRole::SlotRoot,
             visit: ProjectionVisit::Value,
-            definition_only: false,
+
             restriction: None,
         }
         .canonical()
@@ -1229,16 +1253,7 @@ impl<B: BindingAddress> ExpressionReport<B> {
             report: &mut CompletenessReport<'s, B>,
             active: &mut std::collections::HashSet<(NodeId, super::ExpressionEnvironmentId)>,
         ) -> Result<(), MissingEvidence> {
-            let mut usage = usage.canonical()?;
-            if matches!(
-                usage.node.node.kind,
-                ExprKind::Function { .. }
-                    | ExprKind::ProviderDeclaration
-                    | ExprKind::ModuleCall
-                    | ExprKind::Declaration
-            ) {
-                usage.definition_only = false;
-            }
+            let usage = usage.canonical()?;
             if !seen.insert((
                 usage.node.node.id,
                 usage.occurrence,
@@ -1290,7 +1305,7 @@ impl<B: BindingAddress> ExpressionReport<B> {
                 if matches!(usage.node.node.kind, ExprKind::Resource { .. })
                     && (matches!(
                         usage.node.node.children[index].authored.kind,
-                        ExprKind::Sink(_) | ExprKind::NestedBlock { .. }
+                        ExprKind::Sink { .. } | ExprKind::NestedBlock { .. }
                     ) || usage.node.node.children[index]
                         .authored
                         .first_conversion
@@ -1303,16 +1318,16 @@ impl<B: BindingAddress> ExpressionReport<B> {
                 } else {
                     usage.child(index, role)?
                 };
-                if matches!(usage.node.node.kind, ExprKind::Resource { .. }) {
-                    if coverage.has_node(child.node.node.id, &child.node.environment) {
-                        continue;
-                    }
-                    child.definition_only = true;
+                if matches!(usage.node.node.kind, ExprKind::Resource { .. })
+                    && coverage.has_node(child.node.node.id, &child.node.environment)
+                {
+                    continue;
                 }
                 if matches!(usage.node.node.kind, ExprKind::If) && index == 0 {
                     child.edge = EdgeRole::Condition;
                 }
-                if matches!(usage.node.node.kind, ExprKind::Sink(_)) && index == 1 {
+                if matches!(usage.node.node.roles, AuthoredChildRoles::Sink { key: Some(key), .. } if key == child.node.node.id)
+                {
                     child.edge = EdgeRole::MapKey;
                 }
                 visit(child, coverage, seen, report, active)?;
@@ -1352,7 +1367,7 @@ impl<B: BindingAddress> ExpressionReport<B> {
                 instance: root.instance,
                 edge: EdgeRole::SlotRoot,
                 visit: ProjectionVisit::Value,
-                definition_only: root.definition,
+
                 restriction: None,
             };
             let usage = match usage.canonical() {
