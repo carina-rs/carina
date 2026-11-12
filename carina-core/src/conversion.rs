@@ -32,6 +32,21 @@ pub enum ConversionErrorKind {
     Disjoint,
 }
 
+impl ConversionErrorKind {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Destination => "conversion_destination",
+            Self::AmbiguousDestination => "conversion_ambiguous_destination",
+            Self::UnsupportedPosition => "conversion_unsupported_position",
+            Self::Unused => "conversion_unused",
+            Self::Target => "conversion_target",
+            Self::Source => "conversion_source",
+            Self::ScalarKind => "conversion_scalar_kind",
+            Self::Disjoint => "conversion_disjoint",
+        }
+    }
+}
+
 #[derive(Clone, PartialEq)]
 enum ConversionCause {
     Validation(crate::parser::CustomTypeValidationError),
@@ -139,6 +154,11 @@ impl ConversionError {
                         .and_then(
                             crate::validation::ResourceRefTypeValidationError::conversion_error,
                         )
+                })
+                .or_else(|| {
+                    error
+                        .downcast_ref::<crate::validation::ResourceAdmissionFinding>()
+                        .and_then(crate::validation::ResourceAdmissionFinding::conversion_error)
                 })
                 .or_else(|| {
                     error

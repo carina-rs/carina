@@ -166,7 +166,7 @@ fn whole_secret_refined_list_directory_lsp_matches_cli() {
     assert_secret_collection_parity(
         "passwords",
         "passwords = secret(['way-too-long'])",
-        "Invalid value (secret) for 'passwords': length 12 is outside allowed range [2, 4]",
+        "Invalid value (secret) for 'passwords': length 12 is outside allowed range 2..=4",
         &["way-too-long"],
     );
 }
@@ -186,7 +186,7 @@ fn whole_secret_refined_map_directory_lsp_matches_cli() {
     assert_secret_collection_parity(
         "password_map",
         "password_map = secret({ private_key = 'way-too-long' })",
-        "Map value for key '(secret)': Invalid value (secret) for 'password_map': length 12 is outside allowed range [2, 4]",
+        "Map value for key '(secret)': Invalid value (secret) for 'password_map': length 12 is outside allowed range 2..=4",
         &["private_key", "way-too-long"],
     );
 }

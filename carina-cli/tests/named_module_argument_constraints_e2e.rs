@@ -199,7 +199,7 @@ fn named_argument_keeps_declared_length_bound() {
         diagnostics.iter().any(|diagnostic| {
             diagnostic.contains("argument 'x'")
                 && diagnostic.contains("aws.iam.Role.Name")
-                && diagnostic.contains("length 65 is outside allowed range [1, 64]")
+                && diagnostic.contains("length 65 is outside allowed range 1..=64")
         }),
         "a 65-character argument must fail the declared aws.iam.Role.Name length bound:\n{}",
         diagnostics.join("\n"),

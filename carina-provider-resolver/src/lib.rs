@@ -29,7 +29,7 @@ pub use provider_trust::{
     ProviderLoadIdentity, ProviderLoadIdentityError, ProviderLoadSource, ProviderTrust,
     ProviderTrustClass, UnverifiedOfficialProviderError, UnverifiedOfficialProviderReason,
 };
-pub use trusted_local::{GrantParseError, TrustedLocalGrants};
+pub use trusted_local::{GrantParseError, ProviderLoadNotice, TrustedLocalGrants};
 pub use user_trust::UserTrustRecord;
 pub use verified_artifact::{
     LoadedArtifactIdentity, LoadedArtifactOrigin, LockedArtifactVersion, ProviderArtifactBytes,

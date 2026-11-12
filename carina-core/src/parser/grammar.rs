@@ -7,17 +7,54 @@ use std::sync::Arc;
 use super::error::ParseError;
 
 #[derive(Parser)]
+#[grammar = "parser/lexical.pest"]
 #[grammar = "parser/carina.pest"]
 struct CarinaParser;
 
-/// A binding name whose spelling is guaranteed by the parser grammar.
+/// Syntax presentation with parser-owned coordinates and admitted excerpts.
+/// Raw pest errors cannot be admitted without their complete source.
 ///
-/// Construction is limited to grammar-produced let-binding names and the
+/// ```compile_fail
+/// use carina_core::parser::{Rule, SyntaxDiagnostic};
+/// fn without_source(error: pest::error::Error<Rule>) -> SyntaxDiagnostic {
+///     error.into()
+/// }
+/// ```
+#[derive(Debug)]
+pub struct SyntaxDiagnostic(pest::error::Error<Rule>);
+
+impl std::ops::Deref for SyntaxDiagnostic {
+    type Target = pest::error::Error<Rule>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::fmt::Display for SyntaxDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+pub(super) fn literal_key_pair(source: &str) -> pest::iterators::Pair<'_, Rule> {
+    CarinaParser::parse(Rule::string, source)
+        .expect("encoded literal key parses")
+        .next()
+        .unwrap()
+}
+
+/// An identifier or binding name whose spelling is guaranteed by the parser grammar.
+///
+/// Construction is limited to grammar-produced identifiers/binding names and the
 /// parser's own identifier-shaped synthetic bindings. Consumers can therefore
 /// use the value without re-validating it as a resource identity.
 pub(super) struct ParserBindingName(String);
 
 impl ParserBindingName {
+    pub(super) fn from_identifier_pair(pair: pest::iterators::Pair<'_, Rule>) -> Self {
+        assert_eq!(pair.as_rule(), Rule::identifier);
+        Self(pair.as_str().to_owned())
+    }
+
     pub(super) fn from_let_binding_pair(pair: pest::iterators::Pair<'_, Rule>) -> Self {
         assert!(
             matches!(pair.as_rule(), Rule::identifier | Rule::discard_pattern),
@@ -39,16 +76,103 @@ impl ParserBindingName {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ProviderKindAttribute {
+    Source,
+    Version,
+    Revision,
+}
+impl ProviderKindAttribute {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Version => "version",
+            Self::Revision => "revision",
+        }
+    }
+}
+
+/// These semantic errors historically use an empty pest excerpt. Only closed
+/// reasons and grammar-owned identifiers enter this presentation path.
+pub(super) enum ProviderSyntaxIssue<'a> {
+    VersionAndRevision {
+        provider: &'a ParserBindingName,
+    },
+    NamedKindAttribute {
+        field: ProviderKindAttribute,
+        binding: &'a ParserBindingName,
+        provider: &'a ParserBindingName,
+    },
+}
+impl ProviderSyntaxIssue<'_> {
+    pub(super) fn into_parse_error(self) -> ParseError {
+        let message = match self {
+            Self::VersionAndRevision { provider } => format!(
+                "Provider '{}': 'version' and 'revision' are mutually exclusive",
+                provider.as_str()
+            ),
+            Self::NamedKindAttribute {
+                field,
+                binding,
+                provider,
+            } => format!(
+                "'{}' is a kind-level attribute and cannot be set on \
+                 a named provider instance '{}'. Move it to the \
+                 top-level `provider {}` block.",
+                field.name(),
+                binding.as_str(),
+                provider.as_str(),
+            ),
+        };
+        ParseError::Syntax(SyntaxDiagnostic(pest::error::Error::new_from_pos(
+            pest::error::ErrorVariant::CustomError { message },
+            pest::Position::from_start(""),
+        )))
+    }
+}
+
 /// An owned, heredoc-preprocessed file that can yield pest pairs borrowing its
 /// transformed source while retaining the original-position mapping.
 pub(crate) struct PreprocessedFile {
     preprocess_result: Arc<crate::heredoc::PreprocessResult>,
+    secret_regions: std::sync::OnceLock<super::protected_regions::SecretOwnedRanges>,
 }
 
 impl PreprocessedFile {
+    pub(super) fn from_preprocessed(result: crate::heredoc::PreprocessResult) -> Self {
+        Self {
+            preprocess_result: Arc::new(result),
+            secret_regions: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Classification needs syntax without constructing (and recursively
+    /// redacting) a syntax diagnostic. Never expose the raw pest failure.
+    pub(super) fn syntax_for_secret_classification(&self) -> Option<Pairs<'_, Rule>> {
+        CarinaParser::parse(Rule::file, self.preprocess_result.transformed_source()).ok()
+    }
+
     pub(crate) fn parse(&self) -> Result<Pairs<'_, Rule>, ParseError> {
-        CarinaParser::parse(Rule::file, &self.preprocess_result.source)
-            .map_err(|error| ParseError::Syntax(map_pest_error_lines(error, self)))
+        CarinaParser::parse(Rule::file, self.preprocess_result.transformed_source()).map_err(
+            |error| {
+                let error = map_pest_error_lines(error, self);
+                match super::failed_file_text(self.preprocess_result.authored_source()) {
+                    super::FailedFileText::Public(_) => ParseError::Syntax(SyntaxDiagnostic(error)),
+                    super::FailedFileText::Protected => {
+                        ParseError::ProtectedFile(super::ProtectedParseFailure::syntax(&error))
+                    }
+                }
+            },
+        )
+    }
+
+    pub(super) fn protected_regions(&self) -> &super::protected_regions::SecretOwnedRanges {
+        self.secret_regions.get_or_init(|| {
+            let pairs = self
+                .syntax_for_secret_classification()
+                .expect("provenance is collected only from parsed files");
+            super::protected_regions::SecretOwnedRanges::from_pairs(pairs)
+        })
     }
 
     pub(crate) fn original_position(
@@ -56,6 +180,10 @@ impl PreprocessedFile {
         preprocessed_byte: usize,
     ) -> crate::heredoc::OriginalPosition {
         self.preprocess_result.original_position(preprocessed_byte)
+    }
+
+    pub(crate) fn original_byte(&self, preprocessed_byte: usize) -> usize {
+        self.preprocess_result.original_byte(preprocessed_byte)
     }
 
     pub(crate) fn original_slice(&self, preprocessed_range: std::ops::Range<usize>) -> &str {
@@ -89,18 +217,9 @@ impl PreprocessedFile {
 /// The private transformed source makes raw file parsing unavailable outside
 /// this module while allowing returned pairs to borrow from the owned result.
 pub(crate) fn preprocess_file(input: &str) -> Result<PreprocessedFile, ParseError> {
-    let preprocess_result = crate::heredoc::preprocess_heredocs(input).map_err(|error| {
-        let line = match &error {
-            crate::heredoc::HeredocError::Unterminated { line, .. } => *line,
-        };
-        ParseError::InvalidExpression {
-            line,
-            message: error.to_string(),
-        }
-    })?;
-    Ok(PreprocessedFile {
-        preprocess_result: Arc::new(preprocess_result),
-    })
+    let preprocess_result = crate::heredoc::preprocess_heredocs(input)
+        .map_err(crate::heredoc::HeredocError::into_parse_error)?;
+    Ok(PreprocessedFile::from_preprocessed(preprocess_result))
 }
 
 pub(super) fn parse_type_expr_fragment(
@@ -133,4 +252,41 @@ fn map_pest_error_lines(
         }
     };
     error
+}
+
+/// Intrinsic identity is read only from a canonical parsed identifier.
+pub(super) fn is_secret_identifier(input: &str) -> bool {
+    input == "secret"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round14_syntax_failure_is_admitted_from_its_own_source() {
+        let source = "secret('CANARY'";
+        let file = preprocess_file(source).unwrap();
+        let error = file.parse().unwrap_err();
+        for text in [error.to_string(), format!("{error:?}")] {
+            assert!(!text.contains("CANARY"), "{text}");
+        }
+        assert!(error.protected_failure().is_some());
+        let public = preprocess_file("let = {").unwrap();
+        let public = public.parse().unwrap_err();
+        assert!(matches!(public, ParseError::Syntax(_)));
+        assert!(public.to_string().contains("let = {"));
+    }
+
+    #[test]
+    fn round14_preprocess_failure_is_admitted_from_its_own_source() {
+        let source = "let hidden = secret(<<CANARY_MARKER\nCANARY\n";
+        let error = preprocess_file(source)
+            .err()
+            .expect("an unfinished heredoc fails preprocessing");
+        for text in [error.to_string(), format!("{error:?}")] {
+            assert!(!text.contains("CANARY"), "{text}");
+        }
+        assert!(error.protected_failure().is_some());
+    }
 }

@@ -26,12 +26,12 @@ fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
 fn provider_config(default_tags: IndexMap<String, Value>) -> ProviderConfig {
     ProviderConfig {
         name: "test".to_string(),
-        attributes: IndexMap::new(),
-        default_tags,
+        attributes: Default::default(),
+        default_tags: (default_tags).into(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     }
 }

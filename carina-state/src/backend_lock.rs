@@ -299,8 +299,8 @@ mod tests {
     fn resolve(backend_type: &str, attributes: HashMap<String, Value>) -> BackendConfig {
         let raw = carina_core::parser::BackendConfig {
             backend_type: backend_type.to_string(),
-            attributes,
-            attribute_spans: HashMap::new(),
+            attributes: (attributes).into(),
+            attribute_spans: Default::default(),
         };
         BackendConfig::try_from(&raw).unwrap()
     }

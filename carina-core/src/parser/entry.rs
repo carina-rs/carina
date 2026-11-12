@@ -97,29 +97,45 @@ pub struct LetBindingSourceSpans {
 }
 
 /// Reusable syntax spans for editor lookups, collected in one grammar parse.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct SourceSpanIndex {
     let_bindings: HashMap<String, LetBindingSourceSpans>,
     resource_members: Vec<SourceSpanNode>,
 }
 
 /// An owned syntax node retains source mappings without borrowing pest pairs.
-#[derive(Debug)]
 struct SourceSpanNode {
     rule: Rule,
     span: super::SourceSpan,
-    name: Option<String>,
+    name: Option<super::AttributeKey>,
     children: Vec<Self>,
+}
+
+// This index retains raw identity for lookups, including secret-owned keys.
+// It is intentionally opaque on every Debug path, including nested nodes.
+impl std::fmt::Debug for SourceSpanIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceSpanIndex").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for SourceSpanNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceSpanNode").finish_non_exhaustive()
+    }
 }
 
 impl SourceSpanNode {
     fn from_pair(pair: pest::iterators::Pair<'_, Rule>, file: &super::PreprocessedFile) -> Self {
         let rule = pair.as_rule();
         let name = if matches!(rule, Rule::attribute | Rule::map_entry | Rule::nested_block) {
-            pair.clone()
-                .into_inner()
-                .next()
-                .map(|key| key.as_str().trim_matches(['\'', '"']).to_string())
+            pair.clone().into_inner().next().map(|key| {
+                super::AttributeKey::provenance(
+                    key.as_str().trim_matches(['\'', '"']).to_string(),
+                    &key,
+                    file,
+                )
+            })
         } else {
             None
         };
@@ -425,7 +441,7 @@ impl SourceSpanIndex {
             if !matches!(
                 node.rule,
                 Rule::attribute | Rule::map_entry | Rule::nested_block
-            ) || node.name.as_deref() != Some(name)
+            ) || !node.name.as_ref().is_some_and(|key| key.matches(name))
             {
                 return None;
             }
@@ -1629,12 +1645,17 @@ pub(crate) fn parse_expression(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
 ) -> Result<super::retained::ExprValue, ParseError> {
-    let line = pair.line_col().0;
-    ctx.evaluate_retained_expression(pair.clone(), || {
-        let eval = parse_expression_eval(pair, ctx)?;
-        eval.into_value()
-            .map_err(|error| ParseError::from_eval_value(error, line))
-    })
+    let evaluation = ctx.evaluation_site(&pair);
+    evaluation
+        .evaluate(|| {
+            let line = pair.line_col().0;
+            ctx.evaluate_retained_expression(pair.clone(), || {
+                let eval = parse_expression_eval(pair, ctx)?;
+                eval.into_value()
+                    .map_err(|error| ParseError::from_eval_value(error, line))
+            })
+        })
+        .map_err(Into::into)
 }
 
 pub(crate) fn parse_expression_in_sink(
@@ -1642,12 +1663,17 @@ pub(crate) fn parse_expression_in_sink(
     ctx: &ParseContext,
     mode: &ExpressionMode<'_>,
 ) -> Result<super::retained::SinkExpression, ParseError> {
-    let line = pair.line_col().0;
-    ctx.evaluate_retained_sink(pair.clone(), || {
-        parse_expression_eval_with_mode(pair, ctx, mode)?
-            .into_sink_value()
-            .map_err(|error| ParseError::from_eval_value(error, line))
-    })
+    let evaluation = ctx.evaluation_site(&pair);
+    evaluation
+        .evaluate(|| {
+            let line = pair.line_col().0;
+            ctx.evaluate_retained_sink(pair.clone(), || {
+                parse_expression_eval_with_mode(pair, ctx, mode)?
+                    .into_sink_value()
+                    .map_err(|error| ParseError::from_eval_value(error, line))
+            })
+        })
+        .map_err(Into::into)
 }
 
 /// Parse an expression and return the raw `EvalValue`, preserving any
@@ -1659,11 +1685,16 @@ pub(crate) fn parse_expression_eval(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
 ) -> Result<EvalValue, ParseError> {
-    let syntax = pair.clone();
-    let inner = first_inner(pair, "expression body", "expression")?;
-    let value = parse_coalesce_expr(inner, ctx)?;
-    ctx.record_retained_eval(&syntax, &value);
-    Ok(value)
+    let evaluation = ctx.evaluation_site(&pair);
+    evaluation
+        .evaluate(|| {
+            let syntax = pair.clone();
+            let inner = first_inner(pair, "expression body", "expression")?;
+            let value = parse_coalesce_expr(inner, ctx)?;
+            ctx.record_retained_eval(&syntax, &value);
+            Ok(value)
+        })
+        .map_err(Into::into)
 }
 
 pub(crate) fn parse_expression_eval_with_mode(
@@ -1671,11 +1702,16 @@ pub(crate) fn parse_expression_eval_with_mode(
     ctx: &ParseContext,
     mode: &ExpressionMode<'_>,
 ) -> Result<EvalValue, ParseError> {
-    let syntax = pair.clone();
-    let inner = first_inner(pair, "expression body", "expression")?;
-    let value = parse_coalesce_expr_with_mode(inner, ctx, mode)?;
-    ctx.record_retained_eval(&syntax, &value);
-    Ok(value)
+    let evaluation = ctx.evaluation_site(&pair);
+    evaluation
+        .evaluate(|| {
+            let syntax = pair.clone();
+            let inner = first_inner(pair, "expression body", "expression")?;
+            let value = parse_coalesce_expr_with_mode(inner, ctx, mode)?;
+            ctx.record_retained_eval(&syntax, &value);
+            Ok(value)
+        })
+        .map_err(Into::into)
 }
 
 /// Parse a .crn file and resolve resource references.
@@ -1767,7 +1803,7 @@ mod tests {
         let error = top_level_upstream_state_spans("let x = mock.test.Thing {\n  p = <<EOT\nabc\n")
             .expect_err("an unterminated heredoc must be rejected");
 
-        let ParseError::InvalidExpression { line, .. } = error else {
+        let ParseError::InvalidAuthoredExpression { line, .. } = error else {
             panic!("unexpected error: {error:?}");
         };
         assert_eq!(line, 4);

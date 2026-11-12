@@ -683,8 +683,8 @@ mod tests {
             .unwrap_or_default();
         let raw = carina_core::parser::BackendConfig {
             backend_type: "local".to_string(),
-            attributes,
-            attribute_spans: HashMap::new(),
+            attributes: (attributes).into(),
+            attribute_spans: Default::default(),
         };
         match crate::BackendConfig::try_from(&raw).unwrap() {
             crate::BackendConfig::Local(settings) => settings,

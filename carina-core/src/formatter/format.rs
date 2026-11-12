@@ -27,13 +27,13 @@ pub fn format(source: &str, config: &FormatConfig) -> Result<String, FormatParse
             line: 0,
             column: 0,
         })?;
-    let pairs = parser::parse(&preprocess_result.source)?;
-    let cst = build_cst(&preprocess_result.source, pairs);
+    let pairs = parser::parse(preprocess_result.transformed_source())?;
+    let cst = build_cst(preprocess_result.transformed_source(), pairs);
     let formatter = Formatter::new(config.clone());
     let formatted = formatter.format(&cst);
     Ok(crate::heredoc::restore_heredocs(
         &formatted,
-        &preprocess_result.heredocs,
+        preprocess_result.original_heredocs(),
     ))
 }
 
@@ -51,13 +51,13 @@ pub fn format_with_block_names(
             line: 0,
             column: 0,
         })?;
-    let pairs = parser::parse(&preprocess_result.source)?;
-    let cst = build_cst(&preprocess_result.source, pairs);
+    let pairs = parser::parse(preprocess_result.transformed_source())?;
+    let cst = build_cst(preprocess_result.transformed_source(), pairs);
     let formatter = Formatter::with_block_names(config.clone(), block_names.clone());
     let formatted = formatter.format(&cst);
     Ok(crate::heredoc::restore_heredocs(
         &formatted,
-        &preprocess_result.heredocs,
+        preprocess_result.original_heredocs(),
     ))
 }
 

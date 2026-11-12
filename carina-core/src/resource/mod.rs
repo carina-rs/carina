@@ -6023,11 +6023,11 @@ pub(crate) enum LeftoverPlaceholderContext {
     },
     ProviderAttribute {
         provider: String,
-        attribute: String,
+        attribute: crate::parser::AttributeKey,
     },
     BackendAttribute {
         backend: String,
-        attribute: String,
+        attribute: crate::parser::AttributeKey,
     },
     ModuleCallArgument {
         module_call: String,

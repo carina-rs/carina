@@ -181,7 +181,7 @@ fn issue_4276_round2_c_identified_module_if_reports_local_branch_error() {
             .map(|d| d.message.as_str())
             .collect::<Vec<_>>(),
         vec![
-            "Invalid value 'vpc-123' for 'value' (VpcId): length 7 is outside allowed range [, 5]",
+            "Invalid value 'vpc-123' for 'value' (VpcId): length 7 is outside allowed range unbounded..=5",
         ]
     );
 }
@@ -201,10 +201,10 @@ fn issue_4276_round2_c_module_if_reports_errors_from_both_branches() {
         );
         let diagnostics = value_diagnostics(&engine, &source);
         let mut expected = vec![
-            "Invalid value 'vpc-123' for 'value' (VpcId): length 7 is outside allowed range [, 5]",
+            "Invalid value 'vpc-123' for 'value' (VpcId): length 7 is outside allowed range unbounded..=5",
         ];
         if both_local {
-            expected.insert(0, "Invalid value 'bad-long' for 'value' (VpcId): length 8 is outside allowed range [, 5]");
+            expected.insert(0, "Invalid value 'bad-long' for 'value' (VpcId): length 8 is outside allowed range unbounded..=5");
         } else {
             expected.push("test rejected `VpcId`: VpcId rejects bad");
         }
@@ -524,7 +524,7 @@ fn directory_f03_reports_only_the_local_length_error() {
     assert_directory_findings(
         directory_diagnostics(&engine, &[("main.crn", source)], "main.crn"),
         &[(
-            "Invalid value 'abcd' for 'value' (VpcId): length 4 is outside allowed range [, 3]",
+            "Invalid value 'abcd' for 'value' (VpcId): length 4 is outside allowed range unbounded..=3",
             DiagnosticSeverity::ERROR,
             range(1, 2, 7),
         )],
@@ -760,13 +760,13 @@ fn directory_child_module_if_checks_each_undecided_branch() {
             "child/main.crn",
         );
         let mut expected = vec![(
-            "Invalid value 'vpc-123' for 'value' (VpcId): length 7 is outside allowed range [, 5]",
+            "Invalid value 'vpc-123' for 'value' (VpcId): length 7 is outside allowed range unbounded..=5",
             DiagnosticSeverity::ERROR,
             range(1, 2, 7),
         )];
         if first == "bad-long" {
             expected.insert(0, (
-                "Invalid value 'bad-long' for 'value' (VpcId): length 8 is outside allowed range [, 5]",
+                "Invalid value 'bad-long' for 'value' (VpcId): length 8 is outside allowed range unbounded..=5",
                 DiagnosticSeverity::ERROR,
                 range(1, 2, 7),
             ));

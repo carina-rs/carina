@@ -996,7 +996,7 @@ fn assert_enum_witness_masks_env_value(base: DraftType, expected: &str) {
 
 #[test]
 fn review_enum_witness_length_error_masks_env_value() {
-    assert_enum_witness_masks_env_value(string(2, 4, None), "outside allowed range [2, 4]");
+    assert_enum_witness_masks_env_value(string(2, 4, None), "outside allowed range 2..=4");
 }
 
 #[test]
@@ -1162,7 +1162,7 @@ fn module_call_literal_values_obey_the_resolved_witness() {
         findings.iter().any(|finding| finding
             .message()
             .to_string()
-            .contains("length 65 is outside allowed range [1, 64]")),
+            .contains("length 65 is outside allowed range 1..=64")),
         "{findings:#?}"
     );
 }

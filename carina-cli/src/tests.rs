@@ -224,12 +224,12 @@ impl ProviderFactory for EvidenceTestFactory {
 fn provider_config_for_evidence_test(name: &str) -> ExpandedProviderConfig {
     ProviderConfig {
         name: name.to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: Some(format!("file:///{name}.wasm").parse().unwrap()),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     }
 }
@@ -956,20 +956,21 @@ fn plan_file_serde_round_trip() {
             state_serial: Some(1),
             provider_configs: saved_provider_configs(vec![ProviderConfig {
                 name: "aws".to_string(),
-                attributes: IndexMap::from([(
+                attributes: (IndexMap::<String, _>::from([(
                     "region".to_string(),
                     Value::Concrete(ConcreteValue::String("aws.Region.ap_northeast_1".into())),
-                )]),
-                default_tags: IndexMap::new(),
+                )]))
+                .into(),
+                default_tags: Default::default(),
                 source: Some("file:///aws.wasm".parse().unwrap()),
                 version: None,
                 revision: None,
-                unresolved_attributes: IndexMap::new(),
+                unresolved_attributes: Default::default(),
                 binding: None,
             }]),
             backend_config: Some(BackendConfig {
                 backend_type: "s3".to_string(),
-                attributes: HashMap::from([
+                attributes: (HashMap::<String, _>::from([
                     (
                         "bucket".to_string(),
                         Value::Concrete(ConcreteValue::String("my-state".into())),
@@ -978,8 +979,9 @@ fn plan_file_serde_round_trip() {
                         "key".to_string(),
                         Value::Concrete(ConcreteValue::String("prod/carina.state".into())),
                     ),
-                ]),
-                attribute_spans: HashMap::new(),
+                ]))
+                .into(),
+                attribute_spans: Default::default(),
             }),
             plan: plan.to_snapshot(),
             sorted_resources: sorted_resources
@@ -1435,12 +1437,12 @@ fn make_awscc_provider(region_dsl: &str) -> ExpandedProviderConfig {
     );
     ProviderConfig {
         name: "awscc".to_string(),
-        attributes: attrs,
-        default_tags: IndexMap::new(),
+        attributes: (attrs).into(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     }
 }
@@ -2850,6 +2852,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
         &user_dirs,
         &parsed.providers,
         &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
+        &mut crate::commands::human_provider_notices(user_dirs.color_mode()),
     )
     .unwrap();
     let validated_config = providers
@@ -2909,6 +2912,7 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
         &user_dirs,
         &parsed.providers,
         &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
+        &mut crate::commands::human_provider_notices(user_dirs.color_mode()),
     )
     .unwrap();
     let validated_config = providers
@@ -2985,6 +2989,7 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
         &runtime,
         &parsed.providers,
         &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
+        &mut crate::commands::human_provider_notices(runtime.color_mode()),
     )
     .unwrap();
     let validated_config = providers
@@ -4942,12 +4947,12 @@ fn plan_file_decode_rejects_duplicate_schema_fingerprint() {
 fn builtin_mock_provider_config() -> ExpandedProviderConfig {
     ProviderConfig {
         name: "mock".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     }
 }
@@ -5166,12 +5171,12 @@ fn state_only_unloaded_provider_records_absent_schema_and_round_trips() {
 fn recording_invalid_provider_artifact_inventory_does_not_panic() {
     let configured = ExpandedProviderConfig {
         name: "aws".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: Some("file:///missing/aws.wasm".parse().unwrap()),
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     };
     let mut contents = plan_file_contents_with_unchanged_managed_wait_target();

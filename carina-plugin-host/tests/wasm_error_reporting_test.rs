@@ -48,6 +48,7 @@ async fn render_instantiation_error(wat: &str) -> String {
             ProviderLoadIdentity::for_test("fixture", ProviderTrustClass::Untrusted),
         ),
         cache_dir.path(),
+        &mut carina_plugin_host::WasmLoadNoticeSink::new(move |_| {}),
     )
     .await
     {

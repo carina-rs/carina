@@ -707,7 +707,7 @@ fn unique_list_count_error_stays_in_the_second_resource() {
     let tree =
         carina_core::parser::AnalysisTree::try_from_file(document.parsed().unwrap()).unwrap();
     let (diagnostics, reported_duplicate) = test_engine().render_container_findings(
-        &document,
+        &document.for_diagnostics().expect("public fixture"),
         tree.project_resources().nth(1).unwrap(),
         "values",
         effective_type.validate_collect(attributes.get("values").unwrap()),
@@ -793,7 +793,7 @@ fn unique_list_item_error_does_not_mark_a_duplicate_as_reported() {
     let tree =
         carina_core::parser::AnalysisTree::try_from_file(document.parsed().unwrap()).unwrap();
     let (diagnostics, reported_duplicate) = engine.render_container_findings(
-        &document,
+        &document.for_diagnostics().expect("public fixture"),
         tree.project_resources().next().unwrap(),
         "matrix",
         effective_type.validate_collect(value),
@@ -5251,6 +5251,29 @@ awscc.ec2.vpc_gateway_attachment {
 }
 
 #[test]
+fn round8_many_pipe_hints_have_bounded_lsp_analysis() {
+    let source = format!("??? {}", "join('-', []) ".repeat(50_000));
+    let engine = test_engine();
+    let document = create_document(&source);
+    let findings = engine.analyze(&document, None);
+    let hints = findings
+        .iter()
+        .filter(|finding| {
+            finding.message == "Consider using pipe form for 'join': data |> join(...)"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(hints.len(), 50_000);
+    for hint in hints {
+        assert_eq!(
+            hint.severity,
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::INFORMATION)
+        );
+        assert_eq!(hint.range.start, tower_lsp::lsp_types::Position::new(0, 4));
+        assert_eq!(hint.range.end, tower_lsp::lsp_types::Position::new(0, 8));
+    }
+}
+
+#[test]
 fn pipe_preferred_direct_call_produces_info_diagnostic() {
     let engine = test_engine();
     let doc = create_document(
@@ -7680,7 +7703,11 @@ child {}
         .key_span();
     assert_eq!(
         unknown.range,
-        parser_span_range(&doc, unknown_span).unwrap()
+        parser_span_range(
+            &doc.for_diagnostics().expect("public fixture"),
+            unknown_span
+        )
+        .unwrap()
     );
     assert_eq!(unknown.severity, Some(DiagnosticSeverity::ERROR));
 
@@ -7694,7 +7721,11 @@ child {}
         .unwrap_or_else(|| panic!("missing required-argument diagnostic: {diagnostics:#?}"));
     assert_eq!(
         missing.range,
-        parser_span_range(&doc, parsed.module_calls[1].source_span()).unwrap(),
+        parser_span_range(
+            &doc.for_diagnostics().expect("public fixture"),
+            parsed.module_calls[1].source_span()
+        )
+        .unwrap(),
     );
     assert_eq!(missing.severity, Some(DiagnosticSeverity::ERROR));
 }
@@ -7735,7 +7766,11 @@ outer { value = "root" }
         .unwrap_or_else(|| panic!("missing nested module-call diagnostic: {diagnostics:#?}"));
     assert_eq!(
         nested.range,
-        parser_span_range(&doc, parsed.module_calls[0].source_span()).unwrap(),
+        parser_span_range(
+            &doc.for_diagnostics().expect("public fixture"),
+            parsed.module_calls[0].source_span()
+        )
+        .unwrap(),
     );
     assert_eq!(nested.severity, Some(DiagnosticSeverity::ERROR));
 }
@@ -7891,7 +7926,8 @@ let first = unrelated { }
         },
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     );
-    let diagnostics = render_module_call_findings(&doc, &findings);
+    let diagnostics =
+        render_module_call_findings(&doc.for_diagnostics().expect("public fixture"), &findings);
 
     assert!(
         diagnostics.is_empty(),
@@ -10201,7 +10237,7 @@ fn named_annotation_lsp_literals_keep_the_declared_length_bound() {
     assert!(
         diagnostics.iter().any(|diagnostic| diagnostic
             .message
-            .contains("length 65 is outside allowed range [1, 64]")),
+            .contains("length 65 is outside allowed range 1..=64")),
         "{diagnostics:#?}"
     );
 }
@@ -13630,7 +13666,7 @@ provider awscc {
     let finalize_error = engine
         .with_run_for_test(|run| {
             run.finalize_provider_diagnostic(
-                &doc,
+                &doc.for_diagnostics().expect("public fixture"),
                 Some("providers.crn"),
                 &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
             )
@@ -13672,7 +13708,7 @@ let instance = module { count = 'wrong' }
     assert!(
         engine
             .with_run_for_test(|run| run.finalize_provider_diagnostic(
-                &doc,
+                &doc.for_diagnostics().expect("public fixture"),
                 Some("providers.crn"),
                 &carina_core::paths::ResolvedPath::new(root.path()).unwrap()
             ))
@@ -15660,7 +15696,7 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position()
     let merged = engine
         .with_run_for_test(|run| {
             run.parse_and_resolve_merged_with_buffer(
-                &call_doc,
+                &call_doc.for_diagnostics().expect("public fixture"),
                 Some("call.crn"),
                 &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
             )
@@ -15697,7 +15733,7 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position()
     let tree = carina_core::parser::AnalysisTree::try_from_file(merged.directory.parsed.parsed())?;
     let sibling_diagnostics = engine.with_run_for_test(|run| {
         run.module_resolver_error_diagnostics(
-            &sibling_doc,
+            &sibling_doc.for_diagnostics().expect("public fixture"),
             &tree,
             error,
             &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
@@ -15713,7 +15749,7 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position()
     );
     let diagnostics = engine.with_run_for_test(|run| {
         run.module_resolver_error_diagnostics(
-            &module_doc,
+            &module_doc.for_diagnostics().expect("public fixture"),
             &tree,
             error,
             &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
@@ -16634,7 +16670,7 @@ fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
         carina_core::parser::AnalysisTree::try_from_file(merged_result.parsed.parsed()).unwrap();
     let diagnostics = test_engine().with_run_for_test(|run| {
         run.check_mixed_tag_key_styles(
-            &doc,
+            &doc.for_diagnostics().expect("public fixture"),
             &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
             &merged_result,
             &tree,
@@ -17408,7 +17444,13 @@ fn settlement_loaded_error_from_another_file_stays_out_of_the_current_document()
         Vec::new()
     });
     let doc = create_document_at("", "/project/current.crn".into());
-    assert!(DiagnosticEngine::publish_type_diagnostics(terminal, &doc).is_empty());
+    assert!(
+        DiagnosticEngine::publish_type_diagnostics(
+            terminal,
+            &doc.for_diagnostics().expect("public fixture")
+        )
+        .is_empty()
+    );
 }
 
 fn custom_value_depends_on_engine() -> DiagnosticEngine {
@@ -17582,14 +17624,14 @@ fn map_length_diagnostics_in_directory_configuration() {
             assert!(
                 errors[0]
                     .message
-                    .contains("length 11 is outside allowed range [0, 10]"),
+                    .contains("length 11 is outside allowed range 0..=10"),
                 "{diagnostics:#?}"
             );
             // The duplicate Warning for the same error is carina-rs/carina#4265.
             assert!(
                 diagnostics.iter().all(|diagnostic| diagnostic
                     .message
-                    .contains("length 11 is outside allowed range [0, 10]")),
+                    .contains("length 11 is outside allowed range 0..=10")),
                 "{diagnostics:#?}"
             );
         }
@@ -17663,7 +17705,7 @@ fn map_and_list_length_diagnostics_keep_whole_resource_errors() {
         assert!(
             diagnostics.iter().all(|diagnostic| diagnostic
                 .message
-                .contains(&format!("length {count} is outside allowed range [1, 2]"))),
+                .contains(&format!("length {count} is outside allowed range 1..=2"))),
             "{count}: {diagnostics:#?}"
         );
     }
@@ -17904,7 +17946,7 @@ fn review_r7_skipped_lookup_does_not_suppress_a_list_constraint() {
             |diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR)
                 && diagnostic
                     .message
-                    .contains("length 1 is outside allowed range [2, 4]")
+                    .contains("length 1 is outside allowed range 2..=4")
         ),
         "{diagnostics:#?}"
     );

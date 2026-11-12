@@ -1840,12 +1840,12 @@ fn provider_config_with_default_tags(
 ) -> crate::parser::ExpandedProviderConfig {
     crate::parser::ProviderConfig {
         name: "test".to_string(),
-        attributes: indexmap::IndexMap::new(),
-        default_tags: tags,
+        attributes: Default::default(),
+        default_tags: (tags).into(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: indexmap::IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     }
 }

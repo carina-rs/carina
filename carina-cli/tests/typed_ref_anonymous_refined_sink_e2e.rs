@@ -30,8 +30,8 @@ use carina_core::provider::{
 };
 use carina_core::resource::{ConcreteValue, Current, DeferredValue, ResourceId, State, Value};
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, StructField, TypeError, TypeIdentity,
-    ValidatedResourceSchema,
+    AttributeSchema, AttributeType, DiagnosticNumber, NumericRangeBounds, ResourceSchema,
+    StructField, TypeError, TypeIdentity, ValidatedResourceSchema,
 };
 use carina_state::{ResourceState, StateFile};
 use tempfile::TempDir;
@@ -716,7 +716,12 @@ fn typed_ref_int_apply_rejects_unknown_out_of_range_output_before_consumer_creat
         );
         let error = result.failures()[0].to_string();
         assert!(error.contains(CONSUMER), "{error}");
-        assert!(error.contains("outside allowed range"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "Invalid value '{value}' for 'port': outside allowed range 1..=1024"
+            )),
+            "{error}"
+        );
         let EffectFailureKind::Execution { error: cause } = result.failures()[0].kind() else {
             panic!("expected a provider preparation failure: {error}");
         };
@@ -728,8 +733,12 @@ fn typed_ref_int_apply_rejects_unknown_out_of_range_output_before_consumer_creat
         assert!(
             matches!(
                 errors.errors(),
-                [TypeError::ResourceValidationFailed { attribute: Some(attribute), .. }]
-                    if attribute == "port"
+                [TypeError::ValueOutOfRange {
+                    value: DiagnosticNumber::Int(actual),
+                    bounds: NumericRangeBounds::Int { min: Some(1), max: Some(1024) },
+                    attribute: Some(attribute),
+                    type_name: None,
+                }] if attribute == "port" && *actual == value
             ),
             "{errors:?}"
         );

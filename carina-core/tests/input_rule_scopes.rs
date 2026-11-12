@@ -226,10 +226,11 @@ async fn plan_admission_checks_the_host_default_tag_merge_on_both_write_kinds() 
     let config = carina_core::parser::ProviderConfig {
         name: "mock".into(),
         attributes: Default::default(),
-        default_tags: indexmap::IndexMap::from([(
+        default_tags: (indexmap::IndexMap::<String, _>::from([(
             "AWS:private-key".into(),
             string("secret-default-value"),
-        )]),
+        )]))
+        .into(),
         source: None,
         version: None,
         revision: None,

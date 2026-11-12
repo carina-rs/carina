@@ -213,7 +213,7 @@ enum FunctionArgumentTypeCheck {
 
 /// Prepare a user-defined function call: validate args, build substitutions, and return
 /// the child context with all parameters and local lets resolved.
-fn prepare_user_function_call<'cfg, Source: Clone>(
+fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
     func: &UserFunction,
     args: &[FunctionArgument],
     ctx: &ParseContext<'cfg, Source>,
@@ -312,6 +312,7 @@ fn prepare_user_function_call<'cfg, Source: Clone>(
     if has_deferred_type_check {
         ctx.record_pending_function_type_check(PendingFunctionTypeCheck {
             location: func.body.location.clone(),
+            evaluation: ctx.evaluation_site_at(&func.body.location),
             function_name: fn_name.clone(),
             arguments: effective_args.clone(),
             source_line: call_line,
@@ -883,7 +884,7 @@ fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAd
 }
 
 /// Check that a function argument matches the declared parameter type.
-fn check_fn_arg_type<Source: Clone>(
+fn check_fn_arg_type<Source: super::context::EvaluationSource>(
     function: &UserFunction,
     parameter: &FnParam,
     argument: &FunctionArgument,
@@ -1108,7 +1109,7 @@ pub(crate) fn lower_function_arguments(
 pub(crate) fn construct_builtin_call(
     builtin: crate::builtins::Builtin,
     args: Vec<EvalValue>,
-    ctx: &ParseContext<'_, impl Clone>,
+    ctx: &ParseContext<'_, impl super::context::EvaluationSource>,
     line: usize,
 ) -> Result<EvalValue, ParseError> {
     reject_builtin_handle_arguments(&args, line)
@@ -1133,7 +1134,7 @@ pub(crate) fn construct_builtin_call(
         .map(EvalValue::from_value)
 }
 
-pub(super) fn record_deferred_function_type_check<Source: Clone>(
+pub(super) fn record_deferred_function_type_check<Source: super::context::EvaluationSource>(
     function: &UserFunction,
     arguments: &[FunctionArgument],
     ctx: &ParseContext<'_, Source>,
@@ -1148,6 +1149,7 @@ pub(super) fn record_deferred_function_type_check<Source: Clone>(
         || function.return_type.is_some()
     {
         ctx.record_pending_function_type_check(PendingFunctionTypeCheck {
+            evaluation: ctx.evaluation_site_at(&location),
             location,
             function_name: function.name.clone(),
             arguments: function
@@ -1184,7 +1186,7 @@ pub(crate) fn reject_builtin_handle_arguments(
     Ok(())
 }
 
-pub(crate) fn evaluate_user_function_eval<Source: Clone>(
+pub(crate) fn evaluate_user_function_eval<Source: super::context::EvaluationSource>(
     func: &UserFunction,
     args: Vec<EvalValue>,
     ctx: &ParseContext<'_, Source>,
@@ -1210,59 +1212,65 @@ pub(crate) fn validate_pending_function_type_check(
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), ParseError> {
     let ctx = ParseContext::for_evaluation_in_session(session);
-    let Some(function) = functions.get(&check.function_name) else {
-        return Ok(());
-    };
-    if session.function_declaration_failed(function) {
-        return Ok(());
-    }
-    for (parameter, argument) in function.params.iter().zip(&check.arguments) {
-        if function_argument_awaits_module_substitution(argument) {
-            continue;
-        }
-        let result = check_fn_arg_type(
-            function,
-            parameter,
-            argument,
-            &ctx,
-            check.source_line,
-            Some(
-                crate::validation::deferred_types::ProviderTypeCheckSite::new(
-                    check.location.clone(),
-                    format!(
-                        "function '{}' parameter '{}'",
-                        function.name, parameter.name
+    ctx.resume_evaluation(&check.evaluation)
+        .evaluate(|| {
+            let Some(function) = functions.get(&check.function_name) else {
+                return Ok(());
+            };
+            if session.function_declaration_failed(function) {
+                return Ok(());
+            }
+            for (parameter, argument) in function.params.iter().zip(&check.arguments) {
+                if function_argument_awaits_module_substitution(argument) {
+                    continue;
+                }
+                let result = check_fn_arg_type(
+                    function,
+                    parameter,
+                    argument,
+                    &ctx,
+                    check.source_line,
+                    Some(
+                        crate::validation::deferred_types::ProviderTypeCheckSite::new(
+                            check.location.clone(),
+                            format!(
+                                "function '{}' parameter '{}'",
+                                function.name, parameter.name
+                            ),
+                        ),
                     ),
-                ),
-            ),
-        );
-        match result {
-            Ok(FunctionArgumentTypeCheck::Complete)
-            | Ok(FunctionArgumentTypeCheck::AwaitingRuntimeValue)
-            | Ok(FunctionArgumentTypeCheck::RecordedProviderDeferral)
-            | Ok(FunctionArgumentTypeCheck::DeferredHandleAnnotation) => {}
-            Ok(FunctionArgumentTypeCheck::AwaitingProviderSession) => {
-                return Err(ParseError::UserFunctionError(
-                    "provider annotation check requires its session".into(),
-                ));
+                );
+                match result {
+                    Ok(FunctionArgumentTypeCheck::Complete)
+                    | Ok(FunctionArgumentTypeCheck::AwaitingRuntimeValue)
+                    | Ok(FunctionArgumentTypeCheck::RecordedProviderDeferral)
+                    | Ok(FunctionArgumentTypeCheck::DeferredHandleAnnotation) => {}
+                    Ok(FunctionArgumentTypeCheck::AwaitingProviderSession) => {
+                        return Err(ParseError::UserFunctionError(
+                            "provider annotation check requires its session".into(),
+                        ));
+                    }
+                    Err(error) => {
+                        let located = match error {
+                            ParseError::InvalidExpression { message, .. }
+                            | ParseError::UserFunctionError(message) => {
+                                ParseError::InvalidExpression {
+                                    line: check.source_line,
+                                    message,
+                                }
+                            }
+                            other => other,
+                        };
+                        return Err(match &check.source_file {
+                            Some(path) => located.in_file(path.clone()),
+                            None => located,
+                        });
+                    }
+                }
             }
-            Err(error) => {
-                let located = match error {
-                    ParseError::InvalidExpression { message, .. }
-                    | ParseError::UserFunctionError(message) => ParseError::InvalidExpression {
-                        line: check.source_line,
-                        message,
-                    },
-                    other => other,
-                };
-                return Err(match &check.source_file {
-                    Some(path) => located.in_file(path.clone()),
-                    None => located,
-                });
-            }
-        }
-    }
-    Ok(())
+            Ok(())
+        })
+        .map_err(Into::into)
 }
 
 /// Check that a function's return value matches the declared return type.
@@ -1298,7 +1306,7 @@ fn function_return_type_error(
 }
 
 /// Evaluate a user-defined function call by substituting arguments into the body
-pub(crate) fn evaluate_user_function<Source: Clone>(
+pub(crate) fn evaluate_user_function<Source: super::context::EvaluationSource>(
     func: &UserFunction,
     args: &[FunctionArgument],
     ctx: &ParseContext<'_, Source>,
@@ -1362,6 +1370,7 @@ pub(crate) fn evaluate_user_function<Source: Clone>(
         if retain_check {
             ctx.record_pending_function_type_check(PendingFunctionTypeCheck {
                 location: func.body.location.clone(),
+                evaluation: ctx.evaluation_site_at(&func.body.location),
                 function_name: func.name.clone(),
                 arguments: func
                     .params
@@ -1540,7 +1549,7 @@ pub(crate) fn apply_parser_closure(
     construct_builtin_call(builtin, all_args, ctx, line)
 }
 
-pub(super) fn try_evaluate_fn_value<Source: Clone>(
+pub(super) fn try_evaluate_fn_value<Source: super::context::EvaluationSource>(
     value: Value,
     ctx: &ParseContext<'_, Source>,
     containing_line: usize,

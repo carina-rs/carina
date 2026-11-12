@@ -1,7 +1,7 @@
 //! Render schema findings from the sealed resource's parser-owned element locations.
 
 use super::{DiagnosticEngine, render_merged, render_schema_diagnostic};
-use crate::document::Document;
+use crate::document::DiagnosticDocument as Document;
 use carina_core::parser::{AnalysisResourceRef, Located};
 use carina_core::schema::{
     FieldPath, FieldPathStep, LeafPath, LeafPathSegment, MismatchTypeNames, TypeError,
@@ -15,39 +15,8 @@ pub(super) fn reference_mismatch_message(
     attribute: &str,
     types: &MismatchTypeNames,
 ) -> String {
-    use carina_core::resource::{ConcreteValue, DeferredValue, Value};
-
-    let leaf = path
-        .segments()
-        .iter()
-        .try_fold(value, |value, step| match (value, step) {
-            (Value::Concrete(ConcreteValue::List(values)), LeafPathSegment::ListIndex(index)) => {
-                values.get(*index)
-            }
-            (Value::Concrete(ConcreteValue::Map(values)), LeafPathSegment::StructField(name)) => {
-                values.get(name)
-            }
-            (Value::Concrete(ConcreteValue::Map(values)), LeafPathSegment::MapKey(key)) => {
-                values.get(key.expose_plaintext())
-            }
-            _ => None,
-        });
-    let origin = match leaf {
-        Some(Value::Deferred(DeferredValue::ResourceRef { path })) => {
-            Some(format!("from {}", path.to_dot_string()))
-        }
-        Some(Value::Deferred(DeferredValue::BindingRef { binding })) => {
-            Some(format!("from {binding}"))
-        }
-        _ => None,
-    };
-    carina_core::validation::reference_type_mismatch_message(
-        (!path.segments().is_empty()).then_some(attribute),
-        types,
-        origin
-            .as_ref()
-            .map(|origin| origin as &dyn std::fmt::Display),
-    )
+    carina_core::validation::ReferenceMismatch::for_attribute(value, path, attribute, types)
+        .message()
 }
 
 /// A container summary is redundant only when every error it describes has

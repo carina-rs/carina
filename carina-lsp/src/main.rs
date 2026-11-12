@@ -44,11 +44,15 @@ fn resolve_install(
         .ok_or(InstallRejection::MissingSource)?;
     let installed = match source {
         ProviderSource::File(_) => {
-            carina_provider_resolver::find_file_provider_source(source_dir, config)
+            carina_provider_resolver::find_file_provider_source(source_dir, config, &mut |notice| {
+                eprintln!("{notice}")
+            })
         }
         ProviderSource::Remote(_) => {
-            carina_provider_resolver::find_installed_provider(source_dir, config)
-                .map_err(|error| error.to_string())
+            carina_provider_resolver::find_installed_provider(source_dir, config, &mut |notice| {
+                eprintln!("{notice}")
+            })
+            .map_err(|error| error.to_string())
         }
     }
     .map_err(|error| InstallRejection::ResolutionFailed {
@@ -63,7 +67,13 @@ fn install_prober() -> carina_lsp::backend::ProviderInstallProber {
     std::sync::Arc::new(|path, config| {
         carina_core::paths::ResolvedPath::new(path)
             .ok()
-            .map(|root| carina_provider_resolver::provider_artifact_fingerprint(&root, config))
+            .map(|root| {
+                carina_provider_resolver::provider_artifact_fingerprint(
+                    &root,
+                    config,
+                    &mut |notice| eprintln!("{notice}"),
+                )
+            })
             .unwrap_or_else(|| Ok(Default::default()))
     })
 }
@@ -91,7 +101,11 @@ fn build_factories(
         };
         fingerprint.push((
             config.name.clone(),
-            carina_provider_resolver::provider_artifact_fingerprint(&project, config),
+            carina_provider_resolver::provider_artifact_fingerprint(
+                &project,
+                config,
+                &mut |notice| eprintln!("{notice}"),
+            ),
         ));
         let installed = match resolve_install(&project, config) {
             Ok(installed) => installed,
@@ -129,8 +143,23 @@ fn build_factories(
             tokio::runtime::Handle::current().block_on(installed.load_with(
                 user_dirs,
                 grants,
+                &mut |notice| eprintln!("{notice}"),
                 |verified| async move {
-                    carina_plugin_host::WasmProviderFactory::from_bytes(verified, user_dirs).await
+                    carina_plugin_host::WasmProviderFactory::from_bytes(
+                        verified,
+                        user_dirs,
+                        &mut carina_plugin_host::WasmLoadNoticeSink::new(move |notice| {
+                            if matches!(
+                                notice,
+                                carina_plugin_host::WasmLoadNotice::ValidationRebuilt(_)
+                            ) {
+                                log::warn!(target: "carina_plugin_host::wasm_factory", "{notice}");
+                            } else {
+                                eprintln!("{notice}");
+                            }
+                        }),
+                    )
+                    .await
                 },
             ))
         }) {
@@ -226,7 +255,7 @@ mod tests {
     use super::*;
     use carina_core::parser::ProviderConfig;
     use carina_provider_resolver::ProviderArtifactFingerprint;
-    use indexmap::IndexMap;
+
     use std::path::PathBuf;
 
     fn no_local_grants() -> carina_provider_resolver::TrustedLocalGrants {
@@ -258,12 +287,12 @@ mod tests {
             PathBuf::from("/tmp"),
             ProviderConfig {
                 name: name.to_string(),
-                attributes: IndexMap::new(),
-                default_tags: IndexMap::new(),
+                attributes: Default::default(),
+                default_tags: Default::default(),
                 source: source.map(|source| source.parse().unwrap()),
                 version: None,
                 revision: None,
-                unresolved_attributes: IndexMap::new(),
+                unresolved_attributes: Default::default(),
                 binding: binding.map(String::from),
             },
         )

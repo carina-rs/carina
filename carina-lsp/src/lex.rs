@@ -598,7 +598,7 @@ mod tests {
         ] {
             let preprocessed = carina_core::heredoc::preprocess_heredocs(input)
                 .expect("the parser preprocessor must recognize the heredoc");
-            assert_eq!(preprocessed.heredocs.len(), 1, "input: {input:?}");
+            assert_eq!(preprocessed.heredoc_count(), 1, "input: {input:?}");
 
             let lexed = lex(input);
             assert!(

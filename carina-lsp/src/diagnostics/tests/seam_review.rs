@@ -40,6 +40,7 @@ fn review_seam_invalid_judged_tree_becomes_a_diagnostic() {
     .unwrap();
     parsed.resources[0].declaration = Default::default();
     let doc = create_document("mock.Test { input = 'x' }");
+    let doc = doc.for_diagnostics().expect("public fixture");
     let mut diagnostics = Vec::new();
     assert!(analysis_tree(&doc, &parsed, &mut diagnostics).is_none());
     assert_eq!(diagnostics.len(), 1);

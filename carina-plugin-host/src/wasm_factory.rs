@@ -877,6 +877,80 @@ impl fmt::Display for PrecompiledComponentDeserializationError {
 
 impl std::error::Error for PrecompiledComponentDeserializationError {}
 
+/// Host cache events retained until the command chooses its output format.
+/// These safe projections never serialize guest text or provider payloads.
+#[derive(Debug)]
+pub enum WasmLoadNotice {
+    InvalidCache(PrecompiledComponentDeserializationError),
+    CacheWriteFailed(DiagnosticText),
+    ValidationRebuilt(ValidationRecoveryNotice),
+    ProviderDiagnostic(ValidationProviderNotice),
+}
+
+pub struct ValidationProviderNotice(carina_core::provider_text::BoundProviderEvent);
+
+impl fmt::Debug for ValidationProviderNotice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ValidationProviderNotice")
+            .field(&carina_core::provider_text::present_event(&self.0).to_string())
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub struct ValidationRecoveryNotice {
+    reason: PoisonReason,
+}
+
+/// A required, command-owned typed sink that remains valid after loading.
+/// Validation recovery uses the same sink as cache and loader notices.
+#[derive(Clone)]
+pub struct WasmLoadNoticeSink(Arc<std::sync::Mutex<WasmNoticeCallback>>);
+type WasmNoticeCallback = Box<dyn FnMut(WasmLoadNotice) + Send>;
+
+impl WasmLoadNoticeSink {
+    pub fn new(sink: impl FnMut(WasmLoadNotice) + Send + 'static) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Box::new(sink))))
+    }
+    fn emit(&self, notice: WasmLoadNotice) {
+        self.0.lock().expect("WASM notice sink poisoned")(notice);
+    }
+    fn validation_inputs(&self, provider: &str) -> carina_core::provider::ProviderValidationInputs {
+        let notices = self.clone();
+        carina_core::provider::ProviderPlan::state_only()
+            .session_builder(provider, None, None)
+            .with_filtered_diagnostic_sink(move |event| {
+                notices.emit(WasmLoadNotice::ProviderDiagnostic(
+                    ValidationProviderNotice(event),
+                ))
+            })
+            .build()
+            .guest_inputs()
+    }
+}
+
+impl fmt::Display for WasmLoadNotice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidCache(error) => {
+                write!(f, "Precompile cache invalid, recompiling: {error}")
+            }
+            Self::CacheWriteFailed(error) => write!(
+                f,
+                "Failed to write precompile cache, loading directly: {error}"
+            ),
+            Self::ValidationRebuilt(notice) => write!(
+                f,
+                "rebuilt poisoned WASM provider validation instance; previous poison reason: {}",
+                notice.reason
+            ),
+            Self::ProviderDiagnostic(notice) => {
+                carina_core::provider_text::present_event(&notice.0).fmt(f)
+            }
+        }
+    }
+}
+
 /// Failure while creating a credentialed per-binding runtime instance.
 /// Instantiation, `info` guest-call, and decoded initialization failures remain
 /// typed until the `ProviderFactory` trait boundary.
@@ -2414,6 +2488,7 @@ async fn create_schema_only_bindings(
     engine: &Engine,
     component: &Component,
     label: Arc<ProviderLabel>,
+    notices: &WasmLoadNoticeSink,
 ) -> Result<(GuestStore, SchemaOnlyBindings), WasmProviderLoadError> {
     let budget = GuestCallBudget::PRODUCTION;
     let network = GuestNetwork::SchemaOnly;
@@ -2421,6 +2496,7 @@ async fn create_schema_only_bindings(
         create_linker(engine, &network, InstantiationWorld::HttpEnabled).map_err(|failure| {
             single_attempt_load_error(engine, component, InstantiationWorld::HttpEnabled, failure)
         })?;
+    let inputs = notices.validation_inputs(&label.name);
     let mut store = GuestStore::new_with_http_test_route(
         engine,
         label,
@@ -2430,6 +2506,7 @@ async fn create_schema_only_bindings(
         budget,
         None,
     );
+    store.set_input_inventory(inputs.guest_inventory());
     let bindings = SchemaOnlyBindings::instantiate(&mut store, component, &linker)
         .await
         .map_err(|failure| {
@@ -3339,10 +3416,9 @@ impl RebuildContext {
         component: Component,
         label: Arc<ProviderLabel>,
         budget: GuestCallBudget,
+        notices: &WasmLoadNoticeSink,
     ) -> Self {
-        let diagnostic_inputs = carina_core::provider::ProviderPlan::state_only()
-            .session(&label.name, None, None)
-            .guest_inputs();
+        let diagnostic_inputs = notices.validation_inputs(&label.name);
         Self {
             diagnostic_inputs,
             engine,
@@ -3441,16 +3517,18 @@ struct RebuildableInstance {
     state: Mutex<RebuildableState>,
     rebuild: RebuildContext,
     fingerprint_key: [u8; 32],
+    notices: WasmLoadNoticeSink,
     #[cfg(test)]
     additional_instantiations: std::sync::atomic::AtomicUsize,
 }
 
 impl RebuildableInstance {
-    fn new(live: LiveInstance, rebuild: RebuildContext) -> Self {
+    fn new(live: LiveInstance, rebuild: RebuildContext, notices: WasmLoadNoticeSink) -> Self {
         Self {
             state: Mutex::new(RebuildableState::new(live)),
             rebuild,
             fingerprint_key: random_validation_fingerprint_key(),
+            notices,
             #[cfg(test)]
             additional_instantiations: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -3514,9 +3592,9 @@ impl RebuildableInstance {
             }
             state.instance = ValidationInstanceState::Live(Box::new(live));
             if let Some(reason) = previous_poison {
-                log::warn!(
-                    "rebuilt poisoned WASM provider validation instance; previous poison reason: {reason}"
-                );
+                self.notices.emit(WasmLoadNotice::ValidationRebuilt(
+                    ValidationRecoveryNotice { reason },
+                ));
             }
         }
 
@@ -3743,6 +3821,7 @@ impl WasmProviderFactory {
     async fn acquire_cached_component(
         engine: &Engine,
         cwasm_path: &Path,
+        notices: &mut WasmLoadNoticeSink,
     ) -> CachedComponentAcquisition {
         if !cwasm_path.exists() {
             return CachedComponentAcquisition::Miss;
@@ -3763,7 +3842,7 @@ impl WasmProviderFactory {
                 match Self::deserialize_precompiled_component(engine, cwasm_path) {
                     Ok(component) => CachedComponentAcquisition::Hit(component),
                     Err(error) => {
-                        eprintln!("Precompile cache invalid, recompiling: {error}");
+                        notices.emit(WasmLoadNotice::InvalidCache(error));
                         let _ = std::fs::remove_file(cwasm_path);
                         CachedComponentAcquisition::Miss
                     }
@@ -3779,9 +3858,11 @@ impl WasmProviderFactory {
     /// is rejected.
     ///
     /// If the cache directory cannot be created, falls back to compiling without caching.
+    /// Load schema metadata while returning host notices to the command.
     pub async fn from_bytes(
         load: VerifiedLoad,
         user_dirs: &UserDirs,
+        notices: &mut WasmLoadNoticeSink,
     ) -> Result<Self, WasmProviderLoadError> {
         (async {
             VerifiedEgressDeclaration::read(&load)?;
@@ -3794,6 +3875,7 @@ impl WasmProviderFactory {
                     &cache_dir,
                     configured,
                     GuestNetworkRequest::SchemaOnly,
+                    notices,
                 )
                 .await
             });
@@ -3806,6 +3888,7 @@ impl WasmProviderFactory {
     pub async fn from_bytes_with_cache_dir(
         load: VerifiedLoad,
         cache_dir: &Path,
+        notices: &mut WasmLoadNoticeSink,
     ) -> Result<Self, WasmProviderLoadError> {
         (async {
             VerifiedEgressDeclaration::read(&load)?;
@@ -3815,6 +3898,7 @@ impl WasmProviderFactory {
                 cache_dir,
                 configured,
                 GuestNetworkRequest::SchemaOnly,
+                notices,
             )
             .await
         })
@@ -3828,6 +3912,7 @@ impl WasmProviderFactory {
         user_dirs: &UserDirs,
         locked_egress: Option<&LockedEgress>,
         aws: &dyn AwsCredentialProvisioner,
+        notices: &mut WasmLoadNoticeSink,
     ) -> Result<Self, WasmProviderLoadError> {
         (async {
             let declaration = VerifiedEgressDeclaration::read(&load)?;
@@ -3841,6 +3926,7 @@ impl WasmProviderFactory {
                 &cache_dir,
                 configured,
                 GuestNetworkRequest::Runtime { egress, aws },
+                notices,
             )
             .await
         })
@@ -3854,6 +3940,7 @@ impl WasmProviderFactory {
         cache_dir: &Path,
         locked_egress: Option<&LockedEgress>,
         aws: &dyn AwsCredentialProvisioner,
+        notices: &mut WasmLoadNoticeSink,
     ) -> Result<Self, WasmProviderLoadError> {
         (async {
             let declaration = VerifiedEgressDeclaration::read(&load)?;
@@ -3865,6 +3952,7 @@ impl WasmProviderFactory {
                 cache_dir,
                 configured,
                 GuestNetworkRequest::Runtime { egress, aws },
+                notices,
             )
             .await
         })
@@ -3876,6 +3964,7 @@ impl WasmProviderFactory {
         cache_dir: &Path,
         configured: ConfiguredProvider,
         network_request: GuestNetworkRequest<'_>,
+        notices: &mut WasmLoadNoticeSink,
     ) -> Result<Self, WasmProviderLoadError> {
         let engine = Self::create_engine()?;
         let cwasm_name = Self::cache_key(wasm_bytes, &engine);
@@ -3886,16 +3975,22 @@ impl WasmProviderFactory {
         if !cwasm_path.exists()
             && let Err(error) = Self::precompile(&engine, wasm_bytes, cache_dir)
         {
-            eprintln!("Failed to write precompile cache, loading directly: {error}");
-            return Self::new_uncached_configured(engine, wasm_bytes, configured, network_request)
-                .await;
+            notices.emit(WasmLoadNotice::CacheWriteFailed(error));
+            return Self::new_uncached_configured(
+                engine,
+                wasm_bytes,
+                configured,
+                network_request,
+                notices,
+            )
+            .await;
         }
 
         // On resolver-backed loads, verified provider bytes select the
         // `.cwasm` by content hash. The `.cwasm` itself is native code
         // deserialized unsafely and trusted as user-owned cache state under
         // the user's home; it is not verified against the provider lock.
-        let component = match Self::acquire_cached_component(&engine, &cwasm_path).await {
+        let component = match Self::acquire_cached_component(&engine, &cwasm_path, notices).await {
             CachedComponentAcquisition::Hit(component) => component,
             CachedComponentAcquisition::Miss => {
                 // Try to precompile and cache.
@@ -3903,7 +3998,7 @@ impl WasmProviderFactory {
                     Ok(cwasm_path) => Self::deserialize_precompiled_component(&engine, &cwasm_path)
                         .map_err(WasmProviderLoadError::PrecompiledDeserialization)?,
                     Err(error) => {
-                        eprintln!("Failed to write precompile cache, loading directly: {error}");
+                        notices.emit(WasmLoadNotice::CacheWriteFailed(error));
                         // Cache inspection already required this engine. Reuse
                         // it so a stale-cache recovery failure cannot create a
                         // second engine or orphan an epoch ticker.
@@ -3914,7 +4009,15 @@ impl WasmProviderFactory {
         };
 
         let epoch_ticker = EpochTicker::start(engine.clone());
-        Self::bring_up_component(engine, component, epoch_ticker, configured, network_request).await
+        Self::bring_up_component(
+            engine,
+            component,
+            epoch_ticker,
+            configured,
+            network_request,
+            notices,
+        )
+        .await
     }
 
     /// Load provider bytes without any precompile caching.
@@ -3935,6 +4038,7 @@ impl WasmProviderFactory {
             load.bytes().as_bytes(),
             configured,
             GuestNetworkRequest::Runtime { egress, aws },
+            &mut WasmLoadNoticeSink::new(|_| {}),
         )
         .await
     }
@@ -3944,11 +4048,20 @@ impl WasmProviderFactory {
         wasm_bytes: &[u8],
         configured: ConfiguredProvider,
         network_request: GuestNetworkRequest<'_>,
+        notices: &mut WasmLoadNoticeSink,
     ) -> Result<Self, WasmProviderLoadError> {
         let component = Self::load_component_from_bytes(&engine, wasm_bytes)?;
         let epoch_ticker = EpochTicker::start(engine.clone());
 
-        Self::bring_up_component(engine, component, epoch_ticker, configured, network_request).await
+        Self::bring_up_component(
+            engine,
+            component,
+            epoch_ticker,
+            configured,
+            network_request,
+            notices,
+        )
+        .await
     }
 
     /// Precompile provider bytes and publish a .cwasm file in `cache_dir`.
@@ -4021,6 +4134,7 @@ impl WasmProviderFactory {
     pub async fn from_precompiled(
         cwasm_path: &Path,
         identity: ProviderLoadIdentity,
+        notices: &mut WasmLoadNoticeSink,
     ) -> Result<Self, WasmProviderLoadError> {
         (async {
             let engine = Self::create_engine()?;
@@ -4034,6 +4148,7 @@ impl WasmProviderFactory {
                 epoch_ticker,
                 ConfiguredProvider::new(&identity),
                 GuestNetworkRequest::SchemaOnly,
+                notices,
             )
             .await
         })
@@ -4098,6 +4213,7 @@ impl SchemaOnlyWasmProviderFactory {
     pub async fn from_bytes(
         load: VerifiedLoad,
         _user_dirs: &UserDirs,
+        notices: &mut WasmLoadNoticeSink,
     ) -> Result<Self, WasmProviderLoadError> {
         (async {
             let configured = ConfiguredProvider::new(load.identity());
@@ -4107,7 +4223,7 @@ impl SchemaOnlyWasmProviderFactory {
             // publish native code even though the command promises no writes.
             let component =
                 WasmProviderFactory::load_component_from_bytes(&engine, load.bytes().as_bytes())?;
-            Self::bring_up_component(engine, component, configured).await
+            Self::bring_up_component(engine, component, configured, notices).await
         })
         .await
     }

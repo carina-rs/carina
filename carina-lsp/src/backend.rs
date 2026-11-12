@@ -938,7 +938,6 @@ mod tests {
     use super::*;
     use carina_core::provider::{BoxFuture, ProviderResult};
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-    use indexmap::IndexMap;
 
     struct BlockSchemaFactory {
         block_name: &'static str,
@@ -1698,10 +1697,10 @@ let duplicate = mock.test.resource {
                 source: Some("github.com/carina-rs/stub".parse().unwrap()),
                 version: None,
                 revision: None,
-                unresolved_attributes: IndexMap::new(),
+                unresolved_attributes: Default::default(),
                 binding: None,
-                attributes: IndexMap::new(),
-                default_tags: IndexMap::new(),
+                attributes: Default::default(),
+                default_tags: Default::default(),
             });
         let configs = vec![(tmp.path().to_path_buf(), config)];
         let prober = test_prober(Some(installed.clone()));
@@ -1732,10 +1731,10 @@ let duplicate = mock.test.resource {
                 source: None,
                 version: None,
                 revision: None,
-                unresolved_attributes: IndexMap::new(),
+                unresolved_attributes: Default::default(),
                 binding: None,
-                attributes: IndexMap::new(),
-                default_tags: IndexMap::new(),
+                attributes: Default::default(),
+                default_tags: Default::default(),
             });
         let configs = vec![(tmp.path().to_path_buf(), config)];
         let prober = test_prober(None);
@@ -1752,17 +1751,16 @@ mod reload_skip_tests {
     use super::*;
     use carina_core::parser::ProviderConfig;
     use carina_core::resource::{ConcreteValue, ParserPlaceholder, Value};
-    use indexmap::IndexMap;
 
     fn mk_config(name: &str, source: Option<&str>) -> ProviderConfig<ParserPlaceholder> {
         ProviderConfig {
             name: name.into(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: source.map(|source| source.parse().unwrap()),
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: None,
         }
     }
@@ -1900,12 +1898,12 @@ mod reload_skip_tests {
         let dir = std::path::PathBuf::from("/tmp/x");
         let mut cfg_a = mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc"));
         cfg_a.attributes.insert(
-            "region".into(),
+            "region",
             Value::Concrete(ConcreteValue::String("us-east-1".into())),
         );
         let mut cfg_b = mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc"));
         cfg_b.attributes.insert(
-            "region".into(),
+            "region",
             Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
         );
         let a = vec![(dir.clone(), discovered(cfg_a))];
@@ -2016,20 +2014,20 @@ mod reload_skip_tests {
         let dir = std::path::PathBuf::from("/tmp/x");
         let mut cfg_a = mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc"));
         cfg_a.attributes.insert(
-            "region".into(),
+            "region",
             Value::Concrete(ConcreteValue::String("us-east-1".into())),
         );
         cfg_a.attributes.insert(
-            "profile".into(),
+            "profile",
             Value::Concrete(ConcreteValue::String("dev".into())),
         );
         let mut cfg_b = mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc"));
         cfg_b.attributes.insert(
-            "profile".into(),
+            "profile",
             Value::Concrete(ConcreteValue::String("dev".into())),
         );
         cfg_b.attributes.insert(
-            "region".into(),
+            "region",
             Value::Concrete(ConcreteValue::String("us-east-1".into())),
         );
         let a = vec![(dir.clone(), discovered(cfg_a))];

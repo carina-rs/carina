@@ -1884,10 +1884,11 @@ mod tests {
         let configuration = crate::parser::ExpandedInferredFile {
             backend: Some(crate::parser::BackendConfig {
                 backend_type: "s3".into(),
-                attributes: HashMap::from([(
+                attributes: (HashMap::<String, _>::from([(
                     "bucket".into(),
                     Value::Concrete(ConcreteValue::String("".into())),
-                )]),
+                )]))
+                .into(),
                 attribute_spans: Default::default(),
             }),
             ..Default::default()

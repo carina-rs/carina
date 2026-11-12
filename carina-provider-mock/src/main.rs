@@ -982,7 +982,7 @@ impl CarinaProvider for MockProcessProvider {
             )
             .with_status(403));
         }
-        if attrs.contains_key("__mock_validate_config_trap__") {
+        if attrs.contains_key("__mock_validate_config_trap__") || attrs.contains_key(CONFIG_TRAP) {
             panic!("intentional mock validate_config trap");
         }
         if let Some(Value::Int(delay_millis)) = attrs.get("validate_delay_millis")
@@ -2165,3 +2165,6 @@ carina_plugin_sdk::export_provider!(MockProcessProvider);
 
 #[cfg(target_arch = "wasm32")]
 fn main() {}
+
+// Share the original panic site so public diagnostic coordinates stay stable.
+const CONFIG_TRAP: &str = "validate_config_trap";

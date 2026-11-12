@@ -21,7 +21,7 @@ use yoke::{Yoke, Yokeable};
 /// The positive control compiles the same production modules in the doctest's
 /// crate, so these probes cannot pass merely because the methods are private.
 ///
-/// ```no_run
+/// ```
 /// # include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/internal_rule_input_doctest.rs"));
 /// fn dispatch_checked_input(ready: &crate::provider::ProviderReadyResource, request: &crate::provider::UpdateRequest, schema: &crate::schema::ValidatedResourceSchema) {
 ///     let _ = (ready.protected_desired_tree(), request.patch());

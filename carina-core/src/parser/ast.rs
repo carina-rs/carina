@@ -840,7 +840,7 @@ pub struct ParsedDeferredForExpression<
 > {
     location: DiagnosticLocation,
     pub span: SourceSpan,
-    pub header: String,
+    pub header: super::AuthoredExpressionText,
     pub(crate) target: DeferredForTarget<B>,
     pub iterable: Value<P, B>,
     pub(crate) iterable_state: ParsedDeferredForIterableState,
@@ -852,7 +852,7 @@ pub struct ParsedDeferredForExpression<
 pub(crate) struct ParsedDeferredForParts<'a, P: ValueKind, B: BindingAddress> {
     pub location: &'a DiagnosticLocation,
     pub span: SourceSpan,
-    pub header: &'a str,
+    pub header: &'a super::AuthoredExpressionText,
     pub target: &'a DeferredForTarget<B>,
     pub iterable: &'a Value<P, B>,
     pub iterable_state: &'a ParsedDeferredForIterableState,
@@ -885,7 +885,12 @@ impl<P: ValueKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
     }
 
     pub(crate) fn new(
-        site: (Option<String>, usize, SourceSpan, String),
+        site: (
+            Option<String>,
+            usize,
+            SourceSpan,
+            super::AuthoredExpressionText,
+        ),
         target: DeferredForTarget<B>,
         iterable: Value<P, B>,
         iterable_state: ParsedDeferredForIterableState,
@@ -904,7 +909,11 @@ impl<P: ValueKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
     }
 
     pub(crate) fn from_location(
-        site: (DiagnosticLocation, SourceSpan, String),
+        site: (
+            DiagnosticLocation,
+            SourceSpan,
+            super::AuthoredExpressionText,
+        ),
         target: DeferredForTarget<B>,
         iterable: Value<P, B>,
         iterable_state: ParsedDeferredForIterableState,
@@ -1143,7 +1152,7 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
         };
         Ok(DeferredForExpression::from_template_resource(
             location,
-            header,
+            header.to_string(),
             target,
             iterable,
             binding,
@@ -2804,14 +2813,14 @@ impl<P: ValueKind> ValidateExpr<P, AbsoluteBindingAddress> {
 #[derive(Debug, Clone)]
 pub struct RequireBlock<P: ValueKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
     pub condition: ValidateExpr<P, B>,
-    pub error_message: String,
+    pub error_message: super::AuthoredExpressionText,
     source: DeclarationSource,
 }
 
 impl<P: ValueKind, B: BindingAddress> RequireBlock<P, B> {
     pub(crate) fn new_in_source(
         condition: ValidateExpr<P, B>,
-        error_message: String,
+        error_message: super::AuthoredExpressionText,
         source_span: SourceSpan,
         source_location: super::DeclarationLocation,
     ) -> Self {
@@ -2826,7 +2835,7 @@ impl<P: ValueKind, B: BindingAddress> RequireBlock<P, B> {
     pub(crate) fn dummy(condition: ValidateExpr<P, B>, error_message: String) -> Self {
         Self::new_in_source(
             condition,
-            error_message,
+            super::AuthoredExpressionText::literal_value(&error_message),
             SourceSpan::dummy(),
             ModuleCallId::test_dummy_in("test.crn").location,
         )
@@ -3975,10 +3984,33 @@ pub enum BindingUseOwner {
 /// One structural step below a resource attribute or module argument.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AttributePathSegment {
+    ProtectedKey {
+        kind: ProtectedPathKind,
+        key: super::AttributeKey,
+    },
     Attribute(String),
     ListIndex(usize),
     Key(String),
     StructField(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProtectedPathKind {
+    Attribute,
+    Key,
+    StructField,
+}
+
+impl AttributePathSegment {
+    pub(crate) fn semantic_key(&self) -> Option<super::AttributeKey> {
+        match self {
+            Self::ProtectedKey { key, .. } => Some(key.clone()),
+            Self::Attribute(name) | Self::Key(name) | Self::StructField(name) => {
+                Some(super::AttributeKey::literal(name.clone()))
+            }
+            Self::ListIndex(_) => None,
+        }
+    }
 }
 
 /// Parser-authored path from an owning sink to one bare binding leaf.
@@ -3986,6 +4018,9 @@ pub enum AttributePathSegment {
 pub struct AttributePath(Arc<[AttributePathSegment]>);
 
 impl AttributePath {
+    pub(in crate::parser) fn root_segment(segment: AttributePathSegment) -> Self {
+        Self(Arc::from([segment]))
+    }
     pub(in crate::parser) fn root(name: impl Into<String>) -> Self {
         Self(Arc::from([AttributePathSegment::Attribute(name.into())]))
     }
@@ -4000,15 +4035,16 @@ impl AttributePath {
         &self.0
     }
 
-    pub fn root_name(&self) -> &str {
+    pub fn root_name(&self) -> super::AttributeKey {
         match self.0.first() {
-            Some(AttributePathSegment::Attribute(name)) => name,
             Some(
-                AttributePathSegment::ListIndex(_)
-                | AttributePathSegment::Key(_)
-                | AttributePathSegment::StructField(_),
-            )
-            | None => unreachable!("AttributePath is constructed with an attribute root"),
+                segment @ (AttributePathSegment::Attribute(_)
+                | AttributePathSegment::ProtectedKey {
+                    kind: ProtectedPathKind::Attribute,
+                    ..
+                }),
+            ) => segment.semantic_key().expect("attribute root"),
+            _ => unreachable!("AttributePath is constructed with an attribute root"),
         }
     }
 }
@@ -5318,6 +5354,7 @@ impl<B: BindingAddress> Default for ParserBindingMetadata<B> {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PendingFunctionTypeCheck<B: BindingAddress = RelativeBindingName> {
     pub(crate) location: super::DeclarationLocation,
+    pub(crate) evaluation: super::evaluation::EvaluationSite,
     pub(crate) function_name: String,
     pub(crate) arguments: Vec<FunctionArgument<ParserPlaceholder, B>>,
     pub(crate) source_line: usize,
@@ -5520,6 +5557,7 @@ impl ParserBindingMetadata<RelativeBindingName> {
                 .map(|check| {
                     let PendingFunctionTypeCheck {
                         location,
+                        evaluation,
                         function_name,
                         arguments,
                         source_line,
@@ -5528,6 +5566,7 @@ impl ParserBindingMetadata<RelativeBindingName> {
                     } = check;
                     PendingFunctionTypeCheck {
                         location,
+                        evaluation,
                         function_name,
                         arguments: arguments
                             .into_iter()
@@ -5596,6 +5635,7 @@ impl ParserBindingMetadata<AbsoluteBindingAddress> {
         for check in pending_function_type_checks {
             let PendingFunctionTypeCheck {
                 location: _location,
+                evaluation: _evaluation,
                 function_name: _function_name,
                 arguments,
                 source_line: _source_line,
@@ -5617,11 +5657,15 @@ impl ParserBindingMetadata<AbsoluteBindingAddress> {
 ))]
 pub struct ProviderConfig<P: ValueKind = NoPlaceholder, B: BindingAddress = RelativeBindingName> {
     pub name: String,
-    pub attributes: IndexMap<String, Value<P, B>>,
+    pub attributes: super::ConfigurationAttributes<Value<P, B>>,
     /// Default tags to apply to all resources that support tags.
     /// Extracted from `default_tags = { ... }` in the provider block.
-    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
-    pub default_tags: IndexMap<String, Value<P, B>>,
+    #[serde(
+        default,
+        skip_serializing_if = "IndexMap::is_empty",
+        deserialize_with = "super::ConfigurationAttributes::deserialize_literal"
+    )]
+    pub default_tags: super::ConfigurationAttributes<Value<P, B>>,
     /// Provider source (e.g., "carina-rs/awscc", "github.com/carina-rs/carina-provider-awscc",
     /// or "file:///path/to/binary").
     /// Extracted from the provider block and not passed to the provider.
@@ -5639,7 +5683,7 @@ pub struct ProviderConfig<P: ValueKind = NoPlaceholder, B: BindingAddress = Rela
     /// drained and validated by the post-resolver finalize step. Invariant:
     /// empty after finalization. In-memory transit only — never serialized.
     #[serde(skip)]
-    pub unresolved_attributes: IndexMap<String, Value<P, B>>,
+    pub unresolved_attributes: super::ConfigurationAttributes<Value<P, B>>,
     /// The sole source of truth for whether this entry is default or named.
     /// `Some(name)` identifies a named instance declared via
     /// `let <name> = provider <kind> { ... }`; `None` identifies the default
@@ -5666,11 +5710,11 @@ impl<P: ValueKind, B: BindingAddress> ProviderConfig<P, B> {
             unresolved_attributes,
             binding,
         } = self;
-        let mut section = |values: &IndexMap<String, Value<P, B>>| {
+        let mut section = |values: &super::ConfigurationAttributes<Value<P, B>>| {
             values
                 .iter()
                 .map(|(key, value)| map(value).map(|value| (key.clone(), value)))
-                .collect::<Result<IndexMap<_, _>, E>>()
+                .collect::<Result<super::ConfigurationAttributes<_>, E>>()
         };
         Ok(ProviderConfig {
             name: name.clone(),
@@ -5712,12 +5756,12 @@ impl<P: ValueKind, B: BindingAddress> ProviderConfig<P, B> {
         let _configuration_values = (attributes, default_tags, unresolved_attributes);
         ProviderConfig {
             name: name.clone(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: super::ConfigurationAttributes::new(),
+            default_tags: super::ConfigurationAttributes::new(),
             source: source.clone(),
             version: version.clone(),
             revision: revision.clone(),
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: super::ConfigurationAttributes::new(),
             binding: binding.clone(),
         }
     }
@@ -5729,15 +5773,14 @@ impl<B: BindingAddress> ProviderConfig<ParserPlaceholder, B> {
     ) -> Result<ProviderConfig<NoPlaceholder, B>, crate::resource::LeftoverPlaceholder> {
         Ok(ProviderConfig {
             name: self.name,
-            attributes: crate::resource::into_expanded_value_map(self.attributes, None)?,
-            default_tags: crate::resource::into_expanded_value_map(self.default_tags, None)?,
+            attributes: self.attributes.into_try_map(Value::into_expanded)?,
+            default_tags: self.default_tags.into_try_map(Value::into_expanded)?,
             source: self.source,
             version: self.version,
             revision: self.revision,
-            unresolved_attributes: crate::resource::into_expanded_value_map(
-                self.unresolved_attributes,
-                None,
-            )?,
+            unresolved_attributes: self
+                .unresolved_attributes
+                .into_try_map(Value::into_expanded)?,
             binding: self.binding,
         })
     }
@@ -5749,11 +5792,11 @@ pub struct BackendConfig<P: ValueKind = NoPlaceholder, B: BindingAddress = Relat
     /// Backend type (e.g., "s3", "gcs", "local")
     pub backend_type: String,
     /// Backend-specific attributes
-    pub attributes: HashMap<String, Value<P, B>>,
+    pub attributes: super::ConfigurationAttributes<Value<P, B>>,
     /// Parser-authored source spans for attribute keys. Runtime and saved-plan
     /// representations deliberately omit this diagnostic-only metadata.
     #[serde(skip)]
-    pub attribute_spans: HashMap<String, SourceSpan>,
+    pub attribute_spans: super::ConfigurationAttributes<SourceSpan>,
 }
 
 impl<B: BindingAddress> BackendConfig<ParserPlaceholder, B> {
@@ -5762,7 +5805,7 @@ impl<B: BindingAddress> BackendConfig<ParserPlaceholder, B> {
     ) -> Result<BackendConfig<NoPlaceholder, B>, crate::resource::LeftoverPlaceholder> {
         Ok(BackendConfig {
             backend_type: self.backend_type,
-            attributes: crate::resource::into_expanded_value_map(self.attributes, None)?,
+            attributes: self.attributes.into_try_map(Value::into_expanded)?,
             attribute_spans: self.attribute_spans,
         })
     }
@@ -8024,7 +8067,7 @@ impl<B: BindingAddress> ParserBoundaryDeferredPhase<B>
         for deferred in &self.expressions {
             deferred.iterable.collect_leftover_placeholders(
                 LeftoverPlaceholderContext::DeferredForIterable {
-                    header: deferred.header.clone(),
+                    header: deferred.header.to_string(),
                 },
                 module_expansion_field,
                 errors,
@@ -8042,7 +8085,7 @@ impl<B: BindingAddress> ParserBoundaryDeferredPhase<B>
                     for (attribute, value) in &data_source.attributes {
                         value.collect_leftover_placeholders(
                             LeftoverPlaceholderContext::DeferredForAttribute {
-                                header: deferred.header.clone(),
+                                header: deferred.header.to_string(),
                                 attribute: attribute.clone(),
                             },
                             deferred_template,
@@ -8254,7 +8297,7 @@ where
             value.collect_leftover_placeholders(
                 LeftoverPlaceholderContext::ProviderAttribute {
                     provider: name.clone(),
-                    attribute: format!("default_tags.{attribute}"),
+                    attribute: attribute.clone().with_diagnostic_prefix("default_tags."),
                 },
                 reject_all,
                 &mut errors,
@@ -9647,12 +9690,12 @@ mod substitute_placeholder_tests {
         );
         parsed.providers.push(ProviderConfig {
             name: "mock".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
+            attributes: Default::default(),
+            default_tags: Default::default(),
             source: None,
             version: None,
             revision: None,
-            unresolved_attributes: IndexMap::new(),
+            unresolved_attributes: Default::default(),
             binding: Some("provider_name".to_string()),
         });
         parsed
@@ -10204,7 +10247,9 @@ mod substitute_placeholder_tests {
                 None,
                 17,
                 SourceSpan::dummy(),
-                "for item in upstream.items".into(),
+                crate::parser::AuthoredExpressionText::test_for_header(
+                    "let rows = for item in upstream.items { mock.test.resource {} }",
+                ),
             ),
             DeferredForTarget::bound(RelativeBindingName::new("rows")).unwrap(),
             Value::resource_ref("upstream", "items", vec![]),
@@ -10400,7 +10445,9 @@ mod substitute_placeholder_tests {
                 None,
                 1,
                 SourceSpan::dummy(),
-                "for item in upstream.items".to_string(),
+                crate::parser::AuthoredExpressionText::test_for_header(
+                    "let rows = for item in upstream.items { mock.test.resource {} }",
+                ),
             ),
             owning_target,
             crate::resource::Value::<ParserPlaceholder, RelativeBindingName>::resource_ref(
@@ -10445,7 +10492,9 @@ mod substitute_placeholder_tests {
                 None,
                 1,
                 SourceSpan::dummy(),
-                "for item in upstream.items".to_string(),
+                crate::parser::AuthoredExpressionText::test_for_header(
+                    "let rows = for item in upstream.items { mock.test.resource {} }",
+                ),
             ),
             target,
             crate::resource::Value::<ParserPlaceholder, RelativeBindingName>::resource_ref(
@@ -10502,7 +10551,9 @@ mod substitute_placeholder_tests {
                 None,
                 1,
                 SourceSpan::dummy(),
-                "for item in upstream.items".to_string(),
+                crate::parser::AuthoredExpressionText::test_for_header(
+                    "let rows = for item in upstream.items { mock.test.resource {} }",
+                ),
             ),
             target,
             crate::resource::Value::<ParserPlaceholder, RelativeBindingName>::resource_ref(

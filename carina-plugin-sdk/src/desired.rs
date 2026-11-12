@@ -243,8 +243,8 @@ impl DesiredInputs<'_> {
         let owner = Arc::new(());
         let entries = resource
             .wire_attributes()
-            .iter()
-            .map(|(name, value)| (name.clone(), checked_value(value.value())))
+            .transport_iter()
+            .map(|(name, value)| (name.to_owned(), checked_value(value.value())))
             .collect();
         let mut attributes = DesiredMap { entries };
         retain_native_map_metadata(&mut attributes, resource.as_inner().attributes(), &owner);

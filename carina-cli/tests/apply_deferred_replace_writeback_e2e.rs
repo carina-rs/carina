@@ -19,7 +19,6 @@ use carina_core::resource::{
     RelativeBindingName, ResolvedResource, Resource, ResourceId, State, Value,
 };
 use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile, check_and_migrate};
-use indexmap::IndexMap;
 use tempfile::TempDir;
 
 fn resolved(resource: Resource) -> ResolvedResource {
@@ -59,12 +58,12 @@ fn mock_saved_provider_configs() -> SavedProviderConfigs {
     let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = vec![ProviderConfig {
         name: "mock".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     }];
     let resolved = carina_core::validation::deferred_types::with_session_for_test(
@@ -84,12 +83,12 @@ fn mock_saved_provider_configs() -> SavedProviderConfigs {
 fn record_with_mock_provider(contents: PlanFileContents) -> PlanFile {
     let configs: [ProviderConfig; 1] = [ProviderConfig {
         name: "mock".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::new(),
+        attributes: Default::default(),
+        default_tags: Default::default(),
         source: None,
         version: None,
         revision: None,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes: Default::default(),
         binding: None,
     }];
     let providers = ValidatedConfig::for_test(
@@ -346,10 +345,11 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
         provider_configs: mock_saved_provider_configs(),
         backend_config: Some(BackendConfig {
             backend_type: "local".to_string(),
-            attributes: HashMap::from([(
+            attributes: (HashMap::<String, _>::from([(
                 "path".to_string(),
                 Value::Concrete(ConcreteValue::String("carina.state.json".into())),
-            )]),
+            )]))
+            .into(),
             attribute_spans: Default::default(),
         }),
         plan: plan.to_snapshot(),
@@ -487,10 +487,11 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
         provider_configs: mock_saved_provider_configs(),
         backend_config: Some(BackendConfig {
             backend_type: "local".to_string(),
-            attributes: HashMap::from([(
+            attributes: (HashMap::<String, _>::from([(
                 "path".to_string(),
                 Value::Concrete(ConcreteValue::String("carina.state.json".into())),
-            )]),
+            )]))
+            .into(),
             attribute_spans: Default::default(),
         }),
         plan: plan.to_snapshot(),

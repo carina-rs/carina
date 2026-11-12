@@ -27,8 +27,16 @@ impl std::fmt::Display for FormatParseError {
 
 impl std::error::Error for FormatParseError {}
 
-impl From<pest::error::Error<Rule>> for FormatParseError {
-    fn from(err: pest::error::Error<Rule>) -> Self {
+impl FormatParseError {
+    fn from_syntax(err: pest::error::Error<Rule>, source: &str) -> Self {
+        let end = match err.location {
+            pest::error::InputLocation::Pos(byte) => byte,
+            pest::error::InputLocation::Span((_, end)) => end,
+        };
+        assert!(
+            end <= source.len(),
+            "formatter admission requires the complete source"
+        );
         let (line, column) = match err.line_col {
             pest::error::LineColLocation::Pos((l, c)) => (l, c),
             pest::error::LineColLocation::Span((l, c), _) => (l, c),
@@ -43,12 +51,24 @@ impl From<pest::error::Error<Rule>> for FormatParseError {
 
 /// Parse source code for formatting
 pub fn parse(source: &str) -> Result<pest::iterators::Pairs<'_, Rule>, FormatParseError> {
-    CarinaFmtParser::parse(Rule::file, source).map_err(FormatParseError::from)
+    CarinaFmtParser::parse(Rule::file, source)
+        .map_err(|error| FormatParseError::from_syntax(error, source))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formatter_pest_errors_have_no_source_free_conversion() {
+        trait AmbiguousIfFrom<A> {
+            fn check() {}
+        }
+        impl<T> AmbiguousIfFrom<()> for T {}
+        struct ViaFrom;
+        impl<T: From<pest::error::Error<Rule>>> AmbiguousIfFrom<ViaFrom> for T {}
+        let _ = <FormatParseError as AmbiguousIfFrom<_>>::check;
+    }
 
     #[test]
     fn test_parse_simple_provider() {

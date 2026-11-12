@@ -16,9 +16,9 @@ use crate::parser::{
 use crate::parser::{parse_expression, parse_expression_eval, parse_expression_in_sink};
 use crate::resource::{
     AuthoredConcreteValue as ConcreteValue, AuthoredDeferredValue as DeferredValue,
-    AuthoredDirectives as Directives, DiagnosticSourceLocations, DirectiveExpr, LifecycleDirective,
-    LoopElementOrigin, LoopProvenance, ParsedIgnorePath, ParsedIgnorePathSegment,
-    RelativeBindingName, ResourceId, ResourceIdentity, UnexpandedDependencyFields,
+    AuthoredDirectives as Directives, DiagnosticSourceLocations, DirectiveExpr, LoopElementOrigin,
+    LoopProvenance, ParsedIgnorePath, ParsedIgnorePathSegment, RelativeBindingName, ResourceId,
+    ResourceIdentity, UnexpandedDependencyFields,
 };
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
@@ -261,7 +261,7 @@ fn parse_block_contents_with_quoted(
                         let key_pair =
                             next_pair(&mut attr_inner, "attribute name", "block content")?;
                         let key_span = key_pair.as_span();
-                        let key = ctx.key_string(key_pair)?;
+                        let key = ctx.key_string(key_pair.clone())?;
                         reject_reserved_resource_attribute(
                             &key,
                             key_span,
@@ -270,7 +270,7 @@ fn parse_block_contents_with_quoted(
                         let value_pair =
                             next_pair(&mut attr_inner, "attribute value", "block content")?;
                         record_quoted_if_literal(quoted_out, &key, &value_pair);
-                        let value_mode = mode.at_named_child(key.clone());
+                        let value_mode = mode.at_named_child(key.clone(), &key_pair);
                         // Storage consumes the complete sink and shares its
                         // authored handles with the syntax inventory.
                         let expression =
@@ -288,9 +288,9 @@ fn parse_block_contents_with_quoted(
                     }
                     Rule::nested_block => {
                         let mut block_inner = inner.into_inner();
-                        let block_name = next_pair(&mut block_inner, "block name", "nested block")?
-                            .as_str()
-                            .to_string();
+                        let block_name_pair =
+                            next_pair(&mut block_inner, "block name", "nested block")?;
+                        let block_name = block_name_pair.as_str().to_string();
                         if block_name == "directives" {
                             check_directives_depends_on_elements(block_inner.clone())?;
                             check_directives_provider_value(block_inner.clone())?;
@@ -304,7 +304,7 @@ fn parse_block_contents_with_quoted(
                         let block_index = *authored_count;
                         *authored_count += 1;
                         let block_mode = mode
-                            .at_named_child(block_name.clone())
+                            .at_named_child(block_name.clone(), &block_name_pair)
                             .at_list_index(block_index);
                         let block_contents = parse_block_contents_with_quoted(
                             block_inner,
@@ -332,11 +332,11 @@ fn parse_block_contents_with_quoted(
                 let mut attr_inner = content_pair.into_inner();
                 let key_pair = next_pair(&mut attr_inner, "attribute name", "block content")?;
                 let key_span = key_pair.as_span();
-                let key = ctx.key_string(key_pair)?;
+                let key = ctx.key_string(key_pair.clone())?;
                 reject_reserved_resource_attribute(&key, key_span, reserved_attribute_names)?;
                 let value_pair = next_pair(&mut attr_inner, "attribute value", "block content")?;
                 record_quoted_if_literal(quoted_out, &key, &value_pair);
-                let value_mode = mode.at_named_child(key.clone());
+                let value_mode = mode.at_named_child(key.clone(), &key_pair);
                 // This grammar branch stores the same complete sink bundle.
                 let expression = parse_expression_in_sink(value_pair, &local_ctx, &value_mode)?;
                 sinks.insert(key.clone(), expression.clone());
@@ -520,13 +520,15 @@ fn parse_directives(
         }
 
         let mut attr_inner = attr.into_inner();
-        let key = next_pair(&mut attr_inner, "attribute name", "directives block")?
-            .as_str()
-            .to_string();
+        let key = ctx.authored_key(next_pair(
+            &mut attr_inner,
+            "attribute name",
+            "directives block",
+        )?);
         let value_pair = next_pair(&mut attr_inner, "attribute value", "directives block")?;
         let line = value_pair.line_col().0;
 
-        if let Some(directive) = LifecycleDirective::from_name(&key) {
+        if let Some(directive) = key.lifecycle_directive() {
             let source = ctx.directive_value_source_span(&value_pair);
             let value = parse_expression(value_pair, ctx)?
                 .projection()
@@ -538,8 +540,8 @@ fn parse_directives(
             continue;
         }
 
-        match key.as_str() {
-            "ignore_changes" => {
+        match key {
+            key if key.matches("ignore_changes") => {
                 let primary =
                     crate::parser::util::unwrap_to_primary(value_pair).ok_or_else(|| {
                         ParseError::InvalidExpression {
@@ -567,7 +569,7 @@ fn parse_directives(
                     .map(|element| parse_ignore_change_path(element, ctx))
                     .collect::<Result<Vec<_>, _>>()?;
             }
-            "depends_on" => {
+            key if key.matches("depends_on") => {
                 let primary =
                     crate::parser::util::unwrap_to_primary(value_pair).ok_or_else(|| {
                         ParseError::InvalidExpression {
@@ -603,7 +605,7 @@ fn parse_directives(
                 parsed_directives.directives.depends_on_diagnostic_sources =
                     DiagnosticSourceLocations::authored(ctx.source_file(), source_lines);
             }
-            "provider" => {
+            key if key.matches("provider") => {
                 let eval = parse_expression_eval(value_pair, ctx)?;
                 parsed_directives.directives.provider_instance = Some(eval_as_binding_name(
                     eval,
@@ -624,7 +626,7 @@ fn parse_ignore_change_path(
     ctx: &ParseContext,
 ) -> Result<ParsedIgnorePath, ParseError> {
     let line = pair.line_col().0;
-    let authored = pair.as_str().to_string();
+    let authored = crate::parser::AuthoredExpressionText::redact(pair.clone(), None);
     let primary = crate::parser::util::unwrap_to_primary(pair)
         .ok_or_else(|| invalid_ignore_change_path(line, &authored))?;
     let path = first_inner(primary, "attribute path", "directives.ignore_changes")?;
@@ -685,12 +687,13 @@ fn push_ignore_path_head(head: &str, segments: &mut Vec<ParsedIgnorePathSegment>
     );
 }
 
-fn invalid_ignore_change_path(line: usize, authored: &str) -> ParseError {
-    ParseError::InvalidExpression {
+fn invalid_ignore_change_path(
+    line: usize,
+    authored: &crate::parser::AuthoredExpressionText,
+) -> ParseError {
+    ParseError::InvalidAuthoredExpression {
         line,
-        message: format!(
-            "directives.ignore_changes: `{authored}` must be a bare attribute path, not a string literal or computed expression"
-        ),
+        diagnostic: crate::parser::AuthoredExpressionDiagnostic::ignore_changes(authored.clone()),
     }
 }
 

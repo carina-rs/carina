@@ -13,13 +13,34 @@ use crate::parser::escape_double_quoted_character;
 
 /// Result of preprocessing: the transformed source and a list of heredoc
 /// replacements (for the formatter to restore them in the output).
-#[derive(Debug)]
+/// Preprocessed and original text cannot be detached, including by crate code:
+///
+/// ```compile_fail,E0616
+/// # include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/internal_rule_input_doctest.rs"));
+/// fn replace_source() {
+///     let mut file = crate::heredoc::preprocess_heredocs("let x = <<EOF\npublic\nEOF\n").unwrap();
+///     file.source = "secret('CANARY'".into();
+/// }
+/// # fn main() {}
+/// ```
+/// Diagnostic consumers use [`crate::parser::DiagnosticFileText`]. Raw text
+/// cannot be extracted through this preprocessing result:
+///
+/// ```compile_fail,E0616
+/// let result = carina_core::heredoc::preprocess_heredocs("let x = 1").unwrap();
+/// let source = result.source;
+/// ```
+///
+/// ```compile_fail,E0616
+/// let result = carina_core::heredoc::preprocess_heredocs("let x = 1").unwrap();
+/// let originals = result.heredocs;
+/// ```
 pub struct PreprocessResult {
     /// Source with heredocs replaced by double-quoted strings
-    pub source: String,
+    source: String,
     /// Original heredoc texts, in order of replacement.
     /// Each entry is the full heredoc text from `<<MARKER` through the closing `MARKER` line.
-    pub heredocs: Vec<String>,
+    heredocs: Vec<String>,
     /// Non-identity byte mappings, one per collapsed heredoc. Everywhere else
     /// maps through the byte delta established by the preceding segment.
     position_segments: Vec<PositionSegment>,
@@ -29,6 +50,24 @@ pub struct PreprocessResult {
     /// The authored source is needed only when heredocs changed the text.
     /// Heredoc-free files reuse `source` and allocate no mapping segments.
     original_source: Option<String>,
+}
+
+impl std::fmt::Debug for PreprocessResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreprocessResult").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn round13_preprocess_debug_never_exposes_source_or_heredoc_payloads() {
+    for source in [
+        "let x = secret('CANARY') ???",
+        "let x = secret(<<EOF\nCANARY\nEOF\n) ???",
+    ] {
+        let result = preprocess_heredocs(source).unwrap();
+        assert!(!format!("{result:?}").contains("CANARY"));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +92,22 @@ impl OriginalPosition {
 }
 
 impl PreprocessResult {
+    pub(crate) fn transformed_source(&self) -> &str {
+        &self.source
+    }
+
+    pub(crate) fn original_heredocs(&self) -> &[String] {
+        &self.heredocs
+    }
+
+    pub fn heredoc_count(&self) -> usize {
+        self.heredocs.len()
+    }
+
+    pub(crate) fn authored_source(&self) -> &str {
+        self.original_source.as_deref().unwrap_or(&self.source)
+    }
+
     /// Return the exact authored text corresponding to a byte range in the
     /// heredoc-preprocessed source.
     pub(crate) fn original_slice(&self, preprocessed_range: std::ops::Range<usize>) -> &str {
@@ -79,6 +134,8 @@ impl PreprocessResult {
             .saturating_sub(1);
         let line_start = self.original_line_starts[line_index];
         let original_source = self.original_source.as_deref().unwrap_or(&self.source);
+        #[cfg(any(test, feature = "test-utils"))]
+        crate::test_work::record(crate::test_work::Operation::ColumnBytes, byte - line_start);
         let column = original_source[line_start..byte].chars().count() + 1;
         OriginalPosition {
             byte,
@@ -87,7 +144,10 @@ impl PreprocessResult {
         }
     }
 
-    fn original_byte(&self, preprocessed_byte: usize) -> usize {
+    /// Restore a byte offset without computing a scalar column. Callers that
+    /// only need a source range must not repeatedly recount a long line.
+    pub(crate) fn original_byte(&self, preprocessed_byte: usize) -> usize {
+        assert!(preprocessed_byte <= self.source.len());
         let preceding = self
             .position_segments
             .partition_point(|segment| segment.preprocessed_start <= preprocessed_byte);
@@ -144,11 +204,16 @@ fn shift_byte(byte: usize, delta: isize) -> usize {
     }
 }
 
-#[derive(Debug)]
 struct MappedText {
     text: String,
     mapping_pieces: Vec<MappingPiece>,
     end_original: usize,
+}
+
+impl std::fmt::Debug for MappedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedText").finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -320,6 +385,39 @@ fn line_starts(input: &str) -> Vec<usize> {
 /// Returns the preprocessed source and a list of original heredoc texts
 /// (for round-trip preservation in the formatter).
 pub fn preprocess_heredocs(input: &str) -> Result<PreprocessResult, HeredocError> {
+    preprocess_heredocs_raw(input).map_err(|failure| {
+        let diagnostic = match crate::parser::failed_file_text(input) {
+            crate::parser::FailedFileText::Public(source) => HeredocDiagnostic::Public(
+                crate::parser::AuthoredExpressionDiagnostic::unterminated_heredoc(
+                    failure.line,
+                    crate::parser::AuthoredExpressionText::from_public_failed_range(
+                        source,
+                        failure.marker,
+                    ),
+                ),
+            ),
+            crate::parser::FailedFileText::Protected => {
+                let line = input.bytes().filter(|byte| *byte == b'\n').count() + 1;
+                let column = input.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+                HeredocDiagnostic::Protected(crate::parser::ProtectedParseFailure::heredoc(
+                    line, column,
+                ))
+            }
+        };
+        HeredocError {
+            line: failure.line,
+            diagnostic,
+        }
+    })
+}
+
+/// Preprocessing facts, before any diagnostic is constructed.
+pub(crate) struct PreprocessFailure {
+    line: usize,
+    marker: std::ops::Range<usize>,
+}
+
+pub(crate) fn preprocess_heredocs_raw(input: &str) -> Result<PreprocessResult, PreprocessFailure> {
     let lines: Vec<&str> = input.split('\n').collect();
     let original_line_starts = line_starts(input);
     let mut source = String::with_capacity(input.len());
@@ -334,7 +432,8 @@ pub fn preprocess_heredocs(input: &str) -> Result<PreprocessResult, HeredocError
             let opening_line = i;
             let opening_line_start = original_line_starts[opening_line];
             // Emit the part of the line before the heredoc
-            source.push_str(&line[..heredoc_start.prefix_end]);
+            let local_prefix = heredoc_start.prefix_end;
+            source.push_str(&line[..local_prefix]);
 
             let marker = heredoc_start.marker;
             let strip_indent = heredoc_start.strip_indent;
@@ -342,7 +441,7 @@ pub fn preprocess_heredocs(input: &str) -> Result<PreprocessResult, HeredocError
 
             // Save original heredoc text for formatter round-trip
             let mut original = String::new();
-            original.push_str(&line[heredoc_start.prefix_end..]);
+            original.push_str(&line[local_prefix..]);
             original.push('\n');
 
             // Collect body lines until we find the closing marker
@@ -364,9 +463,19 @@ pub fn preprocess_heredocs(input: &str) -> Result<PreprocessResult, HeredocError
             }
 
             if !found_end {
-                return Err(HeredocError::Unterminated {
+                return Err(PreprocessFailure {
                     line: i,
-                    marker: marker.to_string(),
+                    marker: opening_line_start
+                        + heredoc_start.prefix_end
+                        + 2
+                        + usize::from(strip_indent)
+                        + usize::from(quoted)
+                        ..opening_line_start
+                            + heredoc_start.prefix_end
+                            + 2
+                            + usize::from(strip_indent)
+                            + usize::from(quoted)
+                            + marker.len(),
                 });
             }
 
@@ -403,7 +512,7 @@ pub fn preprocess_heredocs(input: &str) -> Result<PreprocessResult, HeredocError
                 original_end: closing_line_start + closing_text.len(),
             });
 
-            // The closing marker line is consumed; continue with the next line
+            // Preserve the DSL's existing line-scoped heredoc discovery.
             i += 1;
             if i < lines.len() {
                 source.push('\n');
@@ -550,24 +659,49 @@ pub fn find_heredoc_opener_range(line: &str) -> Option<std::ops::Range<usize>> {
 
 /// Error during heredoc preprocessing.
 #[derive(Debug, thiserror::Error)]
-pub enum HeredocError {
-    #[error("Unterminated heredoc at line {line}: closing marker '{marker}' not found")]
-    Unterminated { line: usize, marker: String },
+#[error("{diagnostic}")]
+pub struct HeredocError {
+    line: usize,
+    diagnostic: HeredocDiagnostic,
 }
 
-struct HeredocStart<'a> {
-    /// Byte offset where the heredoc operator starts
-    prefix_end: usize,
-    /// The marker string
-    marker: &'a str,
-    /// Whether to strip common leading whitespace (`<<-`)
-    strip_indent: bool,
-    /// Whether the marker is quoted (`<<'EOT'`) — literal, no interpolation
-    quoted: bool,
+#[derive(Debug)]
+enum HeredocDiagnostic {
+    Public(crate::parser::AuthoredExpressionDiagnostic),
+    Protected(crate::parser::ProtectedParseFailure),
+}
+impl std::fmt::Display for HeredocDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Public(error) => error.fmt(f),
+            Self::Protected(error) => error.fmt(f),
+        }
+    }
+}
+impl HeredocError {
+    pub(crate) fn into_parse_error(self) -> crate::parser::ParseError {
+        match self.diagnostic {
+            HeredocDiagnostic::Public(diagnostic) => {
+                crate::parser::ParseError::InvalidAuthoredExpression {
+                    line: self.line,
+                    diagnostic,
+                }
+            }
+            HeredocDiagnostic::Protected(failure) => {
+                crate::parser::ParseError::ProtectedFile(failure)
+            }
+        }
+    }
 }
 
-/// Find a `<<MARKER` or `<<-MARKER` pattern in a line.
-/// Skips occurrences inside string literals.
+#[derive(Clone, Copy)]
+pub(crate) struct HeredocStart<'a> {
+    pub(crate) prefix_end: usize,
+    pub(crate) marker: &'a str,
+    pub(crate) strip_indent: bool,
+    pub(crate) quoted: bool,
+}
+
 fn find_heredoc_start(line: &str) -> Option<HeredocStart<'_>> {
     let bytes = line.as_bytes();
     let mut i = 0;

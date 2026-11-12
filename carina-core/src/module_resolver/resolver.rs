@@ -155,6 +155,10 @@ impl ResidualModuleResolutionError {
         (!residual.is_covered_by(findings)).then_some(residual)
     }
 
+    pub fn individual_errors(&self) -> Vec<super::error::ModuleErrorDiagnostic<'_>> {
+        self.0.individual_errors()
+    }
+
     pub fn call_source(&self) -> ModuleErrorCallSource<'_> {
         self.0.call_source()
     }
@@ -430,6 +434,7 @@ impl ResidualModuleResolutionError {
                     )
                 }
                 ParseError::Syntax(_)
+                | ParseError::ProtectedFile(_)
                 | ParseError::Evaluation { .. }
                 | ParseError::UnavailableSecret(_)
                 | ParseError::InvalidFloatLiteral { line: _, source: _ }
@@ -437,6 +442,7 @@ impl ResidualModuleResolutionError {
                     line: _,
                     message: _,
                 }
+                | ParseError::InvalidAuthoredExpression { .. }
                 | ParseError::IntegerArithmetic {
                     line: _,
                     column: _,

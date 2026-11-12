@@ -176,16 +176,6 @@ fn parse_deferred_for_body_template(
     }))
 }
 
-fn deferred_for_header(binding: &ForBinding, iterable_surface: &str) -> String {
-    match binding {
-        ForBinding::Simple(value) => format!("for {value} in {iterable_surface}"),
-        ForBinding::Indexed(index, value) => {
-            format!("for ({index}, {value}) in {iterable_surface}")
-        }
-        ForBinding::Map(key, value) => format!("for {key}, {value} in {iterable_surface}"),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn record_deferred_for_expression(
     body_pair: pest::iterators::Pair<Rule>,
@@ -198,7 +188,7 @@ fn record_deferred_for_expression(
     span: SourceSpan,
     iterable_location: crate::parser::DeclarationLocation,
     declaration: crate::parser::DeclarationProvenance,
-    header: String,
+    header: crate::parser::AuthoredExpressionText,
     iterable: Value,
     iterable_state: ParsedDeferredForIterableState,
 ) -> Result<(), ParseError> {
@@ -363,7 +353,8 @@ pub(crate) fn extract_for_iterable_name(
         return fallback;
     }
     // Take the last segment of the dotted path (e.g., "accounts" from "orgs.accounts")
-    let text = child.as_str().trim();
+    let admitted = crate::parser::AuthoredExpressionText::redact(child, None);
+    let text = admitted.as_str().trim();
     let last_segment = text.rsplit('.').next().unwrap_or(text);
     format!("_{}", last_segment)
 }
@@ -394,6 +385,7 @@ pub(crate) fn parse_for_expr(
     // Parse the iterable expression
     let iterable_pair = next_pair(&mut inner, "iterable", "for expression")?;
     let iterable_location = ctx.declaration_location(&iterable_pair);
+    let iterable_authored = iterable_pair.clone();
     let iterable_source = ctx.diagnostic_source_text(iterable_pair.clone());
     let ParsedForIterable {
         value: iterable,
@@ -608,10 +600,15 @@ pub(crate) fn parse_for_expr(
                 Value::Deferred(
                     DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument { .. })
                     | DeferredValue::ModuleIf(_),
-                ) => iterable_surface.as_str().to_string(),
-                _ => crate::value::format_value(&iterable),
+                ) => iterable_surface,
+                _ => crate::parser::deferred_if::DiagnosticExpressionText::of(&iterable),
             };
-            let header = deferred_for_header(&binding, &iterable_surface);
+            let header = crate::parser::AuthoredExpressionText::for_header(
+                &binding,
+                iterable_authored,
+                preprocessed_file,
+                &iterable_surface,
+            );
             record_deferred_for_expression(
                 body_pair.clone(),
                 &binding,
@@ -638,7 +635,16 @@ pub(crate) fn parse_for_expr(
                 .as_ref()
                 .or(provisional_binding.as_ref())
             {
-                let header = deferred_for_header(&binding, s);
+                let iterable = Value::Deferred(DeferredValue::BindingRef {
+                    binding: RelativeBindingName::new(s.clone()),
+                });
+                let surface = crate::parser::deferred_if::DiagnosticExpressionText::of(&iterable);
+                let header = crate::parser::AuthoredExpressionText::for_header(
+                    &binding,
+                    iterable_authored,
+                    preprocessed_file,
+                    &surface,
+                );
                 let iterable_state = if bare_unbound_identifier.is_some() {
                     ParsedDeferredForIterableState::UndefinedIdentifier { name: s.clone() }
                 } else {
@@ -656,9 +662,7 @@ pub(crate) fn parse_for_expr(
                     iterable_location.clone(),
                     declaration.clone(),
                     header,
-                    Value::Deferred(DeferredValue::BindingRef {
-                        binding: RelativeBindingName::new(s.clone()),
-                    }),
+                    iterable,
                     iterable_state,
                 )?;
                 return Ok((resources, data_sources, module_calls));

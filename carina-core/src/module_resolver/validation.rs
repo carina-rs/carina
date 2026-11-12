@@ -337,7 +337,7 @@ pub fn evaluate_module_constraints<P: PlaceholderKind, B: BindingAddress>(
                     PendingModuleConstraint {
                         id: ModuleConstraintId::require(ordinal),
                         expression: require.condition.clone(),
-                        message: require.error_message.clone(),
+                        message: require.error_message.to_string(),
                     },
                     ModuleConstraintKind::Require,
                     declared_arguments.clone(),

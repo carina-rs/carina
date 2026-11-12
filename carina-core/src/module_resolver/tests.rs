@@ -1944,6 +1944,7 @@ let forwarded = choice { flag = flag }
 }
 
 fn parsed_deferred_resource(
+    header: crate::parser::AuthoredExpressionText,
     expression: DeferredForExpression<
         ModuleSource,
         ParserPlaceholder,
@@ -1952,11 +1953,7 @@ fn parsed_deferred_resource(
     >,
 ) -> ParsedDeferredForExpression {
     ParsedDeferredForExpression::from_location(
-        (
-            expression.location().clone(),
-            SourceSpan::dummy(),
-            expression.header.clone(),
-        ),
+        (expression.location().clone(), SourceSpan::dummy(), header),
         expression.target().clone(),
         expression.iterable.clone(),
         crate::parser::ParsedDeferredForIterableState::Deferred,
@@ -9179,7 +9176,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             declaration: Default::default(),
         });
         m.parsed_deferred_for_expressions_mut()
-            .push(parsed_deferred_resource(DeferredForExpression::new(
+            .push(parsed_deferred_resource(crate::parser::AuthoredExpressionText::test_for_header("let rows = for _, opt in cert.domain_validation_options { mock.test.resource {} }"), DeferredForExpression::new(
                 None,
                 7,
                 "for _, opt in cert.domain_validation_options".to_string(),
@@ -9333,16 +9330,21 @@ fn module_deferred_template_instantiated_twice_has_distinct_materialized_ids() {
     });
     module
         .parsed_deferred_for_expressions_mut()
-        .push(parsed_deferred_resource(DeferredForExpression::new(
-            None,
-            1,
-            "for _, account in accounts.items".to_string(),
-            DeferredForTarget::bound(RelativeBindingName::new("assignments"))
-                .expect("fixture binding is valid"),
-            Value::resource_ref("accounts", "items", Vec::new()),
-            ForBinding::Map("_".to_string(), "account".to_string()),
-            Resource::pending_with_provider("awscc", "sso.Assignment", None),
-        )));
+        .push(parsed_deferred_resource(
+            crate::parser::AuthoredExpressionText::test_for_header(
+                "let rows = for _, account in accounts.items { mock.test.resource {} }",
+            ),
+            DeferredForExpression::new(
+                None,
+                1,
+                "for _, account in accounts.items".to_string(),
+                DeferredForTarget::bound(RelativeBindingName::new("assignments"))
+                    .expect("fixture binding is valid"),
+                Value::resource_ref("accounts", "items", Vec::new()),
+                ForBinding::Map("_".to_string(), "account".to_string()),
+                Resource::pending_with_provider("awscc", "sso.Assignment", None),
+            ),
+        ));
 
     crate::validation::deferred_types::with_session_for_test(
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
@@ -9410,30 +9412,35 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
         // `accounts` is a module argument, so its caller-expanded address is
         // substituted rather than acquiring the callee's instance prefix.
         m.parsed_deferred_for_expressions_mut()
-            .push(parsed_deferred_resource(DeferredForExpression::new(
-                None,
-                3,
-                "for _, a in accounts.list".to_string(),
-                DeferredForTarget::bound(RelativeBindingName::new("_list"))
-                    .expect("fixture binding is valid"),
-                Value::resource_ref("accounts", "list", Vec::new()),
-                ForBinding::Map("_".to_string(), "a".to_string()),
-                Resource {
-                    id: ResourceId::with_identity("sso.Assignment", "placeholder"),
-                    attributes: HashMap::new().into_iter().collect(),
-                    directives: Directives::default(),
-                    resolved_ignore_changes: Default::default(),
-                    prefixes: HashMap::new(),
-                    binding: None,
-                    dependencies: Default::default(),
-                    module_source: None,
-                    default_tag_keys: Default::default(),
-                    loop_provenance: Default::default(),
-                    quoted_string_attrs: std::collections::HashSet::new(),
-                    authored_slots: Default::default(),
-                    declaration: Default::default(),
-                },
-            )));
+            .push(parsed_deferred_resource(
+                crate::parser::AuthoredExpressionText::test_for_header(
+                    "let rows = for _, a in accounts.list { mock.test.resource {} }",
+                ),
+                DeferredForExpression::new(
+                    None,
+                    3,
+                    "for _, a in accounts.list".to_string(),
+                    DeferredForTarget::bound(RelativeBindingName::new("_list"))
+                        .expect("fixture binding is valid"),
+                    Value::resource_ref("accounts", "list", Vec::new()),
+                    ForBinding::Map("_".to_string(), "a".to_string()),
+                    Resource {
+                        id: ResourceId::with_identity("sso.Assignment", "placeholder"),
+                        attributes: HashMap::new().into_iter().collect(),
+                        directives: Directives::default(),
+                        resolved_ignore_changes: Default::default(),
+                        prefixes: HashMap::new(),
+                        binding: None,
+                        dependencies: Default::default(),
+                        module_source: None,
+                        default_tag_keys: Default::default(),
+                        loop_provenance: Default::default(),
+                        quoted_string_attrs: std::collections::HashSet::new(),
+                        authored_slots: Default::default(),
+                        declaration: Default::default(),
+                    },
+                ),
+            ));
         m
     };
 
