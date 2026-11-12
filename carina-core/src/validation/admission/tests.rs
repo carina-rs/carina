@@ -9,6 +9,9 @@ use std::collections::HashMap;
 #[path = "tests/seam_round4.rs"]
 mod seam_round4;
 
+#[path = "tests/substituted_reference.rs"]
+mod substituted_reference;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct AdmissionWork {
     candidates: usize,
@@ -1154,10 +1157,11 @@ fn slot_identity_mismatches_do_not_mutate() {
                         }
                         SlotMismatch::Path => wrong.inner.destination.identity.path.push(99),
                         SlotMismatch::CatalogRevision => {
-                            wrong.inner.destination.identity.revision = CatalogRevision(
-                                ProviderContext::new(crate::EnvironmentSnapshot::empty())
-                                    .custom_types,
-                            )
+                            wrong.inner.destination.identity.revision =
+                                CatalogRevision(CatalogSnapshot::Provider(
+                                    ProviderContext::new(crate::EnvironmentSnapshot::empty())
+                                        .custom_types,
+                                ));
                         }
                     }
                     assert_eq!(slot.place(wrong), Err(mismatch));
@@ -1521,12 +1525,11 @@ fn different_identity_edges_do_not_relax_local_containment() {
                 };
                 let contract = destination.contract.as_deref().unwrap();
                 assert!(matches!(
-                    source.constraints().next().unwrap().assignment_to(
-                        contract.attr().in_schema(contract.defs()).with_authority(
-                            &catalog.custom_types,
-                            crate::schema::SinkAuthority::Owner(&contract.owner)
-                        )
-                    ),
+                    source
+                        .constraints()
+                        .next()
+                        .unwrap()
+                        .assignment_to(contract.sink_type(contract.attr(), catalog)),
                     crate::schema::TypeAssignability::Mismatch
                 ));
                 assert!(validate(destination, &reference(), bindings, session).is_err());

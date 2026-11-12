@@ -193,7 +193,10 @@ fn creation_admission_exempts_noncreating_effects_and_adoption() {
         target_id: crate::wait::ManagedWaitTarget::new(&resource),
         until: crate::wait::predicate::WaitPredicate::equals(
             crate::wait::predicate::AttrPath::single("name"),
-            string("192.168.1.1"),
+            serde_json::from_value::<crate::wait::WaitRhs>(
+                serde_json::json!({"String": "'192.168.1.1'"}),
+            )
+            .unwrap(),
         )
         .unwrap(),
         until_surface: "legacy.name == legacy-name".into(),
@@ -699,7 +702,10 @@ fn input_scope_classification_table_covers_every_effect_variant() {
                 target_id: crate::wait::ManagedWaitTarget::new(&resource),
                 until: crate::wait::predicate::WaitPredicate::equals(
                     crate::wait::predicate::AttrPath::single("name"),
-                    string("ready"),
+                    serde_json::from_value::<crate::wait::WaitRhs>(
+                        serde_json::json!({"String": "'ready'"}),
+                    )
+                    .unwrap(),
                 )
                 .unwrap(),
                 until_surface: "resource.name == ready".into(),

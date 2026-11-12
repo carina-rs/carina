@@ -14648,7 +14648,7 @@ mod resolved_value_constraint_gate {
     };
     use carina_core::resource::{
         AccessPath, ApplyTimeUnknown, DataSource, InterpolationPart, LiveComposition,
-        LiveCompositionSignature, ModuleConstraintId, PendingModuleConstraint,
+        LiveCompositionSignature, PendingModuleConstraint,
     };
     use carina_core::schema::{TypeIdentity, ValidatorType};
 
@@ -15122,7 +15122,9 @@ mod resolved_value_constraint_gate {
         ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::Var(variable.to_string())),
             op: CompareOp::Ne,
-            rhs: Box::new(ValidateExpr::String("bad".to_string())),
+            rhs: Box::new(ValidateExpr::String(
+                serde_json::from_value(serde_json::json!("'bad'")).unwrap(),
+            )),
         }
     }
 
@@ -15374,11 +15376,12 @@ mod resolved_value_constraint_gate {
     #[tokio::test]
     async fn resolved_module_argument_validation_is_a_structured_plan_error() {
         let source = ref_value();
-        let constraint = PendingModuleConstraint {
-            id: ModuleConstraintId::argument_validation("value", 0),
-            expression: not_bad("value"),
-            message: "value must not be bad".to_string(),
-        };
+        let constraint = PendingModuleConstraint::argument_validation(
+            "value",
+            0,
+            not_bad("value"),
+            "value must not be bad".to_string(),
+        );
         let mut composition = pending_composition(vec![("value", source.clone())], constraint);
 
         let errors = prepare_composition(vec![("value", text("bad"))], &mut composition)
@@ -15541,11 +15544,12 @@ exports { team_prefix: String = "x" }"#,
 
     #[tokio::test]
     async fn plan_refresh_reads_data_source_before_reporting_unrelated_module_constraint() {
-        let constraint = PendingModuleConstraint {
-            id: ModuleConstraintId::argument_validation("value", 0),
-            expression: not_bad("value"),
-            message: "value must not be bad".to_string(),
-        };
+        let constraint = PendingModuleConstraint::argument_validation(
+            "value",
+            0,
+            not_bad("value"),
+            "value must not be bad".to_string(),
+        );
         let composition = pending_composition(vec![("value", text("bad"))], constraint);
         let data_source: DataSource =
             DataSource::with_provider("test", "lookup", "unrelated", None)
@@ -15618,15 +15622,15 @@ exports { team_prefix: String = "x" }"#,
 
     #[tokio::test]
     async fn resolved_cross_argument_require_is_a_structured_plan_error() {
-        let constraint = PendingModuleConstraint {
-            id: ModuleConstraintId::require(0),
-            expression: ValidateExpr::Compare {
+        let constraint = PendingModuleConstraint::require(
+            0,
+            ValidateExpr::Compare {
                 lhs: Box::new(ValidateExpr::Var("left".to_string())),
                 op: CompareOp::Eq,
                 rhs: Box::new(ValidateExpr::Var("right".to_string())),
             },
-            message: "left and right must match".to_string(),
-        };
+            serde_json::from_value(serde_json::json!("'left and right must match'")).unwrap(),
+        );
         let mut composition = pending_composition(
             vec![
                 ("left", ref_value()),
@@ -15661,11 +15665,12 @@ exports { team_prefix: String = "x" }"#,
     #[tokio::test]
     async fn unknown_module_argument_stays_pending_without_rewriting_source() {
         let source = ref_value();
-        let constraint = PendingModuleConstraint {
-            id: ModuleConstraintId::argument_validation("value", 0),
-            expression: not_bad("value"),
-            message: "value must not be bad".to_string(),
-        };
+        let constraint = PendingModuleConstraint::argument_validation(
+            "value",
+            0,
+            not_bad("value"),
+            "value must not be bad".to_string(),
+        );
         let mut composition = pending_composition(vec![("value", source.clone())], constraint);
         let unknown = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path: AccessPath::new("producer", "value").resolve_root_for_test(),
@@ -15682,11 +15687,12 @@ exports { team_prefix: String = "x" }"#,
     #[tokio::test]
     async fn unpublished_module_argument_stays_pending_without_plan_error() {
         let source = ref_value();
-        let constraint = PendingModuleConstraint {
-            id: ModuleConstraintId::argument_validation("value", 0),
-            expression: not_bad("value"),
-            message: "value must not be bad".to_string(),
-        };
+        let constraint = PendingModuleConstraint::argument_validation(
+            "value",
+            0,
+            not_bad("value"),
+            "value must not be bad".to_string(),
+        );
         let mut composition = pending_composition(vec![("value", source.clone())], constraint);
 
         prepare_composition(Vec::new(), &mut composition)
@@ -15699,11 +15705,12 @@ exports { team_prefix: String = "x" }"#,
 
     #[tokio::test]
     async fn satisfied_module_constraint_is_retained_for_apply_time_recheck() {
-        let constraint = PendingModuleConstraint {
-            id: ModuleConstraintId::argument_validation("value", 0),
-            expression: not_bad("value"),
-            message: "value must not be bad".to_string(),
-        };
+        let constraint = PendingModuleConstraint::argument_validation(
+            "value",
+            0,
+            not_bad("value"),
+            "value must not be bad".to_string(),
+        );
         let mut composition = pending_composition(vec![("value", ref_value())], constraint);
 
         prepare_composition(vec![("value", text("good"))], &mut composition)
@@ -15715,11 +15722,12 @@ exports { team_prefix: String = "x" }"#,
 
     #[tokio::test]
     async fn module_constraint_actuals_mask_secret_values() {
-        let constraint = PendingModuleConstraint {
-            id: ModuleConstraintId::argument_validation("value", 0),
-            expression: not_bad("value"),
-            message: "value must not be bad".to_string(),
-        };
+        let constraint = PendingModuleConstraint::argument_validation(
+            "value",
+            0,
+            not_bad("value"),
+            "value must not be bad".to_string(),
+        );
         let mut composition = pending_composition(vec![("value", ref_value())], constraint);
         let secret = Value::Deferred(DeferredValue::Secret(Box::new(text("bad")).into()));
 

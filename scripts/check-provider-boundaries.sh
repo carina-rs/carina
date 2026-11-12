@@ -57,6 +57,15 @@ check_rust_files() {
                 continue
             fi
 
+            # Core owns the built-in S3 backend declaration even without an
+            # installed provider. Permit only its two enum-namespace constants.
+            if [[ "$file" == carina-core/src/validation/admission/configuration/backend.rs &&
+                  "$description" == "carina-core provider string" &&
+                  ( "$stripped" == 'const AWS_PROVIDER_NAME: &str = "aws";' ||
+                    "$stripped" == 'const AWS_REGION_TYPE_NAME: &str = "aws.Region";' ) ]]; then
+                continue
+            fi
+
             echo "VIOLATION ($description): $file:$line_num: $line_content"
             violations=$((violations + 1))
         done <<< "$matches"

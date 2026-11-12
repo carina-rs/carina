@@ -2155,7 +2155,10 @@ impl EffectWithSource<ModuleSource> {
                     target_id: fixture_managed_wait_target(id.clone()),
                     until: WaitPredicate::equals(
                         AttrPath::single("status"),
-                        Value::Concrete(ConcreteValue::String("ready".into())),
+                        serde_json::from_value::<crate::wait::WaitRhs>(
+                            serde_json::json!({"String": "'ready'"})
+                        )
+                        .unwrap(),
                     )
                     .unwrap(),
                     until_surface: "status == 'ready'".to_string(),
@@ -3210,7 +3213,10 @@ mod tests {
                     target_id: fixture_managed_wait_target(rid.clone()),
                     until: WaitPredicate::equals(
                         AttrPath::single("status"),
-                        Value::Concrete(ConcreteValue::String("ready".into())),
+                        serde_json::from_value::<crate::wait::WaitRhs>(
+                            serde_json::json!({"String": "'ready'"}),
+                        )
+                        .unwrap(),
                     )
                     .unwrap(),
                     until_surface: "status == 'ready'".to_string(),
@@ -3999,7 +4005,6 @@ mod tests {
 
     #[test]
     fn wait_variant_constructs() {
-        use crate::resource::{ConcreteValue, Value};
         use crate::wait::predicate::{AttrPath, WaitPredicate};
         use std::time::Duration;
 
@@ -4011,7 +4016,10 @@ mod tests {
             )),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
-                Value::Concrete(ConcreteValue::String("ISSUED".into())),
+                serde_json::from_value::<crate::wait::WaitRhs>(
+                    serde_json::json!({"String": "'ISSUED'"}),
+                )
+                .unwrap(),
             )
             .unwrap(),
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
@@ -4023,7 +4031,6 @@ mod tests {
 
     #[test]
     fn wait_binding_name_returns_wait_binding() {
-        use crate::resource::{ConcreteValue, Value};
         use crate::wait::predicate::{AttrPath, WaitPredicate};
         use std::time::Duration;
 
@@ -4035,7 +4042,10 @@ mod tests {
             )),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
-                Value::Concrete(ConcreteValue::String("ISSUED".into())),
+                serde_json::from_value::<crate::wait::WaitRhs>(
+                    serde_json::json!({"String": "'ISSUED'"}),
+                )
+                .unwrap(),
             )
             .unwrap(),
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
@@ -4051,7 +4061,6 @@ mod tests {
 
     #[test]
     fn wait_is_not_mutating() {
-        use crate::resource::{ConcreteValue, Value};
         use crate::wait::predicate::{AttrPath, WaitPredicate};
         use std::time::Duration;
 
@@ -4063,7 +4072,10 @@ mod tests {
             )),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
-                Value::Concrete(ConcreteValue::String("ISSUED".into())),
+                serde_json::from_value::<crate::wait::WaitRhs>(
+                    serde_json::json!({"String": "'ISSUED'"}),
+                )
+                .unwrap(),
             )
             .unwrap(),
             until_surface: "cert.status == ISSUED".to_string(),
@@ -4077,7 +4089,7 @@ mod tests {
 
     #[test]
     fn wait_serde_round_trip() {
-        use crate::resource::{ConcreteValue, ResolvedResource, Resource, Value};
+        use crate::resource::{ResolvedResource, Resource};
         use crate::wait::ManagedWaitTarget;
         use crate::wait::predicate::{AttrPath, WaitPredicate};
         use std::time::Duration;
@@ -4090,7 +4102,10 @@ mod tests {
             target_id: ManagedWaitTarget::new(&target),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
-                Value::Concrete(ConcreteValue::String("ISSUED".into())),
+                serde_json::from_value::<crate::wait::WaitRhs>(
+                    serde_json::json!({"String": "'ISSUED'"}),
+                )
+                .unwrap(),
             )
             .unwrap(),
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
@@ -4206,9 +4221,10 @@ mod tests {
             target_id: fixture_managed_wait_target(rid.clone()),
             until: WaitPredicate::equals(
                 crate::wait::predicate::AttrPath::single("status"),
-                crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
-                    "ready".into(),
-                )),
+                serde_json::from_value::<crate::wait::WaitRhs>(
+                    serde_json::json!({"String": "'ready'"}),
+                )
+                .unwrap(),
             )
             .unwrap(),
             until_surface: "status == 'ready'".to_string(),

@@ -349,9 +349,9 @@ impl BackendSelection {
                 config: Some(BackendConfig::Local(settings)),
                 base_dir,
             } => {
-                let path = crate::backends::anchored_local_path(settings, base_dir)
-                    .map_err(|error| BackendError::Io(error.to_string()))?;
-                let backend = crate::backends::LocalBackend::with_resolved_path(path.clone())?;
+                let location = settings.pin(base_dir)?;
+                let path = location.path().clone();
+                let backend = crate::backends::LocalBackend::from_location(location)?;
                 Ok((Box::new(backend), Some(path)))
             }
             _ => Ok((crate::backends::create_backend(self).await?, None)),

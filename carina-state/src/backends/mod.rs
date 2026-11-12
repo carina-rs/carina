@@ -13,7 +13,6 @@ pub use url::{
     load_state_from_url,
 };
 
-use crate::backend::BackendError;
 use carina_core::paths::ResolvedPath;
 
 use crate::backend::{BackendResult, StateBackend};
@@ -36,18 +35,17 @@ pub(crate) async fn create_backend(
     match selection.target() {
         BackendTarget::Configured { config, base_dir } => match config {
             Some(config) => create_configured_backend(config, base_dir).await,
-            None => Ok(Box::new(LocalBackend::with_resolved_path(
-                base_dir
-                    .join(LocalBackend::DEFAULT_STATE_FILE)
-                    .map_err(|error| BackendError::Io(error.to_string()))?,
+            None => Ok(Box::new(LocalBackend::from_config(
+                &BackendConfig::implicit_local(),
+                base_dir,
             )?)),
         },
         BackendTarget::ExplicitUrl(StateUrl::S3 { bucket, key }) => Ok(Box::new(
             S3Backend::from_url_parts(bucket.clone(), key.clone()).await?,
         )),
         BackendTarget::ExplicitUrl(StateUrl::File { path }) => {
-            Ok(Box::new(LocalBackend::with_resolved_path(
-                ResolvedPath::new(path).map_err(|error| BackendError::Io(error.to_string()))?,
+            Ok(Box::new(LocalBackend::from_location(
+                LocalBackendSettings::for_file(std::path::Path::new(path))?,
             )?))
         }
     }

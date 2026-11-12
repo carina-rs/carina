@@ -1,24 +1,57 @@
 //! Schema-backed state backend configuration.
 
 use carina_core::parser;
+use carina_core::paths::ResolvedPath;
 use carina_core::resource::{
     AbsoluteBindingAddress, BindingAddress, ConcreteValue, NoPlaceholder, PlaceholderKind, Value,
     ValueString,
 };
-use carina_core::schema::{
-    AttributeType, DslTransform, TypeError, TypeIdentity, ValidatedConfigSchema,
+use carina_core::validation::admission::{
+    configuration::{
+        AdmittedConfiguration,
+        backend::{self, BackendKind},
+    },
+    kind::BackendAttribute,
 };
-use std::collections::{BTreeMap, HashMap};
-use std::fmt;
-use thiserror::Error;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+pub use backend::{BackendAttributeError, BackendConfigError, BackendConfigErrors};
 
 use crate::backend::{LOCAL_BACKEND_TYPE, S3_BACKEND_TYPE};
 
-const AWS_PROVIDER_NAME: &str = "aws";
-const AWS_REGION_TYPE_NAME: &str = "aws.Region";
-
 /// A state backend configuration whose attributes have been checked against
 /// the schema declared by its backend type.
+///
+/// Concrete extraction accepts only the owning admitted aggregate:
+///
+/// ```
+/// use carina_core::{parser::BackendConfig as Raw, resource::NoPlaceholder,
+///     validation::admission::configuration::backend};
+/// use carina_state::BackendConfig;
+/// let raw = Raw::<NoPlaceholder> { backend_type: "local".into(), attributes: Default::default(), attribute_spans: Default::default() };
+/// let checked = BackendConfig::from(backend::admit(&raw).unwrap());
+/// assert!(matches!(checked, BackendConfig::Local(_)));
+/// ```
+/// ```compile_fail,E0277
+/// use carina_core::{parser::BackendConfig as Raw, resource::NoPlaceholder};
+/// use carina_state::BackendConfig;
+/// fn bypass(raw: Raw<NoPlaceholder>) { let _ = BackendConfig::from(raw); }
+/// ```
+/// ```compile_fail,E0277
+/// use carina_core::validation::admission::{configuration::AdmittedConfiguration, kind::BackendAttribute};
+/// let _: AdmittedConfiguration<BackendAttribute> = serde_json::from_str("{}").unwrap();
+/// ```
+/// ```compile_fail,E0277
+/// use carina_core::validation::admission::{PendingAdmission, kind::BackendAttribute};
+/// use carina_state::BackendConfig;
+/// fn bypass(pending: PendingAdmission<BackendAttribute>) { let _ = BackendConfig::from(pending); }
+/// ```
+/// ```compile_fail,E0277
+/// use carina_core::validation::admission::{configuration::AdmittedConfiguration, kind::ProviderConfigAttribute};
+/// use carina_state::BackendConfig;
+/// fn bypass(provider: AdmittedConfiguration<ProviderConfigAttribute>) { let _ = BackendConfig::from(provider); }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendConfig {
     S3(S3BackendSettings),
@@ -26,6 +59,20 @@ pub enum BackendConfig {
 }
 
 impl BackendConfig {
+    pub(crate) fn implicit_local() -> LocalBackendSettings {
+        let raw = parser::BackendConfig::<NoPlaceholder> {
+            backend_type: LOCAL_BACKEND_TYPE.into(),
+            attributes: Default::default(),
+            attribute_spans: Default::default(),
+        };
+        let Self::Local(settings) =
+            Self::from(backend::admit(&raw).expect("built-in local default"))
+        else {
+            unreachable!()
+        };
+        settings
+    }
+
     pub fn as_s3(&self) -> Option<&S3BackendSettings> {
         match self {
             Self::S3(settings) => Some(settings),
@@ -91,12 +138,13 @@ impl BackendConfig {
 
 /// Checked S3 backend settings.
 ///
-/// Settings can only be constructed by resolving a parser backend block:
+/// Settings can only be extracted from admitted backend configuration:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// use carina_state::S3BackendSettings;
 ///
 /// let _ = S3BackendSettings {
+///     configuration: todo!(),
 ///     bucket: todo!(),
 ///     key: todo!(),
 ///     region: None,
@@ -104,8 +152,9 @@ impl BackendConfig {
 ///     auto_create: None,
 /// };
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct S3BackendSettings {
+    configuration: Arc<AdmittedConfiguration<BackendAttribute>>,
     bucket: ValueString,
     key: ValueString,
     region: Option<String>,
@@ -113,7 +162,61 @@ pub struct S3BackendSettings {
     auto_create: Option<bool>,
 }
 
+impl PartialEq for S3BackendSettings {
+    fn eq(&self, other: &Self) -> bool {
+        (
+            &self.bucket,
+            &self.key,
+            &self.region,
+            self.encrypt,
+            self.auto_create,
+        ) == (
+            &other.bucket,
+            &other.key,
+            &other.region,
+            other.encrypt,
+            other.auto_create,
+        )
+    }
+}
+impl Eq for S3BackendSettings {}
+
 impl S3BackendSettings {
+    pub fn configuration(&self) -> &AdmittedConfiguration<BackendAttribute> {
+        &self.configuration
+    }
+
+    pub(crate) fn from_url_parts(bucket: String, key: String) -> Result<Self, BackendConfigError> {
+        let raw = parser::BackendConfig::<NoPlaceholder> {
+            backend_type: S3_BACKEND_TYPE.into(),
+            attributes: [
+                (
+                    "bucket".to_string(),
+                    Value::Concrete(ConcreteValue::String(bucket.into())),
+                ),
+                (
+                    "key".to_string(),
+                    Value::Concrete(ConcreteValue::String(key.into())),
+                ),
+                (
+                    "encrypt".to_string(),
+                    Value::Concrete(ConcreteValue::Bool(true)),
+                ),
+                (
+                    "auto_create".to_string(),
+                    Value::Concrete(ConcreteValue::Bool(false)),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            attribute_spans: Default::default(),
+        };
+        let BackendConfig::S3(settings) = BackendConfig::try_from(&raw)? else {
+            unreachable!()
+        };
+        Ok(settings)
+    }
+
     pub fn bucket(&self) -> &str {
         self.bucket.expose_plaintext()
     }
@@ -148,337 +251,157 @@ impl S3BackendSettings {
 }
 
 /// Checked local filesystem backend settings.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// ```compile_fail,E0451
+/// use carina_state::LocalBackendSettings;
+/// let _ = LocalBackendSettings { configuration: todo!(), path: None };
+/// ```
+#[derive(Debug, Clone)]
 pub struct LocalBackendSettings {
+    configuration: Arc<AdmittedConfiguration<BackendAttribute>>,
     path: Option<ValueString>,
 }
 
+impl PartialEq for LocalBackendSettings {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+impl Eq for LocalBackendSettings {}
+
+/// An admitted local configuration and the address pinned from that input.
+/// No constructor accepts an unrelated receipt and replacement path.
+pub(crate) struct LocalBackendLocation {
+    settings: LocalBackendSettings,
+    path: ResolvedPath,
+}
+impl LocalBackendLocation {
+    pub(crate) fn path(&self) -> &ResolvedPath {
+        &self.path
+    }
+    #[cfg(test)]
+    pub(crate) fn settings(&self) -> &LocalBackendSettings {
+        &self.settings
+    }
+    pub(crate) fn into_parts(self) -> (LocalBackendSettings, ResolvedPath) {
+        (self.settings, self.path)
+    }
+}
+
 impl LocalBackendSettings {
+    pub fn configuration(&self) -> &AdmittedConfiguration<BackendAttribute> {
+        &self.configuration
+    }
+
+    pub(crate) fn pin(&self, base: &ResolvedPath) -> crate::BackendResult<LocalBackendLocation> {
+        let path = crate::backends::anchored_local_path(self, base).map_err(|error| {
+            crate::BackendError::Io(format!("Failed to locate state file: {error}"))
+        })?;
+        Ok(LocalBackendLocation {
+            settings: self.clone(),
+            path,
+        })
+    }
+
+    pub(crate) fn for_file(path: &std::path::Path) -> crate::BackendResult<LocalBackendLocation> {
+        let raw = parser::BackendConfig::<NoPlaceholder> {
+            backend_type: LOCAL_BACKEND_TYPE.into(),
+            attributes: [(
+                "path".to_string(),
+                Value::Concrete(ConcreteValue::String(
+                    path.to_string_lossy().into_owned().into(),
+                )),
+            )]
+            .into_iter()
+            .collect(),
+            attribute_spans: Default::default(),
+        };
+        let BackendConfig::Local(settings) = BackendConfig::try_from(&raw)? else {
+            unreachable!()
+        };
+        // Keep the native address and its diagnostic spelling, including OS
+        // paths accepted by test-utils; admission's text projection never
+        // replaces the original path used for the single pin.
+        let path = ResolvedPath::new(path).map_err(|error| {
+            crate::BackendError::Io(format!("Failed to locate state file: {error}"))
+        })?;
+        Ok(LocalBackendLocation { settings, path })
+    }
+
     pub fn path(&self) -> Option<&str> {
         self.path.as_ref().map(ValueString::expose_plaintext)
     }
 }
 
-/// Failure to resolve a raw backend block through its declared schema.
-#[derive(Debug, Error)]
-pub enum BackendConfigError {
-    #[error("Unsupported backend type: {0}")]
-    UnsupportedBackend(String),
-    #[error(transparent)]
-    Invalid(#[from] BackendConfigErrors),
+fn take_string(
+    attributes: &mut parser::ConfigurationAttributes<Value>,
+    key: &str,
+) -> Option<ValueString> {
+    attributes.shift_remove(key).map(|value| match value {
+        Value::Concrete(ConcreteValue::String(value)) => value,
+        _ => unreachable!("admitted concrete String backend setting"),
+    })
 }
 
-/// All attribute-level failures from resolving one backend block.
-#[derive(Debug)]
-pub struct BackendConfigErrors {
-    errors: Vec<BackendAttributeError>,
+fn take_bool(attributes: &mut parser::ConfigurationAttributes<Value>, key: &str) -> Option<bool> {
+    attributes.shift_remove(key).map(|value| match value {
+        Value::Concrete(ConcreteValue::Bool(value)) => value,
+        _ => unreachable!("admitted concrete Bool backend setting"),
+    })
 }
 
-impl BackendConfigErrors {
-    fn new(mut errors: Vec<BackendAttributeError>) -> Self {
-        debug_assert!(!errors.is_empty());
-        errors.sort_by(|left, right| {
-            left.attribute()
-                .diagnostic_cmp(right.attribute())
-                .then_with(|| left.sort_rank().cmp(&right.sort_rank()))
-        });
-        Self { errors }
-    }
-
-    /// Attribute failures in deterministic attribute-name order.
-    pub fn errors(&self) -> &[BackendAttributeError] {
-        &self.errors
-    }
-}
-
-impl fmt::Display for BackendConfigErrors {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, error) in self.errors.iter().enumerate() {
-            if index != 0 {
-                f.write_str("\n")?;
+impl From<AdmittedConfiguration<BackendAttribute>> for BackendConfig {
+    fn from(configuration: AdmittedConfiguration<BackendAttribute>) -> Self {
+        let mut attributes = configuration.attributes().clone();
+        let kind = configuration.backend_kind();
+        let configuration = Arc::new(configuration);
+        match kind {
+            BackendKind::S3 => {
+                let bucket =
+                    take_string(&mut attributes, "bucket").expect("admitted required bucket");
+                let key = take_string(&mut attributes, "key").expect("admitted required key");
+                let region = attributes.shift_remove("region").map(|value| match value {
+                    Value::Concrete(ConcreteValue::CanonicalEnum(value)) => {
+                        value.api_value().to_owned()
+                    }
+                    _ => unreachable!("admitted canonical backend region"),
+                });
+                let encrypt = take_bool(&mut attributes, "encrypt");
+                let auto_create = take_bool(&mut attributes, "auto_create");
+                debug_assert!(attributes.is_empty());
+                Self::S3(S3BackendSettings {
+                    configuration,
+                    bucket,
+                    key,
+                    region,
+                    encrypt,
+                    auto_create,
+                })
             }
-            write!(f, "{error}")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for BackendConfigErrors {}
-
-/// One schema failure associated with a backend attribute.
-#[derive(Debug, Error)]
-pub enum BackendAttributeError {
-    #[error("Unknown attribute '{attribute}' for backend type '{backend_type}'")]
-    UnknownAttribute {
-        backend_type: String,
-        attribute: carina_core::parser::AttributeKey,
-    },
-    #[error("Missing required attribute: {attribute}")]
-    MissingRequiredAttribute {
-        backend_type: String,
-        attribute: carina_core::parser::AttributeKey,
-    },
-    #[error("Invalid attribute '{attribute}' for backend type '{backend_type}': {error}")]
-    InvalidAttribute {
-        backend_type: String,
-        attribute: carina_core::parser::AttributeKey,
-        error: Box<TypeError>,
-    },
-}
-
-impl BackendAttributeError {
-    pub fn attribute(&self) -> &carina_core::parser::AttributeKey {
-        match self {
-            Self::UnknownAttribute { attribute, .. }
-            | Self::MissingRequiredAttribute { attribute, .. }
-            | Self::InvalidAttribute { attribute, .. } => attribute,
+            BackendKind::Local => {
+                let path = take_string(&mut attributes, "path");
+                debug_assert!(attributes.is_empty());
+                Self::Local(LocalBackendSettings {
+                    configuration,
+                    path,
+                })
+            }
         }
     }
-
-    fn sort_rank(&self) -> u8 {
-        match self {
-            Self::UnknownAttribute { .. } => 0,
-            Self::MissingRequiredAttribute { .. } => 1,
-            Self::InvalidAttribute { .. } => 2,
-        }
-    }
-}
-
-fn s3_schema() -> ValidatedConfigSchema {
-    ValidatedConfigSchema::validate(BTreeMap::from([
-        ("bucket".to_string(), AttributeType::string()),
-        ("key".to_string(), AttributeType::string()),
-        (
-            "region".to_string(),
-            AttributeType::enum_(
-                TypeIdentity::new(Some(AWS_PROVIDER_NAME), Vec::<String>::new(), "Region"),
-                None,
-                Vec::new(),
-                None,
-                Some(DslTransform::HyphenToUnderscore),
-            ),
-        ),
-        ("encrypt".to_string(), AttributeType::bool()),
-        ("auto_create".to_string(), AttributeType::bool()),
-    ]))
-    .expect("the built-in S3 backend config schema must be valid")
-}
-
-fn local_schema() -> ValidatedConfigSchema {
-    ValidatedConfigSchema::validate(BTreeMap::from([(
-        "path".to_string(),
-        AttributeType::string(),
-    )]))
-    .expect("the built-in local backend config schema must be valid")
-}
-
-fn canonicalize_attributes<P: PlaceholderKind, B: BindingAddress>(
-    config: &parser::BackendConfig<P, B>,
-    schema: &ValidatedConfigSchema,
-    required: &[&'static str],
-) -> (
-    carina_core::parser::ConfigurationAttributes<Value<P, B>>,
-    Vec<BackendAttributeError>,
-) {
-    let mut errors = Vec::new();
-    for attribute in required {
-        if !config.attributes.contains_key(*attribute) {
-            errors.push(BackendAttributeError::MissingRequiredAttribute {
-                backend_type: config.backend_type.clone(),
-                attribute: (*attribute).into(),
-            });
-        }
-    }
-
-    let mut canonicalized = carina_core::parser::ConfigurationAttributes::new();
-    for (attribute, value) in &config.attributes {
-        let Some(rootless_type) = attribute.schema_type(schema) else {
-            errors.push(BackendAttributeError::UnknownAttribute {
-                backend_type: config.backend_type.clone(),
-                attribute: attribute.clone(),
-            });
-            continue;
-        };
-        // Passing the schema identity's own provider name deliberately
-        // disables the provider-block alias rule: backend regions accept
-        // `aws.Region.<member>`, never `awscc.Region.<member>`.
-        let canonical =
-            match rootless_type.canonicalize_provider_config(AWS_PROVIDER_NAME, value.clone()) {
-                Ok(canonical) => canonical,
-                Err(error) => {
-                    errors.push(BackendAttributeError::InvalidAttribute {
-                        backend_type: config.backend_type.clone(),
-                        attribute: attribute.clone(),
-                        error: Box::new(error),
-                    });
-                    continue;
-                }
-            };
-        if let Err(error) = rootless_type.validate(&canonical) {
-            errors.push(BackendAttributeError::InvalidAttribute {
-                backend_type: config.backend_type.clone(),
-                attribute: attribute.clone(),
-                error: Box::new(error),
-            });
-            continue;
-        }
-        canonicalized.insert(attribute.clone(), canonical);
-    }
-
-    (canonicalized, errors)
-}
-
-fn invalid_resolved_shape<P: PlaceholderKind, B: BindingAddress>(
-    backend_type: &str,
-    attribute: &str,
-    expected: &str,
-    value: &Value<P, B>,
-) -> BackendAttributeError {
-    BackendAttributeError::InvalidAttribute {
-        backend_type: backend_type.to_string(),
-        attribute: attribute.into(),
-        error: Box::new(TypeError::value_type_mismatch(
-            expected.to_string(),
-            value.type_name(),
-        )),
-    }
-}
-
-fn take_string<P: PlaceholderKind, B: BindingAddress>(
-    attributes: &mut carina_core::parser::ConfigurationAttributes<Value<P, B>>,
-    backend_type: &str,
-    attribute: &str,
-) -> Result<Option<ValueString>, BackendAttributeError> {
-    let Some(value) = attributes.shift_remove(attribute) else {
-        return Ok(None);
-    };
-    match value {
-        Value::Concrete(ConcreteValue::String(value)) => Ok(Some(value)),
-        other => Err(invalid_resolved_shape(
-            backend_type,
-            attribute,
-            "String",
-            &other,
-        )),
-    }
-}
-
-fn take_bool<P: PlaceholderKind, B: BindingAddress>(
-    attributes: &mut carina_core::parser::ConfigurationAttributes<Value<P, B>>,
-    backend_type: &str,
-    attribute: &str,
-) -> Result<Option<bool>, BackendAttributeError> {
-    let Some(value) = attributes.shift_remove(attribute) else {
-        return Ok(None);
-    };
-    match value {
-        Value::Concrete(ConcreteValue::Bool(value)) => Ok(Some(value)),
-        other => Err(invalid_resolved_shape(
-            backend_type,
-            attribute,
-            "Bool",
-            &other,
-        )),
-    }
-}
-
-fn collect_attribute<T>(
-    result: Result<Option<T>, BackendAttributeError>,
-    errors: &mut Vec<BackendAttributeError>,
-) -> Option<T> {
-    match result {
-        Ok(value) => value,
-        Err(error) => {
-            errors.push(error);
-            None
-        }
-    }
-}
-
-fn resolve_s3_backend<P: PlaceholderKind, B: BindingAddress>(
-    config: &parser::BackendConfig<P, B>,
-) -> Result<BackendConfig, BackendConfigError> {
-    let (mut attributes, mut errors) =
-        canonicalize_attributes(config, &s3_schema(), &["bucket", "key"]);
-    let bucket = collect_attribute(
-        take_string(&mut attributes, S3_BACKEND_TYPE, "bucket"),
-        &mut errors,
-    );
-    let key = collect_attribute(
-        take_string(&mut attributes, S3_BACKEND_TYPE, "key"),
-        &mut errors,
-    );
-    let region = match attributes.shift_remove("region") {
-        Some(Value::Concrete(ConcreteValue::CanonicalEnum(value))) => {
-            Some(value.api_value().to_string())
-        }
-        Some(other) => {
-            errors.push(invalid_resolved_shape(
-                S3_BACKEND_TYPE,
-                "region",
-                AWS_REGION_TYPE_NAME,
-                &other,
-            ));
-            None
-        }
-        None => None,
-    };
-    let encrypt = collect_attribute(
-        take_bool(&mut attributes, S3_BACKEND_TYPE, "encrypt"),
-        &mut errors,
-    );
-    let auto_create = collect_attribute(
-        take_bool(&mut attributes, S3_BACKEND_TYPE, "auto_create"),
-        &mut errors,
-    );
-    debug_assert!(attributes.is_empty());
-
-    if !errors.is_empty() {
-        return Err(BackendConfigErrors::new(errors).into());
-    }
-
-    Ok(BackendConfig::S3(S3BackendSettings {
-        bucket: bucket.expect("a valid S3 backend has a bucket"),
-        key: key.expect("a valid S3 backend has a key"),
-        region,
-        encrypt,
-        auto_create,
-    }))
-}
-
-fn resolve_local_backend<P: PlaceholderKind, B: BindingAddress>(
-    config: &parser::BackendConfig<P, B>,
-) -> Result<BackendConfig, BackendConfigError> {
-    let (mut attributes, mut errors) = canonicalize_attributes(config, &local_schema(), &[]);
-    let path = collect_attribute(
-        take_string(&mut attributes, LOCAL_BACKEND_TYPE, "path"),
-        &mut errors,
-    );
-    debug_assert!(attributes.is_empty());
-    if !errors.is_empty() {
-        return Err(BackendConfigErrors::new(errors).into());
-    }
-    Ok(BackendConfig::Local(LocalBackendSettings { path }))
 }
 
 impl<P: PlaceholderKind, B: BindingAddress> TryFrom<&parser::BackendConfig<P, B>>
     for BackendConfig
 {
     type Error = BackendConfigError;
-
     fn try_from(config: &parser::BackendConfig<P, B>) -> Result<Self, Self::Error> {
-        match config.backend_type.as_str() {
-            S3_BACKEND_TYPE => resolve_s3_backend(config),
-            LOCAL_BACKEND_TYPE => resolve_local_backend(config),
-            other => Err(BackendConfigError::UnsupportedBackend(other.to_string())),
-        }
+        backend::admit(config).map(Self::from)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_core::resource::NoPlaceholder;
 
     fn resolve(source: &str) -> Result<BackendConfig, BackendConfigError> {
         let parsed = carina_core::parser::parse_file(
@@ -527,18 +450,6 @@ mod tests {
 
     #[test]
     fn quoted_region_with_underscores_matches_provider_config_canonicalization() {
-        let provider_value = s3_schema()
-            .rootless_type("region")
-            .expect("S3 schema must contain region")
-            .canonicalize_provider_config(
-                AWS_PROVIDER_NAME,
-                Value::<NoPlaceholder>::Concrete(ConcreteValue::String("us_west_2".into())),
-            )
-            .unwrap();
-        let Value::Concrete(ConcreteValue::CanonicalEnum(expected)) = provider_value else {
-            panic!("provider config must canonicalize the quoted region")
-        };
-
         assert_eq!(
             s3_region(
                 r#"backend s3 {
@@ -547,7 +458,7 @@ mod tests {
                     region = "us_west_2"
                 }"#,
             ),
-            expected.api_value()
+            "us-west-2"
         );
     }
 
@@ -755,3 +666,7 @@ mod tests {
         assert!(!format!("{settings:?}").contains(plaintext));
     }
 }
+
+#[cfg(test)]
+#[path = "backend_config/admission_tests.rs"]
+mod admission_tests;

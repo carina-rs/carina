@@ -42,6 +42,45 @@ pub(super) fn literal_key_pair(source: &str) -> pest::iterators::Pair<'_, Rule> 
         .unwrap()
 }
 
+pub(super) fn complete_string_pair(source: &str) -> Result<pest::iterators::Pair<'_, Rule>, ()> {
+    let pair = CarinaParser::parse(Rule::string, source)
+        .map_err(|_| ())?
+        .next()
+        .ok_or(())?;
+    if pair.as_span().start() != 0 || pair.as_span().end() != source.len() {
+        return Err(());
+    }
+    Ok(pair)
+}
+
+/// The wait parser joins only identifiers and field accesses with dots. Check
+/// that same grammar and spelling when admitting a saved enum identifier.
+pub(crate) fn is_wait_enum_identifier(source: &str) -> bool {
+    let Ok(mut pairs) = CarinaParser::parse(Rule::variable_ref, source) else {
+        return false;
+    };
+    let Some(pair) = pairs
+        .next()
+        .filter(|pair| pair.as_span().start() == 0 && pair.as_span().end() == source.len())
+    else {
+        return false;
+    };
+    let mut names = Vec::new();
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::identifier => names.push(part.as_str()),
+            Rule::field_access => {
+                let Some(identifier) = part.into_inner().next() else {
+                    return false;
+                };
+                names.push(identifier.as_str());
+            }
+            _ => return false,
+        }
+    }
+    names.join(".") == source
+}
+
 /// An identifier or binding name whose spelling is guaranteed by the parser grammar.
 ///
 /// Construction is limited to grammar-produced identifiers/binding names and the

@@ -683,10 +683,15 @@ A struct type represents a nested object with typed fields.
   identity/member labels; identified leaves show every identity-conjunction
   pattern. Shared provider docgen
   must render both layers too. This change needs no WIT change.
-  Schema fingerprints use v13 and saved plans use format 44; format 43 plans
+  Schema fingerprints use v13 and saved plans use format 45; format 44 plans
   must fail the version gate before decoding the payload. Saved module
-  `pending_constraints` contain `ValidateExpr` values, not retained types;
-  replay reloads refinement layers from fingerprint-checked provider schemas.
+  `pending_constraints` contain `ValidateExpr` values, not retained types.
+  Condition strings, `require` messages, and wait RHS strings retain checked
+  quoted source so decoding can reject interpolation.
+  Core literal and wait-operand decode errors state only the problem; the
+  saved-plan CLI renders recovery commands with `hint::ProjectCommand`, using
+  the recorded project path and supplied plan-file path.
+  Replay reloads refinement layers from fingerprint-checked provider schemas.
   Every typed sink uses the same String/Int identity-admission rule for
   equal identities and allowed widenings (#4349), including annotations,
   exports, module arguments, and function parameters/returns. Resource/data-source
@@ -709,9 +714,14 @@ A struct type represents a nested object with typed fields.
   Sessions require admitted configuration, including empty built-in configurations;
   initialization consumes a construction owner pairing that session with its selected
   factory. Declaration-loading diagnostics use `ProviderValidationInputs`, which
-  cannot initialize a provider. These validate the full destination before dispatch. Function parameters/returns additionally
-  use runtime `check_resolved_constraints_at`; backend schemas have no anonymous
-  refinements. Member String failures keep their structured pattern/
+  cannot initialize a provider. Built-in backend declarations live in core's
+  `validation/admission/configuration/backend.rs`; state extracts concrete settings
+  only from `AdmittedConfiguration<BackendAttribute>`. Blocks, decoded locks/plans,
+  URLs and default/offline local origins all enter that owner before construction.
+  URL S3 keeps encryption on and automatic bucket creation off; local construction
+  consumes admitted settings bound to one filesystem pin. CLI and LSP share the
+  same owner. Function parameters/returns additionally use runtime
+  `check_resolved_constraints_at`; backend schemas have no anonymous refinements. Member String failures keep their structured pattern/
   length category and label the slot's member constraint; identity failures run first.
   Int-to-Float widening between identified scalars uses identity-bound containment
   too. Float pairs with identities on both sides retain strict declaration range

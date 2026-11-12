@@ -98,39 +98,12 @@ pub(crate) fn display_double_quoted_literal_part(value: &str) -> String {
 pub(crate) fn parse_string_literal(
     pair: pest::iterators::Pair<Rule>,
 ) -> Result<String, ParseError> {
-    // string = single_quoted_string | double_quoted_string
-    let inner_pair = first_inner(pair, "quoted string", "string literal")?;
-
-    if inner_pair.as_rule() == Rule::single_quoted_string {
-        return Ok(inner_pair
-            .into_inner()
-            .next()
-            .map(|p| unescape_single_quoted(p.as_str()))
-            .unwrap_or_default());
-    }
-
-    // Double-quoted string
-    let mut result = String::new();
-    for part in inner_pair.into_inner() {
-        if part.as_rule() == Rule::string_part {
-            let inner = first_inner(part, "string content", "string literal")?;
-            match inner.as_rule() {
-                Rule::string_literal => result.push_str(&unescape_string(inner.as_str())),
-                Rule::interpolation => {
-                    let line = inner.as_span().start_pos().line_col().0;
-                    return Err(ParseError::InterpolationNotAllowedInLiteralString { line });
-                }
-                other => {
-                    let line = inner.as_span().start_pos().line_col().0;
-                    return Err(ParseError::InvalidExpression {
-                        line,
-                        message: format!("Unexpected rule in string literal: {other:?}"),
-                    });
-                }
-            }
-        }
-    }
-    Ok(result)
+    let literal = super::validate_expr::parse_literal_string_pair(pair)?;
+    Ok(if literal.is_single_quoted() {
+        unescape_single_quoted(literal.as_str())
+    } else {
+        unescape_string(literal.as_str())
+    })
 }
 
 pub(crate) fn parse_string_value(

@@ -1,5 +1,5 @@
 {
-  "version": 44,
+  "version": 45,
   "carina_version": "0.9.0",
   "timestamp": "2026-11-01T06:22:23.394810+00:00",
   "source_path": "/fixtures/module_binding_wire_compat",
@@ -481,10 +481,10 @@
               ]
             },
             "value": {
-              "String": "${label}-consumer-id"
+              "String": "'${label}-consumer-id'"
             }
           },
-          "until_surface": "consumer.identifier == \"${label}-consumer-id\"",
+          "until_surface": "consumer.identifier == '${label}-consumer-id'",
           "timeout": 60,
           "interval": 5,
           "explicit_dependencies": [
@@ -516,10 +516,10 @@
               ]
             },
             "value": {
-              "String": "${label}-consumer-id"
+              "String": "'${label}-consumer-id'"
             }
           },
-          "until_surface": "consumer.identifier == \"${label}-consumer-id\"",
+          "until_surface": "consumer.identifier == '${label}-consumer-id'",
           "timeout": 60,
           "interval": 5,
           "explicit_dependencies": [

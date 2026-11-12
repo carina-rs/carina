@@ -257,28 +257,51 @@ impl Default for DeclarationId {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct CatalogRevision(CatalogSnapshot);
+
 #[derive(Clone)]
-struct CatalogRevision(crate::parser::ProviderCustomTypes);
-impl PartialEq for CatalogRevision {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.same_snapshot(&other.0)
+enum CatalogSnapshot {
+    Provider(crate::parser::ProviderCustomTypes),
+    Backend(DeclarationId),
+}
+impl CatalogSnapshot {
+    // Resource assignment compares only provider snapshots. Backend admission
+    // has its own declaration revision and never enters that resource path.
+    fn same_snapshot(&self, catalog: &crate::parser::ProviderCustomTypes) -> bool {
+        matches!(self, Self::Provider(snapshot) if snapshot.same_snapshot(catalog))
     }
 }
-impl Eq for CatalogRevision {}
+impl PartialEq for CatalogSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Provider(left), Self::Provider(right)) => left.same_snapshot(right),
+            (Self::Backend(left), Self::Backend(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+impl Eq for CatalogSnapshot {}
 impl std::fmt::Debug for CatalogRevision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CatalogRevision")
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum DeclarationOwner {
+    Provider(crate::parser::SchemaTypeOwner),
+    Backend(configuration::backend::BackendKind),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DeclarationIdentity {
-    owner: crate::parser::SchemaTypeOwner,
+    owner: DeclarationOwner,
     schema: DeclarationId,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InstanceIdentity {
     Resource(crate::resource::ResourceId),
     Provider(crate::provider::ProviderInstanceKey),
+    Backend(configuration::backend::BackendKind),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DestinationIdentity {
@@ -293,7 +316,7 @@ struct DestinationIdentity {
 pub(crate) struct DestinationContract {
     schema: ContractSchema,
     attribute: String,
-    owner: crate::parser::SchemaTypeOwner,
+    owner: DeclarationOwner,
     ancestry: FieldAncestry,
     path: LeafPath,
 }
@@ -313,7 +336,7 @@ impl DestinationContract {
         Self {
             schema: ContractSchema::Resource(schema),
             attribute,
-            owner,
+            owner: DeclarationOwner::Provider(owner),
             ancestry,
             path,
         }
@@ -337,8 +360,59 @@ impl DestinationContract {
         &'a self,
         catalog: &'a ProviderContext,
     ) -> impl crate::schema::ValidatedCustomTypeLookup + 'a {
-        let crate::parser::SchemaTypeOwner::Provider(owner) = &self.owner;
-        crate::parser::custom_type_lookup_for_owner(catalog.custom_type_resolver(), owner)
+        enum Lookup<L> {
+            Provider(L),
+            Backend,
+        }
+        impl<L: crate::schema::ValidatedCustomTypeLookup> crate::schema::ValidatedCustomTypeLookup
+            for Lookup<L>
+        {
+            fn validate(
+                &self,
+                value: crate::schema::LocallyValidatedCustomType<'_>,
+            ) -> Result<(), TypeError> {
+                match self {
+                    Self::Provider(lookup) => lookup.validate(value),
+                    Self::Backend => Ok(()),
+                }
+            }
+
+            fn canonicalization_error(
+                &self,
+                declaration: crate::parser::IdentifiedCustomTypeDeclaration<'_>,
+                error: TypeError,
+            ) -> TypeError {
+                match self {
+                    Self::Provider(lookup) => lookup.canonicalization_error(declaration, error),
+                    Self::Backend => error,
+                }
+            }
+        }
+        match &self.owner {
+            DeclarationOwner::Provider(crate::parser::SchemaTypeOwner::Provider(owner)) => {
+                Lookup::Provider(crate::parser::custom_type_lookup_for_owner(
+                    catalog.custom_type_resolver(),
+                    owner,
+                ))
+            }
+            DeclarationOwner::Backend(_) => Lookup::Backend,
+        }
+    }
+
+    fn sink_type<'a>(
+        &'a self,
+        attr: &'a CompiledAttributeType,
+        catalog: &'a ProviderContext,
+    ) -> crate::schema::AssignmentSink<'a, crate::schema::Compiled> {
+        let DeclarationOwner::Provider(owner) = &self.owner else {
+            // Built-in backends enter configuration admission, which consumes
+            // concrete settings and never judges resource references.
+            unreachable!("backend configuration has no resource assignment sink")
+        };
+        attr.in_schema(self.defs()).with_authority(
+            &catalog.custom_types,
+            crate::schema::SinkAuthority::Owner(owner),
+        )
     }
 }
 

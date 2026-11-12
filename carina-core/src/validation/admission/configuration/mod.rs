@@ -11,12 +11,38 @@ use crate::parser::ConfigurationAttributes;
 use crate::provider::{ProviderInstanceKey, ProviderWireTarget, WireAttributes, WireReady};
 use crate::schema::{ValidatedConfigSchema, ValidatedCustomTypeLookup};
 
+pub mod backend;
 pub mod provider;
+
+/// The two sealed configuration destinations and their exact payloads.
+/// Backend settings do not acquire a provider transport or provider identity.
+pub trait ConfigurationKind: DestinationKind {
+    type Payload: std::fmt::Debug + Clone + PartialEq;
+    type Instance: std::fmt::Debug + Clone + PartialEq;
+    #[doc(hidden)]
+    fn attributes(payload: &Self::Payload) -> &ConfigurationAttributes<Value>;
+}
+
+impl ConfigurationKind for kind::ProviderConfigAttribute {
+    type Payload = WireReady<ConfigurationAttributes<Value>>;
+    type Instance = ProviderInstanceKey;
+    fn attributes(payload: &Self::Payload) -> &ConfigurationAttributes<Value> {
+        payload.as_inner()
+    }
+}
+
+impl ConfigurationKind for kind::BackendAttribute {
+    type Payload = ConfigurationAttributes<Value>;
+    type Instance = backend::BackendKind;
+    fn attributes(payload: &Self::Payload) -> &ConfigurationAttributes<Value> {
+        payload
+    }
+}
 
 #[derive(Debug)]
 struct ConfigurationDeclaration {
     identity: DeclarationId,
-    owner: crate::parser::SchemaTypeOwner,
+    owner: DeclarationOwner,
     schema: Arc<ValidatedConfigSchema>,
 }
 
@@ -39,14 +65,14 @@ struct ConfigurationDeclaration {
 /// }
 /// ```
 #[derive(Debug, Clone)]
-pub struct AdmittedConfiguration<K: DestinationKind> {
-    payload: WireReady<ConfigurationAttributes<Value>>,
+pub struct AdmittedConfiguration<K: ConfigurationKind> {
+    payload: K::Payload,
     fields: Vec<PlacedValue<K>>,
     declaration: Arc<ConfigurationDeclaration>,
-    instance: ProviderInstanceKey,
+    instance: K::Instance,
 }
 
-impl<K: DestinationKind> PartialEq for AdmittedConfiguration<K> {
+impl<K: ConfigurationKind> PartialEq for AdmittedConfiguration<K> {
     fn eq(&self, other: &Self) -> bool {
         self.payload == other.payload
             && self.instance == other.instance
@@ -55,11 +81,13 @@ impl<K: DestinationKind> PartialEq for AdmittedConfiguration<K> {
     }
 }
 
-impl<K: DestinationKind> AdmittedConfiguration<K> {
+impl<K: ConfigurationKind> AdmittedConfiguration<K> {
     pub fn attributes(&self) -> &ConfigurationAttributes<Value> {
-        self.payload.as_inner()
+        K::attributes(&self.payload)
     }
+}
 
+impl AdmittedConfiguration<kind::ProviderConfigAttribute> {
     pub fn wire_attributes(&self) -> &WireAttributes {
         self.payload.wire()
     }
@@ -69,11 +97,19 @@ impl<K: DestinationKind> AdmittedConfiguration<K> {
     }
 }
 
+impl AdmittedConfiguration<kind::BackendAttribute> {
+    pub fn backend_kind(&self) -> backend::BackendKind {
+        self.instance
+    }
+}
+
 impl ConfigurationDeclaration {
     fn provider(owner: &str, schema: ValidatedConfigSchema) -> Arc<Self> {
         Arc::new(Self {
             identity: DeclarationId::default(),
-            owner: crate::parser::SchemaTypeOwner::Provider(owner.to_owned()),
+            owner: DeclarationOwner::Provider(crate::parser::SchemaTypeOwner::Provider(
+                owner.to_owned(),
+            )),
             schema: Arc::new(schema),
         })
     }
@@ -83,6 +119,19 @@ impl ConfigurationDeclaration {
         key: &crate::parser::AttributeKey,
         instance: &ProviderInstanceKey,
         catalog: &ProviderContext,
+    ) -> Option<Destination<K>> {
+        self.destination_for(
+            key,
+            InstanceIdentity::Provider(instance.clone()),
+            CatalogRevision(CatalogSnapshot::Provider(catalog.custom_types.clone())),
+        )
+    }
+
+    fn destination_for<K: DestinationKind>(
+        &self,
+        key: &crate::parser::AttributeKey,
+        instance: InstanceIdentity,
+        revision: CatalogRevision,
     ) -> Option<Destination<K>> {
         let (ordinal, (name, _)) = self
             .schema
@@ -96,9 +145,9 @@ impl ConfigurationDeclaration {
                     owner: self.owner.clone(),
                     schema: self.identity,
                 },
-                instance: InstanceIdentity::Provider(instance.clone()),
+                instance,
                 path: vec![ordinal],
-                revision: CatalogRevision(catalog.custom_types.clone()),
+                revision,
             }),
             label: key.to_string(),
             contract: Some(Box::new(DestinationContract {

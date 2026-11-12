@@ -24,8 +24,6 @@
 
 use std::path::PathBuf;
 
-use carina_core::paths::ResolvedPath;
-
 use crate::backend::{BackendError, BackendResult, StateBackend};
 use crate::backend_selection::BackendSelection;
 use crate::state::{PublishedExports, StateFile};
@@ -79,10 +77,9 @@ impl LocalStateFile {
 /// let _ = load_local_state_file(&remote);
 /// ```
 pub async fn load_local_state_file(file: &LocalStateFile) -> BackendResult<StateFile> {
-    let path = ResolvedPath::new(&file.path)
-        .map_err(|error| BackendError::Io(format!("Failed to locate state file: {error}")))?;
-    let location = path.display().clone();
-    super::LocalBackend::with_resolved_path(path)?
+    let admitted = crate::LocalBackendSettings::for_file(&file.path)?;
+    let location = admitted.path().display().clone();
+    super::LocalBackend::from_location(admitted)?
         .read_state()
         .await?
         .map(|loaded| loaded.into_state())

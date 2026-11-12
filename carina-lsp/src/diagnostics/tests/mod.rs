@@ -9,6 +9,7 @@ use carina_core::schema::SchemaRegistry;
 
 mod basic;
 mod configuration_admission;
+mod enum_continuation;
 mod extended;
 mod located;
 mod seam_review;

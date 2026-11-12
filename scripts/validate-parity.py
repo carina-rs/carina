@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Compare validate output for all tracked provider/backend fixture directories."""
+"""Compare validate output for every tracked directory containing a .crn file."""
 
 import argparse
+from collections import Counter
 import difflib
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
 
 
-BLOCK = re.compile(r"\b(?:provider|backend)\s+[A-Za-z][A-Za-z0-9_]*\s*\{")
+# carina#4394: only these main fixtures have order-nondeterministic TEXT diagnostics.
+TEXT_DIAGNOSTIC_LINE_MULTISET = {
+    "carina-cli/tests/fixtures/value_knowledge/apply_operand_timing",
+    "carina-cli/tests/fixtures/value_knowledge/guarded_failure_siblings",
+}
 
 
 def configuration_directories(root):
@@ -23,7 +27,7 @@ def configuration_directories(root):
         {
             (root / name).parent
             for name in paths
-            if name and BLOCK.search((root / name).read_text())
+            if name
         }
     )
 
@@ -88,7 +92,11 @@ def main():
                 (args.evidence / f"{stem}.stdout").write_text(stdout)
                 (args.evidence / f"{stem}.stderr").write_text(stderr)
                 outputs.append((status, normalize(stdout), normalize(stderr)))
-            record = {"directory": str(directory), "json": json_output, "statuses": [o[0] for o in outputs], "identical": outputs[0] == outputs[1] and all(o[0] != 124 for o in outputs)}
+            relative = directory.relative_to(roots[0]).as_posix() if directory.is_relative_to(roots[0]) else None
+            comparable = outputs
+            if not json_output and relative in TEXT_DIAGNOSTIC_LINE_MULTISET:
+                comparable = [(code, Counter(out.splitlines(keepends=True)), Counter(err.splitlines(keepends=True))) for code, out, err in outputs]
+            record = {"directory": str(directory), "json": json_output, "statuses": [o[0] for o in outputs], "identical": comparable[0] == comparable[1] and all(o[0] != 124 for o in outputs)}
             results.append(record)
             if not record["identical"]:
                 differences.append(record)

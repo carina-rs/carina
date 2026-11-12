@@ -29,12 +29,12 @@ fn identity(
 ) -> DestinationIdentity {
     DestinationIdentity {
         declaration: DeclarationIdentity {
-            owner: schema.schema_type_owner().clone(),
+            owner: DeclarationOwner::Provider(schema.schema_type_owner().clone()),
             schema: schema.schema().admission_identity,
         },
         instance: InstanceIdentity::Resource(id.clone()),
         path: vec![],
-        revision: CatalogRevision(catalog.custom_types.clone()),
+        revision: CatalogRevision(CatalogSnapshot::Provider(catalog.custom_types.clone())),
     }
 }
 
@@ -773,24 +773,13 @@ fn typed_resource_attribute_admissions<
             );
         let judge_argument = |value| {
             let reference = crate::resource::module_argument_reference_path(value)?;
-            let origin = format!("from {}", reference.as_ref().to_dot_string());
             let reference = ReferenceCandidate { reference };
             let mut findings = Default::default();
             Some(
                 reference
                     .judge_at::<K>(contract, attr, _path, boundary, &mut findings)
                     .map(|()| findings)
-                    .map_err(|error| match error {
-                        TypeError::TypeMismatch { types } => {
-                            assignment::reference_error(AdmissionReferenceError::Computed(
-                                crate::validation::DeferredAccessTypeError::TypeMismatch {
-                                    types,
-                                    origin,
-                                },
-                            ))
-                        }
-                        error => error,
-                    }),
+                    .map_err(|error| reference.error_with_origin(error)),
             )
         };
         if let Value::Deferred(DeferredValue::Interpolation(_)) = value {

@@ -321,7 +321,7 @@ fn saved_plan_layered_scalars_reload_and_validate_both_layers() {
             wait_bindings: Vec::new(),
         };
         let saved = record_with_test_schemas(contents, &schemas);
-        let path = tmp.path().join("layered.v44.plan.json");
+        let path = tmp.path().join("layered.v45.plan.json");
         std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let restored: PlanFile = serde_json::from_slice(&bytes).unwrap();

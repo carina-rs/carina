@@ -59,14 +59,22 @@ A saved plan also records the providers it was computed with: for each provider,
 
 Saved plans are tied to the plan-file format of the Carina version that wrote them. A plan written by another version is rejected with `Unsupported plan file version`; create it again with `carina plan --out`.
 
-The current saved-plan format is `44`, superseding `43`, for v13 schema
-fingerprints and retained identity/member constraint layers. It retains replacement history and dependency requirements so apply can
+The current saved-plan format is `45`, superseding `44`, with quoted condition
+string literals, `require` messages, and wait RHS strings checked for interpolation
+during decoding. It retains v13 schema
+fingerprints and identity/member constraint layers. It retains replacement
+history and dependency requirements so apply can
 revalidate replacement order against each target's schema. It also retains
 typed secret expressions, the absolute source locator and canonical source
 identity, resolved lifecycle directive values and per-element loop expressions,
 and carries complete resolved dependency addresses and the legacy dependency
 migration classification that apply checks against locked state before writing state
 v21. Older plans must be regenerated.
+
+Invalid condition literals, `require` messages, and wait operands are rejected
+before effects run. The error includes a replan command naming the saved-plan
+file and its recorded project directory, with paths quoted when needed. Use
+that command even when applying from a different working directory.
 
 When a saved plan contains secret placeholders, Carina also re-reads and
 evaluates the configuration from the source directory recorded in the plan.
