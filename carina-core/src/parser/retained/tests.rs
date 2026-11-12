@@ -11,13 +11,83 @@ fn config() -> ProviderContext {
 }
 
 #[test]
+fn round2_partial_declarations_cannot_grant_directory_require_admission() {
+    let schemas = SchemaRegistry::new();
+    for condition in ["false", "n > 0"] {
+        let source = format!("require {condition}, 'guard'\n");
+        let parsed =
+            crate::parser::parse_file(&source, std::path::Path::new("guards.crn"), &config())
+                .unwrap();
+        let buffer = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config());
+        assert!(buffer.judged().report().findings().is_empty());
+
+        // A caller-supplied source batch does not prove that siblings are absent.
+        let files = crate::config_loader::parse_directory_files(
+            &[("guards.crn".into(), source)],
+            &config(),
+        )
+        .unwrap();
+        let parsed = files.into_iter().next().unwrap().1.into_inner();
+        let buffer = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config());
+        assert!(buffer.judged().report().findings().is_empty());
+    }
+}
+
+#[test]
+fn round2_recovery_uses_sibling_declaration_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = "require false, 'guard'\n";
+    let guard = directory.path().join("guards.crn");
+    std::fs::write(&guard, source).unwrap();
+    let arguments = directory.path().join("arguments.crn");
+    std::fs::write(&arguments, "arguments { n: Int }\n").unwrap();
+    let broken = directory.path().join("broken.crn");
+    std::fs::write(&broken, "let broken = [\n").unwrap();
+    let context = config();
+    let parsed = crate::parser::parse_file(source, &guard, &context).unwrap();
+    let schemas = SchemaRegistry::new();
+    let pinned = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let overrides = crate::config_loader::SourceOverrides::from([(guard, source.to_string())]);
+    let load = || {
+        crate::config_loader::load_buffer_configuration_in_directory(
+            &parsed, &schemas, &context, &pinned, &overrides,
+        )
+    };
+    let template = load();
+    assert!(matches!(
+        require_scope(template.parsed()),
+        RequireScope::ModuleTemplate { .. }
+    ));
+    assert!(template.judged().report().findings().is_empty());
+
+    std::fs::remove_file(arguments).unwrap();
+    let incomplete = load();
+    assert!(incomplete.judged().report().findings().is_empty());
+
+    // The absent sibling must be established by discovery, including a buffer
+    // whose on-disk copy has not yet been saved.
+    std::fs::remove_file(broken).unwrap();
+    std::fs::remove_file(directory.path().join("guards.crn")).unwrap();
+    let complete = load();
+    let findings = complete.judged().report().findings();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].detail().to_string(), "require failed: guard");
+}
+
+#[test]
 fn round1_retained_require_cannot_lose_its_evaluation_obligation() {
-    let mut parsed = crate::parser::parse_file(
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("guards.crn"),
         "require false, 'retained guard'\n",
-        std::path::Path::new("guards.crn"),
+    )
+    .unwrap();
+    let parsed = crate::config_loader::parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
         &config(),
     )
     .unwrap();
+    let mut parsed = parsed.into_parsed();
     parsed.requires.clear();
     let schemas = SchemaRegistry::new();
     let configuration =

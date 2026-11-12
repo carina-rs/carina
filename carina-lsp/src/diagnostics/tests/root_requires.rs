@@ -10,31 +10,32 @@ fn assert_round1_buffer_guard(condition: &str, broken_sibling: bool) {
     if broken_sibling {
         std::fs::write(directory.path().join("broken.crn"), "let broken = [\n").unwrap();
     }
-    let expected = if condition == "false" {
-        "require failed: guard"
-    } else {
-        "require failed: guard; error evaluating constraint: left operand of + must be int, got float"
-    };
     let diagnostics = engine.analyze(
         &create_document_at(&source, path.clone()),
         broken_sibling.then_some(path.as_path()),
     );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|d| !d.message.contains("require failed:")),
+        "incomplete declarations cannot establish directory ownership: {diagnostics:?}"
+    );
+    if condition == "false" {
+        return;
+    }
     let matching: Vec<_> = diagnostics
         .iter()
-        .filter(|d| d.message == expected)
+        .filter(|d| d.message == "operator '+': left operand must be Int, got Float")
         .collect();
     assert_eq!(matching.len(), 1, "{diagnostics:?}");
     assert_eq!(
         matching[0].range,
-        Range::new(
-            Position::new(1, 8),
-            Position::new(1, 8 + condition.len() as u32)
-        )
+        Range::new(Position::new(1, 12), Position::new(1, 13))
     );
 }
 
 #[test]
-fn round1_broken_sibling_fallback_reports_false_require() {
+fn round1_broken_sibling_fallback_leaves_require_scope_unknown() {
     assert_round1_buffer_guard("false", true);
 }
 
@@ -44,13 +45,44 @@ fn round1_broken_sibling_fallback_reports_require_arithmetic_error() {
 }
 
 #[test]
-fn round1_no_directory_buffer_reports_false_require() {
+fn round1_no_directory_buffer_leaves_require_scope_unknown() {
     assert_round1_buffer_guard("false", false);
 }
 
 #[test]
 fn round1_no_directory_buffer_reports_require_arithmetic_error() {
     assert_round1_buffer_guard("1.5 + 1 == 2", false);
+}
+
+fn assert_round2_module_fallback(condition: &str, message: &str) {
+    let engine = test_engine();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("guards.crn");
+    let source = format!("require {condition}, '{message}'\n");
+    std::fs::write(&path, &source).unwrap();
+    std::fs::write(
+        directory.path().join("arguments.crn"),
+        "arguments { n: Int }\n",
+    )
+    .unwrap();
+    let broken = directory.path().join("broken.crn");
+    std::fs::write(&broken, "let broken = [\n").unwrap();
+    let document = create_document_at(&source, path.clone());
+    let fallback = engine.analyze(&document, Some(&path));
+    assert!(fallback.is_empty(), "{fallback:?}");
+    std::fs::remove_file(broken).unwrap();
+    let complete = engine.analyze(&document, Some(&path));
+    assert!(complete.is_empty(), "{complete:?}");
+}
+
+#[test]
+fn round2_fallback_with_sibling_arguments_does_not_evaluate_false_require() {
+    assert_round2_module_fallback("false", "template guard");
+}
+
+#[test]
+fn round2_fallback_with_sibling_arguments_does_not_reject_argument_name() {
+    assert_round2_module_fallback("n > 0", "positive");
 }
 
 #[test]

@@ -306,10 +306,13 @@ impl<P: ValueKind, B: BindingAddress> std::fmt::Debug for AuthoredExpr<P, B> {
 /// retained with every require node, and reused by all resolver entry points.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum RequireScope {
-    /// Bootstrap/backend parsing retains syntax without entering guard validation.
+    /// An isolated buffer cannot establish that sibling arguments are absent.
     #[default]
-    UnvalidatedDirectory,
-    Directory,
+    Unknown,
+    /// Bootstrap/backend parsing retains complete declarations without
+    /// entering guard validation. Only the directory loader mints this proof.
+    UnvalidatedDirectory(crate::config_loader::CompleteDirectoryDeclarations),
+    Directory(crate::config_loader::CompleteDirectoryDeclarations),
     ModuleTemplate {
         arguments: Arc<[String]>,
     },
@@ -323,7 +326,7 @@ impl RequireScope {
     ) -> Self {
         let arguments = arguments.collect::<Vec<_>>();
         if arguments.is_empty() && !has_attributes {
-            Self::UnvalidatedDirectory
+            Self::Unknown
         } else {
             Self::ModuleTemplate {
                 arguments: arguments.into(),
@@ -959,21 +962,19 @@ pub(crate) fn require_scope<E, D, B: BindingAddress>(
 }
 
 /// Full analysis acquires the directory obligation together with its
-/// inference exemption. Bootstrap/backend-only syntax never receives it.
+/// inference exemption only when the loader proved declaration completeness.
+/// An isolated buffer stays unknown and retains ordinary expression checks.
 pub(crate) fn admit_require_scope<E, D, B: BindingAddress>(
     file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
 ) {
     let expressions = file.parser_binding_metadata.syntax.expressions_mut();
     let scope = match expressions.require_scope.as_ref() {
-        Some(RequireScope::UnvalidatedDirectory) => RequireScope::Directory,
+        Some(RequireScope::UnvalidatedDirectory(evidence)) => RequireScope::Directory(*evidence),
         Some(_) => return,
-        None => match RequireScope::for_declarations(
+        None => RequireScope::for_declarations(
             file.arguments.iter().map(|argument| argument.name.clone()),
             !file.attribute_params.is_empty(),
-        ) {
-            RequireScope::UnvalidatedDirectory => RequireScope::Directory,
-            scope => scope,
-        },
+        ),
     };
     expressions.set_require_scope(scope);
 }
@@ -4083,7 +4084,9 @@ mod judgement {
             self.scope = scope;
             self.visiting.push(id);
             let directory_require = match &root.kind {
-                ExprKind::RequireCondition(require) if require.scope == RequireScope::Directory => {
+                ExprKind::RequireCondition(require)
+                    if matches!(require.scope, RequireScope::Directory(_)) =>
+                {
                     Some(require.clone())
                 }
                 _ => None,

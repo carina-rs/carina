@@ -393,6 +393,48 @@ pub struct RootDirectoryParse<E = crate::parser::ParsedExportParam> {
 pub type ParsedRootDirectory = RootDirectoryParse<crate::parser::ParsedExportParam>;
 pub type InferredRootDirectory = RootDirectoryParse<crate::parser::InferredExportParam>;
 
+/// Negative scope evidence minted only after directory discovery and a
+/// successful declaration parse of every source in that snapshot. A caller
+/// cannot obtain it from an isolated buffer or a caller-supplied source batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompleteDirectoryDeclarations(());
+
+fn mark_complete_require_scope<E>(parsed: &mut File<E>) {
+    use crate::parser::retained::{RequireScope, require_scope, set_require_scope};
+    if matches!(require_scope(parsed), RequireScope::Unknown) {
+        let scope = RequireScope::for_declarations(
+            parsed
+                .arguments
+                .iter()
+                .map(|argument| argument.name.clone()),
+            !parsed.attribute_params.is_empty(),
+        );
+        set_require_scope(
+            parsed,
+            match scope {
+                RequireScope::Unknown => {
+                    RequireScope::UnvalidatedDirectory(CompleteDirectoryDeclarations(()))
+                }
+                scope => scope,
+            },
+        );
+    }
+}
+
+fn mark_complete_directory_files(
+    files: &mut [(PathBuf, DirectoryResolvedFile)],
+    config: &ProviderContext,
+) {
+    for (_, file) in files {
+        mark_complete_require_scope(&mut file.parsed);
+        crate::parser::retained::judge_configuration(
+            &mut file.parsed,
+            &SchemaRegistry::new(),
+            config,
+        );
+    }
+}
+
 impl<E> RootDirectoryParse<E> {
     fn with_resolution(parsed: File<E>, resolution: ResolutionContext) -> Self {
         let mut root = Self { parsed, resolution };
@@ -426,6 +468,7 @@ impl<E> RootDirectoryParse<E> {
     where
         E: crate::parser::ExportParamLike,
     {
+        mark_complete_require_scope(&mut parsed);
         crate::parser::retained::judge_configuration(
             &mut parsed,
             &SchemaRegistry::new(),
@@ -617,6 +660,87 @@ where
 {
     BufferConfiguration {
         judged: crate::parser::retained::JudgedFile::new(parsed.clone(), schemas, config),
+    }
+}
+
+/// Analyze a recovery buffer with declaration evidence from its directory.
+/// Read only syntax inventories, honoring unsaved source overrides. Any
+/// unreadable or malformed sibling leaves scope unknown unless another
+/// inventory proves template scope. Unknown scope retains expression checks
+/// without judging requires. A complete directory without module declarations
+/// enters the same guard evaluator as an ordinary directory load.
+pub fn load_buffer_configuration_in_directory<'a>(
+    parsed: &ParsedFile,
+    schemas: &'a SchemaRegistry,
+    config: &ProviderContext,
+    directory: &ResolvedPath,
+    overrides: &SourceOverrides,
+) -> BufferConfiguration<'a> {
+    let mut parsed = parsed.clone();
+    let scope = recover_directory_require_scope(directory, overrides);
+    // Local arguments already prove template scope even if directory
+    // discovery itself fails. No negative inference is made from that file.
+    if !matches!(scope, crate::parser::retained::RequireScope::Unknown)
+        || !matches!(
+            crate::parser::retained::require_scope(&parsed),
+            crate::parser::retained::RequireScope::ModuleTemplate { .. }
+        )
+    {
+        crate::parser::retained::set_require_scope(&mut parsed, scope);
+    }
+    BufferConfiguration {
+        judged: crate::parser::retained::JudgedFile::new(parsed, schemas, config),
+    }
+}
+
+fn recover_directory_require_scope(
+    directory: &ResolvedPath,
+    overrides: &SourceOverrides,
+) -> crate::parser::retained::RequireScope {
+    use crate::parser::retained::RequireScope;
+    let Ok(mut paths) = directory.crn_files() else {
+        return RequireScope::Unknown;
+    };
+    let mut complete = true;
+    for name in directory_source_overrides(directory, overrides).keys() {
+        match directory.join(name) {
+            Ok(path)
+                if !paths
+                    .iter()
+                    .any(|existing| existing.identity() == path.identity()) =>
+            {
+                paths.push(path)
+            }
+            Ok(_) => {}
+            Err(_) => complete = false,
+        }
+    }
+    complete &= !paths.is_empty();
+    let mut arguments = BTreeSet::new();
+    let mut has_attributes = false;
+    for path in paths {
+        let inventory = read_source_with_overrides(&path, overrides)
+            .ok()
+            .and_then(|source| parser::parse_syntax_inventory(&source, &path.source_label()).ok());
+        let Some(inventory) = inventory else {
+            complete = false;
+            continue;
+        };
+        for declaration in inventory.declarations() {
+            match declaration.detail().kind() {
+                DeclarationKind::Argument => {
+                    arguments.insert(declaration.detail().name().to_string());
+                }
+                DeclarationKind::ModuleAttribute => has_attributes = true,
+                _ => {}
+            }
+        }
+    }
+    match RequireScope::for_declarations(arguments.into_iter(), has_attributes) {
+        RequireScope::Unknown if complete => {
+            RequireScope::UnvalidatedDirectory(CompleteDirectoryDeclarations(()))
+        }
+        scope => scope,
     }
 }
 
@@ -1012,12 +1136,13 @@ fn load_configuration_in_context(
             })?;
             file_inputs.push((file.source_label(), content));
         }
-        let parsed_files = match parse_directory_files_located(&file_inputs, config) {
+        let mut parsed_files = match parse_directory_files_located(&file_inputs, config) {
             Ok(v) => v,
             Err(located) => {
                 return Err(ConfigurationLoadFailure::located(located, path));
             }
         };
+        mark_complete_directory_files(&mut parsed_files, config);
         let authored_bindings = AuthoredBindingView::from_directory_files(&parsed_files);
         let duplicate_declarations = find_duplicate_declarations(path, &parsed_files);
 
@@ -1468,7 +1593,7 @@ fn parse_directory_with_overrides_impl(
         file_inputs.push((file.source_label(), content));
     }
 
-    let parsed_files = match parse_directory_files_located(&file_inputs, config) {
+    let mut parsed_files = match parse_directory_files_located(&file_inputs, config) {
         Ok(v) => v,
         Err(located) => {
             let location = located
@@ -1484,6 +1609,7 @@ fn parse_directory_with_overrides_impl(
             ));
         }
     };
+    mark_complete_directory_files(&mut parsed_files, config);
     let authored_bindings = AuthoredBindingView::from_directory_files(&parsed_files);
     let duplicate_declarations = find_duplicate_declarations(dir, &parsed_files);
     let semantic_files = if resolution.is_diagnostics() {

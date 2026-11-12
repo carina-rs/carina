@@ -1162,11 +1162,21 @@ impl DiagnosticRun<'_> {
                 }
             }
             let pre_expansion_input = merged.unwrap_or(parsed);
-            let pre_expansion_configuration = carina_core::config_loader::load_buffer_configuration(
-                pre_expansion_input,
-                &self.schemas,
-                self.provider_context.catalog(),
-            );
+            let pre_expansion_configuration = if let (None, Some(base)) = (merged, base_path) {
+                carina_core::config_loader::load_buffer_configuration_in_directory(
+                    pre_expansion_input,
+                    &self.schemas,
+                    self.provider_context.catalog(),
+                    base,
+                    &overrides,
+                )
+            } else {
+                carina_core::config_loader::load_buffer_configuration(
+                    pre_expansion_input,
+                    &self.schemas,
+                    self.provider_context.catalog(),
+                )
+            };
             let expression_report = pre_expansion_configuration.judged().report();
             for finding in expression_report.findings() {
                 if let Some(diagnostic) = render_merged(

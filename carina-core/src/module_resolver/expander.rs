@@ -2654,8 +2654,12 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
     ) -> Result<(), ModuleError> {
         use crate::parser::retained::RequireScope;
         let failures = match crate::parser::retained::require_scope(parsed) {
-            RequireScope::ModuleTemplate { .. } | RequireScope::ModuleCall => return Ok(()),
-            RequireScope::Directory | RequireScope::UnvalidatedDirectory => {
+            RequireScope::Unknown
+            | RequireScope::ModuleTemplate { .. }
+            | RequireScope::ModuleCall => {
+                return Ok(());
+            }
+            RequireScope::Directory(_) | RequireScope::UnvalidatedDirectory(_) => {
                 if crate::parser::retained::has_retained_requires(parsed) {
                     parsed
                         .expression_report()
