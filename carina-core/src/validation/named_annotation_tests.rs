@@ -1,7 +1,7 @@
 use super::*;
 use crate::provider::{
     BoxFuture, CanonicalProviderConfigAttributes, InitializeOutcomeMint, LoadedProviderSnapshot,
-    ProviderInitialization, ProviderResult,
+    ProviderFactory, ProviderInitialization, ProviderResult,
 };
 use crate::schema::{
     AttributeSchema, AttributeType as DraftType, RawShape, ResourceSchema, SchemaKind,

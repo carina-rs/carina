@@ -9662,7 +9662,11 @@ fn validate_provider_config_skips_attributes_with_deferred_refs() {
     let (factory, seen_handle) = RecordingFactory::new("aws");
     let factories: Vec<Box<dyn crate::provider::ProviderFactory>> = vec![Box::new(factory)];
 
-    validate_provider_config(&parsed, &factories).expect("validate must not error");
+    admission::configuration::provider::analyze_configs(
+        &parsed.providers,
+        &factories.iter().map(Box::as_ref).collect::<Vec<_>>(),
+    )
+    .expect("validate must not error");
 
     let seen = seen_handle
         .lock()
@@ -9768,7 +9772,11 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
             seen: std::sync::Arc::clone(&seen),
         })];
 
-    validate_provider_config(&parsed, &factories).expect("enum config must validate");
+    admission::configuration::provider::analyze_configs(
+        &parsed.providers,
+        &factories.iter().map(Box::as_ref).collect::<Vec<_>>(),
+    )
+    .expect("enum config must validate");
 
     let calls = seen.lock().unwrap();
     assert!(matches!(

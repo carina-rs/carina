@@ -68,10 +68,6 @@ fn undeclared_enum_configuration_has_one_owner_diagnostic_in_both_clients() {
         .into_iter()
         .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
         .collect();
-    eprintln!(
-        "CONFIG_ENUM_MEASUREMENT {}",
-        serde_json::json!({"sources":{"main.crn":main,"providers.crn":providers,"backend.crn":backend},"cli_text":{"exit":report.exit_code(),"stdout":String::from_utf8(stdout).unwrap(),"stderr":String::from_utf8(stderr.clone()).unwrap()},"cli_json":{"exit":report.exit_code(),"document":json},"lsp":diagnostics})
-    );
     let expected = "provider owner: regoin: Unknown attribute 'regoin', did you mean 'region'?";
     assert_eq!(report.exit_code(), 1);
     assert_eq!(

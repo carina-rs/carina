@@ -803,13 +803,7 @@ impl carina_core::provider::ProviderFactory for MockNormalizer {
         builtin_schemas()
     }
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
-        ValidatedProviderSchemaWitness::new(
-            builtin_schemas(),
-            ValidatedConfigSchema::default(),
-            Default::default(),
-            Vec::new(),
-        )
-        .expect("the normalizer has no configuration fields")
+        builtin_schema_witness()
     }
     fn create_provider(
         &self,
