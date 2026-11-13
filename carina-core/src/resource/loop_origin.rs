@@ -285,6 +285,8 @@ fn loop_system_identity(
     #[cfg(feature = "test-utils")]
     let mut hasher =
         crate::identity_recording::RecordingSha256::new(hasher, "loop-system-identity");
+    #[cfg(feature = "test-utils")]
+    let recording = hasher.result_link();
     component(&mut hasher, file_or_parent_identity.as_bytes());
     hasher.update((start as u64).to_be_bytes());
     hasher.update((end as u64).to_be_bytes());
@@ -299,7 +301,12 @@ fn loop_system_identity(
         }
         None => hasher.update([0]),
     }
-    ResourceIdentity::new(format!("_loop_{}", hex::encode(&hasher.finalize()[..8])))
+    let identity = ResourceIdentity::new(format!("_loop_{}", hex::encode(&hasher.finalize()[..8])));
+    #[cfg(feature = "test-utils")]
+    if let Some(recording) = recording {
+        recording.loop_result(&identity, module_scope.map(|_| file_or_parent_identity));
+    }
+    identity
 }
 
 /// Provenance for one concrete resource emitted by an unbound `for` or `if`.

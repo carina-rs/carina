@@ -231,6 +231,8 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         resolved_bindings: Option<&crate::binding_index::ResolvedBindings<ParserPlaceholder>>,
         expansion_source: ModuleExpansionSource<'_>,
     ) -> Result<crate::parser::RootBindingResolvedParsedFile, ModuleError> {
+        #[cfg(feature = "test-utils")]
+        let _recording_module = crate::identity_recording::enter_module(call.id());
         let module = match expansion_source.module {
             Some(module) => module,
             None => self
@@ -4102,9 +4104,7 @@ pub fn instance_prefix_for_call(call: &ModuleCall) -> String {
     }
 
     #[cfg(feature = "test-utils")]
-    let _recording_context = crate::identity_recording::context(|| {
-        crate::identity_recording::module_context_key(call.id())
-    });
+    let _recording_context = crate::identity_recording::module_context(call.id());
     let mut features: BTreeMap<String, String> = BTreeMap::new();
     features.insert("_module".to_string(), call.module_name.clone());
     for (k, v) in call.arguments() {

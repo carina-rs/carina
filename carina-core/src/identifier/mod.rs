@@ -2104,6 +2104,8 @@ pub(crate) fn compute_simhash<K: std::fmt::Display>(
 ) -> SimHash {
     use std::hash::{Hash, Hasher};
 
+    #[cfg(feature = "test-utils")]
+    let recording = crate::identity_recording::begin_simhash(attributes.len());
     let mut v = [0i32; 64];
     for (key, value) in attributes {
         let feature = format!("{}={}", key, value);
@@ -2127,6 +2129,10 @@ pub(crate) fn compute_simhash<K: std::fmt::Display>(
         if *count > 0 {
             result |= 1 << i;
         }
+    }
+    #[cfg(feature = "test-utils")]
+    if let Some(recording) = recording {
+        recording.finish("simhash", &result.to_le_bytes());
     }
     SimHash(result)
 }
@@ -2607,7 +2613,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
         }
 
         #[cfg(feature = "test-utils")]
-        let _recording_context = crate::identity_recording::context(|| format!("resource:{idx}"));
+        let _recording_context = crate::identity_recording::resource_context(resource);
         let hash_values = anonymous_identity_inputs(resource, schema.schema());
         let hash_suffix = match &hash_values {
             AnonymousIdentityInputs::DeclaredIdentity(IdentityValues::Complete(values)) => {
