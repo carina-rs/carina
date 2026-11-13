@@ -1833,13 +1833,13 @@ impl DiagnosticRun<'_> {
     }
 
     /// Check authored references against directory-wide binding authority.
-    pub(super) fn check_undefined_references(
+    pub(super) fn undefined_reference_findings(
         &self,
-        doc: &Document,
         tree: &carina_core::parser::AnalysisTree<'_>,
         defined_bindings: &HashSet<String>,
         declared_providers: &HashSet<String>,
-    ) -> Vec<Diagnostic> {
+    ) -> Vec<carina_core::parser::Located<carina_core::resource::SecretDiagnosticError<String>>>
+    {
         let mut enum_namespaces = HashSet::new();
         for factory in self
             .factories
@@ -1877,12 +1877,7 @@ impl DiagnosticRun<'_> {
                         )
                     }),
                 );
-                render_merged(
-                    doc,
-                    &finding,
-                    DiagnosticSeverity::ERROR,
-                    finding.detail().to_string(),
-                )
+                Some(finding)
             })
             .collect()
     }

@@ -1726,6 +1726,8 @@ impl From<carina_core::validation::ExportBoundaryError> for AppError {
     }
 }
 
+impl carina_core::validation::ValidationClientFailure for AppError {}
+
 impl carina_core::validation::ValidationClientError for AppError {
     fn kind(&self) -> carina_core::validation::ClientFindingKind {
         carina_core::validation::ClientFindingKind::Error

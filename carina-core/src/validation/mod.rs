@@ -9,12 +9,13 @@ pub mod deferred_populate;
 pub mod deferred_types;
 pub mod depends_on;
 mod parameter_findings;
-mod presentation;
+pub(crate) mod presentation;
 pub(crate) use presentation::{AdmissionComplete, AdmittedConversions};
 pub use presentation::{
-    AdmissionIncomplete, ClientFindingKind, ConversionValidation, FindingSubject, OrdinaryFinding,
-    PresentedConversion, PresentedFinding, PresentedFindings, ResourceAdmissionStep,
-    ResourceValidationReport, ValidationClientError,
+    AdmissionIncomplete, ClientFindingKind, ConversionValidation, FindingSubject, OrdinaryFailure,
+    OrdinaryFinding, PresentedConversion, PresentedFinding, PresentedFindings,
+    ResourceAdmissionStep, ResourceValidationReport, ValidationClientError,
+    ValidationClientFailure,
 };
 pub mod routing;
 pub mod typecheck;

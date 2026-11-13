@@ -125,8 +125,17 @@ pub struct WalkCoverage {
     visits: std::collections::HashSet<(NodeId, UseId, ExpansionInstanceId, ProjectionGeneration)>,
     work: usize,
     conversion_verdicts: std::collections::HashMap<
-        NodeId,
-        std::collections::HashSet<crate::parser::retained::ExpressionEnvironmentId>,
+        (
+            NodeId,
+            crate::parser::retained::ExpressionEnvironmentId,
+            UseId,
+            ExpansionInstanceId,
+        ),
+        crate::parser::retained::conversion::RecordedVerdict,
+    >,
+    unknown_destinations: std::collections::HashMap<
+        (UseId, ExpansionInstanceId),
+        crate::validation::presentation::DestinationUnknown,
     >,
     generations: std::collections::HashMap<(UseId, ExpansionInstanceId), ProjectionGeneration>,
     nodes: std::collections::HashSet<(NodeId, crate::parser::retained::ExpressionEnvironmentId)>,
@@ -137,9 +146,6 @@ impl WalkCoverage {
     pub(crate) fn record_conversions(&mut self, findings: crate::ConversionChannel) {
         self.conversions
             .append(findings.in_subject(self.subject.clone()));
-    }
-    pub(crate) fn has_conversion_findings(&self) -> bool {
-        !self.committed.is_empty()
     }
     pub(crate) fn take_conversions(&mut self) -> crate::ConversionChannel {
         self.committed.take()
@@ -152,13 +158,6 @@ impl WalkCoverage {
     }
     pub(crate) fn commit_pending(&mut self, witness: crate::validation::AdmissionComplete) {
         let pending = std::mem::take(&mut self.conversions);
-        self.committed.commit(witness, pending);
-    }
-    pub(crate) fn commit_channel(
-        &mut self,
-        witness: crate::validation::AdmissionComplete,
-        pending: crate::ConversionChannel,
-    ) {
         self.committed.commit(witness, pending);
     }
     pub(crate) fn in_subject<T>(
@@ -182,12 +181,17 @@ impl WalkCoverage {
         self.record_conversions(other.conversions);
         self.committed.extend(other.committed);
         self.visits.extend(other.visits);
-        for (node, environments) in other.conversion_verdicts {
+        for (usage, verdict) in other.conversion_verdicts {
             self.conversion_verdicts
-                .entry(node)
-                .or_default()
-                .extend(environments);
+                .entry(usage)
+                .and_modify(|current| {
+                    if verdict.rejecting() {
+                        *current = verdict;
+                    }
+                })
+                .or_insert(verdict);
         }
+        self.unknown_destinations.extend(other.unknown_destinations);
         self.nodes.extend(other.nodes);
         self.unavailable.extend(other.unavailable);
         self.work += other.work;
@@ -234,31 +238,57 @@ impl WalkCoverage {
         self.visits
             .contains(&(node, occurrence, instance, generation))
     }
-    pub(crate) fn conversion_judged(
+    pub(crate) fn destination_unknown(
+        &mut self,
+        root: crate::parser::retained::conversion::RootRequirement,
+        witness: crate::validation::presentation::DestinationUnknown,
+    ) {
+        self.unknown_destinations
+            .insert((root.occurrence, root.instance), witness);
+    }
+    pub(crate) fn unknown_destination(
+        &self,
+        root: &crate::parser::retained::conversion::RootRequirement,
+    ) -> Option<&crate::validation::presentation::DestinationUnknown> {
+        self.unknown_destinations
+            .get(&(root.occurrence, root.instance))
+    }
+    pub(crate) fn conversion_outcome(
         &self,
         node: NodeId,
         environment: crate::parser::retained::ExpressionEnvironmentId,
-    ) -> bool {
+        root: &crate::parser::retained::conversion::RootRequirement,
+    ) -> Option<crate::parser::retained::conversion::RecordedVerdict> {
+        if !self.reached_root(root.node, root.occurrence, root.instance, root.generation) {
+            return None;
+        }
         self.conversion_verdicts
-            .get(&node)
-            .is_some_and(|environments| environments.contains(&environment))
-    }
-    pub(crate) fn template_conversion_judged(&self, node: NodeId) -> bool {
-        self.conversion_verdicts.contains_key(&node)
+            .get(&(node, environment, root.occurrence, root.instance))
+            .copied()
     }
     fn verdict<B: BindingAddress>(
         &mut self,
         cursor: &AuthoredCursor<'_, B>,
         outcome: &PolicyOutcome,
     ) {
-        if let PolicyOutcome::Claimed(_) = outcome
+        if let PolicyOutcome::Claimed(verdict) = outcome
             && let CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) = &cursor.kind
             && usage.form() == AuthoredForm::Convert
         {
+            let verdict = verdict.recorded();
             self.conversion_verdicts
-                .entry(usage.node().node_id())
-                .or_default()
-                .insert(usage.node().environment().id());
+                .entry((
+                    usage.node().node_id(),
+                    usage.node().environment().id(),
+                    usage.root_occurrence(),
+                    usage.instance(),
+                ))
+                .and_modify(|current| {
+                    if verdict.rejecting() {
+                        *current = verdict;
+                    }
+                })
+                .or_insert(verdict);
         }
     }
 
@@ -1667,9 +1697,14 @@ pub(crate) struct ReferenceCheck<'a, B: BindingAddress> {
 /// The caller must explicitly choose whether authored policy owns this position.
 /// No default can turn a missed conversion into ordinary assignment.
 #[derive(Debug)]
-pub(crate) enum AuthoredOutcome {
-    Continue(AssignmentFindings),
-    Claimed(crate::parser::retained::ConversionJudgement),
+pub(crate) enum AuthoredOutcome<
+    Judgement = crate::parser::retained::ConversionJudgement,
+    Deferral = std::convert::Infallible,
+    Channel = crate::ConversionChannel,
+> {
+    Continue(AssignmentFindings<Channel>),
+    Claimed(Judgement),
+    Deferred(Deferral),
 }
 
 // Only a consumed authored witness or an explicit hook error reaches this
@@ -1677,6 +1712,7 @@ pub(crate) enum AuthoredOutcome {
 enum PolicyOutcome {
     Continue(AssignmentFindings),
     Claimed(crate::parser::retained::ConversionVerdict),
+    Deferred(crate::parser::retained::conversion::TemplateDeferral),
 }
 pub(crate) type AuthoredAssignmentCheck<'a, P, B> =
     &'a dyn Fn(
@@ -1690,6 +1726,7 @@ pub(crate) type AuthoredAssignmentCheck<'a, P, B> =
 /// supplies policy, including the explicit classified-input producer.
 pub(crate) enum AuthoredChecks<'a, P: ValueKind, B: BindingAddress> {
     Validation(AuthoredAssignmentCheck<'a, P, B>),
+    Preflight(crate::validation::admission::TemplatePreflight),
     Projected(crate::parser::retained::ProjectedPhase),
 }
 impl<P: ValueKind, B: BindingAddress> Copy for AuthoredChecks<'_, P, B> {}
@@ -1864,16 +1901,6 @@ impl<'a, P: ValueKind, B: BindingAddress, M: WalkMode> WalkCallbacks<'a, P, B, M
             }),
         }
     }
-    fn has_observer(&self) -> bool {
-        #[cfg(test)]
-        {
-            self.authored.is_some()
-        }
-        #[cfg(not(test))]
-        {
-            false
-        }
-    }
     #[cfg(test)]
     pub(crate) fn observe(
         mut self,
@@ -1927,6 +1954,7 @@ impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
         match self.policy {
             AuthoredChecks::Validation(check) => match check(attr, value, path, cursor.clone()) {
                 Ok(AuthoredOutcome::Continue(findings)) => PolicyOutcome::Continue(findings),
+                Ok(AuthoredOutcome::Deferred(never)) => match never {},
                 Ok(AuthoredOutcome::Claimed(witness)) => match witness.consume(attr, &cursor) {
                     Ok(verdict) => PolicyOutcome::Claimed(verdict),
                     Err(error) => PolicyOutcome::Claimed(
@@ -1935,6 +1963,34 @@ impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
                 },
                 Err(error) => rejected(error),
             },
+            AuthoredChecks::Preflight(boundary) => {
+                match crate::parser::retained::conversion::check_template(boundary, attr, &cursor) {
+                    AuthoredOutcome::Continue(findings) => {
+                        let AssignmentFindings {
+                            claim_effect,
+                            conversions: NoConversions,
+                            local,
+                            schema,
+                            errors,
+                            #[cfg(test)]
+                            deferred,
+                            matched_destination,
+                        } = findings;
+                        PolicyOutcome::Continue(AssignmentFindings {
+                            claim_effect,
+                            conversions: Default::default(),
+                            local,
+                            schema,
+                            errors,
+                            #[cfg(test)]
+                            deferred,
+                            matched_destination,
+                        })
+                    }
+                    AuthoredOutcome::Claimed(never) => match never {},
+                    AuthoredOutcome::Deferred(deferral) => PolicyOutcome::Deferred(deferral),
+                }
+            }
             AuthoredChecks::Projected(phase) => match cursor.kind {
                 CursorKind::Projected(current) if current == phase => {
                     PolicyOutcome::Continue(Default::default())
@@ -2006,17 +2062,20 @@ pub(crate) enum Claim<'a, B: BindingAddress> {
     Rejected {
         owner: std::rc::Rc<AuthoredCursor<'a, B>>,
     },
+    Deferred {
+        owner: std::rc::Rc<AuthoredCursor<'a, B>>,
+    },
 }
 impl<'a, B: BindingAddress> Claim<'a, B> {
     fn is_claimed(&self) -> bool {
         match self {
             Self::None => false,
-            Self::Accepted { .. } | Self::Rejected { .. } => true,
+            Self::Accepted { .. } | Self::Rejected { .. } | Self::Deferred { .. } => true,
         }
     }
     fn is_rejected(&self) -> bool {
         match self {
-            Self::None | Self::Accepted { .. } => false,
+            Self::None | Self::Accepted { .. } | Self::Deferred { .. } => false,
             Self::Rejected { .. } => true,
         }
     }
@@ -2024,13 +2083,13 @@ impl<'a, B: BindingAddress> Claim<'a, B> {
         match self {
             Self::None => None,
             Self::Accepted { owner } => Some(&owner.cursor),
-            Self::Rejected { owner } => Some(owner),
+            Self::Rejected { owner } | Self::Deferred { owner } => Some(owner),
         }
     }
     fn conversion(&self) -> Option<&crate::parser::retained::conversion::AcceptedConversion> {
         match self {
             Self::Accepted { owner } => Some(&owner.conversion),
-            Self::None | Self::Rejected { .. } => None,
+            Self::None | Self::Rejected { .. } | Self::Deferred { .. } => None,
         }
     }
     fn record(
@@ -2040,6 +2099,15 @@ impl<'a, B: BindingAddress> Claim<'a, B> {
     ) -> AssignmentFindings {
         match outcome {
             PolicyOutcome::Continue(findings) => findings,
+            PolicyOutcome::Deferred(deferral) => {
+                deferral.consume();
+                if !self.is_rejected() {
+                    *self = Self::Deferred {
+                        owner: std::rc::Rc::new(cursor),
+                    };
+                }
+                Default::default()
+            }
             PolicyOutcome::Claimed(verdict) => {
                 let (claim, findings) = verdict.decide(
                     |findings, conversion| {
@@ -2186,9 +2254,14 @@ impl<'a, P: PlaceholderKind, B: BindingAddress, M: WalkMode> AssignmentWalk<'a, 
         let mut findings = AssignmentProbe::default();
         if !self.cursor.is_projection_only()
             && let CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) = &self.cursor.kind
-            && (self.callbacks.has_observer() || usage.node().judgement().contains_any_conversion())
             && matches!(usage.navigation(), Ok(AuthoredNavigation::Parts))
         {
+            let inspect_parts = usage.node().judgement().contains_any_conversion();
+            #[cfg(test)]
+            let inspect_parts = inspect_parts || self.callbacks.authored.is_some();
+            if !inspect_parts {
+                return findings;
+            }
             for index in 0..usage.child_count() {
                 let result = usage.part(index).map_err(seam_error).and_then(|child| {
                     visit_syntax(
@@ -2220,7 +2293,10 @@ impl<'a, P: PlaceholderKind, B: BindingAddress, M: WalkMode> AssignmentWalk<'a, 
         ancestry: FieldAncestry,
     ) -> Result<PreparedWalk<'a, P, B, M>, TypeError> {
         let mut findings = AssignmentProbe::default();
+        #[cfg(test)]
         let mut wrappers = Vec::new();
+        #[cfg(not(test))]
+        let wrappers = Vec::new();
         let mut followed = std::collections::HashSet::new();
         while let CursorKind::Authored(usage) = self.cursor.kind.clone() {
             self.coverage.borrow_mut().record(&usage);
@@ -2239,7 +2315,8 @@ impl<'a, P: PlaceholderKind, B: BindingAddress, M: WalkMode> AssignmentWalk<'a, 
                             &mut findings.authored,
                         );
                     }
-                    if authored && self.callbacks.has_observer() {
+                    #[cfg(test)]
+                    if authored && self.callbacks.authored.is_some() {
                         wrappers.push(self.cursor.clone());
                     }
                     AuthoredCursor::authored(child)
@@ -2259,7 +2336,8 @@ impl<'a, P: PlaceholderKind, B: BindingAddress, M: WalkMode> AssignmentWalk<'a, 
                         CheckValue::Current(value.diagnostic_value()),
                         path,
                     )?);
-                    if self.callbacks.has_observer() {
+                    #[cfg(test)]
+                    if self.callbacks.authored.is_some() {
                         wrappers.push(self.cursor.selection());
                     }
                     let selected = usize::from(!usage.known_condition().map_err(seam_error)?);
@@ -2296,7 +2374,8 @@ impl<'a, P: PlaceholderKind, B: BindingAddress, M: WalkMode> AssignmentWalk<'a, 
                         CheckValue::Current(value.diagnostic_value()),
                         path,
                     )?);
-                    if self.callbacks.has_observer() {
+                    #[cfg(test)]
+                    if self.callbacks.authored.is_some() {
                         wrappers.push(self.cursor.selection());
                     }
                     findings.extend(visit_discarded(

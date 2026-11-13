@@ -290,6 +290,15 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         }
     }
 
+    pub(super) fn not_expanded(
+        &self,
+        body: &pest::iterators::Pair<'_, Rule>,
+        reason: super::retained::NotExpandedReason,
+    ) {
+        self.authored_nodes
+            .not_expanded(body, super::retained::NotExpanded::parser(reason));
+    }
+
     pub(super) fn record_selected_condition(
         &self,
         token: &pest::iterators::Pair<'_, Rule>,

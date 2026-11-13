@@ -385,8 +385,18 @@ struct CandidateObligations {
     schema: SchemaObligation,
 }
 
+/// Authority available only to the module-template admission entry.
+#[derive(Clone, Copy)]
+pub(crate) struct TemplatePreflight {
+    _private: (),
+}
+
 enum AdmissionProof<'a, P: PlaceholderKind, B: BindingAddress> {
     Validation(crate::resource::knowledge::Classification<'a, P, B>),
+    Template {
+        proof: crate::resource::knowledge::Classification<'a, P, B>,
+        boundary: TemplatePreflight,
+    },
     Plan(PlanResolved<'a, P, B>),
     Apply {
         known: KnownValue<'a, P, B>,
@@ -584,6 +594,48 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
 }
 
 impl<B: BindingAddress> Candidate<crate::resource::ParserPlaceholder, B> {
+    fn template_preflight_slot<'a>(
+        slot: &'a crate::parser::retained::JudgedSlot<B>,
+        proof: crate::resource::knowledge::Classification<
+            'a,
+            crate::resource::ParserPlaceholder,
+            B,
+        >,
+        bindings: Option<&'a BindingIndex<'a, B>>,
+        provider: &'a dyn ProviderTypeCheckContext,
+    ) -> Result<
+        (
+            Self,
+            AdmissionContext<'a, crate::resource::ParserPlaceholder, B>,
+        ),
+        AdmissionErrors,
+    > {
+        let value = crate::resource::knowledge::ClassifiedRef::from(&proof).diagnostic_value();
+        if !slot
+            .projection()
+            .is_some_and(|projection| std::ptr::eq(projection, value))
+        {
+            return Err(seam_constraint(
+                crate::parser::retained::MissingEvidence::new(
+                    "template slot/projection proof pairing",
+                ),
+            ));
+        }
+        let cursor = crate::parser::retained::AuthoredCursor::authored(
+            slot.cursor().map_err(seam_constraint)?,
+        );
+        Ok(Self::paired(
+            value.clone(),
+            AdmissionProof::Template {
+                proof,
+                boundary: TemplatePreflight { _private: () },
+            },
+            bindings,
+            provider,
+            cursor,
+        ))
+    }
+
     /// Candidate, knowledge and authored cursor are sealed from one slot.
     /// The classification must borrow this slot's projection allocation;
     /// an equal value from another slot or generation is not its proof.
@@ -626,6 +678,21 @@ impl<B: BindingAddress> Candidate<crate::resource::ParserPlaceholder, B> {
 }
 
 impl<'a, P: PlaceholderKind, B: BindingAddress> AdmissionContext<'a, P, B> {
+    fn authored_policy<'c>(
+        &self,
+        live: crate::schema::value_validation::AuthoredAssignmentCheck<'c, P, B>,
+    ) -> crate::schema::value_validation::AuthoredChecks<'c, P, B> {
+        use crate::schema::value_validation::AuthoredChecks;
+        match &self.proof {
+            AdmissionProof::Validation(_) => AuthoredChecks::Validation(live),
+            AdmissionProof::Template { boundary, .. } => AuthoredChecks::Preflight(*boundary),
+            AdmissionProof::Plan(proof) => {
+                AuthoredChecks::Projected(crate::parser::retained::ProjectedPhase::plan(proof))
+            }
+            AdmissionProof::Apply { phase, .. } => AuthoredChecks::Projected(*phase),
+        }
+    }
+
     fn with_checks<'s>(
         self,
         assignment: AssignmentChecks<'s, P, B>,
@@ -642,7 +709,9 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> AdmissionContext<'a, P, B> {
 
     fn sites(&self) -> Vec<PendingSite<B>> {
         match &self.proof {
-            AdmissionProof::Validation(proof) => proof.sites().collect(),
+            AdmissionProof::Validation(proof) | AdmissionProof::Template { proof, .. } => {
+                proof.sites().collect()
+            }
             AdmissionProof::Plan(proof) => proof.knowledge().sites().collect(),
             AdmissionProof::Apply { .. } => vec![],
         }

@@ -328,7 +328,7 @@ fn conversion_module_body_kinds_have_one_presented_owner_and_context() {
 }
 
 #[test]
-fn conversion_unused_inventory_waits_for_admission_after_an_ordinary_early_failure() {
+fn conversion_unused_inventory_is_a_syntax_verdict_even_after_an_ordinary_early_failure() {
     let directory = tempfile::tempdir().unwrap();
     let path = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
     let mut ordinary = Vec::new();
@@ -356,11 +356,19 @@ fn conversion_unused_inventory_waits_for_admission_after_an_ordinary_early_failu
                 others.push(error.clone());
             }
         }
-        assert!(
-            conversions.is_empty(),
-            "unused destinations require an admission pass: {}",
+        assert_eq!(
+            conversions.len(),
+            usize::from(converted),
+            "unused has no syntactic consumer: {}",
             report.json
         );
+        if converted {
+            assert_eq!(
+                conversions[0]["code"], "conversion_unused",
+                "{}",
+                report.json
+            );
+        }
         ordinary.push(others);
     }
     assert!(!ordinary[0].is_empty());
@@ -599,4 +607,520 @@ fn merge_1b_claim_preserves_sibling_and_nested_reference_judgements() {
             "{lsp:?}"
         );
     }
+}
+
+fn round4_write(directory: &std::path::Path, file: &str, source: &str) {
+    let file = directory.join(file);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, source).unwrap();
+}
+fn round4_validate(directory: &std::path::Path) -> serde_json::Value {
+    carina_cli::commands::validate::validate_diagnostics_with_factories(
+        &carina_core::paths::ResolvedPath::new(directory).unwrap(),
+        carina_cli::wiring::LoadedProviderFactory::for_test(factories()),
+        HashMap::new(),
+    )
+    .json
+}
+fn round4_conversions(json: &serde_json::Value) -> Vec<&serde_json::Value> {
+    json.get("errors")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|error| {
+            error["code"]
+                .as_str()
+                .is_some_and(|code| code.starts_with("conversion_"))
+        })
+        .collect()
+}
+#[test]
+fn round4_nonexpanded_structural_and_module_conversions_have_no_rejection() {
+    let mut failures = Vec::new();
+    for (name, root, module) in [
+        (
+            "empty_for",
+            "for item in [] { mock.Sink { attr = item AS } }",
+            None,
+        ),
+        (
+            "false_if",
+            "let on = false\nif on { mock.Sink { attr = 'ok' AS } }",
+            None,
+        ),
+        (
+            "uncalled_module",
+            "let child = use { source = './child' }",
+            Some("arguments { unused: String }\nmock.Sink { attr = 'ok' AS }"),
+        ),
+        (
+            "module_in_empty_for",
+            "let child = use { source = './child' }\nfor item in [] { child { unused = 'ok' } }",
+            Some("arguments { unused: String }\nmock.Sink { attr = 'ok' AS }"),
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        round4_write(directory.path(), "providers.crn", "provider mock {}\n");
+        for conversion in ["", "as mock.Name"] {
+            round4_write(
+                directory.path(),
+                "main.crn",
+                &root.replace("AS", conversion),
+            );
+            if let Some(module) = module {
+                round4_write(
+                    directory.path(),
+                    "child/main.crn",
+                    &module.replace("AS", conversion),
+                );
+            }
+            let json = round4_validate(directory.path());
+            if json["status"] != "ok" || !round4_conversions(&json).is_empty() {
+                failures.push(format!("{name}, conversion={conversion:?}: {json}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+#[test]
+fn round4_module_rejection_cannot_stop_root_conversion_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    round4_write(directory.path(), "providers.crn", "provider mock {}\n");
+    round4_write(
+        directory.path(),
+        "main.crn",
+        "let child = use { source = './child' }\nlet net = child { unused = 'ok' }\nmock.Sink { attr = 'ok' as mock.Name }\n",
+    );
+    round4_write(
+        directory.path(),
+        "child/main.crn",
+        "arguments { unused: String }\nmock.Sink { attr = 42 as mock.Name }\n",
+    );
+    let json = round4_validate(directory.path());
+    let errors = json["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{json}");
+    assert_eq!(errors[0]["code"], "conversion_scalar_kind", "{json}");
+}
+struct Round4ReloadFactory {
+    inner: ConversionFactory,
+    loaded: bool,
+}
+impl ProviderFactory for Round4ReloadFactory {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn display_name(&self) -> &str {
+        self.inner.display_name()
+    }
+    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+        self.inner.provider_config_attribute_types()
+    }
+    fn validate_config(
+        &self,
+        attributes: &CanonicalProviderConfigAttributes,
+        inputs: &ProviderValidationInputs,
+    ) -> ProviderResult<()> {
+        self.inner.validate_config(attributes, inputs)
+    }
+    fn create_provider(
+        &self,
+        session: &ProviderSession,
+        mint: InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+        self.inner.create_provider(session, mint)
+    }
+    fn create_normalizer(
+        &self,
+        session: &ProviderSession,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
+        self.inner.create_normalizer(session)
+    }
+    fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
+        ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+    fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+        let mut schemas = self.inner.schemas();
+        if self.loaded {
+            schemas.push(
+                ResourceSchema::new("NotLoaded")
+                    .attribute(
+                        AttributeSchema::optional(
+                            "attr",
+                            AttributeType::refined_string(
+                                Some(TypeIdentity::from_dotted("mock.OtherName")),
+                                None,
+                                Some((Some(1), Some(8))),
+                                None,
+                            ),
+                        )
+                        .build(),
+                    )
+                    .validate()
+                    .unwrap(),
+            );
+        }
+        schemas
+    }
+}
+#[test]
+fn round4_alias_schema_unknown_use_does_not_reject_and_is_rechecked_after_load() {
+    let directory = tempfile::tempdir().unwrap();
+    round4_write(directory.path(), "providers.crn", "provider mock {}\n");
+    let path = directory.path().join("main.crn");
+    let source = "let x = 'ok' as mock.Name\nlet accepted = mock.Sink { attr = x }\nlet unknown = mock.NotLoaded { attr = x }\n";
+    round4_write(directory.path(), "main.crn", source);
+    let document = carina_lsp::document::Document::new_with_path(
+        source.into(),
+        path.clone(),
+        Arc::new(carina_core::parser::ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
+    );
+    for (loaded, expected) in [(false, 0), (true, 1), (false, 0)] {
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(Round4ReloadFactory {
+            inner: ConversionFactory,
+            loaded,
+        })];
+        let loaded_providers = loaded_provider_snapshot_from_factories(
+            Arc::new(factories),
+            SchemaRegistry::new(),
+            carina_core::EnvironmentSnapshot::empty(),
+        );
+        let engine = carina_lsp::diagnostics::DiagnosticEngine::new(
+            Arc::new(loaded_providers),
+            vec!["mock".into()],
+        );
+        let diagnostics = engine.analyze(&document, Some(&path));
+        let conversions: Vec<_> = diagnostics.iter().filter(|diagnostic| matches!(&diagnostic.code, Some(tower_lsp::lsp_types::NumberOrString::String(code)) if code.starts_with("conversion_"))).collect();
+        assert_eq!(
+            conversions.len(),
+            expected,
+            "loaded={loaded}: {diagnostics:?}"
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("internal validation invariant")),
+            "{diagnostics:?}"
+        );
+        if loaded {
+            assert!(
+                conversions[0].message.contains("destination"),
+                "{diagnostics:?}"
+            );
+        } else {
+            assert!(
+                diagnostics.iter().any(|diagnostic| diagnostic.severity
+                    == Some(DiagnosticSeverity::WARNING)
+                    && diagnostic.message.contains("No schema")),
+                "{diagnostics:?}"
+            );
+        }
+    }
+}
+#[test]
+fn round4_lsp_sibling_failure_does_not_create_a_conversion_invariant_error() {
+    let directory = tempfile::tempdir().unwrap();
+    round4_write(directory.path(), "providers.crn", "provider mock {}\n");
+    round4_write(
+        directory.path(),
+        "broken.crn",
+        "let broken = mock.Sink { attr = missing.output }\n",
+    );
+    let path = directory.path().join("main.crn");
+    let source = "let accepted = mock.Sink { attr = 'ok' as mock.Name }\n";
+    round4_write(directory.path(), "main.crn", source);
+    let loaded = loaded_provider_snapshot_from_factories(
+        Arc::new(factories()),
+        SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
+    );
+    let engine =
+        carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+    let document = carina_lsp::document::Document::new_with_path(
+        source.into(),
+        path.clone(),
+        Arc::new(carina_core::parser::ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
+    );
+    let diagnostics = engine.analyze(&document, Some(&path));
+    assert!(!diagnostics.iter().any(|diagnostic| diagnostic.message.contains("internal validation invariant") || matches!(&diagnostic.code, Some(tower_lsp::lsp_types::NumberOrString::String(code)) if code.starts_with("conversion_"))), "{diagnostics:?}");
+}
+
+#[test]
+fn round4_function_boundaries_reject_independently_of_calls_and_defaults() {
+    let mut baseline = None;
+    for (name, definition, call) in [
+        ("uncalled_body", "fn f(): String { 'ok' AS }", ""),
+        (
+            "called_body",
+            "fn f(): String { 'ok' AS }",
+            "let result = f()",
+        ),
+        (
+            "uncalled_default",
+            "fn f(a: String = 'ok' AS): String { a }",
+            "",
+        ),
+        (
+            "overridden_default",
+            "fn f(a: String = 'ok' AS): String { a }",
+            "let result = f('other')",
+        ),
+        (
+            "selected_default",
+            "fn f(a: String = 'ok' AS): String { a }",
+            "let result = f()",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        round4_write(directory.path(), "providers.crn", "provider mock {}\n");
+        for conversion in ["", "as mock.Name"] {
+            round4_write(
+                directory.path(),
+                "main.crn",
+                &format!("{}\n{call}\n", definition.replace("AS", conversion)),
+            );
+            let json = round4_validate(directory.path());
+            if conversion.is_empty() {
+                assert_eq!(json["status"], "ok", "{name}: {json}");
+            } else {
+                let findings = round4_conversions(&json);
+                assert_eq!(findings.len(), 1, "{name}: {json}");
+                assert_eq!(
+                    json["errors"].as_array().unwrap().len(),
+                    1,
+                    "{name}: {json}"
+                );
+                assert_eq!(
+                    findings[0]["code"], "conversion_unsupported_position",
+                    "{name}: {json}"
+                );
+                assert!(
+                    findings[0]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("not supported at this position yet"),
+                    "{name}: {json}"
+                );
+                let finding = (findings[0]["code"].clone(), findings[0]["message"].clone());
+                if let Some(expected) = &baseline {
+                    assert_eq!(&finding, expected, "{name}");
+                } else {
+                    baseline = Some(finding);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn round4_module_template_preflight_does_not_check_values_or_register_obligations() {
+    let directory = tempfile::tempdir().unwrap();
+    round4_write(directory.path(), "providers.crn", "provider mock {}\n");
+    round4_write(
+        directory.path(),
+        "main.crn",
+        "let child = use { source = './child' }\n",
+    );
+    round4_write(
+        directory.path(),
+        "child/main.crn",
+        "arguments { unused: String }\nmock.Sink { attr = 'longer-than-eight' as mock.Name }\n",
+    );
+    let json = round4_validate(directory.path());
+    assert_eq!(json["status"], "ok", "{json}");
+    assert!(round4_conversions(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn round4_template_preflight_defers_owned_references_but_preserves_plain_siblings() {
+    let directory = tempfile::tempdir().unwrap();
+    round4_write(directory.path(), "providers.crn", "provider mock {}\n");
+    round4_write(
+        directory.path(),
+        "main.crn",
+        "let child = use { source = './child' }\n",
+    );
+    let mut plain_error = None;
+    for (field, expected_conversion, expected_ordinary) in [
+        ("attr = other.name", 0, 1),
+        ("attr = other.name as mock.Name", 0, 0),
+        ("attr = 42 as mock.Name", 0, 0),
+        ("config = { plain = other.name }", 0, 1),
+        (
+            "config = { converted = other.name as mock.Name plain = other.name }",
+            0,
+            1,
+        ),
+    ] {
+        round4_write(
+            directory.path(),
+            "child/main.crn",
+            &format!(
+                "arguments {{ unused: String }}\nlet other = mock.Source {{ name = 'ok' }}\nlet sink = mock.Sink {{ {field} }}\n"
+            ),
+        );
+        let json = round4_validate(directory.path());
+        assert_eq!(
+            round4_conversions(&json).len(),
+            expected_conversion,
+            "{field}: {json}"
+        );
+        let ordinary: Vec<_> = json
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|finding| finding["code"].is_null())
+            .map(|finding| finding["message"].clone())
+            .collect();
+        assert_eq!(ordinary.len(), expected_ordinary, "{field}: {json}");
+        if field == "config = { plain = other.name }" {
+            plain_error = Some(ordinary.clone());
+        }
+        if field.contains("converted =") {
+            assert_eq!(Some(ordinary), plain_error, "{json}");
+        }
+    }
+}
+
+#[test]
+fn round4_two_module_instances_reject_once_with_the_rejecting_instance_context() {
+    for calls in [
+        "let accepted = child { value = 'ok' }\nlet rejected = child { value = 'longer-than-eight' }",
+        "let rejected = child { value = 'longer-than-eight' }\nlet accepted = child { value = 'ok' }",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        round4_write(directory.path(), "providers.crn", "provider mock {}\n");
+        round4_write(
+            directory.path(),
+            "main.crn",
+            &format!("let child = use {{ source = './child' }}\n{calls}\n"),
+        );
+        round4_write(
+            directory.path(),
+            "child/main.crn",
+            "arguments { value: String }\nlet sink = mock.Sink { attr = value as mock.Name }\n",
+        );
+        let json = round4_validate(directory.path());
+        let findings = round4_conversions(&json);
+        assert_eq!(findings.len(), 1, "{json}");
+        assert_eq!(json["errors"].as_array().unwrap().len(), 1, "{json}");
+        assert_eq!(findings[0]["code"], "conversion_destination", "{json}");
+        assert!(
+            findings[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("rejected"),
+            "{json}"
+        );
+        assert!(
+            findings[0]["location"]["file"]
+                .as_str()
+                .unwrap()
+                .ends_with("child/main.crn"),
+            "{json}"
+        );
+    }
+}
+
+#[test]
+fn round4_cross_file_alias_has_one_rejection_owned_by_its_definition() {
+    let directory = tempfile::tempdir().unwrap();
+    round4_write(directory.path(), "providers.crn", "provider mock {}\n");
+    let source = "let converted = 'ok' as mock.Name\n";
+    round4_write(directory.path(), "definition.crn", source);
+    round4_write(
+        directory.path(),
+        "accepted.crn",
+        "let accepted = mock.Sink { attr = converted }\n",
+    );
+    round4_write(
+        directory.path(),
+        "rejected.crn",
+        "let rejected = mock.Source { name = converted }\n",
+    );
+    let json = round4_validate(directory.path());
+    let findings = round4_conversions(&json);
+    assert_eq!(findings.len(), 1, "{json}");
+    assert_eq!(json["errors"].as_array().unwrap().len(), 1, "{json}");
+    assert_eq!(findings[0]["code"], "conversion_destination", "{json}");
+    assert!(
+        findings[0]["location"]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("definition.crn"),
+        "{json}"
+    );
+    let loaded = loaded_provider_snapshot_from_factories(
+        Arc::new(factories()),
+        SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
+    );
+    let engine =
+        carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+    let path = directory.path().join("definition.crn");
+    let document = carina_lsp::document::Document::new_with_path(
+        source.into(),
+        path.clone(),
+        Arc::new(carina_core::parser::ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
+    );
+    let diagnostics = engine.analyze(&document, Some(&path));
+    let findings: Vec<_> = diagnostics.iter().filter(|finding| matches!(&finding.code, Some(tower_lsp::lsp_types::NumberOrString::String(code)) if code.starts_with("conversion_"))).collect();
+    assert_eq!(findings.len(), 1, "{diagnostics:?}");
+    assert_eq!(findings[0].range.start.line, 0);
+    assert_eq!(findings[0].range.start.character, 16);
+}
+
+#[test]
+fn round4_directory_module_failure_stops_admission_when_an_unrelated_file_is_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = "provider mock {}\n";
+    round4_write(directory.path(), "providers.crn", source);
+    round4_write(
+        directory.path(),
+        "main.crn",
+        "let child = use { source = './child' }\nlet net = child { value = 42 }\nmock.Sink { attr = 'ok' as mock.Name }\n",
+    );
+    round4_write(
+        directory.path(),
+        "child/main.crn",
+        "arguments { value: String }\nattributes { out: String = value }\n",
+    );
+    let cli = round4_validate(directory.path());
+    assert_eq!(round4_conversions(&cli).len(), 0, "{cli}");
+    assert_eq!(cli["status"], "error", "{cli}");
+    let loaded = loaded_provider_snapshot_from_factories(
+        Arc::new(factories()),
+        SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
+    );
+    let engine =
+        carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+    let path = directory.path().join("providers.crn");
+    let document = carina_lsp::document::Document::new_with_path(
+        source.into(),
+        path.clone(),
+        Arc::new(carina_core::parser::ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
+    );
+    let diagnostics = engine.analyze(&document, Some(&path));
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|finding| finding.message.contains("bug in carina")),
+        "{diagnostics:?}"
+    );
+    assert!(!diagnostics.iter().any(|finding| finding.code.as_ref().is_some_and(|code| matches!(code, tower_lsp::lsp_types::NumberOrString::String(code) if code.starts_with("conversion_")))), "{diagnostics:?}");
 }

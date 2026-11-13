@@ -211,7 +211,9 @@ fn conversion_live_covered_and_discarded_uses_each_supply_a_verdict() {
             .into_classification();
         let verdicts = std::cell::Cell::new([0; 3]);
         let mut validation: ConversionValidation = ConversionValidation::new(judged.report());
-        let result = validation.walk(|coverage| {
+        let mut observed_coverage = crate::schema::value_validation::WalkCoverage::default();
+        let result = {
+            let coverage = &mut observed_coverage;
             crate::schema::value_validation::validate_authored_value_for_admission(
                 &schema.schema().as_schema().attributes()["input"].attr_type,
                 &proof,
@@ -260,8 +262,20 @@ fn conversion_live_covered_and_discarded_uses_each_supply_a_verdict() {
                 },
                 coverage,
             )
+        };
+        let bindings =
+            crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+        crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+            validation
+                .admitted_resources(
+                    &tree,
+                    judged,
+                    &bindings,
+                    session,
+                    crate::validation::FindingSubject::Root,
+                )
+                .for_each(drop);
         });
-        validation.finish_test_admission_pass();
         let presented = validation.complete().into_presented();
         assert!(result.local_error().is_none());
         assert_eq!(
@@ -311,7 +325,9 @@ fn conversion_claim_preserves_ordinary_checks_below_a_rejected_wrapper() {
         .into_classification();
     let ordinary = std::cell::RefCell::new(Vec::new());
     let mut validation: ConversionValidation = ConversionValidation::new(judged.report());
-    let result = validation.walk(|coverage| {
+    let mut observed_coverage = crate::schema::value_validation::WalkCoverage::default();
+    let result = {
+        let coverage = &mut observed_coverage;
         crate::schema::value_validation::validate_authored_value_for_admission(
             &schema.schema().as_schema().attributes()["input"].attr_type,
             &proof,
@@ -342,8 +358,20 @@ fn conversion_claim_preserves_ordinary_checks_below_a_rejected_wrapper() {
             },
             coverage,
         )
+    };
+    let bindings =
+        crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+        validation
+            .admitted_resources(
+                &tree,
+                judged,
+                &bindings,
+                session,
+                crate::validation::FindingSubject::Root,
+            )
+            .for_each(drop);
     });
-    validation.finish_test_admission_pass();
     let presented = validation.complete().into_presented();
     assert!(result.local_error().is_none());
     assert_eq!(

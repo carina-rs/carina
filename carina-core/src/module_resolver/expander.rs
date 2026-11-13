@@ -237,6 +237,9 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 .get(&call.module_name)
                 .ok_or_else(|| ModuleError::UnknownModule(call.module_name.clone()))?,
         };
+        self.activated_templates
+            .borrow_mut()
+            .insert(module.expression_report().admission_scope());
         let call_source_file = call.source_file();
         let module_instance_scope = expansion_source.scope.cloned().unwrap_or_else(|| {
             ModuleInstanceScope::for_call(
@@ -2199,6 +2202,35 @@ struct SelectedDeferredIfs {
     dropped: HashMap<AbsoluteBindingAddress, (RelativeBindingName, ConditionalBindingOrigin)>,
 }
 
+/// Only the selection decision below can mint a dropped-branch witness.
+pub(crate) struct UnselectedModuleBranch {
+    scope: ModuleInstanceScope,
+}
+impl UnselectedModuleBranch {
+    pub(crate) fn scope(&self) -> &ModuleInstanceScope {
+        &self.scope
+    }
+}
+fn note_unselected_branch(body: &DeferredIfBody, scope: &ModuleInstanceScope) {
+    match body {
+        DeferredIfBody::Resource(resource) => {
+            resource
+                .authored_slots
+                .note_unselected_branch(UnselectedModuleBranch {
+                    scope: scope.clone(),
+                })
+        }
+        DeferredIfBody::DataSource(source) => {
+            source
+                .authored_slots
+                .note_unselected_branch(UnselectedModuleBranch {
+                    scope: scope.clone(),
+                })
+        }
+        DeferredIfBody::ModuleCall(_) => {}
+    }
+}
+
 fn select_deferred_module_ifs(
     module: &ParsedFile,
     module_call: &crate::resource::ExpandedCompositionCall,
@@ -2233,6 +2265,15 @@ fn select_deferred_module_ifs(
             }
         })?;
 
+        match decision {
+            Some(true) => {
+                if let Some(branch) = deferred.else_branch() {
+                    note_unselected_branch(branch, resolver.scope);
+                }
+            }
+            Some(false) => note_unselected_branch(deferred.then_branch(), resolver.scope),
+            None => {}
+        }
         let selected = match decision {
             Some(true) => Some(deferred.then_branch()),
             Some(false) => deferred.else_branch(),

@@ -31,23 +31,57 @@ use carina_core::validation::DeferredAccessTypeError;
 use carina_core::validation::admission::attributes::uses_resource_attribute_admission;
 
 #[derive(Debug)]
-struct OrdinaryDiagnostic(Diagnostic);
+enum OrdinaryDiagnostic {
+    Visible(Box<Diagnostic>),
+    // The normal directory renderer above owns local output. This typed error
+    // also carries the directory-wide stopping authority when it is a sibling.
+    DirectoryStop(Box<carina_core::config_loader::DirectoryParseFailure>),
+    StructuralStop(Box<carina_core::parser::AnalysisTreeError>),
+    ResolutionStop(Box<carina_core::parser::AnalysisResolutionError>),
+    ExpressionStop(Box<carina_core::parser::Located<carina_core::static_type::InferenceError>>),
+    BindingStop(Box<carina_core::validation::BindingUseFinding>),
+    ReferenceStop(
+        Box<carina_core::parser::Located<carina_core::resource::SecretDiagnosticError<String>>>,
+    ),
+}
+impl OrdinaryDiagnostic {
+    fn visible(diagnostic: Diagnostic) -> Self {
+        Self::Visible(Box::new(diagnostic))
+    }
+}
 impl std::fmt::Display for OrdinaryDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0.message)
+        match self {
+            Self::Visible(diagnostic) => f.write_str(&diagnostic.message),
+            Self::DirectoryStop(error) => write!(f, "{error}"),
+            Self::StructuralStop(error) => write!(f, "{error}"),
+            Self::ResolutionStop(error) => write!(f, "{error}"),
+            Self::ExpressionStop(error) => write!(f, "{error}"),
+            Self::BindingStop(error) => write!(f, "{error}"),
+            Self::ReferenceStop(error) => write!(f, "{error}"),
+        }
     }
 }
 impl carina_core::validation::ValidationClientError for OrdinaryDiagnostic {
     fn kind(&self) -> carina_core::validation::ClientFindingKind {
-        match self.0.severity {
-            None => carina_core::validation::ClientFindingKind::Error,
-            Some(severity) => {
-                if severity == DiagnosticSeverity::ERROR {
-                    carina_core::validation::ClientFindingKind::Error
-                } else {
-                    carina_core::validation::ClientFindingKind::Notice
+        use carina_core::validation::ClientFindingKind;
+        match self {
+            Self::Visible(diagnostic) => match diagnostic.severity {
+                None => ClientFindingKind::Error,
+                Some(severity) => {
+                    if severity == DiagnosticSeverity::ERROR {
+                        ClientFindingKind::Error
+                    } else {
+                        ClientFindingKind::Notice
+                    }
                 }
-            }
+            },
+            Self::DirectoryStop(_)
+            | Self::StructuralStop(_)
+            | Self::ResolutionStop(_)
+            | Self::ExpressionStop(_)
+            | Self::BindingStop(_)
+            | Self::ReferenceStop(_) => ClientFindingKind::Error,
         }
     }
 }
@@ -441,10 +475,48 @@ impl ExpandedDiagnosticValidationInputs<'_> {
         session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Option<carina_core::schema::ResourceValueValidation> {
         let resource = *self.resources.get(resource_id)?;
-        validation.walk_resource(resource, |coverage| {
-            self.resource_admissions_with_coverage(resource_id, session, coverage)
-        })
+        let schemas = self.configuration.schemas();
+        let schema = resource.schema(schemas)?;
+        let inputs =
+            carina_core::validation::admission::attributes::ResourceAttributeInputs::for_resource(
+                resource,
+                self.configuration.report(),
+            )
+            .ok()?;
+        let mut classified = inputs.classify(
+            &carina_core::resource::knowledge::KnowledgeContext::validation(),
+            |_, _| {},
+        );
+        let evaluated = classified
+            .iter()
+            .filter_map(|(name, proof)| {
+                carina_core::parser::evaluate_expanded_value_for_validation(proof, session)
+                    .filter(|value| inputs.value(name).is_some_and(|source| source != value))
+                    .map(|value| (name.clone(), value))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut evaluated_inputs = inputs.clone();
+        let (evaluated_inputs, updated) = evaluated_inputs.materialize_and_classify(
+            &evaluated,
+            &carina_core::resource::knowledge::KnowledgeContext::validation(),
+            |_, _| {},
+        );
+        classified.extend(updated);
+        Some(validation.admit_resource(
+            carina_core::validation::admission::attributes::ResourceAdmissionRequest {
+                resource,
+                parsed: self.configuration.file(),
+                schema,
+                attributes: &classified,
+                quoted: resource.quoted_string_attrs(),
+                inputs: evaluated_inputs,
+                bindings: &self.binding_index,
+                session,
+                schemas,
+            },
+        ))
     }
+    #[cfg(test)]
     fn resource_admissions_with_coverage(
         &mut self,
         resource_id: &carina_core::resource::ResourceId,
@@ -790,7 +862,11 @@ impl DiagnosticRun<'_> {
         } else {
             false
         };
-        let mut merged_result = merged_attempt.and_then(Result::ok);
+        let (mut merged_result, directory_failure) = match merged_attempt {
+            Some(Ok(result)) => (Some(result), None),
+            Some(Err(error)) => (None, Some(error)),
+            None => (None, None),
+        };
         // Keep the parsed input stable while module-analysis results are filled
         // in. Cloning this Arc preserves the exact sealed directory without
         // cloning or revalidating the AST.
@@ -1089,12 +1165,17 @@ impl DiagnosticRun<'_> {
                 },
             ),
         };
-        if let Some(tree) = preferred_analysis {
-            diagnostics.extend(self.check_undefined_references(
+        let undefined_references = preferred_analysis
+            .map(|tree| {
+                self.undefined_reference_findings(tree, &known_bindings, &declared_providers)
+            })
+            .unwrap_or_default();
+        for finding in &undefined_references {
+            diagnostics.extend(render_merged(
                 doc,
-                tree,
-                &known_bindings,
-                &declared_providers,
+                finding,
+                DiagnosticSeverity::ERROR,
+                finding.detail().to_string(),
             ));
         }
 
@@ -1297,11 +1378,15 @@ impl DiagnosticRun<'_> {
                     self.provider_context.catalog(),
                 )
             });
-            let expanded_validation_tree =
-                expanded_configuration.as_ref().and_then(|configuration| {
-                    carina_core::parser::AnalysisTree::try_from_file(configuration.judged().file())
-                        .ok()
-                });
+            let (expanded_validation_tree, expanded_tree_failure) = match &expanded_configuration {
+                Some(configuration) => match carina_core::parser::AnalysisTree::try_from_file(
+                    configuration.judged().file(),
+                ) {
+                    Ok(tree) => (Some(tree), None),
+                    Err(error) => (None, Some(error)),
+                },
+                None => (None, None),
+            };
             let mut expanded_validation_inputs = expanded_configuration.as_ref().and_then(|configuration| {
                 let configuration = configuration.judged();
                 let graph = configuration.file();
@@ -1597,10 +1682,61 @@ impl DiagnosticRun<'_> {
                 OrdinaryDiagnostic,
             > = carina_core::validation::ConversionValidation::new(expression_report);
             let prior_diagnostics = std::mem::take(&mut diagnostics);
-            conversion_validation.extend(prior_diagnostics.iter().cloned().map(OrdinaryDiagnostic));
+            conversion_validation.extend(
+                prior_diagnostics
+                    .iter()
+                    .cloned()
+                    .map(OrdinaryDiagnostic::visible),
+            );
+            if let Some(error) = directory_failure {
+                conversion_validation.push(OrdinaryDiagnostic::DirectoryStop(Box::new(error)));
+            }
+            conversion_validation.extend(
+                expression_report
+                    .findings()
+                    .iter()
+                    .cloned()
+                    .map(|finding| OrdinaryDiagnostic::ExpressionStop(Box::new(finding))),
+            );
+            conversion_validation.extend(
+                binding_use_report
+                    .findings()
+                    .iter()
+                    .cloned()
+                    .map(|finding| OrdinaryDiagnostic::BindingStop(Box::new(finding))),
+            );
+            conversion_validation.extend(
+                undefined_references
+                    .into_iter()
+                    .map(|finding| OrdinaryDiagnostic::ReferenceStop(Box::new(finding))),
+            );
+            if let Some(error) = expanded_tree_failure {
+                conversion_validation.push(OrdinaryDiagnostic::StructuralStop(Box::new(error)));
+            }
             if let Some(configuration) = &expanded_configuration {
                 conversion_validation.include(configuration.judged().report());
             }
+            let authored_tree = match carina_core::parser::AnalysisTree::try_from_file(
+                pre_expansion_configuration.judged().file(),
+            ) {
+                Ok(tree) => {
+                    // The CLI resolves this same directory before admission.
+                    // Keep sibling failures as typed stopping evidence even
+                    // when main's renderer anchors their output in another file.
+                    if let Err(error) = carina_core::parser::resolve_resource_refs_from_analysis(
+                        &tree,
+                        self.provider_context,
+                    ) {
+                        conversion_validation
+                            .push(OrdinaryDiagnostic::ResolutionStop(Box::new(error)));
+                    }
+                    Some(tree)
+                }
+                Err(error) => {
+                    conversion_validation.push(OrdinaryDiagnostic::StructuralStop(Box::new(error)));
+                    None
+                }
+            };
             if let Some(inputs) = expanded_validation_inputs.as_mut() {
                 // A rejected call already owns the diagnostic. Do not add a
                 // downstream resource consequence of that same rejection.
@@ -1653,12 +1789,6 @@ impl DiagnosticRun<'_> {
             }
             // Admission reads the sealed slots and projections owned by the
             // judged directory. Source locations still anchor each diagnostic.
-            // Authored inventory is optional on main's buffer path. Its
-            // absence selects report-based admission, not a new diagnostic.
-            let authored_tree = carina_core::parser::AnalysisTree::try_from_file(
-                pre_expansion_configuration.judged().file(),
-            )
-            .ok();
             let authored_resources = authored_tree.as_ref().map(authored_validation_resources);
             // The document AST intentionally preserves function calls for
             // source-oriented checks. Build a parallel, same-order view with
@@ -1686,7 +1816,6 @@ impl DiagnosticRun<'_> {
                 .map(|resolved| resolved.iter_all_resources().collect::<Vec<_>>());
             // Every schema finding is anchored by the sealed parser view,
             // including the semantic per-file fallback after a buffer parse fails.
-            let mut admitted_resources = HashSet::new();
             for (resource_index, rref) in tree.project_resources().enumerate() {
                 let resource_id = rref.id();
                 let resource_attributes = rref.attributes();
@@ -1709,6 +1838,7 @@ impl DiagnosticRun<'_> {
                 let provider = &resource_id.provider;
                 let full_resource_type = format!("{}.{}", provider, resource_id.resource_type);
 
+                conversion_validation.observe_destination(rref, &self.schemas);
                 if resource_schema().is_none() {
                     let provider_loaded = self.provider_names.contains(&provider.to_string());
 
@@ -1861,10 +1991,11 @@ impl DiagnosticRun<'_> {
                     let mut value_validation = expanded_validation_inputs.as_mut()
                         .filter(|_| uses_composition_output)
                         .and_then(|inputs| inputs.resource_admissions_in(&mut conversion_validation, admission_resource.id(), self.provider_context))
-                        .unwrap_or_else(|| conversion_validation.walk_resource(admission_resource, |coverage| carina_core::validation::admission::attributes::resource_attribute_admissions(
-                            admission_resource, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, evaluated_inputs, &binding_index, self.provider_context, &self.schemas, coverage,
-                        )));
-                    admitted_resources.insert(admission_resource.id().clone());
+                        .unwrap_or_else(|| conversion_validation.admit_resource(carina_core::validation::admission::attributes::ResourceAdmissionRequest {
+                            resource: admission_resource, parsed, schema: validated_schema, attributes: &classified_attrs,
+                            quoted: resource_quoted_string_attrs, inputs: evaluated_inputs, bindings: &binding_index,
+                            session: self.provider_context, schemas: &self.schemas,
+                        }));
                     // Attribute rendering consumes its report entries. Preserve
                     // core's diagnostic ownership before taking those entries.
                     let resource_diagnostic_errors = value_validation
@@ -2412,19 +2543,28 @@ impl DiagnosticRun<'_> {
                 }
             }
 
+            if let (Some(tree), Some(inputs)) =
+                (&expanded_validation_tree, &expanded_validation_inputs)
+            {
+                conversion_validation.admit_remaining_resources(
+                    tree,
+                    inputs.configuration,
+                    &inputs.binding_index,
+                    self.provider_context,
+                );
+            }
             if let Some(authored_tree) = &authored_tree {
                 conversion_validation.admit_remaining_resources(
                     authored_tree,
                     pre_expansion_configuration.judged(),
                     &binding_index,
                     self.provider_context,
-                    &admitted_resources,
                 );
             }
             conversion_validation.extend(
                 std::mem::take(&mut diagnostics)
                     .into_iter()
-                    .map(OrdinaryDiagnostic),
+                    .map(OrdinaryDiagnostic::visible),
             );
             for finding in conversion_validation.complete().into_presented() {
                 use carina_core::validation::{OrdinaryFinding, PresentedFinding};
@@ -2452,7 +2592,23 @@ impl DiagnosticRun<'_> {
                         }
                     }
                     PresentedFinding::Ordinary(OrdinaryFinding::Client(diagnostic)) => {
-                        diagnostics.push(diagnostic.0)
+                        match *diagnostic {
+                            OrdinaryDiagnostic::Visible(diagnostic) => {
+                                diagnostics.push(*diagnostic)
+                            }
+                            OrdinaryDiagnostic::DirectoryStop(_error) => {}
+                            OrdinaryDiagnostic::ResolutionStop(_error) => {}
+                            OrdinaryDiagnostic::ExpressionStop(_error) => {}
+                            OrdinaryDiagnostic::BindingStop(_error) => {}
+                            OrdinaryDiagnostic::ReferenceStop(_error) => {}
+                            OrdinaryDiagnostic::StructuralStop(error) => {
+                                if let Some(diagnostic) = render_analysis_invariant(doc, &error)
+                                    && !diagnostics.contains(&diagnostic)
+                                {
+                                    diagnostics.push(diagnostic);
+                                }
+                            }
+                        }
                     }
                     PresentedFinding::Conversion(error) => {
                         let finding = carina_core::parser::Located::new(

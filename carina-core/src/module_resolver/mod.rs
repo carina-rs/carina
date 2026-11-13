@@ -34,6 +34,7 @@ mod signature;
 mod validation;
 
 pub use error::{ModuleError, ModuleErrorCallSource, ModuleErrorDiagnostic};
+pub(crate) use expander::UnselectedModuleBranch;
 pub use expander::{instance_prefix_for_call, reconcile_anonymous_module_instances};
 pub use loader::{
     LoadedModule, derive_module_name, get_parsed_file, load_directory_module, load_module,
@@ -41,8 +42,8 @@ pub use loader::{
     load_module_with_diagnostics_and_schemas,
 };
 pub(crate) use resolver::{
-    AuthoredModuleGraph, expand_root_directory_file, resolve_upstream_modules_with_config,
-    resolve_upstream_modules_with_providerless_config,
+    AuthoredModuleGraph, TemplateActivation, UnactivatedTemplate, expand_root_directory_file,
+    resolve_upstream_modules_with_config, resolve_upstream_modules_with_providerless_config,
 };
 pub use resolver::{
     ModuleCallConstraintReport, ModuleCallConstraintReports, ModuleResolutionDiagnosticResult,

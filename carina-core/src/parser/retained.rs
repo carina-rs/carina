@@ -51,9 +51,9 @@ fn record_projection_copy(value: &Value<ParserPlaceholder, RelativeBindingName>)
 }
 
 pub(crate) mod conversion;
-pub use conversion::ConversionJudgement;
 pub(crate) use conversion::ConversionVerdict;
 pub(crate) use conversion::check as check_conversion;
+pub use conversion::{ConversionJudgement, TemplateDeferral};
 
 mod cursor;
 pub use cursor::{
@@ -105,6 +105,53 @@ impl Eq for ExpressionInstance {}
 impl std::hash::Hash for ExpressionInstance {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.id().hash(state);
+    }
+}
+
+/// Producer decisions are authored metadata, never reconstructed from walk absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum NotExpandedReason {
+    EmptyListFor,
+    EmptyIndexedFor,
+    EmptyMapFor,
+    UnselectedStructuralIf,
+    DeferredFor,
+    ModuleTemplate,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct NotExpanded {
+    reason: NotExpandedReason,
+}
+impl NotExpanded {
+    pub(in crate::parser) fn parser(reason: NotExpandedReason) -> Self {
+        Self { reason }
+    }
+    pub(crate) fn module_template(_: &crate::module_resolver::UnactivatedTemplate) -> Self {
+        Self {
+            reason: NotExpandedReason::ModuleTemplate,
+        }
+    }
+    pub(crate) fn unselected_branch(_: crate::module_resolver::UnselectedModuleBranch) -> Self {
+        Self {
+            reason: NotExpandedReason::UnselectedStructuralIf,
+        }
+    }
+}
+#[derive(Debug, Clone, Default)]
+struct ExpansionRecord(Arc<std::sync::RwLock<HashMap<ExpressionInstance, NotExpanded>>>);
+impl ExpansionRecord {
+    fn record(&self, environment: &ExpressionInstance, omission: NotExpanded) {
+        self.0
+            .write()
+            .expect("authored expansion decisions lock")
+            .insert(environment.clone(), omission);
+    }
+    fn omission(&self, environment: &ExpressionInstance) -> Option<NotExpanded> {
+        let records = self.0.read().expect("authored expansion decisions lock");
+        records
+            .get(environment)
+            .or_else(|| records.get(&ExpressionInstance::Root))
+            .copied()
     }
 }
 
@@ -296,6 +343,7 @@ struct AuthoredExpr<P: ValueKind, B: BindingAddress> {
     first_conversion: Option<Arc<ConversionSite>>,
     parse_ownership: ParseOwnership,
     children: Vec<ExprValue<P, B>>,
+    expansion: ExpansionRecord,
 }
 
 // Named child handles are identity metadata, independent of syntax equality.
@@ -534,6 +582,7 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
             roles: authored.roles,
             first_conversion: authored.first_conversion,
             parse_ownership: authored.parse_ownership,
+            expansion: authored.expansion,
             children: authored
                 .children
                 .into_iter()
@@ -691,6 +740,11 @@ impl PartialEq for AuthoredScopeId {
     }
 }
 impl Eq for AuthoredScopeId {}
+impl std::hash::Hash for AuthoredScopeId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&Arc::as_ptr(&self.0), state);
+    }
+}
 
 /// Parser-owned expression inventory. Merging and binding expansion preserve
 /// this value wholesale; no provisional evaluator receives its authored roots.
@@ -1000,21 +1054,23 @@ pub(crate) fn attach_report<E, D, B: BindingAddress>(
 pub(crate) fn retain_module_inventory<E, D, B: BindingAddress, C: BindingAddress>(
     file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     template: &ExpressionReport<C>,
+    activation: crate::module_resolver::TemplateActivation,
     subject: crate::validation::FindingSubject,
 ) {
     let expressions = file.parser_binding_metadata.syntax.expressions_mut();
     let inventory = Arc::new(conversion::ConversionInventory::Template {
         inventory: template.conversion_inventory(),
+        activation,
         subject,
     });
     expressions.templates = Arc::new(conversion::ConversionInventory::Joined(
-        expressions.templates.clone(),
         inventory.clone(),
+        expressions.templates.clone(),
     ));
     let report = Arc::make_mut(&mut expressions.report);
     report.conversions = Arc::new(conversion::ConversionInventory::Joined(
-        report.conversions.clone(),
         inventory,
+        report.conversions.clone(),
     ));
 }
 
@@ -1273,6 +1329,7 @@ fn node_at_with_roles(
             roles,
             first_conversion,
             parse_ownership,
+            expansion: Default::default(),
             children,
         }),
         payload: Projection::Pending,
@@ -1307,6 +1364,7 @@ fn lower_blocks(children: Vec<ExprValue>) -> Vec<ExprValue> {
                         .iter()
                         .find_map(|child| child.authored.first_conversion.clone()),
                     parse_ownership: ParseOwnership::Ordinary,
+                    expansion: Default::default(),
                     children: records,
                 }),
                 payload: Projection::Pending,
@@ -1330,6 +1388,7 @@ fn lower_blocks(children: Vec<ExprValue>) -> Vec<ExprValue> {
                         },
                         first_conversion: groups[name].authored.first_conversion.clone(),
                         parse_ownership: ParseOwnership::Ordinary,
+                        expansion: Default::default(),
                         children: vec![groups[name].clone()],
                     }),
                     payload: Projection::Pending,
@@ -1379,6 +1438,14 @@ impl std::fmt::Debug for CapturedNodes {
     }
 }
 impl CapturedNodes {
+    pub(in crate::parser) fn not_expanded(&self, pair: &Pair<'_, Rule>, omission: NotExpanded) {
+        if let Some(expression) = self.get(&ParseNodeKey::of(pair)) {
+            expression
+                .authored
+                .expansion
+                .record(&ExpressionInstance::Root, omission);
+        }
+    }
     fn condition_snapshot(&self) -> ConditionSnapshot {
         self.conditions.snapshot()
     }
@@ -4191,11 +4258,18 @@ mod judgement {
             context: conversion::InventoryContext,
             secret: bool,
             owner: Option<&'a ConversionSite>,
+            omitted: Option<NotExpanded>,
         }
         struct IndexState<'a, B: BindingAddress> {
             authored: HashMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
             visited: HashMap<
-                (usize, conversion::InventoryContext, bool, IndexPurpose),
+                (
+                    usize,
+                    conversion::InventoryContext,
+                    bool,
+                    IndexPurpose,
+                    Option<NotExpanded>,
+                ),
                 conversion::ConversionOrigins,
             >,
             conversions: conversion::InventoryBuilder,
@@ -4213,8 +4287,10 @@ mod judgement {
                 secret,
                 owner,
                 purpose,
+                omitted,
             } = visit;
             let node = &expression.authored;
+            let omitted = node.expansion.omission(&node.location.instance).or(omitted);
             let secret = secret || matches!(node.kind, ExprKind::Secret);
             let context = match node.kind {
                 ExprKind::Function { .. }
@@ -4254,20 +4330,30 @@ mod judgement {
                 | ExprKind::If
                 | ExprKind::Coalesce => context,
             };
-            let key = (Arc::as_ptr(node) as usize, context, secret, purpose);
+            let key = (
+                Arc::as_ptr(node) as usize,
+                context,
+                secret,
+                purpose,
+                omitted,
+            );
             if let Some(origins) = state.visited.get(&key) {
                 return origins.clone();
             }
             state
                 .visited
                 .insert(key, conversion::ConversionOrigins::Empty);
-            let mut origins = if let ExprKind::Convert { parsing, .. } = &node.kind {
+            let mut origins = if let ExprKind::Convert { target, parsing } = &node.kind {
                 conversion::inventory_entry(
                     node,
+                    target,
                     parsing,
-                    context,
-                    secret,
-                    owner,
+                    conversion::InventoryUse {
+                        context,
+                        secret,
+                        owner,
+                        omitted,
+                    },
                     &mut state.conversions,
                 )
             } else {
@@ -4294,6 +4380,7 @@ mod judgement {
                         secret,
                         owner,
                         purpose: IndexPurpose::Inventory,
+                        omitted,
                     },
                 ));
             }
@@ -4305,7 +4392,9 @@ mod judgement {
                 None
             };
             for child in &node.children {
-                let context = if matches!(node.kind, ExprKind::Resource { .. }) {
+                let context = if context == Boundary {
+                    Boundary
+                } else if matches!(node.kind, ExprKind::Resource { .. }) {
                     if matches!(
                         child.authored.kind,
                         ExprKind::Sink { .. } | ExprKind::NestedBlock { .. }
@@ -4326,6 +4415,7 @@ mod judgement {
                         secret,
                         owner,
                         purpose,
+                        omitted,
                     },
                 ));
             }
@@ -4374,6 +4464,7 @@ mod judgement {
                     context,
                     secret: false,
                     owner: None,
+                    omitted: None,
                     purpose: IndexPurpose::AuthoredAndInventory,
                 },
             );
@@ -4411,6 +4502,7 @@ mod judgement {
             config,
             memo: HashMap::new(),
             scope: DiagnosticScope::Public,
+            expansion: None,
             by_location: HashMap::new(),
             by_node: HashMap::new(),
             syntax_nodes: HashMap::new(),
@@ -4486,7 +4578,6 @@ mod judgement {
             conditions: ConditionSnapshot::default(),
         }));
         let mut resources = std::collections::HashSet::new();
-        let mut unresolved_roots = Vec::new();
         for resource in file
             .iter_all_resources()
             .chain(file.deferred_for_phase.analysis_resource_refs())
@@ -4513,21 +4604,17 @@ mod judgement {
                 .unwrap_or_else(|| expressions.instance.clone());
             roots.extend(slots.use_roots().map(|mut root| {
                 root.environment = environment.clone();
-                conversion::require_root(
-                    &root,
-                    origins.get(&(root.node.id, environment.id())),
-                    &mut unresolved_roots,
-                );
+                conversion::require_root(&root, origins.get(&(root.node.id, environment.id())));
                 root
             }));
         }
-        let authored_inventory = Arc::new(conversion::ConversionInventory::Nodes(
-            conversions
+        let authored_inventory = Arc::new(conversion::ConversionInventory::Nodes {
+            nodes: conversions
                 .into_iter()
-                .map(|(key, entry)| (key, entry.borrow().clone()))
+                .map(|(key, entry)| (key, conversion::finalize_entry(&entry)))
                 .collect(),
-            unresolved_roots,
-        ));
+            config: authority.clone(),
+        });
         report.conversions = Arc::new(conversion::ConversionInventory::Joined(
             expressions.templates.clone(),
             authored_inventory,
@@ -4557,8 +4644,9 @@ mod judgement {
         functions: HashMap<(ExpressionInstance, String), Arc<FunctionSignature>>,
         schemas: &'a crate::schema::SchemaRegistry,
         config: &'a super::super::ProviderContext,
-        memo: HashMap<(usize, DiagnosticScope), JudgedExpr>,
+        memo: HashMap<(usize, DiagnosticScope, Option<NotExpanded>), JudgedExpr>,
         scope: DiagnosticScope,
+        expansion: Option<NotExpanded>,
         by_location: HashMap<ExpressionLocation, JudgedExpr>,
         by_node: HashMap<(ExpressionInstance, NodeId), JudgedExpr>,
         syntax_nodes: AuthoredNodes<B>,
@@ -4589,7 +4677,11 @@ mod judgement {
             } else {
                 DiagnosticScope::Public
             };
-            if let Some(judged) = self.memo.get(&(id, scope)) {
+            let expansion = root
+                .expansion
+                .omission(&root.location.instance)
+                .or(self.expansion);
+            if let Some(judged) = self.memo.get(&(id, scope, expansion)) {
                 return judged.clone();
             }
             if self.visiting.contains(&id) {
@@ -4604,6 +4696,8 @@ mod judgement {
                 return failure;
             }
             let outer_scope = self.scope;
+            let outer_expansion = self.expansion;
+            self.expansion = expansion;
             self.scope = scope;
             self.visiting.push(id);
             // Always visit every child, even for length(), selected access,
@@ -4715,7 +4809,9 @@ mod judgement {
                     result.report_at(FailureOwner::BindingIndex);
                 }
             }
-            if let Some(failed) = children.iter().find(|child| child.failed()) {
+            if !(expansion.is_some() && matches!(root.kind, ExprKind::Convert { .. }))
+                && let Some(failed) = children.iter().find(|child| child.failed())
+            {
                 let (error, owner) = failed.failure().expect("failed child");
                 let owner = match owner {
                     FailureOwner::Reported | FailureOwner::BindingScope => owner,
@@ -4766,7 +4862,8 @@ mod judgement {
             }
             self.visiting.pop();
             self.scope = outer_scope;
-            self.memo.insert((id, scope), result.clone());
+            self.expansion = outer_expansion;
+            self.memo.insert((id, scope, expansion), result.clone());
             self.by_location
                 .insert(root.location.clone(), result.clone());
             self.by_node
@@ -5646,7 +5743,11 @@ mod judgement {
                                 self.by_location
                                     .insert(value.authored.location.clone(), rejected.clone());
                                 self.memo.insert(
-                                    (Arc::as_ptr(&value.authored) as usize, self.scope),
+                                    (
+                                        Arc::as_ptr(&value.authored) as usize,
+                                        self.scope,
+                                        self.expansion,
+                                    ),
                                     rejected.clone(),
                                 );
                                 failure.get_or_insert(rejected);

@@ -485,7 +485,8 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
         }
         .into());
     }
-    if let AdmissionProof::Validation(proof) = &context.proof
+    if let AdmissionProof::Validation(proof) | AdmissionProof::Template { proof, .. } =
+        &context.proof
         && let Some(error) = proof.failure()
     {
         return Err(error.into());
@@ -514,7 +515,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
     };
     let lookup = contract.lookup(context.provider.catalog());
     let mut checked = match &context.proof {
-        AdmissionProof::Validation(proof) => {
+        AdmissionProof::Validation(proof) | AdmissionProof::Template { proof, .. } => {
             let reference_context = ReferenceContext::from(context);
             let authored =
                 |attr: &CompiledAttributeType,
@@ -612,9 +613,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                         crate::schema::value_validation::RequiredAssignmentCallbacks {
                             ordinary: &check,
                             scope: context.scope,
-                            authored: crate::schema::value_validation::AuthoredChecks::Validation(
-                                &authored,
-                            ),
+                            authored: context.authored_policy(&authored),
                         },
                     );
                     #[cfg(test)]

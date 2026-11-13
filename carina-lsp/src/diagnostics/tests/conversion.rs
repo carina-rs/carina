@@ -242,9 +242,9 @@ fn conversion_sibling_coverage_preserves_ordinary_provider_callback_counts() {
 }
 
 #[test]
-fn conversion_report_fallback_keeps_ordinary_diagnostics_in_current_and_sibling_files() {
+fn conversion_report_fallback_preserves_ordinary_errors_and_detects_missing_outcomes() {
     use carina_core::validation::admission::attributes::{
-        ResourceAttributeInputs, resource_attribute_admissions,
+        ResourceAdmissionRequest, ResourceAttributeInputs,
     };
     use carina_core::{binding_index::BindingIndex, validation::ConversionValidation};
     let mut schemas = SchemaRegistry::new();
@@ -283,19 +283,16 @@ fn conversion_report_fallback_keeps_ordinary_diagnostics_in_current_and_sibling_
             let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
             let mut validation: ConversionValidation = ConversionValidation::new(judged.report());
             carina_core::validation::deferred_types::with_session_for_test(&catalog, |session| {
-                let findings = validation.walk(|coverage| {
-                    resource_attribute_admissions(
-                        resource,
-                        judged.file(),
-                        resource.schema(&schemas).unwrap(),
-                        &classified,
-                        resource.quoted_string_attrs(),
-                        &inputs,
-                        &bindings,
-                        session,
-                        &schemas,
-                        coverage,
-                    )
+                let findings = validation.admit_resource(ResourceAdmissionRequest {
+                    resource,
+                    parsed: judged.file(),
+                    schema: resource.schema(&schemas).unwrap(),
+                    attributes: &classified,
+                    quoted: resource.quoted_string_attrs(),
+                    inputs: &inputs,
+                    bindings: &bindings,
+                    session,
+                    schemas: &schemas,
                 });
                 ordinary.push(
                     findings
@@ -318,16 +315,9 @@ fn conversion_report_fallback_keeps_ordinary_diagnostics_in_current_and_sibling_
                         empty_configuration.judged(),
                         &bindings,
                         session,
-                        &std::collections::HashSet::new(),
                     );
                 } else {
-                    validation.admit_remaining_resources(
-                        &tree,
-                        judged,
-                        &bindings,
-                        session,
-                        &std::collections::HashSet::from([resource.id().clone()]),
-                    );
+                    validation.admit_remaining_resources(&tree, judged, &bindings, session);
                 }
             });
             let presented = validation.complete().into_presented();
@@ -338,31 +328,26 @@ fn conversion_report_fallback_keeps_ordinary_diagnostics_in_current_and_sibling_
                     carina_core::validation::PresentedFinding::Ordinary(_) => None,
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(
-                conversions.as_slice().len(),
-                usize::from(converted),
-                "{conversions:?}"
-            );
+            assert_eq!(conversions.as_slice().len(), 0, "{conversions:?}");
             if converted {
-                let error = &conversions.as_slice()[0];
-                assert_eq!(
-                    error.error().kind(),
-                    carina_core::ConversionErrorKind::UnsupportedPosition
+                // This fixture deliberately withholds the authored cursor from
+                // an otherwise sound tree and supplies no structural-failure
+                // witness. No producer made a conversion verdict for that use.
+                assert_eq!(presented.len(), 1, "{presented:?}");
+                assert!(
+                    matches!(presented.iter().next(), Some(
+                    carina_core::validation::PresentedFinding::Ordinary(
+                        carina_core::validation::OrdinaryFinding::Resource(error)
+                    )
+                ) if error.admission_incomplete().is_some()),
+                    "{presented:?}"
                 );
-                let document = create_document_at(&source, path.clone());
-                let located = carina_core::parser::Located::new(error.location().clone(), error);
-                let view = document.for_diagnostics().unwrap();
-                let rendered = render_merged(
-                    &view,
-                    &located,
-                    DiagnosticSeverity::ERROR,
-                    error.message().to_owned(),
-                )
-                .unwrap();
-                assert_eq!(
-                    rendered.range.start,
-                    Position::new(0, source.find("'ok'").unwrap() as u32)
+                assert!(
+                    presented.to_string().contains("bug in carina"),
+                    "{presented:?}"
                 );
+            } else {
+                assert!(presented.is_empty(), "{presented:?}");
             }
         }
         assert_eq!(ordinary[0], ordinary[1], "{ordinary:#?}");

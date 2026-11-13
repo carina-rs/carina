@@ -136,10 +136,8 @@ fn conversion_unrendered_no_as_walk_cannot_emit_or_add_shared_sink_findings() {
             let mut run: crate::validation::ConversionValidation =
                 crate::validation::ConversionValidation::new(judged.report());
             if walk_siblings {
-                for resource in tree.resources() {
-                    // The function has no ordinary findings output at all.
-                    let (): () = run.walk(|coverage| crate::validation::admission::attributes::unrendered_resource_conversion_admissions(resource, judged, &bindings, session, coverage));
-                }
+                // The production sibling driver has no ordinary findings output.
+                let (): () = run.admit_remaining_resources(&tree, judged, &bindings, session);
             }
             assert!(run.complete().into_presented().is_empty());
         });

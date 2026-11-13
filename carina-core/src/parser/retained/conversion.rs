@@ -65,6 +65,53 @@ impl ConversionParsing {
     }
 }
 
+/// A template preflight suppresses the ordinary judgement without judging a Convert.
+/// Only the conversion policy, supplied a sealed preflight boundary, can mint it.
+///
+/// ```compile_fail,E0451
+/// use carina_core::parser::retained::TemplateDeferral;
+/// let _ = TemplateDeferral { _private: () };
+/// ```
+#[derive(Debug)]
+pub struct TemplateDeferral {
+    _private: (),
+}
+impl TemplateDeferral {
+    pub(crate) fn consume(self) {}
+}
+
+pub(crate) type TemplateOutcome = AuthoredOutcome<
+    std::convert::Infallible,
+    TemplateDeferral,
+    crate::schema::value_validation::NoConversions,
+>;
+
+pub(crate) fn check_template<B: BindingAddress>(
+    _boundary: crate::validation::admission::TemplatePreflight,
+    _declaration: &CompiledAttributeType,
+    cursor: &AuthoredCursor<'_, B>,
+) -> TemplateOutcome {
+    match &cursor.kind {
+        CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => match usage.form() {
+            AuthoredForm::Convert => AuthoredOutcome::Deferred(TemplateDeferral { _private: () }),
+            AuthoredForm::If
+            | AuthoredForm::Coalesce
+            | AuthoredForm::Forward
+            | AuthoredForm::Sink
+            | AuthoredForm::Parens
+            | AuthoredForm::Definition
+            | AuthoredForm::Binding
+            | AuthoredForm::Reference
+            | AuthoredForm::List
+            | AuthoredForm::Map
+            | AuthoredForm::Secret
+            | AuthoredForm::Literal
+            | AuthoredForm::Computed => AuthoredOutcome::Continue(Default::default()),
+        },
+        CursorKind::Projected(_) => AuthoredOutcome::Continue(Default::default()),
+    }
+}
+
 /// A conversion's accept or reject verdict for one authored use and borrowed
 /// destination. Only conversion policy can mint it; the schema walk consumes it.
 ///
@@ -88,6 +135,16 @@ pub struct ConversionJudgement {
     verdict: ConversionVerdict,
 }
 pub(crate) struct ConversionVerdict(Box<Decision>);
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecordedVerdict {
+    rejected: bool,
+}
+impl RecordedVerdict {
+    pub(crate) fn rejecting(self) -> bool {
+        self.rejected
+    }
+}
+
 enum Decision {
     Accepted(AssignmentFindings, AcceptedConversion),
     Rejected(AssignmentFindings),
@@ -109,6 +166,14 @@ impl AcceptedConversion {
     }
 }
 impl ConversionVerdict {
+    pub(crate) fn recorded(&self) -> RecordedVerdict {
+        RecordedVerdict {
+            rejected: match self.0.as_ref() {
+                Decision::Accepted(..) => false,
+                Decision::Rejected(_) => true,
+            },
+        }
+    }
     pub(crate) fn decide<T>(
         self,
         accepted: impl FnOnce(AssignmentFindings, AcceptedConversion) -> T,
@@ -580,55 +645,86 @@ pub(crate) struct InventoryEntry {
     node: NodeId,
     environment: ExpressionEnvironmentId,
     owner: ConversionSite,
+    target: Box<Located<crate::conversion::ConversionTypePath>>,
     definition: bool,
     boundary: bool,
     secret: bool,
     parsing: ConversionParsing,
+    omitted: Option<NotExpanded>,
+    intrinsic: Option<ConversionError>,
     roots: std::collections::HashSet<RootRequirement>,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct RootRequirement {
-    node: NodeId,
-    occurrence: UseId,
-    instance: ExpansionInstanceId,
-    generation: ProjectionGeneration,
+    pub(crate) node: NodeId,
+    pub(crate) occurrence: UseId,
+    pub(crate) instance: ExpansionInstanceId,
+    pub(crate) generation: ProjectionGeneration,
+    pub(crate) omitted: Option<NotExpanded>,
+}
+impl RootRequirement {
+    pub(super) fn new<B: BindingAddress>(root: &cursor::UseRoot<B>) -> Self {
+        Self {
+            node: cursor::canonical_root_id(&root.node),
+            occurrence: root.occurrence,
+            instance: root.instance,
+            generation: root.generation,
+            omitted: root.node.expansion.omission(&root.environment),
+        }
+    }
 }
 pub(crate) type ConversionNodes = HashMap<(NodeId, ExpressionEnvironmentId), InventoryEntry>;
+#[derive(Default)]
 pub(crate) enum ConversionInventory {
-    Nodes(ConversionNodes, Vec<RootRequirement>),
+    #[default]
+    Empty,
+    Nodes {
+        nodes: ConversionNodes,
+        config: Arc<super::super::ProviderContext>,
+    },
     Joined(Arc<Self>, Arc<Self>),
     Template {
         inventory: Arc<Self>,
+        activation: crate::module_resolver::TemplateActivation,
         subject: crate::validation::FindingSubject,
     },
 }
 #[derive(Clone, Copy)]
 enum InventoryRole<'a> {
     Authored,
-    Template(&'a crate::validation::FindingSubject),
-}
-impl Default for ConversionInventory {
-    fn default() -> Self {
-        Self::Nodes(Default::default(), Vec::new())
-    }
+    Template(
+        &'a crate::validation::FindingSubject,
+        &'a crate::module_resolver::TemplateActivation,
+    ),
 }
 impl ConversionInventory {
-    // Shared chunks are visited once; root evidence is checked once per chunk.
+    // Chunks retain each producer's use scope; ConversionFindings dedups rejections by NodeId.
     fn chunks(
         &self,
-    ) -> impl Iterator<Item = (&ConversionNodes, &[RootRequirement], InventoryRole<'_>)> {
+    ) -> impl Iterator<
+        Item = (
+            &ConversionNodes,
+            &super::super::ProviderContext,
+            InventoryRole<'_>,
+        ),
+    > {
         let mut stack = vec![(self, InventoryRole::Authored)];
         std::iter::from_fn(move || {
             loop {
                 let (inventory, role) = stack.pop()?;
                 match inventory {
-                    Self::Nodes(nodes, roots) => return Some((nodes, roots.as_slice(), role)),
+                    Self::Empty => {}
+                    Self::Nodes { nodes, config } => return Some((nodes, config.as_ref(), role)),
                     Self::Joined(left, right) => {
                         stack.push((right, role));
                         stack.push((left, role));
                     }
-                    Self::Template { inventory, subject } => {
-                        stack.push((inventory, InventoryRole::Template(subject)))
+                    Self::Template {
+                        inventory,
+                        activation,
+                        subject,
+                    } => {
+                        stack.push((inventory, InventoryRole::Template(subject, activation)));
                     }
                 }
             }
@@ -672,14 +768,25 @@ impl ConversionOrigins {
         })
     }
 }
+pub(super) struct InventoryUse<'a> {
+    pub(super) context: InventoryContext,
+    pub(super) secret: bool,
+    pub(super) owner: Option<&'a ConversionSite>,
+    pub(super) omitted: Option<NotExpanded>,
+}
 pub(super) fn inventory_entry<B: BindingAddress>(
     node: &AuthoredExpr<ParserPlaceholder, B>,
+    target: &Located<crate::conversion::ConversionTypePath>,
     parsing: &ConversionParsing,
-    context: InventoryContext,
-    secret: bool,
-    owner: Option<&ConversionSite>,
+    usage: InventoryUse<'_>,
     inventory: &mut InventoryBuilder,
 ) -> ConversionOrigins {
+    let InventoryUse {
+        context,
+        secret,
+        owner,
+        omitted,
+    } = usage;
     let entry = InventoryEntry {
         node: node.id,
         environment: node.location.instance.id(),
@@ -687,10 +794,13 @@ pub(super) fn inventory_entry<B: BindingAddress>(
             .or(node.first_conversion.as_deref())
             .expect("Convert has its authored site")
             .clone(),
+        target: Box::new(target.clone()),
         definition: context == InventoryContext::Definition,
         boundary: context == InventoryContext::Boundary,
         secret,
         parsing: parsing.clone(),
+        omitted,
+        intrinsic: None,
         roots: Default::default(),
     };
     let shared = inventory
@@ -701,128 +811,183 @@ pub(super) fn inventory_entry<B: BindingAddress>(
         current.definition &= entry.definition;
         current.boundary |= entry.boundary;
         current.secret |= entry.secret;
+        current.omitted = current.omitted.or(omitted);
     }
     ConversionOrigins::Entry(shared.clone())
+}
+/// Finalize syntax-owned verdicts from the enclosing grammar roles and actual
+/// syntactic consumer visits, independently of resource admission/coverage.
+pub(super) fn finalize_entry(entry: &std::cell::RefCell<InventoryEntry>) -> InventoryEntry {
+    let mut entry = entry.borrow().clone();
+    let rejection = if entry.boundary {
+        Some((
+            Kind::UnsupportedPosition,
+            "conversion is not supported at this position yet",
+        ))
+    } else if entry.definition {
+        Some((Kind::Unused, "conversion has no typed destination use"))
+    } else {
+        None
+    };
+    if let Some((kind, message)) = rejection {
+        let error =
+            ConversionError::new(kind, &entry.owner.location, message).owned_by(entry.owner.node);
+        entry.intrinsic = Some(if entry.secret {
+            error.inside_secret()
+        } else {
+            error
+        });
+    }
+    entry
 }
 pub(super) fn require_root<B: BindingAddress>(
     root: &cursor::UseRoot<B>,
     origins: Option<&ConversionOrigins>,
-    unresolved_roots: &mut Vec<RootRequirement>,
 ) {
-    let requirement = RootRequirement {
-        node: cursor::canonical_root_id(&root.node),
-        occurrence: root.occurrence,
-        instance: root.instance,
-        generation: root.generation,
-    };
-    match origins {
-        Some(origins) => {
-            for entry in origins.entries() {
-                entry.borrow_mut().roots.insert(requirement);
-            }
+    if let Some(origins) = origins {
+        let requirement = RootRequirement::new(root);
+        for entry in origins.entries() {
+            entry.borrow_mut().roots.insert(requirement);
         }
-        // An unknown authored root cannot prove any conversion in this parsed
-        // inventory. The empty inventory still has no obligations.
-        None => unresolved_roots.push(requirement),
     }
 }
-/// No resource walk is needed to publish judgements already recorded by parsing.
-pub(crate) fn parse_rejections(
-    inventory: &ConversionInventory,
-) -> (crate::ConversionChannel, AdmissionRequirement) {
-    let mut errors = crate::ConversionChannel::default();
-    let mut requirement = AdmissionRequirement::Empty;
-    for (nodes, _, role) in inventory.chunks() {
-        for entry in nodes.values() {
-            requirement = AdmissionRequirement::Required;
-            if let Some(ParseJudgement::Rejected(error)) = entry.parsing.judgement() {
-                errors.append(std::iter::once(in_inventory_role(error.clone(), role)).collect());
-            }
-        }
-    }
-    (errors, requirement)
+
+/// A total outcome is supplied by a policy or by the producer that did not
+/// produce a live destination. There is deliberately no default/miss verdict.
+enum UseOutcome<'a> {
+    Verdict(RecordedVerdict),
+    NotExpanded(NotExpanded),
+    DestinationUnknown(&'a crate::validation::presentation::DestinationUnknown),
+    NotAdmitted(crate::validation::presentation::NotAdmitted),
 }
 #[derive(Clone, Copy)]
-pub(crate) enum AdmissionRequirement {
-    Empty,
-    Required,
+pub(crate) enum InventoryCompletion {
+    Complete,
+    MissingOutcome,
 }
 
 fn in_inventory_role(error: ConversionError, role: InventoryRole<'_>) -> ConversionError {
     match role {
         InventoryRole::Authored => error,
-        InventoryRole::Template(subject) => error.in_subject(subject.clone()),
+        InventoryRole::Template(subject, _) => error.in_subject(subject.clone()),
     }
 }
 
 pub(crate) fn complete_inventory(
     inventory: &ConversionInventory,
     coverage: &crate::schema::value_validation::WalkCoverage,
-    _admitted: &crate::validation::AdmissionComplete,
-) -> crate::ConversionChannel {
-    inventory
-        .chunks()
-        .flat_map(|(nodes, roots, role)| {
-            let unresolved = match role {
-                InventoryRole::Authored => roots.iter().any(|root| {
-                    !coverage.reached_root(
-                        root.node,
-                        root.occurrence,
-                        root.instance,
-                        root.generation,
-                    )
-                }),
-                InventoryRole::Template(_) => false,
+    admission: crate::validation::presentation::InventoryAdmission<'_>,
+) -> (crate::ConversionChannel, InventoryCompletion) {
+    use crate::validation::presentation::{InventoryAdmission, NotAdmitted};
+    let mut errors = crate::ConversionChannel::default();
+    let mut completion = InventoryCompletion::Complete;
+    for (nodes, config, role) in inventory.chunks() {
+        for entry in nodes.values() {
+            let intrinsic = match entry.parsing.judgement() {
+                Some(ParseJudgement::Rejected(error)) => Some(error),
+                Some(ParseJudgement::OperandFailed) => continue,
+                None => entry.intrinsic.as_ref(),
             };
-            nodes.values().filter_map(move |entry| {
-                match entry.parsing.judgement() {
-                    Some(ParseJudgement::OperandFailed) => return None,
-                    Some(ParseJudgement::Rejected(error)) => {
-                        return Some(in_inventory_role(error.clone(), role));
-                    }
-                    None => {}
+            if let Some(error) = intrinsic {
+                errors.append(std::iter::once(in_inventory_role(error.clone(), role)).collect());
+                continue;
+            }
+            // An activated template is a reusable owner, not an additional use.
+            // The resolver registered each instance's own inventory/roots.
+            if let InventoryRole::Template(
+                _,
+                crate::module_resolver::TemplateActivation::Activated(_),
+            ) = role
+            {
+                continue;
+            }
+            let non_admitted = match admission {
+                InventoryAdmission::Stopped(witness) | InventoryAdmission::ReadOnly(witness) => {
+                    Some(witness)
                 }
-                let judged = match role {
-                    InventoryRole::Authored => {
-                        !unresolved
-                            && !entry.boundary
-                            && coverage.conversion_judged(entry.node, entry.environment)
-                            && entry.roots.iter().all(|root| {
-                                coverage.reached_root(
-                                    root.node,
-                                    root.occurrence,
-                                    root.instance,
-                                    root.generation,
-                                )
-                            })
+                InventoryAdmission::Admitted(_) | InventoryAdmission::Required => None,
+            };
+            let template = match role {
+                InventoryRole::Authored => None,
+                InventoryRole::Template(
+                    _,
+                    crate::module_resolver::TemplateActivation::NotExpanded(witness),
+                ) => Some(NotExpanded::module_template(witness)),
+                InventoryRole::Template(
+                    _,
+                    crate::module_resolver::TemplateActivation::Activated(_),
+                ) => None,
+            };
+            let finish = |outcome: Option<UseOutcome<'_>>| -> Result<(), Option<ConversionError>> {
+                match outcome {
+                    Some(UseOutcome::Verdict(verdict)) => {
+                        let _rejected = verdict.rejecting();
+                        Ok(())
                     }
-                    // Instances have their own full use checks. A template has no
-                    // runtime use; retain only nodes no instance ever judged.
-                    InventoryRole::Template(_) => coverage.template_conversion_judged(entry.node),
-                };
-                if judged {
-                    return None;
-                }
-                let (kind, message) =
-                    if entry.definition && !entry.boundary && entry.roots.is_empty() {
-                        (Kind::Unused, "conversion has no typed destination use")
-                    } else {
-                        (
-                            Kind::UnsupportedPosition,
-                            "conversion is not supported at this position",
+                    Some(UseOutcome::NotExpanded(omission)) => {
+                        let _reason = omission.reason;
+                        diagnostic::resolve_target(
+                            entry.target.detail(),
+                            &entry.owner.location,
+                            config,
                         )
+                        .map(|_| ())
+                        .map_err(|error| {
+                            Some(in_inventory_role(error.owned_by(entry.owner.node), role))
+                        })
+                    }
+                    Some(UseOutcome::DestinationUnknown(witness)) => {
+                        witness.observed();
+                        Ok(())
+                    }
+                    Some(UseOutcome::NotAdmitted(witness)) => {
+                        match witness {
+                            NotAdmitted::Ordinary(_) | NotAdmitted::ReadOnly(_) => {}
+                        }
+                        Ok(())
+                    }
+                    None => Err(None),
+                }
+            };
+            let mut outcomes = Vec::new();
+            if let Some(witness) = non_admitted {
+                outcomes.push(Some(UseOutcome::NotAdmitted(witness)));
+            } else if let Some(omission) = template {
+                outcomes.push(Some(UseOutcome::NotExpanded(omission)));
+            } else if entry.roots.is_empty() {
+                outcomes.push(entry.omitted.map(UseOutcome::NotExpanded));
+            } else {
+                for root in &entry.roots {
+                    let outcome = if let Some(omission) = root.omitted {
+                        Some(UseOutcome::NotExpanded(omission))
+                    } else if let Some(witness) = coverage.unknown_destination(root) {
+                        Some(UseOutcome::DestinationUnknown(witness))
+                    } else {
+                        match admission {
+                            InventoryAdmission::Admitted(witness) => {
+                                witness.observed();
+                                coverage
+                                    .conversion_outcome(entry.node, entry.environment, root)
+                                    .map(UseOutcome::Verdict)
+                            }
+                            InventoryAdmission::Required => None,
+                            InventoryAdmission::Stopped(witness)
+                            | InventoryAdmission::ReadOnly(witness) => {
+                                Some(UseOutcome::NotAdmitted(witness))
+                            }
+                        }
                     };
-                let error = in_inventory_role(
-                    ConversionError::new(kind, &entry.owner.location, message)
-                        .owned_by(entry.owner.node),
-                    role,
-                );
-                Some(if entry.secret {
-                    error.inside_secret()
-                } else {
-                    error
-                })
-            })
-        })
-        .collect()
+                    outcomes.push(outcome);
+                }
+            }
+            for outcome in outcomes {
+                match finish(outcome) {
+                    Ok(()) => {}
+                    Err(Some(error)) => errors.append(std::iter::once(error).collect()),
+                    Err(None) => completion = InventoryCompletion::MissingOutcome,
+                }
+            }
+        }
+    }
+    (errors, completion)
 }

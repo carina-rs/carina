@@ -374,7 +374,13 @@ where
         let bare = crate::validation::check_expanded_bare_binding_uses(&context);
         findings.extend(bare.findings().iter().map(|e| finding(e)));
         let mut resources = Vec::new();
-        for step in validation.admitted_authored_test_resources(&tree, judged, &bindings, session) {
+        for step in validation.admitted_resources(
+            &tree,
+            judged,
+            &bindings,
+            session,
+            crate::validation::FindingSubject::Root,
+        ) {
             let (resource, result) = step.into_parts();
             let attributes = resource.attributes();
             let mut admitted = result
@@ -410,9 +416,7 @@ where
             };
             resources.push((label, local));
         }
-        let work = validation.walk(|coverage| {
-            coverage.work() + judged.report().completeness_report(coverage).work()
-        });
+        let work = validation.work_for(judged.report());
         let presented = validation.complete().into_presented();
         findings.extend(presented.iter().map(presented_finding));
         // Also require the CLI's public aggregate admission entry point to

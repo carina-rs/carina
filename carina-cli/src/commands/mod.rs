@@ -398,6 +398,54 @@ pub(crate) enum ConfigNameResolution {
     Paired(Box<UnresolvedConfigSnapshot>),
 }
 
+/// The entry's one closed parameter determines both admission and run kind.
+/// Legacy public validation helpers translate their existing arguments here.
+enum ConfigurationValidationMode {
+    Validate(ConfigNameResolution),
+    ProjectionOnly(ConfigNameResolution),
+    Recovery,
+}
+impl ConfigurationValidationMode {
+    fn from_parts(names: ConfigNameResolution, skip: bool) -> Self {
+        match (names, skip) {
+            (ConfigNameResolution::ReadOnly, true | false) => Self::Recovery,
+            (
+                names @ (ConfigNameResolution::EvaluatedOnly | ConfigNameResolution::Paired(_)),
+                false,
+            ) => Self::Validate(names),
+            (
+                names @ (ConfigNameResolution::EvaluatedOnly | ConfigNameResolution::Paired(_)),
+                true,
+            ) => Self::ProjectionOnly(names),
+        }
+    }
+    fn run<T>(
+        &self,
+        parsed: &carina_core::config_loader::RootDirectoryParse<T>,
+    ) -> carina_core::validation::ConversionValidation<AppError> {
+        match self {
+            Self::Validate(_) => {
+                carina_core::validation::ConversionValidation::for_directory(parsed)
+            }
+            Self::ProjectionOnly(_) | Self::Recovery => {
+                carina_core::validation::ConversionValidation::for_read_only_directory(parsed)
+            }
+        }
+    }
+    fn skips_admission(&self) -> bool {
+        match self {
+            Self::Validate(_) => false,
+            Self::ProjectionOnly(_) | Self::Recovery => true,
+        }
+    }
+    fn names(self) -> ConfigNameResolution {
+        match self {
+            Self::Validate(names) | Self::ProjectionOnly(names) => names,
+            Self::Recovery => ConfigNameResolution::ReadOnly,
+        }
+    }
+}
+
 /// Internal result of the sealed validation pipeline.
 ///
 /// The paired form is built only through [`crate::wiring::ValidationPipelineAccess`]
@@ -595,15 +643,8 @@ pub(crate) fn validate_and_resolve_report_inner(
         &parsed,
         enriched_context,
     );
-    let mut validation =
-        match &name_resolution {
-            ConfigNameResolution::ReadOnly => carina_core::validation::ConversionValidation::<
-                AppError,
-            >::for_read_only_directory(&parsed),
-            ConfigNameResolution::EvaluatedOnly | ConfigNameResolution::Paired(_) => {
-                carina_core::validation::ConversionValidation::<AppError>::for_directory(&parsed)
-            }
-        };
+    let mode = ConfigurationValidationMode::from_parts(name_resolution, skip_resource_validation);
+    let mut validation = mode.run(&parsed);
     let result = validate_and_resolve_configuration(
         access,
         parsed,
@@ -611,9 +652,8 @@ pub(crate) fn validate_and_resolve_report_inner(
         ctx,
         enriched_context,
         _load_errors,
-        skip_resource_validation,
         duplicate_declarations,
-        name_resolution,
+        mode,
         &mut authored_inputs,
         &mut warnings,
         &mut validation,
@@ -629,7 +669,7 @@ pub(crate) fn validate_and_resolve_report_inner(
             Ok(errors) => Err(errors),
             Err(_empty) => Ok(config),
         },
-        Err(ValidationStopped) => Err(non_empty_validation_failure(errors)),
+        Err(ValidationStopped(_failure)) => Err(non_empty_validation_failure(errors)),
     };
     ConfigurationValidation {
         result,
@@ -638,7 +678,20 @@ pub(crate) fn validate_and_resolve_report_inner(
     }
 }
 
-struct ValidationStopped;
+struct ValidationStopped(carina_core::validation::OrdinaryFailure);
+impl ValidationStopped {
+    fn existing(errors: &mut carina_core::validation::ConversionValidation<AppError>) -> Self {
+        let failure = match errors.ordinary_failure() {
+            Some(failure) => failure,
+            None => errors.fail(AppError::Provider(
+                carina_core::provider::HostError::internal(
+                    "bug in carina: validation stopped without an ordinary failure",
+                ),
+            )),
+        };
+        Self(failure)
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn validate_and_resolve_configuration(
@@ -648,13 +701,14 @@ fn validate_and_resolve_configuration(
     ctx: &WiringContext,
     enriched_context: &ValidationProviderCatalog,
     _load_errors: &HashMap<String, String>,
-    skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
-    name_resolution: ConfigNameResolution,
+    mode: ConfigurationValidationMode,
     authored_inputs: &mut carina_core::input_rules::AuthoredInputs,
     warnings: &mut Vec<ConfigurationWarning>,
     validation: &mut carina_core::validation::ConversionValidation<AppError>,
 ) -> Result<ResolvedConfig, ValidationStopped> {
+    let skip_resource_validation = mode.skips_admission();
+    let name_resolution = mode.names();
     let initial_warning_count = parsed.warnings.len();
     let resolved_base = base_dir.clone();
     let base_dir = &resolved_base;
@@ -686,7 +740,7 @@ fn validate_and_resolve_configuration(
             ),
             Err(error) => {
                 errors.push(AppError::AnalysisInvariant(error));
-                return Err(ValidationStopped);
+                return Err(ValidationStopped::existing(errors));
             }
         }
     }
@@ -706,7 +760,7 @@ fn validate_and_resolve_configuration(
             Ok(checked) => checked,
             Err(error) => {
                 errors.push(AppError::AnalysisInvariant(error));
-                return Err(ValidationStopped);
+                return Err(ValidationStopped::existing(errors));
             }
         };
         errors.extend(
@@ -749,7 +803,7 @@ fn validate_and_resolve_configuration(
         Ok(report) => report,
         Err(error) => {
             errors.push(AppError::AnalysisInvariant(error));
-            return Err(ValidationStopped);
+            return Err(ValidationStopped::existing(errors));
         }
     };
     let resolved_argument_types = type_resolution.resolved_argument_types().clone();
@@ -858,7 +912,7 @@ fn validate_and_resolve_configuration(
         Ok(findings) => findings,
         Err(error) => {
             errors.push(AppError::AnalysisInvariant(error));
-            return Err(ValidationStopped);
+            return Err(ValidationStopped::existing(errors));
         }
     };
 
@@ -884,7 +938,7 @@ fn validate_and_resolve_configuration(
     // module-call findings remain separate so diagnostic resolution can
     // collect concrete constraint outcomes before all typed findings are
     // merged below.
-    if !errors.is_empty() {
+    if errors.ordinary_failure().is_some() {
         // Dependency diagnostics are independent of unrelated argument-type
         // failures. The per-argument report preserves every sound result even
         // when expansion cannot proceed to the final graph check.
@@ -911,7 +965,7 @@ fn validate_and_resolve_configuration(
             }
         }
         extend_module_call_errors(errors, authored_module_call_findings);
-        return Err(ValidationStopped);
+        return Err(ValidationStopped::existing(errors));
     }
 
     let module_resolution = module_resolver::resolve_modules_with_diagnostics(
@@ -923,16 +977,18 @@ fn validate_and_resolve_configuration(
     );
     let mut parsed = match module_resolution {
         module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
+            errors.include_file(&graph);
             *authored_inputs = graph
                 .authored_inputs()
                 .map_err(|error| {
-                    errors.replace_ordinary_error(AppError::Provider(error.into()));
-                    ValidationStopped
+                    ValidationStopped(
+                        errors.replace_ordinary_error(AppError::Provider(error.into())),
+                    )
                 })?
                 .clone();
             extend_module_call_errors(errors, authored_module_call_findings);
-            if !errors.is_empty() {
-                return Err(ValidationStopped);
+            if errors.ordinary_failure().is_some() {
+                return Err(ValidationStopped::existing(errors));
             }
             *graph
         }
@@ -954,7 +1010,7 @@ fn validate_and_resolve_configuration(
                 ));
             }
             extend_module_resolution_errors(errors, residuals, base_dir);
-            return Err(ValidationStopped);
+            return Err(ValidationStopped::existing(errors));
         }
         module_resolver::ModuleResolutionDiagnosticResult::Unowned { errors: residuals } => {
             let findings = authored_module_call_findings;
@@ -968,7 +1024,7 @@ fn validate_and_resolve_configuration(
                 ));
             }
             extend_module_resolution_errors(errors, residuals, base_dir);
-            return Err(ValidationStopped);
+            return Err(ValidationStopped::existing(errors));
         }
     };
 
@@ -995,11 +1051,11 @@ fn validate_and_resolve_configuration(
                 "Provider attribute resolution error: {}",
                 e
             )));
-            return Err(ValidationStopped);
+            return Err(ValidationStopped::existing(errors));
         }
         if let Err(e) = carina_core::parser::finalize_provider_configs(&mut parsed) {
             errors.push(AppError::Config(format!("Finalize error: {}", e)));
-            return Err(ValidationStopped);
+            return Err(ValidationStopped::existing(errors));
         }
     }
 
@@ -1050,7 +1106,7 @@ fn validate_and_resolve_configuration(
         enriched_context.catalog(),
     );
     if !binding_use_report.is_ready() {
-        return Err(ValidationStopped);
+        return Err(ValidationStopped::existing(errors));
     }
 
     // Resolve names (let bindings -> resource names) — must succeed
@@ -1061,7 +1117,7 @@ fn validate_and_resolve_configuration(
             let name_errors = resolve_file_names_with_ctx(ctx, &mut parsed);
             if !name_errors.is_empty() {
                 errors.extend(name_errors);
-                return Err(ValidationStopped);
+                return Err(ValidationStopped::existing(errors));
             }
             ResolvedConfig::Evaluated {
                 parsed: Box::new(parsed),
@@ -1074,7 +1130,7 @@ fn validate_and_resolve_configuration(
                 },
                 Err(name_errors) => {
                     errors.extend(name_errors);
-                    return Err(ValidationStopped);
+                    return Err(ValidationStopped::existing(errors));
                 }
             }
         }
@@ -1108,7 +1164,7 @@ fn validate_and_resolve_configuration(
     }
     if let Err(leftovers) = parsed.validate_expansion_boundary(placeholder_boundary) {
         errors.extend(leftovers.into_errors().into_iter().map(AppError::from));
-        return Err(ValidationStopped);
+        return Err(ValidationStopped::existing(errors));
     }
 
     let expanded_analysis = if !skip_resource_validation {
@@ -1116,7 +1172,7 @@ fn validate_and_resolve_configuration(
             Ok(tree) => tree,
             Err(error) => {
                 errors.push(AppError::AnalysisInvariant(error));
-                return Err(ValidationStopped);
+                return Err(ValidationStopped::existing(errors));
             }
         };
 
@@ -1134,7 +1190,7 @@ fn validate_and_resolve_configuration(
             Ok(resolved) => resolved,
             Err(error) => {
                 errors.push(AppError::AnalysisInvariant(error));
-                return Err(ValidationStopped);
+                return Err(ValidationStopped::existing(errors));
             }
         }
     } else {
@@ -1245,8 +1301,8 @@ fn validate_and_resolve_configuration(
                     }),
             );
         }
-        if !errors.is_empty() {
-            return Err(ValidationStopped);
+        if errors.ordinary_failure().is_some() {
+            return Err(ValidationStopped::existing(errors));
         }
     }
 
@@ -1274,8 +1330,8 @@ fn validate_and_resolve_configuration(
     );
     // Downstream plan code assumes every resource has a stable id, so any
     // identity or move-target error must stop the pipeline here.
-    if !errors.is_empty() {
-        return Err(ValidationStopped);
+    if errors.ordinary_failure().is_some() {
+        return Err(ValidationStopped::existing(errors));
     }
 
     // Reject references to `upstream_state` fields that the upstream's
@@ -1292,7 +1348,7 @@ fn validate_and_resolve_configuration(
             Ok(tree) => tree,
             Err(error) => {
                 errors.push(AppError::AnalysisInvariant(error));
-                return Err(ValidationStopped);
+                return Err(ValidationStopped::existing(errors));
             }
         };
         let field_errors =
@@ -1344,10 +1400,10 @@ fn validate_and_resolve_configuration(
         );
     }
 
-    if errors.is_empty() {
+    if errors.ordinary_failure().is_none() {
         Ok(resolved_config)
     } else {
-        Err(ValidationStopped)
+        Err(ValidationStopped::existing(errors))
     }
 }
 

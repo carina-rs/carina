@@ -1705,6 +1705,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn round4_fixture_plan_skip_validation_accepts_a_conversion() {
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let directory = tempfile::tempdir().unwrap();
+        for suffix in ["", " as aws.route53.RecordType"] {
+            fs::write(directory.path().join("main.crn"), format!("provider aws {{ region = 'us-east-1' }}\nlet record = aws.route53.RecordSet {{ hosted_zone_id = 'zone' name = 'example.test' type = aws.route53.RecordType.cname{suffix} }}\n")).unwrap();
+            let fixture = build_plan_from_fixture_path(&runtime, directory.path())
+                .expect("fixture planning must derive skipped admission from its run kind");
+            assert_eq!(fixture.desired_resources.len(), 1);
+        }
+    }
+
+    #[test]
     fn round1_8_corrupt_fixture_export_is_not_an_absent_snapshot() {
         let root = tempfile::tempdir().unwrap();
         let upstream = root.path().join("upstream");

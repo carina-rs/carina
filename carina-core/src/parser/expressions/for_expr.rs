@@ -192,6 +192,10 @@ fn record_deferred_for_expression(
     iterable: Value,
     iterable_state: ParsedDeferredForIterableState,
 ) -> Result<(), ParseError> {
+    ctx.not_expanded(
+        &body_pair,
+        crate::parser::retained::NotExpandedReason::DeferredFor,
+    );
     let mut body = match parse_deferred_for_body_template(
         body_pair,
         binding,
@@ -220,6 +224,13 @@ fn record_deferred_for_expression(
         },
     };
 
+    match &mut body {
+        DeferredForBody::Resource(resource) => {
+            resource.as_resource().authored_slots.note_parser_template()
+        }
+        DeferredForBody::Read(source) => source.authored_slots.note_parser_template(),
+        DeferredForBody::ModuleCall(_) => {}
+    }
     match &mut body {
         DeferredForBody::Resource(resource) => resource
             .declaration_mut()
@@ -464,6 +475,12 @@ pub(crate) fn parse_for_expr(
     let iterable_for_expansion = parser_iterable(&classified);
     match (&binding, &iterable_for_expansion) {
         (ForBinding::Simple(var), ParserIterable::List(items)) => {
+            if items.is_empty() {
+                ctx.not_expanded(
+                    &body_pair,
+                    crate::parser::retained::NotExpandedReason::EmptyListFor,
+                );
+            }
             for (i, item) in items.iter().enumerate() {
                 let element = ForLoopElement::Index(i);
                 let expansion_key = target.element_address(&element);
@@ -502,6 +519,12 @@ pub(crate) fn parse_for_expr(
             }
         }
         (ForBinding::Indexed(idx_var, val_var), ParserIterable::List(items)) => {
+            if items.is_empty() {
+                ctx.not_expanded(
+                    &body_pair,
+                    crate::parser::retained::NotExpandedReason::EmptyIndexedFor,
+                );
+            }
             for (i, item) in items.iter().enumerate() {
                 let element = ForLoopElement::Index(i);
                 let expansion_key = target.element_address(&element);
@@ -545,6 +568,12 @@ pub(crate) fn parse_for_expr(
             }
         }
         (ForBinding::Map(key_var, val_var), ParserIterable::Map(map)) => {
+            if map.is_empty() {
+                ctx.not_expanded(
+                    &body_pair,
+                    crate::parser::retained::NotExpandedReason::EmptyMapFor,
+                );
+            }
             // Sort keys for deterministic output
             let mut keys: Vec<&str> = map.keys().copied().collect();
             keys.sort();

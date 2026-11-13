@@ -36,6 +36,8 @@ pub enum ClientFindingKind {
 pub trait ValidationClientError: std::fmt::Debug + std::fmt::Display {
     fn kind(&self) -> ClientFindingKind;
 }
+/// An ordinary error type whose values always stop validation, unlike notices.
+pub trait ValidationClientFailure: ValidationClientError {}
 impl ValidationClientError for std::convert::Infallible {
     fn kind(&self) -> ClientFindingKind {
         match *self {}
@@ -263,6 +265,29 @@ impl ResourceValidationReport {
 pub(crate) struct AdmissionComplete {
     _private: (),
 }
+impl AdmissionComplete {
+    pub(crate) fn observed(&self) {}
+}
+/// A schema-None decision, owned by the admission driver for this run/use.
+#[derive(Debug)]
+pub(crate) struct DestinationUnknown {
+    _private: (),
+}
+impl DestinationUnknown {
+    pub(crate) fn observed(&self) {}
+}
+#[derive(Clone, Copy)]
+pub(crate) enum NotAdmitted {
+    Ordinary(OrdinaryFailure),
+    ReadOnly(ReadOnlyRun),
+}
+#[derive(Clone, Copy)]
+pub(crate) enum InventoryAdmission<'a> {
+    Admitted(&'a AdmissionComplete),
+    Stopped(NotAdmitted),
+    ReadOnly(NotAdmitted),
+    Required,
+}
 #[derive(Debug, Default)]
 pub(crate) struct AdmittedConversions {
     findings: crate::ConversionChannel,
@@ -277,9 +302,6 @@ impl AdmittedConversions {
     }
     pub(crate) fn extend(&mut self, other: Self) {
         self.findings.append(other.findings);
-    }
-    pub(crate) fn is_empty(&self) -> bool {
-        self.findings.findings().is_empty()
     }
     pub(crate) fn take(&mut self) -> crate::ConversionChannel {
         std::mem::take(&mut self.findings)
@@ -301,13 +323,17 @@ enum ScopeAdmission {
     Admitted(AdmissionComplete),
 }
 #[derive(Clone, Copy)]
-struct ReadOnlyRun;
+pub(crate) struct ReadOnlyRun {
+    _private: (),
+}
 enum RunKind {
     Validate,
     ReadOnly(ReadOnlyRun),
 }
 #[derive(Clone, Copy)]
-struct OrdinaryFailure;
+pub struct OrdinaryFailure {
+    _private: (),
+}
 enum CompletionAuthority {
     Stopped(OrdinaryFailure),
     ReadOnly(ReadOnlyRun),
@@ -315,7 +341,9 @@ enum CompletionAuthority {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("internal validation invariant: admission pass did not complete")]
+#[error(
+    "bug in carina: an authored conversion use has no completion outcome (admission pass did not complete)"
+)]
 pub struct AdmissionIncomplete {
     _private: (),
 }
@@ -384,6 +412,41 @@ struct InventoryScope {
     subject: FindingSubject,
 }
 
+#[derive(PartialEq, Eq, Hash)]
+struct AdmissionUse {
+    declaration: Option<crate::parser::retained::SlotDeclarationId>,
+    resource: crate::resource::ResourceId,
+}
+fn admission_use<D, B: BindingAddress>(
+    resource: &crate::parser::AnalysisResourceRef<
+        '_,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+        B,
+    >,
+) -> (
+    AdmissionUse,
+    Option<crate::parser::retained::ProjectionGeneration>,
+)
+where
+    D: crate::parser::DeferredForPhaseTraversal<
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            B,
+        >,
+{
+    (
+        AdmissionUse {
+            declaration: resource.authored_declaration_id().cloned(),
+            resource: resource.id().clone(),
+        },
+        resource
+            .authored_slots()
+            .and_then(|slots| slots.projection_generation()),
+    )
+}
+
 /// One owner for all admission coverage and completion in a document set.
 pub struct ConversionValidation<E: ValidationClientError = std::convert::Infallible> {
     kind: RunKind,
@@ -391,6 +454,10 @@ pub struct ConversionValidation<E: ValidationClientError = std::convert::Infalli
     inventories: Vec<InventoryScope>,
     coverage: crate::schema::value_validation::WalkCoverage,
     ordinary: Vec<(FindingSubject, OrdinaryFinding<E>)>,
+    admitted_uses: std::collections::HashMap<
+        AdmissionUse,
+        Option<crate::parser::retained::ProjectionGeneration>,
+    >,
 }
 
 impl<E: ValidationClientError> Default for ConversionValidation<E> {
@@ -401,6 +468,7 @@ impl<E: ValidationClientError> Default for ConversionValidation<E> {
             inventories: Vec::new(),
             coverage: Default::default(),
             ordinary: Vec::new(),
+            admitted_uses: Default::default(),
         }
     }
 }
@@ -418,8 +486,12 @@ impl<E: ValidationClientError> ConversionValidation<E> {
             OrdinaryFinding::Client(Box::new(error)),
         ));
     }
-    pub fn is_empty(&self) -> bool {
-        self.ordinary.is_empty() && !self.coverage.has_conversion_findings()
+    pub fn fail(&mut self, error: E) -> OrdinaryFailure
+    where
+        E: ValidationClientFailure,
+    {
+        self.push(error);
+        OrdinaryFailure { _private: () }
     }
 
     /// Register the parsed root inventory before any validation phase can
@@ -433,15 +505,18 @@ impl<E: ValidationClientError> ConversionValidation<E> {
         parsed: &crate::config_loader::RootDirectoryParse<T>,
     ) -> Self {
         let mut run = Self::for_directory(parsed);
-        run.kind = RunKind::ReadOnly(ReadOnlyRun);
+        run.kind = RunKind::ReadOnly(ReadOnlyRun { _private: () });
         run
     }
 
     /// Main's terminal provider-authority failure replaces ordinary errors;
     /// conversion evidence stays owned by this same run.
-    pub fn replace_ordinary_error(&mut self, error: E) {
+    pub fn replace_ordinary_error(&mut self, error: E) -> OrdinaryFailure
+    where
+        E: ValidationClientFailure,
+    {
         self.ordinary.clear();
-        self.push(error);
+        self.fail(error)
     }
 
     /// Each step performs admission before yielding. Only exhausting this
@@ -481,44 +556,9 @@ impl<E: ValidationClientError> ConversionValidation<E> {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn admitted_authored_test_resources<'a, 'file: 'a, B, D, T>(
-        &'a mut self,
-        tree: &'a crate::parser::AnalysisTree<
-            'file,
-            crate::resource::ParserPlaceholder,
-            crate::resource::ParserPlaceholder,
-            D,
-            B,
-            T,
-        >,
-        judged: &'a crate::parser::retained::JudgedFile<'_, T, D, B>,
-        bindings: &'a crate::binding_index::BindingIndex<'_, B>,
-        session: &'a dyn super::deferred_types::ProviderTypeCheckContext,
-    ) -> impl Iterator<Item = ResourceAdmissionStep<'a, 'file, D, B>> + 'a
-    where
-        B: BindingAddress + 'file,
-        T: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B> + 'file,
-        D: crate::parser::DeferredForPhaseTraversal<
-                crate::resource::ParserPlaceholder,
-                crate::resource::ParserPlaceholder,
-                B,
-            > + 'file,
-    {
-        self.resource_steps(
-            tree.resources()
-                .filter(|resource| resource.kind() != crate::parser::AnalysisItemKind::Composition),
-            judged,
-            bindings,
-            session,
-            FindingSubject::Root,
-            AdmissionBoundary::Scope(tree.admission_scope()),
-        )
-    }
-
     pub(super) fn resource_steps<'a, 'file: 'a, B, D, T>(
         &'a mut self,
-        mut resources: impl Iterator<
+        resources: impl Iterator<
             Item = &'a crate::parser::AnalysisResourceRef<
                 'file,
                 crate::resource::ParserPlaceholder,
@@ -542,39 +582,33 @@ impl<E: ValidationClientError> ConversionValidation<E> {
                 B,
             > + 'file,
     {
-        let preflight_start = match &boundary {
+        let mut resources = resources.filter(|resource| match resource.kind() {
+            crate::parser::AnalysisItemKind::Composition => false,
+            crate::parser::AnalysisItemKind::Resource
+            | crate::parser::AnalysisItemKind::DataSource
+            | crate::parser::AnalysisItemKind::DeferredResource
+            | crate::parser::AnalysisItemKind::Wait => true,
+        });
+        let start = match &boundary {
             AdmissionBoundary::Scope(_) => {
                 self.include_in(judged.report(), subject.clone());
-                self.ensure_admission_entry();
-                self.admission_start()
+                self.ensure_admission_entry()
             }
             AdmissionBoundary::Preflight => self.admission_start(),
         };
-        let mut pending = crate::ConversionChannel::default();
         std::iter::from_fn(move || {
             let Some(resource) = resources.next() else {
                 match &boundary {
                     AdmissionBoundary::Scope(scope) => self.admission_pass_complete(scope),
-                    AdmissionBoundary::Preflight => match preflight_start {
-                        AdmissionStart::Ready(_) => self.coverage.commit_channel(
-                            AdmissionComplete { _private: () },
-                            std::mem::take(&mut pending),
-                        ),
-                        AdmissionStart::Stopped(_) => {
-                            pending = Default::default();
-                        }
-                    },
+                    AdmissionBoundary::Preflight => {}
                 }
                 return None;
             };
-            let saved = match &boundary {
-                AdmissionBoundary::Scope(_) => None,
-                AdmissionBoundary::Preflight => {
-                    Some(self.coverage.replace_pending(std::mem::take(&mut pending)))
-                }
-            };
             let values = match resource.schema(judged.schemas()) {
-                None => Ok(None),
+                None => {
+                    self.destination_unknown(resource);
+                    Ok(None)
+                }
                 Some(schema) => {
                     super::admission::attributes::ResourceAttributeInputs::for_resource(
                         resource,
@@ -595,55 +629,43 @@ impl<E: ValidationClientError> ConversionValidation<E> {
                                         module
                                             .module_call_path()
                                             .calls()
-                                            .map(|call| call.display_label())
+                                            .map(|call| format!("{} ({})", call.module_name, call.display_label()))
                                             .collect::<Vec<_>>()
                                             .join(" -> "),
                                     )
                                 }),
                         };
                         Some(self.coverage.in_subject(resource_subject, |coverage| {
-                            super::admission::attributes::resource_attribute_admissions(
-                                resource,
-                                judged.file(),
-                                schema,
-                                &classified,
-                                resource.quoted_string_attrs(),
-                                &inputs,
-                                bindings,
-                                session,
-                                judged.schemas(),
-                                coverage,
-                            )
+                            let request = super::admission::attributes::ResourceAdmissionRequest {
+                                resource, parsed: judged.file(), schema, attributes: &classified,
+                                quoted: resource.quoted_string_attrs(), inputs: &inputs,
+                                bindings, session, schemas: judged.schemas(),
+                            };
+                            match &boundary {
+                                AdmissionBoundary::Scope(_) if matches!(start, AdmissionStart::Stopped(_)) || resource.authored_slots().is_some_and(|slots| slots.is_unexpanded_template()) =>
+                                    super::admission::attributes::resource_template_preflight_admissions(request, coverage),
+                                AdmissionBoundary::Scope(_) => super::admission::attributes::resource_attribute_admissions(
+                                    request.resource, request.parsed, request.schema, request.attributes,
+                                    request.quoted, request.inputs, request.bindings, request.session, request.schemas, coverage,
+                                ),
+                                AdmissionBoundary::Preflight => super::admission::attributes::resource_template_preflight_admissions(request, coverage),
+                            }
                         }))
                     })
                 }
             };
-            if let Some(saved) = saved {
-                pending = self.coverage.replace_pending(saved);
+            if let AdmissionBoundary::Scope(_) = &boundary {
+                self.record_admitted_resource(resource);
             }
             Some(ResourceAdmissionStep { resource, values })
         })
     }
 
-    /// Low-level unit observers implement their own complete admission loop.
-    /// This adapter is unavailable to production callers or external doctests.
-    #[cfg(test)]
-    pub(crate) fn finish_test_admission_pass(&mut self) {
-        let scopes = self
-            .inventories
-            .iter()
-            .map(|scope| scope.scope.clone())
-            .collect::<Vec<_>>();
-        for scope in scopes {
-            self.admission_pass_complete(&scope);
-        }
-    }
-
-    fn ordinary_failure(&self) -> Option<OrdinaryFailure> {
+    pub fn ordinary_failure(&self) -> Option<OrdinaryFailure> {
         self.ordinary.iter().find_map(|(_, finding)| match finding {
-            OrdinaryFinding::Resource(_) => Some(OrdinaryFailure),
+            OrdinaryFinding::Resource(_) => Some(OrdinaryFailure { _private: () }),
             OrdinaryFinding::Client(error) => match error.kind() {
-                ClientFindingKind::Error => Some(OrdinaryFailure),
+                ClientFindingKind::Error => Some(OrdinaryFailure { _private: () }),
                 ClientFindingKind::Notice => None,
             },
         })
@@ -701,7 +723,6 @@ impl<E: ValidationClientError> ConversionValidation<E> {
         judged: &crate::parser::retained::JudgedFile<'_, T, D, B>,
         bindings: &crate::binding_index::BindingIndex<'_, B>,
         session: &dyn super::deferred_types::ProviderTypeCheckContext,
-        admitted: &std::collections::HashSet<crate::resource::ResourceId>,
     ) where
         B: BindingAddress,
         T: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
@@ -711,16 +732,37 @@ impl<E: ValidationClientError> ConversionValidation<E> {
                 B,
             >,
     {
-        self.include(tree.admission_report());
-        for resource in tree
-            .project_resources()
-            .filter(|resource| !admitted.contains(resource.id()))
-        {
+        let start = self.ensure_admission_entry();
+        for resource in tree.project_resources() {
+            let (identity, revision) = admission_use(resource);
+            if self.admitted_uses.get(&identity).is_some_and(|admitted| {
+                match (*admitted, revision) {
+                    (Some(previous), Some(current)) => previous.latest(current) == previous,
+                    (None, None) => true,
+                    (Some(_), None) | (None, Some(_)) => false,
+                }
+            }) {
+                continue;
+            }
+            if resource.schema(judged.schemas()).is_none() {
+                self.destination_unknown(resource);
+            }
             self.walk_resource(resource, |coverage| {
-                super::admission::attributes::unrendered_resource_conversion_admissions(
-                    resource, judged, bindings, session, coverage,
-                )
+                if matches!(start, AdmissionStart::Stopped(_))
+                    || resource
+                        .authored_slots()
+                        .is_some_and(|slots| slots.is_unexpanded_template())
+                {
+                    super::admission::attributes::unrendered_resource_template_admissions(
+                        resource, judged, bindings, session, coverage,
+                    )
+                } else {
+                    super::admission::attributes::unrendered_resource_conversion_admissions(
+                        resource, judged, bindings, session, coverage,
+                    )
+                }
             });
+            self.record_admitted_resource(resource);
         }
         self.admission_pass_complete(&tree.admission_scope());
     }
@@ -733,11 +775,34 @@ impl<E: ValidationClientError> ConversionValidation<E> {
     pub fn include<B: BindingAddress>(&mut self, report: &ExpressionReport<B>) {
         self.include_in(report, FindingSubject::Root);
     }
+    /// Retain the resolver's own template/instance inventory even for a
+    /// read-only entry that deliberately builds no admission analysis tree.
+    pub fn include_file<X, D, B: BindingAddress>(
+        &mut self,
+        file: &crate::parser::File<
+            X,
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            D,
+            B,
+        >,
+    ) {
+        self.include(file.expression_report());
+    }
     pub fn include_in<B: BindingAddress>(
         &mut self,
         report: &ExpressionReport<B>,
         subject: FindingSubject,
     ) {
+        if let Some(scope) = self
+            .inventories
+            .iter_mut()
+            .find(|scope| scope.scope == report.admission_scope())
+        {
+            scope.inventory = report.conversion_inventory();
+            scope.subject = subject;
+            return;
+        }
         self.inventories.push(InventoryScope {
             scope: report.admission_scope(),
             admission: ScopeAdmission::NotAdmitted,
@@ -745,14 +810,128 @@ impl<E: ValidationClientError> ConversionValidation<E> {
             subject,
         });
     }
-    pub fn walk<T>(
+    pub fn observe_destination<D, B: BindingAddress>(
         &mut self,
-        walk: impl FnOnce(&mut crate::schema::value_validation::WalkCoverage) -> T,
-    ) -> T {
-        self.ensure_admission_entry();
-        walk(&mut self.coverage)
+        resource: &crate::parser::AnalysisResourceRef<
+            '_,
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            D,
+            B,
+        >,
+        schemas: &crate::schema::SchemaRegistry,
+    ) where
+        D: crate::parser::DeferredForPhaseTraversal<
+                crate::resource::ParserPlaceholder,
+                crate::resource::ParserPlaceholder,
+                B,
+            >,
+    {
+        if resource.schema(schemas).is_none() {
+            self.destination_unknown(resource);
+        }
     }
-    pub fn walk_resource<'a, P, T, D, B, U>(
+    fn destination_unknown<D, B: BindingAddress>(
+        &mut self,
+        resource: &crate::parser::AnalysisResourceRef<
+            '_,
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            D,
+            B,
+        >,
+    ) where
+        D: crate::parser::DeferredForPhaseTraversal<
+                crate::resource::ParserPlaceholder,
+                crate::resource::ParserPlaceholder,
+                B,
+            >,
+    {
+        if let Some(slots) = resource.authored_slots() {
+            for root in slots.admission_roots() {
+                self.coverage
+                    .destination_unknown(root, DestinationUnknown { _private: () });
+            }
+        }
+    }
+
+    /// Admit one resource use with the run's shared coverage. Only this driver
+    /// records admitted use identities; presentation clients supply no visited set.
+    pub fn admit_resource<X, D, B: BindingAddress>(
+        &mut self,
+        request: super::admission::attributes::ResourceAdmissionRequest<'_, '_, X, D, B>,
+    ) -> crate::schema::ResourceValueValidation
+    where
+        D: crate::parser::DeferredForPhaseTraversal<
+                crate::resource::ParserPlaceholder,
+                crate::resource::ParserPlaceholder,
+                B,
+            >,
+    {
+        let resource = request.resource;
+        let start = self.ensure_admission_entry();
+        let findings = self.walk_resource(resource, |coverage| {
+            if matches!(start, AdmissionStart::Stopped(_))
+                || resource
+                    .authored_slots()
+                    .is_some_and(|slots| slots.is_unexpanded_template())
+            {
+                super::admission::attributes::resource_template_preflight_admissions(
+                    request, coverage,
+                )
+            } else {
+                super::admission::attributes::resource_attribute_admissions(
+                    request.resource,
+                    request.parsed,
+                    request.schema,
+                    request.attributes,
+                    request.quoted,
+                    request.inputs,
+                    request.bindings,
+                    request.session,
+                    request.schemas,
+                    coverage,
+                )
+            }
+        });
+        self.record_admitted_resource(resource);
+        findings
+    }
+
+    fn record_admitted_resource<D, B: BindingAddress>(
+        &mut self,
+        resource: &crate::parser::AnalysisResourceRef<
+            '_,
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            D,
+            B,
+        >,
+    ) where
+        D: crate::parser::DeferredForPhaseTraversal<
+                crate::resource::ParserPlaceholder,
+                crate::resource::ParserPlaceholder,
+                B,
+            >,
+    {
+        let (identity, revision) = admission_use(resource);
+        self.admitted_uses
+            .entry(identity)
+            .and_modify(|previous| {
+                *previous = match (*previous, revision) {
+                    (Some(previous), Some(current)) => Some(previous.latest(current)),
+                    (None, current) => current,
+                    (previous @ Some(_), None) => previous,
+                };
+            })
+            .or_insert(revision);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn work_for<B: BindingAddress>(&self, report: &ExpressionReport<B>) -> usize {
+        self.coverage.work() + report.completeness_report(&self.coverage).work()
+    }
+    pub(crate) fn walk_resource<'a, P, T, D, B, U>(
         &mut self,
         resource: &crate::parser::AnalysisResourceRef<'a, P, T, D, B>,
         walk: impl FnOnce(&mut crate::schema::value_validation::WalkCoverage) -> U,
@@ -771,14 +950,14 @@ impl<E: ValidationClientError> ConversionValidation<E> {
                     module
                         .module_call_path()
                         .calls()
-                        .map(|call| call.display_label())
+                        .map(|call| format!("{} ({})", call.module_name, call.display_label()))
                         .collect::<Vec<_>>()
                         .join(" -> "),
                 )
             });
         self.walk_in(subject, walk)
     }
-    pub fn walk_in<T>(
+    pub(crate) fn walk_in<T>(
         &mut self,
         subject: FindingSubject,
         walk: impl FnOnce(&mut crate::schema::value_validation::WalkCoverage) -> T,
@@ -799,9 +978,7 @@ impl<E: ValidationClientError> ConversionValidation<E> {
         }));
     }
     pub fn complete(mut self) -> ResourceValidationReport<E> {
-        use crate::parser::retained::conversion::{
-            AdmissionRequirement, complete_inventory, parse_rejections,
-        };
+        use crate::parser::retained::conversion::{InventoryCompletion, complete_inventory};
         let authority = match self.ordinary_failure() {
             Some(failure) => CompletionAuthority::Stopped(failure),
             None => match self.kind {
@@ -809,47 +986,41 @@ impl<E: ValidationClientError> ConversionValidation<E> {
                 RunKind::ReadOnly(proof) => CompletionAuthority::ReadOnly(proof),
             },
         };
-        let mut incomplete = AdmissionRequirement::Empty;
+        let mut incomplete = false;
         let mut conversions = crate::ConversionFindings::default();
         conversions.extend(self.coverage.take_conversions());
         for scope in self.inventories {
-            let errors = match scope.admission {
-                ScopeAdmission::Admitted(witness) => {
-                    complete_inventory(&scope.inventory, &self.coverage, &witness)
-                }
-                ScopeAdmission::NotAdmitted => {
-                    let (errors, requirement) = parse_rejections(&scope.inventory);
-                    match (&authority, requirement) {
-                        (CompletionAuthority::Required, AdmissionRequirement::Required) => {
-                            incomplete = AdmissionRequirement::Required
-                        }
-                        (CompletionAuthority::Required, AdmissionRequirement::Empty)
-                        | (
-                            CompletionAuthority::Stopped(_),
-                            AdmissionRequirement::Empty | AdmissionRequirement::Required,
-                        )
-                        | (
-                            CompletionAuthority::ReadOnly(_),
-                            AdmissionRequirement::Empty | AdmissionRequirement::Required,
-                        ) => {}
+            let admission = match &scope.admission {
+                ScopeAdmission::Admitted(witness) => InventoryAdmission::Admitted(witness),
+                ScopeAdmission::NotAdmitted => match authority {
+                    CompletionAuthority::Stopped(witness) => {
+                        InventoryAdmission::Stopped(NotAdmitted::Ordinary(witness))
                     }
-                    errors
-                }
+                    CompletionAuthority::ReadOnly(witness) => {
+                        InventoryAdmission::ReadOnly(NotAdmitted::ReadOnly(witness))
+                    }
+                    CompletionAuthority::Required => InventoryAdmission::Required,
+                },
             };
+            let (errors, completion) =
+                complete_inventory(&scope.inventory, &self.coverage, admission);
+            match completion {
+                InventoryCompletion::Complete => {}
+                InventoryCompletion::MissingOutcome => incomplete = true,
+            }
             let errors = match scope.subject {
                 FindingSubject::Root => errors,
                 subject @ FindingSubject::Module(_) => errors.in_subject(subject),
             };
             conversions.extend(errors);
         }
-        match incomplete {
-            AdmissionRequirement::Empty => {}
-            AdmissionRequirement::Required => self.ordinary.push((
+        if incomplete {
+            self.ordinary.push((
                 FindingSubject::Root,
                 OrdinaryFinding::Resource(Box::new(super::ResourceAdmissionFinding::incomplete(
                     AdmissionIncomplete { _private: () },
                 ))),
-            )),
+            ));
         }
         ResourceValidationReport {
             ordinary: self.ordinary,

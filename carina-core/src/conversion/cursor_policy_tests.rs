@@ -70,15 +70,10 @@ fn conversion_chains_keep_outer_owner_under_existing_restrictions() {
 }
 
 #[test]
-fn conversion_without_resource_schema_reports_unsupported_position() {
+fn conversion_unknown_destination_is_owned_by_the_ordinary_schema_finding() {
     let source = "mock.Unknown { target = 'ok' as mock.Name }";
     let error = check(source, &schema()).unwrap_err();
-    let conversion = conversion_error(&error).unwrap();
-    assert_eq!(conversion.kind(), ConversionErrorKind::UnsupportedPosition);
-    assert_eq!(
-        conversion.diagnostic_message(),
-        "conversion is not supported at this position"
-    );
+    assert!(conversion_error(&error).is_none(), "{error}");
     let crate::validation::ResourceRefTypeValidationError::Validation(report) = error else {
         panic!("typed findings report required");
     };
@@ -90,9 +85,7 @@ fn conversion_without_resource_schema_reports_unsupported_position() {
 
 #[test]
 fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots() {
-    use crate::validation::admission::attributes::{
-        ResourceAttributeInputs, resource_attribute_admissions,
-    };
+    use crate::validation::admission::attributes::ResourceAttributeInputs;
     let schemas = schema();
     let catalog = super::tests::catalog();
     let source = "let converted = 42 as mock.Name\nlet first = mock.Sink { target = converted }\nlet second = mock.Sink { target = converted }";
@@ -115,20 +108,19 @@ fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots()
                 &crate::resource::knowledge::KnowledgeContext::validation(),
                 |_, _| {},
             );
-            let mut report = validation.walk(|coverage| {
-                resource_attribute_admissions(
+            let mut report = validation.admit_resource(
+                crate::validation::admission::attributes::ResourceAdmissionRequest {
                     resource,
-                    judged.file(),
-                    resource.schema(&schemas).unwrap(),
-                    &classified,
-                    resource.quoted_string_attrs(),
-                    &inputs,
-                    &bindings,
+                    parsed: judged.file(),
+                    schema: resource.schema(&schemas).unwrap(),
+                    attributes: &classified,
+                    quoted: resource.quoted_string_attrs(),
+                    inputs: &inputs,
+                    bindings: &bindings,
                     session,
-                    &schemas,
-                    coverage,
-                )
-            });
+                    schemas: &schemas,
+                },
+            );
             assert_eq!(report.errors().count(), 0, "conversion leaked into errors");
             assert_eq!(
                 report.symbolic_errors().count(),
@@ -151,7 +143,9 @@ fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots()
         }
     });
     assert_eq!(resources, 2);
-    validation.finish_test_admission_pass();
+    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+        validation.admit_remaining_resources(&tree, judged, &bindings, session);
+    });
     let conversions = validation.complete().into_presented();
     assert_eq!(conversion_errors(&conversions).len(), 1);
     assert_eq!(
@@ -456,29 +450,31 @@ fn conversion_no_authored_evidence_cannot_admit_a_converted_slot() {
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
         let mut validation: crate::validation::ConversionValidation =
             crate::validation::ConversionValidation::new(judged.report());
-        let report = validation.walk(|coverage| {
-            crate::validation::admission::attributes::resource_attribute_admissions(
+        let report = validation.admit_resource(
+            crate::validation::admission::attributes::ResourceAdmissionRequest {
                 resource,
-                judged.file(),
-                resource.schema(&schemas).unwrap(),
-                &classified,
-                resource.quoted_string_attrs(),
-                &inputs,
-                &bindings,
+                parsed: judged.file(),
+                schema: resource.schema(&schemas).unwrap(),
+                attributes: &classified,
+                quoted: resource.quoted_string_attrs(),
+                inputs: &inputs,
+                bindings: &bindings,
                 session,
-                &schemas,
-                coverage,
-            )
-        });
+                schemas: &schemas,
+            },
+        );
         assert_eq!(report.errors().count(), 0, "{report:?}");
         assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");
-        validation.finish_test_admission_pass();
+        crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+            validation.admit_remaining_resources(&tree, judged, &bindings, session);
+        });
         let conversions = validation.complete().into_presented();
-        assert_eq!(conversion_errors(&conversions).len(), 1);
-        assert_eq!(
-            conversion_errors(&conversions)[0].kind(),
-            ConversionErrorKind::UnsupportedPosition
-        );
+        assert!(conversion_errors(&conversions).is_empty(), "{conversions}");
+        assert_eq!(conversions.len(), 1, "{conversions}");
+        assert!(conversions.iter().any(|finding| matches!(finding,
+            crate::validation::PresentedFinding::Ordinary(crate::validation::OrdinaryFinding::Resource(error))
+                if error.admission_incomplete().is_some())), "{conversions}");
+        assert!(conversions.to_string().contains("bug in carina"));
     });
 }
 
@@ -787,9 +783,7 @@ fn conversion_no_as_directory_inventory_is_vacuous_without_any_walk_evidence() {
 
 #[test]
 fn conversion_one_authored_alias_use_cannot_cover_another_use_without_evidence() {
-    use crate::validation::admission::attributes::{
-        ResourceAttributeInputs, resource_attribute_admissions,
-    };
+    use crate::validation::admission::attributes::ResourceAttributeInputs;
     let schemas = schema();
     let catalog = super::tests::catalog();
     for second in ["converted", "'ok'"] {
@@ -819,33 +813,40 @@ fn conversion_one_authored_alias_use_cannot_cover_another_use_without_evidence()
                     &crate::resource::knowledge::KnowledgeContext::validation(),
                     |_, _| {},
                 );
-                let report = validation.walk(|coverage| {
-                    resource_attribute_admissions(
+                let report = validation.admit_resource(
+                    crate::validation::admission::attributes::ResourceAdmissionRequest {
                         resource,
-                        judged.file(),
-                        resource.schema(&schemas).unwrap(),
-                        &classified,
-                        resource.quoted_string_attrs(),
-                        &inputs,
-                        &bindings,
+                        parsed: judged.file(),
+                        schema: resource.schema(&schemas).unwrap(),
+                        attributes: &classified,
+                        quoted: resource.quoted_string_attrs(),
+                        inputs: &inputs,
+                        bindings: &bindings,
                         session,
-                        &schemas,
-                        coverage,
-                    )
-                });
+                        schemas: &schemas,
+                    },
+                );
                 assert_eq!(report.errors().count(), 0, "{report:?}");
                 assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");
             }
         });
-        validation.finish_test_admission_pass();
+        crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+            validation.admit_remaining_resources(&tree, judged, &bindings, session);
+        });
         let conversions = validation.complete().into_presented();
         assert_eq!(
-            conversion_errors(&conversions).len(),
+            conversions.len(),
             usize::from(second == "converted"),
             "{source}\n{conversions}"
         );
-        for error in conversion_errors(&conversions) {
-            assert_eq!(error.kind(), ConversionErrorKind::UnsupportedPosition);
+        assert!(conversion_errors(&conversions).is_empty(), "{conversions}");
+        for finding in conversions.iter() {
+            assert!(
+                matches!(finding,
+                crate::validation::PresentedFinding::Ordinary(crate::validation::OrdinaryFinding::Resource(error))
+                    if error.admission_incomplete().is_some()),
+                "{finding}"
+            );
         }
     }
 }
@@ -858,7 +859,7 @@ fn round3_completion_without_an_admission_pass_is_an_internal_error() {
     use crate::validation::{ConversionValidation, PresentedFinding};
     let catalog = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let parsed = crate::parser::parse_file(
-        "let converted = 'ok' as mock.Name",
+        "let converted = 'ok' as mock.Name\nmock.Sink { target = converted }",
         Path::new("not_admitted.crn"),
         &catalog,
     )
@@ -937,7 +938,7 @@ fn round3_admitting_another_document_cannot_complete_a_scope() {
     let catalog = super::tests::catalog();
     let schemas = schema();
     let parsed = crate::parser::parse_file(
-        "let unused = 'ok' as mock.Name",
+        "let converted = 'ok' as mock.Name\nmock.Sink { target = converted }",
         Path::new("not_admitted.crn"),
         &catalog,
     )

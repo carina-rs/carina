@@ -376,6 +376,7 @@ enum ProjectionVisit {
 pub struct AuthoredUse<'s, B: BindingAddress = RelativeBindingName> {
     node: JudgedNodeRef<'s, B>,
     occurrence: UseId,
+    root_occurrence: UseId,
     instance: ExpansionInstanceId,
     edge: EdgeRole,
     visit: ProjectionVisit,
@@ -502,6 +503,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
                     self.node.node.id,
                     self.instance,
                 ),
+                root_occurrence: self.root_occurrence,
                 instance: self.instance,
                 edge: EdgeRole::AliasDefinition,
                 restriction: self.inherited_restriction(EdgeRole::AliasDefinition),
@@ -691,6 +693,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             } else {
                 self.occurrence
             },
+            root_occurrence: self.root_occurrence,
             instance: self.instance,
             edge,
             restriction: self.inherited_restriction(edge),
@@ -742,6 +745,9 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
 
     pub fn occurrence(&self) -> UseId {
         self.occurrence
+    }
+    pub(crate) fn root_occurrence(&self) -> UseId {
+        self.root_occurrence
     }
 
     pub fn instance(&self) -> ExpansionInstanceId {
@@ -1120,6 +1126,7 @@ impl<B: BindingAddress> JudgedSlot<B> {
                 environment: self.snapshot.instance.clone(),
             },
             occurrence: self.occurrence,
+            root_occurrence: self.occurrence,
             instance: self.instance,
             edge: EdgeRole::SlotRoot,
             visit: ProjectionVisit::Value,
@@ -1408,6 +1415,7 @@ impl<B: BindingAddress> ExpressionReport<B> {
                     environment: root.environment.clone(),
                 },
                 occurrence: root.occurrence,
+                root_occurrence: root.occurrence,
                 instance: root.instance,
                 edge: EdgeRole::SlotRoot,
                 visit: ProjectionVisit::Value,
@@ -1480,6 +1488,12 @@ impl<B: BindingAddress> AuthoredSlots<B> {
     pub fn declaration_id(&self) -> Option<&SlotDeclarationId> {
         self.declaration.as_ref()
     }
+    pub(crate) fn projection_generation(&self) -> Option<ProjectionGeneration> {
+        self.slots
+            .values()
+            .map(|slot| slot.generation)
+            .reduce(ProjectionGeneration::latest)
+    }
     pub(super) fn set_declaration(&mut self, declaration: SlotDeclarationId) {
         self.declaration = Some(declaration);
     }
@@ -1501,6 +1515,38 @@ impl<B: BindingAddress> AuthoredSlots<B> {
                     .and_then(|authored| self.slots.get(authored))
             })
             .ok_or_else(|| MissingEvidence::new(format!("authored attribute {name}")))
+    }
+    pub(crate) fn admission_roots(
+        &self,
+    ) -> impl Iterator<Item = super::conversion::RootRequirement> + '_ {
+        self.use_roots()
+            .map(|root| super::conversion::RootRequirement::new(&root))
+    }
+    pub(crate) fn is_unexpanded_template(&self) -> bool {
+        self.slots.values().any(|slot| {
+            slot.root
+                .expansion
+                .omission(&slot.snapshot.instance)
+                .is_some()
+        })
+    }
+    pub(in crate::parser) fn note_parser_template(&self) {
+        for slot in self.slots.values() {
+            slot.root.expansion.record(
+                &slot.snapshot.instance,
+                super::NotExpanded::parser(super::NotExpandedReason::DeferredFor),
+            );
+        }
+    }
+    pub(crate) fn note_unselected_branch(
+        &self,
+        witness: crate::module_resolver::UnselectedModuleBranch,
+    ) {
+        let environment = super::ExpressionInstance::for_scope(witness.scope());
+        let omission = super::NotExpanded::unselected_branch(witness);
+        for slot in self.slots.values() {
+            slot.root.expansion.record(&environment, omission);
+        }
     }
     pub(super) fn use_roots(&self) -> impl Iterator<Item = UseRoot<B>> + '_ {
         self.slots.values().map(|slot| UseRoot {

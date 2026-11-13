@@ -962,6 +962,18 @@ impl ModuleLocationKey {
     }
 }
 
+/// Sealed resolver decisions for reusable authored templates.
+pub(crate) struct UnactivatedTemplate {
+    _private: (),
+}
+pub(crate) struct ActivatedTemplate {
+    _private: (),
+}
+pub(crate) enum TemplateActivation {
+    NotExpanded(UnactivatedTemplate),
+    Activated(ActivatedTemplate),
+}
+
 /// Context for module resolution
 pub(crate) struct ModuleResolver<'cfg, P = StrictTypeResolution> {
     /// Base directory for resolving relative imports
@@ -992,6 +1004,7 @@ pub(crate) struct ModuleResolver<'cfg, P = StrictTypeResolution> {
     /// Present only for the editor-facing resolution entry point. Expansion
     /// records into it at the same seam that evaluates fixed-point arguments.
     pub(super) constraint_reports: RefCell<Option<ModuleCallConstraintReports>>,
+    pub(super) activated_templates: RefCell<HashSet<crate::parser::retained::AuthoredScopeId>>,
     /// The type-resolution mode is selected by the resolver's type. This field
     /// is private so callers cannot construct a resolver with a new policy.
     type_resolution: PhantomData<P>,
@@ -1107,6 +1120,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             session,
             schemas,
             constraint_reports: RefCell::new(None),
+            activated_templates: Default::default(),
             type_resolution: PhantomData,
         }
     }
@@ -2154,6 +2168,15 @@ fn resolve_modules_with_diagnostics_and_resolver<
             crate::parser::retained::retain_module_inventory(
                 &mut graph,
                 template.expression_report(),
+                if resolver
+                    .activated_templates
+                    .borrow()
+                    .contains(&template.expression_report().admission_scope())
+                {
+                    TemplateActivation::Activated(ActivatedTemplate { _private: () })
+                } else {
+                    TemplateActivation::NotExpanded(UnactivatedTemplate { _private: () })
+                },
                 crate::validation::FindingSubject::Module(
                     crate::paths::DisplayPath::for_diagnostics_from(
                         directory.source_label(),
