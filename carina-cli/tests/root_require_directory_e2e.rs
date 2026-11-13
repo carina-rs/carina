@@ -50,11 +50,11 @@ impl Directory {
             home,
         };
         success(&directory.run(&["init", "."]));
-        directory.guard(condition);
+        directory.write_root_require(condition);
         directory
     }
 
-    fn guard(&self, condition: &str) {
+    fn write_root_require(&self, condition: &str) {
         fs::write(
             self.project.join("guards.crn"),
             format!("// sibling guard\nrequire {condition}, 'root guard'\n"),
@@ -62,7 +62,7 @@ impl Directory {
         .unwrap();
     }
 
-    fn clear_guard(&self) {
+    fn clear_root_require(&self) {
         fs::remove_file(self.project.join("guards.crn")).unwrap();
     }
 
@@ -164,7 +164,7 @@ fn success(output: &Output) {
 }
 
 #[test]
-fn round5_directory_read_error_chain_renders_once() {
+fn directory_read_error_chain_renders_once() {
     let directory = tempfile::tempdir().unwrap();
     let file = directory.path().join("blocked.crn");
     fs::write(&file, [0xff]).unwrap();
@@ -197,7 +197,7 @@ fn round5_directory_read_error_chain_renders_once() {
 }
 
 #[test]
-fn round5_directory_discovery_error_chain_renders_once() {
+fn directory_discovery_error_chain_renders_once() {
     let directory = tempfile::tempdir().unwrap();
     let missing = directory.path().join("missing");
     let context =
@@ -219,7 +219,7 @@ fn round5_directory_discovery_error_chain_renders_once() {
     );
 }
 
-fn round5_upstream_failures() -> (
+fn upstream_failures() -> (
     carina_core::upstream_exports::UpstreamExportSourceError,
     carina_core::upstream_exports::UpstreamResolveFailure,
 ) {
@@ -272,8 +272,8 @@ fn round5_upstream_failures() -> (
 }
 
 #[test]
-fn round5_module_guard_error_chain_renders_once() {
-    let (source_error, _) = round5_upstream_failures();
+fn module_require_error_chain_renders_once() {
+    let (source_error, _) = upstream_failures();
     let carina_core::upstream_exports::UpstreamExportSourceError::Module { error, .. } =
         source_error
     else {
@@ -291,8 +291,8 @@ fn round5_module_guard_error_chain_renders_once() {
 }
 
 #[test]
-fn round5_upstream_source_error_chain_renders_once() {
-    let (error, _) = round5_upstream_failures();
+fn upstream_source_error_chain_renders_once() {
+    let (error, _) = upstream_failures();
     let (base, module) = error.module_failure().unwrap();
     assert!(base.ends_with("upstream"));
     assert!(module.require_outside_module().is_some());
@@ -303,8 +303,8 @@ fn round5_upstream_source_error_chain_renders_once() {
 }
 
 #[test]
-fn round5_upstream_report_error_chain_renders_once() {
-    let (_, error) = round5_upstream_failures();
+fn upstream_report_error_chain_renders_once() {
+    let (_, error) = upstream_failures();
     assert!(error.module_failure().is_some());
     assert_eq!(
         carina_cli::error::format_error_with_source_chain(&error),
@@ -312,9 +312,9 @@ fn round5_upstream_report_error_chain_renders_once() {
     );
 }
 
-fn assert_round4_empty_template(blocks: &str) {
+fn assert_empty_template(blocks: &str) {
     let directory = Directory::new("true");
-    directory.clear_guard();
+    directory.clear_root_require();
     fs::create_dir(directory.project.join("empty")).unwrap();
     fs::write(directory.project.join("empty/arguments.crn"), blocks).unwrap();
     fs::write(
@@ -336,20 +336,20 @@ fn assert_round4_empty_template(blocks: &str) {
 }
 
 #[test]
-fn round4_empty_arguments_validate_as_template() {
-    assert_round4_empty_template("arguments {}\n");
+fn empty_arguments_validate_as_template() {
+    assert_empty_template("arguments {}\n");
 }
 #[test]
-fn round4_empty_attributes_validate_as_template() {
-    assert_round4_empty_template("attributes {}\n");
+fn empty_attributes_validate_as_template() {
+    assert_empty_template("attributes {}\n");
 }
 #[test]
-fn round4_both_empty_blocks_validate_as_template() {
-    assert_round4_empty_template("arguments {}\nattributes {}\n");
+fn both_empty_blocks_validate_as_template() {
+    assert_empty_template("arguments {}\nattributes {}\n");
 }
 
 #[test]
-fn round1_validate_standalone_module_directory_keeps_template_scope() {
+fn validate_standalone_module_directory_keeps_template_scope() {
     let directory = Directory::new("true");
     fs::write(
         directory.project.join("checked/guards.crn"),
@@ -364,9 +364,9 @@ fn round1_validate_standalone_module_directory_keeps_template_scope() {
     }
 }
 
-fn assert_round1_upstream_guard(condition: &str) {
+fn assert_upstream_require(condition: &str) {
     let directory = Directory::new("true");
-    directory.clear_guard();
+    directory.clear_root_require();
     let upstream = directory.project.join("upstream");
     fs::create_dir(&upstream).unwrap();
     fs::write(
@@ -417,22 +417,22 @@ fn assert_round1_upstream_guard(condition: &str) {
 
 #[test]
 fn root_require_upstream_false_keeps_location() {
-    assert_round1_upstream_guard("false");
+    assert_upstream_require("false");
 }
 
 #[test]
 fn root_require_upstream_unknown_keeps_location() {
-    assert_round1_upstream_guard("missing == 1");
+    assert_upstream_require("missing == 1");
 }
 
 #[test]
 fn root_require_upstream_true_keeps_location() {
-    assert_round1_upstream_guard("true");
+    assert_upstream_require("true");
 }
 
 #[test]
-fn r2_root_require_upstream_function_call_reports_placement_first() {
-    assert_round1_upstream_guard("custom('x') == 1");
+fn root_require_upstream_function_call_reports_placement_first() {
+    assert_upstream_require("custom('x') == 1");
 }
 
 #[test]
@@ -449,11 +449,11 @@ fn root_require_rejected_without_module_calls_and_with_data_sources() {
 }
 
 #[test]
-fn round1_saved_plan_secret_verification_matches_module_policy() {
+fn saved_plan_secret_verification_matches_module_policy() {
     for has_secret in [false, true] {
         for root_guard in [false, true] {
             let directory = Directory::new("true");
-            directory.clear_guard();
+            directory.clear_root_require();
             let comment = if has_secret {
                 "comment = secret('ROUND1_SECRET_VALUE')"
             } else {
@@ -464,7 +464,7 @@ fn round1_saved_plan_secret_verification_matches_module_policy() {
             )).unwrap();
             success(&directory.run(&["plan", "--out", "saved.plan", "."]));
             let message = if root_guard {
-                directory.guard("false");
+                directory.write_root_require("false");
                 ROOT_REQUIRE_ERROR
             } else {
                 fs::write(
@@ -492,9 +492,9 @@ fn round1_saved_plan_secret_verification_matches_module_policy() {
 }
 
 #[test]
-fn r2_root_require_saved_plan_secret_failure_exposes_the_cause() {
+fn root_require_saved_plan_secret_failure_exposes_the_cause() {
     let directory = Directory::new("true");
-    directory.clear_guard();
+    directory.clear_root_require();
     fs::write(
         directory.project.join("main.crn"),
         "let r = mock.test.resource { name = 'root' comment = secret('ROUND2_PRIVATE_VALUE') }\n",
@@ -508,7 +508,7 @@ fn r2_root_require_saved_plan_secret_failure_exposes_the_cause() {
         directory.home.join("mock-state.json"),
     ];
     let before = state_paths.each_ref().map(|path| fs::read(path).ok());
-    directory.guard("true");
+    directory.write_root_require("true");
     let output = directory.run(&["apply", "--auto-approve", "saved.plan"]);
     rejected(&output, ROOT_REQUIRE_ERROR);
     let stderr = String::from_utf8(output.stderr.clone()).unwrap();
@@ -555,10 +555,10 @@ fn assert_root_rejected_on_every_path(condition: &str) {
         directory.home.join("mock-state.json"),
     ];
     assert!(paths.iter().all(|path| !path.exists()));
-    directory.clear_guard();
+    directory.clear_root_require();
     success(&directory.run(&["apply", "--auto-approve", "."]));
     let before = paths.each_ref().map(|path| fs::read(path).unwrap());
-    directory.guard(condition);
+    directory.write_root_require(condition);
     rejected(
         &directory.run(&["apply", "--auto-approve", "."]),
         ROOT_REQUIRE_ERROR,
@@ -581,16 +581,16 @@ fn root_require_let_commands() {
     assert_root_rejected_on_every_path("n == 2");
 }
 
-fn assert_r2_state_command_rejects_root_require(args: &[&str]) {
+fn assert_state_command_rejects_root_require(args: &[&str]) {
     let directory = Directory::new("true");
-    directory.clear_guard();
+    directory.clear_root_require();
     success(&directory.run(&["apply", "--auto-approve", "."]));
     let paths = [
         directory.project.join("carina.state.json"),
         directory.home.join("mock-state.json"),
     ];
     let before = paths.each_ref().map(|path| fs::read(path).unwrap());
-    directory.guard("true");
+    directory.write_root_require("true");
     let output = directory.run(args);
     rejected(&output, ROOT_REQUIRE_ERROR);
     let text = output_text(&output);
@@ -602,13 +602,13 @@ fn assert_r2_state_command_rejects_root_require(args: &[&str]) {
 }
 
 #[test]
-fn r2_root_require_blocks_destroy_without_state_changes() {
-    assert_r2_state_command_rejects_root_require(&["destroy", "--auto-approve", "."]);
+fn root_require_blocks_destroy_without_state_changes() {
+    assert_state_command_rejects_root_require(&["destroy", "--auto-approve", "."]);
 }
 
 #[test]
-fn r2_root_require_blocks_state_refresh_without_state_changes() {
-    assert_r2_state_command_rejects_root_require(&["state", "refresh", "."]);
+fn root_require_blocks_state_refresh_without_state_changes() {
+    assert_state_command_rejects_root_require(&["state", "refresh", "."]);
 }
 
 #[test]
@@ -619,14 +619,14 @@ fn root_require_saved_plan_contract() {
         ROOT_REQUIRE_ERROR,
     );
     assert!(!directory.project.join("saved.plan").exists());
-    directory.clear_guard();
+    directory.clear_root_require();
     success(&directory.run(&["plan", "--out", "saved.plan", "."]));
     let plan_path = directory.project.join("saved.plan");
     let plan: Value = serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
     assert_eq!(plan["version"], 45);
     assert!(!plan.to_string().contains("root guard"));
     // A secret-free saved plan reloads backend syntax without full validation.
-    directory.guard("true");
+    directory.write_root_require("true");
     let mut old = plan.clone();
     old["version"] = json!(44);
     fs::write(
@@ -697,7 +697,7 @@ fn root_require_one_error_per_statement() {
 fn root_require_index_builtin_does_not_expose_map_key() {
     let directory = Directory::new("false");
     rejected(&directory.run(&["validate", "."]), ROOT_REQUIRE_ERROR);
-    directory.guard("r[env('CARINA_ROOT_REQUIRE_KEY')] != null");
+    directory.write_root_require("r[env('CARINA_ROOT_REQUIRE_KEY')] != null");
     for args in [
         &["validate", "."][..],
         &["validate", "--json", "."],
@@ -717,7 +717,7 @@ fn root_require_index_builtin_does_not_expose_map_key() {
 fn root_require_module_control_is_unchanged() {
     let directory = Directory::new("false");
     rejected(&directory.run(&["validate", "."]), ROOT_REQUIRE_ERROR);
-    directory.clear_guard();
+    directory.clear_root_require();
     success(&directory.run(&["validate", "."]));
     success(&directory.run(&["validate", "--json", "."]));
     fs::write(
@@ -797,15 +797,81 @@ fn root_require_attributes_only_directory_is_template() {
 }
 
 #[test]
-fn r1_root_require_lint_matches_validate() {
+fn root_require_lint_matches_validate() {
     for condition in ["true", "false", "n == 2"] {
         let directory = Directory::new(condition);
-        rejected(&directory.run(&["lint", "."]), ROOT_REQUIRE_ERROR);
+        for (file, line) in [("guards.crn", 2), ("main.crn", 5)] {
+            if file == "main.crn" {
+                directory.clear_root_require();
+                let main = directory.project.join("main.crn");
+                let source = fs::read_to_string(&main).unwrap();
+                fs::write(main, format!("{source}require {condition}, 'root guard'\n")).unwrap();
+            }
+            let output = directory.run(&["lint", "."]);
+            assert_eq!(output.status.code(), Some(1));
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+            assert_eq!(
+                String::from_utf8(output.stderr).unwrap(),
+                format!(
+                    "Error: Module resolution error: ./{file}:{line}:1: {ROOT_REQUIRE_ERROR}\n"
+                )
+            );
+        }
     }
 }
 
 #[test]
-fn r1_root_require_lint_keeps_module_template_scope() {
+fn root_require_bootstrap_commands_do_not_publish_retained_rejection() {
+    let directory = Directory::new("true");
+    directory.clear_root_require();
+    fs::write(
+        directory.project.join("main.crn"),
+        "let r = mock.test.resource { name = 'root' }\nexports { value: String = 'published' }\n",
+    )
+    .unwrap();
+    success(&directory.run(&["apply", "--auto-approve", "."]));
+    fs::write(directory.project.join("guards.crn"), "require true, 'x'\n").unwrap();
+    success(&directory.run(&["fmt", "."]));
+    let paths = [
+        directory.project.join("carina.state.json"),
+        directory.home.join("mock-state.json"),
+    ];
+    let before = paths.each_ref().map(|path| fs::read(path).unwrap());
+    for (args, expected) in [
+        (
+            &["init", "."][..],
+            "Resolving 1 provider(s)...\n0 provider(s) installed in .carina/providers/\nInitialized successfully.\n",
+        ),
+        (
+            &["fmt", "--check", "."][..],
+            "All files are properly formatted.\n",
+        ),
+        (&["export"][..], "value = 'published'\n"),
+        (
+            &["module", "info", "."][..],
+            "\u{1b}[1mFile:\u{1b}[0m \u{1b}[36munknown\u{1b}[0m\n\n\u{1b}[1m=== IMPORTS ===\u{1b}[0m\n\n  \u{1b}[2m(none)\u{1b}[0m\n\n\u{1b}[1m=== CREATES ===\u{1b}[0m\n\n  \u{1b}[97mr\u{1b}[0m: \u{1b}[33mmock.test.resource\u{1b}[0m\n\n",
+        ),
+        (&["state", "list", "."][..], "mock.test.resource r\n"),
+    ] {
+        let output = directory.run(args);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            output_text(&output)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            expected,
+            "{args:?}"
+        );
+        assert_eq!(String::from_utf8(output.stderr).unwrap(), "", "{args:?}");
+        assert_eq!(before, paths.each_ref().map(|path| fs::read(path).unwrap()));
+    }
+}
+
+#[test]
+fn root_require_lint_keeps_module_template_scope() {
     let directory = Directory::new("true");
     for blocks in [
         "arguments { n: Int }",
@@ -824,9 +890,9 @@ fn r1_root_require_lint_keeps_module_template_scope() {
 }
 
 #[test]
-fn r1_root_require_blockless_import_keeps_module_context() {
+fn root_require_blockless_import_keeps_module_context() {
     let directory = Directory::new("true");
-    directory.clear_guard();
+    directory.clear_root_require();
     fs::remove_file(directory.project.join("checked/arguments.crn")).unwrap();
     fs::write(
         directory.project.join("checked/guards.crn"),
@@ -858,7 +924,7 @@ fn r1_root_require_blockless_import_keeps_module_context() {
 }
 
 #[test]
-fn r1_root_require_parse_time_errors_precede_placement() {
+fn root_require_parse_time_errors_precede_placement() {
     for (condition, message, column) in [
         (
             "[1] == [1]",

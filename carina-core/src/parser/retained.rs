@@ -311,8 +311,9 @@ pub(crate) enum RequireScope {
     /// An isolated buffer cannot establish that sibling arguments are absent.
     #[default]
     Unknown,
-    /// Bootstrap/backend parsing retains complete declarations without
-    /// entering require placement checks. Only the directory loader mints this proof.
+    /// Only the directory loader mints this declaration-completeness proof.
+    /// Any JudgedFile construction promotes it to Directory, including
+    /// bootstrap/metadata inference. Callers decide whether to publish findings.
     UnvalidatedDirectory(crate::config_loader::CompleteDirectoryDeclarations),
     Directory(crate::config_loader::CompleteDirectoryDeclarations),
     ModuleTemplate(ModuleTemplateDeclarations),
@@ -322,22 +323,14 @@ pub(crate) enum RequireScope {
 /// Positive module-declaration evidence, constructed only by for_declarations.
 /// Resolver entry points cannot manufacture a template from argument names.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ModuleTemplateDeclarations {
-    arguments: Arc<[String]>,
-}
+pub(crate) struct ModuleTemplateDeclarations(());
 
 impl RequireScope {
-    pub(crate) fn for_declarations(
-        arguments: impl Iterator<Item = String>,
-        blocks: super::ModuleDeclarationBlocks,
-    ) -> Self {
-        let arguments = arguments.collect::<Vec<_>>();
+    pub(crate) fn for_declarations(blocks: super::ModuleDeclarationBlocks) -> Self {
         if blocks == super::ModuleDeclarationBlocks::Absent {
             Self::Unknown
         } else {
-            Self::ModuleTemplate(ModuleTemplateDeclarations {
-                arguments: arguments.into(),
-            })
+            Self::ModuleTemplate(ModuleTemplateDeclarations(()))
         }
     }
 }
@@ -999,7 +992,6 @@ pub(crate) fn judge_configuration<
         .is_none()
     {
         let scope = RequireScope::for_declarations(
-            file.arguments.iter().map(|argument| argument.name.clone()),
             file.parser_binding_metadata
                 .syntax()
                 .module_declaration_blocks(),

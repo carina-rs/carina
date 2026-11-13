@@ -1486,10 +1486,6 @@ fn parse_with_seeded_bindings_inner(
     syntax
         .expressions_mut()
         .set_require_scope(super::retained::RequireScope::for_declarations(
-            parsed
-                .arguments
-                .iter()
-                .map(|argument| argument.name.clone()),
             module_blocks,
         ));
     syntax.expressions_mut().finish_captures();

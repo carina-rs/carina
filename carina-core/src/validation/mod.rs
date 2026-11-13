@@ -8288,7 +8288,7 @@ pub enum ModuleCallFindingMessage {
     ReferenceType(Box<ModuleCallReferenceDiagnostic>),
     TypeResolution(Box<crate::parser::Located<TypeResolutionDiagnostic>>),
     AttributeReference(Box<CompositionAttributeRefError>),
-    Constraint(crate::module_resolver::ConstraintDiagnostic),
+    Constraint(Box<crate::module_resolver::ModuleConstraintDiagnostic>),
 }
 
 impl ModuleCallFindingMessage {
@@ -8690,9 +8690,7 @@ impl ModuleCallFinding {
                     ModuleCallFindingMessage::ReferenceType(error) => call
                         .argument_value_location(&error.identity.argument)
                         .unwrap_or_else(|| call.declaration_location()),
-                    ModuleCallFindingMessage::Constraint(
-                        crate::module_resolver::ConstraintDiagnostic::ModuleCall(diagnostic),
-                    ) => match &diagnostic.kind {
+                    ModuleCallFindingMessage::Constraint(diagnostic) => match &diagnostic.kind {
                         crate::module_resolver::ModuleConstraintKind::ArgumentValidation {
                             argument,
                         } => call
@@ -9788,7 +9786,6 @@ impl ModuleCallChecker<'_> {
         compositions: &[crate::resource::LiveComposition<P>],
     ) {
         for report in reports {
-            let crate::module_resolver::ConstraintScopeReport::ModuleCall(report) = report;
             for outcome in &report.outcomes {
                 let crate::module_resolver::ResolvedModuleConstraintStatus::Failed {
                     diagnostic,
@@ -9830,11 +9827,7 @@ impl ModuleCallChecker<'_> {
                     });
                 }
                 for owner in owners {
-                    let message = ModuleCallFindingMessage::Constraint(
-                        crate::module_resolver::ConstraintDiagnostic::ModuleCall(
-                            diagnostic.clone(),
-                        ),
-                    );
+                    let message = ModuleCallFindingMessage::Constraint(diagnostic.clone());
                     match authored_argument {
                         true => self.push_finding(ModuleCallFinding::argument_value(
                             ModuleCallFindingKind::Constraint,

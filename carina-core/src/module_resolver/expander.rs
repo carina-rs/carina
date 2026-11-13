@@ -2640,9 +2640,6 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // Reference normalization re-judges the file before this check. The
         // retained report owns every root require verdict; diagnostic callers
         // publish it directly, while strict callers need a resolver error.
-        if self.records_constraint_reports() {
-            return Ok(());
-        }
         let failures = judged
             .report()
             .findings()

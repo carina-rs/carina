@@ -1,7 +1,7 @@
 use super::*;
 use tower_lsp::lsp_types::{Position, Range};
 
-fn assert_round4_empty_template(blocks: &str) {
+fn assert_empty_template(blocks: &str) {
     let engine = test_engine();
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("arguments.crn"), blocks).unwrap();
@@ -19,21 +19,21 @@ fn assert_round4_empty_template(blocks: &str) {
 }
 
 #[test]
-fn round4_empty_arguments_keep_lsp_template_scope() {
-    assert_round4_empty_template("arguments {}\n");
+fn empty_arguments_keep_lsp_template_scope() {
+    assert_empty_template("arguments {}\n");
 }
 #[test]
-fn round4_empty_attributes_keep_lsp_template_scope() {
-    assert_round4_empty_template("attributes {}\n");
+fn empty_attributes_keep_lsp_template_scope() {
+    assert_empty_template("attributes {}\n");
 }
 #[test]
-fn round4_both_empty_blocks_keep_lsp_template_scope() {
-    assert_round4_empty_template("arguments {}\nattributes {}\n");
+fn both_empty_blocks_keep_lsp_template_scope() {
+    assert_empty_template("arguments {}\nattributes {}\n");
 }
 
 #[cfg(unix)]
 #[test]
-fn round3_non_utf8_editor_file_keeps_its_authored_path() {
+fn non_utf8_editor_file_keeps_its_authored_path() {
     use std::os::unix::ffi::OsStringExt;
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -77,7 +77,7 @@ fn round3_non_utf8_editor_file_keeps_its_authored_path() {
     assert_eq!(argument.location().file().path(), path);
 }
 
-fn assert_round1_buffer_guard(condition: &str, broken_sibling: bool) {
+fn assert_buffer_require(condition: &str, broken_sibling: bool) {
     let engine = test_engine();
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("guards.crn");
@@ -112,26 +112,26 @@ fn assert_round1_buffer_guard(condition: &str, broken_sibling: bool) {
 }
 
 #[test]
-fn round1_broken_sibling_fallback_leaves_require_scope_unknown() {
-    assert_round1_buffer_guard("false", true);
+fn broken_sibling_fallback_leaves_require_scope_unknown() {
+    assert_buffer_require("false", true);
 }
 
 #[test]
-fn round1_broken_sibling_fallback_reports_require_arithmetic_error() {
-    assert_round1_buffer_guard("1.5 + 1 == 2", true);
+fn broken_sibling_fallback_reports_require_arithmetic_error() {
+    assert_buffer_require("1.5 + 1 == 2", true);
 }
 
 #[test]
-fn round1_no_directory_buffer_leaves_require_scope_unknown() {
-    assert_round1_buffer_guard("false", false);
+fn no_directory_buffer_leaves_require_scope_unknown() {
+    assert_buffer_require("false", false);
 }
 
 #[test]
-fn round1_no_directory_buffer_reports_require_arithmetic_error() {
-    assert_round1_buffer_guard("1.5 + 1 == 2", false);
+fn no_directory_buffer_reports_require_arithmetic_error() {
+    assert_buffer_require("1.5 + 1 == 2", false);
 }
 
-fn assert_round2_module_fallback(condition: &str, message: &str) {
+fn assert_module_fallback(condition: &str, message: &str) {
     let engine = test_engine();
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("guards.crn");
@@ -153,13 +153,13 @@ fn assert_round2_module_fallback(condition: &str, message: &str) {
 }
 
 #[test]
-fn round2_fallback_with_sibling_arguments_does_not_evaluate_false_require() {
-    assert_round2_module_fallback("false", "template guard");
+fn fallback_with_sibling_arguments_does_not_evaluate_false_require() {
+    assert_module_fallback("false", "template guard");
 }
 
 #[test]
-fn round2_fallback_with_sibling_arguments_does_not_reject_argument_name() {
-    assert_round2_module_fallback("n > 0", "positive");
+fn fallback_with_sibling_arguments_does_not_reject_argument_name() {
+    assert_module_fallback("n > 0", "positive");
 }
 
 #[test]

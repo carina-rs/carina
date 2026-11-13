@@ -161,9 +161,10 @@ still unresolved.
 configuration (a directory with no `arguments` or `attributes` block) is a
 validation error in `carina validate`, `carina lint`, `carina plan` (including
 `--out`), live `carina apply`, `carina destroy`, and `carina state refresh`,
-even if its condition is true. Commands that do not perform this validation
-(`init`, `fmt`, `export`, `module`, and state subcommands other than `refresh`)
-do not reject a `require` for its placement. Syntax and parse-time
+even if its condition is true. Bootstrap and metadata judgement can also
+retain the placement finding. `init`, `fmt`, `export`, `module`, and state
+subcommands other than `refresh` do not publish or reject those retained
+findings, so they do not reject a `require` for its placement. Syntax and parse-time
 checks still run first. After parsing succeeds, the rejection replaces general
 expression inference inside the condition; the condition is never evaluated.
 The rejection starts at the `require` keyword and covers the statement.

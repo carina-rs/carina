@@ -108,12 +108,7 @@ where
     graph
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConstraintScopeReport {
-    ModuleCall(ModuleCallConstraintReport),
-}
-
-pub type ModuleCallConstraintReports = Vec<ConstraintScopeReport>;
+pub type ModuleCallConstraintReports = Vec<ModuleCallConstraintReport>;
 
 /// Diagnostic module-resolution outcome.
 ///
@@ -1132,7 +1127,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
 
     pub(super) fn record_constraint_report(&self, report: ModuleCallConstraintReport) {
         if let Some(reports) = self.constraint_reports.borrow_mut().as_mut() {
-            reports.push(ConstraintScopeReport::ModuleCall(report));
+            reports.push(report);
         }
     }
 
@@ -1981,8 +1976,10 @@ pub fn resolve_modules_with_providerless_config<E: ResolveExportBindingPhase<Par
     .map_err(|error: ModuleError| error.with_provider_type_warnings(warnings))
 }
 
-/// Resolve a loader-owned directory while retaining argument-dependent
-/// templates for lint/editor analysis.
+/// Resolve a loader-owned directory without requiring an expanded root graph.
+/// This follows [`resolve_modules_with_config`] except for its
+/// [`ensure_expanded_root_graph`] check. Require scope comes from the loader;
+/// this entry point does not turn a root configuration into a module template.
 pub fn resolve_module_template_with_config<E: ResolveExportBindingPhase<ParserPlaceholder>>(
     parsed: AdmittedRootDirectory<'_, E>,
     base_dir: &ResolvedPath,
@@ -1995,7 +1992,9 @@ pub fn resolve_module_template_with_config<E: ResolveExportBindingPhase<ParserPl
         .map(|graph| publish_authored_module_graph(graph, config.catalog()))
 }
 
-/// Providerless/editor form of [`resolve_module_template_with_config`].
+/// Providerless form of [`resolve_module_template_with_config`]. Like
+/// [`resolve_modules_with_providerless_config`], it uses the loader's require
+/// scope, but omits the [`ensure_expanded_root_graph`] check.
 pub fn resolve_module_template_with_providerless_config<
     E: ResolveExportBindingPhase<ParserPlaceholder>,
 >(
@@ -2469,9 +2468,8 @@ fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
         crate::binding_index::ResolvedBindings::for_root_validation(parsed, root);
     let mut expanded_calls = Vec::with_capacity(module_calls.len());
     let mut errors = Vec::new();
-    if let Err(error) = resolver.check_require_placement(judged) {
-        errors.push(error);
-    }
+    // Diagnostic resolution publishes placement findings from the graph's
+    // retained report. Only strict resolution converts them to ModuleError.
     for call in &module_calls {
         let import_failed = parsed
             .uses

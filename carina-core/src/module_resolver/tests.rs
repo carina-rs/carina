@@ -44,7 +44,7 @@ fn resolver_context() -> crate::config_loader::ModuleResolutionContext {
         .module_resolution_context()
 }
 
-fn assert_round4_empty_template(blocks: &str) {
+fn assert_empty_template(blocks: &str) {
     let directory = tempfile::tempdir().unwrap();
     fs::write(directory.path().join("arguments.crn"), blocks).unwrap();
     fs::write(
@@ -127,20 +127,20 @@ fn assert_round4_empty_template(blocks: &str) {
 }
 
 #[test]
-fn round4_empty_arguments_are_template_scope() {
-    assert_round4_empty_template("arguments {}\n");
+fn empty_arguments_are_template_scope() {
+    assert_empty_template("arguments {}\n");
 }
 #[test]
-fn round4_empty_attributes_are_template_scope() {
-    assert_round4_empty_template("attributes {}\n");
+fn empty_attributes_are_template_scope() {
+    assert_empty_template("attributes {}\n");
 }
 #[test]
-fn round4_both_empty_blocks_are_template_scope() {
-    assert_round4_empty_template("arguments {}\nattributes {}\n");
+fn both_empty_blocks_are_template_scope() {
+    assert_empty_template("arguments {}\nattributes {}\n");
 }
 
 #[test]
-fn round1_direct_template_scope_in_all_resolver_entry_points() {
+fn direct_template_scope_in_all_resolver_entry_points() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(
         directory.path().join("arguments.crn"),
@@ -11938,7 +11938,7 @@ let child = consumer_module { record = "record-id" }
 }
 
 #[test]
-fn r1_root_require_template_apis_need_declaration_evidence() {
+fn root_require_template_apis_need_declaration_evidence() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(directory.path().join("guards.crn"), "require true, 'x'\n").unwrap();
     let context = LoadedProviderContext::empty_for_test();
@@ -11965,7 +11965,7 @@ fn r1_root_require_template_apis_need_declaration_evidence() {
 }
 
 #[test]
-fn r2_root_require_has_only_the_expression_report_carrier() {
+fn root_require_has_only_the_expression_report_carrier() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(
         directory.path().join("guards.crn"),
@@ -11999,7 +11999,7 @@ fn r2_root_require_has_only_the_expression_report_carrier() {
 }
 
 #[test]
-fn r2_root_require_public_strict_resolvers_keep_admission_verdict() {
+fn root_require_public_strict_resolvers_keep_admission_verdict() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(
         directory.path().join("guards.crn"),
@@ -12032,5 +12032,46 @@ fn r2_root_require_public_strict_resolvers_keep_admission_verdict() {
             assert_eq!(finding.location().span().start_line(), 1);
             assert_eq!(finding.location().span().start_column(), 1);
         }
+    });
+}
+
+#[test]
+fn module_require_diagnostic_keeps_direct_constraint_type_and_message() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("checked")).unwrap();
+    fs::write(
+        directory.path().join("main.crn"),
+        "let checked = use { source = './checked' }\nlet control = checked { n = 2 }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("checked/main.crn"),
+        "arguments { n: Int }\nrequire n == 3, 'module guard'\n",
+    )
+    .unwrap();
+    let context = LoadedProviderContext::empty_for_test();
+    let schemas = crate::schema::SchemaRegistry::new();
+    let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        let parsed = crate::config_loader::parse_directory(&base, &context).unwrap();
+        let result =
+            super::resolve_modules_with_diagnostics(parsed.admit(&schemas, session), &base, &[]);
+        let super::ModuleResolutionDiagnosticResult::ConstraintFailed { findings, errors } = result
+        else {
+            panic!("the instantiated module require must fail");
+        };
+        assert!(errors.is_empty());
+        assert_eq!(findings.len(), 1);
+        let crate::validation::ModuleCallFindingMessage::Constraint(diagnostic) =
+            findings[0].message()
+        else {
+            panic!("expected a module constraint diagnostic");
+        };
+        let diagnostic: &ModuleConstraintDiagnostic = diagnostic;
+        assert_eq!(
+            diagnostic.to_string(),
+            "module 'checked' (call 'control'): arguments 'n': module guard (got n = 2)"
+        );
+        assert_eq!(findings[0].anchor().location().span().start_line(), 2);
     });
 }

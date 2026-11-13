@@ -48,9 +48,9 @@ pub(crate) use resolver::{
     resolve_upstream_modules_with_providerless_config,
 };
 pub use resolver::{
-    ConstraintScopeReport, ModuleCallConstraintReport, ModuleCallConstraintReports,
-    ModuleResolutionDiagnosticResult, ResidualModuleResolutionDiagnostic,
-    ResidualModuleResolutionError, ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
+    ModuleCallConstraintReport, ModuleCallConstraintReports, ModuleResolutionDiagnosticResult,
+    ResidualModuleResolutionDiagnostic, ResidualModuleResolutionError,
+    ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
     ResolvedModuleConstraintStatus, ensure_expanded_root_graph, prepare_root_export_validation,
     resolve_module_template_with_config, resolve_module_template_with_providerless_config,
     resolve_modules_providerless, resolve_modules_with_config, resolve_modules_with_diagnostics,
@@ -62,12 +62,12 @@ pub use signature::{
     load_resolved_module_signatures_with_overrides,
 };
 pub use validation::{
-    ConstraintDiagnostic, ConstraintEvaluation, ConstraintOrigin, EvaluatedModuleConstraint,
-    ModuleConstraintCall, ModuleConstraintDiagnostic, ModuleConstraintFailure,
-    ModuleConstraintKind, ModuleConstraintResolutionError, ModuleConstraintViolation,
-    ModuleConstraints, RequireOutsideModuleDiagnostic, evaluate_constraint,
-    evaluate_live_pending_constraints, evaluate_module_constraints,
-    evaluate_saved_pending_constraints, referenced_constraint_arguments,
+    ConstraintEvaluation, ConstraintOrigin, EvaluatedModuleConstraint, ModuleConstraintCall,
+    ModuleConstraintDiagnostic, ModuleConstraintFailure, ModuleConstraintKind,
+    ModuleConstraintResolutionError, ModuleConstraintViolation, ModuleConstraints,
+    RequireOutsideModuleDiagnostic, evaluate_constraint, evaluate_live_pending_constraints,
+    evaluate_module_constraints, evaluate_saved_pending_constraints,
+    referenced_constraint_arguments,
 };
 
 // Bring `pub(super)` helpers into mod.rs scope so the `tests` submodule (which

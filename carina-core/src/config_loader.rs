@@ -393,8 +393,10 @@ pub struct RootDirectoryParse<E = crate::parser::ParsedExportParam> {
 pub type ParsedRootDirectory = RootDirectoryParse<crate::parser::ParsedExportParam>;
 pub type InferredRootDirectory = RootDirectoryParse<crate::parser::InferredExportParam>;
 
-/// A loader-owned directory after require admission and expression judgement.
-/// Only [`RootDirectoryParse::admit`] constructs this input. Resolution consumes
+/// A loader-owned directory admitted as resolver input with its judgement.
+/// Judgement, including bootstrap/metadata inference, already retains require
+/// placement findings; commands decide whether to publish or reject them.
+/// Only [`RootDirectoryParse::admit`] constructs this resolver input. Resolution consumes
 /// it to normalize references using imported signatures, then re-judges the
 /// resulting file before checking require placement.
 #[derive(Clone)]
@@ -499,17 +501,10 @@ fn require_scope_from_inventories<'a>(
     inventories: impl IntoIterator<Item = &'a parser::SyntaxInventory>,
 ) -> DirectoryRequireScope {
     let mut blocks = parser::ModuleDeclarationBlocks::Absent;
-    let mut arguments = BTreeSet::new();
     for inventory in inventories {
         blocks = blocks.union(inventory.module_declaration_blocks());
-        for declaration in inventory.declarations() {
-            if declaration.detail().kind() == DeclarationKind::Argument {
-                arguments.insert(declaration.detail().name().to_owned());
-            }
-        }
     }
     DirectoryRequireScope(crate::parser::retained::RequireScope::for_declarations(
-        arguments.into_iter(),
         blocks,
     ))
 }
@@ -2322,10 +2317,6 @@ pub(crate) fn parse_directory_files_located_from_root(
         .collect::<BTreeSet<_>>();
     let require_scope =
         DirectoryRequireScope(crate::parser::retained::RequireScope::for_declarations(
-            merged
-                .arguments
-                .iter()
-                .map(|argument| argument.name.clone()),
             merged
                 .parser_binding_metadata
                 .syntax()
