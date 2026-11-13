@@ -66,7 +66,7 @@ fn recorded_write_only_keys(
     attributes: &PersistedAttributes,
     orphan_recorded: &[String],
 ) -> HashSet<String> {
-    let mut keys: HashSet<_> = schema_write_only_keys(schema).into_iter().collect();
+    let mut keys = schema_write_only_keys(schema);
     keys.extend(orphan_recorded.iter().cloned());
     keys.retain(|key| attributes.contains_key(key));
     keys
@@ -91,7 +91,7 @@ impl SelectedStateAttributes {
         schema: Option<&ResourceSchema>,
         additionally_recorded: &[String],
     ) -> HashSet<String> {
-        let mut keys: HashSet<_> = schema_write_only_keys(schema).into_iter().collect();
+        let mut keys = schema_write_only_keys(schema);
         keys.extend(additionally_recorded.iter().cloned());
         keys
     }
