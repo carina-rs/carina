@@ -1124,7 +1124,7 @@ fn load_artifacts(
         )));
     }
     let artifacts = carina_core::paths::ResolvedPath::new(artifacts)?;
-    let mut overrides = HashMap::new();
+    let mut overrides = indexmap::IndexMap::new();
     for provider in providers.iter().filter(|provider| provider.is_default()) {
         let candidates: Vec<_> = [
             format!("{}.wasm", provider.name),
@@ -1178,7 +1178,7 @@ fn load_artifacts(
                 .join(source.path())?
                 .persisted_path()
                 .to_path_buf();
-            let mut one = HashMap::new();
+            let mut one = indexmap::IndexMap::new();
             one.insert(provider.name.clone(), path);
             *provider = super::schema_check_provider_configs(std::slice::from_ref(provider), &one)?
                 .remove(0);
