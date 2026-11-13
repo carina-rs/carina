@@ -678,12 +678,10 @@ fn conversion_alias_used_at_typed_slot_is_accepted() -> TestResult {
 }
 
 #[test]
-fn conversion_unused_alias_and_dead_alias_chain_are_errors() -> TestResult {
+fn conversion_unused_alias_and_dead_alias_chain_are_legal() -> TestResult {
     for tail in ["", "let alias = converted", "let _ = converted"] {
         let source = format!("let converted = 'ok' as mock.Name\n{tail}");
-        Fixture::string()
-            .check(&source)?
-            .assert_findings(&[(ConversionErrorKind::Unused, site(&source, "'ok' as"))]);
+        Fixture::string().check(&source)?.assert_accepted();
     }
     Ok(())
 }
@@ -698,9 +696,7 @@ fn conversion_local_aliases_unused_locals_and_underscore_are_checked() -> TestRe
         "let sink = mock.Sink {\n let inner = 'ok' as mock.Name\n target = 'ok'\n}",
         "let _ = 'ok' as mock.Name",
     ] {
-        fixture
-            .check(source)?
-            .assert_findings(&[(ConversionErrorKind::Unused, site(source, "'ok' as"))]);
+        fixture.check(source)?.assert_accepted();
     }
     Ok(())
 }
@@ -1338,8 +1334,8 @@ fn conversion_source_snapshot_rejects_a_detached_report() -> TestResult {
 }
 
 #[test]
-fn conversion_completeness_work_scales_linearly_for_aliases_branches_and_containers() -> TestResult
-{
+fn conversion_assignment_walk_work_scales_linearly_for_aliases_branches_and_containers()
+-> TestResult {
     #[derive(Debug)]
     enum Shape {
         Aliases,
@@ -1388,4 +1384,101 @@ fn conversion_completeness_work_scales_linearly_for_aliases_branches_and_contain
         );
     }
     Ok(())
+}
+
+#[test]
+fn round5_unused_converted_definitions_are_legal_without_target_resolution() -> TestResult {
+    let fixture = Fixture::string();
+    for source in [
+        "let unused = 'ok' as mock.Name",
+        "let first = 'ok' as unloaded.Name\nlet second = first",
+        "mock.Sink { let unused = 'ok' as unloaded.Name target = 'ok' }",
+    ] {
+        fixture.check(source)?.assert_accepted();
+    }
+    Ok(())
+}
+
+#[test]
+fn round5_for_iterable_and_literal_access_are_placement_rejections() -> TestResult {
+    let fixture = Fixture::string();
+    for source in [
+        "for n in ['a' as mock.Name] { mock.Sink { target = n } }",
+        "for n in ['a' as mock.Name] { mock.Sink { target = 'ok' } }",
+        "let m = { a = 'ok' as mock.Name }\nmock.Sink { target = m.a }",
+    ] {
+        let outcome = fixture.check(source)?;
+        let conversions: Vec<_> = outcome
+            .findings
+            .iter()
+            .filter_map(|finding| finding.conversion.as_ref())
+            .collect();
+        assert_eq!(conversions.len(), 1, "{source}: {outcome:#?}");
+        assert_eq!(
+            conversions[0].0,
+            ConversionErrorKind::UnsupportedPosition,
+            "{outcome:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn round5_nonexpanded_conversions_do_not_resolve_targets_but_placement_is_checked() -> TestResult {
+    let fixture = Fixture::string();
+    for body in [
+        "target = 'ok' as unloaded.Name",
+        "target = upper('ok' as unloaded.Name)",
+    ] {
+        let source = format!("for n in [] {{ mock.Sink {{ {body} }} }}");
+        let outcome = fixture.check(&source)?;
+        let conversions: Vec<_> = outcome
+            .findings
+            .iter()
+            .filter_map(|finding| finding.conversion.as_ref())
+            .collect();
+        if body.contains("upper") {
+            assert_eq!(conversions.len(), 1, "{outcome:#?}");
+            assert_eq!(
+                conversions[0].0,
+                ConversionErrorKind::UnsupportedPosition,
+                "{outcome:#?}"
+            );
+        } else {
+            outcome.assert_accepted();
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn round5_reported_schema_validation_cannot_admit_without_a_source_proof() {
+    let fixture = Fixture::string();
+    let parsed = crate::parser::parse_file(
+        "mock.Sink { target = 'ok' as mock.Name }",
+        Path::new("reported.crn"),
+        &fixture.catalog,
+    )
+    .unwrap();
+    let configuration = crate::config_loader::load_buffer_configuration(
+        &parsed,
+        &fixture.schemas,
+        &fixture.catalog,
+    );
+    for file in [&parsed, configuration.judged().file()] {
+        let result = crate::validation::validate_resources(
+            file,
+            &fixture.schemas,
+            &HashSet::from(["mock".into()]),
+            &fixture.catalog,
+            &mut Vec::new(),
+        );
+        let error = result
+            .expect_err("a classified validation projection cannot mint a proof for a conversion");
+        assert_eq!(
+            error.matches("conversion cannot be checked here").count(),
+            1,
+            "{error}"
+        );
+    }
 }

@@ -276,7 +276,10 @@ fn conversion_module_body_kinds_have_one_presented_owner_and_context() {
             "let producer = mock.Source {}\nmock.Sink { attr = producer.output as mock.Name }",
             "conversion_disjoint",
         ),
-        ("let abandoned = 'ok' as mock.Name", "conversion_unused"),
+        (
+            "fn abandoned(): String { 'ok' as mock.Name }",
+            "conversion_unsupported_position",
+        ),
         (
             "mock.Sink { plain = upper('ok' as mock.Name) }",
             "conversion_unsupported_position",
@@ -328,7 +331,7 @@ fn conversion_module_body_kinds_have_one_presented_owner_and_context() {
 }
 
 #[test]
-fn conversion_unused_inventory_is_a_syntax_verdict_even_after_an_ordinary_early_failure() {
+fn conversion_unused_alias_has_no_finding_after_an_ordinary_early_failure() {
     let directory = tempfile::tempdir().unwrap();
     let path = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
     let mut ordinary = Vec::new();
@@ -358,17 +361,10 @@ fn conversion_unused_inventory_is_a_syntax_verdict_even_after_an_ordinary_early_
         }
         assert_eq!(
             conversions.len(),
-            usize::from(converted),
-            "unused has no syntactic consumer: {}",
+            0,
+            "unused aliases do not reach a destination: {}",
             report.json
         );
-        if converted {
-            assert_eq!(
-                conversions[0]["code"], "conversion_unused",
-                "{}",
-                report.json
-            );
-        }
         ordinary.push(others);
     }
     assert!(!ordinary[0].is_empty());
@@ -429,7 +425,7 @@ fn round3_early_ordinary_failure_does_not_reject_a_valid_conversion_cli_and_lsp(
 }
 
 #[test]
-fn round3_parse_rejection_survives_an_ordinary_early_failure() {
+fn round5_placement_rejection_survives_an_ordinary_early_failure() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("main.crn"), "provider mock {}\nlet invalid = if 42 as String { 'ok' } else { 'ok' }\nmock.Sink { attr = missing.output }\n").unwrap();
     let report = carina_cli::commands::validate::validate_diagnostics_with_factories(
@@ -451,7 +447,7 @@ fn round3_parse_rejection_survives_an_ordinary_early_failure() {
         conversions[0]["message"]
             .as_str()
             .unwrap()
-            .contains("inside this expression"),
+            .contains("conversion is not supported at this position"),
         "{}",
         report.json
     );

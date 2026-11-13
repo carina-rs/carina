@@ -1138,7 +1138,7 @@ impl SyntaxInventory {
         pairs: Pairs<'_, Rule>,
         file: &PreprocessedFile,
         source: &Path,
-    ) -> Result<Self, super::ParseError> {
+    ) -> Self {
         let expressions = super::retained::Expressions::from_pairs(pairs.clone(), file, source);
         let declarations = declaration_inventory(pairs.clone(), file, source);
         use crate::validation::{
@@ -1330,6 +1330,6 @@ impl SyntaxInventory {
                 }
             }
         }
-        Ok(out)
+        out
     }
 }

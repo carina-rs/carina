@@ -158,6 +158,7 @@ pub fn check(
                 .into_classification(),
             Some(&bindings),
             session,
+            carina_core::test_utils::no_conversion_proof(),
         );
         let pending = admit(&destination, candidate, &context)
             .map_err(|e| e.resolution_error().to_string())?

@@ -1,6 +1,7 @@
 //! Checked conversion policy over the walk's authored cursor. No value routing.
 
 pub(crate) mod diagnostic;
+pub(crate) mod flow;
 
 use super::*;
 use crate::schema::value_validation::{AssignmentFindings, AuthoredOutcome, CheckValue};
@@ -16,7 +17,6 @@ pub(crate) struct ConversionParsing {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ParseJudgement {
-    Rejected(ConversionError),
     OperandFailed,
 }
 impl std::fmt::Debug for ConversionParsing {
@@ -39,34 +39,18 @@ impl ConversionParsing {
             secret,
         }
     }
-    pub(crate) fn judgement(&self) -> Option<&ParseJudgement> {
-        self.judgement.get()
-    }
     pub(super) fn operand_failed(&self) {
         self.judgement.get_or_init(|| ParseJudgement::OperandFailed);
     }
-    pub(super) fn reject(&self, site: &ConversionSite) -> bool {
-        match self.judgement.get_or_init(|| {
-            let error = ConversionError::new(
-                Kind::UnsupportedPosition,
-                &site.location,
-                "conversion is not supported inside this expression",
-            )
-            .owned_by(site.node);
-            ParseJudgement::Rejected(if self.secret {
-                error.inside_secret()
-            } else {
-                error
-            })
-        }) {
-            ParseJudgement::Rejected(_) => true,
-            ParseJudgement::OperandFailed => false,
-        }
+    pub(super) fn recoverable(&self) -> bool {
+        self.judgement.get().is_none()
     }
 }
 
 /// A template preflight suppresses the ordinary judgement without judging a Convert.
 /// Only the conversion policy, supplied a sealed preflight boundary, can mint it.
+/// The instance walk admits values; an uninstantiated module produces none.
+/// Live policy here would double-report two parses and reject unknown unions.
 ///
 /// ```compile_fail,E0451
 /// use carina_core::parser::retained::TemplateDeferral;
@@ -91,24 +75,89 @@ pub(crate) fn check_template<B: BindingAddress>(
     _declaration: &CompiledAttributeType,
     cursor: &AuthoredCursor<'_, B>,
 ) -> TemplateOutcome {
+    if let Some(proof) = cursor.no_conversion() {
+        return AuthoredOutcome::Continue(proof, Default::default());
+    }
     match &cursor.kind {
-        CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => match usage.form() {
-            AuthoredForm::Convert => AuthoredOutcome::Deferred(TemplateDeferral { _private: () }),
-            AuthoredForm::If
-            | AuthoredForm::Coalesce
-            | AuthoredForm::Forward
-            | AuthoredForm::Sink
-            | AuthoredForm::Parens
-            | AuthoredForm::Definition
-            | AuthoredForm::Binding
-            | AuthoredForm::Reference
-            | AuthoredForm::List
-            | AuthoredForm::Map
-            | AuthoredForm::Secret
-            | AuthoredForm::Literal
-            | AuthoredForm::Computed => AuthoredOutcome::Continue(Default::default()),
-        },
-        CursorKind::Projected(_) => AuthoredOutcome::Continue(Default::default()),
+        CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => {
+            match TransportJudgement::new(usage) {
+                Ok(transport) => AuthoredOutcome::Transport(transport),
+                Err(_) => AuthoredOutcome::Deferred(TemplateDeferral { _private: () }),
+            }
+        }
+        CursorKind::Projected(
+            ProjectionAuthority::Validation(_) | ProjectionAuthority::Operational(_),
+        ) => AuthoredOutcome::Deferred(TemplateDeferral { _private: () }),
+    }
+}
+
+/// Sealed permission to descend a conversion-carrying transport. A leaf can
+/// never mint this permission instead of judging its Convert.
+#[derive(Debug)]
+pub(crate) struct TransportJudgement {
+    identity: super::cursor::AuthoredUseIdentity,
+    owner: Arc<ConversionSite>,
+}
+impl TransportJudgement {
+    fn new<B: BindingAddress>(usage: &AuthoredUse<'_, B>) -> Result<Self, MissingEvidence> {
+        let flow::PlacementRole::Transport(_) = usage.node().conversion_role() else {
+            return Err(MissingEvidence::new("conversion transport role"));
+        };
+        match usage.navigation()? {
+            AuthoredNavigation::Forward { .. }
+            | AuthoredNavigation::Alternatives { .. }
+            | AuthoredNavigation::List
+            | AuthoredNavigation::Map => {}
+            AuthoredNavigation::Secret(_)
+            | AuthoredNavigation::Parts
+            | AuthoredNavigation::Leaf
+            | AuthoredNavigation::Covered => {
+                return Err(MissingEvidence::new("conversion transport child"));
+            }
+        }
+        let site = usage
+            .node()
+            .judgement()
+            .conversion_sources()
+            .first()
+            .ok_or_else(|| MissingEvidence::new("conversion transport source"))?;
+        Ok(Self {
+            identity: usage.identity(),
+            owner: Arc::new(site.clone()),
+        })
+    }
+    pub(crate) fn consume<B: BindingAddress>(
+        self,
+        cursor: &AuthoredCursor<'_, B>,
+    ) -> Result<(), ConversionError> {
+        if matches!(&cursor.kind, CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) if usage.identity() == self.identity)
+        {
+            Ok(())
+        } else {
+            Err(ConversionError::new(
+                Kind::Source,
+                &self.owner.location,
+                "conversion transport belongs to another authored use",
+            )
+            .owned_by(self.owner.node))
+        }
+    }
+}
+fn pass<B: BindingAddress>(
+    usage: &AuthoredUse<'_, B>,
+    declaration: &CompiledAttributeType,
+) -> AuthoredOutcome {
+    if let Some(proof) = usage.node().judgement().no_conversion() {
+        return AuthoredOutcome::Continue(proof, Default::default());
+    }
+    match TransportJudgement::new(usage) {
+        Ok(transport) => AuthoredOutcome::Transport(transport),
+        Err(_) => rejection(
+            usage,
+            declaration,
+            Kind::UnsupportedPosition,
+            "conversion cannot be checked here",
+        ),
     }
 }
 
@@ -135,15 +184,6 @@ pub struct ConversionJudgement {
     verdict: ConversionVerdict,
 }
 pub(crate) struct ConversionVerdict(Box<Decision>);
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct RecordedVerdict {
-    rejected: bool,
-}
-impl RecordedVerdict {
-    pub(crate) fn rejecting(self) -> bool {
-        self.rejected
-    }
-}
 
 enum Decision {
     Accepted(AssignmentFindings, AcceptedConversion),
@@ -166,14 +206,6 @@ impl AcceptedConversion {
     }
 }
 impl ConversionVerdict {
-    pub(crate) fn recorded(&self) -> RecordedVerdict {
-        RecordedVerdict {
-            rejected: match self.0.as_ref() {
-                Decision::Accepted(..) => false,
-                Decision::Rejected(_) => true,
-            },
-        }
-    }
     pub(crate) fn decide<T>(
         self,
         accepted: impl FnOnce(AssignmentFindings, AcceptedConversion) -> T,
@@ -182,6 +214,59 @@ impl ConversionVerdict {
         match *self.0 {
             Decision::Accepted(findings, owner) => accepted(findings, owner),
             Decision::Rejected(findings) => rejected(findings),
+        }
+    }
+    fn unchecked(source: &JudgedExpr, carried: flow::CarriedConversion<'_>) -> Self {
+        let site = carried.first();
+        let error = ConversionError::new(
+            Kind::UnsupportedPosition,
+            &site.location,
+            "conversion cannot be checked here",
+        )
+        .owned_by(site.node);
+        Self(Box::new(Decision::Rejected(AssignmentFindings {
+            conversions: std::iter::once(if source.diagnostic_is_secret() {
+                error.inside_secret()
+            } else {
+                error
+            })
+            .collect(),
+            ..Default::default()
+        })))
+    }
+    pub(crate) fn proof_mismatch<B: BindingAddress>(
+        cursor: &AuthoredCursor<'_, B>,
+    ) -> Result<Self, TypeError> {
+        match &cursor.kind {
+            CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => {
+                match usage.node().judgement().conversion_evidence() {
+                    ConversionEvidence::Carried(carried) => {
+                        Ok(Self::unchecked(usage.node().judgement(), carried))
+                    }
+                    ConversionEvidence::Free(_) => {
+                        Err(crate::validation::admission::assignment_seam_error(
+                            MissingEvidence::new("ordinary judgement proof/cursor pairing"),
+                        ))
+                    }
+                }
+            }
+            CursorKind::Projected(ProjectionAuthority::Validation(projection)) => {
+                match projection.evidence() {
+                    super::cursor::ProjectionEvidence::Carried(source, carried) => {
+                        Ok(Self::unchecked(source, carried))
+                    }
+                    super::cursor::ProjectionEvidence::Free(_) => {
+                        Err(crate::validation::admission::assignment_seam_error(
+                            MissingEvidence::new("ordinary judgement proof/cursor pairing"),
+                        ))
+                    }
+                }
+            }
+            CursorKind::Projected(ProjectionAuthority::Operational(_)) => {
+                Err(crate::validation::admission::assignment_seam_error(
+                    MissingEvidence::new("ordinary judgement proof/cursor pairing"),
+                ))
+            }
         }
     }
     pub(crate) fn seam_rejection(path: LeafPath, error: TypeError) -> Self {
@@ -210,19 +295,14 @@ impl ConversionJudgement {
         declaration: &CompiledAttributeType,
         cursor: &AuthoredCursor<'_, B>,
     ) -> Result<ConversionVerdict, ConversionError> {
-        let matches = match &cursor.kind {
-            CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => {
-                self.stamp == SourceStamp::new(usage, declaration)
-            }
-            CursorKind::Projected(_) => false,
-        };
+        let matches = SourceStamp::of(cursor, declaration).as_ref() == Some(&self.stamp);
         if !matches {
             return Err(ConversionError::new(
                 Kind::Destination,
                 &self.location,
                 "conversion verdict belongs to another authored use or destination",
             )
-            .owned_by(self.stamp.node));
+            .owned_by(self.stamp.node()));
         }
         Ok(self.verdict)
     }
@@ -257,24 +337,59 @@ fn rejected<B: BindingAddress>(
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct SourceStamp {
-    node: NodeId,
-    usage: UseId,
-    instance: ExpansionInstanceId,
-    generation: ProjectionGeneration,
-    declaration: *const CompiledAttributeType,
+enum SourceStamp {
+    Authored {
+        node: NodeId,
+        usage: UseId,
+        instance: ExpansionInstanceId,
+        generation: ProjectionGeneration,
+        declaration: *const CompiledAttributeType,
+    },
+    Validation {
+        node: NodeId,
+        declaration: *const CompiledAttributeType,
+        source: usize,
+    },
 }
 impl SourceStamp {
     fn new<B: BindingAddress>(
         usage: &AuthoredUse<'_, B>,
         declaration: &CompiledAttributeType,
     ) -> Self {
-        Self {
+        Self::Authored {
             node: usage.node().node_id(),
             usage: usage.occurrence(),
             instance: usage.instance(),
             generation: usage.node().generation(),
             declaration,
+        }
+    }
+    fn of<B: BindingAddress>(
+        cursor: &AuthoredCursor<'_, B>,
+        declaration: &CompiledAttributeType,
+    ) -> Option<Self> {
+        match &cursor.kind {
+            CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => {
+                Some(Self::new(usage, declaration))
+            }
+            CursorKind::Projected(ProjectionAuthority::Validation(projection)) => {
+                match projection.evidence() {
+                    super::cursor::ProjectionEvidence::Carried(source, carried) => {
+                        Some(Self::Validation {
+                            node: carried.first().node,
+                            declaration,
+                            source: source.judgement_stamp(),
+                        })
+                    }
+                    super::cursor::ProjectionEvidence::Free(_) => None,
+                }
+            }
+            CursorKind::Projected(ProjectionAuthority::Operational(_)) => None,
+        }
+    }
+    fn node(&self) -> NodeId {
+        match self {
+            Self::Authored { node, .. } | Self::Validation { node, .. } => *node,
         }
     }
 }
@@ -301,7 +416,63 @@ fn rejection<B: BindingAddress>(
     rejected(
         usage,
         declaration,
-        error(usage.conversion_owner(), kind, message),
+        match usage.node().kind() {
+            ExprKind::Convert { .. } => error(usage.conversion_owner(), kind, message),
+            ExprKind::If | ExprKind::Coalesce => {
+                let failure = error(usage.node(), kind, message);
+                match usage.node().judgement().conversion_sources().first() {
+                    Some(site) => failure.owned_by(site.node),
+                    None => failure,
+                }
+            }
+            ExprKind::Scalar(_)
+            | ExprKind::Parameter(_)
+            | ExprKind::LoopSlot(_)
+            | ExprKind::UntypedParameter
+            | ExprKind::Binding(_)
+            | ExprKind::Reference { .. }
+            | ExprKind::List
+            | ExprKind::Map(_)
+            | ExprKind::NestedBlock { .. }
+            | ExprKind::Interpolation { .. }
+            | ExprKind::EmptyInterpolation
+            | ExprKind::Secret
+            | ExprKind::Call(_)
+            | ExprKind::Function { .. }
+            | ExprKind::Sequence
+            | ExprKind::Access(_)
+            | ExprKind::Integer { .. }
+            | ExprKind::Alias
+            | ExprKind::Parens
+            | ExprKind::Definition
+            | ExprKind::Element
+            | ExprKind::Iterable
+            | ExprKind::Resource { .. }
+            | ExprKind::Sink { .. }
+            | ExprKind::For
+            | ExprKind::Wait
+            | ExprKind::Compose
+            | ExprKind::DynamicAccess
+            | ExprKind::ModuleCall
+            | ExprKind::Boolean
+            | ExprKind::Declaration
+            | ExprKind::RequireCondition(_)
+            | ExprKind::ProviderDeclaration
+            | ExprKind::Unsupported(_) => {
+                match usage.node().judgement().conversion_sources().first() {
+                    Some(site) => {
+                        let failure =
+                            ConversionError::new(kind, &site.location, message).owned_by(site.node);
+                        if usage.node().judgement().diagnostic_is_secret() {
+                            failure.inside_secret()
+                        } else {
+                            failure
+                        }
+                    }
+                    None => error(usage.conversion_owner(), kind, message),
+                }
+            }
+        },
         false,
     )
 }
@@ -395,23 +566,55 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
     defs: &std::collections::BTreeMap<String, CompiledAttributeType>,
     config: &crate::parser::ProviderContext,
 ) -> Result<AuthoredOutcome, TypeError> {
-    let (usage, covered) = match cursor.kind {
-        CursorKind::Authored(usage) => (usage, false),
-        CursorKind::CoveredBy(usage) => (usage, true),
-        CursorKind::Projected(_) => return Ok(AuthoredOutcome::Continue(Default::default())),
+    let (usage, covered) = match &cursor.kind {
+        CursorKind::Authored(usage) => (usage.clone(), false),
+        CursorKind::CoveredBy(usage) => (usage.clone(), true),
+        CursorKind::Projected(ProjectionAuthority::Operational(phase)) => {
+            return Ok(AuthoredOutcome::Continue(
+                NoConversion::operational(*phase),
+                Default::default(),
+            ));
+        }
+        CursorKind::Projected(ProjectionAuthority::Validation(projection)) => {
+            match projection.evidence() {
+                super::cursor::ProjectionEvidence::Free(proof) => {
+                    return Ok(AuthoredOutcome::Continue(proof, Default::default()));
+                }
+                super::cursor::ProjectionEvidence::Carried(source, carried) => {
+                    let site = carried.first();
+                    return Ok(AuthoredOutcome::Claimed(ConversionJudgement {
+                        stamp: SourceStamp::Validation {
+                            node: site.node,
+                            declaration,
+                            source: source.judgement_stamp(),
+                        },
+                        location: site.location.clone(),
+                        verdict: ConversionVerdict::unchecked(source, carried),
+                    }));
+                }
+            }
+        }
     };
     let node = usage.node();
-    if node.parse_rejected() {
-        return Ok(claimed(
+    if node.judgement().contains_any_conversion()
+        && matches!(
+            node.conversion_role(),
+            flow::PlacementRole::Computed
+                | flow::PlacementRole::Boundary
+                | flow::PlacementRole::SecretArgument
+        )
+    {
+        return Ok(rejection(
             &usage,
             declaration,
-            ConversionVerdict(Box::new(Decision::Rejected(Default::default()))),
+            Kind::UnsupportedPosition,
+            "conversion is not supported at this position",
         ));
     }
     match node.kind() {
         ExprKind::Convert { target, .. } => {
             let discarded = match checked {
-                CheckValue::Current(_) => false,
+                CheckValue::Current(_) | CheckValue::Pending => false,
                 CheckValue::Discarded => true,
                 CheckValue::Covered => {
                     return Ok(rejection(
@@ -461,7 +664,7 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
                 }
             };
             let source = operand.judgement();
-            if source.is_conversion_output() {
+            if source.contains_any_conversion() {
                 return Ok(rejection(
                     &usage,
                     declaration,
@@ -555,13 +758,13 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
         }
         ExprKind::If | ExprKind::Coalesce => {
             if !node.judgement().contains_any_conversion() {
-                return Ok(AuthoredOutcome::Continue(Default::default()));
+                return Ok(pass(&usage, declaration));
             }
             match checked {
-                CheckValue::Covered => return Ok(AuthoredOutcome::Continue(Default::default())),
-                CheckValue::Current(_) | CheckValue::Discarded => {
+                CheckValue::Covered => return Ok(pass(&usage, declaration)),
+                CheckValue::Current(_) | CheckValue::Pending | CheckValue::Discarded => {
                     if covered {
-                        return Ok(AuthoredOutcome::Continue(Default::default()));
+                        return Ok(pass(&usage, declaration));
                     }
                 }
             }
@@ -576,12 +779,12 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
                 .transpose()
                 .map_err(crate::validation::admission::assignment_seam_error)?;
             if let Some(initial) = initial {
-                let converted = initial.judgement().contains_conversion();
+                let converted = initial.judgement().contains_any_conversion();
                 for child in alternatives {
                     if child
                         .map_err(crate::validation::admission::assignment_seam_error)?
                         .judgement()
-                        .contains_conversion()
+                        .contains_any_conversion()
                         != converted
                     {
                         return Ok(rejection(
@@ -593,7 +796,7 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
                     }
                 }
             }
-            Ok(AuthoredOutcome::Continue(Default::default()))
+            Ok(pass(&usage, declaration))
         }
         ExprKind::Scalar(_)
         | ExprKind::Parameter(_)
@@ -628,367 +831,6 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
         | ExprKind::Declaration
         | ExprKind::RequireCondition(_)
         | ExprKind::ProviderDeclaration
-        | ExprKind::Unsupported(_) => Ok(AuthoredOutcome::Continue(Default::default())),
+        | ExprKind::Unsupported(_) => Ok(pass(&usage, declaration)),
     }
-}
-
-/// Parsed-node inventory. It is populated by the existing authored index,
-/// before any node judgement is requested; unavailable walk evidence cannot
-/// remove a Convert from this set.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum InventoryContext {
-    Definition,
-    Value,
-    Boundary,
-}
-#[derive(Clone)]
-pub(crate) struct InventoryEntry {
-    node: NodeId,
-    environment: ExpressionEnvironmentId,
-    owner: ConversionSite,
-    target: Box<Located<crate::conversion::ConversionTypePath>>,
-    definition: bool,
-    boundary: bool,
-    secret: bool,
-    parsing: ConversionParsing,
-    omitted: Option<NotExpanded>,
-    intrinsic: Option<ConversionError>,
-    roots: std::collections::HashSet<RootRequirement>,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct RootRequirement {
-    pub(crate) node: NodeId,
-    pub(crate) occurrence: UseId,
-    pub(crate) instance: ExpansionInstanceId,
-    pub(crate) generation: ProjectionGeneration,
-    pub(crate) omitted: Option<NotExpanded>,
-}
-impl RootRequirement {
-    pub(super) fn new<B: BindingAddress>(root: &cursor::UseRoot<B>) -> Self {
-        Self {
-            node: cursor::canonical_root_id(&root.node),
-            occurrence: root.occurrence,
-            instance: root.instance,
-            generation: root.generation,
-            omitted: root.node.expansion.omission(&root.environment),
-        }
-    }
-}
-pub(crate) type ConversionNodes = HashMap<(NodeId, ExpressionEnvironmentId), InventoryEntry>;
-#[derive(Default)]
-pub(crate) enum ConversionInventory {
-    #[default]
-    Empty,
-    Nodes {
-        nodes: ConversionNodes,
-        config: Arc<super::super::ProviderContext>,
-    },
-    Joined(Arc<Self>, Arc<Self>),
-    Template {
-        inventory: Arc<Self>,
-        activation: crate::module_resolver::TemplateActivation,
-        subject: crate::validation::FindingSubject,
-    },
-}
-#[derive(Clone, Copy)]
-enum InventoryRole<'a> {
-    Authored,
-    Template(
-        &'a crate::validation::FindingSubject,
-        &'a crate::module_resolver::TemplateActivation,
-    ),
-}
-impl ConversionInventory {
-    // Chunks retain each producer's use scope; ConversionFindings dedups rejections by NodeId.
-    fn chunks(
-        &self,
-    ) -> impl Iterator<
-        Item = (
-            &ConversionNodes,
-            &super::super::ProviderContext,
-            InventoryRole<'_>,
-        ),
-    > {
-        let mut stack = vec![(self, InventoryRole::Authored)];
-        std::iter::from_fn(move || {
-            loop {
-                let (inventory, role) = stack.pop()?;
-                match inventory {
-                    Self::Empty => {}
-                    Self::Nodes { nodes, config } => return Some((nodes, config.as_ref(), role)),
-                    Self::Joined(left, right) => {
-                        stack.push((right, role));
-                        stack.push((left, role));
-                    }
-                    Self::Template {
-                        inventory,
-                        activation,
-                        subject,
-                    } => {
-                        stack.push((inventory, InventoryRole::Template(subject, activation)));
-                    }
-                }
-            }
-        })
-    }
-}
-
-pub(super) type InventoryBuilder =
-    HashMap<(NodeId, ExpressionEnvironmentId), std::rc::Rc<std::cell::RefCell<InventoryEntry>>>;
-#[derive(Clone, Default)]
-pub(super) enum ConversionOrigins {
-    #[default]
-    Empty,
-    Entry(std::rc::Rc<std::cell::RefCell<InventoryEntry>>),
-    Joined(std::rc::Rc<Self>, std::rc::Rc<Self>),
-}
-impl ConversionOrigins {
-    pub(super) fn join(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Empty, right) => right,
-            (left, Self::Empty) => left,
-            (
-                left @ (Self::Entry(_) | Self::Joined(..)),
-                right @ (Self::Entry(_) | Self::Joined(..)),
-            ) => Self::Joined(std::rc::Rc::new(left), std::rc::Rc::new(right)),
-        }
-    }
-    fn entries(&self) -> impl Iterator<Item = &std::rc::Rc<std::cell::RefCell<InventoryEntry>>> {
-        let mut stack = vec![self];
-        std::iter::from_fn(move || {
-            loop {
-                match stack.pop()? {
-                    Self::Empty => {}
-                    Self::Entry(entry) => return Some(entry),
-                    Self::Joined(left, right) => {
-                        stack.push(right);
-                        stack.push(left);
-                    }
-                }
-            }
-        })
-    }
-}
-pub(super) struct InventoryUse<'a> {
-    pub(super) context: InventoryContext,
-    pub(super) secret: bool,
-    pub(super) owner: Option<&'a ConversionSite>,
-    pub(super) omitted: Option<NotExpanded>,
-}
-pub(super) fn inventory_entry<B: BindingAddress>(
-    node: &AuthoredExpr<ParserPlaceholder, B>,
-    target: &Located<crate::conversion::ConversionTypePath>,
-    parsing: &ConversionParsing,
-    usage: InventoryUse<'_>,
-    inventory: &mut InventoryBuilder,
-) -> ConversionOrigins {
-    let InventoryUse {
-        context,
-        secret,
-        owner,
-        omitted,
-    } = usage;
-    let entry = InventoryEntry {
-        node: node.id,
-        environment: node.location.instance.id(),
-        owner: owner
-            .or(node.first_conversion.as_deref())
-            .expect("Convert has its authored site")
-            .clone(),
-        target: Box::new(target.clone()),
-        definition: context == InventoryContext::Definition,
-        boundary: context == InventoryContext::Boundary,
-        secret,
-        parsing: parsing.clone(),
-        omitted,
-        intrinsic: None,
-        roots: Default::default(),
-    };
-    let shared = inventory
-        .entry((entry.node, entry.environment))
-        .or_insert_with(|| std::rc::Rc::new(std::cell::RefCell::new(entry.clone())));
-    {
-        let mut current = shared.borrow_mut();
-        current.definition &= entry.definition;
-        current.boundary |= entry.boundary;
-        current.secret |= entry.secret;
-        current.omitted = current.omitted.or(omitted);
-    }
-    ConversionOrigins::Entry(shared.clone())
-}
-/// Finalize syntax-owned verdicts from the enclosing grammar roles and actual
-/// syntactic consumer visits, independently of resource admission/coverage.
-pub(super) fn finalize_entry(entry: &std::cell::RefCell<InventoryEntry>) -> InventoryEntry {
-    let mut entry = entry.borrow().clone();
-    let rejection = if entry.boundary {
-        Some((
-            Kind::UnsupportedPosition,
-            "conversion is not supported at this position yet",
-        ))
-    } else if entry.definition {
-        Some((Kind::Unused, "conversion has no typed destination use"))
-    } else {
-        None
-    };
-    if let Some((kind, message)) = rejection {
-        let error =
-            ConversionError::new(kind, &entry.owner.location, message).owned_by(entry.owner.node);
-        entry.intrinsic = Some(if entry.secret {
-            error.inside_secret()
-        } else {
-            error
-        });
-    }
-    entry
-}
-pub(super) fn require_root<B: BindingAddress>(
-    root: &cursor::UseRoot<B>,
-    origins: Option<&ConversionOrigins>,
-) {
-    if let Some(origins) = origins {
-        let requirement = RootRequirement::new(root);
-        for entry in origins.entries() {
-            entry.borrow_mut().roots.insert(requirement);
-        }
-    }
-}
-
-/// A total outcome is supplied by a policy or by the producer that did not
-/// produce a live destination. There is deliberately no default/miss verdict.
-enum UseOutcome<'a> {
-    Verdict(RecordedVerdict),
-    NotExpanded(NotExpanded),
-    DestinationUnknown(&'a crate::validation::presentation::DestinationUnknown),
-    NotAdmitted(crate::validation::presentation::NotAdmitted),
-}
-#[derive(Clone, Copy)]
-pub(crate) enum InventoryCompletion {
-    Complete,
-    MissingOutcome,
-}
-
-fn in_inventory_role(error: ConversionError, role: InventoryRole<'_>) -> ConversionError {
-    match role {
-        InventoryRole::Authored => error,
-        InventoryRole::Template(subject, _) => error.in_subject(subject.clone()),
-    }
-}
-
-pub(crate) fn complete_inventory(
-    inventory: &ConversionInventory,
-    coverage: &crate::schema::value_validation::WalkCoverage,
-    admission: crate::validation::presentation::InventoryAdmission<'_>,
-) -> (crate::ConversionChannel, InventoryCompletion) {
-    use crate::validation::presentation::{InventoryAdmission, NotAdmitted};
-    let mut errors = crate::ConversionChannel::default();
-    let mut completion = InventoryCompletion::Complete;
-    for (nodes, config, role) in inventory.chunks() {
-        for entry in nodes.values() {
-            let intrinsic = match entry.parsing.judgement() {
-                Some(ParseJudgement::Rejected(error)) => Some(error),
-                Some(ParseJudgement::OperandFailed) => continue,
-                None => entry.intrinsic.as_ref(),
-            };
-            if let Some(error) = intrinsic {
-                errors.append(std::iter::once(in_inventory_role(error.clone(), role)).collect());
-                continue;
-            }
-            // An activated template is a reusable owner, not an additional use.
-            // The resolver registered each instance's own inventory/roots.
-            if let InventoryRole::Template(
-                _,
-                crate::module_resolver::TemplateActivation::Activated(_),
-            ) = role
-            {
-                continue;
-            }
-            let non_admitted = match admission {
-                InventoryAdmission::Stopped(witness) | InventoryAdmission::ReadOnly(witness) => {
-                    Some(witness)
-                }
-                InventoryAdmission::Admitted(_) | InventoryAdmission::Required => None,
-            };
-            let template = match role {
-                InventoryRole::Authored => None,
-                InventoryRole::Template(
-                    _,
-                    crate::module_resolver::TemplateActivation::NotExpanded(witness),
-                ) => Some(NotExpanded::module_template(witness)),
-                InventoryRole::Template(
-                    _,
-                    crate::module_resolver::TemplateActivation::Activated(_),
-                ) => None,
-            };
-            let finish = |outcome: Option<UseOutcome<'_>>| -> Result<(), Option<ConversionError>> {
-                match outcome {
-                    Some(UseOutcome::Verdict(verdict)) => {
-                        let _rejected = verdict.rejecting();
-                        Ok(())
-                    }
-                    Some(UseOutcome::NotExpanded(omission)) => {
-                        let _reason = omission.reason;
-                        diagnostic::resolve_target(
-                            entry.target.detail(),
-                            &entry.owner.location,
-                            config,
-                        )
-                        .map(|_| ())
-                        .map_err(|error| {
-                            Some(in_inventory_role(error.owned_by(entry.owner.node), role))
-                        })
-                    }
-                    Some(UseOutcome::DestinationUnknown(witness)) => {
-                        witness.observed();
-                        Ok(())
-                    }
-                    Some(UseOutcome::NotAdmitted(witness)) => {
-                        match witness {
-                            NotAdmitted::Ordinary(_) | NotAdmitted::ReadOnly(_) => {}
-                        }
-                        Ok(())
-                    }
-                    None => Err(None),
-                }
-            };
-            let mut outcomes = Vec::new();
-            if let Some(witness) = non_admitted {
-                outcomes.push(Some(UseOutcome::NotAdmitted(witness)));
-            } else if let Some(omission) = template {
-                outcomes.push(Some(UseOutcome::NotExpanded(omission)));
-            } else if entry.roots.is_empty() {
-                outcomes.push(entry.omitted.map(UseOutcome::NotExpanded));
-            } else {
-                for root in &entry.roots {
-                    let outcome = if let Some(omission) = root.omitted {
-                        Some(UseOutcome::NotExpanded(omission))
-                    } else if let Some(witness) = coverage.unknown_destination(root) {
-                        Some(UseOutcome::DestinationUnknown(witness))
-                    } else {
-                        match admission {
-                            InventoryAdmission::Admitted(witness) => {
-                                witness.observed();
-                                coverage
-                                    .conversion_outcome(entry.node, entry.environment, root)
-                                    .map(UseOutcome::Verdict)
-                            }
-                            InventoryAdmission::Required => None,
-                            InventoryAdmission::Stopped(witness)
-                            | InventoryAdmission::ReadOnly(witness) => {
-                                Some(UseOutcome::NotAdmitted(witness))
-                            }
-                        }
-                    };
-                    outcomes.push(outcome);
-                }
-            }
-            for outcome in outcomes {
-                match finish(outcome) {
-                    Ok(()) => {}
-                    Err(Some(error)) => errors.append(std::iter::once(error).collect()),
-                    Err(None) => completion = InventoryCompletion::MissingOutcome,
-                }
-            }
-        }
-    }
-    (errors, completion)
 }

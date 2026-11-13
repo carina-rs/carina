@@ -1,5 +1,5 @@
 //! Checked conversion diagnostics and pure declaration policy.
-//! Construction is private to the authored conversion policy and completion.
+//! Construction is private to judgement placement and the authored sink policy.
 pub(crate) use crate::parser::retained::conversion::diagnostic::ConversionTypePath;
 pub(crate) use crate::parser::retained::conversion::diagnostic::{
     ConversionChannel, ConversionFindings,

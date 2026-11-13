@@ -1,5 +1,5 @@
 use super::*;
-use crate::parser::retained::{AuthoredCursor, ProjectedPhase};
+use crate::parser::retained::AuthoredCursor;
 use crate::schema::AttributeType;
 
 #[test]
@@ -104,11 +104,11 @@ fn mismatched_cursor_is_rejected(apply: bool) {
                     context.cursor = if authored {
                         AuthoredCursor::authored(slot.cursor().unwrap())
                     } else {
-                        let validation = value
-                            .knowledge(&KnowledgeContext::validation())
-                            .unwrap()
-                            .into_classification();
-                        AuthoredCursor::projected(ProjectedPhase::classified(&validation))
+                        AuthoredCursor::validation_projected(
+                            crate::parser::retained::ValidationProjection::checked(
+                                crate::test_utils::no_conversion_proof(),
+                            ),
+                        )
                     };
                     let error = admit(destination, candidate, &context)
                         .expect_err("proof cannot borrow its cursor's unrelated phase");

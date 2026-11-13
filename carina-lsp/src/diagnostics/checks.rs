@@ -880,6 +880,9 @@ impl DiagnosticRun<'_> {
         base_path: &carina_core::paths::ResolvedPath,
         upstream_exports: &carina_core::upstream_exports::UpstreamExports,
         source_overrides: &carina_core::config_loader::SourceOverrides,
+        conversion_validation: &mut carina_core::validation::ConversionValidation<
+            super::OrdinaryDiagnostic,
+        >,
     ) {
         let covered_findings = match carina_core::validation::check_module_calls_from_analysis(
             tree,
@@ -907,7 +910,7 @@ impl DiagnosticRun<'_> {
                 &covered_findings,
                 source_overrides,
             );
-        let module_resolution = match module_resolution {
+        let module_resolution = match module_resolution.into_validation(conversion_validation) {
             carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded {
                 mut graph,
             } => {
@@ -952,6 +955,7 @@ impl DiagnosticRun<'_> {
                         base_path,
                         &exports,
                         &overrides,
+                        &mut carina_core::validation::ConversionValidation::default(),
                     ),
                     Err(error) => result.analysis_errors.push(error),
                 }
@@ -1080,22 +1084,17 @@ impl DiagnosticRun<'_> {
                 &self.schemas,
             )
             .ok()?;
-        let module_resolution =
-            carina_core::module_resolver::resolve_modules_with_diagnostics_and_overrides(
-                &merged,
-                base_path,
-                self.provider_context,
-                &self.schemas,
-                &[],
-                &carina_core::config_loader::SourceOverrides::from([(
-                    doc.source_file().to_path_buf(),
-                    doc.text(),
-                )]),
-            );
-        if let carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } =
-            module_resolution
-        {
-            let mut resolved = *graph;
+        // This is a projected provider-value query, not authored admission.
+        // It returns only provider finalization errors and publishes no AST
+        // findings from its deliberately separate metadata parse.
+        let module_resolution = carina_core::module_resolver::resolve_modules_with_config(
+            merged.clone(),
+            base_path,
+            self.provider_context,
+            &self.schemas,
+        );
+        if let Ok(graph) = module_resolution {
+            let mut resolved = graph;
             if let Err(error) =
                 carina_core::parser::resolve_expanded_provider_unresolved_attributes_for_analysis(
                     &mut resolved,

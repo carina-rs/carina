@@ -762,6 +762,7 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
                 _ => Mismatch(mismatch(expected, value)),
             }
         }
+        Ok(crate::parser::retained::ExpressionAdmission::ConversionRequired) => Assignable,
         Ok(admission) => {
             if matches!(
                 expression.static_type(),

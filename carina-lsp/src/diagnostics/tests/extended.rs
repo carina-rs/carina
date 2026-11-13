@@ -8781,6 +8781,11 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
                         &engine.schemas,
                         &[],
                     )
+                    .into_validation(
+                        &mut carina_core::validation::ConversionValidation::<
+                            std::convert::Infallible,
+                        >::default(),
+                    )
                 },
             )
         }
@@ -8794,6 +8799,11 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
                         session,
                         &engine.schemas,
                         &[],
+                    )
+                    .into_validation(
+                        &mut carina_core::validation::ConversionValidation::<
+                            std::convert::Infallible,
+                        >::default(),
                     )
                 },
             )
@@ -10295,6 +10305,7 @@ fn wider_same_identity_name_reference_discharge_reports_the_literal_error_once()
                     .into_classification(),
                 Some(&bindings),
                 session,
+                carina_core::test_utils::no_conversion_proof(),
             );
             let pending = admit(&destination, candidate, &boundary)
                 .unwrap()
@@ -10308,6 +10319,7 @@ fn wider_same_identity_name_reference_discharge_reports_the_literal_error_once()
                     .into_classification(),
                 Some(&bindings),
                 session,
+                carina_core::test_utils::no_conversion_proof(),
             );
             let literal_error = admit(&destination, candidate, &boundary).unwrap_err();
             let mut resolved = ResolvedBindings::default();
@@ -18101,6 +18113,7 @@ fn widening_member_obligation_parity(decoded: bool) {
                         .into_classification(),
                     Some(&bindings),
                     session,
+                    carina_core::test_utils::no_conversion_proof(),
                 );
                 admit(&destination, candidate, &boundary)
             };

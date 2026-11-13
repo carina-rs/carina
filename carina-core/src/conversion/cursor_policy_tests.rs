@@ -45,7 +45,7 @@ fn conversion_chains_keep_outer_owner_under_existing_restrictions() {
             ),
             (
                 format!("\"${{{chain}}}\""),
-                "conversion is not supported inside this expression",
+                "a conversion cannot be the operand of another conversion",
             ),
         ] {
             let source = format!("mock.Sink {{ target = {expression} }}");
@@ -469,13 +469,225 @@ fn conversion_no_authored_evidence_cannot_admit_a_converted_slot() {
             validation.admit_remaining_resources(&tree, judged, &bindings, session);
         });
         let conversions = validation.complete().into_presented();
-        assert!(conversion_errors(&conversions).is_empty(), "{conversions}");
-        assert_eq!(conversions.len(), 1, "{conversions}");
-        assert!(conversions.iter().any(|finding| matches!(finding,
-            crate::validation::PresentedFinding::Ordinary(crate::validation::OrdinaryFinding::Resource(error))
-                if error.admission_incomplete().is_some())), "{conversions}");
-        assert!(conversions.to_string().contains("bug in carina"));
+        assert_eq!(conversion_errors(&conversions).len(), 1, "{conversions}");
+        assert!(!conversions.to_string().contains("bug in carina"));
     });
+}
+
+#[test]
+fn round5_stale_authored_inputs_fail_through_the_conversion_proof() {
+    use crate::validation::admission::attributes::ResourceAttributeInputs;
+    let catalog = super::tests::catalog();
+    let schemas = schema();
+    for converted in [false, true] {
+        let suffix = if converted { " as mock.Name" } else { "" };
+        let parsed = crate::parser::parse_file(
+            &format!("let sink = mock.Sink {{ target = 'ok'{suffix} }}"),
+            Path::new("stale-source.crn"),
+            &catalog,
+        )
+        .unwrap()
+        .resolve_root_for_test();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let judged = configuration.judged();
+        let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let inputs = ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap();
+        let classified = inputs.classify(
+            &crate::resource::knowledge::KnowledgeContext::validation(),
+            |_, _| {},
+        );
+        for instantiate in [false, true] {
+            let mut changed = judged.file().clone();
+            if instantiate {
+                changed.resources[0] = changed.resources[0].instantiate();
+            } else {
+                let values = changed.resources[0].attributes.clone();
+                changed.resources[0]
+                    .authored_slots
+                    .replace_projections(&values);
+            }
+            let changed_tree = crate::parser::AnalysisTree::try_from_file(&changed).unwrap();
+            let resource = changed_tree.resources().next().unwrap();
+            let bindings =
+                crate::binding_index::BindingIndex::from_parsed(&changed, &schemas, &catalog);
+            let mut run: crate::validation::ConversionValidation =
+                crate::validation::ConversionValidation::new(judged.report());
+            crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+                let findings = run.admit_resource(
+                    crate::validation::admission::attributes::ResourceAdmissionRequest {
+                        resource,
+                        parsed: &changed,
+                        schema: resource.schema(&schemas).unwrap(),
+                        attributes: &classified,
+                        quoted: resource.quoted_string_attrs(),
+                        inputs: &inputs,
+                        bindings: &bindings,
+                        session,
+                        schemas: &schemas,
+                    },
+                );
+                assert_eq!(
+                    findings.errors().count(),
+                    usize::from(!converted),
+                    "converted={converted}, instance={instantiate}: {findings:?}"
+                );
+                assert_eq!(findings.symbolic_errors().count(), 0, "{findings:?}");
+            });
+            let presented = run.complete().into_presented();
+            assert_eq!(
+                conversion_errors(&presented).len(),
+                usize::from(converted),
+                "{presented}"
+            );
+            if converted {
+                assert!(
+                    conversion_errors(&presented)[0]
+                        .diagnostic_message()
+                        .contains("conversion cannot be checked here"),
+                    "{presented}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn round5_unresolved_or_reshaped_containers_require_conversion_descent() {
+    use crate::validation::admission::attributes::ResourceAttributeInputs;
+    let catalog = super::tests::catalog();
+    #[derive(Debug, Clone, Copy)]
+    enum Projection {
+        Pending,
+        Failed,
+        Scalar,
+    }
+    for map in [false, true] {
+        for union in [false, true] {
+            for projection in [Projection::Pending, Projection::Failed, Projection::Scalar] {
+                let mut schemas = SchemaRegistry::new();
+                let destination = if matches!(projection, Projection::Scalar) {
+                    AttributeType::string()
+                } else if map {
+                    AttributeType::map(named())
+                } else {
+                    AttributeType::list(named())
+                };
+                let destination = if union {
+                    AttributeType::union(vec![destination, AttributeType::string()])
+                } else {
+                    destination
+                };
+                schemas.insert(
+                    "mock",
+                    ResourceSchema::new("Sink")
+                        .attribute(AttributeSchema::optional("target", destination).build())
+                        .validate()
+                        .unwrap(),
+                );
+                let expression = if map {
+                    "{ item = 42 as mock.Name }"
+                } else {
+                    "[42 as mock.Name]"
+                };
+                let parsed = crate::parser::parse_file(
+                    &format!("let sink = mock.Sink {{ target = {expression} }}"),
+                    Path::new("pending-container.crn"),
+                    &catalog,
+                )
+                .unwrap()
+                .resolve_root_for_test();
+                let configuration =
+                    crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+                let judged = configuration.judged();
+                let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+                let resource = tree.resources().next().unwrap();
+                let value = match projection {
+                    Projection::Pending => {
+                        crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(
+                            crate::resource::ApplyTimeUnknown::PendingReRead(
+                                crate::resource::PendingReRead::not_found(),
+                            ),
+                        ))
+                    }
+                    Projection::Failed => crate::resource::Value::Deferred(
+                        crate::resource::DeferredValue::Unavailable {
+                            name: crate::builtins::BuiltinFunction::env,
+                            args: Vec::new(),
+                            reason: crate::resource::UnavailableReason::from_builtin_error(
+                                "ordinary evaluation failure".into(),
+                            ),
+                            source_line: crate::resource::DiagnosticSourceLine::synthetic(),
+                        },
+                    ),
+                    Projection::Scalar => crate::resource::Value::Concrete(
+                        crate::resource::ConcreteValue::String("ok".into()),
+                    ),
+                };
+                let values = std::collections::HashMap::from([("target".into(), value)]);
+                let inputs =
+                    ResourceAttributeInputs::from_resolved(resource, &values, judged.report())
+                        .unwrap();
+                let classified = inputs.classify(
+                    &crate::resource::knowledge::KnowledgeContext::validation(),
+                    |_, _| {},
+                );
+                assert!(match projection {
+                    Projection::Pending => matches!(
+                        classified["target"],
+                        crate::resource::knowledge::Classification::Pending(_)
+                    ),
+                    Projection::Failed => matches!(
+                        classified["target"],
+                        crate::resource::knowledge::Classification::Failed(_)
+                    ),
+                    Projection::Scalar => matches!(
+                        classified["target"],
+                        crate::resource::knowledge::Classification::Known(_)
+                    ),
+                });
+                let bindings = crate::binding_index::BindingIndex::from_parsed(
+                    judged.file(),
+                    &schemas,
+                    &catalog,
+                );
+                let mut run: crate::validation::ConversionValidation =
+                    crate::validation::ConversionValidation::new(judged.report());
+                crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+                    let findings = run.admit_resource(
+                        crate::validation::admission::attributes::ResourceAdmissionRequest {
+                            resource,
+                            parsed: judged.file(),
+                            schema: resource.schema(&schemas).unwrap(),
+                            attributes: &classified,
+                            quoted: resource.quoted_string_attrs(),
+                            inputs: &inputs,
+                            bindings: &bindings,
+                            session,
+                            schemas: &schemas,
+                        },
+                    );
+                    assert_eq!(
+                        findings.errors().count(),
+                        usize::from(!matches!(projection, Projection::Pending)),
+                        "{projection:?}: {findings:?}"
+                    );
+                    assert_eq!(findings.symbolic_errors().count(), 0, "{findings:?}");
+                });
+                let presented = run.complete().into_presented();
+                let conversions = conversion_errors(&presented);
+                assert_eq!(
+                    conversions.len(),
+                    usize::from(matches!(projection, Projection::Pending)),
+                    "map={map}, union={union}, {projection:?}: {presented}"
+                );
+                if let Some(conversion) = conversions.first() {
+                    assert_eq!(conversion.kind(), ConversionErrorKind::ScalarKind);
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -839,15 +1051,12 @@ fn conversion_one_authored_alias_use_cannot_cover_another_use_without_evidence()
             usize::from(second == "converted"),
             "{source}\n{conversions}"
         );
-        assert!(conversion_errors(&conversions).is_empty(), "{conversions}");
-        for finding in conversions.iter() {
-            assert!(
-                matches!(finding,
-                crate::validation::PresentedFinding::Ordinary(crate::validation::OrdinaryFinding::Resource(error))
-                    if error.admission_incomplete().is_some()),
-                "{finding}"
-            );
-        }
+        assert_eq!(
+            conversion_errors(&conversions).len(),
+            usize::from(second == "converted"),
+            "{conversions}"
+        );
+        assert!(!conversions.to_string().contains("bug in carina"));
     }
 }
 
@@ -855,8 +1064,8 @@ fn conversion_one_authored_alias_use_cannot_cover_another_use_without_evidence()
 mod review_round2_tests;
 
 #[test]
-fn round3_completion_without_an_admission_pass_is_an_internal_error() {
-    use crate::validation::{ConversionValidation, PresentedFinding};
+fn round5_unentered_syntax_does_not_require_a_conversion_verdict() {
+    use crate::validation::ConversionValidation;
     let catalog = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let parsed = crate::parser::parse_file(
         "let converted = 'ok' as mock.Name\nmock.Sink { target = converted }",
@@ -867,17 +1076,7 @@ fn round3_completion_without_an_admission_pass_is_an_internal_error() {
     let report = ConversionValidation::<std::convert::Infallible>::new(parsed.expression_report())
         .complete()
         .into_presented();
-    assert_eq!(report.len(), 1, "{report:?}");
-    assert!(
-        matches!(report.iter().next(), Some(PresentedFinding::Ordinary(_))),
-        "{report:?}"
-    );
-    assert!(
-        report
-            .to_string()
-            .contains("admission pass did not complete"),
-        "{report:?}"
-    );
+    assert!(report.is_empty(), "{report:?}");
     let plain = crate::parser::parse_file(
         "let ordinary = 'ok'",
         Path::new("not_admitted.crn"),
@@ -893,7 +1092,7 @@ fn round3_completion_without_an_admission_pass_is_an_internal_error() {
 }
 
 #[test]
-fn round3_partial_admission_driver_cannot_mint_completion() {
+fn round5_partial_driver_retains_only_the_judged_slot_verdict() {
     for operand in ["'ok'", "42"] {
         let catalog = super::tests::catalog();
         let schemas = schema();
@@ -923,18 +1122,20 @@ fn round3_partial_admission_driver_cannot_mint_completion() {
             // Drop before exhaustion, even though this fixture has one resource.
         });
         let presented = run.complete().into_presented();
-        assert!(conversion_errors(&presented).is_empty(), "{presented:?}");
+        assert_eq!(
+            conversion_errors(&presented).len(),
+            usize::from(operand == "42"),
+            "{presented:?}"
+        );
         assert!(
-            presented
-                .to_string()
-                .contains("admission pass did not complete"),
+            !presented.to_string().contains("bug in carina"),
             "{presented:?}"
         );
     }
 }
 
 #[test]
-fn round3_admitting_another_document_cannot_complete_a_scope() {
+fn round5_an_unentered_document_has_no_sink_findings() {
     let catalog = super::tests::catalog();
     let schemas = schema();
     let parsed = crate::parser::parse_file(
@@ -968,10 +1169,5 @@ fn round3_admitting_another_document_cannot_complete_a_scope() {
     });
     let presented = run.complete().into_presented();
     assert!(conversion_errors(&presented).is_empty(), "{presented:?}");
-    assert!(
-        presented
-            .to_string()
-            .contains("admission pass did not complete"),
-        "{presented:?}"
-    );
+    assert!(presented.is_empty(), "{presented:?}");
 }

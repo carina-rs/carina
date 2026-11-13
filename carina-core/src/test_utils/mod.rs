@@ -36,11 +36,11 @@ pub fn admit_resource_attribute_report<
         .cloned()
         .collect();
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-        crate::validation::admission::attributes::admit_validation_attributes::<
+        crate::validation::admission::attributes::admit_value_only_attributes::<
             crate::validation::admission::kind::ResourceAttribute,
             P,
             B,
-        >(schema, &id, attributes, &quoted, None, session, None, None)
+        >(schema, &id, attributes, &quoted, session)
     })
 }
 
@@ -437,4 +437,26 @@ pub fn resolved_provider_configs(
 ) -> crate::parser::ResolvedProviderConfigs {
     crate::parser::ResolvedProviderConfigs::from_test_configs(configs.to_vec())
         .expect("execution fixture provider configs must be known")
+}
+
+/// An actual conversion-free Judge result for programmatic admission fixtures.
+pub fn no_conversion_proof() -> crate::parser::retained::NoConversion {
+    static PROOF: std::sync::OnceLock<crate::parser::retained::NoConversion> =
+        std::sync::OnceLock::new();
+    *PROOF.get_or_init(|| {
+        let catalog = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed =
+            crate::parser::parse_file("let proof = 0", std::path::Path::new("proof.crn"), &catalog)
+                .expect("plain proof fixture");
+        let schemas = crate::schema::SchemaRegistry::new();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        configuration
+            .judged()
+            .report()
+            .binding(&crate::resource::RelativeBindingName::new("proof"))
+            .expect("proof judgement")
+            .no_conversion()
+            .expect("no conversion")
+    })
 }

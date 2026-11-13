@@ -452,16 +452,21 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
         proof: crate::resource::knowledge::Classification<'a, P, B>,
         bindings: Option<&'a BindingIndex<'a, B>>,
         provider: &'a dyn ProviderTypeCheckContext,
+        no_conversion: crate::parser::retained::NoConversion,
     ) -> (Self, AdmissionContext<'a, P, B>) {
-        let phase = crate::parser::retained::ProjectedPhase::classified(&proof);
-        Self::validation_projected(proof, bindings, provider, phase)
+        Self::validation_projected(
+            proof,
+            bindings,
+            provider,
+            crate::parser::retained::ValidationProjection::checked(no_conversion),
+        )
     }
 
     fn validation_projected<'a>(
         proof: crate::resource::knowledge::Classification<'a, P, B>,
         bindings: Option<&'a BindingIndex<'a, B>>,
         provider: &'a dyn ProviderTypeCheckContext,
-        phase: crate::parser::retained::ProjectedPhase,
+        phase: crate::parser::retained::ValidationProjection,
     ) -> (Self, AdmissionContext<'a, P, B>) {
         let value = crate::resource::knowledge::ClassifiedRef::from(&proof)
             .diagnostic_value()
@@ -471,7 +476,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
             AdmissionProof::Validation(proof),
             bindings,
             provider,
-            crate::parser::retained::AuthoredCursor::projected(phase),
+            crate::parser::retained::AuthoredCursor::validation_projected(phase),
         )
     }
 

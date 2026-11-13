@@ -15,8 +15,8 @@ fn validate(directory: &std::path::Path) -> serde_json::Value {
     .json
 }
 fn conversion_count(json: &serde_json::Value) -> usize {
-    json.get("errors")
-        .and_then(serde_json::Value::as_array)
+    json["errors"]
+        .as_array()
         .into_iter()
         .flatten()
         .filter(|error| {
@@ -28,552 +28,328 @@ fn conversion_count(json: &serde_json::Value) -> usize {
 }
 fn internal(text: &str) -> bool {
     text.contains("bug in carina")
-        || text.contains("conversion admission did not complete")
+        || text.contains("admission did not complete")
         || text.contains("internal_invariant")
 }
 
 #[test]
-fn round4_generated_totality_validate_and_lsp() {
-    let twin_directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("target/conversion-totality-no-as");
-    let emitted = emit_twins(&twin_directory);
-    eprintln!("no-as twins ({emitted}): {}", twin_directory.display());
-    let mut cells = 0;
-    let mut failures = Vec::new();
-    for position in POSITIONS {
-        for liveness in LIVENESS {
-            for quality in QUALITIES {
-                // Read-only is an entry kind, not a mode a validating/LSP run can select.
-                if matches!(liveness, Liveness::ReadOnly) {
-                    continue;
-                }
-                if let Some(reason) = resource_cell_exclusion(position, liveness) {
-                    eprintln!(
-                        "excluded validate/LSP {position:?}/{liveness:?}/{quality:?}: {reason}"
-                    );
-                    continue;
-                }
-                let directory = tempfile::tempdir().unwrap();
-                let generated = fixture(position, liveness, quality, true);
-                generated.write(directory.path());
-                let expected = usize::from(
-                    matches!(quality, Quality::Invalid) && liveness.has_live_destination(),
-                );
-                let key = format!(
-                    "{}/{}/{}",
-                    position.label(),
-                    liveness.label(),
-                    quality.label()
-                );
-                let cli = validate(directory.path());
-                if matches!(quality, Quality::Valid)
-                    && !matches!(
-                        liveness,
-                        Liveness::DestinationUnknown | Liveness::OrdinaryStopped
-                    )
-                    && cli["status"] != "ok"
-                {
-                    failures.push(format!("validate valid fixture {key}: {cli}"));
-                }
-                if conversion_count(&cli) != expected || internal(&cli.to_string()) {
-                    failures.push(format!("validate {key}: expected {expected}; {cli}"));
-                }
-                cells += 1;
-
-                let loaded = loaded_provider_snapshot_from_factories(
-                    Arc::new(factories()),
-                    SchemaRegistry::new(),
-                    carina_core::EnvironmentSnapshot::empty(),
-                );
-                let engine = carina_lsp::diagnostics::DiagnosticEngine::new(
-                    Arc::new(loaded),
-                    vec!["mock".into()],
-                );
-                let mut conversion_diagnostics = Vec::new();
-                let mut internal_diagnostics = Vec::new();
-                for (file, source) in &generated.files {
-                    let path = directory.path().join(file);
-                    let document = carina_lsp::document::Document::new_with_path(
-                        source.clone(),
-                        path.clone(),
-                        Arc::new(carina_core::parser::ProviderContext::new(
-                            carina_core::EnvironmentSnapshot::empty(),
-                        )),
-                    );
-                    for diagnostic in engine.analyze(&document, Some(&path)) {
-                        if let Some(tower_lsp::lsp_types::NumberOrString::String(code)) =
-                            &diagnostic.code
-                        {
-                            // Opening a module's file alone gives it its own directory
-                            // scope. Only live-instance cells ask that standalone scope
-                            // to display the module-owned rejection; an unopened inactive
-                            // template belongs to the importing root's resolver scope.
-                            let owns_scope = !file.starts_with("child/")
-                                || matches!(liveness, Liveness::ModuleInstance);
-                            if code.starts_with("conversion_") && owns_scope {
-                                conversion_diagnostics.push(diagnostic.clone());
-                            }
-                        }
-                        if internal(&diagnostic.message) {
-                            internal_diagnostics.push((file.clone(), diagnostic));
-                        }
-                    }
-                }
-                if conversion_diagnostics.len() != expected || !internal_diagnostics.is_empty() {
-                    failures.push(format!("lsp {key}: expected {expected}; conversion={conversion_diagnostics:?}; internal={internal_diagnostics:?}; CLI={cli}"));
-                }
-                if matches!(quality, Quality::Valid) {
-                    fixture(position, liveness, quality, false).write(directory.path());
-                    let twin = validate(directory.path());
-                    if cli != twin {
-                        failures.push(format!("no-as JSON twin {key}: as={cli}; twin={twin}"));
-                    }
-                }
-                cells += 1;
+fn round5_generated_p1_covers_every_grammar_context() {
+    use std::collections::BTreeSet;
+    let grammar = include_str!("../../carina-core/src/parser/carina.pest");
+    let rules: BTreeSet<_> = grammar
+        .lines()
+        .filter_map(|line| {
+            if line.starts_with(char::is_whitespace) || line.starts_with("//") {
+                return None;
             }
-        }
-    }
-    eprintln!(
-        "totality cells: {cells}; excluded: 44 validate/LSP read-only cells (read-only is a different entry kind)"
+            let (name, _) = line.split_once('=')?;
+            let name = name.trim();
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                .then_some(name)
+        })
+        .collect();
+    let classified: BTreeSet<_> = CONTEXTS
+        .iter()
+        .flat_map(|context| context.rules.iter().copied())
+        .chain(NON_CONTEXT_RULES.iter().map(|(rule, _)| *rule))
+        .collect();
+    assert_eq!(
+        rules, classified,
+        "new grammar rules require an explicit expression-role classification"
     );
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-    assert_eq!(cells, (11 * 12 - 1) * 2 * 2);
-}
-
-async fn production_mock_matrix(position: Position) {
-    let runtime = carina_cli::test_support::TestCommandRuntime::new();
+    assert!(
+        NON_CONTEXT_RULES
+            .iter()
+            .all(|(_, reason)| !reason.is_empty())
+    );
+    let catalog =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let schemas = SchemaRegistry::new();
     let mut cells = 0;
     let mut excluded = 0;
-    let mut accepted_live_plans = 0;
-    let mut accepted_live_applies = 0;
     let mut failures = Vec::new();
-    for liveness in LIVENESS {
-        for quality in QUALITIES {
-            let generated = match apply_fixture(position, liveness, quality, true) {
+    for context in CONTEXTS {
+        for evaluation in EVALUATIONS {
+            let fixture = match context.fixture(evaluation, true) {
                 Ok(fixture) => fixture,
                 Err(reason) => {
-                    eprintln!(
-                        "excluded apply {}/{}/{}: {reason}",
-                        position.label(),
-                        liveness.label(),
-                        quality.label()
-                    );
+                    eprintln!("excluded P1 {}/{evaluation:?}: {reason}", context.label);
                     excluded += 1;
                     continue;
                 }
             };
-            let directory = tempfile::tempdir().unwrap();
-            generated.write(directory.path());
-            let key = format!(
-                "{}/{}/{}",
-                position.label(),
-                liveness.label(),
-                quality.label()
-            );
-            eprintln!("production apply cell: {key}");
-            carina_cli::commands::init::run_init(
-                &runtime,
-                directory.path(),
-                false,
-                false,
-                false,
-                false,
-            )
-            .await
-            .unwrap();
-            let expected =
-                usize::from(matches!(quality, Quality::Invalid) && liveness.has_live_destination());
-            let live_valid = matches!(quality, Quality::Valid) && liveness.has_live_destination();
-            let plan = if live_valid {
-                carina_cli::test_support::run_plan_with_factories(
-                    &runtime,
-                    directory.path(),
-                    carina_cli::wiring::LoadedProviderFactory::for_test(factories()),
-                )
-                .await
-            } else {
-                Ok(false)
+            cells += 1;
+            let source = &fixture.files["main.crn"];
+            let parsed = match carina_core::parser::parse_file(
+                source,
+                std::path::Path::new("p1.crn"),
+                &catalog,
+            ) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    if let Some(reason) = context.parser_rejection(evaluation) {
+                        let mut ordinary = &error;
+                        loop {
+                            if let carina_core::parser::ParseError::Located { error, .. } = ordinary
+                            {
+                                ordinary = error;
+                                continue;
+                            }
+                            if let Some(element) = ordinary.element_diagnostic() {
+                                ordinary = element.detail();
+                                continue;
+                            }
+                            break;
+                        }
+                        assert!(
+                            matches!(
+                                ordinary,
+                                carina_core::parser::ParseError::InvalidExpression { .. }
+                                    | carina_core::parser::ParseError::InvalidAuthoredExpression { .. }
+                            ),
+                            "{error:?}"
+                        );
+                        eprintln!(
+                            "ordinary parse rejection {}/{evaluation:?}: {reason}; {error}",
+                            context.label
+                        );
+                    } else {
+                        failures.push(format!(
+                            "{}/{evaluation:?} did not reach Judge: {error}; {source}",
+                            context.label
+                        ));
+                    }
+                    continue;
+                }
             };
-            let plan_text = plan
-                .as_ref()
-                .err()
-                .map(ToString::to_string)
-                .unwrap_or_default();
-            let apply = carina_cli::commands::apply::run_apply_with_factories_for_test(
-                &runtime,
-                directory.path(),
-                carina_cli::wiring::LoadedProviderFactory::for_test(factories()),
-            )
-            .await;
-            let text = apply
-                .as_ref()
-                .err()
-                .map(ToString::to_string)
-                .unwrap_or_default();
-            let count = text.matches("conversion operand").count()
-                + text.matches("checked conversion failed").count();
-            if count != expected || internal(&text) || internal(&plan_text) {
+            let configuration =
+                carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            let report =
+                carina_core::validation::ConversionValidation::<std::convert::Infallible>::new(
+                    configuration.judged().report(),
+                )
+                .complete()
+                .into_presented();
+            let conversions = report
+                .iter()
+                .filter_map(|finding| match finding {
+                    carina_core::validation::PresentedFinding::Conversion(error) => Some(error),
+                    carina_core::validation::PresentedFinding::Ordinary(_) => None,
+                })
+                .collect::<Vec<_>>();
+            let expected = match context.placement {
+                Placement::Transport => 0,
+                Placement::Computed | Placement::Boundary => 1,
+            };
+            let message_matches = conversions.iter().all(|finding| match context.placement {
+                Placement::Transport => false,
+                Placement::Boundary => finding
+                    .message()
+                    .ends_with("not supported at this position yet"),
+                Placement::Computed => {
+                    finding
+                        .message()
+                        .ends_with("not supported at this position")
+                        || matches!(context.label, "secret" | "nested-convert")
+                }
+            });
+            if conversions.len() != expected || !message_matches || internal(&report.to_string()) {
                 failures.push(format!(
-                    "production apply {key}: expected {expected}; plan={plan_text}; apply={text}"
+                    "{}/{evaluation:?}: expected {expected}; {report:?}; {source}",
+                    context.label
                 ));
             }
-            if matches!(quality, Quality::Valid) && liveness.has_live_destination() {
-                accepted_live_plans += usize::from(plan.is_ok());
-                accepted_live_applies += usize::from(apply.is_ok());
-                if plan.is_err() || apply.is_err() {
-                    failures.push(format!("accepted live conversion must plan and apply {key}: plan={plan_text}; apply={text}"));
-                }
-            }
-            cells += 1;
         }
     }
     eprintln!(
-        "production apply cells: {cells}; excluded: {excluded}; accepted live plans/applies: {accepted_live_plans}/{accepted_live_applies}"
+        "P1 grammar rules: {}; contexts: {}; cells: {cells}; excluded: {excluded}",
+        rules.len(),
+        CONTEXTS.len()
     );
-    assert_eq!(cells + excluded, 13 * 2);
-    let supported = match position {
-        Position::Root
-        | Position::Parens
-        | Position::ListItem
-        | Position::MapValue
-        | Position::StructField
-        | Position::IfBranch
-        | Position::Coalesce
-        | Position::Alias
-        | Position::Union
-        | Position::Secret => true,
-        Position::DataSource => false,
-    };
-    assert_eq!(cells, if supported { 24 } else { 0 });
-    assert_eq!(accepted_live_plans, if supported { 2 } else { 0 });
-    assert_eq!(accepted_live_applies, if supported { 2 } else { 0 });
+    assert_eq!(cells + excluded, CONTEXTS.len() * EVALUATIONS.len());
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-macro_rules! apply_rows {
-    ($($name:ident: $position:ident),+ $(,)?) => { $(
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn $name() { production_mock_matrix(Position::$position).await; }
-    )+ };
-}
-apply_rows! {
-    round4_generated_apply_root: Root, round4_generated_apply_parens: Parens,
-    round4_generated_apply_list_item: ListItem, round4_generated_apply_map_value: MapValue,
-    round4_generated_apply_struct_field: StructField, round4_generated_apply_if_branch: IfBranch,
-    round4_generated_apply_coalesce: Coalesce, round4_generated_apply_alias: Alias,
-    round4_generated_apply_union: Union, round4_generated_apply_secret: Secret,
-    round4_generated_apply_data_source: DataSource,
-}
-
-#[tokio::test]
-async fn round4_generated_totality_plan() {
-    let runtime = carina_cli::test_support::TestCommandRuntime::new();
-    let mut cells = 0;
-    let mut failures = Vec::new();
-    for position in POSITIONS {
-        for liveness in LIVENESS {
-            for quality in QUALITIES {
-                if matches!(liveness, Liveness::ReadOnly) {
-                    continue;
-                }
-                if let Some(reason) = resource_cell_exclusion(position, liveness) {
-                    eprintln!("excluded plan {position:?}/{liveness:?}/{quality:?}: {reason}");
-                    continue;
-                }
-                let directory = tempfile::tempdir().unwrap();
-                fixture(position, liveness, quality, true).write(directory.path());
-                let result = carina_cli::test_support::run_plan_with_factories(
-                    &runtime,
-                    directory.path(),
-                    carina_cli::wiring::LoadedProviderFactory::for_test(factories()),
-                )
-                .await;
-                let text = match result {
-                    Ok(_) => String::new(),
-                    Err(error) => error.to_string(),
-                };
-                let count = text.matches("conversion operand").count()
-                    + text.matches("checked conversion failed").count();
-                let expected = usize::from(
-                    matches!(quality, Quality::Invalid) && liveness.has_live_destination(),
-                );
-                if count != expected || internal(&text) {
-                    failures.push(format!(
-                        "plan {}/{}/{}: expected {expected}; {text}",
-                        position.label(),
-                        liveness.label(),
-                        quality.label()
-                    ));
-                }
-                cells += 1;
-            }
-        }
-    }
-    eprintln!("plan totality cells: {cells}; excluded: 22 read-only cells (different entry)");
-    assert_eq!(cells, (11 * 12 - 1) * 2);
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
-
-fn command(directory: &std::path::Path, args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_carina"))
-        .current_dir(directory)
-        .env("NO_COLOR", "1")
-        .env_remove("CLICOLOR_FORCE")
-        .args(args)
-        .output()
+#[test]
+fn round5_generated_transport_roles_validate_and_lsp() {
+    let roles = include_str!("../../carina-core/src/parser/retained/conversion/flow.rs")
+        .split_once("pub(crate) enum TransportRole {")
         .unwrap()
-}
-fn output(output: &std::process::Output) -> String {
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-}
-
-#[tokio::test]
-async fn round4_generated_totality_destroy_and_state_are_read_only() {
-    let runtime = carina_cli::test_support::TestCommandRuntime::new();
-    let mut cells = 0;
-    let mut failures = Vec::new();
-    for position in POSITIONS {
-        for liveness in LIVENESS {
-            for quality in QUALITIES {
-                if let Some(reason) = resource_cell_exclusion(position, liveness) {
-                    eprintln!(
-                        "excluded destroy/state {position:?}/{liveness:?}/{quality:?}: {reason}"
-                    );
-                    continue;
-                }
-                let directory = tempfile::tempdir().unwrap();
-                fixture(position, liveness, quality, false).write(directory.path());
-                carina_cli::commands::init::run_init(
-                    &runtime,
-                    directory.path(),
-                    false,
-                    false,
-                    false,
-                    false,
-                )
-                .await
-                .unwrap();
-                for arguments in [
-                    vec!["destroy", "--auto-approve", "."],
-                    vec!["state", "refresh", "."],
-                ] {
-                    let mut outcomes = Vec::new();
-                    for converted in [false, true] {
-                        fixture(position, liveness, quality, converted).write(directory.path());
-                        let result = command(directory.path(), &arguments);
-                        let text = output(&result);
-                        if internal(&text)
-                            || text.contains("conversion operand")
-                            || text.contains("checked conversion failed")
-                            || text.contains("conversion is not supported")
-                        {
-                            failures.push(format!(
-                                "{arguments:?} {}/{}/{}: {text}",
-                                position.label(),
-                                liveness.label(),
-                                quality.label()
-                            ));
-                        }
-                        outcomes.push((result.status.code(), text));
-                    }
-                    if matches!(quality, Quality::Valid) && outcomes[0] != outcomes[1] {
-                        failures.push(format!(
-                            "read-only twin mismatch {arguments:?} {}/{}/{}: {outcomes:?}",
-                            position.label(),
-                            liveness.label(),
-                            quality.label()
-                        ));
-                    }
-                    cells += 1;
-                }
-            }
-        }
-    }
-    eprintln!("destroy/state totality cells: {cells}");
-    assert_eq!(cells, (11 * 13 - 1) * 2 * 2);
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
-
-#[tokio::test]
-async fn round4_generated_boundary_totality_is_independent_of_activation() {
-    let runtime = carina_cli::test_support::TestCommandRuntime::new();
-    let mut cells = 0;
-    let mut excluded = 0;
-    let mut failures = Vec::new();
-    for boundary in BOUNDARIES {
-        for liveness in LIVENESS {
-            for quality in QUALITIES {
-                let generated = match boundary_fixture(boundary, liveness, quality, true) {
-                    Ok(fixture) => fixture,
-                    Err(reason) => {
-                        eprintln!(
-                            "excluded boundary {}/{}/{}: {reason}",
-                            boundary.label(),
-                            liveness.label(),
-                            quality.label()
-                        );
-                        excluded += 6;
-                        continue;
-                    }
-                };
-                let directory = tempfile::tempdir().unwrap();
-                fixture(Position::Root, Liveness::Live, Quality::Valid, false)
-                    .write(directory.path());
-                carina_cli::commands::init::run_init(
-                    &runtime,
-                    directory.path(),
-                    false,
-                    false,
-                    false,
-                    false,
-                )
-                .await
-                .unwrap();
-                generated.write(directory.path());
-                let key = format!(
-                    "{}/{}/{}",
-                    boundary.label(),
-                    liveness.label(),
-                    quality.label()
-                );
-                if matches!(liveness, Liveness::ReadOnly) {
-                    excluded += 3;
-                } else {
-                    let json = validate(directory.path());
-                    if conversion_count(&json) != 1
-                        || internal(&json.to_string())
-                        || !json
-                            .to_string()
-                            .contains("conversion is not supported at this position yet")
-                    {
-                        failures.push(format!("boundary validate {key}: {json}"));
-                    }
-                    cells += 1;
-                    let result = carina_cli::test_support::run_plan_with_factories(
-                        &runtime,
-                        directory.path(),
-                        carina_cli::wiring::LoadedProviderFactory::for_test(factories()),
-                    )
-                    .await;
-                    let text = match result {
-                        Ok(_) => String::new(),
-                        Err(error) => error.to_string(),
-                    };
-                    if text
-                        .matches("conversion is not supported at this position yet")
-                        .count()
-                        != 1
-                        || internal(&text)
-                    {
-                        failures.push(format!("boundary plan {key}: {text}"));
-                    }
-                    cells += 1;
-                    let loaded = loaded_provider_snapshot_from_factories(
-                        Arc::new(factories()),
-                        SchemaRegistry::new(),
-                        carina_core::EnvironmentSnapshot::empty(),
-                    );
-                    let engine = carina_lsp::diagnostics::DiagnosticEngine::new(
-                        Arc::new(loaded),
-                        vec!["mock".into()],
-                    );
-                    let mut count = 0;
-                    for (file, source) in &generated.files {
-                        let path = directory.path().join(file);
-                        let document = carina_lsp::document::Document::new_with_path(
-                            source.clone(),
-                            path.clone(),
-                            Arc::new(carina_core::parser::ProviderContext::new(
-                                carina_core::EnvironmentSnapshot::empty(),
-                            )),
-                        );
-                        for diagnostic in engine.analyze(&document, Some(&path)) {
-                            count += usize::from(
-                                diagnostic
-                                    .message
-                                    .contains("conversion is not supported at this position yet"),
-                            );
-                            if internal(&diagnostic.message) {
-                                failures.push(format!("boundary lsp {key}: {diagnostic:?}"));
-                            }
-                        }
-                    }
-                    if count != 1 {
-                        failures.push(format!(
-                            "boundary lsp {key}: expected one placeholder, got {count}"
-                        ));
-                    }
-                    cells += 1;
-                }
-                for arguments in [
-                    vec!["destroy", "--auto-approve", "."],
-                    vec!["state", "refresh", "."],
-                ] {
-                    let result = command(directory.path(), &arguments);
-                    let text = output(&result);
-                    if text
-                        .matches("conversion is not supported at this position yet")
-                        .count()
-                        != 1
-                        || internal(&text)
-                    {
-                        failures.push(format!("boundary {arguments:?} {key}: {text}"));
-                    }
-                    cells += 1;
-                }
-                if matches!(liveness, Liveness::ReadOnly) {
-                    excluded += 1;
-                } else {
-                    let project = ResolvedPath::new(directory.path()).unwrap();
-                    let context = carina_core::parser::ProviderContext::new(
-                        carina_core::EnvironmentSnapshot::empty(),
-                    );
-                    let result = carina_cli::commands::apply::run_apply(
-                        &runtime,
-                        &project,
-                        directory.path(),
-                        true,
-                        false,
-                        std::num::NonZeroUsize::new(2).unwrap(),
-                        false,
-                        &context,
-                        carina_core::shutdown::ShutdownToken::running(),
-                    )
-                    .await;
-                    let text = result
-                        .err()
-                        .map(|error| error.to_string())
-                        .unwrap_or_default();
-                    if text
-                        .matches("conversion is not supported at this position yet")
-                        .count()
-                        != 1
-                        || internal(&text)
-                    {
-                        failures.push(format!("boundary apply {key}: {text}"));
-                    }
-                    cells += 1;
-                }
-            }
-        }
-    }
-    eprintln!(
-        "boundary totality cells: {cells}; excluded {excluded} (of {})",
-        10 * 13 * 2 * 6
-    );
-    assert_eq!(cells + excluded, 10 * 13 * 2 * 6);
+        .1
+        .split_once('}')
+        .unwrap()
+        .0
+        .lines()
+        .filter_map(|line| line.trim().strip_suffix(','))
+        .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
-        cells, 544,
-        "read-only scopes cannot be validate, plan, apply or LSP runs"
+        roles,
+        TRANSPORT_EXAMPLES
+            .iter()
+            .map(|(role, position)| {
+                assert!(
+                    POSITIONS
+                        .iter()
+                        .any(|case| case.label() == position.label())
+                );
+                *role
+            })
+            .collect(),
+        "every transport role needs a matrix fixture"
     );
-    assert_eq!(excluded, 1016);
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    let twins = std::path::Path::new("/Volumes/CargoTargets/issue4260-b1-logs/round5-no-as-twins");
+    let count = emit_twins(twins);
+    eprintln!("no-as twins ({count}): {}", twins.display());
+    let mut cells = 0;
+    for position in POSITIONS {
+        for known in [true, false] {
+            for invalid in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let generated = fixture(position, known, invalid, true);
+                generated.write(directory.path());
+                let cli = validate(directory.path());
+                let expected = usize::from(known && invalid);
+                assert_eq!(
+                    conversion_count(&cli),
+                    expected,
+                    "{position:?}/{known}/{invalid}: {cli}"
+                );
+                assert!(!internal(&cli.to_string()), "{cli}");
+                if known && !invalid {
+                    assert_eq!(cli["status"], "ok", "{cli}");
+                }
+                let diagnostics = lsp_findings(&generated, directory.path());
+                let conversions = diagnostics.iter().filter(|finding| matches!(&finding.code, Some(tower_lsp::lsp_types::NumberOrString::String(code)) if code.starts_with("conversion_"))).count();
+                assert_eq!(
+                    conversions, expected,
+                    "{position:?}/{known}/{invalid}: {diagnostics:?}"
+                );
+                assert!(
+                    diagnostics
+                        .iter()
+                        .all(|finding| !internal(&finding.message)),
+                    "{diagnostics:?}"
+                );
+                if !known {
+                    fixture(position, known, invalid, false).write(directory.path());
+                    let twin = validate(directory.path());
+                    let ordinary = |json: &serde_json::Value| {
+                        json["errors"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|error| (error["message"].clone(), error["code"].clone()))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(
+                        ordinary(&cli),
+                        ordinary(&twin),
+                        "schema-None retains main's ordinary finding"
+                    );
+                    assert!(
+                        diagnostics.iter().any(|finding| finding.severity
+                            == Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING)),
+                        "{diagnostics:?}"
+                    );
+                }
+                cells += 2;
+            }
+        }
+    }
+    assert_eq!(cells, POSITIONS.len() * 2 * 2 * 2);
+}
+
+#[tokio::test]
+async fn round5_accepted_conversion_uses_production_plan_and_apply() {
+    let runtime = carina_cli::test_support::TestCommandRuntime::new();
+    for position in POSITIONS {
+        if matches!(position, Position::DataSource) {
+            eprintln!(
+                "excluded apply data-source: native fixture has no Query read implementation"
+            );
+            continue;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        fixture(position, true, false, true).write(directory.path());
+        carina_cli::commands::init::run_init(
+            &runtime,
+            directory.path(),
+            false,
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        carina_cli::test_support::run_plan_with_factories(
+            &runtime,
+            directory.path(),
+            carina_cli::wiring::LoadedProviderFactory::for_test(factories()),
+        )
+        .await
+        .unwrap();
+        carina_cli::commands::apply::run_apply_with_factories_for_test(
+            &runtime,
+            directory.path(),
+            carina_cli::wiring::LoadedProviderFactory::for_test(factories()),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn round5_read_only_runs_judge_placement_without_slot_admission() {
+    let runtime = carina_cli::test_support::TestCommandRuntime::new();
+    let directory = tempfile::tempdir().unwrap();
+    fixture(Position::Root, true, false, false).write(directory.path());
+    carina_cli::commands::init::run_init(&runtime, directory.path(), false, false, false, false)
+        .await
+        .unwrap();
+    for args in [
+        ["destroy", "--auto-approve", "."],
+        ["state", "refresh", "."],
+    ] {
+        let mut twins = Vec::new();
+        for converted in [false, true] {
+            fixture(Position::Root, true, false, converted).write(directory.path());
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_carina"))
+                .current_dir(directory.path())
+                .env("NO_COLOR", "1")
+                .env_remove("CLICOLOR_FORCE")
+                .args(args)
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!internal(&text), "{text}");
+            twins.push((output.status.code(), text));
+        }
+        assert_eq!(twins[0], twins[1], "{args:?}");
+        let bad = Fixture::source("mock.Sink { attr = upper('ok' as mock.Name) }\n".into());
+        bad.write(directory.path());
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_carina"))
+            .current_dir(directory.path())
+            .env("NO_COLOR", "1")
+            .args(args)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            text.matches("conversion is not supported at this position")
+                .count(),
+            1,
+            "{args:?}: {text}"
+        );
+    }
 }
 
 fn lsp_findings(
@@ -609,7 +385,7 @@ fn merge_require_keeps_an_unrelated_conversion_inventory_owner() {
     let directory = tempfile::tempdir().unwrap();
     let mut outputs = Vec::new();
     for converted in [true, false] {
-        let mut generated = fixture(Position::Root, Liveness::Live, Quality::Valid, converted);
+        let mut generated = fixture(Position::Root, true, false, converted);
         let source = generated.files.get_mut("main.crn").unwrap();
         *source = source.replace("let sink = ", "");
         source.push_str("require 2 == 2, 'root guard'\n");
@@ -627,7 +403,7 @@ fn merge_require_keeps_an_unrelated_conversion_inventory_owner() {
 }
 
 fn require_validation_fixture(module: bool, condition: &str, resource: &str) -> Fixture {
-    let mut generated = fixture(Position::Root, Liveness::Live, Quality::Valid, false);
+    let mut generated = fixture(Position::Root, true, false, false);
     let requirement = format!("require {condition}, 'require merge guard'\n");
     if module {
         generated.files.insert(

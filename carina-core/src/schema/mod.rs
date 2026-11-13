@@ -16615,8 +16615,7 @@ impl PatternResourceSchema<Compiled> {
                 report.attributes.insert(name.clone(), findings);
             } else if mode == ValueEntryValidation::FullInput {
                 if let Some(admit) = admission.unknown {
-                    let findings = admit(name, value);
-                    report.attributes.insert(name.clone(), findings);
+                    report.attributes.insert(name.clone(), admit(name, value));
                 }
                 let id_attribute = format!("{name}_id");
                 let suggestion = if known.contains(&id_attribute.as_str()) {

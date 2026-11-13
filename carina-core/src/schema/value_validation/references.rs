@@ -179,7 +179,9 @@ fn protect_reference_error(error: TypeError) -> TypeError {
 // A thin policy reference fits in the function pointer's unused vtable word.
 // Ordinary callbacks and their transport retain main's layout and ownership.
 pub(super) enum OrdinaryCheck<'a, P: ValueKind, B: BindingAddress, C = crate::ConversionChannel> {
-    Direct(AssignmentCheck<'a, P, B, C>),
+    Direct(ProvenAssignmentCheck<'a, P, B, C>),
+    #[cfg(test)]
+    Observer(AssignmentCheck<'a, P, B, C>),
     References(&'a ReferencePolicy<'a, P, B, C>),
 }
 impl<P: ValueKind, B: BindingAddress, C> Copy for OrdinaryCheck<'_, P, B, C> {}
@@ -189,28 +191,52 @@ impl<P: ValueKind, B: BindingAddress, C> Clone for OrdinaryCheck<'_, P, B, C> {
     }
 }
 impl<'a, P: ValueKind, B: BindingAddress, C> OrdinaryCheck<'a, P, B, C> {
-    pub(super) fn callback(self) -> AssignmentCheck<'a, P, B, C> {
+    pub(super) fn call(
+        self,
+        attr: &CompiledAttributeType,
+        value: CheckValue<'_, P, B>,
+        path: &LeafPath,
+        cursor: AuthoredCursor<'_, B>,
+        proof: crate::parser::retained::NoConversion,
+    ) -> Result<AssignmentFindings<C>, TypeError> {
         match self {
-            Self::Direct(check) => check,
-            Self::References(policy) => policy.ordinary,
+            Self::Direct(check) => check(attr, value, path, cursor, proof),
+            #[cfg(test)]
+            Self::Observer(check) => check(attr, value, path, cursor),
+            Self::References(policy) => policy.ordinary.call(attr, value, path, cursor, proof),
         }
+    }
+}
+
+#[cfg(test)]
+impl<'a, P: ValueKind, B: BindingAddress, C, F> From<&'a F> for OrdinaryCheck<'a, P, B, C>
+where
+    F: Fn(
+        &CompiledAttributeType,
+        CheckValue<'_, P, B>,
+        &LeafPath,
+        AuthoredCursor<'_, B>,
+    ) -> Result<AssignmentFindings<C>, TypeError>,
+{
+    fn from(callback: &'a F) -> Self {
+        Self::Observer(callback)
     }
 }
 
 pub(super) struct ReferencePolicy<'a, P: ValueKind, B: BindingAddress, C = crate::ConversionChannel>
 {
-    ordinary: AssignmentCheck<'a, P, B, C>,
+    ordinary: OrdinaryCheck<'a, P, B, C>,
     schema_source: &'a dyn Fn(&B) -> bool,
     reference: ReferenceJudge<'a, B>,
     scopes: std::cell::RefCell<Vec<UseIdentity>>,
 }
 impl<'a, P: ValueKind, B: BindingAddress, C> ReferencePolicy<'a, P, B, C> {
     pub(super) fn new(
-        ordinary: AssignmentCheck<'a, P, B, C>,
+        ordinary: impl Into<OrdinaryCheck<'a, P, B, C>>,
         reference: ReferenceCheck<'a, B>,
     ) -> Self {
         Self {
-            ordinary,
+            ordinary: ordinary.into(),
             schema_source: reference.schema_source,
             reference: reference.check,
             scopes: Default::default(),

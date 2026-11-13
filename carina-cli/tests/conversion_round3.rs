@@ -72,7 +72,11 @@ fn round3_no_as_module_loop_plan_uses_the_resolver_root_and_identities() {
                 )
             })
             .publish(&mut Vec::new());
-        let mut graph = match result {
+        let mut graph = match result
+            .into_validation(&mut carina_core::validation::ConversionValidation::<
+                std::convert::Infallible,
+            >::default())
+        {
             module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => graph,
             module_resolver::ModuleResolutionDiagnosticResult::ConstraintFailed {
                 findings,

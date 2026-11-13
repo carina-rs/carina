@@ -254,103 +254,14 @@ impl ResourceValidationReport {
     }
 }
 
-/// Only core's admission drivers can mint completion evidence.
-///
-/// ```compile_fail,E0624
-/// use carina_core::validation::ConversionValidation;
-/// let mut run = ConversionValidation::<std::convert::Infallible>::default();
-/// run.admission_pass_complete(unreachable!());
-/// ```
-#[derive(Debug)]
-pub(crate) struct AdmissionComplete {
-    _private: (),
-}
-impl AdmissionComplete {
-    pub(crate) fn observed(&self) {}
-}
-/// A schema-None decision, owned by the admission driver for this run/use.
-#[derive(Debug)]
-pub(crate) struct DestinationUnknown {
-    _private: (),
-}
-impl DestinationUnknown {
-    pub(crate) fn observed(&self) {}
-}
-#[derive(Clone, Copy)]
-pub(crate) enum NotAdmitted {
-    Ordinary(OrdinaryFailure),
-    ReadOnly(ReadOnlyRun),
-}
-#[derive(Clone, Copy)]
-pub(crate) enum InventoryAdmission<'a> {
-    Admitted(&'a AdmissionComplete),
-    Stopped(NotAdmitted),
-    ReadOnly(NotAdmitted),
-    Required,
-}
-#[derive(Debug, Default)]
-pub(crate) struct AdmittedConversions {
-    findings: crate::ConversionChannel,
-}
-impl AdmittedConversions {
-    pub(crate) fn commit(
-        &mut self,
-        _witness: AdmissionComplete,
-        findings: crate::ConversionChannel,
-    ) {
-        self.findings.append(findings);
-    }
-    pub(crate) fn extend(&mut self, other: Self) {
-        self.findings.append(other.findings);
-    }
-    pub(crate) fn take(&mut self) -> crate::ConversionChannel {
-        std::mem::take(&mut self.findings)
-    }
-}
-#[derive(Clone, Copy)]
-struct ReadyForAdmission;
-enum AdmissionEntry {
-    Unstarted,
-    Started(AdmissionStart),
-}
-#[derive(Clone, Copy)]
-enum AdmissionStart {
-    Ready(ReadyForAdmission),
-    Stopped(OrdinaryFailure),
-}
-enum ScopeAdmission {
-    NotAdmitted,
-    Admitted(AdmissionComplete),
-}
-#[derive(Clone, Copy)]
-pub(crate) struct ReadOnlyRun {
-    _private: (),
-}
-enum RunKind {
-    Validate,
-    ReadOnly(ReadOnlyRun),
-}
 #[derive(Clone, Copy)]
 pub struct OrdinaryFailure {
-    _private: (),
-}
-enum CompletionAuthority {
-    Stopped(OrdinaryFailure),
-    ReadOnly(ReadOnlyRun),
-    Required,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "bug in carina: an authored conversion use has no completion outcome (admission pass did not complete)"
-)]
-pub struct AdmissionIncomplete {
     _private: (),
 }
 
 #[derive(Clone)]
 pub(super) enum AdmissionBoundary {
-    Scope(crate::parser::retained::AuthoredScopeId),
+    Live,
     Preflight,
 }
 
@@ -405,13 +316,6 @@ impl<
     }
 }
 
-struct InventoryScope {
-    scope: crate::parser::retained::AuthoredScopeId,
-    admission: ScopeAdmission,
-    inventory: std::sync::Arc<crate::parser::retained::conversion::ConversionInventory>,
-    subject: FindingSubject,
-}
-
 #[derive(PartialEq, Eq, Hash)]
 struct AdmissionUse {
     declaration: Option<crate::parser::retained::SlotDeclarationId>,
@@ -447,11 +351,9 @@ where
     )
 }
 
-/// One owner for all admission coverage and completion in a document set.
+/// One owner for placement and sink findings in a document set.
 pub struct ConversionValidation<E: ValidationClientError = std::convert::Infallible> {
-    kind: RunKind,
-    entry: AdmissionEntry,
-    inventories: Vec<InventoryScope>,
+    conversions: crate::ConversionFindings,
     coverage: crate::schema::value_validation::WalkCoverage,
     ordinary: Vec<(FindingSubject, OrdinaryFinding<E>)>,
     admitted_uses: std::collections::HashMap<
@@ -463,9 +365,7 @@ pub struct ConversionValidation<E: ValidationClientError = std::convert::Infalli
 impl<E: ValidationClientError> Default for ConversionValidation<E> {
     fn default() -> Self {
         Self {
-            kind: RunKind::Validate,
-            entry: AdmissionEntry::Unstarted,
-            inventories: Vec::new(),
+            conversions: Default::default(),
             coverage: Default::default(),
             ordinary: Vec::new(),
             admitted_uses: Default::default(),
@@ -494,19 +394,9 @@ impl<E: ValidationClientError> ConversionValidation<E> {
         OrdinaryFailure { _private: () }
     }
 
-    /// Register the parsed root inventory before any validation phase can
-    /// return early. This reads existing AST inventory without another walk.
+    /// Collect placement findings already produced by the root Judge pass.
     pub fn for_directory<T>(parsed: &crate::config_loader::RootDirectoryParse<T>) -> Self {
         Self::new(parsed.parsed().expression_report())
-    }
-
-    /// Destroy/state deliberately perform no resource admission, as on main.
-    pub fn for_read_only_directory<T>(
-        parsed: &crate::config_loader::RootDirectoryParse<T>,
-    ) -> Self {
-        let mut run = Self::for_directory(parsed);
-        run.kind = RunKind::ReadOnly(ReadOnlyRun { _private: () });
-        run
     }
 
     /// Main's terminal provider-authority failure replaces ordinary errors;
@@ -519,8 +409,8 @@ impl<E: ValidationClientError> ConversionValidation<E> {
         self.fail(error)
     }
 
-    /// Each step performs admission before yielding. Only exhausting this
-    /// core-owned pass grants completeness authority; dropping it cannot.
+    /// Each step performs admission before yielding and records its use in
+    /// this driver. Dropping the iterator produces no judgement for later slots.
     pub fn admitted_resources<'a, 'file: 'a, B, D, T>(
         &'a mut self,
         tree: &'a crate::parser::AnalysisTree<
@@ -552,7 +442,7 @@ impl<E: ValidationClientError> ConversionValidation<E> {
             bindings,
             session,
             subject,
-            AdmissionBoundary::Scope(tree.admission_scope()),
+            AdmissionBoundary::Live,
         )
     }
 
@@ -589,26 +479,14 @@ impl<E: ValidationClientError> ConversionValidation<E> {
             | crate::parser::AnalysisItemKind::DeferredResource
             | crate::parser::AnalysisItemKind::Wait => true,
         });
-        let start = match &boundary {
-            AdmissionBoundary::Scope(_) => {
-                self.include_in(judged.report(), subject.clone());
-                self.ensure_admission_entry()
-            }
-            AdmissionBoundary::Preflight => self.admission_start(),
-        };
+        match &boundary {
+            AdmissionBoundary::Live => self.include_in(judged.report(), subject.clone()),
+            AdmissionBoundary::Preflight => {}
+        }
         std::iter::from_fn(move || {
-            let Some(resource) = resources.next() else {
-                match &boundary {
-                    AdmissionBoundary::Scope(scope) => self.admission_pass_complete(scope),
-                    AdmissionBoundary::Preflight => {}
-                }
-                return None;
-            };
+            let resource = resources.next()?;
             let values = match resource.schema(judged.schemas()) {
-                None => {
-                    self.destination_unknown(resource);
-                    Ok(None)
-                }
+                None => Ok(None),
                 Some(schema) => {
                     super::admission::attributes::ResourceAttributeInputs::for_resource(
                         resource,
@@ -642,9 +520,7 @@ impl<E: ValidationClientError> ConversionValidation<E> {
                                 bindings, session, schemas: judged.schemas(),
                             };
                             match &boundary {
-                                AdmissionBoundary::Scope(_) if matches!(start, AdmissionStart::Stopped(_)) || resource.authored_slots().is_some_and(|slots| slots.is_unexpanded_template()) =>
-                                    super::admission::attributes::resource_template_preflight_admissions(request, coverage),
-                                AdmissionBoundary::Scope(_) => super::admission::attributes::resource_attribute_admissions(
+                                AdmissionBoundary::Live => super::admission::attributes::resource_attribute_admissions(
                                     request.resource, request.parsed, request.schema, request.attributes,
                                     request.quoted, request.inputs, request.bindings, request.session, request.schemas, coverage,
                                 ),
@@ -654,7 +530,7 @@ impl<E: ValidationClientError> ConversionValidation<E> {
                     })
                 }
             };
-            if let AdmissionBoundary::Scope(_) = &boundary {
+            if let AdmissionBoundary::Live = &boundary {
                 self.record_admitted_resource(resource);
             }
             Some(ResourceAdmissionStep { resource, values })
@@ -670,46 +546,9 @@ impl<E: ValidationClientError> ConversionValidation<E> {
             },
         })
     }
-    fn admission_start(&self) -> AdmissionStart {
-        match self.ordinary_failure() {
-            Some(failure) => AdmissionStart::Stopped(failure),
-            None => AdmissionStart::Ready(ReadyForAdmission),
-        }
-    }
-    fn ensure_admission_entry(&mut self) -> AdmissionStart {
-        match self.entry {
-            AdmissionEntry::Started(start) => start,
-            AdmissionEntry::Unstarted => {
-                let start = self.admission_start();
-                self.entry = AdmissionEntry::Started(start);
-                start
-            }
-        }
-    }
-    pub(super) fn admission_pass_complete(
-        &mut self,
-        admitted_scope: &crate::parser::retained::AuthoredScopeId,
-    ) {
-        match self.ensure_admission_entry() {
-            AdmissionStart::Ready(_) => {
-                self.coverage
-                    .commit_pending(AdmissionComplete { _private: () });
-                for scope in &mut self.inventories {
-                    if scope.scope == *admitted_scope {
-                        scope.admission =
-                            ScopeAdmission::Admitted(AdmissionComplete { _private: () });
-                    }
-                }
-            }
-            AdmissionStart::Stopped(_) => {
-                self.coverage.replace_pending(Default::default());
-            }
-        }
-        self.entry = AdmissionEntry::Unstarted;
-    }
-
-    /// Drive the remaining document resources, then seal the scope. Callers
-    /// cannot mint the completion witness by forgetting this admission pass.
+    /// Check sibling uses whose ordinary findings are outside this document.
+    /// This is needed to report an alias rejection at its defining document;
+    /// it neither seals a scope nor supplies completion evidence.
     pub fn admit_remaining_resources<'a, B, D, T>(
         &mut self,
         tree: &crate::parser::AnalysisTree<
@@ -732,7 +571,6 @@ impl<E: ValidationClientError> ConversionValidation<E> {
                 B,
             >,
     {
-        let start = self.ensure_admission_entry();
         for resource in tree.project_resources() {
             let (identity, revision) = admission_use(resource);
             if self.admitted_uses.get(&identity).is_some_and(|admitted| {
@@ -744,27 +582,16 @@ impl<E: ValidationClientError> ConversionValidation<E> {
             }) {
                 continue;
             }
-            if resource.schema(judged.schemas()).is_none() {
-                self.destination_unknown(resource);
+            if self.ordinary_failure().is_some() {
+                continue;
             }
             self.walk_resource(resource, |coverage| {
-                if matches!(start, AdmissionStart::Stopped(_))
-                    || resource
-                        .authored_slots()
-                        .is_some_and(|slots| slots.is_unexpanded_template())
-                {
-                    super::admission::attributes::unrendered_resource_template_admissions(
-                        resource, judged, bindings, session, coverage,
-                    )
-                } else {
-                    super::admission::attributes::unrendered_resource_conversion_admissions(
-                        resource, judged, bindings, session, coverage,
-                    )
-                }
+                super::admission::attributes::unrendered_resource_conversion_admissions(
+                    resource, judged, bindings, session, coverage,
+                )
             });
             self.record_admitted_resource(resource);
         }
-        self.admission_pass_complete(&tree.admission_scope());
     }
 
     pub fn new<B: BindingAddress>(report: &ExpressionReport<B>) -> Self {
@@ -775,8 +602,7 @@ impl<E: ValidationClientError> ConversionValidation<E> {
     pub fn include<B: BindingAddress>(&mut self, report: &ExpressionReport<B>) {
         self.include_in(report, FindingSubject::Root);
     }
-    /// Retain the resolver's own template/instance inventory even for a
-    /// read-only entry that deliberately builds no admission analysis tree.
+    /// Collect produced placement findings even when an entry skips admission.
     pub fn include_file<X, D, B: BindingAddress>(
         &mut self,
         file: &crate::parser::File<
@@ -794,65 +620,12 @@ impl<E: ValidationClientError> ConversionValidation<E> {
         report: &ExpressionReport<B>,
         subject: FindingSubject,
     ) {
-        if let Some(scope) = self
-            .inventories
-            .iter_mut()
-            .find(|scope| scope.scope == report.admission_scope())
-        {
-            scope.inventory = report.conversion_inventory();
-            scope.subject = subject;
-            return;
-        }
-        self.inventories.push(InventoryScope {
-            scope: report.admission_scope(),
-            admission: ScopeAdmission::NotAdmitted,
-            inventory: report.conversion_inventory(),
-            subject,
-        });
+        self.conversions
+            .record_batch(report.placements.clone(), subject);
     }
-    pub fn observe_destination<D, B: BindingAddress>(
-        &mut self,
-        resource: &crate::parser::AnalysisResourceRef<
-            '_,
-            crate::resource::ParserPlaceholder,
-            crate::resource::ParserPlaceholder,
-            D,
-            B,
-        >,
-        schemas: &crate::schema::SchemaRegistry,
-    ) where
-        D: crate::parser::DeferredForPhaseTraversal<
-                crate::resource::ParserPlaceholder,
-                crate::resource::ParserPlaceholder,
-                B,
-            >,
-    {
-        if resource.schema(schemas).is_none() {
-            self.destination_unknown(resource);
-        }
-    }
-    fn destination_unknown<D, B: BindingAddress>(
-        &mut self,
-        resource: &crate::parser::AnalysisResourceRef<
-            '_,
-            crate::resource::ParserPlaceholder,
-            crate::resource::ParserPlaceholder,
-            D,
-            B,
-        >,
-    ) where
-        D: crate::parser::DeferredForPhaseTraversal<
-                crate::resource::ParserPlaceholder,
-                crate::resource::ParserPlaceholder,
-                B,
-            >,
-    {
-        if let Some(slots) = resource.authored_slots() {
-            for root in slots.admission_roots() {
-                self.coverage
-                    .destination_unknown(root, DestinationUnknown { _private: () });
-            }
-        }
+
+    pub(crate) fn produced_placements(&mut self, batch: std::sync::Arc<crate::ConversionChannel>) {
+        self.conversions.record_batch(batch, FindingSubject::Root);
     }
 
     /// Admit one resource use with the run's shared coverage. Only this driver
@@ -869,30 +642,19 @@ impl<E: ValidationClientError> ConversionValidation<E> {
             >,
     {
         let resource = request.resource;
-        let start = self.ensure_admission_entry();
         let findings = self.walk_resource(resource, |coverage| {
-            if matches!(start, AdmissionStart::Stopped(_))
-                || resource
-                    .authored_slots()
-                    .is_some_and(|slots| slots.is_unexpanded_template())
-            {
-                super::admission::attributes::resource_template_preflight_admissions(
-                    request, coverage,
-                )
-            } else {
-                super::admission::attributes::resource_attribute_admissions(
-                    request.resource,
-                    request.parsed,
-                    request.schema,
-                    request.attributes,
-                    request.quoted,
-                    request.inputs,
-                    request.bindings,
-                    request.session,
-                    request.schemas,
-                    coverage,
-                )
-            }
+            super::admission::attributes::resource_attribute_admissions(
+                request.resource,
+                request.parsed,
+                request.schema,
+                request.attributes,
+                request.quoted,
+                request.inputs,
+                request.bindings,
+                request.session,
+                request.schemas,
+                coverage,
+            )
         });
         self.record_admitted_resource(resource);
         findings
@@ -928,8 +690,8 @@ impl<E: ValidationClientError> ConversionValidation<E> {
     }
 
     #[cfg(test)]
-    pub(crate) fn work_for<B: BindingAddress>(&self, report: &ExpressionReport<B>) -> usize {
-        self.coverage.work() + report.completeness_report(&self.coverage).work()
+    pub(crate) fn work_for<B: BindingAddress>(&self, _report: &ExpressionReport<B>) -> usize {
+        self.coverage.work()
     }
     pub(crate) fn walk_resource<'a, P, T, D, B, U>(
         &mut self,
@@ -962,7 +724,6 @@ impl<E: ValidationClientError> ConversionValidation<E> {
         subject: FindingSubject,
         walk: impl FnOnce(&mut crate::schema::value_validation::WalkCoverage) -> T,
     ) -> T {
-        self.ensure_admission_entry();
         self.coverage.in_subject(subject, walk)
     }
     pub(super) fn ordinary(
@@ -978,53 +739,10 @@ impl<E: ValidationClientError> ConversionValidation<E> {
         }));
     }
     pub fn complete(mut self) -> ResourceValidationReport<E> {
-        use crate::parser::retained::conversion::{InventoryCompletion, complete_inventory};
-        let authority = match self.ordinary_failure() {
-            Some(failure) => CompletionAuthority::Stopped(failure),
-            None => match self.kind {
-                RunKind::Validate => CompletionAuthority::Required,
-                RunKind::ReadOnly(proof) => CompletionAuthority::ReadOnly(proof),
-            },
-        };
-        let mut incomplete = false;
-        let mut conversions = crate::ConversionFindings::default();
-        conversions.extend(self.coverage.take_conversions());
-        for scope in self.inventories {
-            let admission = match &scope.admission {
-                ScopeAdmission::Admitted(witness) => InventoryAdmission::Admitted(witness),
-                ScopeAdmission::NotAdmitted => match authority {
-                    CompletionAuthority::Stopped(witness) => {
-                        InventoryAdmission::Stopped(NotAdmitted::Ordinary(witness))
-                    }
-                    CompletionAuthority::ReadOnly(witness) => {
-                        InventoryAdmission::ReadOnly(NotAdmitted::ReadOnly(witness))
-                    }
-                    CompletionAuthority::Required => InventoryAdmission::Required,
-                },
-            };
-            let (errors, completion) =
-                complete_inventory(&scope.inventory, &self.coverage, admission);
-            match completion {
-                InventoryCompletion::Complete => {}
-                InventoryCompletion::MissingOutcome => incomplete = true,
-            }
-            let errors = match scope.subject {
-                FindingSubject::Root => errors,
-                subject @ FindingSubject::Module(_) => errors.in_subject(subject),
-            };
-            conversions.extend(errors);
-        }
-        if incomplete {
-            self.ordinary.push((
-                FindingSubject::Root,
-                OrdinaryFinding::Resource(Box::new(super::ResourceAdmissionFinding::incomplete(
-                    AdmissionIncomplete { _private: () },
-                ))),
-            ));
-        }
+        self.conversions.extend(self.coverage.take_conversions());
         ResourceValidationReport {
             ordinary: self.ordinary,
-            conversions,
+            conversions: self.conversions,
         }
     }
 }

@@ -33,6 +33,7 @@ fn reference_judgement_uses_the_contract_already_found() {
                         .into_classification(),
                     Some(bindings),
                     session,
+                    crate::test_utils::no_conversion_proof(),
                 );
                 let CandidateOrigin::Reference(reference) = CandidateOrigin::of(&value) else {
                     panic!("reference origin")
@@ -542,43 +543,41 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                         None => Ok(Default::default()),
                     }
                 };
-            let check =
-                |attr: &CompiledAttributeType,
-                 checked: crate::schema::value_validation::CheckValue<'_, P, B>,
-                 path: &LeafPath,
-                 cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
-                    let path = join(&contract.path, path);
-                    let mut findings = Default::default();
-                    if context.scope
-                        == crate::schema::value_validation::AssignmentScope::ClaimedValues
-                    {
-                        return Ok(findings);
-                    }
-                    // Selection parents are policy-only: main's ordinary local
-                    // and reference obligations belong to the selected child.
-                    if cursor.is_selection() {
-                        return Ok(findings);
-                    }
-                    let crate::schema::value_validation::CheckValue::Current(value) = checked
-                    else {
-                        return Ok(findings);
-                    };
-                    match CandidateOrigin::of(value) {
-                        CandidateOrigin::Reference(reference) => reference.judge_at::<K>(
-                            contract,
-                            attr,
-                            &path,
-                            &reference_context,
-                            &mut findings,
-                        )?,
-                        CandidateOrigin::Expression => {
-                            if let Some(check) = context.assignment.ordinary {
-                                findings.extend(check(attr, value, &path, cursor)?);
-                            }
+            let check = |attr: &CompiledAttributeType,
+                         checked: crate::schema::value_validation::CheckValue<'_, P, B>,
+                         path: &LeafPath,
+                         cursor: crate::parser::retained::AuthoredCursor<'_, B>,
+                         _proof: crate::parser::retained::NoConversion| {
+                let path = join(&contract.path, path);
+                let mut findings = Default::default();
+                if context.scope == crate::schema::value_validation::AssignmentScope::ClaimedValues
+                {
+                    return Ok(findings);
+                }
+                // Selection parents are policy-only: main's ordinary local
+                // and reference obligations belong to the selected child.
+                if cursor.is_selection() {
+                    return Ok(findings);
+                }
+                let crate::schema::value_validation::CheckValue::Current(value) = checked else {
+                    return Ok(findings);
+                };
+                match CandidateOrigin::of(value) {
+                    CandidateOrigin::Reference(reference) => reference.judge_at::<K>(
+                        contract,
+                        attr,
+                        &path,
+                        &reference_context,
+                        &mut findings,
+                    )?,
+                    CandidateOrigin::Expression => {
+                        if let Some(check) = context.assignment.ordinary {
+                            findings.extend(check(attr, value, &path, cursor)?);
                         }
                     }
-                    Ok(findings)
-                };
+                }
+                Ok(findings)
+            };
             let reference_check =
                 |attr: &CompiledAttributeType,
                  relative_path: &LeafPath,
@@ -642,7 +641,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 context.cursor.clone(),
                 crate::schema::value_validation::WalkCallbacks::from(
                     crate::schema::value_validation::RequiredAssignmentCallbacks {
-                        ordinary: &|_, _, _, _| Ok(Default::default()),
+                        ordinary: &|_, _, _, _, _| Ok(Default::default()),
                         scope: crate::schema::value_validation::AssignmentScope::Full,
                         authored: crate::schema::value_validation::AuthoredChecks::Projected(
                             crate::parser::retained::ProjectedPhase::plan(proof),
@@ -662,7 +661,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 context.cursor.clone(),
                 crate::schema::value_validation::WalkCallbacks::from(
                     crate::schema::value_validation::RequiredAssignmentCallbacks {
-                        ordinary: &|_, _, _, _| Ok(Default::default()),
+                        ordinary: &|_, _, _, _, _| Ok(Default::default()),
                         scope: crate::schema::value_validation::AssignmentScope::Full,
                         authored: crate::schema::value_validation::AuthoredChecks::Projected(
                             *phase,
@@ -781,6 +780,7 @@ mod discharge_tests {
                             .into_classification(),
                         None,
                         session,
+                        crate::test_utils::no_conversion_proof(),
                     );
                     let pending = admit(destination, candidate, &context)
                         .unwrap()
@@ -823,6 +823,7 @@ mod discharge_tests {
                             .into_classification(),
                         Some(&bindings),
                         session,
+                        crate::test_utils::no_conversion_proof(),
                     );
                     let pending = admit(destination, candidate, &context)
                         .unwrap()

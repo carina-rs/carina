@@ -199,7 +199,7 @@ pub fn admit_plan_attributes<K: RechecksResolved>(
 #[derive(Debug)]
 pub(crate) enum ApplyAdmissionErrors {
     Admission(AdmissionErrors),
-    Constraints(Box<crate::schema::ResourceValueValidation>),
+    Constraints(crate::schema::ResourceValueValidation),
 }
 impl From<AdmissionErrors> for ApplyAdmissionErrors {
     fn from(error: AdmissionErrors) -> Self {
@@ -347,7 +347,7 @@ fn admit_apply_attributes<K: RechecksResolved>(
         return Err(ApplyAdmissionErrors::Admission(failures.pop().unwrap()));
     }
     if report.errors().next().is_some() {
-        return Err(ApplyAdmissionErrors::Constraints(Box::new(report)));
+        return Err(ApplyAdmissionErrors::Constraints(report));
     }
     Ok(())
 }
@@ -364,6 +364,12 @@ type ValidationAssignmentCheck<'a, P, B> = Option<
         crate::parser::retained::AuthoredCursor<'_, B>,
     ) -> Result<crate::schema::value_validation::AssignmentFindings, TypeError>,
 >;
+
+pub(crate) struct SchemaInputAuthority<'a, B: BindingAddress> {
+    pub(crate) slots: &'a crate::parser::retained::AuthoredSlots<B>,
+    pub(crate) report: &'a crate::parser::retained::ExpressionReport<B>,
+    pub(crate) coverage: &'a mut WalkCoverage,
+}
 
 /// One authored attribute report, shared by CLI validation and LSP rendering.
 #[allow(clippy::too_many_arguments)]
@@ -385,17 +391,99 @@ pub(crate) fn admit_validation_attributes<
     declarations: Option<
         &std::collections::HashMap<String, (String, crate::binding_index::DeclaredValueSource)>,
     >,
+    authority: SchemaInputAuthority<'_, B>,
 ) -> crate::schema::ResourceValueValidation {
-    admit_validation_attributes_with_input::<K, P, B>(
-        schema,
-        id,
+    let SchemaInputAuthority {
+        slots,
+        report,
+        coverage,
+    } = authority;
+    if slots.declaration_id().is_some() {
+        let candidate = |name: &str, proof| {
+            let source = slots
+                .get(name)
+                .or_else(|error| {
+                    schema
+                        .schema()
+                        .as_schema()
+                        .attributes()
+                        .get(name)
+                        .and_then(|field| field.parts().block_name)
+                        .map_or(Err(error), |alias| slots.get(alias))
+                })
+                .and_then(|slot| {
+                    slot.source_judgement_in(report)
+                        .or_else(|_| slot.source_judgement())
+                });
+            Ok(match source {
+                Ok(source) => {
+                    ValidationCandidate::Checked(Box::new(Candidate::validation_projected(
+                        proof,
+                        bindings,
+                        session,
+                        crate::parser::retained::ValidationProjection::judged(source.clone()),
+                    )))
+                }
+                Err(_) => ValidationCandidate::ValueOnly,
+            })
+        };
+        let visits = std::cell::RefCell::new(std::mem::take(coverage));
+        let findings = admit_validation_attributes_with_input::<K, P, B>(
+            schema,
+            id,
+            attributes,
+            quoted,
+            bindings,
+            session,
+            check,
+            declarations,
+            ValidationInput::Resource {
+                candidate: &candidate,
+                coverage: &visits,
+            },
+        );
+        *coverage = visits.into_inner();
+        return findings;
+    }
+    admit_value_only_attributes::<K, P, B>(schema, id, attributes, quoted, session)
+}
+
+/// Programmatic values enter a NoAuthored walk, with no callback or conversion
+/// channel. Parsed inputs must use the source-bearing factory above.
+pub(crate) fn admit_value_only_attributes<
+    K: RechecksResolved,
+    P: PlaceholderKind,
+    B: BindingAddress,
+>(
+    schema: crate::schema::OwnerBoundResourceSchema<'_>,
+    id: &ResourceId,
+    attributes: &std::collections::HashMap<
+        String,
+        crate::resource::knowledge::Classification<'_, P, B>,
+    >,
+    quoted: &std::collections::HashSet<String>,
+    session: &dyn ProviderTypeCheckContext,
+) -> crate::schema::ResourceValueValidation {
+    schema.schema().as_schema().validate_admission_report(
         attributes,
-        quoted,
-        bindings,
-        session,
-        check,
-        declarations,
-        ValidationInput::Classified,
+        &|name| quoted.contains(name),
+        &crate::schema::value_validation::AttributeAdmission {
+            known: &|name, selected, proof| {
+                let destination =
+                    schema.admission_selected_attribute::<K>(id, name, selected, session.catalog());
+                match destination.contract.as_deref() {
+                    Some(contract) => crate::schema::value_validation::validate_value_with_lookup(
+                        contract.attr(),
+                        proof,
+                        contract.defs(),
+                        contract.ancestry,
+                        &contract.lookup(session.catalog()),
+                    ),
+                    None => Default::default(),
+                }
+            },
+            unknown: None,
+        },
     )
 }
 
@@ -403,12 +491,16 @@ type ValidationCandidateFactory<'a, P, B> =
     &'a dyn Fn(
         &str,
         crate::resource::knowledge::Classification<'a, P, B>,
-    ) -> Result<(Candidate<P, B>, AdmissionContext<'a, P, B>), AdmissionErrors>;
+    ) -> Result<ValidationCandidate<'a, P, B>, AdmissionErrors>;
+
+enum ValidationCandidate<'a, P: PlaceholderKind, B: BindingAddress> {
+    Checked(Box<(Candidate<P, B>, AdmissionContext<'a, P, B>)>),
+    ValueOnly,
+}
 
 /// The classified path is for explicit schema-only producers. A live authored
 /// source must supply its cursor factory; association failure is never projected.
 enum ValidationInput<'a, P: PlaceholderKind, B: BindingAddress> {
-    Classified,
     // Producer-owned inputs preserve pairing even on the report-only path.
     // AttributeInput, not analysis kind, selects the cursor authority.
     Resource {
@@ -444,11 +536,22 @@ fn admit_validation_attributes_with_input<
                            proof: &crate::resource::knowledge::Classification<'v, P, B>,
                            destination: &Destination<K>| {
         let (candidate, mut boundary) = match &input {
-            ValidationInput::Classified => {
-                Candidate::validation_classified(proof.clone(), bindings, session)
-            }
             ValidationInput::Resource { candidate, .. } => match candidate(name, proof.clone()) {
-                Ok(input) => input,
+                Ok(ValidationCandidate::Checked(input)) => *input,
+                Ok(ValidationCandidate::ValueOnly) => {
+                    return match destination.contract.as_deref() {
+                        Some(contract) => {
+                            crate::schema::value_validation::validate_value_with_lookup(
+                                contract.attr(),
+                                proof,
+                                contract.defs(),
+                                contract.ancestry,
+                                &contract.lookup(session.catalog()),
+                            )
+                        }
+                        None => Default::default(),
+                    };
+                }
                 Err(error) => return admission_findings(&mut Err::<Admission<K, P, B>, _>(error)),
             },
         };
@@ -521,9 +624,8 @@ fn admit_validation_attributes_with_input<
             &untyped,
         );
         let findings = admission_findings(&mut admit(destination, candidate, &boundary));
-        if let ValidationInput::Resource { coverage, .. } = &input {
-            coverage.borrow_mut().extend(boundary.coverage.take());
-        }
+        let ValidationInput::Resource { coverage, .. } = &input;
+        coverage.borrow_mut().extend(boundary.coverage.take());
         if proof.failure().is_some() {
             // Keep attempted failure evidence and attribute presence. The
             // expression/collector pass owns its validation diagnostic.
@@ -757,20 +859,30 @@ fn typed_resource_attribute_admissions<
 ) -> crate::schema::ResourceValueValidation {
     use crate::resource::{DeferredValue, ParserPlaceholder};
     let report = inputs.report(parsed.expression_report());
+    let attribute_input = |name: &str| {
+        inputs.input(
+            resource,
+            name,
+            report,
+            schema
+                .schema()
+                .as_schema()
+                .attributes()
+                .get(name)
+                .and_then(|field| field.parts().block_name),
+        )
+    };
     let mut declaration_errors = std::collections::HashMap::new();
     let declarations = attributes
         .iter()
         .map(|(name, proof)| {
-            let expression = match inputs
-                .input(resource, name)
-                .map_err(|error| (name, error))?
-            {
+            let expression = match attribute_input(name).map_err(|error| (name, error))? {
                 AttributeInput::Authored { slot } => slot
                     .cursor()
                     .map_err(|error| (name, error))?
                     .node()
                     .judgement(),
-                AttributeInput::Reported => match report.expression(
+                AttributeInput::Reported { .. } => match report.expression(
                     resource.attribute_value_location(name, &crate::schema::FieldPath::new()),
                 ) {
                     Ok(expression) => expression,
@@ -1046,25 +1158,27 @@ fn typed_resource_attribute_admissions<
         if let Some(error) = declaration_errors.get(name) {
             return Err(seam_constraint(error.clone()));
         }
-        let (candidate, mut boundary) =
-            match inputs.input(resource, name).map_err(seam_constraint)? {
-                AttributeInput::Authored { slot, .. } => {
-                    Pass::candidate(slot, proof, bindings, session)
-                }
-                AttributeInput::Projected { phase, .. } => Ok(Candidate::validation_projected(
-                    proof,
-                    Some(bindings),
-                    session,
-                    phase,
-                )),
-                AttributeInput::Reported => Ok(Candidate::validation_classified(
-                    proof,
-                    Some(bindings),
-                    session,
-                )),
-            }?;
+        let (candidate, mut boundary) = match attribute_input(name).map_err(seam_constraint)? {
+            AttributeInput::Authored { slot, .. } => {
+                Pass::candidate(slot, proof, bindings, session)
+            }
+            AttributeInput::Projected { phase, .. } => Ok(Candidate::validation_projected(
+                proof,
+                Some(bindings),
+                session,
+                phase,
+            )),
+            AttributeInput::Reported { source } => Ok(Candidate::validation_projected(
+                proof,
+                Some(bindings),
+                session,
+                crate::parser::retained::ValidationProjection::judged(source),
+            )),
+        }?;
         boundary.scope = inputs.scope;
-        Ok((candidate, boundary))
+        Ok(ValidationCandidate::Checked(Box::new((
+            candidate, boundary,
+        ))))
     };
     let input = ValidationInput::Resource {
         candidate: &candidate,
@@ -1107,31 +1221,6 @@ pub(crate) fn unrendered_resource_conversion_admissions<E, D, B: BindingAddress>
         >,
 {
     unrendered_resource_admissions::<LiveResource, E, D, B>(
-        resource, judged, bindings, session, coverage,
-    );
-}
-
-pub(in crate::validation) fn unrendered_resource_template_admissions<E, D, B: BindingAddress>(
-    resource: &crate::parser::AnalysisResourceRef<
-        '_,
-        crate::resource::ParserPlaceholder,
-        crate::resource::ParserPlaceholder,
-        D,
-        B,
-    >,
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
-    bindings: &BindingIndex<'_, B>,
-    session: &dyn ProviderTypeCheckContext,
-    coverage: &mut WalkCoverage,
-) where
-    E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
-    D: crate::parser::DeferredForPhaseTraversal<
-            crate::resource::ParserPlaceholder,
-            crate::resource::ParserPlaceholder,
-            B,
-        >,
-{
-    unrendered_resource_admissions::<TemplateResource, E, D, B>(
         resource, judged, bindings, session, coverage,
     );
 }

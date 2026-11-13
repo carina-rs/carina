@@ -144,7 +144,14 @@ fn conversion_cli_directory_parse_rejection_keeps_the_convert_location() {
     );
     assert!(!output.status.success(), "{text}");
     assert_eq!(
-        text.matches("conversion is not supported inside this expression")
+        text.matches("conversion is not supported at this position")
+            .count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("Error:"))
             .count(),
         1,
         "{text}"

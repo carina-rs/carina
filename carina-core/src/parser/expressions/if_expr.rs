@@ -270,21 +270,6 @@ pub(crate) fn parse_if_expr(
         return defer_if_body(condition, then_branch, else_branch, ctx, &target);
     }
 
-    if if_body.kind() == IfBodyKind::Structural {
-        if decision == Some(true) {
-            if let Some(body) = &else_body {
-                ctx.not_expanded(
-                    &body.pair,
-                    crate::parser::retained::NotExpandedReason::UnselectedStructuralIf,
-                );
-            }
-        } else {
-            ctx.not_expanded(
-                &if_body.pair,
-                crate::parser::retained::NotExpandedReason::UnselectedStructuralIf,
-            );
-        }
-    }
     if decision.expect("module-dependent decision returned above") {
         // Use the if branch
         parse_if_body_to_rhs(if_body, ctx, &target, preprocessed_file, source_file)

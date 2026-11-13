@@ -1,8 +1,42 @@
 use super::*;
+
+#[test]
+fn round5_placement_provenance_expansion_is_linear_across_computed_parents() {
+    let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    for count in [24, 48] {
+        // Aliases keep parser nesting bounded while the contributing
+        // judgement DAG still has the same skewed N/2N computed-parent chain.
+        let mut source = "let value0 = 1 as unloaded.Name\n".to_string();
+        for index in 1..count {
+            source.push_str(&format!(
+                "let value{index} = value{} + (1 as unloaded.Name)\n",
+                index - 1
+            ));
+        }
+        source.push_str(&format!("mock.Sink {{ target = value{} }}", count - 1));
+        let parsed = super::super::parse_file(&source, Path::new("p1-work.crn"), &catalog).unwrap();
+        // This is the producer's work/output, before the sole NodeId collector.
+        // A repeated expansion must not build a quadratic error vector there.
+        let produced = parsed.expression_report().placements.findings().len();
+        eprintln!("P1 provenance: {count} Converts, {produced} producer records");
+        assert!(
+            produced <= 2 * count,
+            "{count} Converts produced {produced} records"
+        );
+        let presented =
+            ConversionValidation::<std::convert::Infallible>::new(parsed.expression_report())
+                .complete()
+                .into_presented();
+        assert_eq!(
+            crate::conversion::tests::conversion_errors(&presented).len(),
+            count
+        );
+    }
+}
 use crate::validation::ConversionValidation;
 
 #[test]
-fn conversion_completion_uses_syntax_inventory_when_judgements_are_missing() {
+fn conversion_placement_findings_do_not_depend_on_report_node_maps() {
     let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
     for (source, count) in [
         ("provider mock { endpoint = 'ok' as String }", 1),
@@ -49,6 +83,134 @@ fn conversion_completion_uses_syntax_inventory_when_judgements_are_missing() {
 }
 
 #[test]
+fn round5_condition_roles_reject_an_aliased_conversion_as_computed() {
+    let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    for tail in [
+        "arguments { input: Bool { validation { condition = converted error_message = 'bad' } } }",
+        "arguments { input: Bool { validation { condition = !converted error_message = 'bad' } } }",
+        "arguments { input: Bool { validation { condition = converted || false error_message = 'bad' } } }",
+        "arguments { input: Bool { validation { condition = converted && true error_message = 'bad' } } }",
+    ] {
+        let source = format!("let converted = true as unloaded.Name\n{tail}");
+        let parsed =
+            super::super::parse_file(&source, Path::new("condition-alias.crn"), &catalog).unwrap();
+        let presented =
+            ConversionValidation::<std::convert::Infallible>::new(parsed.expression_report())
+                .complete()
+                .into_presented();
+        let errors = crate::conversion::tests::conversion_errors(&presented);
+        assert_eq!(errors.len(), 1, "{source}: {presented}");
+        assert_eq!(
+            errors[0].diagnostic_message(),
+            "conversion is not supported at this position",
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn round5_map_keys_follow_alias_judgements() {
+    let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    for resource in [false, true] {
+        for expanded in [true, false] {
+            let value = if resource {
+                "mock.Sink { \"${converted}\" = 'ok' }"
+            } else {
+                "mock.Sink { target = { \"${converted}\" = 'ok' } }"
+            };
+            let tail = if expanded {
+                value.into()
+            } else {
+                format!("for item in [] {{ {value} }}")
+            };
+            let source = format!("let converted = 'key' as unloaded.Name\n{tail}");
+            let parsed = super::super::parse_file(&source, Path::new("key-alias.crn"), &catalog);
+            if expanded {
+                let ordinary = parsed.unwrap_err();
+                let twin = super::super::parse_file(
+                    &source.replace(" as unloaded.Name", ""),
+                    Path::new("key-alias.crn"),
+                    &catalog,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    ordinary.to_string(),
+                    twin.to_string(),
+                    "interpolated keys fail before Judge on main too"
+                );
+                continue;
+            }
+            let parsed = parsed.unwrap();
+            let presented =
+                ConversionValidation::<std::convert::Infallible>::new(parsed.expression_report())
+                    .complete()
+                    .into_presented();
+            let errors = crate::conversion::tests::conversion_errors(&presented);
+            assert_eq!(errors.len(), 1, "{presented}");
+            assert_eq!(
+                errors[0].kind(),
+                crate::ConversionErrorKind::UnsupportedPosition
+            );
+        }
+    }
+}
+
+#[test]
+fn round5_non_crossed_edges_reject_converted_callers_before_the_cut() {
+    use conversion::flow::NonCrossedEdge;
+    let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    for edge in [
+        NonCrossedEdge::ModuleArgument,
+        NonCrossedEdge::FunctionParameter,
+        NonCrossedEdge::SchemaAttributeReference,
+        NonCrossedEdge::ModuleOutputReference,
+        NonCrossedEdge::UpstreamStateReference,
+    ] {
+        let (source, boundary) = match edge {
+            NonCrossedEdge::ModuleArgument => (
+                "let child = use { source = './child' }\nchild { input = 'ok' as unloaded.Name }",
+                true,
+            ),
+            NonCrossedEdge::FunctionParameter => (
+                "fn echo(input: String): String { input }\nlet value = echo('ok' as unloaded.Name)",
+                false,
+            ),
+            NonCrossedEdge::SchemaAttributeReference => (
+                "let producer = mock.Source {}\nmock.Sink { target = upper(producer.output as unloaded.Name) }",
+                false,
+            ),
+            NonCrossedEdge::ModuleOutputReference => (
+                "let child = use { source = './child' }\nlet net = child {}\nmock.Sink { target = upper(net.output as unloaded.Name) }",
+                false,
+            ),
+            NonCrossedEdge::UpstreamStateReference => (
+                "let up = upstream_state { source = './upstream' }\nmock.Sink { target = upper(up.output as unloaded.Name) }",
+                false,
+            ),
+        };
+        let parsed = super::super::parse_file(source, Path::new("cut.crn"), &catalog).unwrap();
+        let presented =
+            ConversionValidation::<std::convert::Infallible>::new(parsed.expression_report())
+                .complete()
+                .into_presented();
+        let errors = crate::conversion::tests::conversion_errors(&presented);
+        assert_eq!(errors.len(), 1, "{edge:?}: {presented}");
+        assert_eq!(
+            errors[0].kind(),
+            crate::ConversionErrorKind::UnsupportedPosition
+        );
+        assert_eq!(
+            errors[0].diagnostic_message(),
+            if boundary {
+                "conversion is not supported at this position yet"
+            } else {
+                "conversion is not supported at this position"
+            }
+        );
+    }
+}
+
+#[test]
 fn conversion_discarded_union_claim_is_judged_once_and_covers_wrapped_leaf() {
     use crate::schema::value_validation::{
         AssignmentScope, AuthoredChecks, RequiredAssignmentCallbacks,
@@ -88,7 +250,7 @@ fn conversion_discarded_union_claim_is_judged_once_and_covers_wrapped_leaf() {
         &schema.schema().as_schema().attributes()["input"].attr_type, schema.schema().as_schema().defs(),
         &crate::schema::FieldPath::new(), crate::schema::FieldAncestry::WRITABLE, slot.cursor().unwrap(),
         RequiredAssignmentCallbacks {
-            ordinary: &|_, _, _, _| { ordinary.set(ordinary.get() + 1); Ok(Default::default()) },
+            ordinary: &|_, _, _, _, _| { ordinary.set(ordinary.get() + 1); Ok(Default::default()) },
             authored: AuthoredChecks::Validation(&|attr, checked, path, cursor| {
                 if matches!(&cursor.kind, CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) if usage.form() == AuthoredForm::Convert) { conversions.set(conversions.get() + 1); }
                 check_conversion::<crate::validation::admission::kind::ResourceAttribute, ParserPlaceholder, RelativeBindingName>(attr, checked, path, cursor, schema.schema().as_schema().defs(), &catalog)
@@ -98,8 +260,8 @@ fn conversion_discarded_union_claim_is_judged_once_and_covers_wrapped_leaf() {
     assert_eq!(conversions.get(), 1);
     assert_eq!(
         ordinary.get(),
-        2,
-        "only the two parens wrappers retain ordinary checks; the claimed leaf has none"
+        0,
+        "conversion-carrying transports cannot mint an ordinary assignment proof"
     );
     assert!(findings.authored.errors.is_empty());
     assert_eq!(findings.authored.conversions.findings().len(), 1);
@@ -222,7 +384,7 @@ fn conversion_live_covered_and_discarded_uses_each_supply_a_verdict() {
                 &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
                 AuthoredCursor::authored(slot.cursor().unwrap()),
                 RequiredAssignmentCallbacks {
-                    ordinary: &|_, _, _, _| Ok(Default::default()),
+                    ordinary: &|_, _, _, _, _| Ok(Default::default()),
                     authored: AuthoredChecks::Validation(&|attr, checked, path, cursor| {
                         let is_convert = match &cursor.kind {
                             CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => {
@@ -251,6 +413,9 @@ fn conversion_live_covered_and_discarded_uses_each_supply_a_verdict() {
                                 CheckValue::Current(_) => 0,
                                 CheckValue::Covered => 1,
                                 CheckValue::Discarded => 2,
+                                CheckValue::Pending => panic!(
+                                    "fixture supplies current, covered or discarded evidence"
+                                ),
                             };
                             let mut counts = verdicts.get();
                             counts[index] += 1;
@@ -336,7 +501,7 @@ fn conversion_claim_preserves_ordinary_checks_below_a_rejected_wrapper() {
             &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
             AuthoredCursor::authored(slot.cursor().unwrap()),
             RequiredAssignmentCallbacks {
-                ordinary: &|_, _, path, _| {
+                ordinary: &|_, _, path, _, _| {
                     ordinary.borrow_mut().push(path.clone());
                     Ok(Default::default())
                 },
@@ -531,4 +696,68 @@ fn conversion_quoted_keys_own_the_convert_range_and_one_typed_error() {
             1
         );
     }
+}
+
+#[test]
+fn round5_unclaimed_convert_cannot_reach_ordinary_value_admission() {
+    use crate::schema::value_validation::{
+        AssignmentScope, AuthoredChecks, AuthoredOutcome, RequiredAssignmentCallbacks,
+    };
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+    let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(AttributeSchema::optional("input", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let parsed = super::super::parse_file(
+        "mock.Sink { input = 'ok' as mock.Name }",
+        Path::new("unguarded.crn"),
+        &catalog,
+    )
+    .unwrap();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let judged = configuration.judged();
+    let tree = super::super::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let resource = tree.resources().next().unwrap();
+    let slot = resource.authored_slot("input").unwrap();
+    let schema = resource.schema(&schemas).unwrap();
+    let proof = slot
+        .projection()
+        .unwrap()
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .unwrap()
+        .into_classification();
+    let mut coverage = crate::schema::value_validation::WalkCoverage::default();
+    let findings = crate::schema::value_validation::validate_authored_value_for_admission(
+        &schema.schema().as_schema().attributes()["input"].attr_type,
+        &proof,
+        schema.schema().as_schema().defs(),
+        crate::schema::FieldAncestry::WRITABLE,
+        &|_: &crate::schema::CompiledAttributeType, _: &Value| Ok(()),
+        AuthoredCursor::authored(slot.cursor().unwrap()),
+        RequiredAssignmentCallbacks {
+            ordinary: &|_, _, _, _, _| Ok(Default::default()),
+            authored: AuthoredChecks::Validation(&|_, _, _, cursor| {
+                Ok(AuthoredOutcome::Continue(
+                    cursor
+                        .no_conversion()
+                        .unwrap_or_else(crate::test_utils::no_conversion_proof),
+                    Default::default(),
+                ))
+            }),
+            scope: AssignmentScope::Full,
+        },
+        &mut coverage,
+    );
+    assert_eq!(findings.local_errors().count(), 0, "{findings:?}");
+    assert_eq!(
+        coverage.take_conversions().findings().len(),
+        1,
+        "ordinary value acceptance must require a source proof"
+    );
 }

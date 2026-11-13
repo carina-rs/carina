@@ -71,7 +71,8 @@ fn conversion_missing_operand_judgement_uses_only_the_conversion_channel() {
                 |findings| findings,
             )
         }
-        crate::schema::value_validation::AuthoredOutcome::Continue(_) => {
+        crate::schema::value_validation::AuthoredOutcome::Continue(_, _)
+        | crate::schema::value_validation::AuthoredOutcome::Transport(_) => {
             panic!("a conversion needs a verdict")
         }
     };
@@ -141,7 +142,7 @@ fn ordinary_if_and_coalesce_missing_children_do_not_claim_a_conversion() {
         assert!(
             matches!(
                 outcome,
-                crate::schema::value_validation::AuthoredOutcome::Continue(_)
+                crate::schema::value_validation::AuthoredOutcome::Continue(_, _)
             ),
             "ordinary {value} was claimed"
         );

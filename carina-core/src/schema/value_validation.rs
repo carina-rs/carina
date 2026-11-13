@@ -102,6 +102,8 @@ pub(crate) fn resolve_assignment_declaration<'a>(
 /// discarded by selection. Discarded syntax never supplies a fabricated Value.
 #[derive(Debug)]
 pub(crate) enum CheckValue<'v, P: ValueKind, B: BindingAddress> {
+    /// The live destination is known but its container has no value yet.
+    Pending,
     Current(&'v Value<P, B>),
     /// Live authored syntax whose lowering belongs to its enclosing expression.
     /// No operand value is fabricated and ordinary assignment is disabled.
@@ -120,23 +122,9 @@ impl<P: ValueKind, B: BindingAddress> Clone for CheckValue<'_, P, B> {
 #[derive(Debug, Default)]
 pub struct WalkCoverage {
     conversions: crate::ConversionChannel,
-    committed: crate::validation::AdmittedConversions,
     subject: crate::validation::FindingSubject,
     visits: std::collections::HashSet<(NodeId, UseId, ExpansionInstanceId, ProjectionGeneration)>,
     work: usize,
-    conversion_verdicts: std::collections::HashMap<
-        (
-            NodeId,
-            crate::parser::retained::ExpressionEnvironmentId,
-            UseId,
-            ExpansionInstanceId,
-        ),
-        crate::parser::retained::conversion::RecordedVerdict,
-    >,
-    unknown_destinations: std::collections::HashMap<
-        (UseId, ExpansionInstanceId),
-        crate::validation::presentation::DestinationUnknown,
-    >,
     generations: std::collections::HashMap<(UseId, ExpansionInstanceId), ProjectionGeneration>,
     nodes: std::collections::HashSet<(NodeId, crate::parser::retained::ExpressionEnvironmentId)>,
     unavailable: std::collections::HashSet<crate::parser::retained::UnreachedSlot>,
@@ -148,17 +136,7 @@ impl WalkCoverage {
             .append(findings.in_subject(self.subject.clone()));
     }
     pub(crate) fn take_conversions(&mut self) -> crate::ConversionChannel {
-        self.committed.take()
-    }
-    pub(crate) fn replace_pending(
-        &mut self,
-        pending: crate::ConversionChannel,
-    ) -> crate::ConversionChannel {
-        std::mem::replace(&mut self.conversions, pending)
-    }
-    pub(crate) fn commit_pending(&mut self, witness: crate::validation::AdmissionComplete) {
-        let pending = std::mem::take(&mut self.conversions);
-        self.committed.commit(witness, pending);
+        std::mem::take(&mut self.conversions)
     }
     pub(crate) fn in_subject<T>(
         &mut self,
@@ -179,19 +157,7 @@ impl WalkCoverage {
 
     pub(crate) fn extend(&mut self, other: Self) {
         self.record_conversions(other.conversions);
-        self.committed.extend(other.committed);
         self.visits.extend(other.visits);
-        for (usage, verdict) in other.conversion_verdicts {
-            self.conversion_verdicts
-                .entry(usage)
-                .and_modify(|current| {
-                    if verdict.rejecting() {
-                        *current = verdict;
-                    }
-                })
-                .or_insert(verdict);
-        }
-        self.unknown_destinations.extend(other.unknown_destinations);
         self.nodes.extend(other.nodes);
         self.unavailable.extend(other.unavailable);
         self.work += other.work;
@@ -223,73 +189,6 @@ impl WalkCoverage {
                 generation,
             ))
         })
-    }
-
-    pub(crate) fn reached_root(
-        &self,
-        node: NodeId,
-        occurrence: UseId,
-        instance: ExpansionInstanceId,
-        generation: ProjectionGeneration,
-    ) -> bool {
-        let generation = self
-            .current_generation(occurrence, instance)
-            .map_or(generation, |current| current.latest(generation));
-        self.visits
-            .contains(&(node, occurrence, instance, generation))
-    }
-    pub(crate) fn destination_unknown(
-        &mut self,
-        root: crate::parser::retained::conversion::RootRequirement,
-        witness: crate::validation::presentation::DestinationUnknown,
-    ) {
-        self.unknown_destinations
-            .insert((root.occurrence, root.instance), witness);
-    }
-    pub(crate) fn unknown_destination(
-        &self,
-        root: &crate::parser::retained::conversion::RootRequirement,
-    ) -> Option<&crate::validation::presentation::DestinationUnknown> {
-        self.unknown_destinations
-            .get(&(root.occurrence, root.instance))
-    }
-    pub(crate) fn conversion_outcome(
-        &self,
-        node: NodeId,
-        environment: crate::parser::retained::ExpressionEnvironmentId,
-        root: &crate::parser::retained::conversion::RootRequirement,
-    ) -> Option<crate::parser::retained::conversion::RecordedVerdict> {
-        if !self.reached_root(root.node, root.occurrence, root.instance, root.generation) {
-            return None;
-        }
-        self.conversion_verdicts
-            .get(&(node, environment, root.occurrence, root.instance))
-            .copied()
-    }
-    fn verdict<B: BindingAddress>(
-        &mut self,
-        cursor: &AuthoredCursor<'_, B>,
-        outcome: &PolicyOutcome,
-    ) {
-        if let PolicyOutcome::Claimed(verdict) = outcome
-            && let CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) = &cursor.kind
-            && usage.form() == AuthoredForm::Convert
-        {
-            let verdict = verdict.recorded();
-            self.conversion_verdicts
-                .entry((
-                    usage.node().node_id(),
-                    usage.node().environment().id(),
-                    usage.root_occurrence(),
-                    usage.instance(),
-                ))
-                .and_modify(|current| {
-                    if verdict.rejecting() {
-                        *current = verdict;
-                    }
-                })
-                .or_insert(verdict);
-        }
     }
 
     pub(crate) fn record<B: BindingAddress>(&mut self, authored: &AuthoredUse<'_, B>) {
@@ -930,7 +829,6 @@ pub(crate) struct WithAuthored;
 pub(crate) struct PolicyPosition<'a, 'w, B: BindingAddress, M: WalkMode> {
     cursor: AuthoredCursor<'a, B>,
     claim: &'w mut M::Claim<'a, B>,
-    coverage: &'w mut WalkCoverage,
 }
 pub(crate) trait WalkMode: Clone + Default {
     type Channel: FindingsChannel + 'static;
@@ -978,13 +876,8 @@ impl WalkMode for WithAuthored {
         path: &LeafPath,
         position: PolicyPosition<'a, '_, B, Self>,
     ) -> AssignmentFindings {
-        let PolicyPosition {
-            cursor,
-            claim,
-            coverage,
-        } = position;
+        let PolicyPosition { cursor, claim } = position;
         let outcome = callbacks.policy(declaration, checked, path, cursor.clone());
-        coverage.verdict(&cursor, &outcome);
         claim.record(outcome, cursor)
     }
 }
@@ -1675,6 +1568,16 @@ impl<C: FindingsChannel> InsideSecret for AssignmentFindings<C> {
 }
 /// The destination, value path and definitions still belong to the existing
 /// schema walk. Authored authority is mandatory and moves into each check.
+pub(crate) type ProvenAssignmentCheck<'a, P, B, C = crate::ConversionChannel> =
+    &'a dyn Fn(
+        &CompiledAttributeType,
+        CheckValue<'_, P, B>,
+        &LeafPath,
+        AuthoredCursor<'_, B>,
+        crate::parser::retained::NoConversion,
+    ) -> Result<AssignmentFindings<C>, TypeError>;
+
+#[cfg(test)]
 pub(crate) type AssignmentCheck<'a, P, B, C = crate::ConversionChannel> =
     &'a dyn Fn(
         &CompiledAttributeType,
@@ -1702,7 +1605,11 @@ pub(crate) enum AuthoredOutcome<
     Deferral = std::convert::Infallible,
     Channel = crate::ConversionChannel,
 > {
-    Continue(AssignmentFindings<Channel>),
+    Continue(
+        crate::parser::retained::NoConversion,
+        AssignmentFindings<Channel>,
+    ),
+    Transport(crate::parser::retained::TransportJudgement),
     Claimed(Judgement),
     Deferred(Deferral),
 }
@@ -1745,7 +1652,7 @@ pub(crate) enum AssignmentScope {
 }
 
 pub(crate) struct RequiredAssignmentCallbacks<'a, P: ValueKind, B: BindingAddress> {
-    pub(crate) ordinary: AssignmentCheck<'a, P, B>,
+    pub(crate) ordinary: ProvenAssignmentCheck<'a, P, B>,
     pub(crate) authored: AuthoredChecks<'a, P, B>,
     pub(crate) scope: AssignmentScope,
 }
@@ -1953,7 +1860,22 @@ impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
         };
         match self.policy {
             AuthoredChecks::Validation(check) => match check(attr, value, path, cursor.clone()) {
-                Ok(AuthoredOutcome::Continue(findings)) => PolicyOutcome::Continue(findings),
+                Ok(AuthoredOutcome::Continue(proof, findings)) => {
+                    if cursor.no_conversion() == Some(proof) {
+                        PolicyOutcome::Continue(findings)
+                    } else {
+                        match crate::parser::retained::ConversionVerdict::proof_mismatch(&cursor) {
+                            Ok(verdict) => PolicyOutcome::Claimed(verdict),
+                            Err(error) => rejected(error),
+                        }
+                    }
+                }
+                Ok(AuthoredOutcome::Transport(witness)) => match witness.consume(&cursor) {
+                    Ok(()) => PolicyOutcome::Continue(Default::default()),
+                    Err(error) => PolicyOutcome::Claimed(
+                        crate::parser::retained::ConversionVerdict::invalid_witness(error),
+                    ),
+                },
                 Ok(AuthoredOutcome::Deferred(never)) => match never {},
                 Ok(AuthoredOutcome::Claimed(witness)) => match witness.consume(attr, &cursor) {
                     Ok(verdict) => PolicyOutcome::Claimed(verdict),
@@ -1965,7 +1887,14 @@ impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
             },
             AuthoredChecks::Preflight(boundary) => {
                 match crate::parser::retained::conversion::check_template(boundary, attr, &cursor) {
-                    AuthoredOutcome::Continue(findings) => {
+                    AuthoredOutcome::Continue(proof, findings) => {
+                        if cursor.no_conversion() != Some(proof) {
+                            return rejected(seam_error(
+                                crate::parser::retained::MissingEvidence::new(
+                                    "preflight ordinary proof/cursor pairing",
+                                ),
+                            ));
+                        }
                         let AssignmentFindings {
                             claim_effect,
                             conversions: NoConversions,
@@ -1987,14 +1916,20 @@ impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
                             matched_destination,
                         })
                     }
+                    AuthoredOutcome::Transport(witness) => match witness.consume(&cursor) {
+                        Ok(()) => PolicyOutcome::Continue(Default::default()),
+                        Err(error) => PolicyOutcome::Claimed(
+                            crate::parser::retained::ConversionVerdict::invalid_witness(error),
+                        ),
+                    },
                     AuthoredOutcome::Claimed(never) => match never {},
                     AuthoredOutcome::Deferred(deferral) => PolicyOutcome::Deferred(deferral),
                 }
             }
             AuthoredChecks::Projected(phase) => match cursor.kind {
-                CursorKind::Projected(current) if current == phase => {
-                    PolicyOutcome::Continue(Default::default())
-                }
+                CursorKind::Projected(
+                    crate::parser::retained::ProjectionAuthority::Operational(current),
+                ) if current == phase => PolicyOutcome::Continue(Default::default()),
                 CursorKind::Projected(_) | CursorKind::Authored(_) | CursorKind::CoveredBy(_) => {
                     rejected(seam_error(crate::parser::retained::MissingEvidence::new(
                         "projected callback/cursor pairing",
@@ -2024,9 +1959,12 @@ impl<'a, P: ValueKind, B: BindingAddress> From<AssignmentCallbacks<'a, P, B>>
 {
     fn from(callbacks: AssignmentCallbacks<'a, P, B>) -> Self {
         Self {
-            ordinary: OrdinaryCheck::Direct(callbacks.ordinary),
-            policy: AuthoredChecks::Validation(&|_, _, _, _| {
-                Ok(AuthoredOutcome::Continue(Default::default()))
+            ordinary: OrdinaryCheck::Observer(callbacks.ordinary),
+            policy: AuthoredChecks::Validation(&|_, _, _, cursor| {
+                Ok(AuthoredOutcome::Continue(
+                    cursor.no_conversion().expect("ordinary seam fixture"),
+                    Default::default(),
+                ))
             }),
             scope: AssignmentScope::Full,
             authored: None,
@@ -2039,7 +1977,7 @@ impl<'a, P: ValueKind, B: BindingAddress> From<AssignmentCallbacks<'a, P, B>>
 impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B, NoAuthored> {
     fn new(callbacks: AssignmentCallbacks<'a, P, B, NoConversions>) -> Self {
         Self {
-            ordinary: OrdinaryCheck::Direct(callbacks.ordinary),
+            ordinary: OrdinaryCheck::Observer(callbacks.ordinary),
             policy: (),
             scope: AssignmentScope::Full,
             authored: None,
@@ -2181,7 +2119,16 @@ impl<'a, P: PlaceholderKind, B: BindingAddress, M: WalkMode> AssignmentWalk<'a, 
         if self.claim.is_claimed() {
             return Ok(Default::default());
         }
-        (self.callbacks.ordinary.callback())(attr, value, &path.canonical(), self.cursor.clone())
+        match self.cursor.no_conversion() {
+            Some(proof) => self.callbacks.ordinary.call(
+                attr,
+                value,
+                &path.canonical(),
+                self.cursor.clone(),
+                proof,
+            ),
+            None => Ok(Default::default()), // Transport positions are admitted by their children.
+        }
     }
 
     fn check_selection(
@@ -2193,12 +2140,16 @@ impl<'a, P: PlaceholderKind, B: BindingAddress, M: WalkMode> AssignmentWalk<'a, 
         if self.claim.is_claimed() {
             return Ok(Default::default());
         }
-        (self.callbacks.ordinary.callback())(
-            attr,
-            value,
-            &path.canonical(),
-            self.cursor.selection(),
-        )
+        match self.cursor.no_conversion() {
+            Some(proof) => self.callbacks.ordinary.call(
+                attr,
+                value,
+                &path.canonical(),
+                self.cursor.selection(),
+                proof,
+            ),
+            None => Ok(Default::default()),
+        }
     }
 
     fn apply_policy(
@@ -2223,7 +2174,6 @@ impl<'a, P: PlaceholderKind, B: BindingAddress, M: WalkMode> AssignmentWalk<'a, 
             PolicyPosition {
                 cursor: self.cursor.clone(),
                 claim: &mut self.claim,
-                coverage: &mut self.coverage.borrow_mut(),
             },
         ));
     }
@@ -2476,8 +2426,7 @@ fn validate_authored_value_with_callbacks<
 ) -> ValueValidationFindings {
     let visits = std::cell::RefCell::new(std::mem::take(coverage));
     let callbacks = callbacks.into();
-    let policy =
-        reference.map(|reference| ReferencePolicy::new(callbacks.ordinary.callback(), reference));
+    let policy = reference.map(|reference| ReferencePolicy::new(callbacks.ordinary, reference));
     let checked = {
         let mut callbacks = callbacks.for_walk();
         if !cursor.is_projection_only()
@@ -2600,6 +2549,8 @@ pub(crate) fn visit_discarded<
 
 #[derive(Clone, Copy)]
 enum SyntaxVisit {
+    Pending,
+    PendingCovered,
     Discarded,
     DiscardedCovered,
     Covered,
@@ -2607,6 +2558,8 @@ enum SyntaxVisit {
 impl SyntaxVisit {
     fn value<'v, P: PlaceholderKind, B: BindingAddress>(self) -> CheckValue<'v, P, B> {
         match self {
+            Self::Pending => CheckValue::Pending,
+            Self::PendingCovered => CheckValue::Covered,
             Self::Discarded | Self::DiscardedCovered => CheckValue::Discarded,
             Self::Covered => CheckValue::Covered,
         }
@@ -2614,7 +2567,8 @@ impl SyntaxVisit {
     fn covered(self) -> Self {
         match self {
             Self::Discarded => Self::DiscardedCovered,
-            other => other,
+            Self::Pending => Self::PendingCovered,
+            covered @ (Self::Covered | Self::DiscardedCovered | Self::PendingCovered) => covered,
         }
     }
 }
@@ -2770,8 +2724,10 @@ fn visit_syntax<'w, 's: 'w, P: PlaceholderKind, B: BindingAddress, M: WalkMode>(
             visit
         };
         let authored = match visit.mode {
-            SyntaxVisit::Discarded => AuthoredCursor::authored(cursor.clone()),
-            SyntaxVisit::DiscardedCovered | SyntaxVisit::Covered => {
+            SyntaxVisit::Discarded | SyntaxVisit::Pending => {
+                AuthoredCursor::authored(cursor.clone())
+            }
+            SyntaxVisit::DiscardedCovered | SyntaxVisit::Covered | SyntaxVisit::PendingCovered => {
                 AuthoredCursor::covered_by(cursor.clone())
             }
         };
@@ -2783,16 +2739,19 @@ fn visit_syntax<'w, 's: 'w, P: PlaceholderKind, B: BindingAddress, M: WalkMode>(
             PolicyPosition {
                 cursor: authored.clone(),
                 claim: &mut visit.claim,
-                coverage,
             },
         );
         findings.authored.extend(policy);
-        if !visit.claim.is_claimed() && !matches!(visit.mode, SyntaxVisit::Covered) {
-            findings.ordinary.extend((callbacks.ordinary.callback())(
+        if !visit.claim.is_claimed()
+            && !matches!(visit.mode, SyntaxVisit::Covered)
+            && let Some(proof) = authored.no_conversion()
+        {
+            findings.ordinary.extend(callbacks.ordinary.call(
                 attr,
                 visit.value(),
                 &path.canonical(),
                 authored.clone(),
+                proof,
             )?);
         }
         #[cfg(test)]
@@ -3664,6 +3623,81 @@ impl<'a, M: WalkMode> ValueValidator<'a, '_, M> {
                 path,
                 crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into(),
             );
+        }
+        if let Some(walk) = &assignment
+            && let CursorKind::Authored(usage) = &walk.cursor.kind
+            && usage.node().judgement().contains_any_conversion()
+        {
+            // A transport cannot use a changed projection to bypass its
+            // authored children. Incompatible containers stop at main's
+            // ordinary shape check, before any child conversion is entered.
+            let incompatible = match usage.form() {
+                AuthoredForm::List => (!matches!(
+                    attr.kind,
+                    AttrTypeKind::List { .. } | AttrTypeKind::Union(_)
+                ))
+                .then_some("List"),
+                AuthoredForm::Map => (!matches!(
+                    attr.kind,
+                    AttrTypeKind::Map { .. } | AttrTypeKind::Struct { .. } | AttrTypeKind::Union(_)
+                ))
+                .then_some("Map"),
+                AuthoredForm::Forward
+                | AuthoredForm::Parens
+                | AuthoredForm::Convert
+                | AuthoredForm::Definition
+                | AuthoredForm::Binding
+                | AuthoredForm::Reference
+                | AuthoredForm::Literal
+                | AuthoredForm::Secret
+                | AuthoredForm::If
+                | AuthoredForm::Coalesce
+                | AuthoredForm::Computed
+                | AuthoredForm::Sink => None,
+            };
+            if let Some(shape) = incompatible {
+                return WalkCheckedValue::rejected(
+                    path,
+                    TypeError::value_type_mismatch(attr.type_name(), shape.into()),
+                );
+            }
+        }
+        if matches!(value, ClassifiedRef::Pending(_) | ClassifiedRef::Failed(_))
+            && let Some(walk) = &assignment
+            && let CursorKind::Authored(usage) = &walk.cursor.kind
+            && usage.node().judgement().contains_any_conversion()
+            && matches!(
+                (&attr.kind, usage.form()),
+                (AttrTypeKind::List { .. }, AuthoredForm::List)
+                    | (
+                        AttrTypeKind::Map { .. } | AttrTypeKind::Struct { .. },
+                        AuthoredForm::Map
+                    )
+                    | (
+                        AttrTypeKind::Union(_),
+                        AuthoredForm::List | AuthoredForm::Map
+                    )
+            )
+        {
+            let mut checked =
+                WalkCheckedValue::accepted(attr, FitExactness::EXACT, FitKind::Failed);
+            match visit_syntax(
+                attr,
+                self.defs,
+                path,
+                ancestry,
+                usage.clone(),
+                walk.callbacks.clone(),
+                &mut walk.coverage.borrow_mut(),
+                SyntaxVisit::Pending,
+            ) {
+                Ok(probe) => {
+                    checked.extend_assignment(path, probe.ordinary);
+                    checked.findings.authored.extend(probe.authored);
+                }
+                Err(error) => checked.reject(path, error),
+            }
+            return checked;
         }
         match value {
             ClassifiedRef::Failed(_) => {

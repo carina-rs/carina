@@ -1,5 +1,7 @@
 use super::*;
-use crate::parser::retained::{JudgedSlot, MissingEvidence, ProjectedPhase, ProjectionGeneration};
+use crate::parser::retained::{
+    JudgedExpr, JudgedSlot, MissingEvidence, ProjectionGeneration, ValidationProjection,
+};
 use crate::resource::ParserPlaceholder;
 use crate::resource::knowledge::{
     Classification, ClassificationStage, KnowledgeContext, KnowledgeError,
@@ -30,8 +32,8 @@ enum ResourceEvidence {
 
 pub(super) enum AttributeInput<'a, B: BindingAddress> {
     Authored { slot: &'a JudgedSlot<B> },
-    Projected { phase: ProjectedPhase },
-    Reported,
+    Projected { phase: ValidationProjection },
+    Reported { source: JudgedExpr },
 }
 
 #[derive(Clone)]
@@ -42,14 +44,18 @@ enum StoredInput<B: BindingAddress> {
     },
     Projected {
         value: Arc<Value<ParserPlaceholder, B>>,
-        phase: ProjectedPhase,
+        phase: ValidationProjection,
     },
     // Inputs outside the slot inventory retain main's report-based checks.
     // This mode never grants authored or covered authority.
-    Reported(Arc<Value<ParserPlaceholder, B>>),
+    Reported {
+        value: Arc<Value<ParserPlaceholder, B>>,
+        source: Result<JudgedExpr, MissingEvidence>,
+    },
     Unavailable {
         value: Arc<Value<ParserPlaceholder, B>>,
         error: MissingEvidence,
+        source: Result<JudgedExpr, MissingEvidence>,
     },
 }
 
@@ -58,7 +64,7 @@ impl<B: BindingAddress> StoredInput<B> {
         match self {
             Self::Authored { slot, .. } => slot.projection().expect("prepared materialized slot"),
             Self::Projected { value, .. }
-            | Self::Reported(value)
+            | Self::Reported { value, .. }
             | Self::Unavailable { value, .. } => value,
         }
     }
@@ -149,7 +155,15 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             report: Some(Arc::new(report.clone())),
             inputs: values
                 .iter()
-                .map(|(name, value)| (name.clone(), StoredInput::Reported(Arc::new(value.clone()))))
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        StoredInput::Reported {
+                            value: Arc::new(value.clone()),
+                            source: source_judgement(resource, name),
+                        },
+                    )
+                })
                 .collect(),
         }
     }
@@ -164,7 +178,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     }
 
     pub(super) fn is_reported(&self, name: &str) -> bool {
-        matches!(self.inputs.get(name), Some(StoredInput::Reported(_)))
+        matches!(self.inputs.get(name), Some(StoredInput::Reported { .. }))
     }
 
     /// Produce inputs for exactly the resolved attribute key set. Evaluation
@@ -233,7 +247,12 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
                         // No authored declaration exists for this resolved
                         // name. Main admitted it from the report; it is not a
                         // failed live correspondence or synthetic authority.
-                        Err(_) => return Ok(StoredInput::Reported(Arc::new(value.clone()))),
+                        Err(_) => {
+                            return Ok(StoredInput::Reported {
+                                value: Arc::new(value.clone()),
+                                source: source_judgement(resource, name),
+                            });
+                        }
                     };
                     let source = match &sources {
                         Some(sources) => {
@@ -259,6 +278,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
                     prepare().unwrap_or_else(|error| StoredInput::Unavailable {
                         value: Arc::new(value.clone()),
                         error,
+                        source: source_judgement(resource, name),
                     }),
                 )
             })
@@ -319,7 +339,12 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         for (name, _) in self.unmatched_materializations(values) {
             self.inputs.insert(
                 name.clone(),
-                StoredInput::Reported(Arc::new(values[&name].clone())),
+                StoredInput::Reported {
+                    value: Arc::new(values[&name].clone()),
+                    source: Err(MissingEvidence::new(
+                        "new materialized attribute has no source judgement",
+                    )),
+                },
             );
         }
         self.apply_materializations(values);
@@ -381,7 +406,9 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
                 StoredInput::Projected {
                     value: projection, ..
                 }
-                | StoredInput::Reported(projection)
+                | StoredInput::Reported {
+                    value: projection, ..
+                }
                 | StoredInput::Unavailable {
                     value: projection, ..
                 } => *projection = Arc::new(value.clone()),
@@ -399,6 +426,8 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             B,
         >,
         name: &str,
+        report: &crate::parser::retained::ExpressionReport<B>,
+        alias: Option<&str>,
     ) -> Result<AttributeInput<'_, B>, MissingEvidence>
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -414,17 +443,80 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             StoredInput::Authored {
                 slot,
                 source_generation,
-            } => {
-                let source = resource.authored_slot(name)?;
-                if source.instance() != slot.instance() || source.generation() != *source_generation
+            } => match resource.authored_slot(name) {
+                Ok(source)
+                    if source.instance() == slot.instance()
+                        && source.generation() == *source_generation =>
                 {
-                    return Err(MissingEvidence::new("resource instance/generation pairing"));
+                    Ok(AttributeInput::Authored { slot })
                 }
-                Ok(AttributeInput::Authored { slot })
-            }
-            StoredInput::Unavailable { error, .. } => Err(error.clone()),
-            StoredInput::Projected { phase, .. } => Ok(AttributeInput::Projected { phase: *phase }),
-            StoredInput::Reported(_) => Ok(AttributeInput::Reported),
+                Ok(_) => ValidationProjection::unavailable(
+                    slot.source_judgement()?,
+                    MissingEvidence::new("resource instance/generation pairing"),
+                )
+                .map(|phase| AttributeInput::Projected { phase }),
+                Err(error) => ValidationProjection::unavailable(slot.source_judgement()?, error)
+                    .map(|phase| AttributeInput::Projected { phase }),
+            },
+            StoredInput::Unavailable { error, source, .. } => match source {
+                Ok(source) => ValidationProjection::unavailable(source, error.clone())
+                    .map(|phase| AttributeInput::Projected { phase }),
+                Err(_) => Err(error.clone()),
+            },
+            StoredInput::Projected { phase, .. } => Ok(AttributeInput::Projected {
+                phase: phase.clone(),
+            }),
+            StoredInput::Reported { source, .. } => Ok(AttributeInput::Reported {
+                source: source
+                    .clone()
+                    .or_else(|_| reported_source(resource, name, report, alias))?,
+            }),
         }
+    }
+}
+
+fn source_judgement<B: BindingAddress, D>(
+    resource: &crate::parser::AnalysisResourceRef<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+    name: &str,
+) -> Result<JudgedExpr, MissingEvidence>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    let slot = resource.authored_slot(name)?;
+    slot.source_judgement().cloned()
+}
+
+// Existing semantic module-output bindings and schema block aliases identify
+// the producer. Diagnostic locations never establish conversion authority.
+fn reported_source<B: BindingAddress, D>(
+    resource: &crate::parser::AnalysisResourceRef<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+    name: &str,
+    report: &crate::parser::retained::ExpressionReport<B>,
+    alias: Option<&str>,
+) -> Result<JudgedExpr, MissingEvidence>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    use crate::parser::AnalysisItemKind;
+    match resource.kind() {
+        AnalysisItemKind::Composition => report
+            .module_attribute(
+                resource
+                    .binding_address()
+                    .ok_or_else(|| MissingEvidence::new("composition binding"))?,
+                name,
+            )
+            .cloned(),
+        AnalysisItemKind::Resource
+        | AnalysisItemKind::DataSource
+        | AnalysisItemKind::DeferredResource => {
+            let slot = resource
+                .authored_slot(name)
+                .or_else(|error| alias.map_or(Err(error), |alias| resource.authored_slot(alias)))?;
+            slot.source_judgement_in(report)
+                .or_else(|_| slot.source_judgement())
+                .cloned()
+        }
+        AnalysisItemKind::Wait => Err(MissingEvidence::new("wait is not an attribute producer")),
     }
 }

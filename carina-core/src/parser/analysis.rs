@@ -1475,7 +1475,10 @@ where
             })
     }
 
-    pub(crate) fn projected_phase(&self, name: &str) -> Option<super::retained::ProjectedPhase> {
+    pub(crate) fn projected_phase(
+        &self,
+        name: &str,
+    ) -> Option<super::retained::ValidationProjection> {
         self.authored_slots()?.projected_phase(name)
     }
 
@@ -2819,13 +2822,6 @@ where
         &self.iterables
     }
 
-    pub(crate) fn admission_scope(&self) -> super::retained::AuthoredScopeId {
-        self.file
-            .parser_binding_metadata
-            .syntax()
-            .expressions()
-            .admission_scope()
-    }
     pub(crate) fn admission_report(&self) -> &super::retained::ExpressionReport<B> {
         self.file
             .parser_binding_metadata

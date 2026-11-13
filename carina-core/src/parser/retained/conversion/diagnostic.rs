@@ -25,7 +25,6 @@ pub enum ConversionErrorKind {
     AmbiguousDestination,
     /// Unsupported authored placement, including boundary placeholders until B2.
     UnsupportedPosition,
-    Unused,
     Target,
     Source,
     ScalarKind,
@@ -38,7 +37,6 @@ impl ConversionErrorKind {
             Self::Destination => "conversion_destination",
             Self::AmbiguousDestination => "conversion_ambiguous_destination",
             Self::UnsupportedPosition => "conversion_unsupported_position",
-            Self::Unused => "conversion_unused",
             Self::Target => "conversion_target",
             Self::Source => "conversion_source",
             Self::ScalarKind => "conversion_scalar_kind",
@@ -67,7 +65,7 @@ impl ConversionCause {
 }
 
 /// A located, structured error; it holds no runtime value or admission receipt.
-/// Only conversion policy, completion, and conversion parsing can construct one.
+/// Only judgement placement and conversion sink policy can construct one.
 ///
 /// ```compile_fail,E0624
 /// use carina_core::ConversionError;
@@ -240,8 +238,20 @@ impl InsideSecret for ConversionError {
 pub(crate) struct ConversionFindings {
     findings: Vec<ConversionError>,
     owners: std::collections::HashSet<crate::parser::retained::NodeId>,
+    batches: std::collections::HashMap<usize, std::sync::Arc<ConversionChannel>>,
 }
 impl ConversionFindings {
+    pub(crate) fn record_batch(
+        &mut self,
+        batch: std::sync::Arc<ConversionChannel>,
+        subject: crate::validation::FindingSubject,
+    ) {
+        let key = std::sync::Arc::as_ptr(&batch) as usize;
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.batches.entry(key) {
+            entry.insert(batch.clone());
+            self.extend(batch.as_ref().clone().in_subject(subject));
+        }
+    }
     /// One diagnostic per Convert NodeId: the first rejection wins (shared by CLI and LSP).
     pub fn extend(&mut self, channel: ConversionChannel) {
         for error in channel.into_findings() {
@@ -255,7 +265,7 @@ impl ConversionFindings {
     }
 }
 
-/// Uncollected conversion output from one walk or completeness report. It
+/// Uncollected placement or sink-policy output. It
 /// cannot carry an ordinary error and does not deduplicate per-use evidence.
 #[derive(Clone, Default, PartialEq)]
 pub(crate) struct ConversionChannel {

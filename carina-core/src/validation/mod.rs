@@ -10,12 +10,10 @@ pub mod deferred_types;
 pub mod depends_on;
 mod parameter_findings;
 pub(crate) mod presentation;
-pub(crate) use presentation::{AdmissionComplete, AdmittedConversions};
 pub use presentation::{
-    AdmissionIncomplete, ClientFindingKind, ConversionValidation, FindingSubject, OrdinaryFailure,
-    OrdinaryFinding, PresentedConversion, PresentedFinding, PresentedFindings,
-    ResourceAdmissionStep, ResourceValidationReport, ValidationClientError,
-    ValidationClientFailure,
+    ClientFindingKind, ConversionValidation, FindingSubject, OrdinaryFailure, OrdinaryFinding,
+    PresentedConversion, PresentedFinding, PresentedFindings, ResourceAdmissionStep,
+    ResourceValidationReport, ValidationClientError, ValidationClientFailure,
 };
 pub mod routing;
 pub mod typecheck;
@@ -1419,7 +1417,10 @@ fn precheck_value_source<B: BindingAddress>(
         });
     if matches!(
         admission,
-        Ok(crate::parser::retained::ExpressionAdmission::DeferredInterpolation)
+        Ok(
+            crate::parser::retained::ExpressionAdmission::DeferredInterpolation
+                | crate::parser::retained::ExpressionAdmission::ConversionRequired
+        )
     ) {
         return None;
     }
@@ -5185,28 +5186,10 @@ enum ResourceAdmissionDetail {
     Arithmetic(Box<crate::parser::Located<IntegerArithmeticTypeFinding>>),
     Iterable(Box<crate::parser::Located<DeferredForIterableTypeDiagnostic>>),
     UnavailableSchema(AnonymousResourceSchemaError),
-    Incomplete(AdmissionIncomplete),
     Message,
 }
 
 impl ResourceAdmissionFinding {
-    fn incomplete(error: AdmissionIncomplete) -> Self {
-        Self {
-            human: error.to_string(),
-            detail: ResourceAdmissionDetail::Incomplete(error),
-            location: None,
-        }
-    }
-    pub fn admission_incomplete(&self) -> Option<&AdmissionIncomplete> {
-        match &self.detail {
-            ResourceAdmissionDetail::Incomplete(error) => Some(error),
-            ResourceAdmissionDetail::Schema { .. }
-            | ResourceAdmissionDetail::Arithmetic(_)
-            | ResourceAdmissionDetail::Iterable(_)
-            | ResourceAdmissionDetail::UnavailableSchema(_)
-            | ResourceAdmissionDetail::Message => None,
-        }
-    }
     /// Add CLI module context as presentation without changing the finding.
     fn with_context(mut self, prefix: &str) -> Self {
         self.human = self
@@ -5240,7 +5223,6 @@ impl ResourceAdmissionFinding {
             ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
-            | ResourceAdmissionDetail::Incomplete(_)
             | ResourceAdmissionDetail::Message => None,
         }
     }
@@ -5250,7 +5232,6 @@ impl ResourceAdmissionFinding {
             ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
-            | ResourceAdmissionDetail::Incomplete(_)
             | ResourceAdmissionDetail::Message => None,
         }
     }
@@ -5260,7 +5241,6 @@ impl ResourceAdmissionFinding {
             | ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
-            | ResourceAdmissionDetail::Incomplete(_)
             | ResourceAdmissionDetail::Message => None,
         }
     }
@@ -5286,7 +5266,6 @@ impl ResourceAdmissionFinding {
             ResourceAdmissionDetail::Arithmetic(finding) => finding.detail().to_string(),
             ResourceAdmissionDetail::Iterable(finding) => finding.detail().to_string(),
             ResourceAdmissionDetail::UnavailableSchema(error) => error.to_string(),
-            ResourceAdmissionDetail::Incomplete(error) => error.to_string(),
             ResourceAdmissionDetail::Message => self.human.clone(),
         }
     }
@@ -5335,7 +5314,6 @@ impl std::fmt::Display for ResourceAdmissionFinding {
             | ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
-            | ResourceAdmissionDetail::Incomplete(_)
             | ResourceAdmissionDetail::Message => formatter.write_str(&self.human),
         }
     }
@@ -5353,7 +5331,13 @@ impl ResourceAdmissionFindings {
     }
 }
 
-struct ResourceValidationContext<'a> {
+struct ValueAdmission<'a, B: BindingAddress> {
+    report: &'a crate::parser::retained::ExpressionReport<B>,
+    coverage: &'a mut crate::schema::value_validation::WalkCoverage,
+}
+
+struct ResourceValidationContext<'a, B: BindingAddress> {
+    report: &'a crate::parser::retained::ExpressionReport<B>,
     registry: &'a SchemaRegistry,
     known_providers: &'a HashSet<String>,
     provider_context: &'a ProviderContext,
@@ -5361,15 +5345,17 @@ struct ResourceValidationContext<'a> {
     diagnostics: &'a mut dyn deferred_types::ProviderTypeCheckSink,
     admissions:
         Option<&'a HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>>,
+    coverage: &'a mut crate::schema::value_validation::WalkCoverage,
 }
 
 fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
     id: &crate::resource::ResourceId,
+    slots: &crate::parser::retained::AuthoredSlots<B>,
     quoted_string_attrs: &HashSet<String>,
     attributes: &IndexMap<String, GenericValue<P, B>>,
     schema: Option<crate::schema::OwnerBoundResourceSchema<'_>>,
     kind: ValidatableKind,
-    context: &mut ResourceValidationContext<'_>,
+    context: &mut ResourceValidationContext<'_, B>,
 ) {
     match schema {
         Some(schema) => {
@@ -5402,6 +5388,14 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
                                     session,
                                     None,
                                     None,
+                                    admission::attributes::SchemaInputAuthority {
+                                        slots,
+                                        report: context
+                                            .report
+                                            .for_resource(id)
+                                            .unwrap_or(context.report),
+                                        coverage: context.coverage,
+                                    },
                                 )
                             }
                             ValidatableKind::DataSource => {
@@ -5418,6 +5412,14 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
                                     session,
                                     None,
                                     None,
+                                    admission::attributes::SchemaInputAuthority {
+                                        slots,
+                                        report: context
+                                            .report
+                                            .for_resource(id)
+                                            .unwrap_or(context.report),
+                                        coverage: context.coverage,
+                                    },
                                 )
                             }
                         }
@@ -5532,22 +5534,36 @@ fn validate_resources_from_report<
     >,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
 ) -> Result<(), String> {
-    let findings = resource_values_report(
-        parsed,
-        registry,
-        known_providers,
-        provider_context,
-        admissions,
-        diagnostics,
-    );
+    let existing = parsed
+        .parser_binding_metadata
+        .syntax()
+        .expressions()
+        .admission_report();
+    let fresh;
+    let report = if existing.has_authored_judgement() {
+        existing
+    } else {
+        fresh = crate::parser::retained::judge_expressions(parsed, registry, provider_context);
+        &fresh
+    };
+    let mut run: ConversionValidation = ConversionValidation::new(report);
+    let findings = run.walk_in(FindingSubject::Root, |coverage| {
+        resource_values_report(
+            parsed,
+            registry,
+            known_providers,
+            provider_context,
+            admissions,
+            diagnostics,
+            ValueAdmission { report, coverage },
+        )
+    });
+    run.ordinary(findings, FindingSubject::Root);
+    let findings = run.complete().into_presented();
     if findings.is_empty() {
         Ok(())
     } else {
-        Err(findings
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n"))
+        Err(findings.to_string())
     }
 }
 
@@ -5566,7 +5582,9 @@ fn resource_values_report<
         &HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>,
     >,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
+    admission: ValueAdmission<'_, B>,
 ) -> Vec<ResourceAdmissionFinding> {
+    let ValueAdmission { report, coverage } = admission;
     let mut all_errors = ResourceAdmissionFindings::default();
     // A standalone module receives its providers from the caller, so schema
     // availability cannot be decided until its resources are expanded into a
@@ -5599,12 +5617,14 @@ fn resource_values_report<
     // *opposite* kind exists.
     {
         let mut context = ResourceValidationContext {
+            report,
             registry,
             known_providers,
             provider_context,
             all_errors: &mut all_errors,
             diagnostics,
             admissions,
+            coverage,
         };
         for rref in parsed.iter_all_resources() {
             // A deferred for-expression template body is always managed —
@@ -5613,6 +5633,7 @@ fn resource_values_report<
                 ResourceRef::LiveComposition(_) => {}
                 ResourceRef::DataSource(resource) => validate_resource_values(
                     &resource.id,
+                    &resource.authored_slots,
                     &resource.quoted_string_attrs,
                     &resource.attributes,
                     registry.get_for_data_source(resource),
@@ -5623,6 +5644,7 @@ fn resource_values_report<
                     let schema = registry.get_for(resource);
                     validate_resource_values(
                         &resource.id,
+                        &resource.authored_slots,
                         &resource.quoted_string_attrs,
                         &resource.attributes,
                         schema,
@@ -5644,6 +5666,7 @@ fn resource_values_report<
                     let schema = registry.get_for(resource.as_resource());
                     validate_resource_values(
                         resource.id(),
+                        &resource.as_resource().authored_slots,
                         resource.quoted_string_attrs(),
                         resource.attributes(),
                         schema,
@@ -5740,7 +5763,7 @@ pub fn resource_reference_findings_in<
         diagnostics,
         run,
         &subject,
-        presentation::AdmissionBoundary::Scope(judged.report().admission_scope()),
+        presentation::AdmissionBoundary::Live,
     )?;
     run.ordinary(report.references.0, subject);
     Ok(())
@@ -5860,16 +5883,22 @@ fn complete_resource_admission_report<
         diagnostics,
         run,
         subject,
-        presentation::AdmissionBoundary::Scope(judged.report().admission_scope()),
+        presentation::AdmissionBoundary::Live,
     )?;
-    let mut findings = resource_values_report(
-        judged.file(),
-        judged.schemas(),
-        known_providers,
-        bindings.provider_context(),
-        Some(&report.attributes),
-        diagnostics,
-    );
+    let mut findings = run.walk_in(subject.clone(), |coverage| {
+        resource_values_report(
+            judged.file(),
+            judged.schemas(),
+            known_providers,
+            bindings.provider_context(),
+            Some(&report.attributes),
+            diagnostics,
+            ValueAdmission {
+                report: judged.report(),
+                coverage,
+            },
+        )
+    });
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file())?;
     let mut resources = HashMap::new();
     for resource in tree.project_resources() {

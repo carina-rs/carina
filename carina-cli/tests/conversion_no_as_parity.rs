@@ -1,7 +1,7 @@
 use std::process::Command;
 
 #[path = "support/conversion_totality.rs"]
-mod round4_fixtures;
+mod round5_fixtures;
 
 #[test]
 fn conversion_no_as_directories_match_main_validate_json() {
@@ -33,65 +33,34 @@ fn conversion_no_as_directories_match_main_validate_json() {
 }
 
 #[test]
-fn round4_generated_no_as_twins_keep_mains_vacuous_conversion_result() {
-    use round4_fixtures::*;
+fn round5_generated_no_as_transport_twins_keep_mains_ordinary_result() {
+    use round5_fixtures::*;
     let directory = tempfile::tempdir().unwrap();
     let count = emit_twins(directory.path());
-    assert_eq!(count, 630);
+    eprintln!("{count} no-as twins: {}", directory.path().display());
     let mut checked = 0;
     for position in POSITIONS {
-        for liveness in LIVENESS {
-            if let Some(reason) = resource_cell_exclusion(position, liveness) {
-                eprintln!("excluded no-as {position:?}/{liveness:?}: {reason}");
-                continue;
-            }
+        for known in [true, false] {
             let path = directory
                 .path()
+                .join("transport")
                 .join(position.label())
-                .join(liveness.label())
-                .join(Quality::Valid.label());
+                .join(if known { "known" } else { "unknown" })
+                .join("valid");
             let json = carina_cli::commands::validate::validate_diagnostics_with_factories(
-                &carina_core::paths::ResolvedPath::new(&path).unwrap(),
+                &carina_core::paths::ResolvedPath::new(path).unwrap(),
                 carina_cli::wiring::LoadedProviderFactory::for_test(factories()),
                 Default::default(),
             )
             .json;
-            // Derived from main's schema-None and undefined-reference exits;
-            // every other twin has only fitting literal values and valid names.
-            let expected = if matches!(
-                liveness,
-                Liveness::DestinationUnknown | Liveness::OrdinaryStopped
-            ) {
-                "error"
-            } else {
-                "ok"
-            };
             assert_eq!(
-                json["status"], expected,
-                "{position:?}/{liveness:?}: {json}"
+                json["status"],
+                if known { "ok" } else { "error" },
+                "{position:?}/{known}: {json}"
             );
-            for finding in json
-                .get("errors")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                assert!(
-                    !finding["code"]
-                        .as_str()
-                        .is_some_and(|code| code.starts_with("conversion_")),
-                    "{json}"
-                );
-                assert!(
-                    !finding["message"]
-                        .as_str()
-                        .unwrap()
-                        .contains("bug in carina"),
-                    "{json}"
-                );
-            }
+            assert!(!json.to_string().contains("conversion_"), "{json}");
             checked += 1;
         }
     }
-    assert_eq!(checked, 142);
+    assert_eq!(checked, POSITIONS.len() * 2);
 }

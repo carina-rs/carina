@@ -1195,8 +1195,6 @@ pub enum AppError {
 
     #[error(transparent)]
     ResourceAdmission(Box<carina_core::validation::ResourceAdmissionFinding>),
-    #[error("{0}")]
-    PresentedConversion(Box<carina_core::validation::PresentedConversion>),
 
     #[error("{0}")]
     Parse(Box<carina_core::parser::ParseError>),
@@ -1735,20 +1733,6 @@ impl carina_core::validation::ValidationClientError for AppError {
 }
 
 impl AppError {
-    pub(crate) fn from_presented<E: carina_core::validation::ValidationClientError>(
-        finding: carina_core::validation::PresentedFinding<E>,
-        client: impl FnOnce(E) -> Self,
-    ) -> Self {
-        use carina_core::validation::{OrdinaryFinding, PresentedFinding};
-        match finding {
-            PresentedFinding::Ordinary(OrdinaryFinding::Resource(error)) => {
-                Self::ResourceAdmission(error)
-            }
-            PresentedFinding::Ordinary(OrdinaryFinding::Client(error)) => client(*error),
-            PresentedFinding::Conversion(error) => Self::PresentedConversion(Box::new(error)),
-        }
-    }
-
     pub(crate) fn invalid_saved_plan_provider_evidence(
         path: carina_core::paths::DisplayPath,
         replan_command: Option<String>,
@@ -2848,5 +2832,56 @@ mod tests {
             out.contains("Expected:    111111111111, 222222222222 (allowed_account_ids)"),
             "expected list missing: {out}"
         );
+    }
+}
+
+/// Final presentation only. This type deliberately does not implement
+/// ValidationClientFailure: a conversion cannot stop authored admission.
+///
+/// ```compile_fail,E0308
+/// use carina_cli::error::{AppError, PresentedAppError};
+/// fn stop(run: &mut carina_core::validation::ConversionValidation<AppError>, finding: PresentedAppError) {
+///     run.fail(finding);
+/// }
+/// ```
+#[derive(Debug, thiserror::Error)]
+pub enum PresentedAppError {
+    #[error(transparent)]
+    Ordinary(AppError),
+    #[error("{0}")]
+    Conversion(Box<carina_core::validation::PresentedConversion>),
+}
+impl From<AppError> for PresentedAppError {
+    fn from(error: AppError) -> Self {
+        Self::Ordinary(error)
+    }
+}
+impl PresentedAppError {
+    pub(crate) fn diagnostic_text(&self) -> String {
+        match self {
+            Self::Ordinary(error) => format_error_with_source_chain(error),
+            Self::Conversion(error) => error.to_string(),
+        }
+    }
+    pub(crate) fn into_rendered(self) -> AppError {
+        match self {
+            Self::Ordinary(error) => error,
+            Self::Conversion(error) => AppError::Validation(error.to_string()),
+        }
+    }
+    pub(crate) fn from_presented<E: carina_core::validation::ValidationClientError>(
+        finding: carina_core::validation::PresentedFinding<E>,
+        client: impl FnOnce(E) -> AppError,
+    ) -> Self {
+        use carina_core::validation::{OrdinaryFinding, PresentedFinding};
+        match finding {
+            PresentedFinding::Ordinary(OrdinaryFinding::Resource(error)) => {
+                Self::Ordinary(AppError::ResourceAdmission(error))
+            }
+            PresentedFinding::Ordinary(OrdinaryFinding::Client(error)) => {
+                Self::Ordinary(client(*error))
+            }
+            PresentedFinding::Conversion(error) => Self::Conversion(Box::new(error)),
+        }
     }
 }

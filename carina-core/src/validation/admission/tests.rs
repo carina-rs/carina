@@ -139,6 +139,7 @@ fn validate<K: DestinationKind>(
             .into_classification(),
         Some(bindings),
         session,
+        crate::test_utils::no_conversion_proof(),
     );
     admit(destination, candidate, &context)
 }
@@ -361,6 +362,7 @@ fn ambiguous_union_checks_members<K: DestinationKind + std::fmt::Debug>() {
                                 .into_classification(),
                             Some(bindings),
                             session,
+                            crate::test_utils::no_conversion_proof(),
                         );
                         let judgement =
                             assignment::judge_with_findings(&destination, &candidate, &context);
@@ -400,6 +402,7 @@ fn replacing_candidate_value_carries_all_original_obligations() {
                         .into_classification(),
                     Some(bindings),
                     session,
+                    crate::test_utils::no_conversion_proof(),
                 );
                 let original = candidate.clone();
                 let resolved = text("fits");
@@ -485,6 +488,7 @@ fn needs_local_without_pending_sites_remains_pending() {
                         .into_classification(),
                     None,
                     session,
+                    crate::test_utils::no_conversion_proof(),
                 );
                 let local_check = |_: &CompiledAttributeType,
                                    _: &crate::resource::Value<
@@ -842,6 +846,7 @@ fn declared_reference_defers_same_identity_local_constraints_at_resource_sink() 
                         .into_classification(),
                     Some(bindings),
                     session,
+                    crate::test_utils::no_conversion_proof(),
                 );
                 context.declaration = Some(("argument", &declared));
                 let pending = admit(destination, candidate, &context)
@@ -1411,6 +1416,7 @@ fn candidate_cannot_use_another_candidates_boundary_proof() {
                         .into_classification(),
                     Some(bindings),
                     session,
+                    crate::test_utils::no_conversion_proof(),
                 );
                 let (_, context) = Candidate::validation_classified(
                     second
@@ -1419,6 +1425,7 @@ fn candidate_cannot_use_another_candidates_boundary_proof() {
                         .into_classification(),
                     Some(bindings),
                     session,
+                    crate::test_utils::no_conversion_proof(),
                 );
                 assert!(admit(destination, candidate, &context).is_err());
             })
@@ -2811,6 +2818,7 @@ fn round13_cross_owner_same_identity_defers_in_reference_and_declared_admission(
                         .into_classification(),
                     Some(&bindings),
                     session,
+                    crate::test_utils::no_conversion_proof(),
                 );
                 if as_declared {
                     boundary.declaration = Some(("argument", &declared));
@@ -2922,6 +2930,11 @@ fn round2_plain_reference_skips_expression_callback() {
                 session,
                 Some(&check),
                 None,
+                attributes::SchemaInputAuthority {
+                    slots: resource.authored_slots().unwrap(),
+                    report: judged.report(),
+                    coverage: &mut Default::default(),
+                },
             );
             result
                 .errors()

@@ -275,6 +275,20 @@ pub(crate) fn collapse_errors(errors: Vec<AppError>) -> AppError {
     )
 }
 
+pub(crate) fn collapse_presented_errors(errors: Vec<crate::error::PresentedAppError>) -> AppError {
+    collapse_errors(
+        errors
+            .into_iter()
+            .map(|error| match error {
+                crate::error::PresentedAppError::Ordinary(error) => error,
+                crate::error::PresentedAppError::Conversion(error) => {
+                    AppError::Validation(error.to_string())
+                }
+            })
+            .collect(),
+    )
+}
+
 pub(crate) fn duplicate_declaration_errors(
     duplicate_declarations: &[DuplicateDeclaration],
     module_walk: &ModuleWalk,
@@ -316,7 +330,7 @@ pub fn validate_and_resolve_with_config(
             duplicate_declarations,
         )
         .into_result()
-        .map_err(|errors| collapse_errors(errors.into_vec()))
+        .map_err(|errors| collapse_presented_errors(errors.into_vec()))
 }
 
 /// Human commands explicitly select this output policy for provider events.
@@ -363,7 +377,7 @@ pub fn validate_and_resolve_with_provider_load_for_test(
             duplicate_declarations,
         )
         .into_result()
-        .map_err(|errors| collapse_errors(errors.into_vec()))
+        .map_err(|errors| collapse_presented_errors(errors.into_vec()))
 }
 
 /// Test-support collecting, non-minting validation entry point.
@@ -396,54 +410,6 @@ pub(crate) enum ConfigNameResolution {
     EvaluatedOnly,
     ReadOnly,
     Paired(Box<UnresolvedConfigSnapshot>),
-}
-
-/// The entry's one closed parameter determines both admission and run kind.
-/// Legacy public validation helpers translate their existing arguments here.
-enum ConfigurationValidationMode {
-    Validate(ConfigNameResolution),
-    ProjectionOnly(ConfigNameResolution),
-    Recovery,
-}
-impl ConfigurationValidationMode {
-    fn from_parts(names: ConfigNameResolution, skip: bool) -> Self {
-        match (names, skip) {
-            (ConfigNameResolution::ReadOnly, true | false) => Self::Recovery,
-            (
-                names @ (ConfigNameResolution::EvaluatedOnly | ConfigNameResolution::Paired(_)),
-                false,
-            ) => Self::Validate(names),
-            (
-                names @ (ConfigNameResolution::EvaluatedOnly | ConfigNameResolution::Paired(_)),
-                true,
-            ) => Self::ProjectionOnly(names),
-        }
-    }
-    fn run<T>(
-        &self,
-        parsed: &carina_core::config_loader::RootDirectoryParse<T>,
-    ) -> carina_core::validation::ConversionValidation<AppError> {
-        match self {
-            Self::Validate(_) => {
-                carina_core::validation::ConversionValidation::for_directory(parsed)
-            }
-            Self::ProjectionOnly(_) | Self::Recovery => {
-                carina_core::validation::ConversionValidation::for_read_only_directory(parsed)
-            }
-        }
-    }
-    fn skips_admission(&self) -> bool {
-        match self {
-            Self::Validate(_) => false,
-            Self::ProjectionOnly(_) | Self::Recovery => true,
-        }
-    }
-    fn names(self) -> ConfigNameResolution {
-        match self {
-            Self::Validate(names) | Self::ProjectionOnly(names) => names,
-            Self::Recovery => ConfigNameResolution::ReadOnly,
-        }
-    }
 }
 
 /// Internal result of the sealed validation pipeline.
@@ -643,8 +609,7 @@ pub(crate) fn validate_and_resolve_report_inner(
         &parsed,
         enriched_context,
     );
-    let mode = ConfigurationValidationMode::from_parts(name_resolution, skip_resource_validation);
-    let mut validation = mode.run(&parsed);
+    let mut validation = carina_core::validation::ConversionValidation::for_directory(&parsed);
     let result = validate_and_resolve_configuration(
         access,
         parsed,
@@ -653,7 +618,8 @@ pub(crate) fn validate_and_resolve_report_inner(
         enriched_context,
         _load_errors,
         duplicate_declarations,
-        mode,
+        skip_resource_validation,
+        name_resolution,
         &mut authored_inputs,
         &mut warnings,
         &mut validation,
@@ -662,14 +628,15 @@ pub(crate) fn validate_and_resolve_report_inner(
         .complete()
         .into_presented()
         .into_iter()
-        .map(|finding| AppError::from_presented(finding, |error| error))
+        .map(|finding| crate::error::PresentedAppError::from_presented(finding, |error| error))
         .collect::<Vec<_>>();
     let result = match result {
-        Ok(config) => match NonEmptyValidationErrors::try_from(errors) {
+        Ok(config) => match NonEmptyValidationErrors::from_presented(errors) {
             Ok(errors) => Err(errors),
             Err(_empty) => Ok(config),
         },
-        Err(ValidationStopped(_failure)) => Err(non_empty_validation_failure(errors)),
+        Err(ValidationStopped(_failure)) => Err(NonEmptyValidationErrors::from_presented(errors)
+            .expect("ordinary stop retains a finding")),
     };
     ConfigurationValidation {
         result,
@@ -702,13 +669,12 @@ fn validate_and_resolve_configuration(
     enriched_context: &ValidationProviderCatalog,
     _load_errors: &HashMap<String, String>,
     duplicate_declarations: &[DuplicateDeclaration],
-    mode: ConfigurationValidationMode,
+    skip_resource_validation: bool,
+    name_resolution: ConfigNameResolution,
     authored_inputs: &mut carina_core::input_rules::AuthoredInputs,
     warnings: &mut Vec<ConfigurationWarning>,
     validation: &mut carina_core::validation::ConversionValidation<AppError>,
 ) -> Result<ResolvedConfig, ValidationStopped> {
-    let skip_resource_validation = mode.skips_admission();
-    let name_resolution = mode.names();
     let initial_warning_count = parsed.warnings.len();
     let resolved_base = base_dir.clone();
     let base_dir = &resolved_base;
@@ -975,7 +941,7 @@ fn validate_and_resolve_configuration(
         ctx.schemas(),
         &authored_module_call_findings,
     );
-    let mut parsed = match module_resolution {
+    let mut parsed = match module_resolution.into_validation(errors) {
         module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
             errors.include_file(&graph);
             *authored_inputs = graph
@@ -1407,11 +1373,6 @@ fn validate_and_resolve_configuration(
     }
 }
 
-fn non_empty_validation_failure(errors: Vec<AppError>) -> NonEmptyValidationErrors {
-    NonEmptyValidationErrors::try_from(errors)
-        .expect("validation failure branch must retain at least one diagnostic")
-}
-
 /// Split the newline-joined error strings that `carina_core::validation::*`
 /// helpers return into individual `AppError::Validation` entries. Command and
 /// wiring validation paths share this renderer so multi-error results retain
@@ -1430,22 +1391,6 @@ impl ValidationMessages for str {
 impl ValidationMessages for String {
     fn validation_errors(&self) -> Vec<AppError> {
         self.as_str().validation_errors()
-    }
-}
-impl ValidationMessages for carina_core::validation::PresentedFindings {
-    fn validation_errors(&self) -> Vec<AppError> {
-        use carina_core::validation::{OrdinaryFinding, PresentedFinding};
-        self.iter()
-            .flat_map(|finding| match finding {
-                PresentedFinding::Ordinary(OrdinaryFinding::Resource(finding)) => {
-                    finding.to_string().validation_errors()
-                }
-                PresentedFinding::Ordinary(OrdinaryFinding::Client(never)) => match **never {},
-                PresentedFinding::Conversion(finding) => {
-                    vec![AppError::PresentedConversion(Box::new(finding.clone()))]
-                }
-            })
-            .collect()
     }
 }
 pub(crate) fn split_validation_message(

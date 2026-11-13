@@ -130,7 +130,7 @@ fn conversion_lsp_parse_rejection_keeps_the_convert_range_and_cause() {
     assert!(
         errors[0]
             .message
-            .starts_with("conversion is not supported inside this expression")
+            .starts_with("conversion is not supported at this position")
     );
     let parsed = carina_core::parser::parse_file(
         source,
@@ -328,27 +328,9 @@ fn conversion_report_fallback_preserves_ordinary_errors_and_detects_missing_outc
                     carina_core::validation::PresentedFinding::Ordinary(_) => None,
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(conversions.as_slice().len(), 0, "{conversions:?}");
-            if converted {
-                // This fixture deliberately withholds the authored cursor from
-                // an otherwise sound tree and supplies no structural-failure
-                // witness. No producer made a conversion verdict for that use.
-                assert_eq!(presented.len(), 1, "{presented:?}");
-                assert!(
-                    matches!(presented.iter().next(), Some(
-                    carina_core::validation::PresentedFinding::Ordinary(
-                        carina_core::validation::OrdinaryFinding::Resource(error)
-                    )
-                ) if error.admission_incomplete().is_some()),
-                    "{presented:?}"
-                );
-                assert!(
-                    presented.to_string().contains("bug in carina"),
-                    "{presented:?}"
-                );
-            } else {
-                assert!(presented.is_empty(), "{presented:?}");
-            }
+            assert_eq!(conversions.len(), usize::from(converted), "{presented:?}");
+            assert_eq!(presented.len(), usize::from(converted), "{presented:?}");
+            assert!(!presented.to_string().contains("bug in carina"));
         }
         assert_eq!(ordinary[0], ordinary[1], "{ordinary:#?}");
         assert!(!ordinary[0].is_empty());
