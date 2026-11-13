@@ -227,3 +227,275 @@ fn round5_directory_require_alias_is_checked_by_placement() {
         "main's ordinary require finding remains: {json}"
     );
 }
+
+#[test]
+fn r5b_cross_file_aliases_report_at_the_producer_in_both_file_orders() {
+    for (producer_file, consumer_file) in [("a.crn", "b.crn"), ("b.crn", "a.crn")] {
+        let directory = tempfile::tempdir().unwrap();
+        write(directory.path(), "");
+        let producer = "let converted = 1 as mock.Name\n";
+        let consumer = "mock.Sink { attr = converted }\n";
+        let producer_path = directory.path().join(producer_file);
+        let consumer_path = directory.path().join(consumer_file);
+        std::fs::write(&producer_path, producer).unwrap();
+        std::fs::write(&consumer_path, consumer).unwrap();
+        let json = validate(directory.path());
+        let errors = json["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{json}");
+        assert_eq!(errors[0]["code"], "conversion_scalar_kind", "{json}");
+        assert!(errors[0].to_string().contains(producer_file), "{json}");
+        let at_producer = lsp(producer, &producer_path);
+        let at_consumer = lsp(consumer, &consumer_path);
+        let errors = at_producer
+            .iter()
+            .chain(&at_consumer)
+            .filter(|diagnostic| {
+                diagnostic.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            errors.len(),
+            1,
+            "producer={at_producer:?}, consumer={at_consumer:?}"
+        );
+        assert_eq!(
+            errors[0].code,
+            Some(tower_lsp::lsp_types::NumberOrString::String(
+                "conversion_scalar_kind".into()
+            ))
+        );
+        assert_eq!(
+            errors[0].range.start,
+            tower_lsp::lsp_types::Position::new(0, 16)
+        );
+        // LSP diagnostics belong to the open document. A plain use gets no
+        // fabricated squiggle for the rejection owned by the producer file.
+        assert!(at_consumer.iter().all(|finding| !matches!(&finding.code, Some(tower_lsp::lsp_types::NumberOrString::String(code)) if code.starts_with("conversion_"))));
+    }
+}
+
+#[test]
+fn r5b_non_crossed_edges_have_producer_verdicts_and_plain_consumers() {
+    // Mutation audit: the report records which edges have actual child evidence
+    // to follow. Type-only parameter/state/output edges cannot be made to
+    // propagate a Convert by replacing a cut with Follow over zero children.
+    for (producer, consumer, module, expected_code, yet) in [
+        (
+            "let p = mock.Source { output = 1 as mock.Name }",
+            "mock.Sink { attr = p.output }",
+            "",
+            "conversion_scalar_kind",
+            false,
+        ),
+        (
+            "let p = mock.Source { output = 'ok' as mock.Name }",
+            "mock.Sink { attr = p.output }",
+            "",
+            "",
+            false,
+        ),
+        (
+            "let child = use { source = './child' }",
+            "let net = child {}\nmock.Sink { plain = net.out }",
+            "attributes { out: String = 'x' as mock.Name }",
+            "conversion_unsupported_position",
+            true,
+        ),
+        (
+            "fn f(a: Int): Int { 1 as mock.Name }",
+            "let result = f(1)",
+            "",
+            "conversion_unsupported_position",
+            true,
+        ),
+        (
+            "fn f(a: Int = 1 as mock.Name): Int { a }",
+            "let result = f()",
+            "",
+            "conversion_unsupported_position",
+            true,
+        ),
+        (
+            "fn f(a: Int): Int { a }\nlet converted = 1 as mock.Name",
+            "let result = f(converted)",
+            "",
+            "conversion_unsupported_position",
+            false,
+        ),
+        (
+            "let child = use { source = './child' }\nlet converted = 'x' as mock.Name",
+            "let net = child { input = converted }\nmock.Sink { plain = net.out }",
+            "arguments { input: String }\nattributes { out: String = input }",
+            "conversion_unsupported_position",
+            true,
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        write(directory.path(), "");
+        std::fs::write(directory.path().join("a.crn"), producer).unwrap();
+        std::fs::write(directory.path().join("b.crn"), consumer).unwrap();
+        if !module.is_empty() {
+            std::fs::create_dir(directory.path().join("child")).unwrap();
+            std::fs::write(directory.path().join("child/main.crn"), module).unwrap();
+        }
+        let json = validate(directory.path());
+        let errors = json["errors"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let converted_errors = errors
+            .iter()
+            .filter(|error| {
+                error["code"]
+                    .as_str()
+                    .is_some_and(|code| code.starts_with("conversion_"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            converted_errors.len(),
+            usize::from(!expected_code.is_empty()),
+            "{producer}\n{consumer}\n{module}: {json}"
+        );
+        if producer.starts_with("let p") && !expected_code.is_empty() {
+            // The plain consumer is unclaimed: 1b-rules must still check its
+            // lowered Int value exactly as on main. Suppressing that finding
+            // would contradict the single claim/reference composition rule.
+            let consumer_errors = |json: &serde_json::Value| {
+                json["errors"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|error| error["code"].is_null() && error.to_string().contains("b.crn"))
+                    .map(|error| error["message"].clone())
+                    .collect::<Vec<_>>()
+            };
+            std::fs::write(
+                directory.path().join("a.crn"),
+                producer.replace(" as mock.Name", ""),
+            )
+            .unwrap();
+            let twin = validate(directory.path());
+            assert_eq!(consumer_errors(&json), consumer_errors(&twin));
+            assert_eq!(consumer_errors(&json).len(), 1);
+        } else {
+            assert_eq!(errors.len(), converted_errors.len(), "{json}");
+        }
+        if let Some(error) = converted_errors.first() {
+            assert_eq!(error["code"], expected_code, "{json}");
+            let owner = if module.contains(" as ") {
+                "child/main.crn"
+            } else {
+                "a.crn"
+            };
+            assert!(error.to_string().contains(owner), "{json}");
+            if expected_code == "conversion_unsupported_position" {
+                assert_eq!(
+                    error["message"].as_str().unwrap().ends_with("yet"),
+                    yet,
+                    "{json}"
+                );
+            }
+        }
+        if expected_code.is_empty() {
+            std::fs::write(
+                directory.path().join("a.crn"),
+                producer.replace(" as mock.Name", ""),
+            )
+            .unwrap();
+            let twin = validate(directory.path());
+            assert_eq!(json["errors"], twin["errors"]);
+            assert_eq!(json["status"], twin["status"]);
+        }
+    }
+}
+
+#[test]
+fn r5b_valid_conversion_in_a_block_alias_uses_authored_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    for source in [
+        "mock.Sink { entry { value = 'ok' as mock.Name } }",
+        "mock.Sink { entry { value = 'ok' } }",
+    ] {
+        write(directory.path(), source);
+        let json = validate(directory.path());
+        assert_eq!(json["status"], "ok", "{json}");
+        assert_eq!(
+            json["errors"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .len(),
+            0,
+            "{json}"
+        );
+        assert!(
+            lsp(source, &directory.path().join("main.crn"))
+                .iter()
+                .all(|finding| finding.severity
+                    != Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR))
+        );
+    }
+}
+
+#[test]
+fn r5b_upstream_cut_keeps_the_producer_rejection_out_of_the_plain_consumer() {
+    use carina_core::{
+        parser::ExpandedBackendConfig,
+        resource::{ConcreteValue, Value},
+    };
+    use carina_state::{BackendLock, StateFile};
+    let directory = tempfile::tempdir().unwrap();
+    let upstream = directory.path().join("upstream");
+    let downstream = directory.path().join("downstream");
+    std::fs::create_dir(&upstream).unwrap();
+    std::fs::create_dir(&downstream).unwrap();
+    write(&upstream, "");
+    std::fs::write(upstream.join("a.crn"), "let x = 'ok' as mock.Name").unwrap();
+    std::fs::write(upstream.join("b.crn"), "exports { v: String = x }").unwrap();
+    let mut state = StateFile::new();
+    state.insert_export_json_for_test("v", serde_json::json!("ok"));
+    std::fs::write(
+        upstream.join("carina.state.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+    let backend = ExpandedBackendConfig {
+        backend_type: "local".into(),
+        attributes: std::collections::HashMap::from([(
+            "path".to_string(),
+            Value::Concrete(ConcreteValue::String("carina.state.json".into())),
+        )])
+        .into(),
+        attribute_spans: Default::default(),
+    };
+    BackendLock::for_config(Some(&backend))
+        .unwrap()
+        .save(&ResolvedPath::new(&upstream).unwrap())
+        .unwrap();
+    let producer = validate(&upstream);
+    assert_eq!(conversions(&producer), 1, "{producer}");
+    let error = &producer["errors"][0];
+    assert_eq!(error["code"], "conversion_unsupported_position");
+    assert!(
+        error["message"].as_str().unwrap().ends_with("yet"),
+        "{producer}"
+    );
+    assert!(error.to_string().contains("a.crn"), "{producer}");
+    write(
+        &downstream,
+        "let up = upstream_state { source = '../upstream' }",
+    );
+    std::fs::write(
+        downstream.join("consumer.crn"),
+        "mock.Sink { plain = up.v }",
+    )
+    .unwrap();
+    let consumer = validate(&downstream);
+    assert_eq!(consumer["status"], "ok", "{consumer}");
+    assert_eq!(conversions(&consumer), 0, "{consumer}");
+    std::fs::write(upstream.join("a.crn"), "let x = 'ok'").unwrap();
+    let twin = validate(&downstream);
+    assert_eq!(consumer["errors"], twin["errors"]);
+    assert_eq!(consumer["status"], twin["status"]);
+}

@@ -363,7 +363,13 @@ pub(crate) fn parse_postfix_eval_with_mode(
                 .into_iter()
                 .filter(|part| matches!(part.as_rule(), Rule::index_access | Rule::field_access))
                 .collect::<Vec<_>>();
-            let untyped_mode = (converted || !steps.is_empty()).then(ExpressionMode::untyped);
+            let untyped_mode = if !steps.is_empty() {
+                Some(ExpressionMode::untyped())
+            } else if converted {
+                Some(mode.conversion_operand())
+            } else {
+                None
+            };
             // The expected sink describes the result of a postfix expression, not
             // values inside its intermediate base. In particular, `[resource][0].id`
             // must retain the established bare-handle rejection instead of treating

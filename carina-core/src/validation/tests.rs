@@ -1,3 +1,4 @@
+use crate::test_utils::legacy_validate_resources as validate_resources;
 static TEST_OWNER: std::sync::LazyLock<crate::parser::SchemaTypeOwner> =
     std::sync::LazyLock::new(|| crate::parser::SchemaTypeOwner::Provider("test".into()));
 

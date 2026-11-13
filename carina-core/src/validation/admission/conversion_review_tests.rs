@@ -48,7 +48,7 @@ fn conversion_admission_error_renders_its_typed_channel_once() {
             else {
                 panic!("typed presentation required");
             };
-            let rendered = crate::executor::render_error_chain(&presented);
+            let rendered = crate::test_utils::render_presented_for_test(&presented);
             assert_eq!(
                 rendered.matches(&conversion.error().to_string()).count(),
                 1,

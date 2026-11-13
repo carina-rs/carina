@@ -366,9 +366,32 @@ type ValidationAssignmentCheck<'a, P, B> = Option<
 >;
 
 pub(crate) struct SchemaInputAuthority<'a, B: BindingAddress> {
-    pub(crate) slots: &'a crate::parser::retained::AuthoredSlots<B>,
-    pub(crate) report: &'a crate::parser::retained::ExpressionReport<B>,
-    pub(crate) coverage: &'a mut WalkCoverage,
+    source: SchemaInputSource<'a, B>,
+    report: &'a crate::parser::retained::ExpressionReport<B>,
+    coverage: &'a mut WalkCoverage,
+}
+enum SchemaInputSource<'a, B: BindingAddress> {
+    Programmatic,
+    Authored(&'a crate::parser::retained::AuthoredSlots<B>),
+}
+impl<'a, B: BindingAddress> SchemaInputAuthority<'a, B> {
+    pub(crate) fn new(
+        slots: &'a crate::parser::retained::AuthoredSlots<B>,
+        report: &'a crate::parser::retained::ExpressionReport<B>,
+        coverage: &'a mut WalkCoverage,
+    ) -> Self {
+        // Only the producer's lack of authored storage grants value-only
+        // authority. An attribute lookup failure cannot construct this state.
+        let source = match slots.declaration_id() {
+            Some(_) => SchemaInputSource::Authored(slots),
+            None => SchemaInputSource::Programmatic,
+        };
+        Self {
+            source,
+            report,
+            coverage,
+        }
+    }
 }
 
 /// One authored attribute report, shared by CLI validation and LSP rendering.
@@ -394,58 +417,63 @@ pub(crate) fn admit_validation_attributes<
     authority: SchemaInputAuthority<'_, B>,
 ) -> crate::schema::ResourceValueValidation {
     let SchemaInputAuthority {
-        slots,
+        source,
         report,
         coverage,
     } = authority;
-    if slots.declaration_id().is_some() {
-        let candidate = |name: &str, proof| {
-            let source = slots
-                .get(name)
-                .or_else(|error| {
-                    schema
-                        .schema()
-                        .as_schema()
-                        .attributes()
-                        .get(name)
-                        .and_then(|field| field.parts().block_name)
-                        .map_or(Err(error), |alias| slots.get(alias))
-                })
-                .and_then(|slot| {
-                    slot.source_judgement_in(report)
-                        .or_else(|_| slot.source_judgement())
-                });
-            Ok(match source {
-                Ok(source) => {
-                    ValidationCandidate::Checked(Box::new(Candidate::validation_projected(
-                        proof,
-                        bindings,
-                        session,
-                        crate::parser::retained::ValidationProjection::judged(source.clone()),
-                    )))
-                }
-                Err(_) => ValidationCandidate::ValueOnly,
+    let slots = match source {
+        SchemaInputSource::Programmatic => {
+            return admit_value_only_attributes::<K, P, B>(schema, id, attributes, quoted, session);
+        }
+        SchemaInputSource::Authored(slots) => slots,
+    };
+    let candidate = |name: &str, proof| {
+        if let Some(projection) = slots.projected_phase(name) {
+            return Ok(Box::new(Candidate::validation_projected(
+                proof, bindings, session, projection,
+            )));
+        }
+        let slot = slots
+            .get(name)
+            .or_else(|error| {
+                schema
+                    .schema()
+                    .as_schema()
+                    .attributes()
+                    .get(name)
+                    .and_then(|field| field.parts().block_name)
+                    .map_or(Err(error), |alias| slots.get(alias))
             })
+            .map_err(seam_constraint)?;
+        let projection = match slot.source_judgement_in(report) {
+            Ok(source) => crate::parser::retained::ValidationProjection::judged(source.clone()),
+            Err(missing) => crate::parser::retained::ValidationProjection::unavailable(
+                slot.source_judgement().map_err(seam_constraint)?,
+                missing,
+            )
+            .map_err(seam_constraint)?,
         };
-        let visits = std::cell::RefCell::new(std::mem::take(coverage));
-        let findings = admit_validation_attributes_with_input::<K, P, B>(
-            schema,
-            id,
-            attributes,
-            quoted,
-            bindings,
-            session,
-            check,
-            declarations,
-            ValidationInput::Resource {
-                candidate: &candidate,
-                coverage: &visits,
-            },
-        );
-        *coverage = visits.into_inner();
-        return findings;
-    }
-    admit_value_only_attributes::<K, P, B>(schema, id, attributes, quoted, session)
+        Ok(Box::new(Candidate::validation_projected(
+            proof, bindings, session, projection,
+        )))
+    };
+    let visits = std::cell::RefCell::new(std::mem::take(coverage));
+    let findings = admit_validation_attributes_with_input::<K, P, B>(
+        schema,
+        id,
+        attributes,
+        quoted,
+        bindings,
+        session,
+        check,
+        declarations,
+        ValidationInput::Resource {
+            candidate: &candidate,
+            coverage: &visits,
+        },
+    );
+    *coverage = visits.into_inner();
+    findings
 }
 
 /// Programmatic values enter a NoAuthored walk, with no callback or conversion
@@ -491,12 +519,7 @@ type ValidationCandidateFactory<'a, P, B> =
     &'a dyn Fn(
         &str,
         crate::resource::knowledge::Classification<'a, P, B>,
-    ) -> Result<ValidationCandidate<'a, P, B>, AdmissionErrors>;
-
-enum ValidationCandidate<'a, P: PlaceholderKind, B: BindingAddress> {
-    Checked(Box<(Candidate<P, B>, AdmissionContext<'a, P, B>)>),
-    ValueOnly,
-}
+    ) -> Result<Box<(Candidate<P, B>, AdmissionContext<'a, P, B>)>, AdmissionErrors>;
 
 /// The classified path is for explicit schema-only producers. A live authored
 /// source must supply its cursor factory; association failure is never projected.
@@ -537,21 +560,7 @@ fn admit_validation_attributes_with_input<
                            destination: &Destination<K>| {
         let (candidate, mut boundary) = match &input {
             ValidationInput::Resource { candidate, .. } => match candidate(name, proof.clone()) {
-                Ok(ValidationCandidate::Checked(input)) => *input,
-                Ok(ValidationCandidate::ValueOnly) => {
-                    return match destination.contract.as_deref() {
-                        Some(contract) => {
-                            crate::schema::value_validation::validate_value_with_lookup(
-                                contract.attr(),
-                                proof,
-                                contract.defs(),
-                                contract.ancestry,
-                                &contract.lookup(session.catalog()),
-                            )
-                        }
-                        None => Default::default(),
-                    };
-                }
+                Ok(input) => *input,
                 Err(error) => return admission_findings(&mut Err::<Admission<K, P, B>, _>(error)),
             },
         };
@@ -1176,9 +1185,7 @@ fn typed_resource_attribute_admissions<
             )),
         }?;
         boundary.scope = inputs.scope;
-        Ok(ValidationCandidate::Checked(Box::new((
-            candidate, boundary,
-        ))))
+        Ok(Box::new((candidate, boundary)))
     };
     let input = ValidationInput::Resource {
         candidate: &candidate,

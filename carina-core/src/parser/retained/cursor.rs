@@ -386,10 +386,10 @@ struct ConversionRestriction<'s, B: BindingAddress> {
     owner: JudgedNodeRef<'s, B>,
 }
 
-pub(super) type AuthoredUseIdentity = (NodeId, UseId, ExpansionInstanceId, ProjectionGeneration);
+pub(crate) type AuthoredUseIdentity = (NodeId, UseId, ExpansionInstanceId, ProjectionGeneration);
 
 impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
-    pub(super) fn identity(&self) -> AuthoredUseIdentity {
+    pub(crate) fn identity(&self) -> AuthoredUseIdentity {
         (
             self.node.node.id,
             self.occurrence,
@@ -580,7 +580,13 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             }
             AuthoredForm::If => {
                 if self
-                    .child(0, EdgeRole::Condition)?
+                    .child(
+                        self.node
+                            .node
+                            .condition_index()
+                            .ok_or_else(|| MissingEvidence::new("named if condition"))?,
+                        EdgeRole::Condition,
+                    )?
                     .node()
                     .judgement()
                     .contains_any_conversion()
@@ -656,9 +662,8 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
         let condition = self
             .node
             .node
-            .children
-            .first()
-            .ok_or_else(|| MissingEvidence::new("if condition"))?;
+            .condition()
+            .ok_or_else(|| MissingEvidence::new("named if condition"))?;
         if let Some(selected) = self.node.conditions.get(condition.node_id()) {
             return Ok(selected);
         }
@@ -1583,6 +1588,13 @@ impl<B: BindingAddress> AuthoredSlots<B> {
                     .no_conversion()
                     .expect("synthetic identifier judgement"),
             )
+        })
+    }
+    pub(crate) fn carries_conversion(&self, report: &ExpressionReport<B>) -> bool {
+        self.slots.values().any(|slot| {
+            slot.source_judgement_in(report)
+                .or_else(|_| slot.source_judgement())
+                .is_ok_and(JudgedExpr::contains_any_conversion)
         })
     }
     pub fn get(&self, name: &str) -> Result<&JudgedSlot<B>, MissingEvidence> {

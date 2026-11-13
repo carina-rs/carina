@@ -469,8 +469,10 @@ fn conversion_no_authored_evidence_cannot_admit_a_converted_slot() {
             validation.admit_remaining_resources(&tree, judged, &bindings, session);
         });
         let conversions = validation.complete().into_presented();
-        assert_eq!(conversion_errors(&conversions).len(), 1, "{conversions}");
-        assert!(!conversions.to_string().contains("bug in carina"));
+        assert_eq!(conversion_errors(&conversions).len(), 1, "{conversions:?}");
+        assert!(
+            !crate::test_utils::render_presented_for_test(&conversions).contains("bug in carina")
+        );
     });
 }
 
@@ -539,14 +541,14 @@ fn round5_stale_authored_inputs_fail_through_the_conversion_proof() {
             assert_eq!(
                 conversion_errors(&presented).len(),
                 usize::from(converted),
-                "{presented}"
+                "{presented:?}"
             );
             if converted {
                 assert!(
                     conversion_errors(&presented)[0]
                         .diagnostic_message()
                         .contains("conversion cannot be checked here"),
-                    "{presented}"
+                    "{presented:?}"
                 );
             }
         }
@@ -680,12 +682,102 @@ fn round5_unresolved_or_reshaped_containers_require_conversion_descent() {
                 assert_eq!(
                     conversions.len(),
                     usize::from(matches!(projection, Projection::Pending)),
-                    "map={map}, union={union}, {projection:?}: {presented}"
+                    "map={map}, union={union}, {projection:?}: {presented:?}"
                 );
                 if let Some(conversion) = conversions.first() {
                     assert_eq!(conversion.kind(), ConversionErrorKind::ScalarKind);
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn r5b_pending_transport_requires_a_shape_compatible_destination() {
+    use crate::validation::admission::attributes::ResourceAttributeInputs;
+    let catalog = super::tests::catalog();
+    for expression in [
+        "['ok']",
+        "{ item = 'ok' }",
+        "['ok' as mock.Name]",
+        "{ item = 'ok' as mock.Name }",
+    ] {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("Sink")
+                .attribute(
+                    AttributeSchema::optional(
+                        "target",
+                        AttributeType::union(vec![named(), AttributeType::string()]),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let parsed = crate::parser::parse_file(
+            &format!("mock.Sink {{ target = {expression} }}"),
+            Path::new("shape.crn"),
+            &catalog,
+        )
+        .unwrap()
+        .resolve_root_for_test();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let judged = configuration.judged();
+        let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let values = std::collections::HashMap::from([(
+            "target".into(),
+            crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(
+                crate::resource::ApplyTimeUnknown::PendingReRead(
+                    crate::resource::PendingReRead::not_found(),
+                ),
+            )),
+        )]);
+        let inputs =
+            ResourceAttributeInputs::from_resolved(resource, &values, judged.report()).unwrap();
+        let classified = inputs.classify(
+            &crate::resource::knowledge::KnowledgeContext::validation(),
+            |_, _| {},
+        );
+        let bindings =
+            crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+        let mut run: crate::validation::ConversionValidation =
+            crate::validation::ConversionValidation::new(judged.report());
+        crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+            let findings = run.admit_resource(
+                crate::validation::admission::attributes::ResourceAdmissionRequest {
+                    resource,
+                    parsed: judged.file(),
+                    schema: resource.schema(&schemas).unwrap(),
+                    attributes: &classified,
+                    quoted: resource.quoted_string_attrs(),
+                    inputs: &inputs,
+                    bindings: &bindings,
+                    session,
+                    schemas: &schemas,
+                },
+            );
+            assert_eq!(
+                findings.errors().count(),
+                0,
+                "main leaves the value pending; only carrying transports require a child destination: {findings:?}"
+            );
+        });
+        let presented = run.complete().into_presented();
+        assert_eq!(
+            conversion_errors(&presented).len(),
+            usize::from(expression.contains(" as ")),
+            "{presented:?}"
+        );
+        if let Some(error) = conversion_errors(&presented).first() {
+            assert!(
+                error
+                    .diagnostic_message()
+                    .contains("conversion cannot be checked here")
+            );
         }
     }
 }
@@ -952,7 +1044,7 @@ fn conversion_no_as_directory_inventory_is_vacuous_without_any_walk_evidence() {
                 .into_presented();
             assert!(
                 conversion_errors(&conversions).is_empty(),
-                "{}: {conversions}",
+                "{}: {conversions:?}",
                 case["name"]
             );
         }
@@ -971,7 +1063,7 @@ fn conversion_no_as_directory_inventory_is_vacuous_without_any_walk_evidence() {
                     .into_presented();
                     assert!(
                         conversion_errors(&conversions).is_empty(),
-                        "{}: {conversions}",
+                        "{}: {conversions:?}",
                         case["name"]
                     );
                 }
@@ -1049,14 +1141,16 @@ fn conversion_one_authored_alias_use_cannot_cover_another_use_without_evidence()
         assert_eq!(
             conversions.len(),
             usize::from(second == "converted"),
-            "{source}\n{conversions}"
+            "{source}\n{conversions:?}"
         );
         assert_eq!(
             conversion_errors(&conversions).len(),
             usize::from(second == "converted"),
-            "{conversions}"
+            "{conversions:?}"
         );
-        assert!(!conversions.to_string().contains("bug in carina"));
+        assert!(
+            !crate::test_utils::render_presented_for_test(&conversions).contains("bug in carina")
+        );
     }
 }
 
@@ -1128,7 +1222,7 @@ fn round5_partial_driver_retains_only_the_judged_slot_verdict() {
             "{presented:?}"
         );
         assert!(
-            !presented.to_string().contains("bug in carina"),
+            !crate::test_utils::render_presented_for_test(&presented).contains("bug in carina"),
             "{presented:?}"
         );
     }
@@ -1170,4 +1264,49 @@ fn round5_an_unentered_document_has_no_sink_findings() {
     let presented = run.complete().into_presented();
     assert!(conversion_errors(&presented).is_empty(), "{presented:?}");
     assert!(presented.is_empty(), "{presented:?}");
+}
+
+#[test]
+fn r5b_discarded_containers_keep_kind_only_judgements_without_a_live_child_destination() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "target",
+                    AttributeType::union(vec![named(), AttributeType::string()]),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    for (operand, accepted) in [
+        ("'ok'", true),
+        ("'far too long for the member bound'", true),
+        ("42", false),
+    ] {
+        for expression in [
+            format!("[{operand} as mock.Name]"),
+            format!("{{ item = {operand} as mock.Name }}"),
+        ] {
+            let source = format!(
+                "mock.Sink {{ target = if true {{ 'ok' as mock.Name }} else {{ {expression} }} }}"
+            );
+            let result = check(&source, &schemas);
+            if accepted {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                let conversion = conversion_error(&error)
+                    .expect("the discarded Convert still needs its kind verdict");
+                assert_eq!(
+                    conversion.kind(),
+                    ConversionErrorKind::ScalarKind,
+                    "{error:?}"
+                );
+            }
+        }
+    }
 }

@@ -791,11 +791,18 @@ pub(super) enum StructuralSinkMode {
     DirectHandle,
 }
 
+#[derive(Clone, Copy)]
+enum BindingUseRecording {
+    Ordinary,
+    ProjectionOnly,
+}
+
 #[derive(Clone)]
 pub(crate) struct ExpressionMode<'a> {
     sink: Option<ExpressionSink<'a>>,
     source: Option<IntegerOperandContext<'a>>,
     is_integer_operand: bool,
+    binding_uses: BindingUseRecording,
 }
 
 #[derive(Clone, Copy)]
@@ -820,11 +827,22 @@ impl ExpressionMode<'_> {
             sink: None,
             source: None,
             is_integer_operand: false,
+            binding_uses: BindingUseRecording::Ordinary,
         }
     }
 }
 
 impl<'a> ExpressionMode<'a> {
+    /// An as operand keeps its structural projection owner, but the wrapper's
+    /// policy owns admission rather than a second ordinary bare-binding use.
+    pub(super) fn conversion_operand(&self) -> Self {
+        Self {
+            binding_uses: BindingUseRecording::ProjectionOnly,
+            is_integer_operand: false,
+            ..self.clone()
+        }
+    }
+
     pub(super) fn resource(
         id: ResourceId,
         source_file: &'a std::path::Path,
@@ -844,6 +862,7 @@ impl<'a> ExpressionMode<'a> {
                 preprocessed_file,
             }),
             is_integer_operand: false,
+            binding_uses: BindingUseRecording::Ordinary,
         }
     }
 
@@ -874,6 +893,7 @@ impl<'a> ExpressionMode<'a> {
                 preprocessed_file,
             }),
             is_integer_operand: false,
+            binding_uses: BindingUseRecording::Ordinary,
         }
     }
 
@@ -888,6 +908,7 @@ impl<'a> ExpressionMode<'a> {
                 preprocessed_file,
             }),
             is_integer_operand: false,
+            binding_uses: BindingUseRecording::Ordinary,
         }
     }
 
@@ -902,6 +923,7 @@ impl<'a> ExpressionMode<'a> {
             sink: None,
             source,
             is_integer_operand: true,
+            binding_uses: self.binding_uses,
         }
     }
 
@@ -980,6 +1002,7 @@ impl<'a> ExpressionMode<'a> {
             }),
             source: self.source,
             is_integer_operand: self.is_integer_operand,
+            binding_uses: self.binding_uses,
         }
     }
 
@@ -1074,9 +1097,11 @@ impl<'a> ExpressionMode<'a> {
                 owner: sink.owner.clone(),
                 path: sink.root_path.clone(),
             });
-        ctx.parsed_binding_uses
-            .borrow_mut()
-            .record(authored, source, pending_slot.clone());
+        if let BindingUseRecording::Ordinary = self.binding_uses {
+            ctx.parsed_binding_uses
+                .borrow_mut()
+                .record(authored, source, pending_slot.clone());
+        }
         pending_slot
     }
 }

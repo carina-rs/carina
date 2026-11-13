@@ -3422,6 +3422,7 @@ fn block_name_errors<T: fmt::Display>(conflicts: impl IntoIterator<Item = T>) ->
         .collect()
 }
 
+#[cfg(test)]
 pub fn validate_resources_with_ctx<
     E,
     P: PlaceholderKind,
@@ -3434,7 +3435,7 @@ pub fn validate_resources_with_ctx<
     provider_context: &carina_core::parser::ProviderContext,
 ) -> Vec<AppError> {
     let mut sink = CliTypeCheckSink { errors: Vec::new() };
-    let mut errors = lift_validation_result(validation::validate_resources(
+    let mut errors = lift_validation_result(carina_core::test_utils::legacy_validate_resources(
         parsed,
         ctx.schemas(),
         ctx.known_providers(),
@@ -3585,6 +3586,7 @@ pub fn validate_deferred_populate_refs_with_ctx<
         .collect()
 }
 
+#[cfg(test)]
 pub fn validate_resource_ref_types_with_ctx<
     E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,

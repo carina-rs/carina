@@ -550,7 +550,7 @@ fn resource_callers_admit_wider_same_identity_references() {
             let bindings = BindingIndex::from_parsed(&parsed, schemas, catalog);
             let configuration =
                 crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
-            crate::validation::validate_resources(
+            crate::test_utils::legacy_validate_resources(
                 &parsed,
                 schemas,
                 &std::collections::HashSet::from(["test".into()]),
@@ -2930,11 +2930,11 @@ fn round2_plain_reference_skips_expression_callback() {
                 session,
                 Some(&check),
                 None,
-                attributes::SchemaInputAuthority {
-                    slots: resource.authored_slots().unwrap(),
-                    report: judged.report(),
-                    coverage: &mut Default::default(),
-                },
+                attributes::SchemaInputAuthority::new(
+                    resource.authored_slots().unwrap(),
+                    judged.report(),
+                    &mut Default::default(),
+                ),
             );
             result
                 .errors()

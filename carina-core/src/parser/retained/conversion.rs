@@ -98,6 +98,12 @@ pub(crate) struct TransportJudgement {
     identity: super::cursor::AuthoredUseIdentity,
     owner: Arc<ConversionSite>,
 }
+pub(crate) struct TransportDescent {
+    _private: (),
+}
+impl TransportDescent {
+    pub(crate) fn consume(self) {}
+}
 impl TransportJudgement {
     fn new<B: BindingAddress>(usage: &AuthoredUse<'_, B>) -> Result<Self, MissingEvidence> {
         let flow::PlacementRole::Transport(_) = usage.node().conversion_role() else {
@@ -129,10 +135,10 @@ impl TransportJudgement {
     pub(crate) fn consume<B: BindingAddress>(
         self,
         cursor: &AuthoredCursor<'_, B>,
-    ) -> Result<(), ConversionError> {
+    ) -> Result<TransportDescent, ConversionError> {
         if matches!(&cursor.kind, CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) if usage.identity() == self.identity)
         {
-            Ok(())
+            Ok(TransportDescent { _private: () })
         } else {
             Err(ConversionError::new(
                 Kind::Source,

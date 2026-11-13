@@ -35,7 +35,7 @@ fn parser_conversion_rejections_wait_for_the_presented_exit() {
             &mut Vec::new(),
         )
         .unwrap();
-        assert_eq!(findings.len(), 1, "{source}: {findings}");
+        assert_eq!(findings.len(), 1, "{source}: {findings:?}");
         for finding in findings {
             match finding {
                 PresentedFinding::Ordinary(error) => {

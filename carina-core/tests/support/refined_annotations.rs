@@ -162,7 +162,7 @@ pub fn validate(dir: &Path, snapshot: &LoadedProviderSnapshot) -> Result<(), Str
     .map_err(|e| e.to_string())?;
     let parsed = loaded.parsed.parsed();
     let bindings = BindingIndex::from_parsed(parsed, schemas, context);
-    carina_core::validation::validate_resources(
+    carina_core::test_utils::legacy_validate_resources(
         parsed,
         schemas,
         &std::collections::HashSet::from(["awscc".into()]),

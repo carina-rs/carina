@@ -304,6 +304,9 @@ struct AuthoredExpr<P: ValueKind, B: BindingAddress> {
 #[derive(Clone)]
 enum AuthoredChildRoles {
     Positional,
+    If {
+        condition: NodeId,
+    },
     Computed,
     Function {
         body: NodeId,
@@ -346,6 +349,7 @@ impl<P: ValueKind, B: BindingAddress> AuthoredExpr<P, B> {
                 ..
             } => conversion::flow::PlacementRole::Boundary,
             AuthoredChildRoles::Positional
+            | AuthoredChildRoles::If { .. }
             | AuthoredChildRoles::Function { .. }
             | AuthoredChildRoles::Sequence { .. }
             | AuthoredChildRoles::Sink {
@@ -353,6 +357,23 @@ impl<P: ValueKind, B: BindingAddress> AuthoredExpr<P, B> {
                 ..
             } => conversion::flow::PlacementRole::of(&self.kind),
         }
+    }
+    fn condition_index(&self) -> Option<usize> {
+        match self.roles {
+            AuthoredChildRoles::If { condition } => self
+                .children
+                .iter()
+                .position(|child| child.node_id() == condition),
+            AuthoredChildRoles::Positional
+            | AuthoredChildRoles::Computed
+            | AuthoredChildRoles::Function { .. }
+            | AuthoredChildRoles::Sequence { .. }
+            | AuthoredChildRoles::Sink { .. } => None,
+        }
+    }
+    fn condition(&self) -> Option<&ExprValue<P, B>> {
+        self.condition_index()
+            .and_then(|index| self.children.get(index))
     }
     fn result_index(&self) -> Option<usize> {
         match self.roles {
@@ -362,6 +383,7 @@ impl<P: ValueKind, B: BindingAddress> AuthoredExpr<P, B> {
                     .position(|child| child.node_id() == result)
             }),
             AuthoredChildRoles::Positional
+            | AuthoredChildRoles::If { .. }
             | AuthoredChildRoles::Computed
             | AuthoredChildRoles::Function { .. }
             | AuthoredChildRoles::Sink { .. } => None,
@@ -377,6 +399,7 @@ impl<P: ValueKind, B: BindingAddress> AuthoredExpr<P, B> {
         match self.roles {
             AuthoredChildRoles::Sink { key, .. } => key,
             AuthoredChildRoles::Positional
+            | AuthoredChildRoles::If { .. }
             | AuthoredChildRoles::Computed
             | AuthoredChildRoles::Function { .. }
             | AuthoredChildRoles::Sequence { .. } => None,
@@ -1502,7 +1525,8 @@ fn node_at_with_roles(
             AuthoredChildRoles::Function { .. }
             | AuthoredChildRoles::Sequence { .. }
             | AuthoredChildRoles::Computed
-            | AuthoredChildRoles::Positional => ParseOwnership::Ordinary,
+            | AuthoredChildRoles::Positional
+            | AuthoredChildRoles::If { .. } => ParseOwnership::Ordinary,
         },
         ExprKind::Alias | ExprKind::Parens | ExprKind::Definition => {
             children.first().map_or(ParseOwnership::Ordinary, |child| {
@@ -1514,6 +1538,7 @@ fn node_at_with_roles(
                 result.and_then(|result| children.iter().find(|child| child.node_id() == result))
             }
             AuthoredChildRoles::Positional
+            | AuthoredChildRoles::If { .. }
             | AuthoredChildRoles::Computed
             | AuthoredChildRoles::Function { .. }
             | AuthoredChildRoles::Sink { .. } => None,
@@ -2003,8 +2028,27 @@ fn compile_form(
 ) -> ExprValue {
     match pair.as_rule() {
         Rule::if_expr => {
-            let children = compile_children(&pair, file, source, scope, captures);
-            node(&pair, ExprKind::If, children, file, source)
+            let mut parts = pair.clone().into_inner();
+            let condition = compile(
+                parts.next().expect("if grammar condition"),
+                file,
+                source,
+                scope,
+                captures,
+            );
+            let condition_id = condition.node_id();
+            let mut children = vec![condition];
+            children.extend(parts.map(|part| compile(part, file, source, scope, captures)));
+            node_with_roles(
+                &pair,
+                ExprKind::If,
+                children,
+                AuthoredChildRoles::If {
+                    condition: condition_id,
+                },
+                file,
+                source,
+            )
         }
         Rule::list => {
             let children = compile_children(&pair, file, source, scope, captures);
@@ -3106,6 +3150,23 @@ mod judgement {
         data: Arc<JudgedExprData>,
         conversions: conversion::flow::ConversionSources,
     }
+    #[derive(Debug, Clone)]
+    struct InferredExpr {
+        data: Arc<JudgedExprData>,
+    }
+    impl From<&JudgedExpr> for InferredExpr {
+        fn from(expression: &JudgedExpr) -> Self {
+            Self {
+                data: expression.data.clone(),
+            }
+        }
+    }
+    impl std::ops::Deref for InferredExpr {
+        type Target = JudgedExprData;
+        fn deref(&self) -> &Self::Target {
+            &self.data
+        }
+    }
     impl PartialEq for JudgedExpr {
         fn eq(&self, other: &Self) -> bool {
             self.data == other.data
@@ -3209,9 +3270,6 @@ mod judgement {
                 conversions: edges.sources(),
             }
         }
-        fn data_mut(&mut self) -> &mut JudgedExprData {
-            Arc::make_mut(&mut self.data)
-        }
         pub(super) fn conversion_evidence(&self) -> ConversionEvidence<'_> {
             match self.conversions.carried() {
                 Some(carried) => ConversionEvidence::Carried(carried),
@@ -3233,6 +3291,117 @@ mod judgement {
             &self.conversions
         }
 
+        fn sink_owner(&self, sink: &TypeExpr) -> FailureOwner {
+            if self
+                .authority
+                .as_ref()
+                .is_some_and(|config| self.for_sink(sink, config).requires_declared_assignment())
+                && self.static_type() == Ok(&TypeExpr::String)
+                && sink.is_string_shaped()
+                && !matches!(sink, TypeExpr::String)
+            {
+                return FailureOwner::Expression;
+            }
+            if let Some((_, owner)) = self.failure() {
+                return owner;
+            }
+            if let Some(branch) = self
+                .alternatives
+                .iter()
+                .find(|branch| admit_expression(branch, sink).is_err())
+            {
+                return branch.sink_owner(sink);
+            }
+            match self.check_owner() {
+                ExpressionCheckOwner::BindingIndex => FailureOwner::BindingIndex,
+                ExpressionCheckOwner::BindingScope => FailureOwner::BindingScope,
+                ExpressionCheckOwner::Reported => FailureOwner::Reported,
+                ExpressionCheckOwner::Expression if self.concrete() => FailureOwner::Boundary,
+                ExpressionCheckOwner::Expression => FailureOwner::Expression,
+            }
+        }
+
+        pub(crate) fn contains_any_conversion(&self) -> bool {
+            !self.conversions.is_empty()
+        }
+
+        /// Interpret builtin evidence as an ordinary result at other sinks.
+        /// This also preserves the original collection diagnostic granularity.
+        pub fn for_sink<'a>(
+            &'a self,
+            sink: &'a TypeExpr,
+            config: &'a super::super::ProviderContext,
+        ) -> SinkJudgedExpr<'a> {
+            fn string_sink(actual: &TypeExpr, sink: &TypeExpr) -> bool {
+                match sink {
+                    TypeExpr::Union(members) => {
+                        members.iter().any(|sink| string_sink(actual, sink))
+                    }
+                    TypeExpr::List(inner) => match actual {
+                        TypeExpr::List(member) => string_sink(member, inner),
+                        TypeExpr::String
+                        | TypeExpr::Bool
+                        | TypeExpr::Int
+                        | TypeExpr::Float
+                        | TypeExpr::Duration
+                        | TypeExpr::Simple(_)
+                        | TypeExpr::UnloadedSchemaType(_)
+                        | TypeExpr::Map(_)
+                        | TypeExpr::Ref(_)
+                        | TypeExpr::DottedUnresolved(_)
+                        | TypeExpr::SchemaType { .. }
+                        | TypeExpr::Struct { .. }
+                        | TypeExpr::StringLiteral(_)
+                        | TypeExpr::Union(_) => false,
+                    },
+                    TypeExpr::String
+                    | TypeExpr::Bool
+                    | TypeExpr::Int
+                    | TypeExpr::Float
+                    | TypeExpr::Duration
+                    | TypeExpr::Simple(_)
+                    | TypeExpr::UnloadedSchemaType(_)
+                    | TypeExpr::Map(_)
+                    | TypeExpr::Ref(_)
+                    | TypeExpr::DottedUnresolved(_)
+                    | TypeExpr::SchemaType { .. }
+                    | TypeExpr::Struct { .. }
+                    | TypeExpr::StringLiteral(_) => {
+                        actual == &TypeExpr::String && sink.is_string_shaped()
+                    }
+                }
+            }
+            let expression = if matches!(
+                self.judgement,
+                ExprJudgement::Typed {
+                    kind: InferredKind::BuiltinConstruction(_) | InferredKind::BuiltinStringList(_),
+                    ..
+                }
+            ) && let (Ok(actual), Ok(sink)) = (
+                self.static_type(),
+                crate::validation::resolve_type_expr(sink, config),
+            ) && !string_sink(actual, &sink)
+            {
+                let mut ordinary = self.clone();
+                ordinary.set_kind(InferredKind::Ordinary);
+                ordinary.data_mut().member = None;
+                std::borrow::Cow::Owned(ordinary)
+            } else {
+                std::borrow::Cow::Borrowed(self)
+            };
+            SinkJudgedExpr {
+                expression,
+                sink,
+                config,
+            }
+        }
+
+        // Intrinsic reference provenance controls single-reference unwrapping.
+        // It does not interpret construction evidence or admit a sink.
+    }
+
+    trait InferenceMut: std::ops::Deref<Target = JudgedExprData> + Sized {
+        fn data_mut(&mut self) -> &mut JudgedExprData;
         fn report_at(&mut self, owner: FailureOwner) {
             match &mut self.data_mut().judgement {
                 ExprJudgement::Typed { owner: current, .. }
@@ -3273,17 +3442,6 @@ mod judgement {
                 };
             }
         }
-        pub(crate) fn concrete(&self) -> bool {
-            matches!(self.judgement, ExprJudgement::Typed { kind, .. }
-                if kind.knowledge() == Classification::Known)
-                || matches!(
-                    self.judgement,
-                    ExprJudgement::ValueDependent {
-                        shape: Some((_, Classification::Known)),
-                        ..
-                    }
-                )
-        }
         fn inherit_output_materialization(&mut self, previous: &JudgedExpr) {
             // Refresh carries an already-judged output fact. It neither
             // classifies a value nor constructs a new value-knowledge proof.
@@ -3304,16 +3462,6 @@ mod judgement {
                 };
             }
         }
-        fn failed(&self) -> bool {
-            self.failure().is_some()
-        }
-        fn failure(&self) -> Option<(&InferenceError, FailureOwner)> {
-            match &self.judgement {
-                ExprJudgement::Failed { error, owner }
-                | ExprJudgement::Rejected { error, owner, .. } => Some((error, *owner)),
-                _ => None,
-            }
-        }
         fn reject(&mut self, error: InferenceError, owner: FailureOwner) {
             self.data_mut().judgement = ExprJudgement::Rejected {
                 source: Box::new(self.judgement.clone()),
@@ -3321,43 +3469,51 @@ mod judgement {
                 owner,
             };
         }
-        fn sink_owner(&self, sink: &TypeExpr) -> FailureOwner {
-            if self
-                .authority
-                .as_ref()
-                .is_some_and(|config| self.for_sink(sink, config).requires_declared_assignment())
-                && self.static_type() == Ok(&TypeExpr::String)
-                && sink.is_string_shaped()
-                && !matches!(sink, TypeExpr::String)
-            {
-                return FailureOwner::Expression;
-            }
-            if let Some((_, owner)) = self.failure() {
-                return owner;
-            }
-            if let Some(branch) = self
-                .alternatives
-                .iter()
-                .find(|branch| admit_expression(branch, sink).is_err())
-            {
-                return branch.sink_owner(sink);
-            }
-            match self.check_owner() {
-                ExpressionCheckOwner::BindingIndex => FailureOwner::BindingIndex,
-                ExpressionCheckOwner::BindingScope => FailureOwner::BindingScope,
-                ExpressionCheckOwner::Reported => FailureOwner::Reported,
-                ExpressionCheckOwner::Expression if self.concrete() => FailureOwner::Boundary,
-                ExpressionCheckOwner::Expression => FailureOwner::Expression,
-            }
-        }
         fn mark_failed(&mut self, error: InferenceError, owner: FailureOwner) {
             self.data_mut().judgement = ExprJudgement::Failed { error, owner };
         }
+        fn owned_by_bindings(mut self) -> Self {
+            self.report_at(FailureOwner::BindingIndex);
+            self
+        }
+    }
+    impl InferenceMut for JudgedExpr {
+        fn data_mut(&mut self) -> &mut JudgedExprData {
+            Arc::make_mut(&mut self.data)
+        }
+    }
+    impl InferenceMut for InferredExpr {
+        fn data_mut(&mut self) -> &mut JudgedExprData {
+            Arc::make_mut(&mut self.data)
+        }
+    }
+    impl JudgedExprData {
+        pub(crate) fn concrete(&self) -> bool {
+            matches!(self.judgement, ExprJudgement::Typed { kind, .. }
+                if kind.knowledge() == Classification::Known)
+                || matches!(
+                    self.judgement,
+                    ExprJudgement::ValueDependent {
+                        shape: Some((_, Classification::Known)),
+                        ..
+                    }
+                )
+        }
+        fn failed(&self) -> bool {
+            self.failure().is_some()
+        }
+        fn failure(&self) -> Option<(&InferenceError, FailureOwner)> {
+            match &self.judgement {
+                ExprJudgement::Failed { error, owner }
+                | ExprJudgement::Rejected { error, owner, .. } => Some((error, *owner)),
+                ExprJudgement::Typed { .. }
+                | ExprJudgement::ValueDependent { .. }
+                | ExprJudgement::AuthorityUnavailable(_)
+                | ExprJudgement::Declaration => None,
+            }
+        }
         pub(crate) fn diagnostic_is_secret(&self) -> bool {
             self.diagnostic_scope.is_secret()
-        }
-        pub(crate) fn contains_any_conversion(&self) -> bool {
-            !self.conversions.is_empty()
         }
         pub fn static_type(&self) -> Result<&TypeExpr, InferenceIssue> {
             self.judgement.static_type()
@@ -3402,49 +3558,6 @@ mod judgement {
                 _ => None,
             }
         }
-        /// Interpret builtin evidence as an ordinary result at other sinks.
-        /// This also preserves the original collection diagnostic granularity.
-        pub fn for_sink<'a>(
-            &'a self,
-            sink: &'a TypeExpr,
-            config: &'a super::super::ProviderContext,
-        ) -> SinkJudgedExpr<'a> {
-            fn string_sink(actual: &TypeExpr, sink: &TypeExpr) -> bool {
-                match sink {
-                    TypeExpr::Union(members) => {
-                        members.iter().any(|sink| string_sink(actual, sink))
-                    }
-                    TypeExpr::List(inner) => match actual {
-                        TypeExpr::List(member) => string_sink(member, inner),
-                        _ => false,
-                    },
-                    _ => actual == &TypeExpr::String && sink.is_string_shaped(),
-                }
-            }
-            let expression = if matches!(
-                self.judgement,
-                ExprJudgement::Typed {
-                    kind: InferredKind::BuiltinConstruction(_) | InferredKind::BuiltinStringList(_),
-                    ..
-                }
-            ) && let (Ok(actual), Ok(sink)) = (
-                self.static_type(),
-                crate::validation::resolve_type_expr(sink, config),
-            ) && !string_sink(actual, &sink)
-            {
-                let mut ordinary = self.clone();
-                ordinary.set_kind(InferredKind::Ordinary);
-                ordinary.data_mut().member = None;
-                std::borrow::Cow::Owned(ordinary)
-            } else {
-                std::borrow::Cow::Borrowed(self)
-            };
-            SinkJudgedExpr {
-                expression,
-                sink,
-                config,
-            }
-        }
         fn is_enum_identifier(&self) -> bool {
             fn is_enum(judgement: &ExprJudgement) -> bool {
                 match judgement {
@@ -3458,8 +3571,6 @@ mod judgement {
             }
             is_enum(&self.judgement)
         }
-        // Intrinsic reference provenance controls single-reference unwrapping.
-        // It does not interpret construction evidence or admit a sink.
         fn preserves_reference_assignment(&self) -> bool {
             fn reference(judgement: &ExprJudgement) -> bool {
                 match judgement {
@@ -3473,8 +3584,6 @@ mod judgement {
             }
             reference(&self.judgement) && self.alternatives.is_empty()
         }
-        /// Borrow the assigned reference for diagnostics when the judgement
-        /// preserves it through interpolation. Evaluation keeps the stored value.
         pub fn assignment_value<'a, P: ValueKind, B: BindingAddress>(
             &self,
             value: &'a Value<P, B>,
@@ -3484,7 +3593,7 @@ mod judgement {
                     && self
                         .alternatives
                         .iter()
-                        .all(Self::preserves_reference_assignment));
+                        .all(|expression| expression.preserves_reference_assignment()));
             if reference_assignment
                 && let Value::Deferred(crate::resource::DeferredValue::Interpolation(parts)) = value
                 && let [crate::resource::InterpolationPart::Expr(inner)] = parts.as_slice()
@@ -3519,10 +3628,6 @@ mod judgement {
         }
         pub fn boundary_owner(&self) -> Option<&DeclarationLocation> {
             self.boundary_owner.as_deref()
-        }
-        fn owned_by_bindings(mut self) -> Self {
-            self.report_at(FailureOwner::BindingIndex);
-            self
         }
         pub fn coalesce_operand(&self, index: usize) -> Result<&JudgedExpr, MissingEvidence> {
             self.coalesce
@@ -3574,7 +3679,6 @@ mod judgement {
                 })
         }
     }
-
     /// Expression evidence interpreted at a particular sink. Only this view
     /// exposes construction and assignment categories.
     pub struct SinkJudgedExpr<'a> {
@@ -4679,7 +4783,12 @@ mod judgement {
                     (argument.name.clone(), {
                         let mut parameter = declared(Ok(argument.static_type.clone()), false);
                         parameter.data_mut().authority = Some(authority.clone());
-                        parameter
+                        JudgedExpr::build(
+                            parameter.data,
+                            conversion::flow::JudgementEdges::NonCrossed(
+                                conversion::flow::NonCrossedEdge::ModuleArgument,
+                            ),
+                        )
                     })
                 })
                 .collect::<HashMap<_, _>>()
@@ -4822,7 +4931,7 @@ mod judgement {
                     false,
                 );
                 failure.report_at(FailureOwner::BindingIndex);
-                return failure;
+                return JudgedExpr::build(failure.data, conversion::flow::JudgementEdges::Leaf);
             }
             let outer_placement_owner = self.placement_owner.clone();
             self.placement_owner = match &root.kind {
@@ -4912,7 +5021,11 @@ mod judgement {
                 // not require a common element type. Only its list-shape
                 // failure is discharged: every element retains its evidence,
                 // and other uses of this collection retain their rejection.
-                let knowledge = list.elements.iter().all(JudgedExpr::concrete).into();
+                let knowledge = list
+                    .elements
+                    .iter()
+                    .all(|expression| expression.concrete())
+                    .into();
                 list.data_mut().judgement = ExprJudgement::ValueDependent {
                     reason: NotInferableReason::ValueDependent {
                         reason: "join accepts independently rendered scalar elements".into(),
@@ -4921,11 +5034,17 @@ mod judgement {
                     owner: FailureOwner::Boundary,
                 };
             }
-            let reference = if let ExprKind::Reference { binding, .. } = &root.kind {
-                self.expressions
-                    .definitions
-                    .get(binding)
-                    .map(|definition| self.judge(definition))
+            let reference = if let ExprKind::Reference { binding, .. }
+            | ExprKind::Binding(binding) = &root.kind
+            {
+                if self.parameter_type(binding).is_some() {
+                    None
+                } else {
+                    self.expressions
+                        .definitions
+                        .get(binding)
+                        .map(|definition| self.judge(definition))
+                }
             } else {
                 None
             };
@@ -4942,7 +5061,7 @@ mod judgement {
                 self.placement_owner.as_deref(),
                 &mut self.placements,
             );
-            let mut result = if let Some(require) = directory_require {
+            let result = if let Some(require) = directory_require {
                 if let Some(diagnostic) =
                     crate::module_resolver::evaluate_directory_require(&require.declaration)
                 {
@@ -4958,7 +5077,7 @@ mod judgement {
                 self.infer(expression, &children)
             };
             use conversion::flow::{JudgementEdges as E, NonCrossedEdge as N};
-            let inherited = inherited.join(result.conversion_sources().clone());
+
             let edges = match &root.kind {
                 ExprKind::Convert { .. } => E::Convert(
                     root.first_conversion
@@ -5028,7 +5147,7 @@ mod judgement {
                     children: &children,
                 },
             };
-            result = JudgedExpr::build(result.data.clone(), edges);
+            let mut result = JudgedExpr::build(result.data, edges);
             result.data_mut().origin = Some(root.location.clone());
             result.data_mut().authority = Some(self.authority.clone());
             if matches!(root.kind, ExprKind::Reference { .. }) {
@@ -5123,7 +5242,10 @@ mod judgement {
             };
             let mut output = match self.authored.get(origin).copied() {
                 Some(authored) => self.judge(authored),
-                None => incomplete("authored module output origin"),
+                None => JudgedExpr::build(
+                    incomplete("authored module output origin").data,
+                    conversion::flow::JudgementEdges::Selected(evidence),
+                ),
             };
             output.inherit_output_materialization(evidence);
             output
@@ -5135,7 +5257,7 @@ mod judgement {
             location: &DeclarationLocation,
             owner: &DeclarationLocation,
             context: &str,
-        ) -> Option<JudgedExpr> {
+        ) -> Option<InferredExpr> {
             let error = crate::validation::typecheck::admit_function_expression(
                 expression,
                 sink,
@@ -5159,7 +5281,7 @@ mod judgement {
                 crate::validation::typecheck::FunctionExpressionError::Expression(error) => error,
             };
             if expression.failed() {
-                return Some(expression.clone());
+                return Some(InferredExpr::from(expression));
             }
             let finding = Located::new(
                 location.clone(),
@@ -5272,20 +5394,22 @@ mod judgement {
         // the authored children of heterogeneous records.
         fn access(
             &self,
-            base: &JudgedExpr,
+            base: &JudgedExprData,
             step: Option<&PathSegment>,
             binding: &str,
-        ) -> JudgedExpr {
+        ) -> InferredExpr {
             if base.is_value_dependent()
                 || base.failed()
                 || matches!(base.judgement, ExprJudgement::AuthorityUnavailable(_))
                 || base.is_enum_identifier()
             {
-                return base.clone();
+                return InferredExpr {
+                    data: Arc::new(base.clone()),
+                };
             }
             let Some(step) = step else {
                 if let Some(member) = &base.member {
-                    return (**member).clone();
+                    return InferredExpr::from(member.as_ref());
                 }
                 let candidates: Vec<_> = base
                     .elements
@@ -5330,7 +5454,7 @@ mod judgement {
                 }),
             };
             if let Some(selected) = selected {
-                return selected.clone();
+                return InferredExpr::from(selected);
             }
             let ty = base
                 .static_type()
@@ -5355,10 +5479,10 @@ mod judgement {
 
         fn access_path(
             &self,
-            base: JudgedExpr,
+            base: InferredExpr,
             steps: &[PathSegment],
             binding: &str,
-        ) -> JudgedExpr {
+        ) -> InferredExpr {
             steps
                 .iter()
                 .fold(base, |base, step| self.access(&base, Some(step), binding))
@@ -5368,7 +5492,7 @@ mod judgement {
             &mut self,
             expression: &ExprValue<ParserPlaceholder, B>,
             children: &[JudgedExpr],
-        ) -> JudgedExpr {
+        ) -> InferredExpr {
             let root = &expression.authored;
             let ordinary = declared;
             let child_type = |index: usize| {
@@ -5391,7 +5515,7 @@ mod judgement {
                     if let Some(ty) = self.parameter_type(name) {
                         ordinary(Ok(ty.clone()), false).owned_by_bindings()
                     } else if let Some(definition) = self.expressions.definitions.get(name) {
-                        self.judge(definition)
+                        InferredExpr::from(&self.judge(definition))
                     } else {
                         ordinary(Ok(TypeExpr::String), true).with_kind(|_| InferredKind::Literal)
                     }
@@ -5417,7 +5541,11 @@ mod judgement {
                         attributes.get(&(binding.clone(), attribute.clone()))
                     }) {
                         let attribute = self.refresh_module_output(attribute);
-                        return self.access_path(attribute, segments, binding.as_str());
+                        return self.access_path(
+                            InferredExpr::from(&attribute),
+                            segments,
+                            binding.as_str(),
+                        );
                     }
                     if matches!(
                         self.bindings.get(binding.as_str()),
@@ -5461,7 +5589,7 @@ mod judgement {
                         )
                     } else if let Some(definition) = self.expressions.definitions.get(binding) {
                         let base = self.judge(definition);
-                        self.access_path(base, &steps, binding.as_str())
+                        self.access_path(InferredExpr::from(&base), &steps, binding.as_str())
                     } else {
                         ordinary(Ok(TypeExpr::String), true)
                             .with_kind(|_| InferredKind::EnumIdentifier)
@@ -5475,11 +5603,11 @@ mod judgement {
                 {
                     // Only a sole String-family reference preserves the child's
                     // kind, type, and diagnostic owner. Other scalars stringify.
-                    children[0].clone()
+                    InferredExpr::from(&children[0])
                 }
                 ExprKind::Interpolation { .. } => ordinary(
                     Ok(TypeExpr::String),
-                    children.iter().all(JudgedExpr::concrete),
+                    children.iter().all(|expression| expression.concrete()),
                 )
                 .with_kind(InferredKind::StringConstruction),
                 ExprKind::Coalesce => {
@@ -5597,7 +5725,11 @@ mod judgement {
                             failed.report_at(FailureOwner::Boundary);
                             failed
                         }
-                        ty => collection(ty, shape, children.iter().all(JudgedExpr::concrete)),
+                        ty => collection(
+                            ty,
+                            shape,
+                            children.iter().all(|expression| expression.concrete()),
+                        ),
                     };
                     result.data_mut().member = None;
                     match &root.kind {
@@ -5623,7 +5755,7 @@ mod judgement {
                     else {
                         return incomplete("named function body judgement");
                     };
-                    let body = authored_child(Some(body));
+                    let body = body.clone();
                     if let Some(sink) = &signature.return_type
                         && let Some(failure) = self.check_function_sink(
                             &body,
@@ -5742,7 +5874,7 @@ mod judgement {
                     }
                     children
                         .first()
-                        .cloned()
+                        .map(InferredExpr::from)
                         .unwrap_or_else(|| incomplete("iterable operand"))
                 }
                 ExprKind::Alias | ExprKind::Parens | ExprKind::Definition | ExprKind::Wait => {
@@ -5764,7 +5896,7 @@ mod judgement {
                         );
                     }
                     if let Some(member) = &collection.member {
-                        return loop_element((**member).clone());
+                        return loop_element(InferredExpr::from(member.as_ref()));
                     }
                     let members = collection
                         .elements
@@ -5773,7 +5905,7 @@ mod judgement {
                         .cloned()
                         .collect::<Vec<_>>();
                     if !members.is_empty() {
-                        let mut element = members[0].clone();
+                        let mut element = InferredExpr::from(&members[0]);
                         element.data_mut().alternatives = Arc::new(members);
                         return loop_element(element);
                     }
@@ -5826,7 +5958,15 @@ mod judgement {
                     result
                 }
                 ExprKind::If => {
-                    let branches = &children[1..];
+                    let Some(condition) = root.condition_index() else {
+                        return incomplete("named if condition");
+                    };
+                    let branches = children
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| *index != condition)
+                        .map(|(_, child)| child.clone())
+                        .collect::<Vec<_>>();
                     let mut ty = branches
                         .first()
                         .map(|branch| branch.static_type().cloned())
@@ -5861,8 +6001,8 @@ mod judgement {
                             _ => {}
                         }
                     }
-                    let mut result = alternatives(ty, branches);
-                    if !branches.iter().any(JudgedExpr::failed) && result.failed() {
+                    let mut result = alternatives(ty, &branches);
+                    if !branches.iter().any(|expression| expression.failed()) && result.failed() {
                         result.data_mut().judgement = ExprJudgement::ValueDependent {
                             reason: NotInferableReason::ValueDependent {
                                 reason: result.static_type().unwrap_err().to_string(),
@@ -5876,7 +6016,10 @@ mod judgement {
                         ..
                     } = &mut result.data_mut().judgement
                     {
-                        *knowledge = children.iter().all(JudgedExpr::concrete).into();
+                        *knowledge = children
+                            .iter()
+                            .all(|expression| expression.concrete())
+                            .into();
                     }
                     result
                 }
@@ -5901,10 +6044,9 @@ mod judgement {
                         failure.report_at(FailureOwner::BindingScope);
                         return failure;
                     }
-                    let body = children
-                        .last()
-                        .cloned()
-                        .unwrap_or_else(|| incomplete("for body"));
+                    let Some(body) = children.last() else {
+                        return incomplete("for body");
+                    };
                     let mut result = collection(
                         body.static_type()
                             .cloned()
@@ -5912,7 +6054,7 @@ mod judgement {
                         CollectionKind::List,
                         false,
                     );
-                    result.data_mut().member = Some(Arc::new(body));
+                    result.data_mut().member = Some(Arc::new(body.clone()));
                     result
                 }
                 ExprKind::DynamicAccess => self.access(&children[0], None, "dynamic access base"),
@@ -5925,7 +6067,7 @@ mod judgement {
                     result.report_at(FailureOwner::Boundary);
                     result
                 }
-                ExprKind::NestedBlock { .. } => children[0].clone(),
+                ExprKind::NestedBlock { .. } => InferredExpr::from(&children[0]),
                 ExprKind::ModuleCall => {
                     let mut result = value_dependent("module call result requires its signature");
                     result.report_at(FailureOwner::Boundary);
@@ -6013,7 +6155,7 @@ mod judgement {
         }
     }
 
-    fn loop_element(mut expression: JudgedExpr) -> JudgedExpr {
+    fn loop_element(mut expression: InferredExpr) -> InferredExpr {
         if matches!(
             expression.judgement,
             ExprJudgement::Typed {
@@ -6027,8 +6169,12 @@ mod judgement {
             expression
                 .alternatives
                 .iter()
-                .cloned()
-                .map(loop_element)
+                .map(|child| {
+                    JudgedExpr::build(
+                        loop_element(InferredExpr::from(child)).data,
+                        conversion::flow::JudgementEdges::Selected(child),
+                    )
+                })
                 .collect(),
         );
         expression
@@ -6036,9 +6182,9 @@ mod judgement {
 
     /// Join source evidence independently of a selected projection. Exact
     /// containers keep evidence for every index/key any branch can produce.
-    fn alternatives(ty: Result<TypeExpr, InferenceIssue>, branches: &[JudgedExpr]) -> JudgedExpr {
+    fn alternatives(ty: Result<TypeExpr, InferenceIssue>, branches: &[JudgedExpr]) -> InferredExpr {
         if branches.len() == 1 {
-            return branches[0].clone();
+            return InferredExpr::from(&branches[0]);
         }
         let mut result = declared(ty, branches.iter().all(|branch| branch.concrete()));
         result.data_mut().authority = branches.first().and_then(|branch| branch.authority.clone());
@@ -6048,9 +6194,12 @@ mod judgement {
             .filter_map(|branch| branch.member.as_deref())
             .cloned()
             .collect::<Vec<_>>();
-        result.data_mut().member = member_sources
-            .first()
-            .map(|first| Arc::new(alternatives(first.static_type().cloned(), &member_sources)));
+        result.data_mut().member = member_sources.first().map(|first| {
+            Arc::new(alternatives_following_sources(
+                first.static_type().cloned(),
+                &member_sources,
+            ))
+        });
         let max_len = branches
             .iter()
             .map(|branch| branch.elements.len())
@@ -6066,7 +6215,7 @@ mod judgement {
                         })
                         .cloned()
                         .collect::<Vec<_>>();
-                    alternatives(sources[0].static_type().cloned(), &sources)
+                    alternatives_following_sources(sources[0].static_type().cloned(), &sources)
                 })
                 .collect(),
         );
@@ -6086,7 +6235,7 @@ mod judgement {
                         .collect::<Vec<_>>();
                     (
                         key,
-                        alternatives(sources[0].static_type().cloned(), &sources),
+                        alternatives_following_sources(sources[0].static_type().cloned(), &sources),
                     )
                 })
                 .collect(),
@@ -6094,17 +6243,30 @@ mod judgement {
         result
     }
 
+    fn alternatives_following_sources(
+        ty: Result<TypeExpr, InferenceIssue>,
+        sources: &[JudgedExpr],
+    ) -> JudgedExpr {
+        JudgedExpr::build(
+            alternatives(ty, sources).data,
+            conversion::flow::JudgementEdges::Follow {
+                inherited: &conversion::flow::ConversionSources::empty(),
+                children: sources,
+            },
+        )
+    }
+
     /// Interpret the registry declaration once for both calls and intrinsics.
     fn builtin_result(
         result_typing: crate::builtins::BuiltinResultTyping,
         children: &[JudgedExpr],
-    ) -> JudgedExpr {
+    ) -> InferredExpr {
         use crate::builtins::BuiltinResultTyping as R;
-        let concrete = children.iter().all(JudgedExpr::concrete);
+        let concrete = children.iter().all(|expression| expression.concrete());
         match result_typing {
             R::Argument(index) => children
                 .get(index)
-                .cloned()
+                .map(InferredExpr::from)
                 .unwrap_or_else(|| incomplete("builtin argument")),
             R::String | R::SecretString => declared(Ok(TypeExpr::String), concrete),
             R::ConstructedString => declared(Ok(TypeExpr::String), concrete)
@@ -6117,19 +6279,28 @@ mod judgement {
                     CollectionKind::List,
                     concrete,
                 );
-                result.data_mut().member = Some(Arc::new(
+                result.data_mut().member = Some(Arc::new(JudgedExpr::build(
                     declared(Ok(TypeExpr::String), concrete)
-                        .with_kind(InferredKind::BuiltinConstruction),
-                ));
+                        .with_kind(InferredKind::BuiltinConstruction)
+                        .data,
+                    conversion::flow::JudgementEdges::Follow {
+                        inherited: &conversion::flow::ConversionSources::empty(),
+                        children,
+                    },
+                )));
                 result.with_kind(InferredKind::BuiltinStringList)
             }
-            R::List => builtin_collection(CollectionKind::List, concrete),
-            R::Map => builtin_collection(CollectionKind::Map, concrete),
+            R::List => builtin_collection(CollectionKind::List, concrete, children),
+            R::Map => builtin_collection(CollectionKind::Map, concrete, children),
             R::Any => value_dependent("builtin return type depends on arguments"),
         }
     }
 
-    fn builtin_collection(shape: CollectionKind, concrete: bool) -> JudgedExpr {
+    fn builtin_collection(
+        shape: CollectionKind,
+        concrete: bool,
+        children: &[JudgedExpr],
+    ) -> InferredExpr {
         let mut result = collection(
             value_dependent("builtin return type depends on arguments")
                 .static_type()
@@ -6137,8 +6308,12 @@ mod judgement {
             shape,
             concrete,
         );
-        result.data_mut().member = Some(Arc::new(value_dependent(
-            "builtin elements require resolved constraint checks",
+        result.data_mut().member = Some(Arc::new(JudgedExpr::build(
+            value_dependent("builtin elements require resolved constraint checks").data,
+            conversion::flow::JudgementEdges::Follow {
+                inherited: &conversion::flow::ConversionSources::empty(),
+                children,
+            },
         )));
         result
     }
@@ -6147,7 +6322,7 @@ mod judgement {
         ty: Result<TypeExpr, InferenceIssue>,
         shape: CollectionKind,
         concrete: bool,
-    ) -> JudgedExpr {
+    ) -> InferredExpr {
         let mut result = match ty {
             Err(reason) => {
                 let mut result = value_dependent("collection has no common element type");
@@ -6175,10 +6350,13 @@ mod judgement {
 
     pub(super) fn synthetic_judgement(source: super::SyntheticSource) -> JudgedExpr {
         match source {
-            super::SyntheticSource::ResourcePrefix(_) => declared(Ok(TypeExpr::String), true),
+            super::SyntheticSource::ResourcePrefix(_) => JudgedExpr::build(
+                declared(Ok(TypeExpr::String), true).data,
+                conversion::flow::JudgementEdges::Leaf,
+            ),
         }
     }
-    fn declared(ty: Result<TypeExpr, InferenceIssue>, concrete: bool) -> JudgedExpr {
+    fn declared(ty: Result<TypeExpr, InferenceIssue>, concrete: bool) -> InferredExpr {
         let judgement = match ty {
             Ok(ty) => ExprJudgement::Typed {
                 ty,
@@ -6213,8 +6391,8 @@ mod judgement {
                 owner: FailureOwner::Boundary,
             },
         };
-        JudgedExpr::build(
-            Arc::new(JudgedExprData {
+        InferredExpr {
+            data: Arc::new(JudgedExprData {
                 diagnostic_scope: DiagnosticScope::Public,
                 origin: None,
                 boundary_owner: None,
@@ -6226,19 +6404,18 @@ mod judgement {
                 elements: Arc::default(),
                 fields: Arc::default(),
             }),
-            conversion::flow::JudgementEdges::Leaf,
-        )
+        }
     }
     pub(crate) fn unjudged() -> Result<JudgedExpr, MissingEvidence> {
         Err(MissingEvidence::new("declaration has not been judged"))
     }
-    fn authored_child(child: Option<&JudgedExpr>) -> JudgedExpr {
+    fn authored_child(child: Option<&JudgedExpr>) -> InferredExpr {
         child
-            .cloned()
+            .map(InferredExpr::from)
             .unwrap_or_else(|| incomplete("authored child"))
     }
 
-    fn incomplete(request: &str) -> JudgedExpr {
+    fn incomplete(request: &str) -> InferredExpr {
         declared(
             Err(InferenceError::from(MissingEvidence::new(request)).into()),
             false,
@@ -6257,7 +6434,7 @@ mod judgement {
         result.data_mut().authority = Some(Arc::new(super::super::ProviderContext::new(
             crate::EnvironmentSnapshot::empty(),
         )));
-        result
+        JudgedExpr::build(result.data, conversion::flow::JudgementEdges::Leaf)
     }
     #[test]
     fn pending_secret_output_cannot_gain_materialized_value_evidence() {
@@ -6277,6 +6454,7 @@ mod judgement {
         if let Ok(known) = proof.into_known() {
             expression.materialize_output(&known);
         }
+        let expression = JudgedExpr::build(expression.data, conversion::flow::JudgementEdges::Leaf);
         assert_eq!(
             admit_with_context(
                 &expression,
@@ -6299,7 +6477,10 @@ mod judgement {
                 declared(Ok(TypeExpr::String), known).with_kind(InferredKind::BuiltinConstruction);
             let mut refreshed =
                 declared(Ok(TypeExpr::String), false).with_kind(InferredKind::BuiltinConstruction);
+            let previous = JudgedExpr::build(previous.data, conversion::flow::JudgementEdges::Leaf);
             refreshed.inherit_output_materialization(&previous);
+            let refreshed =
+                JudgedExpr::build(refreshed.data, conversion::flow::JudgementEdges::Leaf);
             assert_eq!(
                 admit_with_context(
                     &refreshed,
@@ -6324,7 +6505,7 @@ mod judgement {
         );
     }
 
-    pub(super) fn value_dependent(reason: &str) -> JudgedExpr {
+    fn value_dependent(reason: &str) -> InferredExpr {
         let mut result = declared(Ok(TypeExpr::String), false);
         result.data_mut().judgement = ExprJudgement::ValueDependent {
             reason: NotInferableReason::ValueDependent {
@@ -6335,7 +6516,7 @@ mod judgement {
         };
         result
     }
-    fn declaration() -> JudgedExpr {
+    fn declaration() -> InferredExpr {
         let mut result = value_dependent("declaration is not a value");
         result.data_mut().judgement = ExprJudgement::Declaration;
         result

@@ -837,27 +837,76 @@ pub(crate) trait WalkMode: Clone + Default {
     fn shorten<'a: 'b, 'b, P: ValueKind + 'a, B: BindingAddress>(
         policy: Self::Policy<'a, P, B>,
     ) -> Self::Policy<'b, P, B>;
+    fn reject_transport<B: BindingAddress>(
+        cursor: &AuthoredCursor<'_, B>,
+        path: &LeafPath,
+    ) -> AssignmentFindings<Self::Channel>;
+    fn judge_position<'s, 'c, 'd, 'v, P: PlaceholderKind, B: BindingAddress>(
+        callbacks: &WalkCallbacks<'c, P, B, Self>,
+        declaration: &'d CompiledAttributeType,
+        checked: CheckValue<'v, P, B>,
+        path: &LeafPath,
+        position: PolicyPosition<'s, '_, B, Self>,
+    ) -> (
+        AssignmentFindings<Self::Channel>,
+        CheckedPosition<'s, 'c, 'd, 'v, P, B, Self>,
+    ) {
+        let cursor = position.cursor.clone();
+        let (findings, decision) =
+            Self::apply_policy(callbacks, declaration, checked, path, position);
+        (
+            findings,
+            CheckedPosition {
+                cursor,
+                callbacks: callbacks.clone(),
+                declaration,
+                checked,
+                path: path.clone(),
+                decision,
+            },
+        )
+    }
     fn apply_policy<'a, P: PlaceholderKind, B: BindingAddress>(
         callbacks: &WalkCallbacks<'_, P, B, Self>,
         declaration: &CompiledAttributeType,
         checked: CheckValue<'_, P, B>,
         path: &LeafPath,
         position: PolicyPosition<'a, '_, B, Self>,
-    ) -> AssignmentFindings<Self::Channel>;
+    ) -> (AssignmentFindings<Self::Channel>, PositionDecision);
 }
 impl WalkMode for NoAuthored {
     type Channel = NoConversions;
     type Policy<'a, P: ValueKind + 'a, B: BindingAddress> = ();
     type Claim<'a, B: BindingAddress> = NoClaim;
     fn shorten<'a: 'b, 'b, P: ValueKind + 'a, B: BindingAddress>(_: ()) {}
+    fn reject_transport<B: BindingAddress>(
+        _: &AuthoredCursor<'_, B>,
+        path: &LeafPath,
+    ) -> AssignmentFindings<NoConversions> {
+        AssignmentFindings {
+            errors: vec![(
+                path.clone(),
+                seam_error(crate::parser::retained::MissingEvidence::new(
+                    "ordinary syntax descent",
+                )),
+            )],
+            ..Default::default()
+        }
+    }
     fn apply_policy<'a, P: PlaceholderKind, B: BindingAddress>(
         _callbacks: &WalkCallbacks<'_, P, B, Self>,
         _declaration: &CompiledAttributeType,
         _checked: CheckValue<'_, P, B>,
         _path: &LeafPath,
-        _position: PolicyPosition<'a, '_, B, Self>,
-    ) -> AssignmentFindings<NoConversions> {
-        Default::default()
+        position: PolicyPosition<'a, '_, B, Self>,
+    ) -> (AssignmentFindings<NoConversions>, PositionDecision) {
+        let decision = match position.cursor.no_conversion() {
+            Some(proof) => PositionDecision::ordinary(proof),
+            None => PositionDecision::invalid(seam_error(
+                crate::parser::retained::MissingEvidence::new("ordinary projected proof"),
+            )),
+        };
+        (Default::default(), decision)
     }
 }
 impl WalkMode for WithAuthored {
@@ -869,13 +918,31 @@ impl WalkMode for WithAuthored {
     ) -> AuthoredChecks<'b, P, B> {
         policy
     }
+    fn reject_transport<B: BindingAddress>(
+        cursor: &AuthoredCursor<'_, B>,
+        path: &LeafPath,
+    ) -> AssignmentFindings {
+        let verdict = match crate::parser::retained::ConversionVerdict::proof_mismatch(cursor) {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                crate::parser::retained::ConversionVerdict::seam_rejection(path.clone(), error)
+            }
+        };
+        verdict.decide(
+            |findings, _| findings,
+            |mut findings| {
+                findings.claim_effect = ClaimEffect::Rejected;
+                findings
+            },
+        )
+    }
     fn apply_policy<'a, P: PlaceholderKind, B: BindingAddress>(
         callbacks: &WalkCallbacks<'_, P, B, Self>,
         declaration: &CompiledAttributeType,
         checked: CheckValue<'_, P, B>,
         path: &LeafPath,
         position: PolicyPosition<'a, '_, B, Self>,
-    ) -> AssignmentFindings {
+    ) -> (AssignmentFindings, PositionDecision) {
         let PolicyPosition { cursor, claim } = position;
         let outcome = callbacks.policy(declaration, checked, path, cursor.clone());
         claim.record(outcome, cursor)
@@ -1617,9 +1684,33 @@ pub(crate) enum AuthoredOutcome<
 // Only a consumed authored witness or an explicit hook error reaches this
 // internal verdict. Callers cannot claim a position with empty findings.
 enum PolicyOutcome {
-    Continue(AssignmentFindings),
+    Continue(crate::parser::retained::NoConversion, AssignmentFindings),
+    Transport(crate::parser::retained::conversion::TransportDescent),
     Claimed(crate::parser::retained::ConversionVerdict),
     Deferred(crate::parser::retained::conversion::TemplateDeferral),
+}
+// A check cannot infer permission from the absence of an ordinary proof.
+// This token is produced by policy for this value position, before checking it.
+pub(crate) struct PositionDecision(PositionDecisionKind);
+enum PositionDecisionKind {
+    Ordinary(crate::parser::retained::NoConversion),
+    Claimed,
+    Transport(crate::parser::retained::conversion::TransportDescent),
+    Invalid(TypeError),
+}
+impl PositionDecision {
+    fn ordinary(proof: crate::parser::retained::NoConversion) -> Self {
+        Self(PositionDecisionKind::Ordinary(proof))
+    }
+    fn claimed() -> Self {
+        Self(PositionDecisionKind::Claimed)
+    }
+    fn transport(descent: crate::parser::retained::conversion::TransportDescent) -> Self {
+        Self(PositionDecisionKind::Transport(descent))
+    }
+    fn invalid(error: TypeError) -> Self {
+        Self(PositionDecisionKind::Invalid(error))
+    }
 }
 pub(crate) type AuthoredAssignmentCheck<'a, P, B> =
     &'a dyn Fn(
@@ -1862,7 +1953,7 @@ impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
             AuthoredChecks::Validation(check) => match check(attr, value, path, cursor.clone()) {
                 Ok(AuthoredOutcome::Continue(proof, findings)) => {
                     if cursor.no_conversion() == Some(proof) {
-                        PolicyOutcome::Continue(findings)
+                        PolicyOutcome::Continue(proof, findings)
                     } else {
                         match crate::parser::retained::ConversionVerdict::proof_mismatch(&cursor) {
                             Ok(verdict) => PolicyOutcome::Claimed(verdict),
@@ -1871,7 +1962,7 @@ impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
                     }
                 }
                 Ok(AuthoredOutcome::Transport(witness)) => match witness.consume(&cursor) {
-                    Ok(()) => PolicyOutcome::Continue(Default::default()),
+                    Ok(descent) => PolicyOutcome::Transport(descent),
                     Err(error) => PolicyOutcome::Claimed(
                         crate::parser::retained::ConversionVerdict::invalid_witness(error),
                     ),
@@ -1905,19 +1996,22 @@ impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
                             deferred,
                             matched_destination,
                         } = findings;
-                        PolicyOutcome::Continue(AssignmentFindings {
-                            claim_effect,
-                            conversions: Default::default(),
-                            local,
-                            schema,
-                            errors,
-                            #[cfg(test)]
-                            deferred,
-                            matched_destination,
-                        })
+                        PolicyOutcome::Continue(
+                            proof,
+                            AssignmentFindings {
+                                claim_effect,
+                                conversions: Default::default(),
+                                local,
+                                schema,
+                                errors,
+                                #[cfg(test)]
+                                deferred,
+                                matched_destination,
+                            },
+                        )
                     }
                     AuthoredOutcome::Transport(witness) => match witness.consume(&cursor) {
-                        Ok(()) => PolicyOutcome::Continue(Default::default()),
+                        Ok(descent) => PolicyOutcome::Transport(descent),
                         Err(error) => PolicyOutcome::Claimed(
                             crate::parser::retained::ConversionVerdict::invalid_witness(error),
                         ),
@@ -1929,7 +2023,10 @@ impl<'a, P: ValueKind, B: BindingAddress> WalkCallbacks<'a, P, B> {
             AuthoredChecks::Projected(phase) => match cursor.kind {
                 CursorKind::Projected(
                     crate::parser::retained::ProjectionAuthority::Operational(current),
-                ) if current == phase => PolicyOutcome::Continue(Default::default()),
+                ) if current == phase => PolicyOutcome::Continue(
+                    crate::parser::retained::NoConversion::operational(phase),
+                    Default::default(),
+                ),
                 CursorKind::Projected(_) | CursorKind::Authored(_) | CursorKind::CoveredBy(_) => {
                     rejected(seam_error(crate::parser::retained::MissingEvidence::new(
                         "projected callback/cursor pairing",
@@ -2034,9 +2131,24 @@ impl<'a, B: BindingAddress> Claim<'a, B> {
         &mut self,
         outcome: PolicyOutcome,
         cursor: AuthoredCursor<'a, B>,
-    ) -> AssignmentFindings {
+    ) -> (AssignmentFindings, PositionDecision) {
         match outcome {
-            PolicyOutcome::Continue(findings) => findings,
+            PolicyOutcome::Continue(proof, findings) => (
+                findings,
+                if self.is_claimed() {
+                    PositionDecision::claimed()
+                } else {
+                    PositionDecision::ordinary(proof)
+                },
+            ),
+            PolicyOutcome::Transport(descent) => (
+                Default::default(),
+                if self.is_claimed() {
+                    PositionDecision::claimed()
+                } else {
+                    PositionDecision::transport(descent)
+                },
+            ),
             PolicyOutcome::Deferred(deferral) => {
                 deferral.consume();
                 if !self.is_rejected() {
@@ -2044,7 +2156,7 @@ impl<'a, B: BindingAddress> Claim<'a, B> {
                         owner: std::rc::Rc::new(cursor),
                     };
                 }
-                Default::default()
+                (Default::default(), PositionDecision::claimed())
             }
             PolicyOutcome::Claimed(verdict) => {
                 let (claim, findings) = verdict.decide(
@@ -2073,8 +2185,76 @@ impl<'a, B: BindingAddress> Claim<'a, B> {
                 if !self.is_rejected() {
                     *self = claim;
                 }
-                findings
+                (findings, PositionDecision::claimed())
             }
+        }
+    }
+}
+
+/// An ordinary check cannot be rebound to a different value position after
+/// policy. Construction is private; check consumes the complete captured input.
+pub(crate) struct CheckedPosition<
+    's,
+    'c,
+    'd,
+    'v,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    M: WalkMode,
+> {
+    cursor: AuthoredCursor<'s, B>,
+    callbacks: WalkCallbacks<'c, P, B, M>,
+    declaration: &'d CompiledAttributeType,
+    checked: CheckValue<'v, P, B>,
+    path: LeafPath,
+    decision: PositionDecision,
+}
+impl<P: PlaceholderKind, B: BindingAddress, M: WalkMode> CheckedPosition<'_, '_, '_, '_, P, B, M> {
+    fn check(self) -> Result<AssignmentFindings<M::Channel>, TypeError> {
+        self.check_as(false)
+    }
+    fn check_selection(self) -> Result<AssignmentFindings<M::Channel>, TypeError> {
+        self.check_as(true)
+    }
+    fn check_as(self, selection: bool) -> Result<AssignmentFindings<M::Channel>, TypeError> {
+        match self.decision.0 {
+            PositionDecisionKind::Ordinary(proof) => self.callbacks.ordinary.call(
+                self.declaration,
+                self.checked,
+                &self.path,
+                if selection {
+                    self.cursor.selection()
+                } else {
+                    self.cursor
+                },
+                proof,
+            ),
+            PositionDecisionKind::Claimed => Ok(Default::default()),
+            PositionDecisionKind::Transport(descent) => {
+                descent.consume();
+                Ok(Default::default())
+            }
+            PositionDecisionKind::Invalid(error) => Err(error),
+        }
+    }
+}
+enum AssignmentPosition<T> {
+    SchemaOnly,
+    Judged(T),
+}
+impl<'s, 'c, 'd, 'v, P: PlaceholderKind, B: BindingAddress, M: WalkMode>
+    AssignmentPosition<CheckedPosition<'s, 'c, 'd, 'v, P, B, M>>
+{
+    fn check(self) -> Result<AssignmentFindings<M::Channel>, TypeError> {
+        match self {
+            Self::SchemaOnly => Ok(Default::default()),
+            Self::Judged(position) => position.check(),
+        }
+    }
+    fn check_selection(self) -> Result<AssignmentFindings<M::Channel>, TypeError> {
+        match self {
+            Self::SchemaOnly => Ok(Default::default()),
+            Self::Judged(position) => position.check_selection(),
         }
     }
 }
@@ -2110,63 +2290,14 @@ impl<'a, P: PlaceholderKind, B: BindingAddress, M: WalkMode> AssignmentWalk<'a, 
             ..self.clone()
         })
     }
-    fn check(
-        &self,
-        attr: &CompiledAttributeType,
-        value: CheckValue<'_, P, B>,
-        path: &FieldPath,
-    ) -> Result<AssignmentFindings<M::Channel>, TypeError> {
-        if self.claim.is_claimed() {
-            return Ok(Default::default());
-        }
-        match self.cursor.no_conversion() {
-            Some(proof) => self.callbacks.ordinary.call(
-                attr,
-                value,
-                &path.canonical(),
-                self.cursor.clone(),
-                proof,
-            ),
-            None => Ok(Default::default()), // Transport positions are admitted by their children.
-        }
-    }
-
-    fn check_selection(
-        &self,
-        attr: &CompiledAttributeType,
-        value: CheckValue<'_, P, B>,
-        path: &FieldPath,
-    ) -> Result<AssignmentFindings<M::Channel>, TypeError> {
-        if self.claim.is_claimed() {
-            return Ok(Default::default());
-        }
-        match self.cursor.no_conversion() {
-            Some(proof) => self.callbacks.ordinary.call(
-                attr,
-                value,
-                &path.canonical(),
-                self.cursor.selection(),
-                proof,
-            ),
-            None => Ok(Default::default()),
-        }
-    }
-
-    fn apply_policy(
+    fn apply_policy<'d, 'v>(
         &mut self,
-        attr: &CompiledAttributeType,
-        value: CheckValue<'_, P, B>,
+        attr: &'d CompiledAttributeType,
+        value: CheckValue<'v, P, B>,
         path: &FieldPath,
         findings: &mut AssignmentFindings<M::Channel>,
-    ) {
-        if matches!(
-            &self.cursor.kind,
-            CursorKind::Authored(_) | CursorKind::CoveredBy(_)
-        ) && self.cursor.is_projection_only()
-        {
-            return;
-        }
-        findings.extend(M::apply_policy(
+    ) -> CheckedPosition<'a, 'a, 'd, 'v, P, B, M> {
+        let (policy, position) = M::judge_position(
             &self.callbacks,
             attr,
             value,
@@ -2175,7 +2306,9 @@ impl<'a, P: PlaceholderKind, B: BindingAddress, M: WalkMode> AssignmentWalk<'a, 
                 cursor: self.cursor.clone(),
                 claim: &mut self.claim,
             },
-        ));
+        );
+        findings.extend(policy);
+        position
     }
 
     fn authored(
@@ -2275,17 +2408,13 @@ impl<'a, P: PlaceholderKind, B: BindingAddress, M: WalkMode> AssignmentWalk<'a, 
                 AuthoredNavigation::Alternatives { first, .. }
                     if usage.form() == AuthoredForm::If && value.branches().is_none() =>
                 {
-                    self.apply_policy(
+                    let decision = self.apply_policy(
                         attr,
                         CheckValue::Current(value.diagnostic_value()),
                         path,
                         &mut findings.authored,
                     );
-                    findings.ordinary.extend(self.check_selection(
-                        attr,
-                        CheckValue::Current(value.diagnostic_value()),
-                        path,
-                    )?);
+                    findings.ordinary.extend(decision.check_selection()?);
                     #[cfg(test)]
                     if self.callbacks.authored.is_some() {
                         wrappers.push(self.cursor.selection());
@@ -2313,17 +2442,13 @@ impl<'a, P: PlaceholderKind, B: BindingAddress, M: WalkMode> AssignmentWalk<'a, 
                 AuthoredNavigation::Alternatives { .. }
                     if usage.form() == AuthoredForm::Coalesce && value.coalesce().is_none() =>
                 {
-                    self.apply_policy(
+                    let decision = self.apply_policy(
                         attr,
                         CheckValue::Current(value.diagnostic_value()),
                         path,
                         &mut findings.authored,
                     );
-                    findings.ordinary.extend(self.check_selection(
-                        attr,
-                        CheckValue::Current(value.diagnostic_value()),
-                        path,
-                    )?);
+                    findings.ordinary.extend(decision.check_selection()?);
                     #[cfg(test)]
                     if self.callbacks.authored.is_some() {
                         wrappers.push(self.cursor.selection());
@@ -2556,6 +2681,17 @@ enum SyntaxVisit {
     Covered,
 }
 impl SyntaxVisit {
+    // Discarded/covered syntax is judged without admitting a value; its
+    // placement and kind verdicts do not require a live child contract.
+    fn requires_child_contract(self) -> bool {
+        match self {
+            Self::Pending => true,
+            Self::PendingCovered | Self::Discarded | Self::DiscardedCovered | Self::Covered => {
+                false
+            }
+        }
+    }
+
     fn value<'v, P: PlaceholderKind, B: BindingAddress>(self) -> CheckValue<'v, P, B> {
         match self {
             Self::Pending => CheckValue::Pending,
@@ -2590,6 +2726,26 @@ impl<B: BindingAddress, M: WalkMode> SyntaxVisitState<'_, B, M> {
     }
 }
 
+// Only a completed descent can be reused. An in-progress carrying use is a
+// failed descent, never an ordinary acceptance.
+enum SyntaxProgress {
+    Entered,
+    Completed(CompletedSyntax),
+}
+struct CompletedSyntax;
+type SyntaxVisits = std::collections::HashMap<
+    (
+        (
+            NodeId,
+            UseId,
+            crate::parser::retained::ExpansionInstanceId,
+            crate::parser::retained::ProjectionGeneration,
+        ),
+        usize,
+    ),
+    SyntaxProgress,
+>;
+
 #[allow(clippy::too_many_arguments)]
 fn visit_syntax<'w, 's: 'w, P: PlaceholderKind, B: BindingAddress, M: WalkMode>(
     attr: &'w CompiledAttributeType,
@@ -2611,281 +2767,347 @@ fn visit_syntax<'w, 's: 'w, P: PlaceholderKind, B: BindingAddress, M: WalkMode>(
         visit: SyntaxVisitState<'s, B, M>,
         coverage: &mut WalkCoverage,
         findings: &mut AssignmentProbe<M::Channel>,
-        visited: &mut std::collections::HashSet<(NodeId, UseId)>,
+        visited: &mut SyntaxVisits,
     ) -> Result<(), TypeError> {
         let mut references = Vec::new();
         let resolved = resolve_refs_on_path(attr, defs, &mut references)
             .map_err(|error| error.into_validation_error())?;
         let attr = resolved.attr;
         let navigation = cursor.navigation().map_err(seam_error)?;
-        if let AuthoredNavigation::Forward {
-            child,
-            authored: false,
-        } = navigation
-        {
-            return descend(
-                attr,
-                defs,
-                path,
-                ancestry,
-                child,
-                callbacks.clone(),
-                visit,
-                coverage,
-                findings,
-                visited,
-            );
+        let key = (
+            cursor.identity(),
+            attr as *const CompiledAttributeType as usize,
+        );
+        match visited.get(&key) {
+            Some(SyntaxProgress::Completed(CompletedSyntax)) => return Ok(()),
+            Some(SyntaxProgress::Entered) => {
+                if cursor.node().judgement().contains_any_conversion() {
+                    findings.authored.extend(M::reject_transport(
+                        &AuthoredCursor::authored(cursor),
+                        &path.canonical(),
+                    ));
+                }
+                return Ok(());
+            }
+            None => {}
         }
-        let policy_position = (visit.claim.is_claimed()
-            || cursor.node().judgement().contains_any_conversion())
-            && match &navigation {
-                AuthoredNavigation::Forward { .. }
-                | AuthoredNavigation::Secret(_)
-                | AuthoredNavigation::Alternatives { .. }
-                | AuthoredNavigation::Parts
-                | AuthoredNavigation::Leaf
-                | AuthoredNavigation::Covered => true,
-                AuthoredNavigation::List | AuthoredNavigation::Map => false,
-            };
-        // Authored wrappers and alternatives retain the original declaration
-        // until their policy judges the value position. Container probes still
-        // choose child contracts; no-as probes keep their existing timing.
-        if !policy_position && let AttrTypeKind::Union(members) = &attr.kind {
-            // Syntax, never a fabricated Value, determines which container
-            // declarations can supply child contracts to this authored probe.
-            let mut shape = cursor.clone();
-            let shape = loop {
-                match shape.navigation().map_err(seam_error)? {
-                    AuthoredNavigation::Forward { child: next, .. }
-                    | AuthoredNavigation::Secret(next) => shape = next,
-                    navigation => break navigation,
-                }
-            };
-            let mut best = None;
-            for member in members.as_raw_slice() {
-                let resolved = resolve_refs_on_path(member, defs, &mut Vec::new())
-                    .map_err(|error| error.into_validation_error())?;
-                let compatible = match &shape {
-                    AuthoredNavigation::List => matches!(
-                        resolved.attr.kind,
-                        AttrTypeKind::List { .. } | AttrTypeKind::Union(_)
-                    ),
-                    AuthoredNavigation::Map => matches!(
-                        resolved.attr.kind,
-                        AttrTypeKind::Map { .. }
-                            | AttrTypeKind::Struct { .. }
-                            | AttrTypeKind::Union(_)
-                    ),
-                    _ => true,
-                };
-                if !compatible {
-                    continue;
-                }
-                let mut probe = AssignmentProbe::default();
-                let mut reached = WalkCoverage::default();
-                descend(
-                    member,
+        visited.insert(key, SyntaxProgress::Entered);
+        let result = (|| {
+            if let AuthoredNavigation::Forward {
+                child,
+                authored: false,
+            } = navigation
+            {
+                return descend(
+                    attr,
                     defs,
                     path,
                     ancestry,
-                    cursor.clone(),
-                    callbacks.probing(),
-                    visit.clone(),
-                    &mut reached,
-                    &mut probe,
-                    &mut Default::default(),
-                )?;
-                let rank = (
-                    std::cmp::Reverse(authored_shape_matches(resolved.attr, &cursor)),
-                    probe.ordinary.errors.len()
-                        + probe.authored.errors.len()
-                        + probe.authored.conversions.findings().len(),
-                    std::cmp::Reverse(reached.len()),
+                    child,
+                    callbacks.clone(),
+                    visit,
+                    coverage,
+                    findings,
+                    visited,
                 );
-                if best.as_ref().is_none_or(|(current, _, _)| rank < *current) {
-                    best = Some((rank, probe, reached));
+            }
+            let policy_position = (visit.claim.is_claimed()
+                || cursor.node().judgement().contains_any_conversion())
+                && match &navigation {
+                    AuthoredNavigation::Forward { .. }
+                    | AuthoredNavigation::Secret(_)
+                    | AuthoredNavigation::Alternatives { .. }
+                    | AuthoredNavigation::Parts
+                    | AuthoredNavigation::Leaf
+                    | AuthoredNavigation::Covered => true,
+                    AuthoredNavigation::List | AuthoredNavigation::Map => false,
+                };
+            // Authored wrappers and alternatives retain the original declaration
+            // until their policy judges the value position. Container probes still
+            // choose child contracts; no-as probes keep their existing timing.
+            if !policy_position && let AttrTypeKind::Union(members) = &attr.kind {
+                // Syntax, never a fabricated Value, determines which container
+                // declarations can supply child contracts to this authored probe.
+                let mut shape = cursor.clone();
+                let shape = loop {
+                    match shape.navigation().map_err(seam_error)? {
+                        AuthoredNavigation::Forward { child: next, .. }
+                        | AuthoredNavigation::Secret(next) => shape = next,
+                        navigation @ (AuthoredNavigation::Alternatives { .. }
+                        | AuthoredNavigation::List
+                        | AuthoredNavigation::Map
+                        | AuthoredNavigation::Parts
+                        | AuthoredNavigation::Leaf
+                        | AuthoredNavigation::Covered) => break navigation,
+                    }
+                };
+                let mut best = None;
+                for member in members.as_raw_slice() {
+                    let resolved = resolve_refs_on_path(member, defs, &mut Vec::new())
+                        .map_err(|error| error.into_validation_error())?;
+                    let compatible = match &shape {
+                        AuthoredNavigation::List => matches!(
+                            resolved.attr.kind,
+                            AttrTypeKind::List { .. } | AttrTypeKind::Union(_)
+                        ),
+                        AuthoredNavigation::Map => matches!(
+                            resolved.attr.kind,
+                            AttrTypeKind::Map { .. }
+                                | AttrTypeKind::Struct { .. }
+                                | AttrTypeKind::Union(_)
+                        ),
+                        AuthoredNavigation::Forward { .. }
+                        | AuthoredNavigation::Secret(_)
+                        | AuthoredNavigation::Alternatives { .. }
+                        | AuthoredNavigation::Parts
+                        | AuthoredNavigation::Leaf
+                        | AuthoredNavigation::Covered => true,
+                    };
+                    if !compatible {
+                        continue;
+                    }
+                    let mut probe = AssignmentProbe::default();
+                    let mut reached = WalkCoverage::default();
+                    descend(
+                        member,
+                        defs,
+                        path,
+                        ancestry,
+                        cursor.clone(),
+                        callbacks.probing(),
+                        visit.clone(),
+                        &mut reached,
+                        &mut probe,
+                        &mut Default::default(),
+                    )?;
+                    let rank = (
+                        std::cmp::Reverse(authored_shape_matches(resolved.attr, &cursor)),
+                        probe.ordinary.errors.len()
+                            + probe.authored.errors.len()
+                            + probe.authored.conversions.findings().len(),
+                        std::cmp::Reverse(reached.len()),
+                    );
+                    if best.as_ref().is_none_or(|(current, _, _)| rank < *current) {
+                        best = Some((rank, probe, reached));
+                    }
+                }
+                if let Some((_, probe, reached)) = best {
+                    findings.extend(probe);
+                    coverage.extend(reached);
+                    return Ok(());
+                }
+                if visit.mode.requires_child_contract()
+                    && cursor.node().judgement().contains_any_conversion()
+                {
+                    findings.authored.extend(M::reject_transport(
+                        &AuthoredCursor::authored(cursor.clone()),
+                        &path.canonical(),
+                    ));
+                    coverage.record(&cursor);
+                    return Ok(());
                 }
             }
-            if let Some((_, probe, reached)) = best {
-                findings.extend(probe);
-                coverage.extend(reached);
-                return Ok(());
-            }
-        }
-        if !visited.insert((cursor.node().node_id(), cursor.occurrence())) {
-            return Ok(());
-        }
-        let mut visit = if matches!(
-            navigation,
-            AuthoredNavigation::Covered | AuthoredNavigation::Parts
-        ) {
-            visit.covered()
-        } else {
-            visit
-        };
-        let authored = match visit.mode {
-            SyntaxVisit::Discarded | SyntaxVisit::Pending => {
-                AuthoredCursor::authored(cursor.clone())
-            }
-            SyntaxVisit::DiscardedCovered | SyntaxVisit::Covered | SyntaxVisit::PendingCovered => {
-                AuthoredCursor::covered_by(cursor.clone())
-            }
-        };
-        let policy = M::apply_policy(
-            &callbacks,
-            attr,
-            visit.value(),
-            &path.canonical(),
-            PolicyPosition {
-                cursor: authored.clone(),
-                claim: &mut visit.claim,
-            },
-        );
-        findings.authored.extend(policy);
-        if !visit.claim.is_claimed()
-            && !matches!(visit.mode, SyntaxVisit::Covered)
-            && let Some(proof) = authored.no_conversion()
-        {
-            findings.ordinary.extend(callbacks.ordinary.call(
+            let mut visit = if matches!(
+                navigation,
+                AuthoredNavigation::Covered | AuthoredNavigation::Parts
+            ) {
+                visit.covered()
+            } else {
+                visit
+            };
+            let authored = match visit.mode {
+                SyntaxVisit::Discarded | SyntaxVisit::Pending => {
+                    AuthoredCursor::authored(cursor.clone())
+                }
+                SyntaxVisit::DiscardedCovered
+                | SyntaxVisit::Covered
+                | SyntaxVisit::PendingCovered => AuthoredCursor::covered_by(cursor.clone()),
+            };
+            let (policy, position) = M::judge_position(
+                &callbacks,
                 attr,
                 visit.value(),
                 &path.canonical(),
-                authored.clone(),
-                proof,
-            )?);
-        }
-        #[cfg(test)]
-        if let Some(hook) = &callbacks.authored {
-            findings
-                .authored
-                .extend(hook.record(attr, visit.value(), &path.canonical(), authored));
-        }
-        coverage.record(&cursor);
-        let same_position = matches!(
-            navigation,
-            AuthoredNavigation::Forward { .. }
-                | AuthoredNavigation::Secret(_)
-                | AuthoredNavigation::Alternatives { .. }
-        );
-        let mut child = |attr: &'w CompiledAttributeType,
-                         child: AuthoredUse<'s, B>,
-                         path: FieldPath,
-                         ancestry| {
-            let nested = if same_position {
-                visit.clone()
-            } else {
-                SyntaxVisitState::<B, M> {
-                    claim: Default::default(),
-                    ..visit.clone()
-                }
-            };
-            descend(
-                attr,
-                defs,
-                &path,
-                ancestry,
-                child,
-                callbacks.clone(),
-                nested,
-                coverage,
-                findings,
-                visited,
-            )
-        };
-        match navigation {
-            AuthoredNavigation::Forward { child: next, .. } => {
-                child(attr, next, path.clone(), ancestry)
+                PolicyPosition {
+                    cursor: authored.clone(),
+                    claim: &mut visit.claim,
+                },
+            );
+            findings.authored.extend(policy);
+            if !matches!(visit.mode, SyntaxVisit::Covered) {
+                findings.ordinary.extend(position.check()?);
             }
-            AuthoredNavigation::Secret(next) => {
-                child(attr, next, path.clone(), ancestry.inside_secret())
+            #[cfg(test)]
+            if let Some(hook) = &callbacks.authored {
+                findings.authored.extend(hook.record(
+                    attr,
+                    visit.value(),
+                    &path.canonical(),
+                    authored,
+                ));
             }
-            AuthoredNavigation::Alternatives { first, .. } => {
-                for index in 0..cursor.child_count() - first {
-                    child(
-                        attr,
-                        cursor.alternative(index).map_err(seam_error)?,
-                        path.clone(),
-                        ancestry,
-                    )?;
-                }
-                Ok(())
-            }
-            AuthoredNavigation::List => {
-                let element = match &attr.kind {
-                    AttrTypeKind::List { element_type, .. } => element_type.as_ref(),
-                    _ => attr,
+            coverage.record(&cursor);
+            let same_position = matches!(
+                navigation,
+                AuthoredNavigation::Forward { .. }
+                    | AuthoredNavigation::Secret(_)
+                    | AuthoredNavigation::Alternatives { .. }
+            );
+            let mut child = |attr: &'w CompiledAttributeType,
+                             child: AuthoredUse<'s, B>,
+                             path: FieldPath,
+                             ancestry| {
+                let nested = if same_position {
+                    visit.clone()
+                } else {
+                    SyntaxVisitState::<B, M> {
+                        claim: Default::default(),
+                        ..visit.clone()
+                    }
                 };
-                for index in 0..cursor.child_count() {
-                    let route = ChildRoute::ListItem(index);
-                    let CursorKind::Authored(next) = route
-                        .step(&AuthoredCursor::authored(cursor.clone()))
-                        .map_err(seam_error)?
-                        .kind
-                    else {
-                        unreachable!("authored list child")
-                    };
-                    child(element, next, route.path(path), ancestry)?;
+                descend(
+                    attr,
+                    defs,
+                    &path,
+                    ancestry,
+                    child,
+                    callbacks.clone(),
+                    nested,
+                    coverage,
+                    findings,
+                    visited,
+                )
+            };
+            match navigation {
+                AuthoredNavigation::Forward { child: next, .. } => {
+                    child(attr, next, path.clone(), ancestry)
                 }
-                Ok(())
-            }
-            AuthoredNavigation::Map => {
-                for key in cursor.map_keys() {
-                    let (declaration, route, ancestry) = match &attr.kind {
-                        AttrTypeKind::Map { value, .. } => (
-                            value.as_ref(),
-                            ChildRoute::MapValue(std::borrow::Cow::Borrowed(key)),
-                            ancestry,
-                        ),
-                        AttrTypeKind::Struct { fields, .. } => {
-                            let Some(field) =
-                                struct_field_for_key(fields, key.transport_identity(), ancestry)
-                            else {
-                                continue;
-                            };
-                            if validate_struct_field_assignment(field, &key.to_string(), ancestry)
-                                .is_some()
-                            {
-                                continue;
-                            }
-                            (
-                                &field.field_type,
-                                ChildRoute::StructField {
-                                    key: std::borrow::Cow::Borrowed(key),
-                                    alias: ancestry.block_name(field),
-                                },
-                                ancestry.descend(field),
-                            )
-                        }
-                        _ => (
+                AuthoredNavigation::Secret(next) => {
+                    child(attr, next, path.clone(), ancestry.inside_secret())
+                }
+                AuthoredNavigation::Alternatives { first, .. } => {
+                    for index in 0..cursor.child_count() - first {
+                        child(
                             attr,
-                            ChildRoute::MapValue(std::borrow::Cow::Borrowed(key)),
+                            cursor.alternative(index).map_err(seam_error)?,
+                            path.clone(),
                             ancestry,
-                        ),
-                    };
-                    let CursorKind::Authored(next) = route
-                        .step(&AuthoredCursor::authored(cursor.clone()))
-                        .map_err(seam_error)?
-                        .kind
-                    else {
-                        unreachable!("authored map child")
-                    };
-                    child(declaration, next, route.path(path), ancestry)?;
+                        )?;
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
-            AuthoredNavigation::Parts => {
-                for index in 0..cursor.child_count() {
-                    child(
-                        attr,
-                        cursor.part(index).map_err(seam_error)?,
-                        path.clone(),
-                        ancestry,
-                    )?;
+                AuthoredNavigation::List => {
+                    let element = match &attr.kind {
+                        AttrTypeKind::List { element_type, .. } => element_type.as_ref(),
+                        AttrTypeKind::UnloadedSchemaType(_)
+                        | AttrTypeKind::Reference { .. }
+                        | AttrTypeKind::String { .. }
+                        | AttrTypeKind::ResourceHandle { .. }
+                        | AttrTypeKind::StringLiteralSet { .. }
+                        | AttrTypeKind::Int { .. }
+                        | AttrTypeKind::Float { .. }
+                        | AttrTypeKind::Bool
+                        | AttrTypeKind::Duration
+                        | AttrTypeKind::Enum { .. }
+                        | AttrTypeKind::Union(_)
+                        | AttrTypeKind::Ref(_)
+                        | AttrTypeKind::Map { .. }
+                        | AttrTypeKind::Struct { .. } => attr,
+                    };
+                    for index in 0..cursor.child_count() {
+                        let route = ChildRoute::ListItem(index);
+                        let CursorKind::Authored(next) = route
+                            .step(&AuthoredCursor::authored(cursor.clone()))
+                            .map_err(seam_error)?
+                            .kind
+                        else {
+                            unreachable!("authored list child")
+                        };
+                        child(element, next, route.path(path), ancestry)?;
+                    }
+                    Ok(())
                 }
-                Ok(())
+                AuthoredNavigation::Map => {
+                    for key in cursor.map_keys() {
+                        let (declaration, route, ancestry) = match &attr.kind {
+                            AttrTypeKind::Map { value, .. } => (
+                                value.as_ref(),
+                                ChildRoute::MapValue(std::borrow::Cow::Borrowed(key)),
+                                ancestry,
+                            ),
+                            AttrTypeKind::Struct { fields, .. } => {
+                                let Some(field) = struct_field_for_key(
+                                    fields,
+                                    key.transport_identity(),
+                                    ancestry,
+                                ) else {
+                                    continue;
+                                };
+                                if validate_struct_field_assignment(
+                                    field,
+                                    &key.to_string(),
+                                    ancestry,
+                                )
+                                .is_some()
+                                {
+                                    continue;
+                                }
+                                (
+                                    &field.field_type,
+                                    ChildRoute::StructField {
+                                        key: std::borrow::Cow::Borrowed(key),
+                                        alias: ancestry.block_name(field),
+                                    },
+                                    ancestry.descend(field),
+                                )
+                            }
+                            AttrTypeKind::UnloadedSchemaType(_)
+                            | AttrTypeKind::Reference { .. }
+                            | AttrTypeKind::String { .. }
+                            | AttrTypeKind::ResourceHandle { .. }
+                            | AttrTypeKind::StringLiteralSet { .. }
+                            | AttrTypeKind::Int { .. }
+                            | AttrTypeKind::Float { .. }
+                            | AttrTypeKind::Bool
+                            | AttrTypeKind::Duration
+                            | AttrTypeKind::Enum { .. }
+                            | AttrTypeKind::Union(_)
+                            | AttrTypeKind::Ref(_)
+                            | AttrTypeKind::List { .. } => (
+                                attr,
+                                ChildRoute::MapValue(std::borrow::Cow::Borrowed(key)),
+                                ancestry,
+                            ),
+                        };
+                        let CursorKind::Authored(next) = route
+                            .step(&AuthoredCursor::authored(cursor.clone()))
+                            .map_err(seam_error)?
+                            .kind
+                        else {
+                            unreachable!("authored map child")
+                        };
+                        child(declaration, next, route.path(path), ancestry)?;
+                    }
+                    Ok(())
+                }
+                AuthoredNavigation::Parts => {
+                    for index in 0..cursor.child_count() {
+                        child(
+                            attr,
+                            cursor.part(index).map_err(seam_error)?,
+                            path.clone(),
+                            ancestry,
+                        )?;
+                    }
+                    Ok(())
+                }
+                AuthoredNavigation::Leaf | AuthoredNavigation::Covered => Ok(()),
             }
-            AuthoredNavigation::Leaf | AuthoredNavigation::Covered => Ok(()),
+        })();
+        if result.is_ok() {
+            visited.insert(key, SyntaxProgress::Completed(CompletedSyntax));
         }
+        result
     }
     let mut findings = AssignmentProbe::default();
     let mut completed = WalkCoverage::default();
@@ -3178,10 +3400,10 @@ impl<'a, M: WalkMode> ValueValidator<'a, '_, M> {
         // judgement while the existing walk checks both classified
         // alternatives, including their provider callbacks.
         let mut assignment = assignment;
-        let parent_authored = match &mut assignment {
+        let (parent_authored, decision) = match &mut assignment {
             Some(walk) => {
                 let mut policy = AssignmentFindings::<M::Channel>::default();
-                walk.apply_policy(
+                let decision = walk.apply_policy(
                     attr,
                     CheckValue::Current(value.diagnostic_value()),
                     path,
@@ -3192,14 +3414,14 @@ impl<'a, M: WalkMode> ValueValidator<'a, '_, M> {
                     CheckValue::Current(value.diagnostic_value()),
                     path,
                 ));
-                policy
+                (policy, AssignmentPosition::Judged(decision))
             }
-            None => AssignmentFindings::<M::Channel>::default(),
+            None => (
+                AssignmentFindings::<M::Channel>::default(),
+                AssignmentPosition::SchemaOnly,
+            ),
         };
-        let parent_assignment = match &assignment {
-            Some(walk) => walk.check(attr, CheckValue::Current(value.diagnostic_value()), path),
-            None => Ok(AssignmentFindings::<M::Channel>::default()),
-        };
+        let parent_assignment = decision.check();
         let left_assignment = match alternative_assignment(assignment.as_ref(), 0) {
             Ok(walk) => walk,
             Err(error) => return WalkCheckedValue::rejected(path, error),
@@ -3305,18 +3527,21 @@ impl<'a, M: WalkMode> ValueValidator<'a, '_, M> {
             unreachable!("only an undecided conditional has branches")
         };
         let mut assignment = assignment;
-        let parent_policy = match &mut assignment {
+        let (parent_policy, decision) = match &mut assignment {
             Some(walk) => {
                 let mut policy = AssignmentFindings::<M::Channel>::default();
-                walk.apply_policy(
+                let decision = walk.apply_policy(
                     attr,
                     CheckValue::Current(value.diagnostic_value()),
                     path,
                     &mut policy,
                 );
-                policy
+                (policy, AssignmentPosition::Judged(decision))
             }
-            None => AssignmentFindings::<M::Channel>::default(),
+            None => (
+                AssignmentFindings::<M::Channel>::default(),
+                AssignmentPosition::SchemaOnly,
+            ),
         };
         let mut checked =
             WalkCheckedValue::accepted(attr, FitExactness::EXACT, FitKind::Deferred(pending.fit()));
@@ -3330,7 +3555,7 @@ impl<'a, M: WalkMode> ValueValidator<'a, '_, M> {
                 CheckValue::Current(value.diagnostic_value()),
                 path,
             ));
-            match walk.check_selection(attr, CheckValue::Current(value.diagnostic_value()), path) {
+            match decision.check_selection() {
                 Ok(findings) => checked.findings.assignment.extend(findings),
                 Err(error) => return WalkCheckedValue::rejected(path, error),
             }
@@ -3453,18 +3678,21 @@ impl<'a, M: WalkMode> ValueValidator<'a, '_, M> {
         'a: 'w,
     {
         let mut assignment = assignment;
-        let policy = match &mut assignment {
+        let (policy, decision) = match &mut assignment {
             Some(walk) => {
                 let mut policy = AssignmentFindings::<M::Channel>::default();
-                walk.apply_policy(
+                let decision = walk.apply_policy(
                     attr,
                     CheckValue::Current(value.diagnostic_value()),
                     path,
                     &mut policy,
                 );
-                policy
+                (policy, AssignmentPosition::Judged(decision))
             }
-            None => AssignmentFindings::<M::Channel>::default(),
+            None => (
+                AssignmentFindings::<M::Channel>::default(),
+                AssignmentPosition::SchemaOnly,
+            ),
         };
         // Main's union-level ordinary check remains before member trials.
         // The authored hook belongs to the chosen member's probe instead.
@@ -3491,49 +3719,42 @@ impl<'a, M: WalkMode> ValueValidator<'a, '_, M> {
             })
             .unwrap_or_default();
         authored.extend(policy);
-        let findings = match &assignment {
-            Some(walk) => {
-                match walk.check(attr, CheckValue::Current(value.diagnostic_value()), path) {
-                    Ok(findings) if !findings.errors.is_empty() => {
-                        let mut checked =
-                            WalkCheckedValue::rejected(path, findings.errors[0].1.clone());
-                        checked.findings.additional_local_errors.extend(
-                            findings
-                                .errors
-                                .iter()
-                                .skip(1)
-                                .map(|(_, error)| error.clone()),
-                        );
-                        checked.findings.located.extend(findings.errors.iter().map(
-                            |(path, error)| {
-                                (
-                                    FieldPath::from_canonical_segments(
-                                        path.segments().iter().cloned(),
-                                    ),
-                                    error.clone(),
-                                )
-                            },
-                        ));
-                        checked.findings.assignment = findings;
-                        checked.findings.authored = authored;
-                        checked.selected = Some(attr);
-                        return checked;
-                    }
-                    Ok(findings) => findings,
-                    Err(error) => {
-                        let mut checked = WalkCheckedValue::rejected(path, error.clone());
-                        checked
-                            .findings
-                            .assignment
-                            .errors
-                            .push((path.canonical(), error));
-                        checked.findings.authored = authored;
-                        checked.selected = Some(attr);
-                        return checked;
-                    }
-                }
+        let findings = match decision.check() {
+            Ok(findings) if !findings.errors.is_empty() => {
+                let mut checked = WalkCheckedValue::rejected(path, findings.errors[0].1.clone());
+                checked.findings.additional_local_errors.extend(
+                    findings
+                        .errors
+                        .iter()
+                        .skip(1)
+                        .map(|(_, error)| error.clone()),
+                );
+                checked
+                    .findings
+                    .located
+                    .extend(findings.errors.iter().map(|(path, error)| {
+                        (
+                            FieldPath::from_canonical_segments(path.segments().iter().cloned()),
+                            error.clone(),
+                        )
+                    }));
+                checked.findings.assignment = findings;
+                checked.findings.authored = authored;
+                checked.selected = Some(attr);
+                return checked;
             }
-            None => AssignmentFindings::<M::Channel>::default(),
+            Ok(findings) => findings,
+            Err(error) => {
+                let mut checked = WalkCheckedValue::rejected(path, error.clone());
+                checked
+                    .findings
+                    .assignment
+                    .errors
+                    .push((path.canonical(), error));
+                checked.findings.authored = authored;
+                checked.selected = Some(attr);
+                return checked;
+            }
         };
         let mut checked =
             self.walk_resolved_value(attr, value, path, ancestry, visited, assignment.clone());

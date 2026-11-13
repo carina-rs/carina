@@ -13,7 +13,6 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::DiagnosticDocument as Document;
 use crate::position;
-use carina_core::parser::retained::JudgedExpr;
 use carina_core::parser::{
     ParseError, ProviderConfig, SourceSpan, WarningKind, contains_function_call,
 };
@@ -1368,7 +1367,7 @@ impl DiagnosticRun<'_> {
                     let owner = expression_report
                         .expression(finding.location())
                         .ok()
-                        .and_then(JudgedExpr::boundary_owner);
+                        .and_then(|expression| expression.boundary_owner());
                     let owned_range = owner.and_then(|owner| {
                         render_merged(
                             doc,

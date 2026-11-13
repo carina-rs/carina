@@ -371,6 +371,15 @@ impl<K: DestinationKind> Destination<K> {
 
 /// A candidate is always paired with the exact proof consumed by its factory.
 /// There is deliberately no raw-value constructor or expression accessor.
+///
+/// A foreign conversion-free judgement cannot authorize a classified input.
+/// The raw-proof seam is crate-private even with test-utils enabled.
+/// ```compile_fail,E0624
+/// use carina_core::{parser::retained::NoConversion, resource::{ParserPlaceholder, RelativeBindingName, knowledge::Classification}, validation::{admission::Candidate, deferred_types::ProviderTypeCheckContext}};
+/// fn foreign<'a>(value: Classification<'a, ParserPlaceholder, RelativeBindingName>, provider: &'a dyn ProviderTypeCheckContext, proof: NoConversion) {
+///     Candidate::validation_classified(value, None, provider, proof);
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate<P: PlaceholderKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress>
 {
@@ -448,7 +457,8 @@ pub struct AdmissionContext<
 }
 
 impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
-    pub fn validation_classified<'a>(
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn validation_classified<'a>(
         proof: crate::resource::knowledge::Classification<'a, P, B>,
         bindings: Option<&'a BindingIndex<'a, B>>,
         provider: &'a dyn ProviderTypeCheckContext,

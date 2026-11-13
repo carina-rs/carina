@@ -49,9 +49,7 @@ impl PlacementRole {
             ExprKind::Map(_) => Self::Transport(T::MapValue),
             ExprKind::NestedBlock { .. } => Self::Transport(T::StructFieldValue),
             ExprKind::Definition => Self::Transport(T::DefinitionValue),
-            ExprKind::Binding(_) | ExprKind::Alias | ExprKind::LoopSlot(_) => {
-                Self::Transport(T::AliasForward)
-            }
+            ExprKind::Binding(_) | ExprKind::Alias => Self::Transport(T::AliasForward),
             ExprKind::Sink { .. } => Self::Transport(T::AttributeSlot),
             ExprKind::Sequence => Self::Transport(T::SequenceResult),
             ExprKind::Function { .. }
@@ -60,11 +58,10 @@ impl PlacementRole {
             | ExprKind::ProviderDeclaration => Self::Boundary,
             ExprKind::Secret => Self::SecretArgument,
             ExprKind::Resource { .. } => Self::Resource,
-            ExprKind::Scalar(_)
-            | ExprKind::Parameter(_)
-            | ExprKind::UntypedParameter
-            | ExprKind::Element => Self::Leaf,
-            ExprKind::Reference { .. }
+            ExprKind::Scalar(_) | ExprKind::Parameter(_) | ExprKind::UntypedParameter => Self::Leaf,
+            ExprKind::Element
+            | ExprKind::LoopSlot(_)
+            | ExprKind::Reference { .. }
             | ExprKind::Interpolation { .. }
             | ExprKind::EmptyInterpolation
             | ExprKind::Call(_)
@@ -258,7 +255,7 @@ pub(in crate::parser::retained) fn check_placement<B: BindingAddress>(
             return true;
         }
         PlacementRole::Transport(TransportRole::IfValue) => {
-            if let Some(condition) = children.first() {
+            if let Some(condition) = root.condition_index().and_then(|index| children.get(index)) {
                 condition.conversion_sources().reject(
                     Kind::UnsupportedPosition,
                     "conversion is not supported at this position",

@@ -154,7 +154,10 @@ fn round5_generated_p1_covers_every_grammar_context() {
                         || matches!(context.label, "secret" | "nested-convert")
                 }
             });
-            if conversions.len() != expected || !message_matches || internal(&report.to_string()) {
+            if conversions.len() != expected
+                || !message_matches
+                || internal(&carina_core::test_utils::render_presented_for_test(&report))
+            {
                 failures.push(format!(
                     "{}/{evaluation:?}: expected {expected}; {report:?}; {source}",
                     context.label

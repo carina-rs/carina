@@ -1466,7 +1466,7 @@ fn round5_reported_schema_validation_cannot_admit_without_a_source_proof() {
         &fixture.catalog,
     );
     for file in [&parsed, configuration.judged().file()] {
-        let result = crate::validation::validate_resources(
+        let result = crate::test_utils::legacy_validate_resources(
             file,
             &fixture.schemas,
             &HashSet::from(["mock".into()]),
@@ -1481,4 +1481,68 @@ fn round5_reported_schema_validation_cannot_admit_without_a_source_proof() {
             "{error}"
         );
     }
+}
+
+#[test]
+fn r5b_legacy_quoted_and_lookup_miss_cannot_admit_a_conversion() {
+    let fixture = Fixture::string();
+    for quoted in [false, true] {
+        for converted in [false, true] {
+            let key = if quoted { "'target'" } else { "target" };
+            let expression = if converted { "42 as mock.Name" } else { "42" };
+            let source = format!("mock.Sink {{ {key} = {expression} }}");
+            let parsed =
+                crate::parser::parse_file(&source, Path::new("legacy-key.crn"), &fixture.catalog)
+                    .unwrap();
+            let result = crate::validation::validate_resources(
+                &parsed,
+                &fixture.schemas,
+                &HashSet::from(["mock".into()]),
+                &fixture.catalog,
+                &mut Vec::new(),
+            );
+            let error = result.expect_err("the wrong-kind attribute cannot be admitted");
+            assert_eq!(
+                conversion_errors(&error).len(),
+                usize::from(converted),
+                "{source}: {error:?}"
+            );
+        }
+    }
+    let parsed = crate::parser::parse_file(
+        "mock.Sink { entry { value = 42 as mock.Name } }",
+        Path::new("legacy-alias.crn"),
+        &fixture.catalog,
+    )
+    .unwrap();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "entries",
+                    AttributeType::list(AttributeType::struct_(
+                        "Entry",
+                        vec![
+                            StructField::optional("value", named_string("mock.Name", 1, 8)).build(),
+                        ],
+                    )),
+                )
+                .with_block_name("entry")
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    assert!(parsed.resources[0].authored_slots.get("entries").is_err());
+    let result = crate::validation::validate_resources(
+        &parsed,
+        &schemas,
+        &HashSet::from(["mock".into()]),
+        &fixture.catalog,
+        &mut Vec::new(),
+    );
+    let error = result.expect_err("a canonical lookup miss cannot erase the authored source");
+    assert_eq!(conversion_errors(&error).len(), 1, "{error:?}");
 }

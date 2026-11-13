@@ -330,7 +330,10 @@ fn conversion_report_fallback_preserves_ordinary_errors_and_detects_missing_outc
                 .collect::<Vec<_>>();
             assert_eq!(conversions.len(), usize::from(converted), "{presented:?}");
             assert_eq!(presented.len(), usize::from(converted), "{presented:?}");
-            assert!(!presented.to_string().contains("bug in carina"));
+            assert!(
+                !carina_core::test_utils::render_presented_for_test(&presented)
+                    .contains("bug in carina")
+            );
         }
         assert_eq!(ordinary[0], ordinary[1], "{ordinary:#?}");
         assert!(!ordinary[0].is_empty());

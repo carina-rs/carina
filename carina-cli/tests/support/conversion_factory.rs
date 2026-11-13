@@ -62,6 +62,7 @@ impl ProviderFactory for TotalityFactory {
         let mut schemas = carina_provider_mock::builtin_schemas();
         schemas.extend([
             ResourceSchema::new("Sink")
+                .attribute(AttributeSchema::optional("plain", AttributeType::string()).build())
                 .attribute(AttributeSchema::optional("attr", name()).build())
                 .attribute(AttributeSchema::provider_populated("read_only", name()).build())
                 .attribute(
@@ -97,6 +98,7 @@ impl ProviderFactory for TotalityFactory {
                 .validate()
                 .unwrap(),
             ResourceSchema::new("Source")
+                .attribute(AttributeSchema::optional("output", name()).build())
                 .attribute(
                     AttributeSchema::optional(
                         "items",

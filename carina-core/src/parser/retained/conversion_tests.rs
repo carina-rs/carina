@@ -99,7 +99,7 @@ fn round5_condition_roles_reject_an_aliased_conversion_as_computed() {
                 .complete()
                 .into_presented();
         let errors = crate::conversion::tests::conversion_errors(&presented);
-        assert_eq!(errors.len(), 1, "{source}: {presented}");
+        assert_eq!(errors.len(), 1, "{source}: {presented:?}");
         assert_eq!(
             errors[0].diagnostic_message(),
             "conversion is not supported at this position",
@@ -146,67 +146,12 @@ fn round5_map_keys_follow_alias_judgements() {
                     .complete()
                     .into_presented();
             let errors = crate::conversion::tests::conversion_errors(&presented);
-            assert_eq!(errors.len(), 1, "{presented}");
+            assert_eq!(errors.len(), 1, "{presented:?}");
             assert_eq!(
                 errors[0].kind(),
                 crate::ConversionErrorKind::UnsupportedPosition
             );
         }
-    }
-}
-
-#[test]
-fn round5_non_crossed_edges_reject_converted_callers_before_the_cut() {
-    use conversion::flow::NonCrossedEdge;
-    let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
-    for edge in [
-        NonCrossedEdge::ModuleArgument,
-        NonCrossedEdge::FunctionParameter,
-        NonCrossedEdge::SchemaAttributeReference,
-        NonCrossedEdge::ModuleOutputReference,
-        NonCrossedEdge::UpstreamStateReference,
-    ] {
-        let (source, boundary) = match edge {
-            NonCrossedEdge::ModuleArgument => (
-                "let child = use { source = './child' }\nchild { input = 'ok' as unloaded.Name }",
-                true,
-            ),
-            NonCrossedEdge::FunctionParameter => (
-                "fn echo(input: String): String { input }\nlet value = echo('ok' as unloaded.Name)",
-                false,
-            ),
-            NonCrossedEdge::SchemaAttributeReference => (
-                "let producer = mock.Source {}\nmock.Sink { target = upper(producer.output as unloaded.Name) }",
-                false,
-            ),
-            NonCrossedEdge::ModuleOutputReference => (
-                "let child = use { source = './child' }\nlet net = child {}\nmock.Sink { target = upper(net.output as unloaded.Name) }",
-                false,
-            ),
-            NonCrossedEdge::UpstreamStateReference => (
-                "let up = upstream_state { source = './upstream' }\nmock.Sink { target = upper(up.output as unloaded.Name) }",
-                false,
-            ),
-        };
-        let parsed = super::super::parse_file(source, Path::new("cut.crn"), &catalog).unwrap();
-        let presented =
-            ConversionValidation::<std::convert::Infallible>::new(parsed.expression_report())
-                .complete()
-                .into_presented();
-        let errors = crate::conversion::tests::conversion_errors(&presented);
-        assert_eq!(errors.len(), 1, "{edge:?}: {presented}");
-        assert_eq!(
-            errors[0].kind(),
-            crate::ConversionErrorKind::UnsupportedPosition
-        );
-        assert_eq!(
-            errors[0].diagnostic_message(),
-            if boundary {
-                "conversion is not supported at this position yet"
-            } else {
-                "conversion is not supported at this position"
-            }
-        );
     }
 }
 
@@ -655,7 +600,7 @@ fn conversion_parser_failures_keep_unsupported_placement_and_the_convert_range()
                 .complete()
                 .into_presented();
         let errors = crate::conversion::tests::conversion_errors(&presented);
-        assert_eq!(errors.len(), 1, "{source}: {presented}");
+        assert_eq!(errors.len(), 1, "{source}: {presented:?}");
         let conversion = errors[0];
         assert_eq!(
             conversion.kind(),
@@ -690,7 +635,7 @@ fn conversion_quoted_keys_own_the_convert_range_and_one_typed_error() {
             source.find("'").unwrap() + 1
         );
         assert_eq!(
-            crate::executor::render_error_chain(&presented)
+            crate::test_utils::render_presented_for_test(&presented)
                 .matches(&conversion.to_string())
                 .count(),
             1
@@ -759,5 +704,227 @@ fn round5_unclaimed_convert_cannot_reach_ordinary_value_admission() {
         coverage.take_conversions().findings().len(),
         1,
         "ordinary value acceptance must require a source proof"
+    );
+}
+
+#[test]
+fn r5b_loop_elements_and_slots_reject_without_a_parent_rejection() {
+    let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    for source in [
+        "for n in [1 as mock.Count] { mock.Sink { target = n } }",
+        "for (i, n) in [1 as mock.Count] { mock.Sink { target = i } }",
+        "let data = { a = 1 as mock.Count }\nfor k, n in data { mock.Sink { target = k } }",
+    ] {
+        let parsed =
+            super::super::parse_file(source, Path::new("element-role.crn"), &catalog).unwrap();
+        let report = parsed.expression_report();
+        let mut checked = 0;
+        for node in report
+            .syntax_nodes
+            .values()
+            .filter(|node| matches!(node.kind, ExprKind::Element | ExprKind::LoopSlot(_)))
+        {
+            let children = node
+                .children
+                .iter()
+                .map(|child| {
+                    report
+                        .node(&child.authored.location.instance, child.node_id())
+                        .unwrap()
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let mut output = conversion::flow::PlacementFindings::new(Default::default());
+            assert!(
+                conversion::flow::check_placement(
+                    node,
+                    &children,
+                    &conversion::flow::ConversionSources::empty(),
+                    false,
+                    None,
+                    &mut output
+                ),
+                "{source}"
+            );
+            assert_eq!(output.into_findings().findings().len(), 1, "{source}");
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "the grammar fixture must exercise the loop role: {source}"
+        );
+    }
+}
+
+#[test]
+fn r5b_directive_attribute_and_block_are_placement_boundaries() {
+    let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    for directive in [
+        "directives { depends_on = [x as mock.Name] }",
+        "directives = { depends_on = [x as mock.Name] }",
+    ] {
+        let source = format!("let x = mock.Source {{}}\nmock.Sink {{ {directive} }}");
+        let parsed =
+            super::super::parse_file(&source, Path::new("directives.crn"), &catalog).unwrap();
+        let presented =
+            ConversionValidation::<std::convert::Infallible>::new(parsed.expression_report())
+                .complete()
+                .into_presented();
+        let conversions = crate::conversion::tests::conversion_errors(&presented);
+        assert_eq!(conversions.len(), 1, "{directive}: {presented:?}");
+        assert_eq!(
+            conversions[0].kind(),
+            crate::ConversionErrorKind::UnsupportedPosition
+        );
+        assert_eq!(
+            conversions[0].diagnostic_message(),
+            "conversion is not supported at this position yet"
+        );
+    }
+}
+
+#[test]
+fn r5b_unloaded_transport_destinations_decline_before_child_admission() {
+    use crate::schema::value_validation::{
+        AssignmentScope, AuthoredChecks, RequiredAssignmentCallbacks, WalkCoverage,
+    };
+    use crate::schema::{
+        AttrTypeKind, AttributeSchema, AttributeType, CompiledAttributeType, ResourceSchema,
+        SchemaRegistry, TypeIdentity,
+    };
+    let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(AttributeSchema::optional("input", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let destination = CompiledAttributeType {
+        kind: AttrTypeKind::UnloadedSchemaType(
+            crate::parser::UnloadedSchemaType::try_from(TypeIdentity::bare("Unavailable")).unwrap(),
+        ),
+    };
+    for (converted, expression) in [
+        (false, "['ok']"),
+        (true, "['ok' as unloaded.Name]"),
+        (false, "{ item = 'ok' }"),
+        (true, "{ item = 'ok' as unloaded.Name }"),
+    ] {
+        let parsed = super::super::parse_file(
+            &format!("mock.Sink {{ input = {expression} }}"),
+            Path::new("unloaded.crn"),
+            &catalog,
+        )
+        .unwrap();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let judged = configuration.judged();
+        let tree = super::super::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let slot = resource.authored_slot("input").unwrap();
+        let proof = slot
+            .projection()
+            .unwrap()
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .unwrap()
+            .into_classification();
+        let mut coverage = WalkCoverage::default();
+        let findings = crate::schema::value_validation::validate_authored_value_for_admission(
+            &destination,
+            &proof,
+            &Default::default(),
+            crate::schema::FieldAncestry::WRITABLE,
+            &|_: &CompiledAttributeType, _: &Value| Ok(()),
+            AuthoredCursor::authored(slot.cursor().unwrap()),
+            RequiredAssignmentCallbacks {
+                ordinary: &|_, _, _, _, _| Ok(Default::default()),
+                authored: AuthoredChecks::Validation(&|attr, checked, path, cursor| {
+                    check_conversion::<
+                        crate::validation::admission::kind::ResourceAttribute,
+                        ParserPlaceholder,
+                        RelativeBindingName,
+                    >(attr, checked, path, cursor, &Default::default(), &catalog)
+                }),
+                scope: AssignmentScope::Full,
+            },
+            &mut coverage,
+        );
+        assert_eq!(
+            findings.local_errors().count(),
+            1,
+            "converted={converted}: {findings:?}"
+        );
+        assert_eq!(
+            coverage.take_conversions().findings().len(),
+            0,
+            "the unavailable destination declines the slot before its children"
+        );
+    }
+}
+
+#[test]
+fn r5b_resource_and_function_boundaries_cut_actual_producer_evidence() {
+    let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut violations = Vec::new();
+    for source in [
+        "let p = mock.Source { output = 'ok' as mock.Name }\nlet consumer = p.output",
+        "fn f(a: Int): Int { 1 as mock.Name }\nlet consumer = f(1)",
+        "fn f(a: Int = 1 as mock.Name): Int { a }\nlet consumer = f()",
+    ] {
+        let parsed = super::super::parse_file(source, Path::new("producer.crn"), &catalog).unwrap();
+        let report = parsed.expression_report();
+        let producer = report
+            .syntax_nodes
+            .values()
+            .find(|root| {
+                matches!(
+                    root.kind,
+                    ExprKind::Resource { .. } | ExprKind::Function { .. }
+                )
+            })
+            .expect("actual producer node");
+        assert!(
+            producer.children.iter().any(|child| report
+                .node(&child.authored.location.instance, child.node_id())
+                .is_some_and(JudgedExpr::contains_any_conversion)),
+            "the cut must receive a carrying child: {source}"
+        );
+        if report
+            .node(&producer.location.instance, producer.id)
+            .unwrap()
+            .contains_any_conversion()
+        {
+            violations.push(format!("producer boundary: {source}"));
+        }
+        if report
+            .binding(&RelativeBindingName::new("consumer"))
+            .unwrap()
+            .contains_any_conversion()
+        {
+            violations.push(format!("plain consumer: {source}"));
+        }
+    }
+    assert!(violations.is_empty(), "{violations:#?}");
+}
+
+#[test]
+fn r5b_typed_sink_rejects_a_carried_expression_without_a_placement_parent() {
+    let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = super::super::parse_file(
+        "let x = 'ok' as unloaded.Name",
+        Path::new("sink.crn"),
+        &catalog,
+    )
+    .unwrap();
+    let source = parsed
+        .expression_report()
+        .binding(&RelativeBindingName::new("x"))
+        .unwrap();
+    assert!(source.contains_any_conversion());
+    assert!(
+        admit_expression(source, &super::super::TypeExpr::String).is_err(),
+        "a typed sink must reject a carrying expression even when P1 has no rejecting parent"
     );
 }

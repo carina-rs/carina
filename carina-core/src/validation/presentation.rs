@@ -1,6 +1,6 @@
 //! The consuming presentation boundary for authored validation findings.
 
-use super::{ResourceAdmissionFinding, ResourceRefTypeValidationError};
+use super::ResourceAdmissionFinding;
 use crate::parser::retained::ExpressionReport;
 use crate::resource::BindingAddress;
 
@@ -143,6 +143,11 @@ impl<E: ValidationClientError> std::fmt::Display for PresentedFinding<E> {
 }
 
 /// Findings which have already crossed the report's one consuming exit.
+///
+/// ```compile_fail,E0277
+/// use carina_core::validation::PresentedFindings;
+/// fn ordinary_string(findings: PresentedFindings) -> String { format!("{findings}") }
+/// ```
 #[derive(Debug)]
 pub struct PresentedFindings<E: ValidationClientError = std::convert::Infallible>(
     Vec<PresentedFinding<E>>,
@@ -166,28 +171,6 @@ impl<E: ValidationClientError> IntoIterator for PresentedFindings<E> {
         self.0.into_iter()
     }
 }
-impl<E: ValidationClientError> std::fmt::Display for PresentedFindings<E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (index, finding) in self.0.iter().enumerate() {
-            if index != 0 {
-                writeln!(f)?;
-            }
-            write!(f, "{finding}")?;
-        }
-        Ok(())
-    }
-}
-impl<E: ValidationClientError> std::error::Error for PresentedFindings<E> {}
-impl PresentedFindings {
-    pub fn lines(&self) -> impl Iterator<Item = &str> {
-        self.0.iter().flat_map(|finding| match finding {
-            PresentedFinding::Ordinary(OrdinaryFinding::Resource(finding)) => finding.human.lines(),
-            PresentedFinding::Ordinary(OrdinaryFinding::Client(never)) => match **never {},
-            PresentedFinding::Conversion(finding) => finding.human.lines(),
-        })
-    }
-}
-
 /// An unpresented report cannot expose just its ordinary channel.
 ///
 /// ```compile_fail,E0599
@@ -243,17 +226,6 @@ impl<E: ValidationClientError> ResourceValidationReport<E> {
         PresentedFindings(findings)
     }
 }
-impl ResourceValidationReport {
-    pub(super) fn into_legacy_result(self) -> Result<(), ResourceRefTypeValidationError> {
-        let findings = self.into_presented();
-        if findings.is_empty() {
-            Ok(())
-        } else {
-            Err(ResourceRefTypeValidationError::Validation(findings))
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 pub struct OrdinaryFailure {
     _private: (),
@@ -356,6 +328,7 @@ pub struct ConversionValidation<E: ValidationClientError = std::convert::Infalli
     conversions: crate::ConversionFindings,
     coverage: crate::schema::value_validation::WalkCoverage,
     ordinary: Vec<(FindingSubject, OrdinaryFinding<E>)>,
+    // Work memo: NodeId diagnostic dedup cannot undo repeated provider callbacks.
     admitted_uses: std::collections::HashMap<
         AdmissionUse,
         Option<crate::parser::retained::ProjectionGeneration>,
@@ -572,6 +545,12 @@ impl<E: ValidationClientError> ConversionValidation<E> {
             >,
     {
         for resource in tree.project_resources() {
+            if !resource
+                .authored_slots()
+                .is_some_and(|slots| slots.carries_conversion(judged.report()))
+            {
+                continue;
+            }
             let (identity, revision) = admission_use(resource);
             if self.admitted_uses.get(&identity).is_some_and(|admitted| {
                 match (*admitted, revision) {

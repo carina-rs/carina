@@ -146,3 +146,143 @@ fn conversion_unrendered_no_as_walk_cannot_emit_or_add_shared_sink_findings() {
     assert_eq!(diagnostics[0], diagnostics[1]);
     assert!(diagnostics[0].contains("existing shared check"));
 }
+
+#[test]
+fn r5b_no_as_sibling_driver_does_no_extra_walks() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("a.crn"),
+        "let producer = mock.Source {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("b.crn"),
+        "mock.Sink { target = 'ok' plain = producer.output }\n",
+    )
+    .unwrap();
+    let catalog = crate::conversion::tests::catalog();
+    let schemas = schema();
+    let parsed = crate::config_loader::parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &catalog,
+    )
+    .unwrap()
+    .into_parsed()
+    .resolve_root_for_test();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let judged = configuration.judged();
+    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let bindings =
+        crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+        let mut run: crate::validation::ConversionValidation =
+            crate::validation::ConversionValidation::new(judged.report());
+        let before = run.walk_in(crate::validation::FindingSubject::Root, |coverage| {
+            coverage.work()
+        });
+        run.admit_remaining_resources(&tree, judged, &bindings, session);
+        let after = run.walk_in(crate::validation::FindingSubject::Root, |coverage| {
+            coverage.work()
+        });
+        assert_eq!(
+            after, before,
+            "a no-as directory must do zero sibling admission walks"
+        );
+    });
+}
+
+#[test]
+fn r5b_sibling_driver_does_not_repeat_a_completed_conversion_validator() {
+    use crate::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
+    };
+    use crate::validation::admission::attributes::{
+        ResourceAdmissionRequest, ResourceAttributeInputs,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "target",
+                    AttributeType::refined_string_with_validator(
+                        TypeIdentity::from_dotted("mock.Name"),
+                        None,
+                        None,
+                        crate::schema::validator(move |_| {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }),
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let catalog = crate::conversion::tests::catalog();
+    let parsed = crate::parser::parse_file(
+        "mock.Sink { target = 'ok' as mock.Name }",
+        Path::new("carrying-sibling.crn"),
+        &catalog,
+    )
+    .unwrap()
+    .resolve_root_for_test();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let judged = configuration.judged();
+    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let resource = tree.resources().next().unwrap();
+    let bindings =
+        crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+    let inputs = ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap();
+    let classified = inputs.classify(
+        &crate::resource::knowledge::KnowledgeContext::validation(),
+        |_, _| {},
+    );
+    let mut run: crate::validation::ConversionValidation =
+        crate::validation::ConversionValidation::new(judged.report());
+    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+        let report = run.admit_resource(ResourceAdmissionRequest {
+            resource,
+            parsed: judged.file(),
+            schema: resource.schema(&schemas).unwrap(),
+            attributes: &classified,
+            quoted: resource.quoted_string_attrs(),
+            inputs: &inputs,
+            bindings: &bindings,
+            session,
+            schemas: &schemas,
+        });
+        assert_eq!(report.errors().count(), 0, "{report:?}");
+        let after = calls.load(Ordering::SeqCst);
+        assert!(
+            after > 0,
+            "this must exercise the destination's native validator"
+        );
+        let work = run.walk_in(crate::validation::FindingSubject::Root, |coverage| {
+            coverage.work()
+        });
+        run.admit_remaining_resources(&tree, judged, &bindings, session);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            after,
+            "diagnostic dedup cannot undo a repeated provider callback"
+        );
+        assert_eq!(
+            run.walk_in(crate::validation::FindingSubject::Root, |coverage| coverage
+                .work()),
+            work
+        );
+    });
+    assert!(run.complete().into_presented().is_empty());
+}

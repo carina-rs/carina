@@ -335,3 +335,74 @@ fn round3_editor_grammars_highlight_as_and_stay_identical() {
     let json: serde_json::Value = serde_json::from_str(vscode).unwrap();
     assert!(json.to_string().contains("for|in|if|else|as"));
 }
+
+#[test]
+fn r5b_read_only_commands_use_mains_ordinary_judge_gate() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    let wasm = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
+        .into_iter()
+        .map(|name| workspace.join("target/wasm32-wasip2/debug").join(name))
+        .find(|path| path.is_file())
+        .expect("build the mock WASM fixture");
+    let source = format!("file://{}", wasm.display());
+    write(
+        directory.path(),
+        "providers.crn",
+        &format!("provider mock {{ source = '{source}' }}\n"),
+    );
+    write(
+        directory.path(),
+        "backend.crn",
+        "backend local { path = 'carina.state.json' }\n",
+    );
+    write(directory.path(), "main.crn", "");
+    let init = command(directory.path(), &["init", ".", "--accept-egress", &source]);
+    assert!(init.status.success(), "{}", rendered(&init));
+    for args in [
+        vec!["destroy", "--auto-approve", "."],
+        vec!["state", "refresh", "."],
+    ] {
+        for (case, body, accepted, message) in [
+            (
+                "ordinary Judge",
+                "fn wants_int(value: Int): Int { value }\nlet producer = mock.test.resource { name = 'p' }\nlet result = wants_int(producer.name)\n",
+                false,
+                "parameter 'value'",
+            ),
+            (
+                "P1 placement",
+                "mock.actions.OidcSubject { claim_keys = [upper('repo' as mock.actions.OidcSubject.ClaimKey)] }\n",
+                false,
+                "conversion is not supported at this position",
+            ),
+            (
+                "P2 kind",
+                "mock.actions.OidcSubject { claim_keys = [1 as mock.actions.OidcSubject.ClaimKey] }\n",
+                true,
+                "",
+            ),
+        ] {
+            write(directory.path(), "main.crn", body);
+            let output = command(directory.path(), &args);
+            let text = rendered(&output);
+            eprintln!(
+                "readonly {args:?} {case}: {:?}\n{text}",
+                output.status.code()
+            );
+            assert_eq!(output.status.success(), accepted, "{args:?} {case}: {text}");
+            if !accepted {
+                assert!(text.contains(message), "{text}");
+            }
+            assert!(!text.contains("bug in carina"), "{text}");
+            if case == "P2 kind" {
+                assert!(
+                    !text.contains("conversion is") && !text.contains("conversion operand"),
+                    "{text}"
+                );
+            }
+        }
+    }
+}

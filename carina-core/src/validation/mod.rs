@@ -5388,14 +5388,11 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
                                     session,
                                     None,
                                     None,
-                                    admission::attributes::SchemaInputAuthority {
+                                    admission::attributes::SchemaInputAuthority::new(
                                         slots,
-                                        report: context
-                                            .report
-                                            .for_resource(id)
-                                            .unwrap_or(context.report),
-                                        coverage: context.coverage,
-                                    },
+                                        context.report.for_resource(id).unwrap_or(context.report),
+                                        context.coverage,
+                                    ),
                                 )
                             }
                             ValidatableKind::DataSource => {
@@ -5412,14 +5409,11 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
                                     session,
                                     None,
                                     None,
-                                    admission::attributes::SchemaInputAuthority {
+                                    admission::attributes::SchemaInputAuthority::new(
                                         slots,
-                                        report: context
-                                            .report
-                                            .for_resource(id)
-                                            .unwrap_or(context.report),
-                                        coverage: context.coverage,
-                                    },
+                                        context.report.for_resource(id).unwrap_or(context.report),
+                                        context.coverage,
+                                    ),
                                 )
                             }
                         }
@@ -5507,7 +5501,7 @@ pub fn validate_resources<
     known_providers: &HashSet<String>,
     provider_context: &ProviderContext,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
-) -> Result<(), String> {
+) -> Result<(), PresentedFindings> {
     validate_resources_from_report(
         parsed,
         registry,
@@ -5533,7 +5527,7 @@ fn validate_resources_from_report<
         &HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>,
     >,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
-) -> Result<(), String> {
+) -> Result<(), PresentedFindings> {
     let existing = parsed
         .parser_binding_metadata
         .syntax()
@@ -5563,7 +5557,7 @@ fn validate_resources_from_report<
     if findings.is_empty() {
         Ok(())
     } else {
-        Err(findings.to_string())
+        Err(findings)
     }
 }
 
@@ -5690,39 +5684,12 @@ fn resource_values_report<
     all_errors.0
 }
 
-/// Validate that resource references have compatible types.
-///
-/// For example, if `ipv4_ipam_pool_id` expects `IpamPoolId` type,
-/// a reference like `vpc.vpc_id` (which is `AwsResourceId`) should be an error.
-/// Resource reference findings remain distinct from a rejected analysis input.
-#[derive(Debug, thiserror::Error)]
-pub enum ResourceRefTypeValidationError {
-    #[error(transparent)]
-    AnalysisInvariant(#[from] crate::parser::AnalysisTreeError),
-    #[error(transparent)]
-    Validation(PresentedFindings),
-}
-
-pub fn validate_resource_ref_types<
-    E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
-    B: BindingAddress,
-    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
->(
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
-    _argument_names: &HashSet<String>,
-    bindings: &BindingIndex<'_, B>,
-    diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
-) -> Result<(), ResourceRefTypeValidationError> {
-    let mut run = ConversionValidation::default();
-    resource_reference_findings_in(
-        &mut run,
-        judged,
-        bindings,
-        diagnostics,
-        FindingSubject::Root,
-    )?;
-    run.complete().into_legacy_result()
-}
+#[cfg(any(test, feature = "test-utils"))]
+pub use crate::test_utils::{
+    LegacyValidationError as ResourceRefTypeValidationError,
+    legacy_validate_resource_admissions as validate_resource_admissions,
+    legacy_validate_resource_ref_types as validate_resource_ref_types,
+};
 
 pub fn resource_reference_findings<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
@@ -5792,28 +5759,6 @@ pub fn resource_reference_preflight_findings_in<
     )?;
     run.ordinary(report.references.0, subject);
     Ok(())
-}
-
-pub fn validate_resource_admissions<
-    E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
-    B: BindingAddress,
-    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
->(
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
-    bindings: &BindingIndex<'_, B>,
-    known_providers: &HashSet<String>,
-    diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
-) -> Result<(), ResourceRefTypeValidationError> {
-    let mut run = ConversionValidation::default();
-    resource_admission_findings_in(
-        &mut run,
-        judged,
-        bindings,
-        known_providers,
-        diagnostics,
-        FindingSubject::Root,
-    )?;
-    run.complete().into_legacy_result()
 }
 
 pub fn resource_admission_findings<
