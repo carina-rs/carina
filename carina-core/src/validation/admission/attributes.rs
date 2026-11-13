@@ -170,7 +170,7 @@ fn admission_findings<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>
 /// pending admissions are dropped; apply re-admits the resolved resource values.
 pub fn admit_plan_attributes<K: RechecksResolved>(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
-    resource: &crate::parser::TopLevelResourceRef<'_>,
+    resource: &ResourceId,
     attributes: &indexmap::IndexMap<String, PlanResolved<'_>>,
     quoted: &std::collections::HashSet<String>,
     session: &dyn ProviderTypeCheckContext,
@@ -188,7 +188,7 @@ pub fn admit_plan_attributes<K: RechecksResolved>(
             &|name| quoted.contains(name),
             &|name, selected, _| {
                 let destination = schema.admission_selected_attribute::<K>(
-                    resource.id(),
+                    resource,
                     name,
                     selected,
                     session.catalog(),

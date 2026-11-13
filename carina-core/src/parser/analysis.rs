@@ -1274,7 +1274,13 @@ where
     // Graph membership comes from the ordering pass's exact
     // dependency computation. Provenance only anchors those
     // edges; retained references never add graph edges.
-    for binding in crate::deps::get_resource_dependencies(managed) {
+    // Dependency membership has no authored sequence. Order invariant checks
+    // by binding so missing provenance always names the same edge first.
+    let mut bindings = crate::deps::get_resource_dependencies(managed)
+        .into_iter()
+        .collect::<Vec<_>>();
+    bindings.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    for binding in bindings {
         let explicit = dependencies
             .iter()
             .find(|dependency| dependency.operand().binding_reference() == binding);
@@ -3212,9 +3218,48 @@ mod location_tests {
 #[cfg(test)]
 mod diagnostic_order_tests {
     #[test]
+    fn missing_dependency_provenance_reports_the_first_binding_in_key_order() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/diagnostic_order/metadata_values");
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::config_loader::parse_directory(
+            &crate::paths::ResolvedPath::new(root).unwrap(),
+            &context,
+        )
+        .unwrap()
+        .into_parsed();
+        let tree = super::AnalysisTree::try_from_file(&parsed).unwrap();
+        let location = tree
+            .top_level_resources()
+            .next()
+            .unwrap()
+            .location()
+            .clone();
+        let mut resource = parsed.resources[0].clone();
+        resource.attributes = ["zulu", "alpha", "quartz", "bravo", "mango", "delta"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_owned(),
+                    crate::resource::Value::resource_ref(name, "name", vec![]),
+                )
+            })
+            .collect();
+        for _ in 0..8 {
+            let error = super::managed_dependency_origins(&parsed, &resource, &[], &[], &location)
+                .unwrap_err();
+            assert!(
+                matches!(error.kind(), super::AnalysisTreeErrorKind::MissingElementProvenance { element, .. }
+                if element == "dependency edge to alpha"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn retained_missing_annotation_reports_the_first_declared_function() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/diagnostic_order/functions/references");
+            .join("tests/fixtures/diagnostic_order/functions/undefined_references");
         let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let mut parsed = crate::config_loader::parse_directory(
             &crate::paths::ResolvedPath::new(root).unwrap(),
@@ -3222,15 +3267,34 @@ mod diagnostic_order_tests {
         )
         .unwrap()
         .into_parsed();
-        for function in parsed.user_functions.values_mut() {
-            function.type_annotations.clear();
-        }
-        let error = crate::parser::AnalysisTree::try_from_file(&parsed)
-            .err()
-            .unwrap();
+        let annotations = parsed
+            .user_functions
+            .iter_mut()
+            .map(|(name, function)| (name.clone(), std::mem::take(&mut function.type_annotations)))
+            .collect::<Vec<_>>();
         assert_eq!(
-            error.to_string(),
-            "missing parser syntax provenance for function return type 'zebra' annotation"
+            annotations
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["zebra", "mango", "quartz", "delta", "alpha", "bravo"]
         );
+        for (name, annotations) in annotations {
+            let error = crate::parser::AnalysisTree::try_from_file(&parsed)
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "missing parser syntax provenance for function return type '{name}' annotation"
+                )
+            );
+            parsed
+                .user_functions
+                .get_mut(&name)
+                .unwrap()
+                .type_annotations = annotations;
+        }
+        assert!(crate::parser::AnalysisTree::try_from_file(&parsed).is_ok());
     }
 }

@@ -54,14 +54,48 @@ fn duplicate_sibling_functions_are_rejected() {
 }
 
 fn check_shard(index: usize) {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let script = repo.join("scripts/validate-parity.py");
-    // Keep raw captures for investigating failures in archived/partitioned runs.
+    with_evidence(index, |evidence| check_shard_in(index, evidence));
+}
+
+fn with_evidence(index: usize, check: impl FnOnce(&Path)) {
     let evidence = tempfile::Builder::new()
         .prefix(&format!("validate-parity-shard-{index}-"))
         .tempdir()
-        .unwrap()
-        .keep();
+        .unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(evidence.path())));
+    if let Err(panic) = result {
+        eprintln!(
+            "failed diagnostic-order sweep evidence: {}",
+            evidence.keep().display()
+        );
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[test]
+fn sweep_evidence_is_deleted_on_success_and_retained_on_failure() {
+    let success = std::cell::RefCell::new(std::path::PathBuf::new());
+    with_evidence(0, |directory| *success.borrow_mut() = directory.to_owned());
+    assert!(
+        !success.borrow().exists(),
+        "successful sweep left {}",
+        success.borrow().display()
+    );
+    let failure = std::cell::RefCell::new(std::path::PathBuf::new());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_evidence(0, |directory| {
+            *failure.borrow_mut() = directory.to_owned();
+            panic!("failed sweep");
+        });
+    }));
+    assert!(result.is_err());
+    assert!(failure.borrow().exists());
+    std::fs::remove_dir_all(&*failure.borrow()).unwrap();
+}
+
+fn check_shard_in(index: usize, evidence: &Path) {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let script = repo.join("scripts/validate-parity.py");
     let command = || {
         let mut command = Command::new("python3");
         command
@@ -75,7 +109,7 @@ fn check_shard(index: usize) {
             ])
             .arg(repo)
             .arg("--evidence")
-            .arg(&evidence);
+            .arg(evidence);
         command
     };
     // Python owns enumeration and validates the complete manifest and shard coverage.
@@ -106,9 +140,18 @@ fn check_shard(index: usize) {
         summary["validation_directories"].as_u64().unwrap() > 0,
         "shard {index}/{SHARDS} reached no validation: {summary}"
     );
+    let validated = summary["validated_directory_names"].as_array().unwrap();
+    for fixture in summary["diagnostic_order_directory_names"]
+        .as_array()
+        .unwrap()
+    {
+        assert!(
+            validated.contains(fixture),
+            "focused fixture {fixture} did not reach validation: {summary}"
+        );
+    }
     eprintln!(
-        "shard {index}/{SHARDS}; evidence: {}; {}",
-        evidence.display(),
+        "shard {index}/{SHARDS}; {}",
         String::from_utf8_lossy(&output.stdout)
             .lines()
             .last()

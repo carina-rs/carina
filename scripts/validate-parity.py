@@ -228,8 +228,17 @@ def main():
             print(f"{index + 1}/{len(directories)} {'json' if json_output else 'text'} {'PASS' if record['identical'] else 'DIFF'} {directory}", flush=True)
     if args.binary and not validated_directories:
         failures.append({"failure": "No directory reached validation in this shard"})
+    diagnostic_order_directories = {str(directory) for directory in directories
+                                    if "diagnostic_order" in directory.parts}
+    unvalidated_fixtures = sorted(diagnostic_order_directories - validated_directories)
+    if args.binary and unvalidated_fixtures:
+        failures.append({"failure": "Named diagnostic-order fixtures did not reach validation",
+                         "directories": unvalidated_fixtures})
     summary = {"directories": len(directories), "total_directories": len(all_directories),
                "validation_directories": len(validated_directories),
+               "validated_directory_names": sorted(validated_directories),
+               "diagnostic_order_directory_names": sorted(diagnostic_order_directories),
+               "unvalidated_diagnostic_order_directories": unvalidated_fixtures,
                "setup_failure_directories": len(directories) - len(validated_directories),
                "provider_not_installed_directories": len(provider_not_installed),
                "shard": {"index": shard_index, "count": shard_count},
@@ -239,7 +248,8 @@ def main():
                "wall_seconds": time.monotonic() - started,
                "differences": differences, "failures": failures, "results": results}
     (args.evidence / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    print(json.dumps({key: value for key, value in summary.items() if key not in ("differences", "results")}))
+    print(json.dumps({key: value for key, value in summary.items() if key not in (
+        "differences", "results", "validated_directory_names", "diagnostic_order_directory_names")}))
     return int(bool(differences or failures))
 
 

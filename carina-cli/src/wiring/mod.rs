@@ -1852,7 +1852,7 @@ impl MigrationCheckProviderLoad {
             carina_core::resource::RelativeBindingName,
         >],
         base_dir: &ResolvedPath,
-        schema_overrides: &HashMap<String, PathBuf>,
+        schema_overrides: &IndexMap<String, PathBuf>,
         notices: &mut ProviderNoticeSink,
     ) -> Result<Self, AppError> {
         let effective = schema_check_provider_configs(providers, schema_overrides)?;
@@ -4693,7 +4693,7 @@ fn validate_resolved_value_constraints(
             carina_core::validation::admission::kind::ResourceAttribute,
         >(
             &mut plan_errors,
-            carina_core::parser::TopLevelResourceRef::Resource(resource),
+            &resource.id,
             schema,
             &classified,
             &resource.quoted_string_attrs,
@@ -4735,7 +4735,7 @@ fn validate_resolved_value_constraints(
             carina_core::validation::admission::kind::DataSourceAttribute,
         >(
             &mut plan_errors,
-            carina_core::parser::TopLevelResourceRef::DataSource(resource),
+            &resource.id,
             schema,
             &classified,
             &resource.quoted_string_attrs,
@@ -4751,7 +4751,7 @@ fn append_resolved_value_constraint_errors<
     K: carina_core::validation::admission::RechecksResolved,
 >(
     plan_errors: &mut Vec<PlanError>,
-    resource: carina_core::parser::TopLevelResourceRef<'_>,
+    resource: &ResourceId,
     schema: OwnerBoundResourceSchema<'_>,
     attributes: &IndexMap<String, carina_core::resource::knowledge::PlanResolved<'_>>,
     quoted_string_attrs: &HashSet<String>,
@@ -4760,7 +4760,7 @@ fn append_resolved_value_constraint_errors<
 ) {
     let report = carina_core::validation::admission::attributes::admit_plan_attributes::<K>(
         schema,
-        &resource,
+        resource,
         attributes,
         quoted_string_attrs,
         session,
@@ -4769,7 +4769,7 @@ fn append_resolved_value_constraint_errors<
         let (attributes, origins) =
             resolved_constraint_context(error, origin_attributes, schema.schema().as_schema());
         plan_errors.push(PlanError::new(
-            resource.id().clone(),
+            resource.clone(),
             PlanErrorKind::ResolvedValueConstraint {
                 attributes,
                 origins,
@@ -11053,14 +11053,12 @@ mod tests;
 
 fn schema_check_provider_configs(
     providers: &[ProviderConfig<ParserPlaceholder, carina_core::resource::RelativeBindingName>],
-    overrides: &HashMap<String, PathBuf>,
+    overrides: &IndexMap<String, PathBuf>,
 ) -> Result<
     Vec<ProviderConfig<ParserPlaceholder, carina_core::resource::RelativeBindingName>>,
     AppError,
 > {
     let mut effective = providers.to_vec();
-    let mut overrides = overrides.iter().collect::<Vec<_>>();
-    overrides.sort_unstable_by_key(|(name, _)| *name);
     for (name, path) in overrides {
         let Some(config) = effective
             .iter_mut()

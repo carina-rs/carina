@@ -6788,6 +6788,7 @@ fn describe_struct_union_members(
                 .collect();
             Some(UnionStructAlternative {
                 name: name.clone(),
+                canonical_fields: fields.iter().map(|field| field.name.clone()).collect(),
                 accepted_fields,
                 required_fields,
             })
@@ -7089,11 +7090,14 @@ fn format_invalid_enum(
 ) -> String {
     let suggestion = value.as_plain().and_then(|value| {
         let input = value.rsplit('.').next().unwrap_or(value);
-        let known = expected
-            .iter()
-            .map(|candidate| candidate.value.0.as_str())
-            .collect::<Vec<_>>();
-        let suggested = suggest_similar_name(input, &known)?;
+        let names = |is_alias| {
+            expected
+                .iter()
+                .filter(move |candidate| candidate.is_alias == is_alias)
+                .map(|candidate| candidate.value.0.as_str())
+                .collect::<Vec<_>>()
+        };
+        let suggested = suggest_similar_name(input, &names(false), &names(true))?;
         expected
             .iter()
             .find(|candidate| candidate.value.0 == suggested)
@@ -7334,6 +7338,8 @@ pub enum UnionStructMismatchReason {
 pub struct UnionStructAlternative {
     /// Declared Struct name.
     pub name: String,
+    /// Canonical field names, in schema declaration order.
+    pub canonical_fields: Vec<String>,
     /// Canonical field names and accepted `block_name` aliases.
     pub accepted_fields: Vec<String>,
     /// Canonical names of fields required by this alternative.
@@ -7498,15 +7504,19 @@ fn format_union_unknown_prefix(
         "one of these forms: "
     };
     if let [field] = unrecognized_fields {
-        let mut known_fields = Vec::new();
+        let mut primary = Vec::new();
+        let mut aliases = Vec::new();
         for alternative in alternatives {
-            for accepted in &alternative.accepted_fields {
-                if !known_fields.contains(&accepted.as_str()) {
-                    known_fields.push(accepted.as_str());
-                }
-            }
+            primary.extend(alternative.canonical_fields.iter().map(String::as_str));
+            aliases.extend(
+                alternative
+                    .accepted_fields
+                    .iter()
+                    .filter(|field| !alternative.canonical_fields.contains(field))
+                    .map(String::as_str),
+            );
         }
-        if let Some(suggestion) = suggest_similar_name(field, &known_fields) {
+        if let Some(suggestion) = suggest_similar_name(field, &primary, &aliases) {
             return format!(
                 "Unknown field '{field}', did you mean '{suggestion}'? Expected {expectation}"
             );
@@ -15567,20 +15577,23 @@ pub(crate) fn levenshtein_distance(a: &str, b: &str) -> usize {
 }
 
 /// Suggest the most similar field name, if one is close enough.
-/// Equal distances choose the lexically smallest name, independent of candidate order.
-pub fn suggest_similar_name(unknown: &str, known: &[&str]) -> Option<String> {
+/// Equal distances prefer primary names over aliases, then the lexically
+/// smallest name. Candidate iteration order never affects the result.
+pub fn suggest_similar_name(unknown: &str, primary: &[&str], aliases: &[&str]) -> Option<String> {
     let max_distance = match unknown.len() {
         0..=2 => 1,
         3..=5 => 2,
         _ => 3,
     };
 
-    known
+    primary
         .iter()
-        .map(|name| (*name, levenshtein_distance(unknown, name)))
-        .filter(|(_, dist)| *dist <= max_distance)
-        .min_by_key(|(name, dist)| (*dist, *name))
-        .map(|(name, _)| name.to_string())
+        .map(|name| (*name, 0))
+        .chain(aliases.iter().map(|name| (*name, 1)))
+        .map(|(name, tier)| (levenshtein_distance(unknown, name), tier, name))
+        .filter(|(distance, _, _)| *distance <= max_distance)
+        .min()
+        .map(|(_, _, name)| name.to_string())
 }
 
 /// Validate a single IPv6 group (1-4 hex digits)
@@ -16556,11 +16569,8 @@ impl PatternResourceSchema<Compiled> {
         // Build block_name -> canonical_name map for alias resolution
         let bn_map = self.block_name_map();
 
-        // Build suggestion candidates (canonical names + block name aliases)
-        let mut known: Vec<&str> = self.attributes.keys().map(|s| s.as_str()).collect();
-        for bn in bn_map.keys() {
-            known.push(bn.as_str());
-        }
+        let known: Vec<&str> = self.attributes.keys().map(String::as_str).collect();
+        let aliases: Vec<&str> = bn_map.keys().map(String::as_str).collect();
 
         // Type check each attribute and reject unknown ones
         for (name, value) in entries {
@@ -16628,10 +16638,12 @@ impl PatternResourceSchema<Compiled> {
                     report.attributes.insert(name.clone(), admit(name, value));
                 }
                 let id_attribute = format!("{name}_id");
-                let suggestion = if known.contains(&id_attribute.as_str()) {
+                let suggestion = if known.contains(&id_attribute.as_str())
+                    || aliases.contains(&id_attribute.as_str())
+                {
                     Some(id_attribute)
                 } else {
-                    suggest_similar_name(name, &known)
+                    suggest_similar_name(name, &known, &aliases)
                 };
                 report.errors.push(TypeError::UnknownAttribute {
                     name: name.clone(),

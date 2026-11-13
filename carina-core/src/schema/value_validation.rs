@@ -2986,7 +2986,7 @@ impl<'a> ValueValidator<'a, '_> {
                     TypeError::UnknownStructField {
                         struct_name: name.clone(),
                         field: key.clone(),
-                        suggestion: suggest_similar_name(key, &known),
+                        suggestion: suggest_similar_name(key, &known, &[]),
                     },
                 ),
             };

@@ -103,7 +103,7 @@ fn migration_check_current_state_still_validates_provider_schema_flags() {
 }
 
 #[test]
-fn migration_check_multiple_bad_schema_overrides_choose_the_first_key() {
+fn migration_check_multiple_bad_schema_overrides_choose_the_first_argument() {
     let temp = tempfile::tempdir().unwrap();
     let state = write_current_state(temp.path());
     let mut legacy: serde_json::Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
@@ -131,7 +131,7 @@ fn migration_check_multiple_bad_schema_overrides_choose_the_first_key() {
         assert!(!output.status.success(), "{output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("undeclared default provider 'alpha'"),
+            stderr.contains("undeclared default provider 'zulu'"),
             "{stderr}"
         );
     }

@@ -1,2 +1,4 @@
 fn zebra(): String { missing_zebra.name }
 fn mango(): String { missing_mango.name }
+fn quartz(): String { missing_quartz.name }
+fn delta(): String { missing_delta.name }

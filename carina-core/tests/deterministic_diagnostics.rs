@@ -368,20 +368,20 @@ fn block_alias_suggestion_ties_choose_lexical_minimum() {
             aliases.keys().map(String::as_str).collect::<Vec<_>>(),
             ["cat", "bat"]
         );
-        let candidates = schema
+        let primary = schema
             .as_schema()
             .attributes()
             .keys()
-            .chain(aliases.keys())
             .map(String::as_str)
             .collect::<Vec<_>>();
+        let candidates = aliases.keys().map(String::as_str).collect::<Vec<_>>();
         assert_eq!(
-            suggest_similar_name("hat", &candidates).as_deref(),
+            suggest_similar_name("hat", &primary, &candidates).as_deref(),
             Some("bat")
         );
     }
     assert_eq!(
-        suggest_similar_name("hat", &["bat", "cat"]).as_deref(),
+        suggest_similar_name("hat", &["bat", "cat"], &[]).as_deref(),
         Some("bat")
     );
 }
@@ -390,10 +390,113 @@ fn block_alias_suggestion_ties_choose_lexical_minimum() {
 fn suggestion_ties_choose_lexical_minimum_for_every_candidate_order() {
     for candidates in [["cat", "bat"], ["bat", "cat"]] {
         assert_eq!(
-            suggest_similar_name("hat", &candidates).as_deref(),
+            suggest_similar_name("hat", &candidates, &[]).as_deref(),
             Some("bat")
         );
     }
+}
+
+#[test]
+fn canonical_attribute_wins_an_equal_distance_block_alias() {
+    let parsed = custom_directory("mock.test.resource { name = 'ordered' rulez = [] }");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("rules", AttributeType::list(AttributeType::string()))
+                    .with_block_name("rule")
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let loaded = load_buffer_configuration(&parsed, &schemas, &config);
+    let judged = loaded.judged();
+    let tree = AnalysisTree::try_from_file(judged.file()).unwrap();
+    let resource = tree.resources().next().unwrap();
+    let inputs = ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap();
+    let classified = inputs.classify(&KnowledgeContext::validation(), |_, error| {
+        panic!("{error}")
+    });
+    let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &config);
+    with_session_for_test(&config, |session| {
+        let report = resource_attribute_admissions(
+            resource,
+            judged.file(),
+            resource.schema(&schemas).unwrap(),
+            &classified,
+            resource.quoted_string_attrs(),
+            &inputs,
+            &bindings,
+            session,
+            &schemas,
+            &mut Default::default(),
+        );
+        let errors = report.errors().collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            matches!(errors[0], TypeError::UnknownAttribute { name, suggestion }
+            if name == "rulez" && suggestion.as_deref() == Some("rules")),
+            "{errors:?}"
+        );
+    });
+}
+
+#[test]
+fn module_arguments_and_their_source_spans_keep_authored_order() {
+    for _ in 0..8 {
+        let parsed = directory("module_arguments/unknown");
+        let call = &parsed.module_calls[0];
+        let expected = [
+            "flag",
+            "zulu_bad",
+            "alpha_bad",
+            "quartz_bad",
+            "bravo_bad",
+            "mango_bad",
+            "delta_bad",
+        ];
+        assert_eq!(
+            call.arguments().map(|(name, _)| name).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            call.arguments_with_source_spans()
+                .map(|argument| (argument.name(), argument.key_span().start_line()))
+                .collect::<Vec<_>>(),
+            expected
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| (name, index + 2))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn retained_module_argument_references_keep_authored_order() {
+    let parsed = directory("module_arguments/references");
+    let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+    assert_eq!(
+        tree.value_references()
+            .iter()
+            .map(|value| value
+                .reference()
+                .render(|path| path.binding().to_string())
+                .to_string())
+            .collect::<Vec<_>>(),
+        [
+            "missing_zulu",
+            "missing_alpha",
+            "missing_quartz",
+            "missing_bravo",
+            "missing_mango",
+            "missing_delta"
+        ]
+    );
 }
 
 #[test]
@@ -423,7 +526,7 @@ fn plan_admission_validates_supplied_proofs_absent_from_the_resource() {
     with_session_for_test(&config, |session| {
         let report = admit_plan_attributes::<kind::ResourceAttribute>(
             schemas.get_for(&resource).unwrap(),
-            &carina_core::parser::TopLevelResourceRef::Resource(&resource),
+            &resource.id,
             &proofs,
             &Default::default(),
             session,
@@ -652,7 +755,7 @@ fn plan_admission_keeps_supplied_proof_order() {
     with_session_for_test(&config, |session| {
         let report = admit_plan_attributes::<kind::ResourceAttribute>(
             schemas.get_for(&resource).unwrap(),
-            &carina_core::parser::TopLevelResourceRef::Resource(&resource),
+            &resource.id,
             &proofs,
             &Default::default(),
             session,
@@ -663,6 +766,44 @@ fn plan_admission_keeps_supplied_proof_order() {
                 .map(|(error, path, _)| path.unwrap_or_else(|| panic!("missing path: {error:?}")).0)
                 .collect::<Vec<_>>(),
             UNKNOWN.into_iter().rev().collect::<Vec<_>>()
+        );
+    });
+}
+
+#[test]
+fn unknown_module_argument_findings_keep_authored_order() {
+    let parsed = directory("module_arguments/unknown");
+    let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+    let base = ResolvedPath::new(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/diagnostic_order/module_arguments/unknown"),
+    )
+    .unwrap();
+    let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    with_session_for_test(&context, |session| {
+        let findings = carina_core::validation::check_module_calls_from_analysis(
+            &tree,
+            &base,
+            session,
+            &SchemaRegistry::new(),
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.message().to_string())
+                .collect::<Vec<_>>(),
+            ["zulu", "alpha", "quartz", "bravo", "mango", "delta"]
+                .map(|name| format!("Unknown argument '{name}_bad' for module 'choice'"))
+        );
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.anchor().span.start_line())
+                .collect::<Vec<_>>(),
+            [3, 4, 5, 6, 7, 8]
         );
     });
 }

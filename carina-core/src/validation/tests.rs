@@ -589,7 +589,7 @@ fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType 
 
 fn module_arguments(
     values: impl IntoIterator<Item = (String, Value)>,
-) -> HashMap<String, ModuleArgument> {
+) -> indexmap::IndexMap<String, ModuleArgument> {
     values
         .into_iter()
         .map(|(name, value)| (name, ModuleArgument::new(value)))

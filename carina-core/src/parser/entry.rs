@@ -915,8 +915,8 @@ fn resolve_top_level_user_functions(
         }
     }
 
-    // Resolution follows dependencies, while every consumer sees sorted-file,
-    // then authored declaration order.
+    // Resolution follows dependencies. Each name keeps its first declaration's
+    // slot in sorted-file order; duplicates use the later file's definition.
     Ok(owners
         .into_keys()
         .map(|name| {

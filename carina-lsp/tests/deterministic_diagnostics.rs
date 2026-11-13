@@ -24,8 +24,16 @@ fn undefined_function_references_keep_sibling_declaration_order() {
     );
     let engine = engine_with_schemas(schemas);
     for (file, names) in [
-        ("a_functions.crn", ["missing_zebra", "missing_mango"]),
-        ("z_functions.crn", ["missing_alpha", "missing_bravo"]),
+        (
+            "a_functions.crn",
+            &[
+                "missing_zebra",
+                "missing_mango",
+                "missing_quartz",
+                "missing_delta",
+            ][..],
+        ),
+        ("z_functions.crn", &["missing_alpha", "missing_bravo"][..]),
     ] {
         let diagnostics = analyze(&engine, &fixture, file);
         let undefined = diagnostics
@@ -37,16 +45,19 @@ fn undefined_function_references_keep_sibling_declaration_order() {
                 .iter()
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
-            names.map(|name| format!(
-                "Undefined resource: '{name}'. Define it with 'let {name} = aws...'"
-            ))
+            names
+                .iter()
+                .map(|name| format!(
+                    "Undefined resource: '{name}'. Define it with 'let {name} = aws...'"
+                ))
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             undefined
                 .iter()
                 .map(|diagnostic| diagnostic.range.start.line)
                 .collect::<Vec<_>>(),
-            [0, 1]
+            (0..names.len() as u32).collect::<Vec<_>>()
         );
     }
 }

@@ -24,12 +24,12 @@ class ValidationCoverageTests(unittest.TestCase):
             root = Path(temporary)
             directories = [root / name for name in responses]
             for directory in directories:
-                directory.mkdir()
+                directory.mkdir(parents=True)
                 (directory / "main.crn").write_text("exports {}\n")
             evidence = root / "evidence"
 
             def invoke(command, **_):
-                response = responses[Path(command[2]).name]
+                response = responses[Path(command[2]).relative_to(root).as_posix()]
                 stdout = response if isinstance(response, bytes) else json.dumps(response).encode()
                 return subprocess.CompletedProcess(command, 1, stdout, b"")
 
@@ -67,6 +67,23 @@ class ValidationCoverageTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(summary.get("validation_directories"), 0)
         self.assertEqual(summary.get("setup_failure_directories"), 1)
+
+    def test_every_named_diagnostic_order_fixture_must_reach_validation(self):
+        status, summary = self.sweep({
+            "ordinary": {"status": "ok", "resources": [], "errors": []},
+            "diagnostic_order/focused": {"status": "error", "resources": [], "errors": [{"message": "Provider 'mock' not installed"}]},
+        })
+        self.assertEqual(summary["validation_directories"], 1)
+        self.assertEqual(status, 1)
+        self.assertEqual(len(summary.get("unvalidated_diagnostic_order_directories", [])), 1)
+
+    def test_named_invalid_fixture_still_counts_as_validation(self):
+        status, summary = self.sweep({
+            "diagnostic_order/focused": {"status": "error", "resources": [], "errors": [{"message": "Unknown argument 'zulu'"}]},
+        })
+        self.assertEqual(status, 0)
+        self.assertEqual(summary.get("validated_directory_names"), summary.get("diagnostic_order_directory_names"))
+        self.assertEqual(len(summary.get("validated_directory_names", [])), 1)
 
 
 if __name__ == "__main__":

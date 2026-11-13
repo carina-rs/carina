@@ -2285,6 +2285,8 @@ pub(crate) fn value_dependent_judgement_for_test() -> JudgedExpr {
 // particular, the syntax compiler and provisional evaluators cannot mint it.
 mod judgement {
     #[cfg(test)]
+    mod diagnostic_order_tests;
+    #[cfg(test)]
     mod round2_tests;
 
     use super::*;
@@ -3406,7 +3408,7 @@ mod judgement {
     #[derive(Clone)]
     pub struct ExpressionReport<B: BindingAddress = RelativeBindingName> {
         bindings: Arc<HashMap<B, JudgedExpr>>,
-        expressions: Arc<HashMap<ExpressionLocation, JudgedExpr>>,
+        expressions: Arc<IndexMap<ExpressionLocation, JudgedExpr>>,
         pub(super) nodes: Arc<HashMap<(ExpressionInstance, NodeId), JudgedExpr>>,
         pub(super) syntax_nodes: Arc<AuthoredNodes<B>>,
         pub(super) use_roots: Arc<Vec<cursor::UseRoot<B>>>,
@@ -3417,7 +3419,7 @@ mod judgement {
         findings: Arc<Vec<Located<InferenceError>>>,
         function_errors: Arc<Vec<Located<InferenceError>>>,
         operands: Arc<HashMap<ExpressionLocation, [JudgedExpr; 2]>>,
-        module_attributes: Arc<HashMap<(B, String), JudgedExpr>>,
+        module_attributes: Arc<IndexMap<(B, String), JudgedExpr>>,
         resource_reports: Arc<HashMap<crate::resource::ResourceId, Arc<ExpressionReport<B>>>>,
         parameters: Arc<HashMap<String, JudgedExpr>>,
         pub(super) instance: ExpressionInstance,
@@ -3600,7 +3602,7 @@ mod judgement {
                             expression.clone(),
                         )
                     })
-                    .collect::<HashMap<_, _>>()
+                    .collect::<IndexMap<_, _>>()
                     .into(),
                 resource_reports,
                 parameters: self.parameters.clone(),
@@ -3917,7 +3919,7 @@ mod judgement {
             config,
             memo: HashMap::new(),
             scope: DiagnosticScope::Public,
-            by_location: HashMap::new(),
+            by_location: IndexMap::new(),
             by_node: HashMap::new(),
             syntax_nodes: HashMap::new(),
             visiting: Vec::new(),
@@ -4044,14 +4046,14 @@ mod judgement {
         config: &'a super::super::ProviderContext,
         memo: HashMap<(usize, DiagnosticScope), JudgedExpr>,
         scope: DiagnosticScope,
-        by_location: HashMap<ExpressionLocation, JudgedExpr>,
+        by_location: IndexMap<ExpressionLocation, JudgedExpr>,
         by_node: HashMap<(ExpressionInstance, NodeId), JudgedExpr>,
         syntax_nodes: AuthoredNodes<B>,
         visiting: Vec<usize>,
         findings: Vec<Located<InferenceError>>,
         function_errors: Vec<Located<InferenceError>>,
         operands: HashMap<ExpressionLocation, [JudgedExpr; 2]>,
-        module_attributes: Option<&'a HashMap<(B, String), JudgedExpr>>,
+        module_attributes: Option<&'a IndexMap<(B, String), JudgedExpr>>,
     }
 
     impl<B: BindingAddress> Judge<'_, B> {

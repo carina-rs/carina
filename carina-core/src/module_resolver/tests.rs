@@ -350,7 +350,7 @@ fn reconcile_anonymous_module_instances(
 
 fn module_arguments(
     values: impl IntoIterator<Item = (String, Value<ParserPlaceholder>)>,
-) -> HashMap<String, ModuleArgument<ParserPlaceholder>> {
+) -> indexmap::IndexMap<String, ModuleArgument<ParserPlaceholder>> {
     values
         .into_iter()
         .map(|(name, value)| (name, ModuleArgument::new(value)))
@@ -2910,7 +2910,7 @@ fn test_expand_anonymous_resource_in_named_module_keeps_identity_absent() {
             let call = ModuleCall::test(
                 "policy_module".to_string(),
                 Some("bootstrap".to_string()),
-                HashMap::new(),
+                indexmap::IndexMap::new(),
             );
 
             let expanded = resolver
@@ -2956,7 +2956,8 @@ fn anonymous_module_resource_instantiated_twice_has_distinct_pending_ids() {
                 );
                 resolver
             };
-            let call = ModuleCall::test("policy_module".to_string(), None, HashMap::new());
+            let call =
+                ModuleCall::test("policy_module".to_string(), None, indexmap::IndexMap::new());
 
             let first = resolver
                 .expand_module_call(&call, "first")
@@ -3133,7 +3134,7 @@ fn test_expand_module_call_preserves_provider_instance_on_id() {
             let call = ModuleCall::test(
                 "registry".to_string(),
                 Some("acme".to_string()),
-                HashMap::new(),
+                indexmap::IndexMap::new(),
             );
 
             let expanded = resolver
@@ -3514,7 +3515,7 @@ fn test_expand_module_call_creates_composition() {
             let call = ModuleCall::test(
                 "web_tier".to_string(),
                 Some("web".to_string()),
-                HashMap::new(),
+                indexmap::IndexMap::new(),
             );
 
             let expanded = resolver.expand_module_call(&call, "web").unwrap();
@@ -3584,7 +3585,7 @@ fn test_expand_module_call_populates_compositions_slice() {
             let call = ModuleCall::test(
                 "web_tier".to_string(),
                 Some("web".to_string()),
-                HashMap::new(),
+                indexmap::IndexMap::new(),
             );
 
             let expanded = resolver.expand_module_call(&call, "web").unwrap();
@@ -3631,7 +3632,7 @@ fn test_expand_module_call_populates_expansion_trace_single_level() {
             let call = ModuleCall::test(
                 "web_tier".to_string(),
                 Some("web".to_string()),
-                HashMap::new(),
+                indexmap::IndexMap::new(),
             );
 
             let expanded = resolver.expand_module_call(&call, "web").unwrap();
@@ -3689,7 +3690,7 @@ fn test_expand_module_call_records_use_source_path_on_call_site() {
             let call = ModuleCall::test(
                 "web_tier".to_string(),
                 Some("web".to_string()),
-                HashMap::new(),
+                indexmap::IndexMap::new(),
             );
 
             let expanded = resolver.expand_module_call(&call, "web").unwrap();
@@ -3733,7 +3734,7 @@ fn test_expand_module_call_call_site_source_path_none_when_unmapped() {
             let call = ModuleCall::test(
                 "web_tier".to_string(),
                 Some("web".to_string()),
-                HashMap::new(),
+                indexmap::IndexMap::new(),
             );
 
             let expanded = resolver.expand_module_call(&call, "web").unwrap();
@@ -3965,7 +3966,7 @@ fn test_expand_module_call_without_binding_still_records_boundary_composition() 
             };
 
             // Module call without binding_name
-            let call = ModuleCall::test("web_tier".to_string(), None, HashMap::new());
+            let call = ModuleCall::test("web_tier".to_string(), None, indexmap::IndexMap::new());
 
             let expanded = resolver.expand_module_call(&call, "web_tier").unwrap();
             assert_eq!(expanded.compositions.len(), 1);
@@ -4111,7 +4112,7 @@ fn test_named_module_call_uses_binding_name() {
     let call = ModuleCall::test(
         "github".to_string(),
         Some("prod".to_string()),
-        HashMap::new(),
+        indexmap::IndexMap::new(),
     );
     assert_eq!(instance_prefix_for_call(&call), "prod");
 }
@@ -4188,7 +4189,7 @@ fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
                 resolver.insert_module_for_test("m".to_string(), module);
                 resolver
             };
-            let call = ModuleCall::test("m".to_string(), None, HashMap::new());
+            let call = ModuleCall::test("m".to_string(), None, indexmap::IndexMap::new());
             let mut resources = Vec::new();
             for instance in ["first", "second"] {
                 resources.extend(
@@ -4827,7 +4828,7 @@ fn test_missing_required_argument() {
             let call = ModuleCall::test(
                 "test_module".to_string(),
                 Some("my_instance".to_string()),
-                HashMap::new(), // Missing vpc_id
+                indexmap::IndexMap::new(), // Missing vpc_id
             );
 
             let result = resolver.expand_module_call(&call, "my_instance");
@@ -5095,7 +5096,7 @@ fn test_module_composition_dot_path_refs() {
             let call = ModuleCall::test(
                 "web_tier".to_string(),
                 Some("web".to_string()),
-                HashMap::new(),
+                indexmap::IndexMap::new(),
             );
 
             let expanded = resolver.expand_module_call(&call, "web").unwrap();
@@ -6389,7 +6390,7 @@ fn test_argument_validation_passes_with_default_value() {
             let call = ModuleCall::test(
                 "web_server".to_string(),
                 Some("web".to_string()),
-                HashMap::new(), // Uses default 8080
+                indexmap::IndexMap::new(), // Uses default 8080
             );
 
             let result = resolver.expand_module_call(&call, "web");

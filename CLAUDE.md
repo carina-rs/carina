@@ -338,8 +338,9 @@ Run `python3 scripts/validate-parity.py --main <main> --candidate <candidate>
 Use `--binary <path> --repeat 8 --repo . --evidence <dir>` to compare fresh
 processes of the same binary over every tracked configuration directory without
 reordering output. The `carina-cli` nextest `validate_diagnostic_order` integration
-tests retain this gate in four checked shards; each shard reports validation and
-provider-not-installed directory counts and must reach validation in at least one directory.
+tests retain this gate in four checked shards; each shard reports validation,
+provider-not-installed, and setup failure counts and must reach validation for
+every named `diagnostic_order/*` fixture it owns.
 
 CI keeps its parallel jobs by selecting kinds from `scripts/verify.sh`.
 The archive job builds the WASM mock fixtures and host test archive once;

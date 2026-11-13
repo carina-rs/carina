@@ -6506,8 +6506,8 @@ fn round7_unknown_attribute_suggests_existing_id_attribute() {
             if name == "vpc" && suggestion.as_deref() == Some("vpc_id")),
         "{errors:#?}"
     );
-    assert_eq!(suggest_similar_name("vpc", &["vpc_id"]), None);
-    assert_eq!(suggest_similar_name("vpc", &["subnet_id"]), None);
+    assert_eq!(suggest_similar_name("vpc", &["vpc_id"], &[]), None);
+    assert_eq!(suggest_similar_name("vpc", &["subnet_id"], &[]), None);
 }
 
 #[test]
@@ -6555,7 +6555,7 @@ fn round8_struct_field_and_binding_suggestions_do_not_invent_id_suffix() {
             if struct_name == "Rule" && field == "ip" && suggestion.is_none()),
         "{error:#?}"
     );
-    assert_eq!(suggest_similar_name("ip", &["ip_id"]), None);
+    assert_eq!(suggest_similar_name("ip", &["ip_id"], &[]), None);
     let binding_error = crate::parser::ParseError::undefined_identifier(
         "ip".to_string(),
         1,
@@ -6583,20 +6583,23 @@ fn test_suggest_similar_name() {
 
     // Close match
     assert_eq!(
-        suggest_similar_name("ip_protcol", &fields),
+        suggest_similar_name("ip_protcol", &fields, &[]),
         Some("ip_protocol".to_string())
     );
     assert_eq!(
-        suggest_similar_name("cidr_iip", &fields),
+        suggest_similar_name("cidr_iip", &fields, &[]),
         Some("cidr_ip".to_string())
     );
     assert_eq!(
-        suggest_similar_name("from_prot", &fields),
+        suggest_similar_name("from_prot", &fields, &[]),
         Some("from_port".to_string())
     );
 
     // No match (too far)
-    assert_eq!(suggest_similar_name("completely_unrelated", &fields), None);
+    assert_eq!(
+        suggest_similar_name("completely_unrelated", &fields, &[]),
+        None
+    );
 }
 
 #[test]
@@ -18806,4 +18809,52 @@ fn configuration_located_findings_cover_legacy_errors_without_primary() {
             .collect::<Vec<_>>(),
         legacy
     );
+}
+
+#[test]
+fn enum_suggestion_prefers_canonical_name_over_alias() {
+    let expected = [
+        ExpectedEnumVariant::from_namespaced(None, "Rule", "rules", false),
+        ExpectedEnumVariant::from_namespaced(None, "Rule", "rule", true),
+    ];
+    let message = format_invalid_enum(
+        &"rulez".into(),
+        InvalidEnumValueKind::Identifier,
+        None,
+        None,
+        &expected,
+    );
+    assert!(message.ends_with("did you mean 'rules'?"), "{message}");
+}
+
+#[test]
+fn union_suggestion_prefers_canonical_name_over_alias() {
+    let alternatives = [UnionStructAlternative {
+        name: "Rules".into(),
+        canonical_fields: vec!["rules".into()],
+        accepted_fields: vec!["rules".into(), "rule".into()],
+        required_fields: vec![],
+    }];
+    let message = format_union_unknown_prefix(&["rulez".into()], &alternatives, false);
+    assert!(message.contains("did you mean 'rules'?"), "{message}");
+}
+
+#[test]
+fn suggestion_tiers_keep_distance_before_canonical_preference() {
+    for primary in [["rules", "ruler"], ["ruler", "rules"]] {
+        assert_eq!(
+            suggest_similar_name("rulez", &primary, &["rule"]),
+            Some("ruler".into())
+        );
+        assert_eq!(
+            suggest_similar_name("rule", &primary, &["rule"]),
+            Some("rule".into())
+        );
+    }
+    for aliases in [["cat", "bat"], ["bat", "cat"]] {
+        assert_eq!(
+            suggest_similar_name("hat", &[], &aliases),
+            Some("bat".into())
+        );
+    }
 }

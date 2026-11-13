@@ -644,7 +644,7 @@ impl std::fmt::Display for RefTypeError {
                 known_exports,
             } => {
                 let known: Vec<&str> = known_exports.iter().map(String::as_str).collect();
-                let suggestion = suggest_similar_name(export, &known)
+                let suggestion = suggest_similar_name(export, &known, &[])
                     .map(|suggestion| format!(" Did you mean `{}`?", suggestion))
                     .unwrap_or_default();
                 write!(
@@ -679,7 +679,7 @@ pub enum RefType {
 }
 
 fn suggestion_suffix(unknown: &str, known: &[&str]) -> String {
-    suggest_similar_name(unknown, known)
+    suggest_similar_name(unknown, known, &[])
         .map(|suggestion| format!(" Did you mean '{}'?", suggestion))
         .unwrap_or_default()
 }

@@ -16271,7 +16271,7 @@ async fn provider_config_directory_builtin_keeps_ignored_opaque_values() {
     }
 }
 #[test]
-fn schema_override_errors_choose_the_first_key() {
+fn schema_override_errors_choose_the_first_argument() {
     for _ in 0..64 {
         let overrides = [
             ("zulu".to_owned(), PathBuf::from("missing-zulu.wasm")),
@@ -16282,7 +16282,7 @@ fn schema_override_errors_choose_the_first_key() {
         let error = schema_check_provider_configs(&[], &overrides).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "provider schema override names undeclared default provider 'alpha'"
+            "provider schema override names undeclared default provider 'zulu'"
         );
     }
 }
