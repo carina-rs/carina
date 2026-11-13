@@ -235,55 +235,70 @@ pub struct LocalBackendSettings {
     path: Option<ValueString>,
 }
 
-/// A local address pinned from admitted settings or native operation context.
-pub(crate) struct LocalBackendLocation {
+/// Failure to pin a local state address, retaining the original IO cause.
+#[derive(Debug, thiserror::Error)]
+#[error("state file address lookup failed")] // error-chain: caller-renders-sources
+pub struct LocalStateLocateError {
+    #[source]
+    cause: std::io::Error,
+}
+impl From<std::io::Error> for LocalStateLocateError {
+    fn from(cause: std::io::Error) -> Self {
+        Self { cause }
+    }
+}
+impl LocalStateLocateError {
+    pub(crate) fn io_error(&self) -> &std::io::Error {
+        &self.cause
+    }
+}
+
+/// A location derived from settings or an explicit native file address.
+/// The contained pins can only be minted in this module.
+#[derive(Debug)]
+pub(crate) enum LocalBackendLocation {
+    Configured(PinnedLocalSettings),
+    NativeFile(NativeFileAddress),
+}
+#[derive(Debug)]
+pub(crate) struct PinnedLocalSettings {
+    path: ResolvedPath,
+}
+#[derive(Debug)]
+pub(crate) struct NativeFileAddress {
     path: ResolvedPath,
 }
 impl LocalBackendLocation {
+    pub(crate) fn for_file(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, LocalStateLocateError> {
+        Ok(Self::NativeFile(NativeFileAddress {
+            path: ResolvedPath::new(path)?,
+        }))
+    }
     pub(crate) fn path(&self) -> &ResolvedPath {
-        &self.path
+        match self {
+            Self::Configured(pin) => &pin.path,
+            Self::NativeFile(pin) => &pin.path,
+        }
     }
     pub(crate) fn into_path(self) -> ResolvedPath {
-        self.path
+        match self {
+            Self::Configured(pin) => pin.path,
+            Self::NativeFile(pin) => pin.path,
+        }
     }
 }
 
 impl LocalBackendSettings {
-    pub(crate) fn pin(&self, base: &ResolvedPath) -> crate::BackendResult<LocalBackendLocation> {
-        let path = crate::backends::anchored_local_path(self, base)
-            .map_err(|error| crate::BackendError::Io(error.to_string()))?;
-        Ok(LocalBackendLocation { path })
-    }
-
-    pub(crate) fn for_file(path: &std::path::Path) -> crate::BackendResult<LocalBackendLocation> {
-        let path = if let Some(text) = path.to_str() {
-            let raw = parser::BackendConfig::<NoPlaceholder> {
-                backend_type: LOCAL_BACKEND_TYPE.into(),
-                attributes: [(
-                    "path".to_owned(),
-                    Value::Concrete(ConcreteValue::String(text.into())),
-                )]
-                .into_iter()
-                .collect(),
-                attribute_spans: Default::default(),
-            };
-            let BackendConfig::Local(settings) = BackendConfig::try_from(&raw)? else {
-                unreachable!()
-            };
-            ResolvedPath::new(settings.path().expect("admitted file address"))
-        } else {
-            // Native OS addresses cannot inhabit a declared String field.
-            // Admit the local kind's empty settings and pin this address as
-            // operation context; no path-field receipt or lossy text is made.
-            let settings = BackendConfig::implicit_local();
-            settings.pin_native_file(path)
-        }
-        .map_err(|error| crate::BackendError::Io(error.to_string()))?;
-        Ok(LocalBackendLocation { path })
-    }
-
-    fn pin_native_file(self, path: &std::path::Path) -> std::io::Result<ResolvedPath> {
-        ResolvedPath::new(path)
+    pub(crate) fn pin(
+        &self,
+        base: &ResolvedPath,
+    ) -> Result<LocalBackendLocation, LocalStateLocateError> {
+        let path = crate::backends::anchored_local_path(self, base)?;
+        Ok(LocalBackendLocation::Configured(PinnedLocalSettings {
+            path,
+        }))
     }
 
     pub fn path(&self) -> Option<&str> {

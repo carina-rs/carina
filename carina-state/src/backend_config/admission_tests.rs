@@ -55,7 +55,7 @@ async fn backend_local_location_pins_the_admitted_path_once() {
     let alias = root.path().join("alias");
     symlink(&first, &alias).unwrap();
     let path = alias.join("state.json");
-    let location = LocalBackendSettings::for_file(&path).unwrap();
+    let location = LocalBackendLocation::for_file(&path).unwrap();
     std::fs::remove_file(&alias).unwrap();
     symlink(&second, &alias).unwrap();
     let backend = crate::backends::LocalBackend::from_location(location).unwrap();
@@ -74,7 +74,7 @@ fn backend_local_native_address_pin_preserves_non_utf8_bytes() {
     let path = root
         .path()
         .join(std::ffi::OsString::from_vec(b"state-\xff.json".to_vec()));
-    let location = LocalBackendSettings::for_file(&path).unwrap();
+    let location = LocalBackendLocation::for_file(&path).unwrap();
     assert_eq!(
         location.path().identity(),
         ResolvedPath::new(&path).unwrap().identity()
@@ -89,5 +89,62 @@ fn backend_local_native_address_pin_preserves_non_utf8_bytes() {
     assert_eq!(
         backend.state_path(),
         &carina_core::paths::DisplayPath::new(&path).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn review_r1_native_file_origin_is_explicit_and_not_admitted_settings() {
+    use std::os::unix::ffi::OsStringExt;
+    let root = tempfile::tempdir().unwrap();
+    let path = root
+        .path()
+        .join(std::ffi::OsString::from_vec(b"native-\xff.json".to_vec()));
+    let location = LocalBackendLocation::for_file(&path).unwrap();
+    assert!(matches!(location, LocalBackendLocation::NativeFile(_)));
+    assert_eq!(
+        location.path().identity(),
+        ResolvedPath::new(&path).unwrap().identity()
+    );
+    let settings = BackendConfig::implicit_local();
+    assert!(matches!(
+        settings
+            .pin(&ResolvedPath::new(root.path()).unwrap())
+            .unwrap(),
+        LocalBackendLocation::Configured(_)
+    ));
+}
+
+#[test]
+fn review_r1_locate_error_keeps_the_io_source() {
+    let error: LocalStateLocateError =
+        LocalBackendLocation::for_file(std::path::Path::new("bad\0state")).unwrap_err();
+    assert!(std::error::Error::source(&error).is_some());
+}
+
+#[test]
+fn review_r1_configured_locate_error_matches_main_text() {
+    let root = tempfile::tempdir().unwrap();
+    let raw = parser::BackendConfig::<NoPlaceholder> {
+        backend_type: "local".into(),
+        attributes: [(
+            "path".to_owned(),
+            Value::Concrete(ConcreteValue::String("bad\0state".into())),
+        )]
+        .into_iter()
+        .collect(),
+        attribute_spans: Default::default(),
+    };
+    let BackendConfig::Local(settings) = BackendConfig::try_from(&raw).unwrap() else {
+        panic!("local")
+    };
+    let base = ResolvedPath::new(root.path()).unwrap();
+    let io = crate::backends::anchored_local_path(&settings, &base).unwrap_err();
+    let error = crate::backends::LocalBackend::from_config(&settings, &base)
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.to_string(),
+        format!("I/O error: Failed to locate state file: {io}")
     );
 }

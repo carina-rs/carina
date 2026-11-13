@@ -165,8 +165,34 @@ fn field<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     session: &dyn ProviderTypeCheckContext,
     lookup: &dyn ValidatedCustomTypeLookup,
-    operational: bool,
 ) -> Result<Admission<K, P, B>, AdmissionErrors> {
-    let (candidate, context) = Candidate::configuration(value, session, lookup, operational)?;
+    let proof = value
+        .knowledge(&KnowledgeContext::validation())?
+        .into_classification();
+    let (candidate, context) = Candidate::configuration(value, session, lookup, proof);
     admit(destination, candidate, &context)
+}
+
+fn complete_field<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
+    destination: &Destination<K>,
+    value: &Value<P, B>,
+    session: &dyn ProviderTypeCheckContext,
+    lookup: &dyn ValidatedCustomTypeLookup,
+) -> Result<PlacedValue<K, P, B>, AdmissionErrors> {
+    let known = Candidate::known_at_apply(
+        value.knowledge(&KnowledgeContext::apply(&ResolvedBindings::default()))?,
+    )?;
+    let (candidate, context) = Candidate::configuration(
+        value,
+        session,
+        lookup,
+        crate::resource::knowledge::Classification::Known(known),
+    );
+    match admit(destination, candidate, &context)? {
+        Admission::Ready(placed) => Ok(placed),
+        Admission::Pending(pending) => Err(KnowledgeError::<B>::UnresolvedAtBoundary {
+            sites: pending.inner.sites,
+        }
+        .into()),
+    }
 }

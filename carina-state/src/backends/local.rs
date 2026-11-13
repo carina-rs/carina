@@ -104,7 +104,7 @@ impl LocalBackend {
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn with_path(state_path: PathBuf) -> Self {
         Self::from_location(
-            LocalBackendSettings::for_file(&state_path).expect("admit test state path"),
+            LocalBackendLocation::for_file(&state_path).expect("admit test state path"),
         )
         .expect("resolve test lock path")
     }
@@ -145,12 +145,7 @@ impl LocalBackend {
         config: &LocalBackendSettings,
         base_dir: &ResolvedPath,
     ) -> BackendResult<Self> {
-        let location = config.pin(base_dir).map_err(|error| match error {
-            BackendError::Io(message) => {
-                BackendError::Io(format!("Failed to locate state file: {message}"))
-            }
-            error => error,
-        })?;
+        let location = config.pin(base_dir)?;
         Self::from_location(location)
     }
 

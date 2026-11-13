@@ -140,3 +140,38 @@ fn validate_module_backend_reports_only_the_structural_error() {
         "CLI validate must match the LSP module-directory diagnostic"
     );
 }
+
+#[test]
+fn review_r1_deferred_backend_directory_text_and_status_match_main() {
+    for case in ["resource_reference", "sibling_reference", "sibling_literal"] {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/backend_deferred_config")
+            .join(case);
+        let expected: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(directory.join("expected.json")).unwrap(),
+        )
+        .unwrap();
+        let run = std::process::Command::new(env!("CARGO_BIN_EXE_carina"))
+            .args(["validate"])
+            .arg(&directory)
+            .env("NO_COLOR", "1")
+            .env_remove("CLICOLOR_FORCE")
+            .output()
+            .unwrap();
+        assert_eq!(
+            run.status.code(),
+            expected["status"].as_i64().map(|n| n as i32),
+            "{case}"
+        );
+        assert_eq!(
+            String::from_utf8(run.stdout).unwrap(),
+            expected["stdout"].as_str().unwrap(),
+            "{case}"
+        );
+        assert_eq!(
+            String::from_utf8(run.stderr).unwrap(),
+            expected["stderr"].as_str().unwrap(),
+            "{case}"
+        );
+    }
+}

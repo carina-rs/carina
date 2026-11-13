@@ -712,16 +712,19 @@ A struct type represents a nested object with typed fields.
   Resource/data-source attributes use `admit_apply_resource`/`admit_apply_data_source`
   in `executor/provider_ready.rs`. Provider configuration enters `admit()` through
   `validation/admission/configuration/`, including compact-list custom-type callbacks.
-  Its immutable aggregate owns the exact canonical payload and field placements.
+  Its complete immutable aggregate owns the exact canonical payload and field
+  placements; partial analysis returns `AnalyzedConfiguration`, which cannot
+  authorize construction. Undeclared factory-owned keys remain opaque passthrough.
   Sessions require admitted configuration, including empty built-in configurations;
   initialization consumes a construction owner pairing that session with its selected
   factory. Declaration-loading diagnostics use `ProviderValidationInputs`, which
   cannot initialize a provider. Built-in backend declarations live in core's
   `validation/admission/configuration/backend.rs`; state extracts concrete settings
   only from `AdmittedConfiguration<BackendAttribute>`. Blocks, decoded locks/plans,
-  URLs and default/offline local origins all enter that owner before construction.
-  URL S3 keeps encryption on and automatic bucket creation off; local construction
-  consumes admitted settings bound to one filesystem pin. CLI and LSP share the
+  S3 URLs and the implicit local default enter that owner before construction.
+  URL S3 keeps encryption on and automatic bucket creation off. Local locations
+  distinguish a pin derived from admitted settings from an explicit native file
+  address, preserving non-UTF-8 paths without inventing configuration. CLI and LSP share the
   same owner. Function parameters/returns additionally use runtime
   `check_resolved_constraints_at`; backend schemas have no anonymous refinements. Member String failures keep their structured pattern/
   length category and label the slot's member constraint; identity failures run first.

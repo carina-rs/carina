@@ -35,6 +35,9 @@ impl AdmittedConfiguration<kind::ProviderConfigAttribute> {
     pub fn wire_attributes(&self) -> &WireAttributes {
         self.payload.wire()
     }
+    pub(super) fn canonical_payload(&self) -> WireReady<ConfigurationAttributes<Value>> {
+        self.payload.clone()
+    }
     pub fn instance(&self) -> &ProviderInstanceKey {
         &self.instance
     }
@@ -84,22 +87,32 @@ impl ConfigurationBuilder<kind::ProviderConfigAttribute> {
         self.values.insert(key.clone(), value.clone());
         self.opaque_passthrough.insert(key, value);
     }
+    fn provider_payload(
+        &mut self,
+    ) -> Result<WireReady<ConfigurationAttributes<Value>>, crate::provider::ProviderWireError> {
+        WireReady::try_new(
+            std::mem::take(&mut self.values),
+            ProviderWireTarget::Configuration {
+                provider: self.instance.provider().to_owned(),
+            },
+        )
+    }
+    pub(super) fn analyze_payload(
+        mut self,
+    ) -> Result<WireReady<ConfigurationAttributes<Value>>, crate::provider::ProviderWireError> {
+        self.provider_payload()
+    }
     pub(super) fn admit_payload(
         mut self,
     ) -> Result<
         AdmittedConfiguration<kind::ProviderConfigAttribute>,
         crate::provider::ProviderWireError,
     > {
-        let values = std::mem::take(&mut self.values);
-        let payload = WireReady::try_new(
-            values,
-            ProviderWireTarget::Configuration {
-                provider: self.instance.provider().to_owned(),
-            },
-        )?;
+        let payload = self.provider_payload()?;
         Ok(self.finish(payload))
     }
 }
+
 impl ConfigurationBuilder<kind::BackendAttribute> {
     pub(super) fn admit_payload(mut self) -> AdmittedConfiguration<kind::BackendAttribute> {
         let payload = std::mem::take(&mut self.values);

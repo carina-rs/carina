@@ -77,13 +77,13 @@ impl LocalStateFile {
 /// let _ = load_local_state_file(&remote);
 /// ```
 pub async fn load_local_state_file(file: &LocalStateFile) -> BackendResult<StateFile> {
-    let admitted = crate::LocalBackendSettings::for_file(&file.path)?;
-    let location = admitted.path().display().clone();
-    super::LocalBackend::from_location(admitted)?
+    let location = crate::backend_config::LocalBackendLocation::for_file(&file.path)?;
+    let display_path = location.path().display().clone();
+    super::LocalBackend::from_location(location)?
         .read_state()
         .await?
         .map(|loaded| loaded.into_state())
-        .ok_or_else(|| BackendError::InvalidState(format!("No state at {location}")))
+        .ok_or_else(|| BackendError::InvalidState(format!("No state at {display_path}")))
 }
 
 /// A parsed `--state-url` argument.
@@ -199,6 +199,27 @@ pub async fn load_encoded_published_exports_from_url(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn review_r1_offline_locate_error_matches_main_text() {
+        let path = "invalid\0state.json";
+        let io = carina_core::paths::ResolvedPath::new(path).unwrap_err();
+        let file = LocalStateFile::parse(path).unwrap();
+        let error = load_local_state_file(&file).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("I/O error: Failed to locate state file: {io}")
+        );
+    }
+
+    #[tokio::test]
+    async fn review_r1_url_locate_error_matches_main_text() {
+        let path = "invalid\0state.json";
+        let io = carina_core::paths::ResolvedPath::new(path).unwrap_err();
+        let url = StateUrl::parse(path).unwrap();
+        let error = load_state_from_url(&url).await.unwrap_err();
+        assert_eq!(error.to_string(), format!("I/O error: {io}"));
+    }
 
     #[test]
     fn offline_local_state_file_rejects_remote_schemes() {

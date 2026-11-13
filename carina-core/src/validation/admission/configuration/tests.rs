@@ -8,6 +8,18 @@ use std::sync::atomic::Ordering;
 use crate::test_utils::configuration::{ConfigFactory as Factory, provider_directory as directory};
 
 #[test]
+fn review_r1_analysis_and_complete_configuration_have_distinct_types() {
+    let factory = Factory::new(ValidatedConfigSchema::default());
+    let attrs = ConfigurationAttributes::new();
+    let analyzed = analysis(&factory, "owner", &attrs).unwrap();
+    let complete = admitted(&factory, "owner", None, &attrs, &factory.schema).unwrap();
+    assert_ne!(
+        std::any::type_name_of_val(&analyzed),
+        std::any::type_name_of_val(&complete)
+    );
+}
+
+#[test]
 fn operational_provider_configuration_never_omits_unresolved_fields() {
     let root = crate::test_utils::configuration::ConfigurationDirectory::new(&[
         ("providers.crn", "provider owner { value = producer.id }"),
@@ -33,18 +45,14 @@ fn operational_provider_configuration_never_omits_unresolved_fields() {
             ValidatedConfigSchema::default()
         };
         let factory = Factory::new(schema.clone());
-        let error = admitted(&factory, "owner", None, attributes, &schema, true)
+        let error = admitted(&factory, "owner", None, attributes, &schema)
             .expect_err("operational admission must not drop an unresolved value");
         let ProviderConfigPreparationError::InvalidAttribute { error, .. } = error else {
             panic!("typed attribute error")
         };
         assert!(matches!(error.errors()[0], TypeError::Knowledge { .. }));
         assert!(factory.seen.lock().unwrap().is_empty());
-        assert!(
-            admitted(&factory, "owner", None, attributes, &schema, false)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(analyze(&factory, "owner", attributes).unwrap().is_empty());
     }
 }
 
@@ -77,8 +85,8 @@ fn provider_config_admission_owns_exact_canonical_payload() {
         ready.attributes()["extension"],
         Value::Concrete(ConcreteValue::String("kept".into()))
     );
-    assert_eq!(ready.inner.canonical.admitted.placements().len(), 1);
-    assert_eq!(ready.inner.canonical.admitted.opaque_passthrough().len(), 1);
+    assert_eq!(ready.inner.admitted.placements().len(), 1);
+    assert_eq!(ready.inner.admitted.opaque_passthrough().len(), 1);
     crate::test_utils::provider_text::block_on(ProviderBoundary::initialize(&construction))
         .unwrap();
     assert_eq!(factory.initialized.load(Ordering::SeqCst), 1);
@@ -155,7 +163,7 @@ fn provider_config_receipt_rejects_other_declaration_instance_revision() {
     let lookup_inputs = ProviderValidationInputs::for_schema("owner");
     let lookup = crate::parser::custom_type_lookup_for_factory(&factory, &lookup_inputs);
     let checked = crate::validation::deferred_types::TypeCheckSession::run(&catalog, |session| {
-        let placed = field(&expected, &value, session, &lookup, true)
+        let placed = field(&expected, &value, session, &lookup)
             .unwrap()
             .ready()
             .unwrap();

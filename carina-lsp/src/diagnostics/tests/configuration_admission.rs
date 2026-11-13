@@ -57,3 +57,43 @@ fn provider_config_directory_compact_callback_parity() {
         }
     }
 }
+
+#[test]
+fn review_r1_deferred_backend_directory_diagnostics_match_main() {
+    let factory = carina_provider_mock::ConfiguredBuiltinMock::new(
+        Default::default(),
+        carina_provider_mock::MockScope::memory(),
+    );
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(factory)]),
+        vec!["mock".into()],
+    );
+    for case in ["resource_reference", "sibling_reference", "sibling_literal"] {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../carina-cli/tests/fixtures/backend_deferred_config")
+            .join(case);
+        let path = directory.join("backend.crn");
+        let source = std::fs::read_to_string(&path).unwrap();
+        let diagnostics = engine.analyze(&create_document_at(&source, path.clone()), Some(&path));
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .map(|d| d.message.as_str())
+            .collect();
+        let expected: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(directory.join("expected.json")).unwrap(),
+        )
+        .unwrap();
+        let message = expected["stderr"]
+            .as_str()
+            .unwrap()
+            .trim()
+            .strip_prefix("Error: ")
+            .unwrap_or("");
+        if message.is_empty() {
+            assert!(errors.is_empty(), "{case}: {errors:?}");
+        } else {
+            assert_eq!(errors, [message], "{case}");
+        }
+    }
+}

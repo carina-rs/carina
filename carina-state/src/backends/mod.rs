@@ -17,7 +17,7 @@ use carina_core::paths::ResolvedPath;
 
 use crate::backend::{BackendResult, StateBackend};
 use crate::backend_config::{BackendConfig, LocalBackendSettings};
-use crate::backend_selection::{BackendSelection, BackendTarget};
+use crate::backend_selection::ConfiguredBackend;
 
 /// Provider name reported for the storage resource (the state bucket).
 pub(crate) const S3_BACKEND_PROVIDER_NAME: &str = "aws";
@@ -28,22 +28,24 @@ pub(crate) const S3_BACKEND_RESOURCE_TYPE: &str = "s3.Bucket";
 /// Create the backend named by an opaque, operation-specific selection token.
 ///
 /// Raw backend configuration is deliberately not accepted. Callers must first
-/// choose one of the named selection paths on [`BackendSelection`].
+/// choose one of the named selection paths on [`crate::BackendSelection`].
 pub(crate) async fn create_backend(
-    selection: &BackendSelection,
+    selection: &ConfiguredBackend,
 ) -> BackendResult<Box<dyn StateBackend>> {
-    match selection.target() {
-        BackendTarget::Configured { config, base_dir } => {
-            create_configured_backend(config, base_dir).await
-        }
-        BackendTarget::ExplicitUrl(StateUrl::S3 { bucket, key }) => Ok(Box::new(
+    create_configured_backend(selection.config(), selection.base_dir(), selection.origin()).await
+}
+
+pub(crate) async fn create_explicit_backend(
+    url: &StateUrl,
+) -> BackendResult<Box<dyn StateBackend>> {
+    match url {
+        StateUrl::S3 { bucket, key } => Ok(Box::new(
             S3Backend::from_url_parts(bucket.clone(), key.clone()).await?,
         )),
-        BackendTarget::ExplicitUrl(StateUrl::File { path }) => {
-            Ok(Box::new(LocalBackend::from_location(
-                LocalBackendSettings::for_file(std::path::Path::new(path))?,
-            )?))
-        }
+        StateUrl::File { path } => Ok(Box::new(LocalBackend::from_location(
+            crate::backend_config::LocalBackendLocation::for_file(path)
+                .map_err(crate::BackendError::bare_local_locate)?,
+        )?)),
     }
 }
 
@@ -57,6 +59,7 @@ pub fn local_backend_for_test(state_path: impl Into<std::path::PathBuf>) -> Box<
 async fn create_configured_backend(
     config: &BackendConfig,
     base_dir: &ResolvedPath,
+    origin: crate::ReadBackendOrigin,
 ) -> BackendResult<Box<dyn StateBackend>> {
     match config {
         BackendConfig::S3(settings) => {
@@ -64,7 +67,16 @@ async fn create_configured_backend(
             Ok(Box::new(backend))
         }
         BackendConfig::Local(settings) => {
-            let backend = LocalBackend::from_config(settings, base_dir)?;
+            let backend = match origin {
+                crate::ReadBackendOrigin::Implicit => LocalBackend::from_location(
+                    settings
+                        .pin(base_dir)
+                        .map_err(crate::BackendError::bare_local_locate)?,
+                )?,
+                crate::ReadBackendOrigin::Declared | crate::ReadBackendOrigin::Locked => {
+                    LocalBackend::from_config(settings, base_dir)?
+                }
+            };
             Ok(Box::new(backend))
         }
     }

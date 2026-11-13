@@ -633,26 +633,17 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
         value: &'a Value<P, B>,
         provider: &'a dyn ProviderTypeCheckContext,
         lookup: &'a dyn crate::schema::ValidatedCustomTypeLookup,
-        operational: bool,
-    ) -> Result<(Self, AdmissionContext<'a, P, B>), AdmissionErrors> {
-        let proof = if operational {
-            crate::resource::knowledge::Classification::Known(Self::known_at_apply(
-                value.knowledge(&KnowledgeContext::apply(&ResolvedBindings::default()))?,
-            )?)
-        } else {
-            value
-                .knowledge(&KnowledgeContext::validation())?
-                .into_classification()
-        };
+        proof: crate::resource::knowledge::Classification<'a, P, B>,
+    ) -> (Self, AdmissionContext<'a, P, B>) {
         let phase = crate::parser::retained::ProjectedPhase::classified(&proof);
-        Ok(Self::paired_in(
+        Self::paired_in(
             value.clone(),
             AdmissionProof::Validation(proof),
             None,
             provider,
             crate::parser::retained::AuthoredCursor::projected(phase),
             AdmissionLookup::Configuration(lookup),
-        ))
+        )
     }
 
     fn paired_in<'a>(

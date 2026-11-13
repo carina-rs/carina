@@ -11,15 +11,15 @@ use crate::provider::{ProviderFactory, ProviderValidationInputs};
 
 #[derive(Debug, Clone)]
 pub struct CanonicalProviderConfigAttributes {
-    admitted: AdmittedConfiguration<kind::ProviderConfigAttribute>,
+    payload: WireReady<ConfigurationAttributes<Value>>,
 }
 
 impl CanonicalProviderConfigAttributes {
     pub fn attributes(&self) -> &ConfigurationAttributes<Value> {
-        self.admitted.attributes()
+        self.payload.as_inner()
     }
     pub fn wire_attributes(&self) -> &WireAttributes {
-        self.admitted.wire_attributes()
+        self.payload.wire()
     }
 }
 
@@ -27,6 +27,29 @@ impl Deref for CanonicalProviderConfigAttributes {
     type Target = ConfigurationAttributes<Value>;
     fn deref(&self) -> &Self::Target {
         self.attributes()
+    }
+}
+
+/// A partial analysis projection, which grants no construction authority.
+///
+/// ```compile_fail,E0277
+/// use carina_core::provider::ProviderReadyConfig;
+/// use carina_core::validation::admission::configuration::provider::AnalyzedConfiguration;
+/// fn bypass(analyzed: AnalyzedConfiguration) -> ProviderReadyConfig { analyzed.into() }
+/// ```
+/// ```
+/// use carina_core::provider::ProviderReadyConfig;
+/// use carina_core::validation::admission::{configuration::AdmittedConfiguration, kind::ProviderConfigAttribute};
+/// fn ready(complete: AdmittedConfiguration<ProviderConfigAttribute>) -> ProviderReadyConfig { complete.into() }
+/// ```
+#[derive(Debug, Clone)]
+pub struct AnalyzedConfiguration {
+    canonical: CanonicalProviderConfigAttributes,
+}
+impl Deref for AnalyzedConfiguration {
+    type Target = CanonicalProviderConfigAttributes;
+    fn deref(&self) -> &Self::Target {
+        &self.canonical
     }
 }
 
@@ -60,27 +83,129 @@ pub struct ProviderReadyConfig {
 }
 #[derive(Debug)]
 struct ReadyConfiguration {
-    canonical: CanonicalProviderConfigAttributes,
+    admitted: AdmittedConfiguration<kind::ProviderConfigAttribute>,
     region: Option<String>,
 }
 
 impl ProviderReadyConfig {
-    fn new(canonical: CanonicalProviderConfigAttributes, region: Option<String>) -> Self {
+    fn new(
+        admitted: AdmittedConfiguration<kind::ProviderConfigAttribute>,
+        region: Option<String>,
+    ) -> Self {
         Self {
-            inner: Arc::new(ReadyConfiguration { canonical, region }),
+            inner: Arc::new(ReadyConfiguration { admitted, region }),
         }
     }
     pub fn attributes(&self) -> &ConfigurationAttributes<Value> {
-        self.inner.canonical.attributes()
+        self.inner.admitted.attributes()
     }
     pub fn wire_attributes(&self) -> &WireAttributes {
-        self.inner.canonical.wire_attributes()
+        self.inner.admitted.wire_attributes()
     }
     pub fn region(&self) -> Option<&str> {
         self.inner.region.as_deref()
     }
     pub fn instance(&self) -> &ProviderInstanceKey {
-        self.inner.canonical.admitted.instance()
+        self.inner.admitted.instance()
+    }
+}
+
+impl From<AdmittedConfiguration<kind::ProviderConfigAttribute>> for ProviderReadyConfig {
+    fn from(admitted: AdmittedConfiguration<kind::ProviderConfigAttribute>) -> Self {
+        let region = admitted
+            .field("region")
+            .and_then(|_| crate::utils::region_from_attrs(admitted.attributes()));
+        Self::new(admitted, region)
+    }
+}
+
+trait PreparationPhase {
+    type Output;
+    fn declared(
+        destination: &Destination<kind::ProviderConfigAttribute>,
+        key: &crate::parser::AttributeKey,
+        value: &Value,
+        session: &dyn ProviderTypeCheckContext,
+        lookup: &dyn ValidatedCustomTypeLookup,
+        aggregate: &mut ConfigurationBuilder<kind::ProviderConfigAttribute>,
+    ) -> Result<(), AdmissionErrors>;
+    fn unresolved<P: PlaceholderKind, B: BindingAddress>(
+        value: &Value<P, B>,
+    ) -> Result<(), AdmissionErrors>;
+    fn finish(
+        aggregate: ConfigurationBuilder<kind::ProviderConfigAttribute>,
+    ) -> Result<Self::Output, crate::provider::ProviderWireError>;
+    fn projection(result: &Self::Output) -> CanonicalProviderConfigAttributes;
+}
+struct Analysis;
+struct Complete;
+impl PreparationPhase for Analysis {
+    type Output = AnalyzedConfiguration;
+    fn declared(
+        destination: &Destination<kind::ProviderConfigAttribute>,
+        key: &crate::parser::AttributeKey,
+        value: &Value,
+        session: &dyn ProviderTypeCheckContext,
+        lookup: &dyn ValidatedCustomTypeLookup,
+        aggregate: &mut ConfigurationBuilder<kind::ProviderConfigAttribute>,
+    ) -> Result<(), AdmissionErrors> {
+        if let Admission::Ready(placed) = field(destination, value, session, lookup)? {
+            aggregate.place(key.clone(), placed);
+        }
+        Ok(())
+    }
+    fn unresolved<P: PlaceholderKind, B: BindingAddress>(
+        _: &Value<P, B>,
+    ) -> Result<(), AdmissionErrors> {
+        Ok(())
+    }
+    fn finish(
+        aggregate: ConfigurationBuilder<kind::ProviderConfigAttribute>,
+    ) -> Result<Self::Output, crate::provider::ProviderWireError> {
+        Ok(AnalyzedConfiguration {
+            canonical: CanonicalProviderConfigAttributes {
+                payload: aggregate.analyze_payload()?,
+            },
+        })
+    }
+    fn projection(result: &Self::Output) -> CanonicalProviderConfigAttributes {
+        result.canonical.clone()
+    }
+}
+impl PreparationPhase for Complete {
+    type Output = AdmittedConfiguration<kind::ProviderConfigAttribute>;
+    fn declared(
+        destination: &Destination<kind::ProviderConfigAttribute>,
+        key: &crate::parser::AttributeKey,
+        value: &Value,
+        session: &dyn ProviderTypeCheckContext,
+        lookup: &dyn ValidatedCustomTypeLookup,
+        aggregate: &mut ConfigurationBuilder<kind::ProviderConfigAttribute>,
+    ) -> Result<(), AdmissionErrors> {
+        aggregate.place(
+            key.clone(),
+            complete_field(destination, value, session, lookup)?,
+        );
+        Ok(())
+    }
+    fn unresolved<P: PlaceholderKind, B: BindingAddress>(
+        value: &Value<P, B>,
+    ) -> Result<(), AdmissionErrors> {
+        let proof = value.knowledge(&KnowledgeContext::validation())?;
+        Err(KnowledgeError::<B>::UnresolvedAtBoundary {
+            sites: proof.sites().collect(),
+        }
+        .into())
+    }
+    fn finish(
+        aggregate: ConfigurationBuilder<kind::ProviderConfigAttribute>,
+    ) -> Result<Self::Output, crate::provider::ProviderWireError> {
+        aggregate.admit_payload()
+    }
+    fn projection(result: &Self::Output) -> CanonicalProviderConfigAttributes {
+        CanonicalProviderConfigAttributes {
+            payload: result.canonical_payload(),
+        }
     }
 }
 
@@ -118,14 +243,13 @@ fn attribute_error(
     }
 }
 
-fn admitted<P: PlaceholderKind, B: BindingAddress>(
+fn prepare_fields<M: PreparationPhase, P: PlaceholderKind, B: BindingAddress>(
     factory: &dyn ProviderFactory,
     provider_name: &str,
     binding: Option<&str>,
     attributes: &ConfigurationAttributes<Value<P, B>>,
     schema: &ValidatedConfigSchema,
-    operational: bool,
-) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
+) -> Result<M::Output, ProviderConfigPreparationError> {
     let declaration = ConfigurationDeclaration::provider(factory.name(), schema.clone());
     let canonical = crate::value::canonicalize_provider_config_attributes_with_types(
         provider_name,
@@ -159,43 +283,17 @@ fn admitted<P: PlaceholderKind, B: BindingAddress>(
                 .and_then(Value::try_into_address_free_absolute)
             {
                 if let Some(destination) = destination {
-                    match field(&destination, &known, session, &lookup, operational)
-                        .map_err(|error| attribute_error(provider_name, key, error))?
-                    {
-                        Admission::Ready(placed) => aggregate.place(key.clone(), placed),
-                        Admission::Pending(pending) if operational => {
-                            return Err(attribute_error(
-                                provider_name,
-                                key,
-                                KnowledgeError::<AbsoluteBindingAddress>::UnresolvedAtBoundary {
-                                    sites: pending.inner.sites,
-                                }
-                                .into(),
-                            ));
-                        }
-                        Admission::Pending(_) => {}
-                    }
+                    M::declared(&destination, key, &known, session, &lookup, &mut aggregate)
+                        .map_err(|error| attribute_error(provider_name, key, error))?;
                 } else {
                     aggregate.passthrough(key.clone(), known);
                 }
             } else {
                 if let Some(destination) = destination {
-                    field(&destination, value, session, &lookup, false)
+                    field(&destination, value, session, &lookup)
                         .map_err(|error| attribute_error(provider_name, key, error))?;
                 }
-                if operational {
-                    let proof = value
-                        .knowledge(&KnowledgeContext::validation())
-                        .map_err(|error| attribute_error(provider_name, key, error.into()))?;
-                    return Err(attribute_error(
-                        provider_name,
-                        key,
-                        KnowledgeError::<B>::UnresolvedAtBoundary {
-                            sites: proof.sites().collect(),
-                        }
-                        .into(),
-                    ));
-                }
+                M::unresolved(value).map_err(|error| attribute_error(provider_name, key, error))?;
             }
         }
         Ok::<_, ProviderConfigPreparationError>(aggregate)
@@ -208,9 +306,8 @@ fn admitted<P: PlaceholderKind, B: BindingAddress>(
             error: ProviderConfigValidationError::deferred(deferred),
         });
     }
-    let canonical = CanonicalProviderConfigAttributes {
-        admitted: aggregate.admit_payload()?,
-    };
+    let result = M::finish(aggregate)?;
+    let canonical = M::projection(&result);
     let session = ProviderValidationInputs::collect(provider_name, canonical.values());
     session
         .diagnostics()
@@ -228,30 +325,36 @@ fn admitted<P: PlaceholderKind, B: BindingAddress>(
                 ),
             }
         })?;
-    Ok(canonical)
+    Ok(result)
 }
 
 fn analyze<P: PlaceholderKind, B: BindingAddress>(
     factory: &dyn ProviderFactory,
     provider_name: &str,
     attributes: &ConfigurationAttributes<Value<P, B>>,
-) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
-    let witness = factory.schema_witness();
-    admitted(
+) -> Result<AnalyzedConfiguration, ProviderConfigPreparationError> {
+    prepare_fields::<Analysis, _, _>(
         factory,
         provider_name,
         None,
         attributes,
-        witness.config(),
-        false,
+        factory.schema_witness().config(),
     )
 }
-
+fn admitted<P: PlaceholderKind, B: BindingAddress>(
+    factory: &dyn ProviderFactory,
+    provider_name: &str,
+    binding: Option<&str>,
+    attributes: &ConfigurationAttributes<Value<P, B>>,
+    schema: &ValidatedConfigSchema,
+) -> Result<AdmittedConfiguration<kind::ProviderConfigAttribute>, ProviderConfigPreparationError> {
+    prepare_fields::<Complete, _, _>(factory, provider_name, binding, attributes, schema)
+}
 pub fn analysis(
     factory: &dyn ProviderFactory,
     provider_name: &str,
     attributes: &ConfigurationAttributes<Value>,
-) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
+) -> Result<AnalyzedConfiguration, ProviderConfigPreparationError> {
     analyze(factory, provider_name, attributes)
 }
 pub fn validate_parser_provider_config(
@@ -260,7 +363,7 @@ pub fn validate_parser_provider_config(
     attributes: &ConfigurationAttributes<
         Value<crate::resource::ParserPlaceholder, crate::resource::RelativeBindingName>,
     >,
-) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
+) -> Result<AnalyzedConfiguration, ProviderConfigPreparationError> {
     analyze(factory, provider_name, attributes)
 }
 
@@ -270,18 +373,14 @@ fn ready(
     attributes: &ConfigurationAttributes<Value>,
     schema: &ValidatedConfigSchema,
 ) -> Result<ProviderReadyConfig, ProviderConfigPreparationError> {
-    let canonical = admitted(
+    Ok(admitted(
         factory,
         instance.provider(),
         instance.provider_instance(),
         attributes,
         schema,
-        true,
-    )?;
-    let region = schema
-        .rootless_type("region")
-        .and_then(|_| crate::utils::region_from_attrs(canonical.attributes()));
-    Ok(ProviderReadyConfig::new(canonical, region))
+    )?
+    .into())
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -402,7 +501,6 @@ pub(crate) fn test_configuration(
         binding,
         config.map_or(&empty, ProviderReadyConfig::attributes),
         &factory.provider_config_attribute_types(),
-        true,
     )
     .expect("admit fixture configuration");
     ProviderReadyConfig::new(

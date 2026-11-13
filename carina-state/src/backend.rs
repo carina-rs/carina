@@ -262,6 +262,13 @@ pub enum BackendError {
     #[error("State write failed after {attempts} conditional-write conflicts")]
     StateWriteConflict { attempts: usize },
 
+    /// A local state file could not be located for a configured/offline read.
+    #[error("I/O error: Failed to locate state file: {cause}", cause = .error.io_error())]
+    LocateLocalFile { error: crate::LocalStateLocateError },
+    /// A URL or migration address uses the existing unadorned IO diagnostic.
+    #[error("I/O error: {cause}", cause = .error.io_error())]
+    LocateLocalAddress { error: crate::LocalStateLocateError },
+
     /// Network or I/O error
     #[error("I/O error: {0}")]
     Io(String),
@@ -564,7 +571,17 @@ fn write_cause_line(out: &mut String, source: &(dyn std::error::Error + 'static)
     out.push('\n');
 }
 
+impl From<crate::LocalStateLocateError> for BackendError {
+    fn from(error: crate::LocalStateLocateError) -> Self {
+        Self::LocateLocalFile { error }
+    }
+}
+
 impl BackendError {
+    pub(crate) fn bare_local_locate(error: crate::LocalStateLocateError) -> Self {
+        Self::LocateLocalAddress { error }
+    }
+
     /// Create a Locked error from a LockInfo
     pub fn locked(lock: &LockInfo) -> Self {
         Self::Locked {

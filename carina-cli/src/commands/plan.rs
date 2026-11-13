@@ -5898,11 +5898,7 @@ pub(crate) async fn run_plan_using(
     )
     .await?;
     let use_locked_backend = plan_backend.migration_pending();
-    let plan_file_backend_config = if parsed.backend.is_none() && !use_locked_backend {
-        SavedBackendConfig::implicit_local()
-    } else {
-        SavedBackendConfig::from(Some(plan_backend.selected_config().to_parser_config()))
-    };
+    let plan_file_backend_config = SavedBackendConfig::from_read_backend(&plan_backend);
     let drift_note = use_locked_backend.then(|| {
         format!(
             "Backend migration pending: plan read state from the OLD backend recorded in \
