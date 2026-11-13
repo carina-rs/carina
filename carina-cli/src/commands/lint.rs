@@ -334,6 +334,11 @@ fn lint_result(
                 .into_iter()
                 .map(|error| error.to_string())
                 .collect::<Vec<_>>();
+            if let Err(error) =
+                carina_core::validation::validate_no_module_declarations_in_root(parsed.parsed())
+            {
+                type_findings.push(error);
+            }
             if type_findings.is_empty()
                 && let Err(error) = carina_core::validation::validate_attribute_params_with_context(
                     &parsed.attribute_params,

@@ -442,8 +442,7 @@ require cidr_block != '', 'CIDR block cannot be empty'
 ```
 
 A `require` outside a module is a validation error:
-`` `require` is only allowed inside a module ``. In a root configuration
-(directory with no `arguments` or `attributes` block), the configuration
+`` `require` is only allowed inside a module ``. In a root configuration, the configuration
 validation step that checks declarations and expressions rejects each
 `require`, whether its condition is true or false. Parsing still checks the
 condition's syntax and parse-time restrictions; a parse error is reported
@@ -460,15 +459,7 @@ depend on the selected operation and the state being processed. Saved-plan
 apply follows the
 [saved-plan validation rules](/reference/dsl/modules/#when-constraints-run).
 
-A directory with no `arguments` or `attributes` block is a root configuration
-when validated directly. Root scope is established only after all sibling
-`.crn` files have been read and parsed. If a sibling cannot be read or parsed and no module declaration
-block is known, the scope remains unknown and no `require` verdict is issued.
-Ordinary expression checks still run in that case and for isolated editor buffers.
-
-A directory containing either module declaration block is treated as an
-uninstantiated template when validated directly, even if the block is empty.
-Its `require` conditions are not evaluated. Calling the directory as a module
-still requires at least one declared argument or output attribute.
+The [directory scope rules](/reference/dsl/modules/#root-configurations-and-module-templates)
+define roots, standalone templates, and incomplete directory snapshots.
 
 The condition is a [validate expression](/reference/dsl/expressions/#validate-expressions) that supports comparison operators (`==`, `!=`, `>`, `<`, `>=`, `<=`), integer arithmetic (`+`, `-`, `*`, `/`, `%`), and logical operators (`&&`, `||`, `!`).

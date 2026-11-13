@@ -56,11 +56,12 @@ fn review_schemas() -> SchemaRegistry {
 fn findings(
     source: &str,
     argument_type: Option<&str>,
+    module_template: bool,
 ) -> (BTreeMap<String, usize>, BTreeMap<String, usize>) {
-    let fixture = write_fixture(&[
-        ("providers.crn", "provider mock {}\n"),
-        ("main.crn", source),
-    ]);
+    let fixture = write_fixture(&[("main.crn", source)]);
+    if !module_template {
+        std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    }
     if let Some(argument_type) = argument_type {
         std::fs::create_dir(fixture.path().join("child")).unwrap();
         std::fs::write(
@@ -159,6 +160,7 @@ fn assert_list_case(expression: &str, partial: bool, valid: bool, bound: bool, s
     let mut actual = findings(
         &source,
         (sink == "module").then_some("list(mock.test.Resource.Name)"),
+        sink == "annotation",
     );
     actual
         .1

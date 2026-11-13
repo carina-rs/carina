@@ -1324,7 +1324,13 @@ fn wasm_validation_recovery_notices_belong_to_the_report() {
         .join(".carina/providers/file/local/local.wasm");
     std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
     std::fs::copy(wasm, installed).unwrap();
-    std::fs::write(fixture.path().join("main.crn"), "provider mock { source = 'file://local.wasm' validate_config_trap = true }\nfn checked(value: mock.RecoveryProbe): String { value }\nlet _ = checked('ok')\nattributes { probe: mock.RecoveryProbe = 'ok' }\n").unwrap();
+    std::fs::write(fixture.path().join("main.crn"), "provider mock { source = 'file://local.wasm' validate_config_trap = true }\nfn checked(value: mock.RecoveryProbe): String { value }\nlet _ = checked('ok')\nlet outputs = use { source = './outputs' }\nlet result = outputs {}\n").unwrap();
+    std::fs::create_dir(fixture.path().join("outputs")).unwrap();
+    std::fs::write(
+        fixture.path().join("outputs/main.crn"),
+        "attributes { probe: mock.RecoveryProbe = 'ok' }\n",
+    )
+    .unwrap();
     let run = |json| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_carina"));
         command

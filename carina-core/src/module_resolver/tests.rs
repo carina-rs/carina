@@ -118,10 +118,17 @@ fn assert_empty_template(blocks: &str) {
         let configuration = crate::config_loader::load_buffer_configuration_in_directory(
             snapshot, &schemas, &context,
         );
-        assert!(matches!(
-            crate::parser::retained::require_scope(configuration.parsed()),
-            crate::parser::retained::RequireScope::ModuleTemplate(_)
-        ));
+        assert_eq!(
+            configuration.parsed().directory_verdict().is_unknown(),
+            broken
+        );
+        assert_eq!(
+            configuration
+                .parsed()
+                .directory_verdict()
+                .is_module_template(),
+            !broken
+        );
         assert!(configuration.judged().report().findings().is_empty());
     }
 }
@@ -288,7 +295,7 @@ fn root_require_directory_rejected_and_module_evaluated() {
             assert_eq!(diagnostic.location().span().start_line(), 1);
             assert_eq!(diagnostic.location().span().start_column(), 1);
             assert_eq!(
-                diagnostic.detail().to_string(),
+                diagnostic.detail().to_string().lines().next().unwrap(),
                 "`require` is only allowed inside a module"
             );
         });
@@ -11957,7 +11964,14 @@ fn root_require_template_apis_need_declaration_evidence() {
             };
             let error = result.expect_err("a template API cannot manufacture module declarations");
             assert_eq!(
-                error.require_outside_module().unwrap().detail().to_string(),
+                error
+                    .require_outside_module()
+                    .unwrap()
+                    .detail()
+                    .to_string()
+                    .lines()
+                    .next()
+                    .unwrap(),
                 "`require` is only allowed inside a module"
             );
         }
@@ -12022,7 +12036,7 @@ fn root_require_public_strict_resolvers_keep_admission_verdict() {
                 result.expect_err("public resolution must preserve the root require verdict");
             let finding = error.require_outside_module().unwrap();
             assert_eq!(
-                finding.detail().to_string(),
+                finding.detail().to_string().lines().next().unwrap(),
                 "`require` is only allowed inside a module"
             );
             assert_eq!(

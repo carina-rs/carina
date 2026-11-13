@@ -8,6 +8,35 @@ resources along with input parameters (`arguments`) and same-stack outputs
 (`attributes`). An output may be an ordinary value or a typed managed-resource
 handle.
 
+## Root Configurations and Module Templates
+
+Carina determines the declaration scope from the complete directory, including
+all sibling `.crn` files:
+
+| Declarations in the directory | Scope when validated directly |
+| --- | --- |
+| Any authored `provider` or `backend` block, including a provider instance bound with `let` | Root configuration |
+| No provider/backend, but an `arguments` or `attributes` block | Uninstantiated module template, even with an empty block |
+| Neither kind of block | Root configuration |
+
+Root configurations cannot declare `arguments` or `attributes`, empty or
+populated. Root outputs use `exports`. Module templates inherit providers from
+their caller; provider and backend blocks are rejected inside imported modules.
+A template's `require` conditions remain unevaluated until a module call binds
+its arguments. Calling a module still requires at least one declared argument
+or output attribute; empty blocks alone do not make a directory callable.
+
+If a sibling cannot be read or parsed, or an editor buffer has no directory
+snapshot, the scope is unknown. Carina issues no scope verdict in that case;
+ordinary expression checks still run.
+
+Each root-placement diagnostic explains the directory verdict. With a provider
+or backend block, the CLI includes a note naming that block's file and line;
+the language server attaches its location as related information to the same
+diagnostic. Without either block, the diagnostic explains that the complete
+directory has no `arguments` or `attributes` block, without inventing a source
+location.
+
 ## Block Roles at a Glance
 
 A directory of `.crn` files may contain three interface-like blocks. They share a similar surface — `name: Type = expr` — but play different roles, and the `=` part means something different in each:
@@ -158,8 +187,9 @@ error during validation, even when one of the declared argument values is
 still unresolved.
 
 `require` is argument validation for modules. A `require` in a root
-configuration (a directory with no `arguments` or `attributes` block) is a
-validation error, even if its condition is true. Commands that run the
+configuration is a validation error, even if its condition is true. The
+[directory scope rules](#root-configurations-and-module-templates) determine
+whether the directory is a root or a template. Commands that run the
 configuration validation step, which checks declarations and expressions,
 reject it. Loading configuration can retain the finding without reporting
 it; commands that only load the files do not reject it for placement.
@@ -170,10 +200,6 @@ expression inference inside the condition; the condition is never evaluated.
 The rejection starts at the `require` keyword and covers the statement.
 This also applies to a root configuration loaded through `upstream_state`; the error retains the upstream
 file and position. See [Require Statement](/reference/dsl/syntax/#require-statement).
-
-When validated directly, a directory containing either module declaration
-block keeps its `require` conditions unevaluated as a template, including
-when the block is empty.
 
 ### When Constraints Run
 

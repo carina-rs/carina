@@ -6,7 +6,6 @@
 use crate::paths::ResolvedPath;
 #[cfg(test)]
 use std::fs;
-use std::path::PathBuf;
 
 use crate::parser::{ParsedFile, ProviderContext};
 
@@ -61,17 +60,6 @@ pub fn load_module_with_diagnostics_and_schemas(
     load_directory_module_with_diagnostics_and_config(&path, config, &Default::default(), schemas)
 }
 
-/// Collect `.crn` file paths directly inside `dir_path`, sorted by path.
-///
-/// Sorting is load-bearing: merged `ParsedFile` vectors inherit this order,
-/// and downstream consumers (LSP first-match-wins lookups, CLI diagnostic
-/// ordering) must not depend on filesystem iteration order, which varies
-/// across ext4/APFS/tmpfs.
-pub(super) fn sorted_crn_paths_in(dir_path: &ResolvedPath) -> std::io::Result<Vec<ResolvedPath>> {
-    crate::config_loader::DirectoryFiles::discover(dir_path, &Default::default())
-        .map(crate::config_loader::DirectoryFiles::into_paths)
-}
-
 /// Load all `.crn` files from a directory and merge them into a single `ParsedFile`.
 ///
 /// Returns `None` if the directory cannot be read or contains no module
@@ -117,28 +105,19 @@ pub(crate) fn load_module_with_overrides(
     .map(|loaded| loaded.parsed)
 }
 
-pub(super) fn source_paths_with_overrides(
-    dir: &ResolvedPath,
-    overrides: &crate::config_loader::SourceOverrides,
-) -> std::io::Result<Vec<ResolvedPath>> {
-    crate::config_loader::DirectoryFiles::discover(dir, overrides)
-        .map(crate::config_loader::DirectoryFiles::into_paths)
-}
-
 fn load_directory_module_with_diagnostics_and_config(
     dir_path: &ResolvedPath,
     config: &ProviderContext,
     overrides: &crate::config_loader::SourceOverrides,
     schemas: &crate::schema::SchemaRegistry,
 ) -> Option<LoadedModule> {
-    let paths = source_paths_with_overrides(dir_path, overrides).ok()?;
-    let mut files: Vec<(PathBuf, String)> = Vec::with_capacity(paths.len());
-    for path in paths {
-        if let Ok(content) = crate::config_loader::read_source_with_overrides(&path, overrides) {
-            files.push((path.source_label(), content));
-        }
-    }
-    let parsed_files = crate::config_loader::parse_directory_files(&files, config).ok()?;
+    let inputs = crate::config_loader::DirectoryFiles::discover(dir_path, overrides)
+        .ok()?
+        .read_all(overrides)
+        .ok()?;
+    let parsed_files = inputs
+        .parse_from_root(config, &dir_path.source_label())
+        .ok()?;
     let duplicate_declarations =
         crate::config_loader::find_duplicate_declarations(&dir_path.source_label(), &parsed_files);
 
@@ -204,19 +183,14 @@ pub fn load_module_from_directory(
     config: &ProviderContext,
 ) -> Result<ParsedFile, String> {
     let dir = dir.clone();
-    let paths = sorted_crn_paths_in(&dir)
+    let inputs = crate::config_loader::DirectoryFiles::discover(&dir, &Default::default())
         .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
-
-    let mut files: Vec<(PathBuf, String)> = Vec::with_capacity(paths.len());
-    for path in paths {
-        let content = path
-            .read_to_string()
-            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        files.push((path.source_label(), content));
-    }
-
-    let parsed_files = crate::config_loader::parse_directory_files(&files, config)
-        .map_err(|e| format!("Failed to parse directory {}: {}", dir.display(), e))?;
+    let inputs = inputs
+        .read_all(&Default::default())
+        .map_err(|e| e.to_string())?;
+    let parsed_files = inputs
+        .parse_from_root(config, &dir.source_label())
+        .map_err(|e| format!("Failed to parse directory {}: {}", dir.display(), e.error))?;
 
     let mut merged = ParsedFile::default();
     for (_, parsed) in parsed_files {
@@ -230,6 +204,35 @@ pub fn load_module_from_directory(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn module_metadata_load_retains_root_verdict_and_require_finding() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("backend.crn"),
+            "backend local { path = 'state.json' }\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("arguments.crn"), "arguments {}\n").unwrap();
+        fs::write(
+            dir.path().join("guards.crn"),
+            "require false, 'PRIVATE_GUARD'\n",
+        )
+        .unwrap();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let loaded =
+            load_module_from_directory(&ResolvedPath::new(dir.path()).unwrap(), &config).unwrap();
+        assert!(loaded.directory_verdict().is_root());
+        let schemas = crate::schema::SchemaRegistry::new();
+        let judged = crate::config_loader::load_buffer_configuration(&loaded, &schemas, &config);
+        assert_eq!(judged.judged().report().findings().len(), 1);
+        assert!(
+            judged.judged().report().findings()[0]
+                .detail()
+                .to_string()
+                .starts_with("`require` is only allowed inside a module\nNote: ")
+        );
+    }
 
     #[test]
     fn load_module_from_directory_preserves_pest_syntax_diagnostic() {

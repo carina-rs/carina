@@ -10,6 +10,45 @@ fn config() -> ProviderContext {
     ProviderContext::new(crate::EnvironmentSnapshot::empty())
 }
 
+#[test]
+fn root_evidence_prevents_module_declarations_from_exempting_require() {
+    for root in [
+        "provider mock {}",
+        "backend local { path = 'state.json' }",
+        "let alias = provider mock {}",
+    ] {
+        for block in ["arguments {}", "attributes {}", "arguments { n: Int = 1 }"] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("providers.crn"), root).unwrap();
+            std::fs::write(directory.path().join("declarations.crn"), block).unwrap();
+            std::fs::write(
+                directory.path().join("guards.crn"),
+                "require false, 'PRIVATE_GUARD'\n",
+            )
+            .unwrap();
+            let context = config();
+            let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+            let loaded = crate::config_loader::load_configuration_with_config(
+                &path,
+                &context,
+                &SchemaRegistry::new(),
+            )
+            .unwrap();
+            let parsed = loaded.parsed.parsed();
+            assert!(
+                matches!(require_scope(parsed), RequireScope::Directory(_)),
+                "{root}; {block}"
+            );
+            let findings = parsed.expression_report().findings();
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert_eq!(
+                findings[0].detail().to_string().lines().next().unwrap(),
+                "`require` is only allowed inside a module"
+            );
+        }
+    }
+}
+
 fn assert_buffer_membership(buffer_text: &str, disk_text: &str, expected_template: bool) {
     let directory = tempfile::tempdir().unwrap();
     let file = directory.path().join("guards.crn");
@@ -46,7 +85,7 @@ fn assert_buffer_membership(buffer_text: &str, disk_text: &str, expected_templat
                 "a different on-disk template must not suppress the buffer guard"
             );
             assert_eq!(
-                findings[0].detail().to_string(),
+                findings[0].detail().to_string().lines().next().unwrap(),
                 "`require` is only allowed inside a module"
             );
         }
@@ -258,7 +297,7 @@ fn recovery_uses_sibling_declaration_evidence() {
     let template = load();
     assert!(matches!(
         require_scope(template.parsed()),
-        RequireScope::ModuleTemplate(_)
+        RequireScope::Unknown
     ));
     assert!(template.judged().report().findings().is_empty());
 
@@ -274,7 +313,7 @@ fn recovery_uses_sibling_declaration_evidence() {
     let findings = complete.judged().report().findings();
     assert_eq!(findings.len(), 1);
     assert_eq!(
-        findings[0].detail().to_string(),
+        findings[0].detail().to_string().lines().next().unwrap(),
         "`require` is only allowed inside a module"
     );
 }
@@ -304,7 +343,7 @@ fn root_require_retained_rejection_cannot_be_erased() {
         "removing the public AST list must not erase the retained obligation"
     );
     assert_eq!(
-        findings[0].detail().to_string(),
+        findings[0].detail().to_string().lines().next().unwrap(),
         "`require` is only allowed inside a module"
     );
     assert!(findings[0].location().file().path().ends_with("guards.crn"));
@@ -343,7 +382,7 @@ fn strict_require_error_retains_location_and_typed_cause() {
             .ends_with("upstream/guards.crn")
     );
     assert_eq!(
-        located.detail().to_string(),
+        located.detail().to_string().lines().next().unwrap(),
         "`require` is only allowed inside a module"
     );
     assert!(error.source().is_none());

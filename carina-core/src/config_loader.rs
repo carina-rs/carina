@@ -438,20 +438,131 @@ impl<E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder>> Root
     }
 }
 
-/// Negative scope evidence minted only after directory discovery and a
-/// successful declaration parse of every source in that snapshot. A caller
-/// cannot obtain it from an isolated buffer or a caller-supplied source batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CompleteDirectoryDeclarations(());
+/// The sole directory classification, issued from one complete sibling inventory.
+/// Root and template witnesses have private constructors: callers can borrow
+/// and clone a verdict, but cannot manufacture either classification.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DirectoryVerdict {
+    #[default]
+    Unknown,
+    Root(RootDirectoryVerdict),
+    ModuleTemplate(ModuleTemplateDeclarations),
+}
 
-/// Scope derived from loader-owned declaration inventories. Only this module
-/// can construct it; the retained layer accepts no arbitrary scope override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootDirectoryVerdict {
+    evidence: std::sync::Arc<RootEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleTemplateDeclarations(());
+
+/// Every positive root reason owns its authored location; the negative proof
+/// is a separate case and can never supply an invented source location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootEvidence {
+    Provider {
+        location: parser::DeclarationLocation,
+        utf16_columns: (u32, u32),
+    },
+    Backend {
+        location: parser::DeclarationLocation,
+        utf16_columns: (u32, u32),
+    },
+    CompleteDirectoryWithoutModuleDeclarations,
+}
+
+impl DirectoryVerdict {
+    pub fn is_root(&self) -> bool {
+        matches!(self, Self::Root(_))
+    }
+    pub fn is_module_template(&self) -> bool {
+        matches!(self, Self::ModuleTemplate(_))
+    }
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+    pub fn root(&self) -> Option<&RootDirectoryVerdict> {
+        match self {
+            Self::Root(root) => Some(root),
+            Self::Unknown | Self::ModuleTemplate(_) => None,
+        }
+    }
+}
+
+impl RootDirectoryVerdict {
+    pub fn evidence(&self) -> &RootEvidence {
+        &self.evidence
+    }
+    pub fn format_message(&self, message: &str) -> String {
+        format!("{message}\nNote: {}", self.evidence.note())
+    }
+    pub fn lsp_message(&self, message: &str) -> String {
+        if self.evidence.location().is_some() {
+            message.to_string()
+        } else {
+            self.format_message(message)
+        }
+    }
+}
+
+impl RootEvidence {
+    pub fn location(&self) -> Option<&parser::DeclarationLocation> {
+        match self {
+            Self::Provider { location, .. } | Self::Backend { location, .. } => Some(location),
+            Self::CompleteDirectoryWithoutModuleDeclarations => None,
+        }
+    }
+    pub fn utf16_columns(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::Provider { utf16_columns, .. } | Self::Backend { utf16_columns, .. } => {
+                Some(*utf16_columns)
+            }
+            Self::CompleteDirectoryWithoutModuleDeclarations => None,
+        }
+    }
+    pub fn related_message(&self) -> &'static str {
+        match self {
+            Self::Provider { .. } => {
+                "This provider block makes the directory a root configuration."
+            }
+            Self::Backend { .. } => "This backend block makes the directory a root configuration.",
+            Self::CompleteDirectoryWithoutModuleDeclarations => {
+                "The complete directory has no arguments or attributes block."
+            }
+        }
+    }
+    pub fn note(&self) -> String {
+        let located = |kind: &str, location: &parser::DeclarationLocation| {
+            format!(
+                "directory is a root configuration because of the {kind} block at {}:{}.",
+                crate::paths::DisplayPath::for_diagnostics(location.file().path()),
+                location.span().start_line()
+            )
+        };
+        match self {
+            Self::Provider { location, .. } => located("provider", location),
+            Self::Backend { location, .. } => located("backend", location),
+            Self::CompleteDirectoryWithoutModuleDeclarations => "directory is a root configuration because the complete directory has no `arguments` or `attributes` block.".to_string(),
+        }
+    }
+}
+
+/// Loader-owned admission installs the same verdict on the file, declarations
+/// and require nodes. There is no arbitrary RequireScope setter outside parsing.
 #[derive(Clone)]
-pub(crate) struct DirectoryRequireScope(crate::parser::retained::RequireScope);
-
+pub(crate) struct DirectoryRequireScope(DirectoryVerdict);
 impl DirectoryRequireScope {
-    pub(crate) fn into_scope(self) -> crate::parser::retained::RequireScope {
-        self.0
+    pub(crate) fn into_parts(self) -> (DirectoryVerdict, parser::retained::RequireScope) {
+        use parser::retained::RequireScope;
+        let scope = match &self.0 {
+            DirectoryVerdict::Unknown => RequireScope::Unknown,
+            DirectoryVerdict::Root(root) => RequireScope::UnvalidatedDirectory(root.clone()),
+            DirectoryVerdict::ModuleTemplate(template) => {
+                RequireScope::ModuleTemplate(template.clone())
+            }
+        };
+        (self.0, scope)
     }
 }
 
@@ -485,28 +596,44 @@ struct CompleteDirectoryInventories<'a> {
 
 impl CompleteDirectoryInventories<'_> {
     fn require_scope(self) -> DirectoryRequireScope {
-        use crate::parser::retained::RequireScope;
-        DirectoryRequireScope(
-            match require_scope_from_inventories(self.inventories).into_scope() {
-                RequireScope::Unknown => {
-                    RequireScope::UnvalidatedDirectory(CompleteDirectoryDeclarations(()))
+        use parser::ConfigurationBlock;
+        let mut evidence = None;
+        let mut module_block = false;
+        for inventory in self.inventories {
+            for block in inventory.configuration_blocks() {
+                match block.detail().kind() {
+                    ConfigurationBlock::Provider if evidence.is_none() => {
+                        evidence = Some(RootEvidence::Provider {
+                            location: block.location().clone(),
+                            utf16_columns: block.detail().utf16_columns(),
+                        })
+                    }
+                    ConfigurationBlock::Backend if evidence.is_none() => {
+                        evidence = Some(RootEvidence::Backend {
+                            location: block.location().clone(),
+                            utf16_columns: block.detail().utf16_columns(),
+                        })
+                    }
+                    ConfigurationBlock::Arguments | ConfigurationBlock::Attributes => {
+                        module_block = true
+                    }
+                    _ => {}
                 }
-                scope => scope,
-            },
-        )
+            }
+        }
+        let verdict = match (evidence, module_block) {
+            (Some(evidence), _) => DirectoryVerdict::Root(RootDirectoryVerdict {
+                evidence: std::sync::Arc::new(evidence),
+            }),
+            (None, true) => DirectoryVerdict::ModuleTemplate(ModuleTemplateDeclarations(())),
+            (None, false) => DirectoryVerdict::Root(RootDirectoryVerdict {
+                evidence: std::sync::Arc::new(
+                    RootEvidence::CompleteDirectoryWithoutModuleDeclarations,
+                ),
+            }),
+        };
+        DirectoryRequireScope(verdict)
     }
-}
-
-fn require_scope_from_inventories<'a>(
-    inventories: impl IntoIterator<Item = &'a parser::SyntaxInventory>,
-) -> DirectoryRequireScope {
-    let mut blocks = parser::ModuleDeclarationBlocks::Absent;
-    for inventory in inventories {
-        blocks = blocks.union(inventory.module_declaration_blocks());
-    }
-    DirectoryRequireScope(crate::parser::retained::RequireScope::for_declarations(
-        blocks,
-    ))
 }
 
 impl<E> RootDirectoryParse<E> {
@@ -860,15 +987,14 @@ impl DirectoryBufferSnapshot {
             }
             .require_scope()
         } else {
-            require_scope_from_inventories(inventories.iter().filter_map(Option::as_ref))
+            DirectoryRequireScope(DirectoryVerdict::Unknown)
         }
     }
 }
 
 /// Judge the buffer parsed from the exact member text of this sealed snapshot.
 /// Incomplete syntax knowledge retains ordinary expression checks without a
-/// require verdict. A known module block proves template scope; only complete
-/// absence of module blocks admits rejection of a require outside a module.
+/// directory verdict. Every known classification requires the complete snapshot.
 pub fn load_buffer_configuration_in_directory<'a>(
     snapshot: DirectoryBufferSnapshot,
     schemas: &'a SchemaRegistry,
@@ -1049,7 +1175,7 @@ impl DirectoryFiles {
         self.paths
     }
 
-    fn read_all(
+    pub(crate) fn read_all(
         self,
         overrides: &SourceOverrides,
     ) -> Result<DirectoryInputs, DirectorySourceReadFailure> {
@@ -1070,7 +1196,7 @@ impl DirectoryFiles {
 
 #[derive(Debug, thiserror::Error)]
 #[error("Failed to read {}: {error}", .file.display())]
-struct DirectorySourceReadFailure {
+pub(crate) struct DirectorySourceReadFailure {
     file: PathBuf,
     // Display includes the complete I/O diagnostic. DirectoryParseFailure
     // exposes the typed error without repeating it through Error::source.
@@ -1079,8 +1205,14 @@ struct DirectorySourceReadFailure {
 
 /// Only an unfiltered discovery followed by successful reads can construct
 /// these inputs. Successful parsing of all of them can mint completeness.
-struct DirectoryInputs {
+pub(crate) struct DirectoryInputs {
     sources: Vec<(ResolvedPath, String)>,
+}
+
+impl DirectorySourceReadFailure {
+    pub(crate) fn into_error(self) -> std::io::Error {
+        self.error
+    }
 }
 
 impl DirectoryInputs {
@@ -1093,7 +1225,26 @@ impl DirectoryInputs {
             .iter()
             .map(|(file, source)| (file.source_label(), source.clone()))
             .collect::<Vec<_>>();
-        let mut parsed = parse_directory_files_located(&inputs, config)?;
+        self.parse_from_root(
+            config,
+            inputs
+                .first()
+                .and_then(|(path, _)| path.parent())
+                .unwrap_or_else(|| Path::new("")),
+        )
+    }
+
+    pub(crate) fn parse_from_root(
+        &self,
+        config: &ProviderContext,
+        display_root: &Path,
+    ) -> Result<Vec<(PathBuf, DirectoryResolvedFile)>, LocatedParseError> {
+        let inputs = self
+            .sources
+            .iter()
+            .map(|(file, source)| (file.source_label(), source.clone()))
+            .collect::<Vec<_>>();
+        let mut parsed = parse_directory_files_located_from_root(&inputs, config, display_root)?;
         mark_complete_directory_files(&mut parsed, config);
         Ok(parsed)
     }
@@ -2315,18 +2466,7 @@ pub(crate) fn parse_directory_files_located_from_root(
         .iter_names()
         .map(str::to_string)
         .collect::<BTreeSet<_>>();
-    let require_scope =
-        DirectoryRequireScope(crate::parser::retained::RequireScope::for_declarations(
-            merged
-                .parser_binding_metadata
-                .syntax()
-                .module_declaration_blocks(),
-        ));
     for (_, file) in &mut out {
-        crate::parser::retained::set_directory_require_scope(
-            &mut file.parsed,
-            require_scope.clone(),
-        );
         crate::parser::retained::judge_configuration(
             &mut file.parsed,
             &SchemaRegistry::new(),

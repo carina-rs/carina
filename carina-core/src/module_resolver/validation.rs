@@ -19,9 +19,32 @@ use crate::resource::{
 use super::ModuleError;
 
 /// A rejected root declaration retains no condition or user message in its error.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("`require` is only allowed inside a module")]
-pub struct RequireOutsideModuleDiagnostic;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequireOutsideModuleDiagnostic {
+    root: crate::config_loader::RootDirectoryVerdict,
+}
+impl RequireOutsideModuleDiagnostic {
+    pub(crate) fn new(root: crate::config_loader::RootDirectoryVerdict) -> Self {
+        Self { root }
+    }
+    pub fn root_evidence(&self) -> &crate::config_loader::RootEvidence {
+        self.root.evidence()
+    }
+    pub fn lsp_message(&self) -> String {
+        self.root
+            .lsp_message("`require` is only allowed inside a module")
+    }
+}
+impl fmt::Display for RequireOutsideModuleDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            &self
+                .root
+                .format_message("`require` is only allowed inside a module"),
+        )
+    }
+}
+impl std::error::Error for RequireOutsideModuleDiagnostic {}
 
 pub(crate) struct ConstraintDeclaration<P: PlaceholderKind, B: BindingAddress> {
     pub constraint: PendingModuleConstraint<P, B>,

@@ -1960,15 +1960,23 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
             ]),
         )
     };
+    let project = tempfile::tempdir().unwrap();
+    let source_file = project.path().join("main.crn");
+    std::fs::write(&source_file, "provider zeta { source = 'file:///definitely-missing/zeta.wasm' }\nprovider alpha { source = 'file:///definitely-missing/alpha.wasm' }\narguments { unrelated: String }\n").unwrap();
+    let project_path = carina_core::paths::ResolvedPath::new(project.path()).unwrap();
     let invalid_config = || {
-        crate::test_support::inferred_fixture(
-            "provider zeta { source = 'file:///definitely-missing/zeta.wasm' }\nprovider alpha { source = 'file:///definitely-missing/alpha.wasm' }\narguments { unrelated: String }\n",
+        carina_core::config_loader::load_configuration_with_config(
+            &project_path,
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &SchemaRegistry::new(),
         )
+        .unwrap()
+        .parsed
     };
 
     let evaluated_error = match incomplete_load().validate_evaluated_config(
-        carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(invalid_config()),
-        &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+        invalid_config(),
+        &project_path,
         true,
         &[],
     ) {
@@ -1977,9 +1985,9 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
     };
     let unresolved = carina_core::parser::ParsedFile::default();
     let pair_error = match incomplete_load().validate_config_pair(
-        carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(invalid_config()),
+        invalid_config(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
-        &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+        &project_path,
         true,
         &[],
     ) {
@@ -1987,7 +1995,10 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
         Err(error) => error,
     };
 
-    let expected = "arguments blocks are only valid inside module definitions, not in root configurations.\nalpha failed\nzeta failed";
+    let expected = format!(
+        "arguments blocks are only valid inside module definitions, not in root configurations.\nNote: directory is a root configuration because of the provider block at {}:1.\nalpha failed\nzeta failed",
+        carina_core::paths::DisplayPath::for_diagnostics(&source_file)
+    );
     assert_eq!(evaluated_error.to_string(), expected);
     assert_eq!(pair_error.to_string(), expected);
 }
@@ -2150,20 +2161,22 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
         std::slice::from_ref(&provider),
         HashMap::from([("broken".to_string(), "broken provider failed".to_string())]),
     );
-    let parsed = crate::test_support::inferred_fixture(
-        "provider broken { source = 'file:///definitely-missing/broken.wasm' }\narguments { unrelated: String }\n",
-    );
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("main.crn"), "provider broken { source = 'file:///definitely-missing/broken.wasm' }\narguments { unrelated: String }\n").unwrap();
+    let project_path = carina_core::paths::ResolvedPath::new(project.path()).unwrap();
+    let parsed = carina_core::config_loader::load_configuration_with_config(
+        &project_path,
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        &SchemaRegistry::new(),
+    )
+    .unwrap()
+    .parsed;
 
     let unresolved = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
         carina_core::parser::ParsedFile::default(),
     );
-    let error = match providers.validate_config_pair(
-        carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
-        unresolved,
-        &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-        false,
-        &[],
-    ) {
+    let error = match providers.validate_config_pair(parsed, unresolved, &project_path, false, &[])
+    {
         Ok(_) => panic!("plan-style validation must reject both independent errors"),
         Err(error) => error,
     };

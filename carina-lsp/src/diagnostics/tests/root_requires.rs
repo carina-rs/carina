@@ -1,6 +1,180 @@
 use super::*;
 use tower_lsp::lsp_types::{Position, Range};
 
+#[test]
+fn root_placement_recovery_reuses_complete_declaration_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let providers = directory.path().join("providers.crn");
+    std::fs::write(&providers, "provider mock {}\n").unwrap();
+    std::fs::write(
+        directory.path().join("arguments.crn"),
+        "arguments { value: MissingType }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("guards.crn"),
+        "require false, 'PRIVATE_GUARD'\n",
+    )
+    .unwrap();
+    for (file, source, message, end) in [
+        (
+            "arguments.crn",
+            "arguments { value: MissingType }\n",
+            "arguments blocks are only valid inside module definitions, not in root configurations.",
+            9,
+        ),
+        (
+            "guards.crn",
+            "require false, 'PRIVATE_GUARD'\n",
+            "`require` is only allowed inside a module",
+            30,
+        ),
+    ] {
+        let path = directory.path().join(file);
+        let diagnostics =
+            test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+        let placement: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message == message)
+            .collect();
+        assert_eq!(placement.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            placement[0].range,
+            Range::new(Position::new(0, 0), Position::new(0, end))
+        );
+        let related = placement[0]
+            .related_information
+            .as_ref()
+            .expect("recovery retains the issued evidence");
+        assert_eq!(related.len(), 1);
+        assert_eq!(
+            related[0].location.uri,
+            tower_lsp::lsp_types::Url::from_file_path(&providers).unwrap()
+        );
+        assert_eq!(
+            related[0].location.range,
+            Range::new(Position::new(0, 0), Position::new(0, 13))
+        );
+    }
+}
+
+#[test]
+fn upstream_root_require_keeps_backend_evidence_in_related_information() {
+    let directory = tempfile::tempdir().unwrap();
+    let caller = directory.path().join("caller");
+    let upstream = directory.path().join("upstream");
+    std::fs::create_dir(&caller).unwrap();
+    std::fs::create_dir(&upstream).unwrap();
+    let backend = upstream.join("backend.crn");
+    std::fs::write(&backend, "backend local { path = 'state.json' }\n").unwrap();
+    std::fs::write(
+        upstream.join("guards.crn"),
+        "require true, 'PRIVATE_GUARD'\n",
+    )
+    .unwrap();
+    std::fs::write(upstream.join("exports.crn"), "exports { value: Int = 1 }\n").unwrap();
+    let path = caller.join("main.crn");
+    let source = "let previous = upstream_state { source = '../upstream' }\n";
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+        .collect();
+    assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+    assert!(
+        errors[0]
+            .message
+            .contains("`require` is only allowed inside a module"),
+        "{diagnostics:#?}"
+    );
+    assert!(!errors[0].message.contains("PRIVATE_GUARD"));
+    let related = errors[0]
+        .related_information
+        .as_ref()
+        .expect("upstream root evidence must remain typed");
+    assert_eq!(related.len(), 1);
+    assert_eq!(
+        related[0].message,
+        "This backend block makes the directory a root configuration."
+    );
+    assert_eq!(
+        related[0].location.uri,
+        tower_lsp::lsp_types::Url::from_file_path(caller.join("../upstream/backend.crn")).unwrap()
+    );
+    assert_eq!(
+        related[0].location.range,
+        Range::new(Position::new(0, 0), Position::new(0, 7))
+    );
+}
+
+#[test]
+fn aliased_provider_supplies_root_evidence_for_module_declarations_and_require() {
+    let directory = tempfile::tempdir().unwrap();
+    let providers = directory.path().join("providers.crn");
+    std::fs::write(&providers, "let alias = provider mock {}\n").unwrap();
+    for (file, source) in [
+        ("arguments.crn", "arguments {}\n"),
+        ("guards.crn", "require false, 'PRIVATE_GUARD'\n"),
+    ] {
+        std::fs::write(directory.path().join(file), source).unwrap();
+    }
+    for (file, source, message) in [
+        (
+            "arguments.crn",
+            "arguments {}\n",
+            "arguments blocks are only valid inside module definitions, not in root configurations.",
+        ),
+        (
+            "guards.crn",
+            "require false, 'PRIVATE_GUARD'\n",
+            "`require` is only allowed inside a module",
+        ),
+    ] {
+        let path = directory.path().join(file);
+        let diagnostics =
+            test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .collect();
+        assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+        assert_eq!(errors[0].message, message);
+        let related = errors[0]
+            .related_information
+            .as_ref()
+            .expect("aliased provider evidence");
+        assert_eq!(related.len(), 1);
+        assert_eq!(
+            related[0].location.uri,
+            tower_lsp::lsp_types::Url::from_file_path(&providers).unwrap()
+        );
+        assert_eq!(
+            related[0].location.range,
+            Range::new(Position::new(0, 12), Position::new(0, 25))
+        );
+    }
+}
+
+#[test]
+fn blockless_root_explains_complete_directory_evidence_without_fake_location() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("guards.crn");
+    let source = "require false, 'PRIVATE_GUARD'\n";
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
+    );
+    assert!(diagnostics[0].related_information.is_none());
+    assert_eq!(
+        diagnostics[0].range,
+        Range::new(Position::new(0, 0), Position::new(0, 30))
+    );
+}
+
 fn assert_empty_template(blocks: &str) {
     let engine = test_engine();
     let directory = tempfile::tempdir().unwrap();
@@ -29,6 +203,135 @@ fn empty_attributes_keep_lsp_template_scope() {
 #[test]
 fn both_empty_blocks_keep_lsp_template_scope() {
     assert_empty_template("arguments {}\nattributes {}\n");
+}
+
+fn assert_root_declaration_diagnostics(block: &str, declaration: &str, same_file: bool) {
+    let providers = loaded_providers_from_factories(vec![Box::new(
+        carina_provider_mock::ConfiguredBuiltinMock::new(
+            carina_provider_mock::MockBehavior::default(),
+            carina_provider_mock::MockScope::memory(),
+        ),
+    )]);
+    let engine = DiagnosticEngine::new(providers, vec!["mock".into()]);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
+        "let r = mock.test.resource { name = 'root' }\n",
+    )
+    .unwrap();
+    let require = "require false, 'PRIVATE_GUARD'\n";
+    let declarations = format!("{declaration}\n");
+    let source = if same_file {
+        format!("{declarations}{require}")
+    } else {
+        std::fs::write(directory.path().join("declarations.crn"), &declarations).unwrap();
+        require.to_string()
+    };
+    std::fs::write(directory.path().join("guards.crn"), source).unwrap();
+    for file in [
+        "providers.crn",
+        "main.crn",
+        "guards.crn",
+        "declarations.crn",
+    ] {
+        let path = directory.path().join(file);
+        if !path.exists() {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).unwrap();
+        let diagnostics = engine.analyze(&create_document_at(&source, path.clone()), Some(&path));
+        let actual: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+            .map(|diagnostic| (diagnostic.message.clone(), diagnostic.range))
+            .collect();
+        let mut expected = Vec::new();
+        if file
+            == if same_file {
+                "guards.crn"
+            } else {
+                "declarations.crn"
+            }
+        {
+            expected.push((
+                format!("{block} blocks are only valid inside module definitions, not in root configurations."),
+                Range::new(Position::new(0, 0), Position::new(0, block.len() as u32)),
+            ));
+        }
+        if file == "guards.crn" {
+            let line = u32::from(same_file);
+            expected.push((
+                "`require` is only allowed inside a module".to_string(),
+                Range::new(
+                    Position::new(line, 0),
+                    Position::new(line, require.trim_end().len() as u32),
+                ),
+            ));
+        }
+        let mut actual = actual;
+        actual.sort_by_key(|(_, range)| range.start);
+        expected.sort_by_key(|(_, range)| range.start);
+        assert_eq!(actual, expected, "{file}: {diagnostics:?}");
+        for diagnostic in diagnostics
+            .iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+        {
+            let related = diagnostic
+                .related_information
+                .as_ref()
+                .expect("root placement needs evidence");
+            assert_eq!(related.len(), 1);
+            assert_eq!(
+                related[0].message,
+                "This provider block makes the directory a root configuration."
+            );
+            assert_eq!(
+                related[0].location.uri,
+                tower_lsp::lsp_types::Url::from_file_path(directory.path().join("providers.crn"))
+                    .unwrap()
+            );
+            assert_eq!(
+                related[0].location.range,
+                Range::new(Position::new(0, 0), Position::new(0, 13))
+            );
+        }
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("PRIVATE_GUARD"))
+        );
+    }
+}
+
+#[test]
+fn root_empty_arguments_beside_require_have_lsp_placement_errors() {
+    assert_root_declaration_diagnostics("arguments", "arguments {}", true);
+}
+
+#[test]
+fn root_empty_arguments_in_sibling_have_lsp_placement_errors() {
+    assert_root_declaration_diagnostics("arguments", "arguments {}", false);
+}
+
+#[test]
+fn root_empty_attributes_beside_require_have_lsp_placement_errors() {
+    assert_root_declaration_diagnostics("attributes", "attributes {}", true);
+}
+
+#[test]
+fn root_empty_attributes_in_sibling_have_lsp_placement_errors() {
+    assert_root_declaration_diagnostics("attributes", "attributes {}", false);
+}
+
+#[test]
+fn root_populated_attributes_beside_require_have_lsp_placement_errors() {
+    assert_root_declaration_diagnostics("attributes", "attributes { value: Int = 1 }", true);
+}
+
+#[test]
+fn root_populated_attributes_in_sibling_have_lsp_placement_errors() {
+    assert_root_declaration_diagnostics("attributes", "attributes { value: Int = 1 }", false);
 }
 
 #[cfg(unix)]
@@ -250,7 +553,7 @@ fn root_require_unreadable_sibling_keeps_unknown_scope() {
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert_eq!(
         diagnostics[0].message,
-        "`require` is only allowed inside a module"
+        "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
     );
     assert_eq!(
         diagnostics[0].range,

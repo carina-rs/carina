@@ -1692,10 +1692,40 @@ fn closure_module_placement_owns_multiline_provider_header() {
             "let note = <<TEXT\nprovider aws {}\nTEXT\nprovider\n  aws {}\n",
         ),
     ]);
-    directory.assert_sibling_owner(
-        &test_engine(),
-        "provider blocks are not allowed inside modules",
-        &[("provider\n  aws", 0)],
+    let path = directory.root.path().join("main.crn");
+    let source = std::fs::read_to_string(&path).unwrap();
+    let diagnostics =
+        test_engine().analyze(&create_document_at(&source, path.clone()), Some(&path));
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+        .collect();
+    assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        errors[0].message,
+        "arguments blocks are only valid inside module definitions, not in root configurations."
+    );
+    assert_eq!(
+        errors[0].range,
+        Range::new(Position::new(0, 0), Position::new(0, 9))
+    );
+    let related = errors[0]
+        .related_information
+        .as_ref()
+        .expect("root evidence must be related information");
+    assert_eq!(related.len(), 1);
+    assert_eq!(
+        related[0].message,
+        "This provider block makes the directory a root configuration."
+    );
+    assert_eq!(
+        related[0].location.uri,
+        tower_lsp::lsp_types::Url::from_file_path(directory.root.path().join("sibling.crn"))
+            .unwrap()
+    );
+    assert_eq!(
+        related[0].location.range,
+        Range::new(Position::new(3, 0), Position::new(4, 5))
     );
 }
 

@@ -1579,8 +1579,17 @@ fn backend_schema_diagnostics_are_directory_scoped_and_attribute_anchored() {
 #[test]
 fn backend_schema_is_not_reported_for_a_module_definition() {
     let backend = "backend s3 {\n  bucket = \"state\"\n  key = \"state.json\"\n  typo = true\n}\n";
+    let fixture = tempfile::tempdir().unwrap();
+    let module = fixture.path().join("module");
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(module.join("main.crn"), "arguments { name: String }\n").unwrap();
+    std::fs::write(module.join("backend.crn"), backend).unwrap();
+    let source =
+        "let component = use { source = './module' }\nlet call = component { name = 'test' }\n";
+    let path = fixture.path().join("main.crn");
+    std::fs::write(&path, source).unwrap();
     let module_diagnostics =
-        backend_directory_diagnostics_with_sibling("arguments {\n  name: String\n}\n", backend);
+        test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
     let module_messages: Vec<_> = module_diagnostics
         .iter()
         .map(|diagnostic| diagnostic.message.as_str())
@@ -4640,22 +4649,23 @@ cidr_block = "10.0.1.0/24"
 
 #[test]
 fn provider_in_module_emits_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("child")).unwrap();
+    std::fs::write(
+        tmp.path().join("child/main.crn"),
+        "arguments { vpc_cidr: String }\nprovider awscc { region = awscc.Region.ap_northeast_1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("imports.crn"),
+        "let child = use { source = './child' }\n",
+    )
+    .unwrap();
+    let source = "// Providers are inherited from a module's caller.\n// This imported directory incorrectly declares its own.\n// Supply the argument at an anonymous call.\n// The diagnostic belongs to that call's header.\nchild { vpc_cidr = '10.0.0.0/16' }\n";
+    let path = tmp.path().join("main.crn");
+    std::fs::write(&path, source).unwrap();
     let engine = test_engine();
-    let doc = create_document(
-        r#"arguments {
-    vpc_cidr: String
-}
-
-provider awscc {
-    region = awscc.Region.ap_northeast_1
-}
-
-awscc.ec2.Vpc {
-    cidr_block = args.vpc_cidr
-}"#,
-    );
-
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
 
     let provider_diag = diagnostics.iter().find(|d| {
         d.message
@@ -4674,26 +4684,25 @@ awscc.ec2.Vpc {
 
 #[test]
 fn provider_in_module_with_sibling_arguments_emits_error() {
-    // Issue #3717 repro shape: the open buffer contains only the provider,
-    // while a sibling file carries the marker that makes the directory a
-    // module. Buffer-only classification misses this combination.
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().to_path_buf();
+    std::fs::create_dir(base.join("child")).unwrap();
     std::fs::write(
-        base.join("arguments.crn"),
-        r#"arguments {
-    name: String = "test"
-}
-"#,
+        base.join("child/arguments.crn"),
+        "arguments { name: String = 'test' }\n",
     )
     .unwrap();
-    std::fs::write(base.join("providers.crn"), "provider mock { }\n").unwrap();
-
+    std::fs::write(base.join("child/providers.crn"), "provider mock {}\n").unwrap();
+    std::fs::write(
+        base.join("imports.crn"),
+        "let child = use { source = './child' }\n",
+    )
+    .unwrap();
+    let source = "child {}\n";
+    let path = base.join("main.crn");
+    std::fs::write(&path, source).unwrap();
     let engine = test_engine();
-    let buffer = std::fs::read_to_string(base.join("providers.crn")).unwrap();
-    let path = base.join("providers.crn");
-    let doc = create_document_at(&buffer, path.clone());
-    let diagnostics = engine.analyze(&doc, Some(&path));
+    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
 
     let provider_diag = diagnostics.iter().find(|diagnostic| {
         diagnostic
@@ -4783,7 +4792,12 @@ moved {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("main.crn");
+    let source = doc.text();
+    std::fs::write(&path, &source).unwrap();
+    let doc = create_document_at(&source, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
 
     let state_block_diag = diagnostics.iter().find(|diagnostic| {
         diagnostic
@@ -4953,7 +4967,12 @@ let up = upstream_state { source = './b' }
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("main.crn");
+    let source = doc.text();
+    std::fs::write(&path, &source).unwrap();
+    let doc = create_document_at(&source, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
     let upstream_state_lines: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| {
@@ -4987,7 +5006,12 @@ backend local {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("main.crn");
+    let source = doc.text();
+    std::fs::write(&path, &source).unwrap();
+    let doc = create_document_at(&source, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
 
     let arguments_diag = diagnostics.iter().find(|d| {
         d.message

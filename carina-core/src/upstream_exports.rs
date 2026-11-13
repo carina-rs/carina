@@ -726,7 +726,7 @@ where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
     let (exports, findings) =
-        resolve_upstream_export_report_inner(base_dir, tree, config, schemas, overrides)?;
+        resolve_upstream_exports_report_with_overrides(base_dir, tree, config, schemas, overrides)?;
     Ok((
         exports,
         findings
@@ -751,10 +751,16 @@ pub fn resolve_upstream_exports_report<D, B: BindingAddress, E>(
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    resolve_upstream_export_report_inner(base_dir, tree, config, schemas, &Default::default())
+    resolve_upstream_exports_report_with_overrides(
+        base_dir,
+        tree,
+        config,
+        schemas,
+        &Default::default(),
+    )
 }
 
-fn resolve_upstream_export_report_inner<D, B: BindingAddress, E>(
+pub fn resolve_upstream_exports_report_with_overrides<D, B: BindingAddress, E>(
     base_dir: &ResolvedPath,
     tree: &UpstreamAnalysis<'_, D, B, E>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
@@ -1911,7 +1917,7 @@ mod tests {
         let project = upstream_project(&[upstream("prior", "./upstream")]);
         let context = ctx();
         crate::validation::deferred_types::with_session_for_test(&context, |session| {
-            let (_, errors) = super::resolve_upstream_export_report_inner(
+            let (_, errors) = super::resolve_upstream_exports_report_with_overrides(
                 &ResolvedPath::new(directory.path()).unwrap(),
                 &AnalysisTree::try_from_file(&project).unwrap(),
                 session,
@@ -1931,11 +1937,11 @@ mod tests {
             assert_eq!(finding.location().span().start_column(), 1);
             assert_eq!(finding.location().span().end_column(), 32);
             assert_eq!(
-                finding.detail().to_string(),
+                finding.detail().to_string().lines().next().unwrap(),
                 "`require` is only allowed inside a module"
             );
             if physical {
-                let (_, errors) = super::resolve_upstream_export_report_inner(
+                let (_, errors) = super::resolve_upstream_exports_report_with_overrides(
                     &ResolvedPath::new(directory.path()).unwrap(),
                     &AnalysisTree::try_from_file(&project).unwrap(),
                     session,

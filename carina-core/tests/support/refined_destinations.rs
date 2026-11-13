@@ -69,6 +69,11 @@ pub fn directory(boundary: Boundary, resolved_length: Option<usize>) -> tempfile
         &format!("let source = awscc.MemberSource {{}}\n{main}"),
         &exports,
     );
+    if matches!(boundary, Boundary::Attributes) {
+        // A standalone module inherits provider types from the supplied snapshot.
+        std::fs::remove_file(dir.path().join("providers.crn")).unwrap();
+        std::fs::remove_file(dir.path().join("exports.crn")).unwrap();
+    }
     if let Some(child) = child {
         std::fs::create_dir(dir.path().join("forward")).unwrap();
         std::fs::write(dir.path().join("forward/main.crn"), child).unwrap();

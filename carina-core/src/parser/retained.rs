@@ -314,25 +314,10 @@ pub(crate) enum RequireScope {
     /// Only the directory loader mints this declaration-completeness proof.
     /// Any JudgedFile construction promotes it to Directory, including
     /// bootstrap/metadata inference. Callers decide whether to publish findings.
-    UnvalidatedDirectory(crate::config_loader::CompleteDirectoryDeclarations),
-    Directory(crate::config_loader::CompleteDirectoryDeclarations),
-    ModuleTemplate(ModuleTemplateDeclarations),
+    UnvalidatedDirectory(crate::config_loader::RootDirectoryVerdict),
+    Directory(crate::config_loader::RootDirectoryVerdict),
+    ModuleTemplate(crate::config_loader::ModuleTemplateDeclarations),
     ModuleCall,
-}
-
-/// Positive module-declaration evidence, constructed only by for_declarations.
-/// Resolver entry points cannot manufacture a template from argument names.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ModuleTemplateDeclarations(());
-
-impl RequireScope {
-    pub(crate) fn for_declarations(blocks: super::ModuleDeclarationBlocks) -> Self {
-        if blocks == super::ModuleDeclarationBlocks::Absent {
-            Self::Unknown
-        } else {
-            Self::ModuleTemplate(ModuleTemplateDeclarations(()))
-        }
-    }
 }
 
 /// Parser-minted declaration identity and its scope evidence. The same node
@@ -731,7 +716,7 @@ fn retain_require_nodes<P: ValueKind, B: BindingAddress>(
 }
 
 impl<B: BindingAddress> Expressions<B> {
-    pub(in crate::parser) fn set_require_scope(&mut self, scope: RequireScope) {
+    fn set_require_scope(&mut self, scope: RequireScope) {
         self.require_scope = Some(scope.clone());
         let mut memo = HashMap::new();
         let mut transform = |_: NodeId, current: Option<RetainedRequireCondition>| {
@@ -943,8 +928,12 @@ pub(crate) fn set_directory_require_scope<E, D, B: BindingAddress>(
 ) {
     file.parser_binding_metadata
         .syntax
+        .install_directory_verdict(scope.clone());
+    let (_, scope) = scope.into_parts();
+    file.parser_binding_metadata
+        .syntax
         .expressions_mut()
-        .set_require_scope(scope.into_scope());
+        .set_require_scope(scope);
 }
 
 #[cfg(test)]
@@ -970,7 +959,7 @@ fn admit_require_scope<E, D, B: BindingAddress>(
     else {
         return;
     };
-    expressions.set_require_scope(RequireScope::Directory(*evidence));
+    expressions.set_require_scope(RequireScope::Directory(evidence.clone()));
 }
 
 pub(crate) fn judge_configuration<
@@ -984,23 +973,6 @@ pub(crate) fn judge_configuration<
 ) where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    if file
-        .parser_binding_metadata
-        .syntax()
-        .expressions()
-        .require_scope
-        .is_none()
-    {
-        let scope = RequireScope::for_declarations(
-            file.parser_binding_metadata
-                .syntax()
-                .module_declaration_blocks(),
-        );
-        file.parser_binding_metadata
-            .syntax
-            .expressions_mut()
-            .set_require_scope(scope);
-    }
     prepare_slots(file, schemas);
     let mut report = judge_expressions(file, schemas, config);
     for parameter in &file.export_params {
@@ -4061,11 +4033,12 @@ mod judgement {
             self.scope = scope;
             self.visiting.push(id);
             let rejected_require = match &root.kind {
-                ExprKind::RequireCondition(require)
-                    if matches!(require.scope, RequireScope::Directory(_)) =>
-                {
-                    Some(require.statement.clone())
-                }
+                ExprKind::RequireCondition(require) => match &require.scope {
+                    RequireScope::Directory(verdict) => {
+                        Some((require.statement.clone(), verdict.clone()))
+                    }
+                    _ => None,
+                },
                 _ => None,
             };
             let mut children = if rejected_require.is_some() {
@@ -4109,13 +4082,13 @@ mod judgement {
                     owner: FailureOwner::Boundary,
                 };
             }
-            let mut result = if let Some(statement) = rejected_require {
+            let mut result = if let Some((statement, verdict)) = rejected_require {
                 // A rejected declaration owns the sole diagnostic for its
                 // condition. Do not infer or evaluate any of its children.
                 self.push_finding(
                     statement,
                     InferenceError::RequireOutsideModule(Box::new(
-                        crate::module_resolver::RequireOutsideModuleDiagnostic,
+                        crate::module_resolver::RequireOutsideModuleDiagnostic::new(verdict),
                     )),
                 );
                 declaration()

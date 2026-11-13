@@ -4948,7 +4948,7 @@ impl SourceSpan {
             Rule::removed_block => "removed",
             Rule::import_state_block => "import",
             Rule::let_binding => "let",
-            Rule::provider_block => {
+            Rule::provider_block | Rule::provider_expr => {
                 let name = pair.clone().into_inner().next().expect("provider name");
                 return Self::from_preprocessed_range(
                     pair.as_span().start(),
@@ -7585,6 +7585,10 @@ where
     T: ValueKind,
     B: BindingAddress,
 {
+    pub fn directory_verdict(&self) -> &crate::config_loader::DirectoryVerdict {
+        self.parser_binding_metadata.syntax().directory_verdict()
+    }
+
     /// Populate fixture resources while keeping parser-owned metadata private.
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn with_resources_for_test(

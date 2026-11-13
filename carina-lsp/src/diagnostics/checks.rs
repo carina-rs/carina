@@ -641,12 +641,16 @@ impl DiagnosticRun<'_> {
         carina_core::validation::configuration_placement_diagnostics(tree)
             .iter()
             .filter_map(|finding| {
-                render_merged(
+                let mut diagnostic = render_merged(
                     doc,
                     finding,
                     DiagnosticSeverity::ERROR,
-                    finding.detail().to_string(),
-                )
+                    finding.detail().lsp_message(),
+                )?;
+                if let Some(evidence) = finding.detail().root_evidence() {
+                    super::attach_root_evidence(&mut diagnostic, evidence);
+                }
+                Some(diagnostic)
             })
             .collect()
     }
@@ -665,7 +669,12 @@ impl DiagnosticRun<'_> {
         // CLI validation reports only the structural backend-in-module error
         // for a module-definition directory. Keep editor diagnostics at the
         // same layer instead of adding backend-schema errors.
-        if carina_core::validation::is_module_definition(&merged.directory.parsed) {
+        if merged
+            .directory
+            .parsed
+            .directory_verdict()
+            .is_module_template()
+        {
             return Vec::new();
         }
         // A duplicate backend has no single semantic owner. The parser
@@ -1199,18 +1208,27 @@ impl DiagnosticRun<'_> {
         tree: &carina_core::parser::AnalysisTree<'_>,
         exports: &carina_core::upstream_exports::UpstreamExports,
         resolve_errors: &[carina_core::parser::Located<
-            carina_core::upstream_exports::UpstreamResolveError,
+            carina_core::upstream_exports::UpstreamResolveFailure,
         >],
     ) -> Vec<Diagnostic> {
         let mut diagnostics: Vec<_> = resolve_errors
             .iter()
             .filter_map(|finding| {
-                render_merged(
+                let mut diagnostic = render_merged(
                     doc,
                     finding,
                     DiagnosticSeverity::ERROR,
                     finding.detail().to_string(),
-                )
+                )?;
+                if let Some((_, error)) = finding.detail().module_failure()
+                    && let Some(rejection) = error.root_cause().require_outside_module()
+                {
+                    super::attach_root_evidence(
+                        &mut diagnostic,
+                        rejection.detail().root_evidence(),
+                    );
+                }
+                Some(diagnostic)
             })
             .collect();
         macro_rules! render_references {

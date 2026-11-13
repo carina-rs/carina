@@ -5523,7 +5523,7 @@ fn resource_values_report<
     // availability cannot be decided until its resources are expanded into a
     // root configuration. Keep every other schema/type check below active for
     // modules; only defer this provider-availability diagnostic.
-    if !is_module_definition(parsed) {
+    if !parsed.directory_verdict().is_module_template() {
         all_errors.extend(group_anonymous_resource_schema_errors(
             parsed
                 .iter_all_resources()
@@ -7033,7 +7033,7 @@ fn is_string_compatible_type_on_path<'a>(
     }
 }
 
-/// Check that a root configuration does not contain `arguments` blocks.
+/// Check that a root configuration does not contain module interface blocks.
 ///
 /// `arguments` is a module-input declaration: it belongs on the module side
 /// of a module boundary and is paired with `use` on the caller side. In a
@@ -7045,12 +7045,21 @@ fn is_string_compatible_type_on_path<'a>(
 /// the user is validating in isolation. We only flag the misplaced block
 /// when a `backend` or `provider` block is also present, since both are
 /// root-only constructs and unambiguously identify a root configuration.
-pub fn validate_no_arguments_in_root<E>(parsed: &crate::parser::File<E>) -> Result<(), String> {
-    let is_root = parsed.backend.is_some() || !parsed.providers.is_empty();
-    if !parsed.arguments.is_empty() && is_root {
-        return Err(
-            "arguments blocks are only valid inside module definitions, not in root configurations.".to_string(),
-        );
+/// Block presence, including empty arguments/attributes, uses the same
+/// declaration classification as require admission.
+pub fn validate_no_module_declarations_in_root<E>(
+    parsed: &crate::parser::File<E>,
+) -> Result<(), String> {
+    for block in parsed
+        .parser_binding_metadata
+        .syntax()
+        .configuration_blocks()
+    {
+        if let Some(root) = block.detail().directory_verdict().root()
+            && let Some(message) = root_declaration_message(block.detail().kind())
+        {
+            return Err(root.format_message(message));
+        }
     }
     Ok(())
 }
@@ -7982,25 +7991,45 @@ pub fn resolve_export_static_type_for_consumer(
     }
 }
 
-/// Return whether a merged configuration directory is a module definition.
-///
-/// This is the classification used by the root-owned-block validators: a
-/// top-level `arguments` or `attributes` block marks the directory as a
-/// module whose provider configuration comes from its caller.
-#[must_use]
-pub fn is_module_definition<
-    E,
-    P: crate::resource::PlaceholderKind,
-    T: crate::resource::PlaceholderKind,
-    D,
-    B: BindingAddress,
->(
-    parsed: &crate::parser::File<E, P, T, D, B>,
-) -> bool {
-    !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty()
+/// The placement finding owns the issued root evidence; formatting never
+/// searches declarations or reclassifies a directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigurationPlacementDiagnostic {
+    message: &'static str,
+    root: Option<crate::config_loader::RootDirectoryVerdict>,
+}
+impl ConfigurationPlacementDiagnostic {
+    pub fn root_evidence(&self) -> Option<&crate::config_loader::RootEvidence> {
+        self.root.as_ref().map(|root| root.evidence())
+    }
+    pub fn lsp_message(&self) -> String {
+        self.root.as_ref().map_or_else(
+            || self.message.to_string(),
+            |root| root.lsp_message(self.message),
+        )
+    }
+}
+impl std::fmt::Display for ConfigurationPlacementDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.root {
+            Some(root) => f.write_str(&root.format_message(self.message)),
+            None => f.write_str(self.message),
+        }
+    }
+}
+fn root_declaration_message(block: crate::parser::ConfigurationBlock) -> Option<&'static str> {
+    use crate::parser::ConfigurationBlock;
+    match block {
+        ConfigurationBlock::Arguments => Some(
+            "arguments blocks are only valid inside module definitions, not in root configurations.",
+        ),
+        ConfigurationBlock::Attributes => Some(
+            "attributes blocks are only valid inside module definitions, not in root configurations.",
+        ),
+        _ => None,
+    }
 }
 
-/// Report root-only blocks in modules and argument blocks in root configurations.
 pub fn configuration_placement_diagnostics<
     P: crate::resource::PlaceholderKind,
     T: crate::resource::PlaceholderKind,
@@ -8008,28 +8037,36 @@ pub fn configuration_placement_diagnostics<
     D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
 >(
     tree: &crate::parser::AnalysisTree<'_, P, T, D, B>,
-) -> Vec<crate::parser::Located<&'static str>> {
+) -> Vec<crate::parser::Located<ConfigurationPlacementDiagnostic>> {
+    use crate::config_loader::DirectoryVerdict;
     use crate::parser::ConfigurationBlock;
     tree.syntax().configuration_blocks().iter().filter_map(|block| {
-        let message = match block.detail() {
-            ConfigurationBlock::Arguments if tree.is_root_configuration() => "arguments blocks are only valid inside module definitions, not in root configurations.",
-            ConfigurationBlock::Provider if tree.is_module_definition() => "provider blocks are not allowed inside modules. Define providers at the root configuration level.",
-            ConfigurationBlock::State if tree.is_module_definition() => "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
-            ConfigurationBlock::Backend if tree.is_module_definition() => "backend blocks are not allowed inside modules. Define the backend at the root configuration level.",
-            ConfigurationBlock::UpstreamState if tree.is_module_definition() => "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
-            ConfigurationBlock::Exports if tree.is_module_definition() => "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
-            _ => return None,
+        let (message, root) = match block.detail().directory_verdict() {
+            DirectoryVerdict::Root(root) => (root_declaration_message(block.detail().kind())?, Some(root.clone())),
+            DirectoryVerdict::ModuleTemplate(_) => {
+                let message = match block.detail().kind() {
+                    ConfigurationBlock::Provider => "provider blocks are not allowed inside modules. Define providers at the root configuration level.",
+                    ConfigurationBlock::Backend => "backend blocks are not allowed inside modules. Define the backend at the root configuration level.",
+                    ConfigurationBlock::State => "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
+                    ConfigurationBlock::UpstreamState => "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
+                    ConfigurationBlock::Exports => "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
+                    ConfigurationBlock::Arguments | ConfigurationBlock::Attributes => return None,
+                };
+                (message, None)
+            }
+            DirectoryVerdict::Unknown => return None,
         };
-        Some(crate::parser::Located::new(block.location().clone(), message))
+        Some(crate::parser::Located::new(block.location().clone(), ConfigurationPlacementDiagnostic { message, root }))
     }).collect()
 }
 
 /// Check that a module file does not contain provider blocks.
 ///
 /// Provider configuration should only be defined at the root configuration level,
-/// not inside modules (files with `arguments` or `attributes` blocks).
+/// not inside explicitly imported modules. This is a module-use check, not
+/// a directory classifier; the caller has already selected the module boundary.
 pub fn validate_no_provider_in_module<E>(parsed: &crate::parser::File<E>) -> Result<(), String> {
-    if is_module_definition(parsed) && !parsed.providers.is_empty() {
+    if !parsed.providers.is_empty() {
         return Err(
             "provider blocks are not allowed inside modules. Define providers at the root configuration level.".to_string(),
         );
@@ -8044,7 +8081,7 @@ pub fn validate_no_provider_in_module<E>(parsed: &crate::parser::File<E>) -> Res
 pub fn validate_no_state_blocks_in_module<E>(
     parsed: &crate::parser::File<E>,
 ) -> Result<(), String> {
-    if is_module_definition(parsed) && !parsed.state_blocks.is_empty() {
+    if !parsed.state_blocks.is_empty() {
         return Err(
             "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.".to_string(),
         );
@@ -8057,7 +8094,7 @@ pub fn validate_no_state_blocks_in_module<E>(
 /// Backend configuration should only be defined at the root configuration
 /// level, not inside modules (files with `arguments` or `attributes` blocks).
 pub fn validate_no_backend_in_module<E>(parsed: &crate::parser::File<E>) -> Result<(), String> {
-    if is_module_definition(parsed) && parsed.backend.is_some() {
+    if parsed.backend.is_some() {
         return Err(
             "backend blocks are not allowed inside modules. Define the backend at the root configuration level.".to_string(),
         );
@@ -8073,7 +8110,7 @@ pub fn validate_no_backend_in_module<E>(parsed: &crate::parser::File<E>) -> Resu
 pub fn validate_no_upstream_states_in_module<E>(
     parsed: &crate::parser::File<E>,
 ) -> Result<(), String> {
-    if is_module_definition(parsed) && !parsed.upstream_states.is_empty() {
+    if !parsed.upstream_states.is_empty() {
         return Err(
             "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.".to_string(),
         );
@@ -8086,7 +8123,7 @@ pub fn validate_no_upstream_states_in_module<E>(
 /// State exports should only be defined at the root configuration level, not
 /// inside modules (files with `arguments` or `attributes` blocks).
 pub fn validate_no_exports_in_module<E>(parsed: &crate::parser::File<E>) -> Result<(), String> {
-    if is_module_definition(parsed) && !parsed.export_params.is_empty() {
+    if !parsed.export_params.is_empty() {
         return Err(
             "exports blocks are not allowed inside modules. Define exports at the root configuration level.".to_string(),
         );

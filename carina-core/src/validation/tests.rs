@@ -4167,20 +4167,9 @@ fn provider_in_module_with_attributes_errors() {
 
 #[test]
 fn provider_without_module_markers_ok() {
-    let mut parsed = empty_parsed();
-    parsed.providers.push(crate::parser::ProviderConfig {
-        name: "awscc".to_string(),
-        attributes: Default::default(),
-        default_tags: Default::default(),
-        source: None,
-        version: None,
-        revision: None,
-        unresolved_attributes: Default::default(),
-        binding: None,
-    });
-
-    let result = validate_no_provider_in_module(&parsed);
-    assert!(result.is_ok());
+    let parsed = admitted_placement_directory("provider awscc {}\n");
+    assert!(parsed.parsed().directory_verdict().is_root());
+    assert!(validate_no_module_declarations_in_root(parsed.parsed()).is_ok());
 }
 
 #[test]
@@ -4280,7 +4269,7 @@ fn state_block_in_module_with_attributes_errors() {
 
 #[test]
 fn state_blocks_without_module_markers_ok() {
-    let parsed = parse_state_blocks(
+    let parsed = admitted_placement_directory(
         r#"moved {
   from = mock.test.Resource 'old'
   to = mock.test.Resource 'new'
@@ -4297,7 +4286,7 @@ import {
 "#,
     );
 
-    let result = validate_no_state_blocks_in_module(&parsed);
+    let result = validate_no_module_declarations_in_root(parsed.parsed());
 
     assert!(result.is_ok());
 }
@@ -4353,16 +4342,9 @@ fn backend_in_module_with_attributes_errors() {
 
 #[test]
 fn backend_without_module_markers_ok() {
-    let mut parsed = empty_parsed();
-    parsed.backend = Some(crate::parser::BackendConfig {
-        backend_type: "local".to_string(),
-        attributes: Default::default(),
-        attribute_spans: Default::default(),
-    });
-
-    let result = validate_no_backend_in_module(&parsed);
-
-    assert!(result.is_ok());
+    let parsed = admitted_placement_directory("backend local { path = 'state.json' }\n");
+    assert!(parsed.parsed().directory_verdict().is_root());
+    assert!(validate_no_module_declarations_in_root(parsed.parsed()).is_ok());
 }
 
 #[test]
@@ -4416,9 +4398,9 @@ fn upstream_state_in_module_with_attributes_errors() {
 
 #[test]
 fn upstream_state_without_module_markers_ok() {
-    let parsed = parse_root_owned_declaration("let up = upstream_state { source = '../other' }\n");
+    let parsed = admitted_placement_directory("let up = upstream_state { source = '../other' }\n");
 
-    let result = validate_no_upstream_states_in_module(&parsed);
+    let result = validate_no_module_declarations_in_root(parsed.parsed());
 
     assert!(result.is_ok());
 }
@@ -4464,9 +4446,9 @@ fn exports_in_module_with_attributes_errors() {
 
 #[test]
 fn exports_without_module_markers_ok() {
-    let parsed = parse_root_owned_declaration("exports {\n  root_value = 'root'\n}\n");
+    let parsed = admitted_placement_directory("exports {\n  root_value = 'root'\n}\n");
 
-    let result = validate_no_exports_in_module(&parsed);
+    let result = validate_no_module_declarations_in_root(parsed.parsed());
 
     assert!(result.is_ok());
 }
@@ -4481,7 +4463,17 @@ fn module_without_exports_ok() {
     assert!(result.is_ok());
 }
 
-// --- validate_no_arguments_in_root tests ---
+fn admitted_placement_directory(source: &str) -> crate::config_loader::ParsedRootDirectory {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("main.crn"), source).unwrap();
+    crate::config_loader::parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap()
+}
+
+// --- validate_no_module_declarations_in_root tests ---
 
 fn argument_param(name: &str) -> crate::parser::ArgumentParameter {
     crate::parser::ArgumentParameter {
@@ -4493,66 +4485,63 @@ fn argument_param(name: &str) -> crate::parser::ArgumentParameter {
     }
 }
 
-fn provider(name: &str) -> crate::parser::ProviderConfig<ParserPlaceholder> {
-    crate::parser::ProviderConfig {
-        name: name.to_string(),
-        attributes: Default::default(),
-        default_tags: Default::default(),
-        source: None,
-        version: None,
-        revision: None,
-        unresolved_attributes: Default::default(),
-        binding: None,
-    }
-}
-
 #[test]
 fn arguments_with_backend_errors() {
-    let mut parsed = empty_parsed();
-    parsed.arguments.push(argument_param("state_path"));
-    parsed.backend = Some(crate::parser::BackendConfig {
-        backend_type: "local".to_string(),
-        attributes: Default::default(),
-        attribute_spans: Default::default(),
-    });
-
-    let result = validate_no_arguments_in_root(&parsed);
+    let parsed = admitted_placement_directory(
+        "arguments { state_path: String }\nbackend local { path = 'state.json' }\n",
+    );
+    let error = validate_no_module_declarations_in_root(parsed.parsed()).unwrap_err();
     assert_eq!(
-        result.unwrap_err(),
+        error.lines().next().unwrap(),
         "arguments blocks are only valid inside module definitions, not in root configurations."
     );
+    assert!(error.contains("backend block at"), "{error}");
 }
 
 #[test]
 fn arguments_with_provider_errors() {
-    let mut parsed = empty_parsed();
-    parsed.arguments.push(argument_param("vpc_cidr"));
-    parsed.providers.push(provider("aws"));
+    let parsed = admitted_placement_directory("arguments { vpc_cidr: String }\nprovider aws {}\n");
+    assert!(validate_no_module_declarations_in_root(parsed.parsed()).is_err());
+}
 
-    let result = validate_no_arguments_in_root(&parsed);
-    assert!(result.is_err());
+#[test]
+fn authored_arguments_in_root_are_rejected_regardless_of_entries() {
+    for root in ["provider mock {}", "backend local { path = 'state.json' }"] {
+        for block in ["arguments {}", "arguments { n: Int = 1 }"] {
+            let parsed = admitted_placement_directory(&format!("{root}\n{block}\n"));
+            let error = validate_no_module_declarations_in_root(parsed.parsed()).unwrap_err();
+            assert_eq!(
+                error.lines().next().unwrap(),
+                "arguments blocks are only valid inside module definitions, not in root configurations.",
+                "{root}; {block}"
+            );
+            assert!(
+                parsed
+                    .parsed()
+                    .directory_verdict()
+                    .root()
+                    .unwrap()
+                    .evidence()
+                    .location()
+                    .is_some()
+            );
+        }
+    }
 }
 
 #[test]
 fn arguments_alone_is_ok() {
-    // A directory with only `arguments` looks like a module the user
-    // is validating in isolation; we cannot prove it is a root, so
-    // do not flag it (issue #2198).
-    let mut parsed = empty_parsed();
-    parsed.arguments.push(argument_param("vpc_cidr"));
-
-    let result = validate_no_arguments_in_root(&parsed);
-    assert!(result.is_ok());
+    let parsed = admitted_placement_directory("arguments { vpc_cidr: String }\n");
+    assert!(parsed.parsed().directory_verdict().is_module_template());
+    assert!(validate_no_module_declarations_in_root(parsed.parsed()).is_ok());
 }
 
 #[test]
 fn empty_arguments_in_root_ok() {
-    let parsed = empty_parsed();
-    let result = validate_no_arguments_in_root(&parsed);
-    assert!(result.is_ok());
+    let parsed = admitted_placement_directory("// No arguments block.\n");
+    assert!(parsed.parsed().directory_verdict().is_root());
+    assert!(validate_no_module_declarations_in_root(parsed.parsed()).is_ok());
 }
-
-// --- rendered_typecheck_result tests ---
 
 #[test]
 fn bare_builtin_custom_types_report_scalar_kind_mismatches() {

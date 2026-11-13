@@ -317,7 +317,7 @@ impl ResidualModuleResolutionError {
             | ModuleError::StateBlockInModule
             | ModuleError::BackendInModule
             | ModuleError::UpstreamStateInModule
-            | ModuleError::ExportsInModule => None,
+            | ModuleError::ExportsInModule => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::NotADirectory { path: _path } => {
                 Some(ResidualModuleResolutionDiagnostic::ModuleCall)
             }
@@ -1324,25 +1324,19 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     /// in `main.crn` would be invisible to `${env}` interpolations in
     /// sibling `role.crn` (#2815). #2817.
     fn load_directory_module(&self, dir_path: &ResolvedPath) -> Result<ParsedFile, ModuleError> {
-        let paths = super::loader::source_paths_with_overrides(dir_path, &self.source_overrides)?;
-        let mut files: Vec<(std::path::PathBuf, String)> = Vec::with_capacity(paths.len());
-        for path in paths {
-            let content =
-                crate::config_loader::read_source_with_overrides(&path, &self.source_overrides)?;
-            files.push((path.source_label(), content));
-        }
-        let parsed_files = crate::config_loader::parse_directory_files_located_from_root(
-            &files,
-            self.config(),
-            &self.configuration_root,
-        )
-        .map_err(|located| match located.source_file {
-            Some(path) => ModuleError::ParseInFile {
-                path,
-                error: located.error,
-            },
-            None => ModuleError::Parse(*located.error),
-        })?;
+        let files =
+            crate::config_loader::DirectoryFiles::discover(dir_path, &self.source_overrides)?
+                .read_all(&self.source_overrides)
+                .map_err(|error| ModuleError::from(error.into_error()))?;
+        let parsed_files = files
+            .parse_from_root(self.config(), &self.configuration_root)
+            .map_err(|located| match located.source_file {
+                Some(path) => ModuleError::ParseInFile {
+                    path,
+                    error: located.error,
+                },
+                None => ModuleError::Parse(*located.error),
+            })?;
 
         let mut merged = ParsedFile::default();
         for (_, parsed) in parsed_files {

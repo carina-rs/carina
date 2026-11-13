@@ -110,13 +110,16 @@ fn validate_accepts_backend_enum_region_from_sibling_file() {
 #[test]
 fn validate_module_backend_reports_only_the_structural_error() {
     let fixture = tempfile::tempdir().unwrap();
+    let module = fixture.path().join("module");
+    std::fs::create_dir(&module).unwrap();
     std::fs::write(
         fixture.path().join("main.crn"),
-        "arguments {\n  name: String\n}\n",
+        "let component = use { source = './module' }\nlet call = component { name = 'test' }\n",
     )
     .unwrap();
+    std::fs::write(module.join("main.crn"), "arguments {\n  name: String\n}\n").unwrap();
     std::fs::write(
-        fixture.path().join("backend.crn"),
+        module.join("backend.crn"),
         r#"backend s3 {
   bucket = "state"
   key = "state.json"
@@ -129,7 +132,15 @@ fn validate_module_backend_reports_only_the_structural_error() {
     let diagnostics = carina_cli::commands::validate::validate_with_factories(
         &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
         Vec::new(),
-    );
+    )
+    .into_iter()
+    .map(|message| {
+        message
+            .strip_prefix("module: ")
+            .expect("module error retains its import label")
+            .to_string()
+    })
+    .collect::<Vec<_>>();
 
     assert_eq!(
         diagnostics,

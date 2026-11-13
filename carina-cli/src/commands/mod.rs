@@ -496,7 +496,7 @@ fn extend_module_resolution_errors(
 
 /// Backend checks depend on authored values, even when provider loading fails.
 pub(crate) fn validate_root_backend<E>(parsed: &carina_core::parser::File<E>) -> Vec<AppError> {
-    if !carina_core::validation::is_module_definition(parsed)
+    if !parsed.directory_verdict().is_module_template()
         && let Some(backend) = &parsed.backend
         && let Err(error) = StateBackendConfig::try_from(backend)
     {
@@ -689,13 +689,8 @@ fn validate_and_resolve_configuration(
         );
     }
 
-    // A backend in a module-definition directory is the structural error: the
-    // backend is misplaced, so do not also classify the module's arguments as
-    // misplaced root declarations. Provider + arguments retains the existing
-    // root-arguments rule (#2198).
-    if let Err(msg) = carina_core::validation::validate_no_backend_in_module(parsed.parsed()) {
-        errors.push(AppError::Validation(msg));
-    } else if let Err(msg) = carina_core::validation::validate_no_arguments_in_root(parsed.parsed())
+    if let Err(msg) =
+        carina_core::validation::validate_no_module_declarations_in_root(parsed.parsed())
     {
         errors.push(AppError::Validation(msg));
     }
@@ -1054,7 +1049,7 @@ fn validate_and_resolve_configuration(
     // This is the sole parser-placeholder boundary. Standalone module
     // definitions intentionally retain typed module-argument slots until a
     // caller expands them; root configurations must be fully expanded.
-    let placeholder_boundary = if carina_core::validation::is_module_definition(parsed) {
+    let placeholder_boundary = if parsed.directory_verdict().is_module_template() {
         carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
     } else {
         carina_core::parser::ParserPlaceholderBoundary::ExpandedFile

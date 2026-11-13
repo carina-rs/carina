@@ -99,7 +99,10 @@ impl Directory {
         let report: Value = serde_json::from_slice(&output.stdout).unwrap();
         let errors = report["errors"].as_array().unwrap();
         assert_eq!(errors.len(), 1, "{report}");
-        assert_eq!(errors[0]["message"], message);
+        assert_eq!(
+            errors[0]["message"],
+            format!("{message}\n{ROOT_BACKEND_NOTE}")
+        );
         assert_eq!(errors[0]["location"]["file"], "guards.crn");
         assert_eq!(
             errors[0]["location"]["range"],
@@ -284,7 +287,10 @@ fn module_require_error_chain_renders_once() {
     assert!(finding.location().file().path().ends_with("guards.crn"));
     assert_eq!(finding.location().span().start_column(), 1);
     assert_eq!(finding.location().span().end_column(), 32);
-    assert_eq!(finding.detail().to_string(), ROOT_REQUIRE_ERROR);
+    assert_eq!(
+        finding.detail().to_string().lines().next().unwrap(),
+        ROOT_REQUIRE_ERROR
+    );
     assert_eq!(
         carina_cli::error::format_error_with_source_chain(error.as_ref()),
         error.to_string()
@@ -516,7 +522,7 @@ fn root_require_saved_plan_secret_failure_exposes_the_cause() {
     assert_eq!(
         stderr,
         format!(
-            "Error: Saved-plan secret verification failed because the current configuration could not be evaluated (for example, an environment variable or decryption key may be unavailable); re-run `carina plan --out saved.plan {project}` after restoring the required inputs: {project}/guards.crn at line 2\nError: {ROOT_REQUIRE_ERROR}\n",
+            "Error: Saved-plan secret verification failed because the current configuration could not be evaluated (for example, an environment variable or decryption key may be unavailable); re-run `carina plan --out saved.plan {project}` after restoring the required inputs: {project}/guards.crn at line 2\nError: {ROOT_REQUIRE_ERROR}\nError: Note: directory is a root configuration because of the backend block at {project}/providers.crn:1.\n",
             project = directory.project.display(),
         )
     );
@@ -537,6 +543,239 @@ fn rejected(output: &Output, message: &str) {
 }
 
 const ROOT_REQUIRE_ERROR: &str = "`require` is only allowed inside a module";
+const ROOT_BACKEND_NOTE: &str =
+    "Note: directory is a root configuration because of the backend block at providers.crn:1.";
+
+#[test]
+fn blockless_root_explains_complete_directory_evidence() {
+    let directory = root_with_mock_resource();
+    fs::remove_file(directory.project.join("providers.crn")).unwrap();
+    fs::write(
+        directory.project.join("main.crn"),
+        "require false, 'PRIVATE_GUARD'\n",
+    )
+    .unwrap();
+    let output = directory.run(&["validate", "--json", "."]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["errors"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        report["errors"][0]["message"],
+        "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
+    );
+    assert_eq!(report["errors"][0]["location"]["file"], "main.crn");
+}
+
+fn root_with_mock_resource() -> Directory {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let home = temp.path().join("home");
+    fs::create_dir(&project).unwrap();
+    fs::create_dir(&home).unwrap();
+    fs::write(project.join("providers.crn"), "provider mock {}\n").unwrap();
+    fs::write(
+        project.join("main.crn"),
+        "let r = mock.test.resource { name = 'root' }\n",
+    )
+    .unwrap();
+    let directory = Directory {
+        _temp: temp,
+        project,
+        home,
+    };
+    success(&directory.run(&["init", "."]));
+    directory
+}
+
+fn assert_root_declaration_rejected(block: &str, declaration: &str, same_file: bool) {
+    let directory = root_with_mock_resource();
+    success(&directory.run(&["apply", "--auto-approve", "."]));
+    let state_paths = [
+        directory.project.join("carina.state.json"),
+        directory.home.join("mock-state.json"),
+    ];
+    let state_before = state_paths.each_ref().map(|path| fs::read(path).unwrap());
+    let require = "require false, 'PRIVATE_GUARD'\n";
+    fs::write(
+        directory.project.join("guards.crn"),
+        if same_file {
+            format!("{declaration}\n{require}")
+        } else {
+            fs::write(
+                directory.project.join("declarations.crn"),
+                format!("{declaration}\n"),
+            )
+            .unwrap();
+            require.to_string()
+        },
+    )
+    .unwrap();
+    let block_error = format!(
+        "{block} blocks are only valid inside module definitions, not in root configurations."
+    );
+    let evidence_note =
+        "Note: directory is a root configuration because of the provider block at providers.crn:1.";
+    let require_error = format!("{ROOT_REQUIRE_ERROR}\n{evidence_note}");
+    let require_line = if same_file { 2 } else { 1 };
+    let human = directory.run(&["validate", "."]);
+    assert_eq!(human.status.code(), Some(1), "{}", output_text(&human));
+    assert_eq!(String::from_utf8(human.stdout).unwrap(), "Validating...\n");
+    assert_eq!(
+        String::from_utf8(human.stderr).unwrap(),
+        format!(
+            "Error: {block_error}\nError: {evidence_note}\nError: ./guards.crn at line {require_line}\nError: {ROOT_REQUIRE_ERROR}\nError: {evidence_note}\n"
+        )
+    );
+
+    let json = directory.run(&["validate", "--json", "."]);
+    assert_eq!(json.status.code(), Some(1), "{}", output_text(&json));
+    assert!(json.stderr.is_empty(), "{}", output_text(&json));
+    let report: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(report["status"], "error");
+    assert_eq!(
+        report["errors"],
+        json!([
+            {"message": format!("{block_error}\n{evidence_note}"), "severity": "error", "code": null, "location": null},
+            {"message": require_error, "severity": "error", "code": null,
+             "location": {"file": "guards.crn", "range": {
+                 "start": {"line": require_line, "column": 1},
+                 "end": {"line": require_line, "column": require.trim_end().len() + 1}
+             }}}
+        ])
+    );
+    assert!(
+        !String::from_utf8(json.stdout)
+            .unwrap()
+            .contains("PRIVATE_GUARD")
+    );
+
+    let lint = directory.run(&["lint", "."]);
+    assert_eq!(lint.status.code(), Some(1), "{}", output_text(&lint));
+    assert_eq!(String::from_utf8(lint.stdout).unwrap(), "");
+    assert_eq!(
+        String::from_utf8(lint.stderr).unwrap(),
+        format!("warning: .:1  {block_error}\n{evidence_note}\nError: Found 1 lint warning(s).\n")
+    );
+
+    for command in [
+        &["plan", "."][..],
+        &["plan", "--out", "saved.plan", "."],
+        &["apply", "--auto-approve", "."],
+        &["destroy", "--auto-approve", "."],
+    ] {
+        let output = directory.run(command);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{command:?}: {}",
+            output_text(&output)
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "", "{command:?}");
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!(
+                "Error: {block_error}\nError: {evidence_note}\nError: ./guards.crn at line {require_line}\nError: {ROOT_REQUIRE_ERROR}\nError: {evidence_note}\n"
+            ),
+            "{command:?}"
+        );
+        assert!(!directory.project.join("saved.plan").exists());
+        assert_eq!(
+            state_before,
+            state_paths.each_ref().map(|path| fs::read(path).unwrap())
+        );
+    }
+}
+
+#[test]
+fn root_empty_arguments_beside_require_are_rejected() {
+    assert_root_declaration_rejected("arguments", "arguments {}", true);
+}
+
+#[test]
+fn root_empty_arguments_in_sibling_are_rejected() {
+    assert_root_declaration_rejected("arguments", "arguments {}", false);
+}
+
+#[test]
+fn root_empty_attributes_beside_require_are_rejected() {
+    assert_root_declaration_rejected("attributes", "attributes {}", true);
+}
+
+#[test]
+fn root_empty_attributes_in_sibling_are_rejected() {
+    assert_root_declaration_rejected("attributes", "attributes {}", false);
+}
+
+#[test]
+fn root_populated_attributes_beside_require_are_rejected() {
+    assert_root_declaration_rejected("attributes", "attributes { value: Int = 1 }", true);
+}
+
+#[test]
+fn root_populated_attributes_in_sibling_are_rejected() {
+    assert_root_declaration_rejected("attributes", "attributes { value: Int = 1 }", false);
+}
+
+fn assert_called_module_outputs(blocks: &str) {
+    let directory = root_with_mock_resource();
+    fs::create_dir(directory.project.join("checked")).unwrap();
+    fs::write(
+        directory.project.join("main.crn"),
+        "let checked = use { source = './checked' }\nlet call = checked {}\nlet r = mock.test.resource { name = 'root' }\n",
+    )
+    .unwrap();
+    fs::write(directory.project.join("checked/arguments.crn"), blocks).unwrap();
+    fs::write(
+        directory.project.join("checked/guards.crn"),
+        "require true, 'module constraint'\n",
+    )
+    .unwrap();
+    let validate = directory.run(&["validate", "."]);
+    assert_eq!(
+        validate.status.code(),
+        Some(0),
+        "{}",
+        output_text(&validate)
+    );
+    assert_eq!(String::from_utf8(validate.stderr).unwrap(), "");
+    assert_eq!(
+        String::from_utf8(validate.stdout).unwrap(),
+        "Validating...\n✓ 2 resources validated successfully.\n  • mock.test.resource.r\n  • _virtual.call\n⚠ Unused let binding 'r'. Consider using an anonymous resource instead.\n"
+    );
+    let plan = directory.run(&["plan", "."]);
+    assert_eq!(plan.status.code(), Some(0), "{}", output_text(&plan));
+    assert_eq!(String::from_utf8(plan.stderr).unwrap(), "");
+    let stdout = String::from_utf8(plan.stdout).unwrap();
+    // Provider timing varies; keep the entire plan pinned after its timing line.
+    let (provider, plan) = stdout.split_once("\n\nExecution Plan:\n").unwrap();
+    assert!(
+        provider.starts_with(
+            "Using mock provider\nRefreshing state...\n  ✓ mock.test.resource r took "
+        ),
+        "{stdout}"
+    );
+    assert!(provider.ends_with('s'), "{stdout}");
+    assert_eq!(
+        plan,
+        "\n  + mock.test.resource r\n      name: 'root'\n      identifier: (known after apply)\n\nPlan: 1 to add, 0 to change, 0 to destroy.\n\n"
+    );
+}
+
+#[test]
+fn called_module_with_empty_arguments_preserves_validate_and_plan() {
+    assert_called_module_outputs("arguments {}\nattributes { value: Int = 1 }\n");
+}
+
+#[test]
+fn called_module_with_empty_attributes_preserves_validate_and_plan() {
+    assert_called_module_outputs("arguments { n: Int = 1 }\nattributes {}\n");
+}
+
+#[test]
+fn called_module_with_populated_attributes_preserves_validate_and_plan() {
+    assert_called_module_outputs("attributes { value: Int = 1 }\n");
+}
 
 fn assert_root_rejected_on_every_path(condition: &str) {
     let directory = Directory::new(condition);
@@ -597,7 +836,9 @@ fn assert_state_command_rejects_root_require(args: &[&str]) {
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
-        format!("Error: ./guards.crn at line 2\nError: {ROOT_REQUIRE_ERROR}\n")
+        format!(
+            "Error: ./guards.crn at line 2\nError: {ROOT_REQUIRE_ERROR}\nError: {ROOT_BACKEND_NOTE}\n"
+        )
     );
     assert_eq!(before, paths.each_ref().map(|path| fs::read(path).unwrap()));
 }
@@ -687,7 +928,10 @@ fn root_require_one_error_per_statement() {
     let errors = report["errors"].as_array().unwrap();
     assert_eq!(errors.len(), 3, "{report}");
     for (index, error) in errors.iter().enumerate() {
-        assert_eq!(error["message"], ROOT_REQUIRE_ERROR);
+        assert_eq!(
+            error["message"],
+            format!("{ROOT_REQUIRE_ERROR}\n{ROOT_BACKEND_NOTE}")
+        );
         assert_eq!(error["location"]["file"], "guards.crn");
         assert_eq!(error["location"]["range"]["start"]["line"], index + 1);
     }
@@ -814,7 +1058,7 @@ fn root_require_lint_matches_validate() {
             assert_eq!(
                 String::from_utf8(output.stderr).unwrap(),
                 format!(
-                    "Error: Module resolution error: ./{file}:{line}:1: {ROOT_REQUIRE_ERROR}\n"
+                    "Error: Module resolution error: ./{file}:{line}:1: {ROOT_REQUIRE_ERROR}\nError: {ROOT_BACKEND_NOTE}\n"
                 )
             );
         }
@@ -902,7 +1146,9 @@ fn root_require_state_subcommands_follow_validation_paths() {
             .into_state()
             .requires_legacy_dependency_migration()
     );
-    let root_error = format!("Error: ./guards.crn at line 1\nError: {ROOT_REQUIRE_ERROR}\n");
+    let root_error = format!(
+        "Error: ./guards.crn at line 1\nError: {ROOT_REQUIRE_ERROR}\nError: {ROOT_BACKEND_NOTE}\n"
+    );
     let migration_error = format!(
         "Warning: state file legacy.json is v20 on disk; migration toward v21 was loaded in memory. Legacy dependency names, if present, will be classified against the expanded configuration and the disk state will be rewritten by the next apply, destroy, or state refresh.\n{root_error}"
     );

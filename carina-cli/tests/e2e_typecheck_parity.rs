@@ -671,7 +671,6 @@ fn attribute_parameter_mismatch_has_exactly_one_lsp_diagnostic() {
     let fixture = write_fixture(&[
         ("main.crn", source),
         ("source.crn", "let source = test.r.typed {}\n"),
-        ("providers.crn", "provider test {}\n"),
     ]);
     let diagnostics = lsp_diagnostics(
         &engine_with_schemas(expression_typing_schemas()),
