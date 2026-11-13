@@ -13,11 +13,7 @@ use crate::resource::{
 };
 use indexmap::IndexMap;
 use pest::iterators::{Pair, Pairs};
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 #[cfg(test)]
 mod tests;
@@ -316,13 +312,18 @@ pub(crate) enum RequireScope {
     #[default]
     Unknown,
     /// Bootstrap/backend parsing retains complete declarations without
-    /// entering guard validation. Only the directory loader mints this proof.
+    /// entering require placement checks. Only the directory loader mints this proof.
     UnvalidatedDirectory(crate::config_loader::CompleteDirectoryDeclarations),
     Directory(crate::config_loader::CompleteDirectoryDeclarations),
-    ModuleTemplate {
-        arguments: Arc<[String]>,
-    },
+    ModuleTemplate(ModuleTemplateDeclarations),
     ModuleCall,
+}
+
+/// Positive module-declaration evidence, constructed only by for_declarations.
+/// Resolver entry points cannot manufacture a template from argument names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModuleTemplateDeclarations {
+    arguments: Arc<[String]>,
 }
 
 impl RequireScope {
@@ -334,9 +335,9 @@ impl RequireScope {
         if blocks == super::ModuleDeclarationBlocks::Absent {
             Self::Unknown
         } else {
-            Self::ModuleTemplate {
+            Self::ModuleTemplate(ModuleTemplateDeclarations {
                 arguments: arguments.into(),
-            }
+            })
         }
     }
 }
@@ -348,6 +349,7 @@ impl RequireScope {
 struct RetainedRequireCondition {
     id: NodeId,
     scope: RequireScope,
+    statement: DeclarationLocation,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -892,20 +894,22 @@ impl<B: BindingAddress> Expressions<B> {
 /// A schema-judged configuration owns its file and report and borrows the
 /// caller's schema registry. Parsing alone cannot construct this type.
 /// Consumers borrow this bundle so the file and schemas stay paired.
+/// Admission and judgement are inseparable: every Directory require has a
+/// placement verdict, and callers cannot reset the report through this type.
 #[derive(Debug, Clone)]
 pub struct JudgedFile<'a, E, D, B: BindingAddress = RelativeBindingName> {
     file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     schemas: &'a crate::schema::SchemaRegistry,
 }
 
-impl<E, D, B: BindingAddress> JudgedFile<'_, E, D, B> {
+impl<'a, E, D, B: BindingAddress> JudgedFile<'a, E, D, B> {
     pub fn file(&self) -> &super::File<E, ParserPlaceholder, ParserPlaceholder, D, B> {
         &self.file
     }
     pub fn report(&self) -> &ExpressionReport<B> {
         self.file.expression_report()
     }
-    pub fn schemas(&self) -> &crate::schema::SchemaRegistry {
+    pub fn schemas(&self) -> &'a crate::schema::SchemaRegistry {
         self.schemas
     }
     pub(crate) fn into_file(self) -> super::File<E, ParserPlaceholder, ParserPlaceholder, D, B> {
@@ -949,6 +953,7 @@ pub(crate) fn set_require_scope<E, D, B: BindingAddress>(
         .set_require_scope(scope);
 }
 
+#[cfg(test)]
 pub(crate) fn require_scope<E, D, B: BindingAddress>(
     file: &super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
 ) -> RequireScope {
@@ -960,10 +965,10 @@ pub(crate) fn require_scope<E, D, B: BindingAddress>(
         .unwrap_or_default()
 }
 
-/// Full analysis acquires the directory obligation together with its
+/// Full analysis acquires the root require rejection together with its
 /// inference exemption only when the loader proved declaration completeness.
 /// An isolated buffer stays unknown and retains ordinary expression checks.
-pub(crate) fn admit_require_scope<E, D, B: BindingAddress>(
+fn admit_require_scope<E, D, B: BindingAddress>(
     file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
 ) {
     let module_blocks = file
@@ -1123,10 +1128,11 @@ impl Expressions {
         for root in &mut self.roots {
             retain_require_nodes(root, &mut memo, &mut |id, current| {
                 declarations
-                    .contains(&id)
-                    .then(|| RetainedRequireCondition {
+                    .get(&id)
+                    .map(|statement| RetainedRequireCondition {
                         id,
                         scope: scope.clone(),
+                        statement: statement.clone(),
                     })
                     .or(current)
             });
@@ -1283,7 +1289,7 @@ impl ParseNodeKey {
 pub(in crate::parser) struct CapturedNodes {
     inventory: bool,
     nodes: HashMap<ParseNodeKey, ExprValue>,
-    requires: std::sync::RwLock<HashSet<NodeId>>,
+    requires: std::sync::RwLock<HashMap<NodeId, DeclarationLocation>>,
     resource_declarations: HashMap<NodeId, SlotDeclarationId>,
     values: std::sync::RwLock<HashMap<NodeId, Value<ParserPlaceholder, RelativeBindingName>>>,
     conditions: ConditionRecorder,
@@ -1294,11 +1300,11 @@ impl std::fmt::Debug for CapturedNodes {
     }
 }
 impl CapturedNodes {
-    pub(in crate::parser) fn retain_require(&self, id: NodeId) {
+    pub(in crate::parser) fn retain_require(&self, id: NodeId, statement: DeclarationLocation) {
         self.requires
             .write()
             .expect("retained require declarations")
-            .insert(id);
+            .insert(id, statement);
     }
 
     fn condition_snapshot(&self) -> ConditionSnapshot {
@@ -3819,7 +3825,7 @@ mod judgement {
     fn first_error(findings: &[Located<InferenceError>]) -> Option<super::super::ParseError> {
         findings
             .iter()
-            .find(|finding| !matches!(finding.detail(), InferenceError::DirectoryConstraint(_)))
+            .find(|finding| !matches!(finding.detail(), InferenceError::RequireOutsideModule(_)))
             .map(|finding| {
                 super::super::ParseError::InvalidExpression {
                     line: finding.location().span().start_line(),
@@ -4066,12 +4072,15 @@ mod judgement {
             let outer_scope = self.scope;
             self.scope = scope;
             self.visiting.push(id);
-            let directory_require = matches!(
-                &root.kind,
+            let rejected_require = match &root.kind {
                 ExprKind::RequireCondition(require)
-                    if matches!(require.scope, RequireScope::Directory(_))
-            );
-            let mut children = if directory_require {
+                    if matches!(require.scope, RequireScope::Directory(_)) =>
+                {
+                    Some(require.statement.clone())
+                }
+                _ => None,
+            };
+            let mut children = if rejected_require.is_some() {
                 Vec::new()
             } else {
                 root.children
@@ -4112,13 +4121,13 @@ mod judgement {
                     owner: FailureOwner::Boundary,
                 };
             }
-            let mut result = if directory_require {
+            let mut result = if let Some(statement) = rejected_require {
                 // A rejected declaration owns the sole diagnostic for its
                 // condition. Do not infer or evaluate any of its children.
                 self.push_finding(
-                    root.location.authored.clone(),
-                    InferenceError::DirectoryConstraint(Box::new(
-                        crate::module_resolver::DirectoryConstraintDiagnostic,
+                    statement,
+                    InferenceError::RequireOutsideModule(Box::new(
+                        crate::module_resolver::RequireOutsideModuleDiagnostic,
                     )),
                 );
                 declaration()

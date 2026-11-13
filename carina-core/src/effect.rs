@@ -1169,7 +1169,9 @@ impl ResolvedMovePairs {
     /// let parsed = parse_directory(&project_dir, &config).unwrap();
     /// let checks = carina_core::validation::deferred_types::TypeCheckSession::run(
     ///     &config,
-    ///     |session| resolve_modules_providerless(parsed, &project_dir, session)
+    ///     |session| resolve_modules_providerless(
+    ///         parsed.admit(&SchemaRegistry::new(), session), &project_dir,
+    ///     )
     ///         .unwrap()
     ///         .into_expanded(&SchemaRegistry::new(), session.catalog())
     ///         .unwrap(),

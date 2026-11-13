@@ -35,7 +35,7 @@ fn assert_round4_buffer_membership(buffer_text: &str, disk_text: &str, expected_
         if expected_template {
             assert!(matches!(
                 require_scope(configuration.parsed()),
-                RequireScope::ModuleTemplate { .. }
+                RequireScope::ModuleTemplate(_)
             ));
             assert!(configuration.judged().report().findings().is_empty());
         } else {
@@ -123,7 +123,7 @@ fn round3_non_utf8_sibling_is_preserved_in_recovery_discovery() {
         crate::config_loader::load_buffer_configuration_in_directory(snapshot, &schemas, &context);
     assert!(matches!(
         require_scope(buffer.parsed()),
-        RequireScope::ModuleTemplate { .. }
+        RequireScope::ModuleTemplate(_)
     ));
     assert!(buffer.judged().report().findings().is_empty());
     if physical {
@@ -137,11 +137,11 @@ fn round3_non_utf8_sibling_is_preserved_in_recovery_discovery() {
         .unwrap();
         assert!(matches!(
             require_scope(cli.parsed.parsed()),
-            RequireScope::ModuleTemplate { .. }
+            RequireScope::ModuleTemplate(_)
         ));
         assert!(matches!(
             require_scope(lsp.parsed.parsed()),
-            RequireScope::ModuleTemplate { .. }
+            RequireScope::ModuleTemplate(_)
         ));
         let cli_buffer = crate::config_loader::load_buffer_configuration(
             cli.parsed.parsed(),
@@ -258,7 +258,7 @@ fn round2_recovery_uses_sibling_declaration_evidence() {
     let template = load();
     assert!(matches!(
         require_scope(template.parsed()),
-        RequireScope::ModuleTemplate { .. }
+        RequireScope::ModuleTemplate(_)
     ));
     assert!(template.judged().report().findings().is_empty());
 
@@ -325,11 +325,15 @@ fn round1_strict_require_error_retains_location_and_typed_cause() {
     let path = crate::paths::ResolvedPath::new(upstream_dir).unwrap();
     let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
     let error = crate::validation::deferred_types::with_session_for_test(&context, |session| {
-        crate::module_resolver::resolve_modules_providerless(parsed, &path, session).unwrap_err()
+        crate::module_resolver::resolve_modules_providerless(
+            parsed.admit(&crate::schema::SchemaRegistry::new(), session),
+            &path,
+        )
+        .unwrap_err()
     });
-    assert!(error.to_string().contains("upstream/guards.crn:1:9"));
+    assert!(error.to_string().contains("upstream/guards.crn:1:1"));
     let located = error
-        .directory_constraint()
+        .require_outside_module()
         .expect("the located error remains available as a typed cause");
     assert!(
         located
@@ -349,7 +353,7 @@ fn round1_strict_require_error_retains_location_and_typed_cause() {
     };
     let (base, module) = upstream.module_failure().unwrap();
     assert_eq!(base, std::path::Path::new("upstream"));
-    assert!(module.directory_constraint().is_some());
+    assert!(module.require_outside_module().is_some());
     assert!(upstream.source().is_none());
 }
 

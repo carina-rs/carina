@@ -500,9 +500,11 @@ require min_size <= max_size, 'min_size must not exceed max_size'
 ```
 
 `require` is only allowed inside a module. In a root configuration, every
-`require` is a validation error; its condition is neither evaluated nor checked
-for expression errors. A module directory validated directly keeps its
-conditions unevaluated until it is instantiated. See
+`require` is a validation error. Syntax and parse-time checks of its condition
+still run and can report an error before the root rejection. Once parsing
+succeeds, the rejection replaces general expression inference inside the
+condition. The condition is never evaluated. A module directory validated
+directly keeps its conditions unevaluated until it is instantiated. See
 [Require Statement](/reference/dsl/syntax/#require-statement) for directory
 scope rules.
 

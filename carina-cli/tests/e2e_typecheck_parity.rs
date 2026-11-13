@@ -2125,10 +2125,8 @@ fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &Schema
         )
         .unwrap();
         match carina_core::module_resolver::resolve_modules_with_diagnostics(
-            &directory.parsed,
+            directory.parsed.clone().admit(schemas, session),
             &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
-            session,
-            schemas,
             &covered_findings,
         ) {
             carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
@@ -5275,10 +5273,8 @@ awscc.cloudfront.Distribution {
     let parsed =
         carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
             carina_core::module_resolver::resolve_modules_with_providerless_config(
-                loaded.parsed,
+                loaded.parsed.admit(&schemas, session),
                 &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
-                session,
-                &schemas,
             )
             .expect("expand module call without panicking")
         });

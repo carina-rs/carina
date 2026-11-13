@@ -24,6 +24,9 @@
 //! `config_loader::DirectoryParseResult` for a directory parsed by editor
 //! diagnostics. Module directories validated standalone enter through the
 //! ordinary `resolve_modules*` APIs and retain their uninstantiated template scope.
+//! These APIs consume `config_loader::AdmittedRootDirectory`, constructed by
+//! `RootDirectoryParse::admit` with its judgement, schemas, and typecheck context.
+//! A raw loader result cannot enter module resolution.
 
 mod deferred_if;
 mod error;
@@ -59,10 +62,10 @@ pub use signature::{
     load_resolved_module_signatures_with_overrides,
 };
 pub use validation::{
-    ConstraintDiagnostic, ConstraintEvaluation, ConstraintOrigin, DirectoryConstraintDiagnostic,
-    EvaluatedModuleConstraint, ModuleConstraintCall, ModuleConstraintDiagnostic,
-    ModuleConstraintFailure, ModuleConstraintKind, ModuleConstraintResolutionError,
-    ModuleConstraintViolation, ModuleConstraints, evaluate_constraint,
+    ConstraintDiagnostic, ConstraintEvaluation, ConstraintOrigin, EvaluatedModuleConstraint,
+    ModuleConstraintCall, ModuleConstraintDiagnostic, ModuleConstraintFailure,
+    ModuleConstraintKind, ModuleConstraintResolutionError, ModuleConstraintViolation,
+    ModuleConstraints, RequireOutsideModuleDiagnostic, evaluate_constraint,
     evaluate_live_pending_constraints, evaluate_module_constraints,
     evaluate_saved_pending_constraints, referenced_constraint_arguments,
 };

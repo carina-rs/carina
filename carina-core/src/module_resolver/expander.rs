@@ -655,7 +655,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // Collect and evaluate argument-local validations and module-level
         // requirements through the single constraint seam shared by the LSP,
         // planning, and apply.
-        let evaluated_constraints = evaluate_constraint_scope(ConstraintScope::ModuleCall {
+        let evaluated_constraints = evaluate_constraint_scope(ConstraintScope {
             module,
             arguments: argument_substitutions,
             argument_values: &argument_values,
@@ -2588,13 +2588,11 @@ fn resolve_module_binding_uses<P: TypeResolutionPolicy>(
 type ArgumentSubstitutionPosition = crate::value_walk::RewritePosition;
 
 /// Only a module call with bound arguments can enter constraint evaluation.
-pub(super) enum ConstraintScope<'a> {
-    ModuleCall {
-        module: &'a ParsedFile,
-        arguments: ArgumentSubstitutions<'a>,
-        argument_values: &'a HashMap<String, ModuleResolvedValue>,
-        resolved_bindings: Option<&'a crate::binding_index::ResolvedBindings<ParserPlaceholder>>,
-    },
+pub(super) struct ConstraintScope<'a> {
+    module: &'a ParsedFile,
+    arguments: ArgumentSubstitutions<'a>,
+    argument_values: &'a HashMap<String, ModuleResolvedValue>,
+    resolved_bindings: Option<&'a crate::binding_index::ResolvedBindings<ParserPlaceholder>>,
 }
 
 pub(super) fn evaluate_constraint_scope(
@@ -2603,7 +2601,7 @@ pub(super) fn evaluate_constraint_scope(
     Vec<crate::parser::Located<EvaluatedModuleConstraint<ParserPlaceholder>>>,
     ArgumentSubstitutionError,
 > {
-    let ConstraintScope::ModuleCall {
+    let ConstraintScope {
         module,
         arguments,
         argument_values,
@@ -2635,25 +2633,18 @@ pub(super) fn evaluate_constraint_scope(
 }
 
 impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
-    pub(super) fn check_directory_requires<E>(
+    pub(super) fn check_require_placement<E>(
         &self,
-        parsed: &crate::parser::File<E>,
+        judged: &crate::parser::retained::JudgedFile<'_, E, crate::parser::ParsedDeferredForPhase>,
     ) -> Result<(), ModuleError> {
-        use crate::parser::retained::RequireScope;
-        match crate::parser::retained::require_scope(parsed) {
-            RequireScope::Directory(_) | RequireScope::UnvalidatedDirectory(_) => {}
-            RequireScope::Unknown
-            | RequireScope::ModuleTemplate { .. }
-            | RequireScope::ModuleCall => return Ok(()),
-        }
-        // Only retained RequireCondition nodes with a Directory witness can
-        // produce these findings. Public AST lists cannot grant or erase them.
-        let failures = parsed
-            .expression_report()
+        // JudgedFile can only be constructed by admission plus judgement and
+        // exposes no mutable file access. Every root require has its verdict.
+        let failures = judged
+            .report()
             .findings()
             .iter()
             .filter_map(|finding| {
-                if let crate::static_type::InferenceError::DirectoryConstraint(diagnostic) =
+                if let crate::static_type::InferenceError::RequireOutsideModule(diagnostic) =
                     finding.detail()
                 {
                     Some(crate::parser::Located::new(
@@ -2666,13 +2657,15 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             })
             .collect::<Vec<_>>();
         if self.records_constraint_reports() {
-            self.record_directory_constraint_report(failures);
+            if !failures.is_empty() {
+                self.record_require_outside_module_report(failures);
+            }
             Ok(())
         } else {
             ModuleError::from_errors(
                 failures
                     .into_iter()
-                    .map(|failure| ModuleError::DirectoryConstraint(Box::new(failure)))
+                    .map(|failure| ModuleError::RequireOutsideModule(Box::new(failure)))
                     .collect(),
             )
             .map_or(Ok(()), Err)

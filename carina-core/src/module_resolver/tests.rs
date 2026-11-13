@@ -59,39 +59,45 @@ fn assert_round4_empty_template(blocks: &str) {
         crate::config_loader::load_configuration_with_config(&path, &context, &schemas).unwrap();
     assert!(matches!(
         crate::parser::retained::require_scope(loaded.parsed.parsed()),
-        crate::parser::retained::RequireScope::ModuleTemplate { .. }
+        crate::parser::retained::RequireScope::ModuleTemplate(_)
     ));
     crate::validation::deferred_types::with_session_for_test(&context, |session| {
         for template in [false, true] {
             let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
             let result = if template {
-                super::resolve_module_template_with_config(parsed, &path, session, &schemas)
+                super::resolve_module_template_with_config(parsed.admit(&schemas, session), &path)
             } else {
-                super::resolve_modules_with_config(parsed, &path, session, &schemas)
+                super::resolve_modules_with_config(parsed.admit(&schemas, session), &path)
             };
             assert!(result.is_ok(), "{result:?}");
             let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
             let result = if template {
                 super::resolve_module_template_with_providerless_config(
-                    parsed, &path, session, &schemas,
+                    parsed.admit(&schemas, session),
+                    &path,
                 )
             } else {
-                super::resolve_modules_with_providerless_config(parsed, &path, session, &schemas)
+                super::resolve_modules_with_providerless_config(
+                    parsed.admit(&schemas, session),
+                    &path,
+                )
             };
             assert!(result.is_ok(), "{result:?}");
         }
         let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
         assert!(matches!(
-            super::resolve_modules_with_diagnostics(&parsed, &path, session, &schemas, &[]),
+            super::resolve_modules_with_diagnostics(
+                parsed.clone().admit(&schemas, session),
+                &path,
+                &[],
+            ),
             super::ModuleResolutionDiagnosticResult::Expanded { .. }
         ));
         assert!(matches!(
             super::resolve_modules_with_providerless_diagnostics(
-                &parsed,
+                parsed.clone().admit(&schemas, session),
                 &path,
-                session,
-                &schemas,
-                &[]
+                &[],
             ),
             super::ModuleResolutionDiagnosticResult::Expanded { .. }
         ));
@@ -114,7 +120,7 @@ fn assert_round4_empty_template(blocks: &str) {
         );
         assert!(matches!(
             crate::parser::retained::require_scope(configuration.parsed()),
-            crate::parser::retained::RequireScope::ModuleTemplate { .. }
+            crate::parser::retained::RequireScope::ModuleTemplate(_)
         ));
         assert!(configuration.judged().report().findings().is_empty());
     }
@@ -154,10 +160,14 @@ fn round1_direct_template_scope_in_all_resolver_entry_points() {
             let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
             let result = if template_api {
                 super::resolve_module_template_with_providerless_config(
-                    parsed, &path, session, &schemas,
+                    parsed.admit(&schemas, session),
+                    &path,
                 )
             } else {
-                super::resolve_modules_with_providerless_config(parsed, &path, session, &schemas)
+                super::resolve_modules_with_providerless_config(
+                    parsed.admit(&schemas, session),
+                    &path,
+                )
             };
             assert!(
                 result.is_ok(),
@@ -166,9 +176,9 @@ fn round1_direct_template_scope_in_all_resolver_entry_points() {
             );
             let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
             let result = if template_api {
-                super::resolve_module_template_with_config(parsed, &path, session, &schemas)
+                super::resolve_module_template_with_config(parsed.admit(&schemas, session), &path)
             } else {
-                super::resolve_modules_with_config(parsed, &path, session, &schemas)
+                super::resolve_modules_with_config(parsed.admit(&schemas, session), &path)
             };
             assert!(
                 result.is_ok(),
@@ -179,16 +189,18 @@ fn round1_direct_template_scope_in_all_resolver_entry_points() {
         let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
         assert!(matches!(
             super::resolve_modules_with_providerless_diagnostics(
-                &parsed,
+                parsed.clone().admit(&schemas, session),
                 &path,
-                session,
-                &schemas,
-                &[]
+                &[],
             ),
             super::ModuleResolutionDiagnosticResult::Expanded { .. }
         ));
         assert!(matches!(
-            super::resolve_modules_with_diagnostics(&parsed, &path, session, &schemas, &[]),
+            super::resolve_modules_with_diagnostics(
+                parsed.clone().admit(&schemas, session),
+                &path,
+                &[],
+            ),
             super::ModuleResolutionDiagnosticResult::Expanded { .. }
         ));
     });
@@ -213,23 +225,14 @@ fn resolve_modules(
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             super::resolve_modules_providerless(
-                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                    .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(base_dir).unwrap(),
-                session,
             )
             .map_err(Box::new)
         },
     )
     .map_err(|error| *error)
-}
-
-// An irrefutable pattern makes adding a directory evaluator scope fail to compile.
-#[test]
-fn root_require_evaluator_scope_is_module_call_only() {
-    fn module_call_only(scope: super::expander::ConstraintScope<'_>) {
-        let super::expander::ConstraintScope::ModuleCall { .. } = scope;
-    }
-    let _ = module_call_only;
 }
 
 #[test]
@@ -272,15 +275,18 @@ fn root_require_directory_rejected_and_module_evaluated() {
         .unwrap();
         let parsed = crate::config_loader::parse_directory(&path, &config).unwrap();
         crate::validation::deferred_types::with_session_for_test(&config, |session| {
-            let result = super::resolve_modules_providerless(parsed, &path, session);
+            let result = super::resolve_modules_providerless(
+                parsed.admit(&crate::schema::SchemaRegistry::new(), session),
+                &path,
+            );
             assert!(result.is_err(), "ignored root constraint: {condition}");
             let error = result.err().unwrap();
-            let ModuleError::DirectoryConstraint(diagnostic) = &error else {
+            let ModuleError::RequireOutsideModule(diagnostic) = &error else {
                 panic!("directory failure must retain its own owner: {error}");
             };
             assert!(diagnostic.location().file().path().ends_with("guards.crn"));
             assert_eq!(diagnostic.location().span().start_line(), 1);
-            assert_eq!(diagnostic.location().span().start_column(), 9);
+            assert_eq!(diagnostic.location().span().start_column(), 1);
             assert_eq!(
                 diagnostic.detail().to_string(),
                 "`require` is only allowed inside a module"
@@ -295,9 +301,12 @@ fn root_require_directory_rejected_and_module_evaluated() {
     .unwrap();
     let parsed = crate::config_loader::parse_directory(&path, &config).unwrap();
     crate::validation::deferred_types::with_session_for_test(&config, |session| {
-        let error = super::resolve_modules_providerless(parsed, &path, session)
-            .err()
-            .unwrap();
+        let error = super::resolve_modules_providerless(
+            parsed.admit(&crate::schema::SchemaRegistry::new(), session),
+            &path,
+        )
+        .err()
+        .unwrap();
         let ModuleError::Constraint(diagnostic) = error.root_cause() else {
             panic!("module failure must retain its call owner: {error}");
         };
@@ -319,10 +328,9 @@ fn resolve_modules_with_config(
 ) -> Result<ModuleResolvedParsedFile, ModuleError> {
     crate::validation::deferred_types::with_session_for_test(config, |session| {
         super::resolve_modules_with_providerless_config(
-            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                .admit(schemas, session),
             &crate::paths::ResolvedPath::new(base_dir).unwrap(),
-            session,
-            schemas,
         )
         .map_err(Box::new)
     })
@@ -425,13 +433,12 @@ impl ModuleResolutionFixture {
             .expect("fixture caller parses");
         crate::validation::deferred_types::with_session_for_test(&config, |session| {
             resolve_upstream_modules_with_providerless_config(
-                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                    .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(
                     caller_file.parent().expect("caller file has a directory"),
                 )
                 .unwrap(),
-                session,
-                &crate::schema::SchemaRegistry::new(),
                 &Default::default(),
             )
         })
@@ -1405,10 +1412,10 @@ let forwarded = inner { flag = flag }
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             super::resolve_modules_with_providerless_diagnostics(
-                &parsed,
+                parsed
+                    .clone()
+                    .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(&outer_dir).unwrap(),
-                session,
-                &crate::schema::SchemaRegistry::new(),
                 &[],
             )
         },
@@ -9917,10 +9924,10 @@ let resources = for item in itmes {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             super::resolve_modules_with_providerless_config(
-                loaded.parsed,
+                loaded
+                    .parsed
+                    .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
-                session,
-                &crate::schema::SchemaRegistry::new(),
             )
             .expect_err("finalization must reject an undefined managed-resource iterable")
         },
@@ -9959,9 +9966,9 @@ let second = for item in secnd_items {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             super::resolve_modules_providerless(
-                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                    .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                session,
             )
             .expect_err("finalization must reject both undefined iterables")
         },
@@ -11072,10 +11079,8 @@ fn anonymous_module_handle_output_resolves_after_instance_reconciliation() {
         assert_eq!(loaded.parsed.export_params.len(), 1);
         crate::validation::deferred_types::with_session_for_test(&context, |session| {
             super::resolve_modules_with_providerless_config(
-                loaded.parsed,
+                loaded.parsed.admit(&schemas, session),
                 &crate::paths::ResolvedPath::new(&fixture.root).unwrap(),
-                session,
-                &schemas,
             )
             .map_err(Box::new)
         })
@@ -11930,4 +11935,76 @@ let child = consumer_module { record = "record-id" }
         ),
         "unexpected diagnostic: {error}",
     );
+}
+
+#[test]
+fn r1_root_require_template_apis_need_declaration_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("guards.crn"), "require true, 'x'\n").unwrap();
+    let context = LoadedProviderContext::empty_for_test();
+    let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let schemas = crate::schema::SchemaRegistry::new();
+    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        for providerless in [false, true] {
+            let parsed = crate::config_loader::parse_directory(&base, &context).unwrap();
+            let result = if providerless {
+                super::resolve_module_template_with_providerless_config(
+                    parsed.admit(&schemas, session),
+                    &base,
+                )
+            } else {
+                super::resolve_module_template_with_config(parsed.admit(&schemas, session), &base)
+            };
+            let error = result.expect_err("a template API cannot manufacture module declarations");
+            assert_eq!(
+                error.require_outside_module().unwrap().detail().to_string(),
+                "`require` is only allowed inside a module"
+            );
+        }
+    });
+}
+
+fn assert_r1_require_admission(reset_report: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("guards.crn"), "require true, 'x'\n").unwrap();
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let schemas = crate::schema::SchemaRegistry::new();
+    let parsed = crate::config_loader::parse_directory(&base, &context).unwrap();
+    let resolution = parsed.module_resolution_context();
+    let mut parsed = parsed.into_parsed();
+    let crate::parser::retained::RequireScope::UnvalidatedDirectory(evidence) =
+        crate::parser::retained::require_scope(&parsed)
+    else {
+        panic!("expected an unadmitted complete directory");
+    };
+    if reset_report {
+        crate::parser::retained::set_require_scope(
+            &mut parsed,
+            crate::parser::retained::RequireScope::Directory(evidence),
+        );
+    }
+    assert!(parsed.expression_report().findings().is_empty());
+    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        let resolver =
+            ModuleResolver::with_config_and_schemas(&base, session, &schemas, resolution);
+        let judged = crate::parser::retained::JudgedFile::new(parsed, &schemas, &context);
+        let error = resolver
+            .check_require_placement(&judged)
+            .expect_err("an unadmitted or unjudged directory must not pass the placement check");
+        assert_eq!(
+            error.require_outside_module().unwrap().detail().to_string(),
+            "`require` is only allowed inside a module"
+        );
+    });
+}
+
+#[test]
+fn r1_root_require_unadmitted_directory_cannot_pass() {
+    assert_r1_require_admission(false);
+}
+
+#[test]
+fn r1_root_require_unjudged_directory_cannot_pass() {
+    assert_r1_require_admission(true);
 }

@@ -370,7 +370,8 @@ fn lint_result(
             // suggestions return once the blocking finding is fixed.
             let mut parsed = if module_boundary_findings.is_empty() && type_findings.is_empty() {
                 let resolution = module_resolver::resolve_module_template_with_config(
-                    parsed, base_dir, catalog, schemas,
+                    parsed.admit(schemas, catalog),
+                    base_dir,
                 );
                 LintFile::Resolved(resolution.map_err(|e| {
                     format!(

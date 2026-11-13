@@ -2636,10 +2636,9 @@ mod tests {
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             |session| {
                 carina_core::module_resolver::resolve_modules_with_providerless_config(
-                    carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+                    carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed)
+                        .admit(&carina_core::schema::SchemaRegistry::new(), session),
                     &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
-                    session,
-                    &carina_core::schema::SchemaRegistry::new(),
                 )
                 .expect("test fixture crosses module resolution")
             },

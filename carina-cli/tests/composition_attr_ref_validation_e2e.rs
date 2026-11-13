@@ -667,13 +667,11 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
         provider_context,
         |session| {
             carina_core::module_resolver::resolve_modules_with_config(
-                parsed,
+                parsed.admit(schemas.schemas(), session),
                 &carina_core::paths::ResolvedPath::new(carina_core::config_loader::get_base_dir(
                     &fixture.caller,
                 ))
                 .unwrap(),
-                session,
-                schemas.schemas(),
             )
             .expect("expand module call")
         },

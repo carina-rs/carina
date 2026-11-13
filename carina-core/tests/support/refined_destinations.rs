@@ -98,10 +98,8 @@ pub fn check(
     )?;
     let parsed = with_session_for_test(snapshot.provider_context(), |session| {
         carina_core::module_resolver::resolve_modules_with_config(
-            loaded.parsed,
+            loaded.parsed.admit(schemas, session),
             &root,
-            session,
-            schemas,
         )
     })
     .map_err(|e| e.to_string())?;

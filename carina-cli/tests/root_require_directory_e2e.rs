@@ -103,8 +103,8 @@ impl Directory {
         assert_eq!(
             errors[0]["location"]["range"],
             json!({
-                "start": {"line": 2, "column": 9},
-                "end": {"line": 2, "column": 9 + condition.len()}
+                "start": {"line": 2, "column": 1},
+                "end": {"line": 2, "column": 23 + condition.len()}
             })
         );
 
@@ -137,8 +137,8 @@ impl Directory {
                 assert_eq!(
                     matching[0].range,
                     Range::new(
-                        Position::new(1, 8),
-                        Position::new(1, 8 + condition.len() as u32)
+                        Position::new(1, 0),
+                        Position::new(1, 22 + condition.len() as u32)
                     )
                 );
             } else {
@@ -279,10 +279,10 @@ fn round5_module_guard_error_chain_renders_once() {
     else {
         panic!("expected module failure");
     };
-    let finding = error.directory_constraint().unwrap();
+    let finding = error.require_outside_module().unwrap();
     assert!(finding.location().file().path().ends_with("guards.crn"));
-    assert_eq!(finding.location().span().start_column(), 9);
-    assert_eq!(finding.location().span().end_column(), 14);
+    assert_eq!(finding.location().span().start_column(), 1);
+    assert_eq!(finding.location().span().end_column(), 32);
     assert_eq!(finding.detail().to_string(), ROOT_REQUIRE_ERROR);
     assert_eq!(
         carina_cli::error::format_error_with_source_chain(error.as_ref()),
@@ -295,7 +295,7 @@ fn round5_upstream_source_error_chain_renders_once() {
     let (error, _) = round5_upstream_failures();
     let (base, module) = error.module_failure().unwrap();
     assert!(base.ends_with("upstream"));
-    assert!(module.directory_constraint().is_some());
+    assert!(module.require_outside_module().is_some());
     assert_eq!(
         carina_cli::error::format_error_with_source_chain(&error),
         error.to_string()
@@ -406,13 +406,13 @@ fn assert_round1_upstream_guard(condition: &str) {
     assert_eq!(
         error["location"]["range"],
         json!({
-            "start": {"line": 2, "column": 9},
-            "end": {"line": 2, "column": 9 + condition.len()}
+            "start": {"line": 2, "column": 1},
+            "end": {"line": 2, "column": 27 + condition.len()}
         })
     );
     let human = directory.run(&["validate", "."]);
     let text = output_text(&human);
-    assert!(text.contains("upstream/guards.crn:2:9"), "{text}");
+    assert!(text.contains("upstream/guards.crn:2:1"), "{text}");
 }
 
 #[test]
@@ -722,4 +722,116 @@ fn root_require_attributes_only_directory_is_template() {
     .unwrap();
     success(&directory.run(&["validate", "checked"]));
     success(&directory.run(&["validate", "--json", "checked"]));
+}
+
+#[test]
+fn r1_root_require_lint_matches_validate() {
+    for condition in ["true", "false", "n == 2"] {
+        let directory = Directory::new(condition);
+        rejected(&directory.run(&["lint", "."]), ROOT_REQUIRE_ERROR);
+    }
+}
+
+#[test]
+fn r1_root_require_lint_keeps_module_template_scope() {
+    let directory = Directory::new("true");
+    for blocks in [
+        "arguments { n: Int }",
+        "arguments {}",
+        "attributes {}",
+        "attributes { value: Int = 1 }",
+    ] {
+        fs::write(directory.project.join("checked/arguments.crn"), blocks).unwrap();
+        fs::write(
+            directory.project.join("checked/guards.crn"),
+            "require false, 'template guard'\n",
+        )
+        .unwrap();
+        success(&directory.run(&["lint", "checked"]));
+    }
+}
+
+#[test]
+fn r1_root_require_blockless_import_keeps_module_context() {
+    let directory = Directory::new("true");
+    directory.clear_guard();
+    fs::remove_file(directory.project.join("checked/arguments.crn")).unwrap();
+    fs::write(
+        directory.project.join("checked/guards.crn"),
+        "require true, 'blockless guard'\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.project.join("main.crn"),
+        "let checked = use { source = './checked' }\n",
+    )
+    .unwrap();
+    // An imported directory is analyzed in module context. Existing callability
+    // rules for a directory with no declared inputs/outputs are unchanged.
+    for args in [&["validate", "."][..], &["validate", "--json", "."]] {
+        let imported = directory.run(args);
+        rejected(&imported, "Module not found: ./checked");
+        assert!(!output_text(&imported).contains(ROOT_REQUIRE_ERROR));
+    }
+    fs::write(
+        directory.project.join("main.crn"),
+        "let checked = use { source = './checked' }\nlet call = checked {}\n",
+    )
+    .unwrap();
+    let called = directory.run(&["validate", "."]);
+    rejected(&called, "Module not found: ./checked");
+    assert!(!output_text(&called).contains(ROOT_REQUIRE_ERROR));
+    rejected(&directory.run(&["validate", "checked"]), ROOT_REQUIRE_ERROR);
+    rejected(&directory.run(&["lint", "checked"]), ROOT_REQUIRE_ERROR);
+}
+
+#[test]
+fn r1_root_require_parse_time_errors_precede_placement() {
+    for (condition, message, column) in [
+        (
+            "[1] == [1]",
+            "Syntax error: expected validate_primary",
+            Some(9),
+        ),
+        (
+            "{ key = 1 } == null",
+            "Syntax error: expected EOI or statement",
+            Some(21),
+        ),
+        (
+            "'abc'[0] == 'a'",
+            "Syntax error: expected compare_op, add_op, or multiplicative_op",
+            Some(14),
+        ),
+        (
+            "r[env('K')] != null",
+            "index access key must be an integer or string, got function call",
+            None,
+        ),
+    ] {
+        let directory = Directory::new(condition);
+        let human = directory.run(&["validate", "."]);
+        let human_message = message.strip_prefix("Syntax error: ").unwrap_or(message);
+        rejected(&human, human_message);
+        assert_eq!(output_text(&human).matches(human_message).count(), 1);
+        assert!(!output_text(&human).contains(ROOT_REQUIRE_ERROR));
+        let output = directory.run(&["validate", "--json", "."]);
+        assert!(!output.status.success());
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let errors = report["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{report}");
+        assert_eq!(errors[0]["message"], message);
+        assert_eq!(errors[0]["location"]["file"], "guards.crn");
+        if let Some(column) = column {
+            assert_eq!(
+                errors[0]["location"]["range"],
+                json!({
+                    "start": {"line": 2, "column": column},
+                    "end": {"line": 2, "column": column}
+                })
+            );
+        } else {
+            assert_eq!(errors[0]["location"]["range"], Value::Null);
+        }
+    }
 }

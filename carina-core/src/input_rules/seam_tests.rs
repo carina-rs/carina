@@ -1091,37 +1091,30 @@ fn all_module_publication_paths_retain_authored_rule_authority() {
             let graph =
                 crate::validation::deferred_types::with_session_for_test(&context, |session| {
                     match entry {
-                        0 => resolve_modules_with_config(parsed.clone(), &base, session, &schemas),
-                        1 => resolve_modules_with_providerless_config(
-                            parsed.clone(),
+                        0 => resolve_modules_with_config(
+                            parsed.clone().admit(&schemas, session),
                             &base,
-                            session,
-                            &schemas,
+                        ),
+                        1 => resolve_modules_with_providerless_config(
+                            parsed.clone().admit(&schemas, session),
+                            &base,
                         ),
                         2 => resolve_module_template_with_config(
-                            parsed.clone(),
+                            parsed.clone().admit(&schemas, session),
                             &base,
-                            session,
-                            &schemas,
                         ),
                         3 => resolve_module_template_with_providerless_config(
-                            parsed.clone(),
+                            parsed.clone().admit(&schemas, session),
                             &base,
-                            session,
-                            &schemas,
                         ),
                         4 => resolve_upstream_modules_with_config(
-                            parsed.clone(),
+                            parsed.clone().admit(&schemas, session),
                             &base,
-                            session,
-                            &schemas,
                             &Default::default(),
                         ),
                         5 => resolve_upstream_modules_with_providerless_config(
-                            parsed.clone(),
+                            parsed.clone().admit(&schemas, session),
                             &base,
-                            session,
-                            &schemas,
                             &Default::default(),
                         ),
                         _ => unreachable!(),

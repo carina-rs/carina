@@ -150,10 +150,9 @@ where
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::module_resolver::resolve_modules_with_providerless_config(
-                carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
+                carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed)
+                    .admit(&carina_core::schema::SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
-                session,
-                &carina_core::schema::SchemaRegistry::new(),
             )
             .expect("test fixture crosses module resolution")
         },
@@ -1100,9 +1099,9 @@ for account_id in orgs.accounts {
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
         |session| {
             carina_core::module_resolver::resolve_modules_providerless(
-                carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                    .admit(&carina_core::schema::SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-                session,
             )
             .expect("cross the deferred-body resolution seam")
         },
@@ -10350,9 +10349,9 @@ mod apply_deferred_for_parity {
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
             |session| {
                 carina_core::module_resolver::resolve_modules_providerless(
-                    carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                        .admit(&carina_core::schema::SchemaRegistry::new(), session),
                     &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                    session,
                 )
                 .expect("cross the deferred-body resolution seam")
             },

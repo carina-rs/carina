@@ -1507,9 +1507,8 @@ mod tests {
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
             |session| {
                 carina_core::module_resolver::resolve_modules_providerless(
-                    parsed,
+                    parsed.admit(&carina_core::schema::SchemaRegistry::new(), session),
                     &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
-                    session,
                 )
                 .expect("cross the deferred-body resolution seam")
             },

@@ -201,8 +201,8 @@ pub enum ModuleError {
     Constraint(Box<ModuleConstraintDiagnostic>),
 
     #[error("{0}")]
-    DirectoryConstraint(
-        Box<crate::parser::Located<super::validation::DirectoryConstraintDiagnostic>>,
+    RequireOutsideModule(
+        Box<crate::parser::Located<super::validation::RequireOutsideModuleDiagnostic>>,
     ),
 
     #[error(
@@ -224,13 +224,13 @@ impl From<ParseError> for ModuleError {
 }
 
 impl ModuleError {
-    /// Authored directory guard and location, without exposing the diagnostic
+    /// Authored require rejected outside a module and its location, without exposing the diagnostic
     /// already included in this error's Display as another source-chain link.
-    pub fn directory_constraint(
+    pub fn require_outside_module(
         &self,
-    ) -> Option<&crate::parser::Located<super::validation::DirectoryConstraintDiagnostic>> {
+    ) -> Option<&crate::parser::Located<super::validation::RequireOutsideModuleDiagnostic>> {
         match self.root_cause() {
-            Self::DirectoryConstraint(finding) => Some(finding),
+            Self::RequireOutsideModule(finding) => Some(finding),
             _ => None,
         }
     }
@@ -338,7 +338,7 @@ impl ModuleError {
             | Self::UpstreamStateInModule
             | Self::ExportsInModule
             | Self::Constraint(_)
-            | Self::DirectoryConstraint(_)
+            | Self::RequireOutsideModule(_)
             | Self::NotADirectory { .. } => ModuleErrorCallSource::Unavailable,
         }
     }
@@ -397,7 +397,7 @@ impl ModuleError {
             | Self::UpstreamStateInModule
             | Self::ExportsInModule
             | Self::Constraint(_)
-            | Self::DirectoryConstraint(_)
+            | Self::RequireOutsideModule(_)
             | Self::NotADirectory { path: _ } => None,
         }
     }
@@ -465,7 +465,7 @@ impl ModuleError {
             | Self::UpstreamStateInModule
             | Self::ExportsInModule
             | Self::Constraint(_)
-            | Self::DirectoryConstraint(_)
+            | Self::RequireOutsideModule(_)
             | Self::NotADirectory { .. }) => error,
         }
     }
@@ -582,7 +582,7 @@ impl ModuleError {
             | Self::UpstreamStateInModule
             | Self::ExportsInModule
             | Self::Constraint(_)
-            | Self::DirectoryConstraint(_)
+            | Self::RequireOutsideModule(_)
             | Self::NotADirectory { .. } => self.to_string(),
         }
     }
@@ -619,7 +619,7 @@ impl ModuleError {
             | Self::UpstreamStateInModule
             | Self::ExportsInModule
             | Self::Constraint(_)
-            | Self::DirectoryConstraint(_)
+            | Self::RequireOutsideModule(_)
             | Self::NotADirectory { .. } => false,
         }
     }

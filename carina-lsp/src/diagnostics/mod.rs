@@ -311,14 +311,13 @@ fn render_module_call_findings(
 ) -> Vec<Diagnostic> {
     findings
         .iter()
-        // Directory declarations publish through their retained expression
-        // report on both directory and buffer-only paths. This renderer owns
-        // the module-call carrier of constraint outcomes.
+        // Require-placement rejections publish through retained expression
+        // reports. This renderer owns evaluated module-call outcomes.
         .filter(|finding| {
             !matches!(
                 finding.message(),
                 carina_core::validation::ModuleCallFindingMessage::Constraint(
-                    carina_core::module_resolver::ConstraintDiagnostic::Directory(_)
+                    carina_core::module_resolver::ConstraintDiagnostic::RequireOutsideModule(_)
                 )
             )
         })

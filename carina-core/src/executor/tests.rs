@@ -322,9 +322,9 @@ fn anonymous_deferred_collision_fixture() -> (
                 &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 |session| {
                     crate::module_resolver::resolve_modules_providerless(
-                        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                            .admit(&crate::schema::SchemaRegistry::new(), session),
                         &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                        session,
                     )
                     .map_err(Box::new)
                 },
@@ -8308,9 +8308,9 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(
-                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                    .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                session,
             )
             .expect("reference alias fixture crosses the module-resolution seam")
         },

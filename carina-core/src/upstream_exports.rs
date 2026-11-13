@@ -997,17 +997,13 @@ pub fn resolve_upstream_exports_from_parsed(
     let expansion_schemas = schemas.unwrap_or(&empty_schemas);
     let module_resolution = match provider_context.loaded_context() {
         Some(_loaded) => crate::module_resolver::resolve_upstream_modules_with_config(
-            parsed,
+            parsed.admit(expansion_schemas, config),
             source_abs,
-            config,
-            expansion_schemas,
             overrides,
         ),
         None => crate::module_resolver::resolve_upstream_modules_with_providerless_config(
-            parsed,
+            parsed.admit(expansion_schemas, config),
             source_abs,
-            config,
-            expansion_schemas,
             overrides,
         ),
     };
@@ -1925,15 +1921,15 @@ mod tests {
             .unwrap();
             assert_eq!(errors.len(), 1, "upstream guard was omitted");
             let (_, error) = errors[0].detail().module_failure().unwrap();
-            let crate::module_resolver::ModuleError::DirectoryConstraint(finding) =
+            let crate::module_resolver::ModuleError::RequireOutsideModule(finding) =
                 error.root_cause()
             else {
                 panic!("expected a located directory constraint: {error}");
             };
             assert_eq!(finding.location().file().path(), guard);
             assert_eq!(finding.location().span().start_line(), 1);
-            assert_eq!(finding.location().span().start_column(), 9);
-            assert_eq!(finding.location().span().end_column(), 14);
+            assert_eq!(finding.location().span().start_column(), 1);
+            assert_eq!(finding.location().span().end_column(), 32);
             assert_eq!(
                 finding.detail().to_string(),
                 "`require` is only allowed inside a module"

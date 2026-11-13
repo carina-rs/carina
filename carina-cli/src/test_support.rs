@@ -81,10 +81,8 @@ pub(crate) fn composition_declaration_fixture() -> carina_core::parser::Declarat
             .unwrap();
     carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
         carina_core::module_resolver::resolve_modules_with_providerless_config(
-            loaded.parsed,
+            loaded.parsed.admit(&schemas, session),
             &project,
-            session,
-            &schemas,
         )
         .unwrap()
         .compositions

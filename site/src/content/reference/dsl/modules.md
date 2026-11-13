@@ -159,9 +159,11 @@ still unresolved.
 
 `require` is argument validation for modules. A `require` in a root
 configuration (a directory with no `arguments` or `attributes` block) is a
-validation error, even if its condition is true. The condition is neither
-evaluated nor checked for expression errors. This also applies to a root
-configuration loaded through `upstream_state`; the error retains the upstream
+validation error, even if its condition is true. Syntax and parse-time
+checks still run first. After parsing succeeds, the rejection replaces general
+expression inference inside the condition; the condition is never evaluated.
+The rejection starts at the `require` keyword and covers the statement.
+This also applies to a root configuration loaded through `upstream_state`; the error retains the upstream
 file and position. See [Require Statement](/reference/dsl/syntax/#require-statement).
 
 When validated directly, a directory containing either module declaration

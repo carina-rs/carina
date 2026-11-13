@@ -8775,10 +8775,8 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
                 provider_context,
                 |session| {
                     carina_core::module_resolver::resolve_modules_with_diagnostics(
-                        &resolver_input,
+                        resolver_input.clone().admit(&engine.schemas, session),
                         &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
-                        session,
-                        &engine.schemas,
                         &[],
                     )
                 },
@@ -8789,10 +8787,8 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
                 provider_context,
                 |session| {
                     carina_core::module_resolver::resolve_modules_with_providerless_diagnostics(
-                        &resolver_input,
+                        resolver_input.clone().admit(&engine.schemas, session),
                         &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
-                        session,
-                        &engine.schemas,
                         &[],
                     )
                 },

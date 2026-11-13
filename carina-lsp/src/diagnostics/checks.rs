@@ -900,10 +900,12 @@ impl DiagnosticRun<'_> {
         // successful outcome can replace it with the expanded graph.
         let module_resolution =
             carina_core::module_resolver::resolve_modules_with_diagnostics_and_overrides(
-                &result.directory.parsed,
+                result
+                    .directory
+                    .parsed
+                    .clone()
+                    .admit(&self.schemas, self.provider_context),
                 base_path,
-                self.provider_context,
-                &self.schemas,
                 &covered_findings,
                 source_overrides,
             );
@@ -1082,10 +1084,8 @@ impl DiagnosticRun<'_> {
             .ok()?;
         let module_resolution =
             carina_core::module_resolver::resolve_modules_with_diagnostics_and_overrides(
-                &merged,
+                merged.clone().admit(&self.schemas, self.provider_context),
                 base_path,
-                self.provider_context,
-                &self.schemas,
                 &[],
                 &carina_core::config_loader::SourceOverrides::from([(
                     doc.source_file().to_path_buf(),

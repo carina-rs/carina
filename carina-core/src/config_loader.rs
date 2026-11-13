@@ -393,6 +393,47 @@ pub struct RootDirectoryParse<E = crate::parser::ParsedExportParam> {
 pub type ParsedRootDirectory = RootDirectoryParse<crate::parser::ParsedExportParam>;
 pub type InferredRootDirectory = RootDirectoryParse<crate::parser::InferredExportParam>;
 
+/// A loader-owned directory after require admission and expression judgement.
+/// Only [`RootDirectoryParse::admit`] can construct this immutable resolver input.
+#[derive(Clone)]
+pub struct AdmittedRootDirectory<'a, E = crate::parser::ParsedExportParam> {
+    judged: crate::parser::retained::JudgedFile<'a, E, crate::parser::ParsedDeferredForPhase>,
+    resolution: ModuleResolutionContext,
+    context: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+}
+
+impl<'a, E> AdmittedRootDirectory<'a, E> {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::parser::retained::JudgedFile<'a, E, crate::parser::ParsedDeferredForPhase>,
+        ModuleResolutionContext,
+        &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) {
+        (self.judged, self.resolution, self.context)
+    }
+}
+
+impl<E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder>> RootDirectoryParse<E> {
+    /// Admit the retained require scopes and judge this exact loader snapshot.
+    pub fn admit<'a>(
+        self,
+        schemas: &'a SchemaRegistry,
+        context: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> AdmittedRootDirectory<'a, E> {
+        let resolution = self.module_resolution_context();
+        AdmittedRootDirectory {
+            judged: crate::parser::retained::JudgedFile::new(
+                self.parsed,
+                schemas,
+                context.catalog(),
+            ),
+            resolution,
+            context,
+        }
+    }
+}
+
 /// Negative scope evidence minted only after directory discovery and a
 /// successful declaration parse of every source in that snapshot. A caller
 /// cannot obtain it from an isolated buffer or a caller-supplied source batch.
@@ -485,7 +526,7 @@ impl<E> RootDirectoryParse<E> {
 
     #[cfg(any(test, feature = "test-utils"))]
     /// Wrap test data without granting directory declaration completeness.
-    /// Directory-scoped guard tests must use a real directory loader.
+    /// Require placement tests must use a real directory loader.
     pub fn from_parsed_for_test(mut parsed: File<E>) -> Self
     where
         E: crate::parser::ExportParamLike,
@@ -814,7 +855,7 @@ impl DirectoryBufferSnapshot {
 /// Judge the buffer parsed from the exact member text of this sealed snapshot.
 /// Incomplete syntax knowledge retains ordinary expression checks without a
 /// require verdict. A known module block proves template scope; only complete
-/// absence of module blocks admits directory evaluation.
+/// absence of module blocks admits rejection of a require outside a module.
 pub fn load_buffer_configuration_in_directory<'a>(
     snapshot: DirectoryBufferSnapshot,
     schemas: &'a SchemaRegistry,
@@ -3399,10 +3440,8 @@ for account_id in orgs.accounts {
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::module_resolver::resolve_modules_with_providerless_config(
-                    config.parsed,
+                    config.parsed.admit(&SchemaRegistry::new(), session),
                     &crate::paths::ResolvedPath::new(&dir).unwrap(),
-                    session,
-                    &SchemaRegistry::new(),
                 )
                 .expect("directory fixture crosses the module-resolution seam")
             },
@@ -3588,10 +3627,8 @@ let orgs = upstream_state {
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::module_resolver::resolve_modules_with_providerless_config(
-                    parsed,
+                    parsed.admit(&SchemaRegistry::new(), session),
                     &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
-                    session,
-                    &SchemaRegistry::new(),
                 )
                 .map_err(Box::new)
             },

@@ -358,7 +358,7 @@ fn module_error_diagnostics(
                 ModuleErrorCallSource::Unavailable => None,
             };
             let mut diagnostics = match finding.error {
-                ModuleError::DirectoryConstraint(finding) => {
+                ModuleError::RequireOutsideModule(finding) => {
                     vec![Diagnostic::located(
                         finding.detail().to_string(),
                         finding.location(),

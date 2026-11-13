@@ -21,20 +21,20 @@ use super::ModuleError;
 /// A rejected root declaration retains no condition or user message in its error.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("`require` is only allowed inside a module")]
-pub struct DirectoryConstraintDiagnostic;
+pub struct RequireOutsideModuleDiagnostic;
 
-/// Scope ownership is retained through rendering; a directory failure cannot
-/// be mistaken for an anonymous module call.
+/// Require placement errors and evaluated module-call failures retain their
+/// distinct ownership through rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstraintDiagnostic {
-    Directory(DirectoryConstraintDiagnostic),
+    RequireOutsideModule(RequireOutsideModuleDiagnostic),
     ModuleCall(Box<ModuleConstraintDiagnostic>),
 }
 
 impl fmt::Display for ConstraintDiagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Directory(diagnostic) => diagnostic.fmt(f),
+            Self::RequireOutsideModule(diagnostic) => diagnostic.fmt(f),
             Self::ModuleCall(diagnostic) => diagnostic.fmt(f),
         }
     }

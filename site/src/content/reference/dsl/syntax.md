@@ -444,13 +444,17 @@ require cidr_block != '', 'CIDR block cannot be empty'
 A `require` outside a module is a validation error:
 `` `require` is only allowed inside a module ``. In a root configuration
 (directory with no `arguments` or `attributes` block), every `require` is
-rejected, whether its condition is true or false. Its condition is neither
-evaluated nor checked for expression errors. Validation, planning, saving a
-plan, live apply, and the language server report the same error at the
-condition's authored file and position, including declarations in sibling files.
+rejected, whether its condition is true or false. Parsing still checks the
+condition's syntax and parse-time restrictions; a parse error is reported
+before the placement check. After parsing succeeds, the root rejection
+replaces general expression inference inside the condition, and the condition
+is never evaluated. Validation, lint, planning, saving a plan, live apply,
+and the language server report the rejection at the `require` keyword with
+a range covering the authored statement, including declarations in sibling files.
 
-Root scope is established only after all sibling `.crn` files have been read
-and parsed. If a sibling cannot be read or parsed and no module declaration
+A directory with no `arguments` or `attributes` block is a root configuration
+when validated directly. Root scope is established only after all sibling
+`.crn` files have been read and parsed. If a sibling cannot be read or parsed and no module declaration
 block is known, the scope remains unknown and no `require` verdict is issued.
 Ordinary expression checks still run in that case and for isolated editor buffers.
 

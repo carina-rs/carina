@@ -994,9 +994,9 @@ mod tests {
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::module_resolver::resolve_modules_providerless(
-                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                        .admit(&crate::schema::SchemaRegistry::new(), session),
                     &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                    session,
                 )
                 .expect("deferred fixture crosses the module-resolution seam")
             },
@@ -1073,9 +1073,9 @@ mod tests {
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::module_resolver::resolve_modules_providerless(
-                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                        .admit(&crate::schema::SchemaRegistry::new(), session),
                     &crate::paths::ResolvedPath::new(".").unwrap(),
-                    session,
                 )
                 .map_err(Box::new)
             },

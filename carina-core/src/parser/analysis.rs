@@ -141,6 +141,7 @@ impl DeclarationLocation {
                 | Rule::type_expr
                 | Rule::attributes_param
                 | Rule::exports_param
+                | Rule::require_statement
                 | Rule::validate_expr
                 | Rule::for_expr
                 | Rule::if_expr

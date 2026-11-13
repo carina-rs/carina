@@ -370,7 +370,8 @@ fn round5_module_body_slots_keep_per_instance_authored_roots() {
     let parsed = crate::config_loader::parse_directory(&path, &catalog).unwrap();
     with_session_for_test(&catalog, |session| {
         let expanded = crate::module_resolver::resolve_modules_with_providerless_config(
-            parsed, &path, session, &schemas,
+            parsed.admit(&schemas, session),
+            &path,
         )
         .unwrap();
         let configuration =

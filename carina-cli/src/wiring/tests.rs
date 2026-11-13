@@ -676,10 +676,8 @@ fn retained_deferred_warnings_match_source_location_for_both_file_owners() {
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::module_resolver::resolve_modules_with_providerless_config(
-                loaded.parsed,
+                loaded.parsed.admit(&SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-                session,
-                &SchemaRegistry::new(),
             )
             .unwrap()
         },
@@ -1457,10 +1455,8 @@ fn anonymous_to_named_fixed_point_uses_state_origin_after_undeclared_hash_projec
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::module_resolver::resolve_modules_with_providerless_config(
-                loaded.parsed,
+                loaded.parsed.admit(&SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-                session,
-                &SchemaRegistry::new(),
             )
             .expect("test fixture crosses module resolution")
         },
@@ -1800,10 +1796,9 @@ query {}
     let parsed =
         carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
             carina_core::module_resolver::resolve_modules_with_providerless_config(
-                carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                    .admit(&SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(&root_dir).unwrap(),
-                session,
-                &SchemaRegistry::new(),
             )
             .expect("anonymous calls must expand")
         });
@@ -1899,10 +1894,9 @@ outer {{}}
     let parsed =
         carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
             carina_core::module_resolver::resolve_modules_with_providerless_config(
-                carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                    .admit(&SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(&root_dir).unwrap(),
-                session,
-                &SchemaRegistry::new(),
             )
             .expect("nested calls must expand")
         });
@@ -2717,10 +2711,9 @@ where
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::module_resolver::resolve_modules_with_providerless_config(
-                carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
+                carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed)
+                    .admit(&carina_core::schema::SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                session,
-                &carina_core::schema::SchemaRegistry::new(),
             )
             .expect("test fixture crosses module resolution")
         },
@@ -8254,10 +8247,8 @@ async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::module_resolver::resolve_modules_with_providerless_config(
-                loaded.parsed,
+                loaded.parsed.admit(&SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-                session,
-                &SchemaRegistry::new(),
             )
             .expect("test fixture crosses module resolution")
         },
@@ -8446,10 +8437,8 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::module_resolver::resolve_modules_with_providerless_config(
-                loaded.parsed,
+                loaded.parsed.admit(&SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-                session,
-                &SchemaRegistry::new(),
             )
             .expect("test fixture crosses module resolution")
         },
@@ -12585,9 +12574,9 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
             |session| {
                 carina_core::module_resolver::resolve_modules_providerless(
-                    carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                        .admit(&carina_core::schema::SchemaRegistry::new(), session),
                     &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                    session,
                 )
                 .map_err(Box::<dyn std::error::Error>::from)
             },

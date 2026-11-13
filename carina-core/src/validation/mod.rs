@@ -3004,7 +3004,7 @@ fn check_inferred_assignment<P: PlaceholderKind, B: BindingAddress>(
             });
         }
         Err(crate::static_type::InferenceIssue::Failed(
-            error @ (inference::InferenceError::DirectoryConstraint(_)
+            error @ (inference::InferenceError::RequireOutsideModule(_)
             | inference::InferenceError::InsideSecret { .. }
             | inference::InferenceError::SecretAssignmentMismatch { .. }
             | inference::InferenceError::InvalidIntegerArithmeticOperand { .. }
@@ -6249,7 +6249,7 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
     let inferred = match deferred_iterable_shape_for_phase(&judged) {
         Ok(inferred) => Some(inferred),
         Err(crate::static_type::InferenceIssue::Failed(
-            error @ (inference::InferenceError::DirectoryConstraint(_)
+            error @ (inference::InferenceError::RequireOutsideModule(_)
             | inference::InferenceError::InsideSecret { .. }
             | inference::InferenceError::SecretAssignmentMismatch { .. }
             | inference::InferenceError::MissingEvidence(_)
@@ -8691,7 +8691,7 @@ impl ModuleCallFinding {
                         .argument_value_location(&error.identity.argument)
                         .unwrap_or_else(|| call.declaration_location()),
                     ModuleCallFindingMessage::Constraint(
-                        crate::module_resolver::ConstraintDiagnostic::Directory(_),
+                        crate::module_resolver::ConstraintDiagnostic::RequireOutsideModule(_),
                     ) => unreachable!("directory findings have authored anchors"),
                     ModuleCallFindingMessage::Constraint(
                         crate::module_resolver::ConstraintDiagnostic::ModuleCall(diagnostic),
@@ -9792,7 +9792,7 @@ impl ModuleCallChecker<'_> {
     ) {
         for report in reports {
             let report = match report {
-                crate::module_resolver::ConstraintScopeReport::Directory(failures) => {
+                crate::module_resolver::ConstraintScopeReport::RequireOutsideModule(failures) => {
                     for failure in failures {
                         let anchor = ModuleCallFindingAnchor::new(failure.location().clone());
                         let owner = ModuleCallFindingOwnerSource::Authored(anchor.clone());
@@ -9804,7 +9804,7 @@ impl ModuleCallChecker<'_> {
                             }],
                             anchor,
                             message: ModuleCallFindingMessage::Constraint(
-                                crate::module_resolver::ConstraintDiagnostic::Directory(
+                                crate::module_resolver::ConstraintDiagnostic::RequireOutsideModule(
                                     failure.detail().clone(),
                                 ),
                             ),

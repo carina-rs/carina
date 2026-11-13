@@ -1206,10 +1206,8 @@ mod producer_tests {
                 .unwrap();
                 let resolution =
                     crate::module_resolver::resolve_module_template_with_providerless_config(
-                        loaded.parsed,
+                        loaded.parsed.admit(&schemas, context),
                         &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
-                        context,
-                        &schemas,
                     );
                 resolution.map_err(Box::new)
             },
@@ -1252,10 +1250,8 @@ mod producer_tests {
                     .unwrap();
                     let resolution =
                         crate::module_resolver::resolve_module_template_with_providerless_config(
-                            loaded.parsed,
+                            loaded.parsed.admit(&schemas, context),
                             &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
-                            context,
-                            &schemas,
                         );
                     resolution.map_err(Box::new)
                 },

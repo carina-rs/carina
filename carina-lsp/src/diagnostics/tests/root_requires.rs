@@ -227,8 +227,8 @@ fn root_require_directory_diagnostics_follow_authored_sibling() {
         assert_eq!(
             matching[0].range,
             Range::new(
-                Position::new(1, 8),
-                Position::new(1, 8 + condition.len() as u32)
+                Position::new(1, 0),
+                Position::new(1, 22 + condition.len() as u32)
             )
         );
     }
@@ -254,6 +254,9 @@ fn root_require_unreadable_sibling_keeps_unknown_scope() {
     );
     assert_eq!(
         diagnostics[0].range,
-        Range::new(Position::new(0, 8), Position::new(0, 12))
+        Range::new(
+            Position::new(0, 0),
+            Position::new(0, source.trim_end().encode_utf16().count() as u32)
+        )
     );
 }

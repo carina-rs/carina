@@ -132,10 +132,8 @@ fn module_instances_retain_substituted_judgements() {
     let directory = crate::config_loader::parse_directory(&path, &config).unwrap();
     let graph = deferred_types::with_session_for_test(&config, |session| {
         crate::module_resolver::resolve_modules_with_providerless_config(
-            directory,
+            directory.admit(&SchemaRegistry::new(), session),
             &path,
-            session,
-            &SchemaRegistry::new(),
         )
     })
     .unwrap();
@@ -330,10 +328,8 @@ fn deferred_directive_consumes_judged_iterable_type() {
         crate::config_loader::load_configuration_with_config(&path, &config, &schemas).unwrap();
     let graph = deferred_types::with_session_for_test(&config, |session| {
         crate::module_resolver::resolve_modules_with_providerless_config(
-            loaded.parsed,
+            loaded.parsed.admit(&schemas, session),
             &path,
-            session,
-            &schemas,
         )
     })
     .unwrap();
@@ -450,10 +446,8 @@ fn authored_expression_module_argument_substitution_cannot_erase_fallback() {
     .unwrap();
     let result = deferred_types::with_session_for_test(&config, |session| {
         crate::module_resolver::resolve_modules_with_providerless_config(
-            loaded.parsed,
+            loaded.parsed.admit(&SchemaRegistry::new(), session),
             &path,
-            session,
-            &SchemaRegistry::new(),
         )
     });
     assert!(
@@ -3100,10 +3094,8 @@ mock.test.Consumer { name = shared }
     .expect("load module fixture");
     let parsed = crate::validation::deferred_types::with_session_for_test(&config, |session| {
         crate::module_resolver::resolve_modules_with_providerless_config(
-            parsed,
+            parsed.admit(&schemas, session),
             &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
-            session,
-            &schemas,
         )
         .expect("expand nested module")
     });
@@ -11100,10 +11092,8 @@ fn module_argument_interpolation_cannot_bypass_substitution() {
     let result =
         deferred_types::with_session_for_test(&expression_validation_config(), |session| {
             crate::module_resolver::resolve_modules_with_providerless_config(
-                parsed,
+                parsed.admit(&SchemaRegistry::new(), session),
                 &path,
-                session,
-                &SchemaRegistry::new(),
             )
         });
     assert!(
@@ -11135,10 +11125,8 @@ fn instances_retain_each_authored_location() {
     let location = child.attribute_params[0].value_location().unwrap().clone();
     let graph = deferred_types::with_session_for_test(&expression_validation_config(), |session| {
         crate::module_resolver::resolve_modules_with_providerless_config(
-            parsed,
+            parsed.admit(&SchemaRegistry::new(), session),
             &path,
-            session,
-            &SchemaRegistry::new(),
         )
     })
     .unwrap();

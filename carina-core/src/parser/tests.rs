@@ -1154,10 +1154,9 @@ fn deferred_for_projection_evaluates_nested_env_from_the_caller_snapshot() {
         .expect("the environment lookup stays deferred until upstream is loaded");
         crate::validation::deferred_types::with_session_for_test(&context, |session| {
             let mut expanded = crate::module_resolver::resolve_modules_with_providerless_config(
-                crate::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
+                crate::config_loader::RootDirectoryParse::from_parsed_for_test(parsed)
+                    .admit(&schemas, session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                session,
-                &schemas,
             )
             .expect("fixture crosses module resolution")
             .into_expanded(&schemas, &context)
@@ -1260,10 +1259,9 @@ where
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_with_providerless_config(
-                crate::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
+                crate::config_loader::RootDirectoryParse::from_parsed_for_test(parsed)
+                    .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                session,
-                &crate::schema::SchemaRegistry::new(),
             )
             .expect("deferred fixture crosses the module-resolution seam")
         },
@@ -5718,10 +5716,9 @@ fn resolve_provider_attributes_with_remote_uses_sibling_user_functions() {
                     &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
                     &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
-                .unwrap(),
+                .unwrap()
+                .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
-                session,
-                &crate::schema::SchemaRegistry::new(),
             )
             .expect("provider config crosses the module-resolution seam")
         },
@@ -5772,10 +5769,9 @@ fn resolve_provider_attributes_with_remote_preserves_function_call_line() {
                     &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
                     &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
-                .unwrap(),
+                .unwrap()
+                .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
-                session,
-                &crate::schema::SchemaRegistry::new(),
             )
             .expect("provider config crosses the module-resolution seam")
         },
@@ -15975,9 +15971,9 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(
-                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                    .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                session,
             )
             .expect_err("finalization must reject the bare undefined iterable")
         },
@@ -17214,9 +17210,8 @@ fn parse_directory_preserves_module_arg_dotted_string_literal() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             resolve_modules(
-                parsed,
+                parsed.admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
-                session,
             )
             .expect("module expansion must succeed")
         },

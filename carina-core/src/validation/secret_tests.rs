@@ -196,10 +196,8 @@ fn secret_origin_4275_module_arguments_inside_secret_are_substituted() {
     let parsed = crate::config_loader::parse_directory(&path, &config()).unwrap();
     let graph = deferred_types::with_session_for_test(&config(), |session| {
         crate::module_resolver::resolve_modules_with_providerless_config(
-            parsed,
+            parsed.admit(&SchemaRegistry::new(), session),
             &path,
-            session,
-            &SchemaRegistry::new(),
         )
     })
     .unwrap();
@@ -221,10 +219,8 @@ fn secret_origin_4275_if_condition_diagnostic_has_no_source_literal() {
     let parsed = crate::config_loader::parse_directory(&path, &config()).unwrap();
     let error = deferred_types::with_session_for_test(&config(), |session| {
         crate::module_resolver::resolve_modules_with_providerless_config(
-            parsed,
+            parsed.admit(&SchemaRegistry::new(), session),
             &path,
-            session,
-            &SchemaRegistry::new(),
         )
     })
     .unwrap_err();
@@ -426,10 +422,8 @@ fn secret_origin_4275_module_builtin_failure_is_redacted() {
     let parsed = crate::config_loader::parse_directory(&path, &config()).unwrap();
     let error = deferred_types::with_session_for_test(&config(), |session| {
         crate::module_resolver::resolve_modules_with_providerless_config(
-            parsed,
+            parsed.admit(&SchemaRegistry::new(), session),
             &path,
-            session,
-            &SchemaRegistry::new(),
         )
     })
     .unwrap_err();

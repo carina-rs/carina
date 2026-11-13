@@ -888,10 +888,8 @@ fn validate_and_resolve_configuration(
     }
 
     let module_resolution = module_resolver::resolve_modules_with_diagnostics(
-        &parsed,
+        parsed.clone().admit(ctx.schemas(), enriched_context),
         base_dir,
-        enriched_context,
-        ctx.schemas(),
         &authored_module_call_findings,
     );
     let mut parsed = match module_resolution {
