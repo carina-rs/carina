@@ -4635,7 +4635,7 @@ fn project_plan_attributes<'a>(
     attributes: &'a IndexMap<String, Value>,
     bindings: &ResolvedBindings,
     errors: &mut Vec<PlanError>,
-) -> HashMap<String, carina_core::resource::knowledge::PlanResolved<'a>> {
+) -> IndexMap<String, carina_core::resource::knowledge::PlanResolved<'a>> {
     use carina_core::resource::knowledge::{KnowledgeContext, PlanResolved};
     let cx = KnowledgeContext::plan(bindings);
     attributes
@@ -4693,7 +4693,7 @@ fn validate_resolved_value_constraints(
             carina_core::validation::admission::kind::ResourceAttribute,
         >(
             &mut plan_errors,
-            &resource.id,
+            carina_core::parser::TopLevelResourceRef::Resource(resource),
             schema,
             &classified,
             &resource.quoted_string_attrs,
@@ -4735,7 +4735,7 @@ fn validate_resolved_value_constraints(
             carina_core::validation::admission::kind::DataSourceAttribute,
         >(
             &mut plan_errors,
-            &resource.id,
+            carina_core::parser::TopLevelResourceRef::DataSource(resource),
             schema,
             &classified,
             &resource.quoted_string_attrs,
@@ -4751,16 +4751,16 @@ fn append_resolved_value_constraint_errors<
     K: carina_core::validation::admission::RechecksResolved,
 >(
     plan_errors: &mut Vec<PlanError>,
-    id: &ResourceId,
+    resource: carina_core::parser::TopLevelResourceRef<'_>,
     schema: OwnerBoundResourceSchema<'_>,
-    attributes: &HashMap<String, carina_core::resource::knowledge::PlanResolved<'_>>,
+    attributes: &IndexMap<String, carina_core::resource::knowledge::PlanResolved<'_>>,
     quoted_string_attrs: &HashSet<String>,
     origin_attributes: &IndexMap<String, Value>,
     session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) {
     let report = carina_core::validation::admission::attributes::admit_plan_attributes::<K>(
         schema,
-        id,
+        &resource,
         attributes,
         quoted_string_attrs,
         session,
@@ -4769,7 +4769,7 @@ fn append_resolved_value_constraint_errors<
         let (attributes, origins) =
             resolved_constraint_context(error, origin_attributes, schema.schema().as_schema());
         plan_errors.push(PlanError::new(
-            id.clone(),
+            resource.id().clone(),
             PlanErrorKind::ResolvedValueConstraint {
                 attributes,
                 origins,

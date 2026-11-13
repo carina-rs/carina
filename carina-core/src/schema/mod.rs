@@ -2302,7 +2302,7 @@ fn knowledge_type_error<B: BindingAddress>(
 #[cfg(test)]
 pub(crate) fn classified_attributes<'v, P: PlaceholderKind, B: BindingAddress>(
     attributes: &'v HashMap<String, Value<P, B>>,
-) -> Result<HashMap<String, Classification<'v, P, B>>, Vec<TypeError>> {
+) -> Result<indexmap::IndexMap<String, Classification<'v, P, B>>, Vec<TypeError>> {
     attributes
         .iter()
         .map(|(name, value)| {
@@ -10553,7 +10553,7 @@ impl ValidatedResourceSchema {
     #[cfg(test)]
     pub(crate) fn validate_with_origins_and_lookup<P: PlaceholderKind, B: BindingAddress>(
         &self,
-        attributes: &HashMap<String, Classification<'_, P, B>>,
+        attributes: &indexmap::IndexMap<String, Classification<'_, P, B>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
@@ -12841,7 +12841,7 @@ impl<R: PatternForm> PatternResourceSchema<R> {
 
     /// Returns a map of block_name -> canonical attribute name
     /// for all attributes that have a block_name set.
-    pub fn block_name_map(&self) -> HashMap<String, String> {
+    pub fn block_name_map(&self) -> IndexMap<String, String> {
         self.attributes
             .iter()
             .filter_map(|(attr_name, schema)| {
@@ -15565,7 +15565,8 @@ pub(crate) fn levenshtein_distance(a: &str, b: &str) -> usize {
     prev[b_len]
 }
 
-/// Suggest the most similar field name, if one is close enough
+/// Suggest the most similar field name, if one is close enough.
+/// Equal distances retain candidate order: canonical fields, then schema-ordered aliases.
 pub fn suggest_similar_name(unknown: &str, known: &[&str]) -> Option<String> {
     let max_distance = match unknown.len() {
         0..=2 => 1,
@@ -15575,10 +15576,11 @@ pub fn suggest_similar_name(unknown: &str, known: &[&str]) -> Option<String> {
 
     known
         .iter()
-        .map(|name| (*name, levenshtein_distance(unknown, name)))
-        .filter(|(_, dist)| *dist <= max_distance)
-        .min_by_key(|(_, dist)| *dist)
-        .map(|(name, _)| name.to_string())
+        .enumerate()
+        .map(|(rank, name)| (*name, levenshtein_distance(unknown, name), rank))
+        .filter(|(_, dist, _)| *dist <= max_distance)
+        .min_by_key(|(_, dist, rank)| (*dist, *rank))
+        .map(|(name, _, _)| name.to_string())
 }
 
 /// Validate a single IPv6 group (1-4 hex digits)
@@ -16416,7 +16418,7 @@ impl PatternResourceSchema<Compiled> {
         T: StructuralPending<'v, P, B>,
     >(
         &self,
-        attributes: &HashMap<String, Classification<'v, P, B, T>>,
+        attributes: &indexmap::IndexMap<String, Classification<'v, P, B, T>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         admission: &value_validation::AttributeAdmission<'_, 'v, P, B, T>,
     ) -> ResourceValueValidation {
@@ -16484,7 +16486,7 @@ impl PatternResourceSchema<Compiled> {
             >,
     >(
         &self,
-        attributes: &HashMap<
+        attributes: &indexmap::IndexMap<
             String,
             Classification<
                 'v,
@@ -16540,7 +16542,7 @@ impl PatternResourceSchema<Compiled> {
         T: StructuralPending<'v, P, B>,
     >(
         &self,
-        attributes: &HashMap<String, Classification<'v, P, B, T>>,
+        attributes: &indexmap::IndexMap<String, Classification<'v, P, B, T>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         mode: ValueEntryValidation,
         selected: Option<&HashSet<String>>,

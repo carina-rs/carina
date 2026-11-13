@@ -839,7 +839,7 @@ fn empty_parsed() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: Vec::new(),
-        user_functions: HashMap::new(),
+        user_functions: indexmap::IndexMap::new(),
         upstream_states: Vec::new(),
         wait_bindings: Vec::new(),
         requires: Vec::new(),

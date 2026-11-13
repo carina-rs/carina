@@ -151,7 +151,7 @@ fn every_edge_fixture() -> crate::resource::AuthoredValue {
         }),
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function: function.clone(),
-            functions: std::sync::Arc::new(std::collections::HashMap::from([(
+            functions: std::sync::Arc::new(indexmap::IndexMap::from([(
                 "captured".into(),
                 (*function).clone(),
             )])),
@@ -1924,7 +1924,7 @@ fn r4_unchanged_resolved_call_preserves_both_arc_identities() {
 fn r4_distinct_captured_definition_occurrences_are_rewritten_once_each() {
     let mut value = r4_resolved_fixture();
     if let Value::Deferred(DeferredValue::ResolvedFunctionCall { functions, .. }) = &mut value {
-        Arc::make_mut(functions).remove("called");
+        Arc::make_mut(functions).shift_remove("called");
     }
     let mut rewrite = R4Rewrite {
         increment_integers: true,
@@ -2624,7 +2624,10 @@ fn unavailable_search_ignores_captured_code_and_checks_call_arguments() {
     function.body.value = unavailable_candidate().into_secret();
     let mut scope_function = function.clone();
     scope_function.name = "unused".into();
-    let functions = Arc::new(HashMap::from([("unused".into(), scope_function)]));
+    let functions = Arc::new(indexmap::IndexMap::from([(
+        "unused".into(),
+        scope_function,
+    )]));
     let mut value = Value::Deferred(DeferredValue::ResolvedFunctionCall {
         function: Arc::new(function),
         functions,

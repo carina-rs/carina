@@ -1765,7 +1765,7 @@ pub struct AnalysisTree<
     validation_values: Vec<Located<FunctionValidationValue<'a, P, B>>>,
     iterables: Vec<AnalysisForRef<'a, P, B>>,
     arguments: &'a [super::ArgumentParameter<super::TypeExpr, P, B>],
-    functions: &'a std::collections::HashMap<String, super::UserFunction<B>>,
+    functions: &'a indexmap::IndexMap<String, super::UserFunction<B>>,
     module_calls: &'a [super::ModuleCall<P, B>],
     binding_names: std::collections::HashSet<String>,
     module_definition: bool,

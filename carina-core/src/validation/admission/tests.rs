@@ -3167,7 +3167,7 @@ fn round7_hook_error_without_attribute_has_one_diagnostic_owner() {
         .knowledge(&KnowledgeContext::validation())
         .unwrap()
         .into_classification();
-    let attributes = HashMap::from([("input".into(), proof)]);
+    let attributes = indexmap::IndexMap::from([("input".into(), proof)]);
     let destination = schemas
         .resource_attribute_destination(resource.id(), "input", &catalog)
         .unwrap();

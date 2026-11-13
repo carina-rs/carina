@@ -272,7 +272,7 @@ fn custom_type_provider_rejection_keeps_masking_and_walkable_cause() {
 
 pub(crate) fn resolved_admission_for_test(
     schema: &CompiledResourceSchema,
-    attributes: &HashMap<String, Classification<'_>>,
+    attributes: &IndexMap<String, Classification<'_>>,
     selected: Option<&HashSet<String>>,
     is_string_literal: &dyn Fn(&str) -> bool,
     lookup: CustomTypeLookup<'_>,

@@ -707,7 +707,7 @@ pub struct BindingIndex<'a, B: BindingAddress = RelativeBindingName> {
     /// keep this index-only view keyed by the visible composition binding.
     pending_composition_handles: HashMap<B, HashMap<String, crate::parser::ResourceTypePath>>,
     registry: &'a SchemaRegistry,
-    user_functions: &'a HashMap<String, crate::parser::UserFunction<B>>,
+    user_functions: &'a indexmap::IndexMap<String, crate::parser::UserFunction<B>>,
 }
 
 impl<'a, B: BindingAddress> BindingIndex<'a, B> {

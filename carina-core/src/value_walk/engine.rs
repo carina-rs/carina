@@ -124,7 +124,7 @@ pub(super) enum Parts<'v, M: WalkMode, P: ValueKind + 'v, B: BindingAddress> {
     },
     ResolvedCall {
         function: M::Input<'v, Arc<UserFunction<B>>>,
-        functions: M::Input<'v, Arc<HashMap<String, UserFunction<B>>>>,
+        functions: M::Input<'v, Arc<indexmap::IndexMap<String, UserFunction<B>>>>,
         args: M::Input<'v, Vec<FunctionArgument<P, B>>>,
         source_line: M::Input<'v, DiagnosticSourceLine>,
     },

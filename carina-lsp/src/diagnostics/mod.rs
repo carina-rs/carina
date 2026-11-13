@@ -5,6 +5,7 @@ mod validation;
 #[cfg(test)]
 mod tests;
 
+use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -51,7 +52,7 @@ fn select_admission_inputs<'r, 'a>(
             &'r carina_core::parser::AnalysisResourceRef<'a>,
         >,
     >,
-    values: &HashMap<String, Value>,
+    values: &IndexMap<String, Value>,
     report: &carina_core::parser::retained::ExpressionReport,
 ) -> (
     &'r carina_core::parser::AnalysisResourceRef<'a>,
@@ -434,7 +435,7 @@ impl ExpandedDiagnosticValidationInputs<'_> {
                     .filter(|value| inputs.value(name).is_some_and(|source| source != value))
                     .map(|value| (name.clone(), value))
             })
-            .collect::<HashMap<_, _>>();
+            .collect::<IndexMap<_, _>>();
         let mut evaluated_inputs = inputs.clone();
         let (evaluated_inputs, updated) = evaluated_inputs.materialize_and_classify(
             &evaluated,
@@ -1757,8 +1758,8 @@ impl DiagnosticRun<'_> {
                     let bn_map = schema.block_name_map();
                     let resolved_attrs = semantic_resource_attributes
                         .as_ref()
-                        .map(carina_core::resource::attrs_to_hashmap)
-                        .unwrap_or_else(|| rref.resolved_attributes());
+                        .cloned()
+                        .unwrap_or_else(|| rref.attributes().into_owned());
                     let (admission_resource, inputs) = select_admission_inputs(
                         rref,
                         authored_resources.as_ref(),
@@ -1810,7 +1811,7 @@ impl DiagnosticRun<'_> {
                             })
                             .map(|value| (name.clone(), value))
                         })
-                        .collect::<HashMap<_, _>>();
+                        .collect::<IndexMap<_, _>>();
                     let mut evaluated_inputs = inputs.clone();
                     let (evaluated_inputs, updated) = evaluated_inputs.materialize_and_classify(
                         &evaluated_attrs,
