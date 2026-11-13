@@ -927,4 +927,19 @@ fn r5b_typed_sink_rejects_a_carried_expression_without_a_placement_parent() {
         admit_expression(source, &super::super::TypeExpr::String).is_err(),
         "a typed sink must reject a carrying expression even when P1 has no rejecting parent"
     );
+    let rejection = match admit_expression(source, &super::super::TypeExpr::String) {
+        Err(SinkRejection::Conversion(rejection)) => rejection,
+        Err(SinkRejection::Ordinary(error)) => panic!("wrong finding channel: {error}"),
+        Ok(admission) => panic!("unjudged conversion admitted: {admission:?}"),
+    };
+    let mut run = crate::validation::ConversionValidation::<std::convert::Infallible>::new(
+        parsed.expression_report(),
+    );
+    run.reject_sink(rejection, crate::validation::FindingSubject::Root);
+    let presented = run.complete().into_presented();
+    assert_eq!(presented.len(), 1);
+    assert!(matches!(
+        presented.iter().next().unwrap(),
+        crate::validation::PresentedFinding::Conversion(_)
+    ));
 }

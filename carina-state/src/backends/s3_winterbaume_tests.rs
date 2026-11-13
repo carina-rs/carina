@@ -31,6 +31,44 @@ const TEST_REGION: &str = "us-east-1";
 const TEST_BUCKET: &str = "carina-state-test-bucket";
 const TEST_KEY: &str = "carina.state.json";
 
+// Emulator clients consume settings from the same admission owner as production.
+fn backend_with_client(
+    client: Client,
+    bucket: String,
+    key: String,
+    region: String,
+    encrypt: bool,
+    auto_create: bool,
+) -> S3Backend {
+    use carina_core::resource::{ConcreteValue, NoPlaceholder, Value};
+    let raw = carina_core::parser::BackendConfig::<NoPlaceholder> {
+        backend_type: "s3".into(),
+        attributes: [
+            (
+                "bucket".to_string(),
+                Value::Concrete(ConcreteValue::String(bucket.into())),
+            ),
+            (
+                "key".to_string(),
+                Value::Concrete(ConcreteValue::String(key.into())),
+            ),
+            (
+                "encrypt".to_string(),
+                Value::Concrete(ConcreteValue::Bool(encrypt)),
+            ),
+            (
+                "auto_create".to_string(),
+                Value::Concrete(ConcreteValue::Bool(auto_create)),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        attribute_spans: Default::default(),
+    };
+    let config = crate::BackendConfig::try_from(&raw).unwrap();
+    S3Backend::from_client(client, config.as_s3().unwrap(), region)
+}
+
 /// Build an `S3Backend` over a winterbaume-backed client. `encrypt` is
 /// disabled because the mock does not need server-side encryption and
 /// leaving it on only adds a header the mock ignores.
@@ -45,7 +83,7 @@ async fn mock_backend() -> S3Backend {
 async fn mock_backend_with_client() -> (S3Backend, Client) {
     let mock = MockAws::builder().with_service(S3Service::new()).build();
     let sdk_config = mock.sdk_config(TEST_REGION).await;
-    let backend = S3Backend::from_client(
+    let backend = backend_with_client(
         Client::new(&sdk_config),
         TEST_BUCKET.to_string(),
         TEST_KEY.to_string(),
@@ -60,7 +98,7 @@ async fn mock_backend_with_client() -> (S3Backend, Client) {
 async fn mock_backend_with_service(service: impl MockService) -> S3Backend {
     let mock = MockAws::builder().with_service(service).build();
     let sdk_config = mock.sdk_config(TEST_REGION).await;
-    S3Backend::from_client(
+    backend_with_client(
         Client::new(&sdk_config),
         TEST_BUCKET.to_string(),
         TEST_KEY.to_string(),
@@ -604,7 +642,7 @@ async fn cleanup_locked_write_with_cached_state_etag_uses_three_s3_calls() {
         .build();
     let sdk_config = mock.sdk_config(TEST_REGION).await;
 
-    let seed_backend = S3Backend::from_client(
+    let seed_backend = backend_with_client(
         Client::new(&sdk_config),
         TEST_BUCKET.to_string(),
         TEST_KEY.to_string(),
@@ -615,7 +653,7 @@ async fn cleanup_locked_write_with_cached_state_etag_uses_three_s3_calls() {
     create_bucket_and_seed_empty_state(&seed_backend).await;
 
     // Use a fresh backend so only this read can seed its state ETag cache.
-    let backend = S3Backend::from_client(
+    let backend = backend_with_client(
         Client::new(&sdk_config),
         TEST_BUCKET.to_string(),
         TEST_KEY.to_string(),
@@ -669,7 +707,7 @@ async fn published_exports_read_does_not_seed_the_state_etag_cache() {
         .build();
     let sdk_config = mock.sdk_config(TEST_REGION).await;
 
-    let seed_backend = S3Backend::from_client(
+    let seed_backend = backend_with_client(
         Client::new(&sdk_config),
         TEST_BUCKET.to_string(),
         TEST_KEY.to_string(),
@@ -679,7 +717,7 @@ async fn published_exports_read_does_not_seed_the_state_etag_cache() {
     );
     create_bucket_and_seed_empty_state(&seed_backend).await;
 
-    let backend = S3Backend::from_client(
+    let backend = backend_with_client(
         Client::new(&sdk_config),
         TEST_BUCKET.to_string(),
         TEST_KEY.to_string(),
@@ -727,7 +765,7 @@ async fn cleanup_locked_write_with_known_absent_state_uses_three_s3_calls() {
         })
         .build();
     let sdk_config = mock.sdk_config(TEST_REGION).await;
-    let backend = S3Backend::from_client(
+    let backend = backend_with_client(
         Client::new(&sdk_config),
         TEST_BUCKET.to_string(),
         TEST_KEY.to_string(),
@@ -848,7 +886,7 @@ async fn locked_state_conflict_rechecks_ownership_before_retrying() {
         })
         .build();
     let sdk_config = mock.sdk_config(TEST_REGION).await;
-    let backend = Arc::new(S3Backend::from_client(
+    let backend = Arc::new(backend_with_client(
         Client::new(&sdk_config),
         TEST_BUCKET.to_string(),
         TEST_KEY.to_string(),

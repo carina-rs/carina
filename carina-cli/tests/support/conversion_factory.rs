@@ -11,9 +11,6 @@ impl ProviderFactory for TotalityFactory {
     fn display_name(&self) -> &str {
         "Mock totality fixture"
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        Default::default()
-    }
     fn validate_config(
         &self,
         _: &CanonicalProviderConfigAttributes,
@@ -38,13 +35,14 @@ impl ProviderFactory for TotalityFactory {
     fn create_normalizer(
         &self,
         _: &ProviderSession,
+        _: InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )

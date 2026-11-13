@@ -6,8 +6,8 @@ use carina_core::provider::{
     ProviderInitialization, ProviderResult,
 };
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, ValidatedConfigSchema,
-    ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+    AttributeSchema, AttributeType, ResourceSchema, ValidatedProviderSchemaWitness,
+    ValidatedResourceSchema,
 };
 
 struct MapBoundsFactory;
@@ -19,10 +19,6 @@ impl ProviderFactory for MapBoundsFactory {
 
     fn display_name(&self) -> &str {
         "Map bounds validation mock"
-    }
-
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        Default::default()
     }
 
     fn validate_config(
@@ -44,7 +40,7 @@ impl ProviderFactory for MapBoundsFactory {
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )

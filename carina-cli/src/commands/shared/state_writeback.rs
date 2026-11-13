@@ -741,6 +741,9 @@ pub(crate) fn resolve_export_values_post_apply<D>(
                     input.export_params,
                     &bindings,
                     session,
+                    carina_core::parser::retained::ProjectedPhase::apply_context(
+                        &carina_core::resource::knowledge::KnowledgeContext::apply(&bindings),
+                    ),
                 )
                 .map_err(AppError::Validation)
             },
@@ -8048,6 +8051,14 @@ mod export_writeback_tests {
                     export_params,
                     &carina_core::binding_index::ResolvedBindings::default(),
                     session,
+                    carina_core::parser::retained::ProjectedPhase::plan_context::<
+                        carina_core::resource::NoPlaceholder,
+                        carina_core::resource::AbsoluteBindingAddress,
+                    >(
+                        &carina_core::resource::knowledge::KnowledgeContext::plan(
+                            &carina_core::binding_index::ResolvedBindings::default(),
+                        ),
+                    ),
                 )
             },
         )
@@ -8115,6 +8126,14 @@ mod export_writeback_tests {
                     &export_params,
                     &carina_core::binding_index::ResolvedBindings::default(),
                     session,
+                    carina_core::parser::retained::ProjectedPhase::plan_context::<
+                        carina_core::resource::NoPlaceholder,
+                        carina_core::resource::AbsoluteBindingAddress,
+                    >(
+                        &carina_core::resource::knowledge::KnowledgeContext::plan(
+                            &carina_core::binding_index::ResolvedBindings::default(),
+                        ),
+                    ),
                 )
             },
         )

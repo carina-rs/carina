@@ -725,3 +725,59 @@ impl<E: ValidationClientError> ConversionValidation<E> {
         }
     }
 }
+
+/// Authored sink checks transfer their conversion channel to the run before
+/// exposing their ordinary result. This is not a presentation exit.
+pub struct SinkFindings<T> {
+    pub(super) ordinary: T,
+    pub(super) conversions: crate::ConversionChannel,
+}
+impl<T> SinkFindings<T> {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn expect_ordinary_for_test(self) -> T {
+        assert!(
+            self.conversions.findings().is_empty(),
+            "conversion fixture must use the production validation driver"
+        );
+        self.ordinary
+    }
+
+    pub(super) fn new(ordinary: T, conversions: crate::ConversionChannel) -> Self {
+        Self {
+            ordinary,
+            conversions,
+        }
+    }
+    pub(super) fn map<U>(self, map: impl FnOnce(T) -> U) -> SinkFindings<U> {
+        SinkFindings {
+            ordinary: map(self.ordinary),
+            conversions: self.conversions,
+        }
+    }
+    pub fn into_validation<E: ValidationClientError>(
+        self,
+        run: &mut ConversionValidation<E>,
+        subject: FindingSubject,
+    ) -> T {
+        run.conversions.extend(self.conversions.in_subject(subject));
+        self.ordinary
+    }
+}
+impl<T: std::fmt::Debug> std::fmt::Debug for SinkFindings<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SinkFindings")
+            .field("ordinary", &self.ordinary)
+            .field("conversions", &self.conversions)
+            .finish()
+    }
+}
+impl<E: ValidationClientError> ConversionValidation<E> {
+    pub fn reject_sink(
+        &mut self,
+        rejection: crate::parser::retained::ConversionRejection,
+        subject: FindingSubject,
+    ) {
+        self.conversions
+            .extend(rejection.into_channel().in_subject(subject));
+    }
+}

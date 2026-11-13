@@ -9,7 +9,7 @@ use carina_core::provider::{
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
-    ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+    ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
 use carina_lsp::diagnostics::DiagnosticEngine;
 use carina_lsp::document::Document;
@@ -23,10 +23,6 @@ impl ProviderFactory for CollectionFactory {
 
     fn display_name(&self) -> &str {
         "Secret collection diagnostics fixture"
-    }
-
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        Default::default()
     }
 
     fn validate_config(
@@ -48,7 +44,7 @@ impl ProviderFactory for CollectionFactory {
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )

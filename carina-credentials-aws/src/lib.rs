@@ -277,7 +277,7 @@ mod tests {
     impl CredentialProbe {
         fn new(protected: AwsCredentials) -> Self {
             let inputs = carina_core::provider::ProviderPlan::state_only()
-                .session("", None, None)
+                .test_session("", None, None)
                 .guest_inventory();
             let project = |value| match inputs.handoff_for_test(value).unwrap() {
                 carina_provider_protocol::types::Value::String(value) => value,

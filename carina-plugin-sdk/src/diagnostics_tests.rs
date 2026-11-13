@@ -6,7 +6,7 @@ use carina_core::test_utils::provider_text::captured_session;
 #[test]
 fn ordinary_query_values_do_not_mask_later_diagnostics() {
     let (session, events) =
-        captured_session(ProviderPlan::state_only().session_builder("native", None, None));
+        captured_session(ProviderPlan::state_only().test_session_builder("native", None, None));
     let diagnostics = ProviderDiagnostics::from_session(&session);
     diagnostics.prepare_request(
         http::Request::builder()
@@ -29,7 +29,7 @@ fn ordinary_query_values_do_not_mask_later_diagnostics() {
 
 #[test]
 fn repeated_credential_adoption_is_idempotent() {
-    let session = ProviderPlan::state_only().session("native", None, None);
+    let session = ProviderPlan::state_only().test_session("native", None, None);
     let diagnostics = ProviderDiagnostics::from_session(&session);
     for _ in 0..2000 {
         diagnostics
@@ -48,7 +48,7 @@ fn repeated_credential_adoption_is_idempotent() {
 #[test]
 fn native_sdk_handle_emits_borrowed_errors_before_success() {
     let (session, events) =
-        captured_session(ProviderPlan::state_only().session_builder("native", None, None));
+        captured_session(ProviderPlan::state_only().test_session_builder("native", None, None));
     let diagnostics = ProviderDiagnostics::from_session(&session);
     let error = ProviderError::api_error_caused_by(
         "handled operation",
@@ -75,7 +75,7 @@ fn native_sdk_handle_emits_borrowed_errors_before_success() {
 #[test]
 fn registration_acknowledgement_precedes_operational_adoption() {
     let (session, events) =
-        captured_session(ProviderPlan::state_only().session_builder("native", None, None));
+        captured_session(ProviderPlan::state_only().test_session_builder("native", None, None));
     let diagnostics = ProviderDiagnostics::from_session(&session);
     let token = diagnostics
         .register_github_token(crate::protected_material::GithubTokenMaterial::new(
@@ -97,7 +97,7 @@ fn registration_acknowledgement_precedes_operational_adoption() {
 
 #[test]
 fn failed_registration_returns_no_operational_wrapper() {
-    let session = ProviderPlan::state_only().session("native", None, None);
+    let session = ProviderPlan::state_only().test_session("native", None, None);
     let diagnostics = ProviderDiagnostics::from_session(&session);
     let result = diagnostics.register_github_token(
         crate::protected_material::GithubTokenMaterial::new("x".repeat(300_000)),
@@ -111,7 +111,7 @@ fn failed_registration_returns_no_operational_wrapper() {
 #[test]
 fn native_registration_and_emission_stop_when_the_host_context_closes() {
     let (session, events) =
-        captured_session(ProviderPlan::state_only().session_builder("native", None, None));
+        captured_session(ProviderPlan::state_only().test_session_builder("native", None, None));
     let diagnostics = ProviderDiagnostics::from_session(&session);
     drop(session);
     assert!(matches!(
@@ -131,7 +131,7 @@ fn native_registration_and_emission_stop_when_the_host_context_closes() {
 
 #[test]
 fn invalid_authorization_is_a_preparation_error_without_a_credential_echo() {
-    let session = ProviderPlan::state_only().session("native", None, None);
+    let session = ProviderPlan::state_only().test_session("native", None, None);
     let diagnostics = ProviderDiagnostics::from_session(&session);
     let token = diagnostics
         .register_github_token(crate::protected_material::GithubTokenMaterial::new(
@@ -154,7 +154,7 @@ async fn apply_replaces_credentials_and_preserves_remaining_settings() {
     };
     use aws_types::{SdkConfig, region::Region};
 
-    let session = ProviderPlan::state_only().session("aws", None, None);
+    let session = ProviderPlan::state_only().test_session("aws", None, None);
     let source = super::aws_session_tests::StaticSource(AwsSessionMaterial::new(
         aws_credential_types::Credentials::new(
             "registered-access",

@@ -16,16 +16,18 @@ pub trait InitializeFixture: ProviderFactory + Sized {
         binding: Option<&str>,
         config: &ProviderReadyConfig,
     ) -> BoxFuture<'_, HostResult<InitializedProvider>> {
-        let session = ProviderPlan::state_only().session(self.name(), binding, Some(config));
-        Box::pin(async move { ProviderBoundary::initialize(self, &session).await })
+        let session = ProviderPlan::state_only().test_session(self.name(), binding, Some(config));
+        Box::pin(async move { ProviderBoundary::initialize_for_test(self, &session).await })
     }
     fn initialize_normalizer_fixture(
         &self,
         binding: Option<&str>,
         config: &ProviderReadyConfig,
     ) -> BoxFuture<'_, HostResult<ConfiguredNormalizer>> {
-        let session = ProviderPlan::state_only().session(self.name(), binding, Some(config));
-        Box::pin(async move { ProviderBoundary::initialize_normalizer(self, &session).await })
+        let session = ProviderPlan::state_only().test_session(self.name(), binding, Some(config));
+        Box::pin(
+            async move { ProviderBoundary::initialize_normalizer_for_test(self, &session).await },
+        )
     }
 }
 #[cfg(feature = "provider-host")]
@@ -72,7 +74,7 @@ fn fixture_session<S, D>(
     >],
     _: &[crate::resource::DataSource],
 ) -> ProviderSession {
-    plan_for_desired(desired).session(provider, binding, config)
+    plan_for_desired(desired).test_session(provider, binding, config)
 }
 
 pub fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
@@ -121,7 +123,7 @@ pub fn context(values: &[&str]) -> Context {
 }
 impl Context {
     pub fn session_builder(&self) -> ProviderSessionBuilder {
-        plan_for_desired(std::slice::from_ref(&self.desired)).session_builder(
+        plan_for_desired(std::slice::from_ref(&self.desired)).test_session_builder(
             "text-fixture",
             None,
             None,
@@ -136,7 +138,7 @@ impl Context {
 pub fn rebind_state_only(error: ProviderError) -> HostError {
     let context = Context {
         desired: Resource::with_provider("text-fixture", "resource", "fixture", None),
-        session: ProviderPlan::state_only().session("text-fixture", None, None),
+        session: ProviderPlan::state_only().test_session("text-fixture", None, None),
     };
     BindProviderText::with_secrets_for_test(error, &context)
 }
@@ -162,16 +164,14 @@ impl ProviderFactory for NativeFactory {
     ) -> ProviderResult<()> {
         Ok(())
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        ValidatedConfigSchema::default()
-    }
+
     fn schemas(&self) -> Vec<ValidatedResourceSchema> {
         self.schemas.clone()
     }
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas.clone(),
-            self.provider_config_attribute_types(),
+            ValidatedConfigSchema::default(),
             Default::default(),
             Vec::new(),
         )
@@ -194,6 +194,7 @@ impl ProviderFactory for NativeFactory {
     fn create_normalizer(
         &self,
         _: &ProviderSession,
+        _: crate::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         let normalizer = self
             .normalizer
@@ -211,7 +212,7 @@ pub fn initialized_with_context(
     provider: Box<dyn Provider>,
     context: &Context,
 ) -> InitializedProvider {
-    block_on(ProviderBoundary::initialize(
+    block_on(ProviderBoundary::initialize_for_test(
         &NativeFactory {
             scope: ReferenceScope::Unavailable,
             normalizer: Mutex::new(None),
@@ -355,7 +356,7 @@ fn fixture(payload: Payload, context: &Context) -> InitializedProvider {
         )
         .validate()
         .unwrap();
-    block_on(ProviderBoundary::initialize(
+    block_on(ProviderBoundary::initialize_for_test(
         &NativeFactory {
             scope: ReferenceScope::Unavailable,
             normalizer: Mutex::new(None),
@@ -598,7 +599,7 @@ pub fn normalizer_with_context(
     let mut desired = context.desired.clone();
     desired.id.provider = owner.to_owned();
     let session = fixture_session(owner, None, None, &[desired], &[]);
-    block_on(ProviderBoundary::initialize_normalizer(
+    block_on(ProviderBoundary::initialize_normalizer_for_test(
         &NativeFactory {
             scope: ReferenceScope::Unavailable,
             provider: Mutex::new(None),
@@ -644,7 +645,7 @@ pub fn initialized_for_desired<S, D>(
                 .unwrap()
         })
         .collect();
-    block_on(ProviderBoundary::initialize(
+    block_on(ProviderBoundary::initialize_for_test(
         &NativeFactory {
             scope: ReferenceScope::Unavailable,
             normalizer: Mutex::new(None),
@@ -671,7 +672,7 @@ pub fn boundary_with_components(
         || provider.name().to_owned(),
         |(owner, _, _, _)| owner.to_owned(),
     );
-    let session = ProviderPlan::state_only().session(&name, None, None);
+    let session = ProviderPlan::state_only().test_session(&name, None, None);
     let factory = NativeFactory {
         scope: ReferenceScope::Unavailable,
         provider: Mutex::new(Some(provider)),
@@ -683,7 +684,7 @@ pub fn boundary_with_components(
             .collect(),
         name,
     };
-    block_on(ProviderBoundary::initialize(&factory, &session))
+    block_on(ProviderBoundary::initialize_for_test(&factory, &session))
         .unwrap()
         .into_boundary()
 }
@@ -701,7 +702,11 @@ pub fn initialized_with_scope(
         schemas: Vec::new(),
         name: "text-fixture".into(),
     };
-    block_on(ProviderBoundary::initialize(&factory, context.session())).unwrap()
+    block_on(ProviderBoundary::initialize_for_test(
+        &factory,
+        context.session(),
+    ))
+    .unwrap()
 }
 
 /// Capture a real scheduler-minted attempt through the host boundary.

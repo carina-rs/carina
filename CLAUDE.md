@@ -332,6 +332,10 @@ run. When in doubt, run `scripts/verify.sh` without `--local`.
    Use `--base <ref>` to override the helper's default base of `origin/main`.
 2. PR CI must be green before merge.
 
+Use `scripts/validate-parity.py` for main/candidate text and JSON parity (carina#4394).
+Run `python3 scripts/validate-parity.py --main <main> --candidate <candidate>
+--repo . --infra ../../../infra --evidence <dir>`.
+
 CI keeps its parallel jobs by selecting kinds from `scripts/verify.sh`.
 The archive job builds the WASM mock fixtures and host test archive once;
 partitions and in-process isolation consume those artifacts. Provider-cause
@@ -568,9 +572,9 @@ A struct type represents a nested object with typed fields.
   (carina#3981, carina#3984). Accepted write-only values, including nested
   leaves, are recorded in state (since state v18; secrets as hashes) so plans
   converge.
-- **Provider input wire checks**: `WireReady<T>::try_new` is the sole admission
-  constructor for complete desired resources, data sources, final update
-  patches and provider configuration. It caches the checked projection after
+- **Provider input wire checks**: `WireReady<T>::try_new` checks and caches the
+  transport projection of complete desired resources, data sources, final update
+  patches and admitted provider configuration. It does not mint declaration admission. It caches the checked projection after
   host rewrites, including default tags and observed ignored patch leaves.
   Each final payload is projected once. Wire failures remain
   `ProviderPreparationError::Wire`, with protected diagnostic paths retained.
@@ -707,13 +711,18 @@ A struct type represents a nested object with typed fields.
   Declaration compatibility admits types, not resolved-value validity.
   `NeedsLocal` exists only in the admission-facing reference relation, requiring
   a `ReferenceCandidate`; it cannot convert back into general type compatibility.
-  Resource/data-source attributes use `admit_apply_resource`/`admit_apply_data_source`
-  in `executor/provider_ready.rs`; provider config uses
-  `validate_provider_config_attributes` on resolved values. These validate the full
-  destination declaration before dispatch. Function parameters/returns additionally
-  use runtime `check_resolved_constraints_at`; backend schemas have no anonymous
-  refinements. Member String failures keep their structured pattern/
-  length category and label the slot's member constraint; identity failures run first.
+  Resource/data-source final inputs use `admit_apply_resource` and
+  `admit_apply_data_source`. Provider/backend configuration enters `admit()` through
+  `validation/admission/configuration/`, including compact-list callbacks.
+  Complete admissions own the canonical payload and placements; analysis cannot
+  authorize construction. Opaque provider keys retain factory validation.
+  Provider construction binds admitted configuration to its factory and instance.
+  Core owns the S3/local declarations; state extracts settings only from
+  `AdmittedConfiguration<BackendAttribute>`. Native file addresses retain their
+  own pins and non-UTF-8 bytes. S3 URLs keep encryption on and auto-creation off.
+  CLI and LSP share the owner. Function parameters/returns use
+  `check_resolved_constraints_at`. Member String failures retain their pattern/
+  length category and member label; identity failures run first.
   Int-to-Float widening between identified scalars uses identity-bound containment
   too. Float pairs with identities on both sides retain strict declaration range
   containment; same-identity Float reference admission retains resolved-value

@@ -1786,7 +1786,7 @@ fn render_value_type_error(
                         type_expr,
                         value,
                         provider_context,
-                        expression,
+                        (expression).ordinary().unwrap(),
                     )
                     .require_provider_schemas()
                 }
@@ -1794,7 +1794,7 @@ fn render_value_type_error(
                     type_expr,
                     value,
                     &engine.provider_context,
-                    expression,
+                    (expression).ordinary().unwrap(),
                 )
                 .record_deferred(session),
             };

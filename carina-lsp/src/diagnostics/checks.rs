@@ -1,6 +1,9 @@
 //! Semantic checks: provider region, module calls, unused bindings, undefined references.
 
 use carina_core::parser::ExportParamLike;
+use carina_core::validation::admission::configuration::backend::{
+    self as backend_admission, BackendAttributeError, BackendConfigError,
+};
 use std::collections::HashSet;
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
@@ -676,11 +679,11 @@ impl DiagnosticRun<'_> {
         let Some(backend) = merged.directory.parsed.backend.as_ref() else {
             return Vec::new();
         };
-        let Err(error) = carina_state::BackendConfig::try_from(backend) else {
+        let Err(error) = backend_admission::admit(backend) else {
             return Vec::new();
         };
 
-        let attribute_diagnostic = |error: &carina_state::BackendAttributeError| {
+        let attribute_diagnostic = |error: &BackendAttributeError| {
             // Directory resolution deliberately retains user-function calls
             // that failed evaluation so other editor checks can continue.
             // Suppress only those calls, including nested ones. A deferred
@@ -706,12 +709,12 @@ impl DiagnosticRun<'_> {
         };
 
         match error {
-            carina_state::BackendConfigError::Invalid(errors) => errors
+            BackendConfigError::Invalid(errors) => errors
                 .errors()
                 .iter()
                 .filter_map(attribute_diagnostic)
                 .collect(),
-            unsupported @ carina_state::BackendConfigError::UnsupportedBackend(_) => {
+            unsupported @ BackendConfigError::UnsupportedBackend(_) => {
                 let finding = carina_core::parser::Located::new(
                     tree.backend_location()
                         .expect("backend declaration provenance")
@@ -1390,8 +1393,8 @@ impl DiagnosticRun<'_> {
         semantic_view: &SemanticView<'_>,
         binding_index: &BindingIndex<'_>,
         known_bindings: &HashSet<String>,
-        _inference_bindings: &carina_core::validation::inference::InferenceBindings<
-            ParserPlaceholder,
+        conversion_validation: &mut carina_core::validation::ConversionValidation<
+            super::OrdinaryDiagnostic,
         >,
     ) -> Vec<Diagnostic> {
         let (parsed, tree) = authored;
@@ -1503,12 +1506,22 @@ impl DiagnosticRun<'_> {
                             continue;
                         }
                     };
+                    let source = match expression.ordinary() {
+                        Ok(source) => source,
+                        Err(rejection) => {
+                            conversion_validation.reject_sink(
+                                rejection,
+                                carina_core::validation::FindingSubject::Root,
+                            );
+                            continue;
+                        }
+                    };
                     let type_error = match self.provider_context.loaded_context() {
                         Some(provider_context) => typecheck::check_type_expr_value(
                             type_expr,
                             semantic_value,
                             provider_context,
-                            expression,
+                            source,
                         )
                         .require_provider_schemas()
                         .err(),
@@ -1516,7 +1529,7 @@ impl DiagnosticRun<'_> {
                             type_expr,
                             semantic_value,
                             self.provider_context.catalog(),
-                            expression,
+                            source,
                         )
                         .record_at(
                             self.provider_context,
@@ -1612,8 +1625,12 @@ impl DiagnosticRun<'_> {
         tree: &carina_core::parser::AnalysisTree<'_>,
         semantic_view: &SemanticView<'_>,
         value_bindings: &ResolvedBindings,
-        expanded: Option<&carina_core::parser::ModuleResolvedParsedFile>,
+        context: (
+            Option<&carina_core::parser::ModuleResolvedParsedFile>,
+            &mut carina_core::validation::ConversionValidation<super::OrdinaryDiagnostic>,
+        ),
     ) -> Vec<Diagnostic> {
+        let (expanded, conversion_validation) = context;
         let mut diagnostics = Vec::new();
         let name_location = |param: &ParsedExportParam| {
             tree.syntax()
@@ -1672,7 +1689,9 @@ impl DiagnosticRun<'_> {
                         candidate.source_file() == param.source_file()
                             && candidate.source_span() == param.source_span()
                     })
-                    .and_then(|semantic_param| self.export_value_error(semantic_param, bindings)),
+                    .and_then(|semantic_param| {
+                        self.export_value_error(semantic_param, bindings, conversion_validation)
+                    }),
                 None => {
                     let mut fallback;
                     let semantic_param = match semantic_view.lookup(param) {
@@ -1688,7 +1707,7 @@ impl DiagnosticRun<'_> {
                             &fallback
                         }
                     };
-                    self.export_value_error(semantic_param, value_bindings)
+                    self.export_value_error(semantic_param, value_bindings, conversion_validation)
                 }
             };
             if let Some(message) = message
@@ -1712,13 +1731,27 @@ impl DiagnosticRun<'_> {
         &self,
         param: &ParsedExportParam<ParserPlaceholder, B>,
         value_bindings: &GenericResolvedBindings<ParserPlaceholder, B>,
+        conversion_validation: &mut carina_core::validation::ConversionValidation<
+            super::OrdinaryDiagnostic,
+        >,
     ) -> Option<String> {
-        let error = carina_core::validation::check_export_values_pre_apply(
+        let error = carina_core::validation::check_export_values_for_validation(
             std::slice::from_ref(param),
             value_bindings,
             self.provider_context,
         )
-        .err();
+        .into_validation(
+            conversion_validation,
+            carina_core::validation::FindingSubject::Root,
+        )
+        .err()
+        .map(|findings| {
+            findings
+                .into_iter()
+                .map(|finding| finding.detail().to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
         if param.judgement().is_ok_and(|expression| {
             expression.check_owner()
                 == carina_core::parser::retained::ExpressionCheckOwner::BindingIndex
@@ -1846,7 +1879,7 @@ impl DiagnosticRun<'_> {
             .iter()
             .filter(|factory| declared_providers.contains(factory.name()))
         {
-            for attr_type in factory.provider_config_attribute_types().parts().values() {
+            for attr_type in factory.schema_witness().config().parts().values() {
                 collect_enum_provider_namespaces(attr_type, &mut enum_namespaces);
             }
         }

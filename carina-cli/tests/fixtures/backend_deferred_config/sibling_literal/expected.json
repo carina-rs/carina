@@ -1,0 +1,5 @@
+{
+  "status": 0,
+  "stdout": "Validating...\n\u2713 1 resources validated successfully.\n  \u2022 mock.test.resource.other\n\u26a0 Unused let binding 'other'. Consider using an anonymous resource instead.\n",
+  "stderr": ""
+}

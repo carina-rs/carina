@@ -5,8 +5,7 @@ use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::differ::{Orphan, Orphans, restore_current_move_source};
 use carina_core::input_rules::{InputAdmissionFailure, InputCheckedPlan, InputTypeContext};
 use carina_core::parser::{
-    ExpandedBackendConfig as BackendConfig, ExpandedInferredExportParam as InferredExportParam,
-    SavedProviderConfigs,
+    ExpandedInferredExportParam as InferredExportParam, SavedProviderConfigs,
 };
 type ExecutableSavedPlan = carina_core::saved_replay::AdmittedSavedPlanReplay;
 use carina_core::provider::{HostProvider, PersistedAttributes, ProviderRouter, ReadRequest};
@@ -204,10 +203,10 @@ impl ProviderBoundPlanFile {
         Self::NeedsSecretVerification { plan, providers }
     }
 
-    pub(super) fn backend_config(&self) -> Option<&BackendConfig> {
+    pub(super) fn backend_config(&self) -> &crate::commands::plan::SavedBackendConfig {
         match self {
-            Self::Verified { plan, .. } => plan.plan_file.backend_config.as_ref(),
-            Self::NeedsSecretVerification { plan, .. } => plan.plan_file.backend_config.as_ref(),
+            Self::Verified { plan, .. } => &plan.plan_file.backend_config,
+            Self::NeedsSecretVerification { plan, .. } => &plan.plan_file.backend_config,
         }
     }
 
@@ -1299,10 +1298,6 @@ mod tests {
             "Saved-plan artifact test provider"
         }
 
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
-
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -1334,7 +1329,7 @@ mod tests {
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                Default::default(),
                 Default::default(),
                 Vec::new(),
             )
@@ -1441,7 +1436,7 @@ mod tests {
             state_lineage: None,
             state_serial: None,
             provider_configs: saved_provider_configs(provider_configs),
-            backend_config: None,
+            backend_config: crate::commands::plan::SavedBackendConfig::default(),
             plan: carina_core::plan::SnapshotPlan::default(),
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
@@ -2069,7 +2064,7 @@ mod tests {
             state_serial: None,
             provider_configs: serde_json::from_value(serde_json::json!([]))
                 .expect("empty saved provider configs"),
-            backend_config: None,
+            backend_config: crate::commands::plan::SavedBackendConfig::default(),
             plan: plan.clone().to_snapshot(),
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),

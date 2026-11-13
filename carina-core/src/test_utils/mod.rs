@@ -1,5 +1,6 @@
 //! Fixtures available to downstream tests with the `test-utils` feature.
 
+pub mod configuration;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod loopback;
 
@@ -363,9 +364,7 @@ pub fn loaded_fixture_snapshot(
         fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
             self.witness.clone()
         }
-        fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-            Default::default()
-        }
+
         fn validate_config(
             &self,
             _: &crate::provider::CanonicalProviderConfigAttributes,
@@ -589,4 +588,22 @@ pub fn legacy_validate_resource_admissions<
         known,
         diagnostics,
     ))
+}
+
+/// Adapt an ordinary-only fixture to the source-proof API. Conversion cases
+/// must exercise the production run and presentation driver instead.
+pub fn ordinary_sink_findings_for_test<T>(findings: crate::validation::SinkFindings<T>) -> T {
+    findings.expect_ordinary_for_test()
+}
+
+pub fn ordinary_sink_result_for_test<T, E>(
+    result: Result<T, crate::parser::retained::SinkRejection<E>>,
+) -> Result<T, E> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(crate::parser::retained::SinkRejection::Ordinary(error)) => Err(error),
+        Err(crate::parser::retained::SinkRejection::Conversion(_)) => {
+            panic!("conversion fixture must use the production validation driver")
+        }
+    }
 }

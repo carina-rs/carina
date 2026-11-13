@@ -38,7 +38,7 @@ pub(crate) enum PlacementRole {
     Leaf,
 }
 impl PlacementRole {
-    pub(crate) fn of<B: BindingAddress>(kind: &ExprKind<B>) -> Self {
+    pub(crate) const fn of<B: BindingAddress>(kind: &ExprKind<B>) -> Self {
         use TransportRole as T;
         match kind {
             ExprKind::Convert { .. } => Self::Convert,
@@ -78,6 +78,23 @@ impl PlacementRole {
         }
     }
 }
+
+/// The operational export check relies on P1 rejecting authored conversions.
+/// B2 must replace that shortcut with a conversion verdict before changing
+/// export declarations into transport positions.
+pub(crate) struct OperationalExportBoundary(());
+pub(crate) const OPERATIONAL_EXPORT_BOUNDARY: OperationalExportBoundary =
+    match PlacementRole::of::<RelativeBindingName>(&ExprKind::Declaration) {
+        PlacementRole::Boundary => OperationalExportBoundary(()),
+        PlacementRole::Convert
+        | PlacementRole::Transport(_)
+        | PlacementRole::Computed
+        | PlacementRole::SecretArgument
+        | PlacementRole::Resource
+        | PlacementRole::Leaf => {
+            panic!("B2 requires a conversion verdict in the pre-apply export check")
+        }
+    };
 
 /// Persistent value-flow evidence. This is not a set of syntax to complete:
 /// only children which contribute to a judgement occur in the evidence.
@@ -119,6 +136,9 @@ impl PlacementFindings {
     }
     pub(in crate::parser::retained) fn into_findings(self) -> crate::ConversionChannel {
         self.findings
+    }
+    pub(in crate::parser::retained) fn append_rejection(&mut self, rejection: ConversionRejection) {
+        self.findings.append(rejection.into_channel());
     }
     fn reject(&mut self, source: Arc<ConversionFlow>, kind: Kind, message: &str, secret: bool) {
         let mut pending = vec![source];
@@ -303,5 +323,79 @@ pub(in crate::parser::retained) fn check_placement<B: BindingAddress>(
         !sources.is_empty()
     } else {
         false
+    }
+}
+/// A rejected authored typed sink cannot become an ordinary error or success.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConversionRejection {
+    channel: crate::ConversionChannel,
+}
+impl ConversionRejection {
+    pub(in crate::parser::retained) fn at_sink(expression: &JudgedExpr) -> Self {
+        let mut output = PlacementFindings::new(Default::default());
+        expression.conversion_sources().reject(
+            Kind::UnsupportedPosition,
+            "conversion is not supported at this position yet",
+            expression.diagnostic_is_secret(),
+            &mut output,
+        );
+        Self {
+            channel: output.into_findings(),
+        }
+    }
+    pub(crate) fn into_channel(self) -> crate::ConversionChannel {
+        self.channel
+    }
+}
+#[derive(Debug, Clone, PartialEq)]
+pub enum SinkRejection<E> {
+    Ordinary(E),
+    Conversion(ConversionRejection),
+}
+impl<E> From<E> for SinkRejection<E> {
+    fn from(error: E) -> Self {
+        Self::Ordinary(error)
+    }
+}
+impl<E> SinkRejection<E> {
+    pub(crate) fn map_ordinary<F>(self, f: impl FnOnce(E) -> F) -> SinkRejection<F> {
+        match self {
+            Self::Ordinary(error) => SinkRejection::Ordinary(f(error)),
+            Self::Conversion(error) => SinkRejection::Conversion(error),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn r5d_operational_export_proof_requires_p1_sink_boundaries() {
+        // The pre-apply export check uses an operational proof because P1
+        // rejects conversions in exports and function sinks. When B2 makes
+        // either a legal slot, that check needs its own conversion verdict.
+        for (position, kind) in [
+            (
+                "export declaration",
+                ExprKind::<RelativeBindingName>::Declaration,
+            ),
+            (
+                "function sink",
+                ExprKind::Function {
+                    name: String::new(),
+                    signature: Arc::new(FunctionSignature {
+                        parameters: Vec::new(),
+                        return_type: None,
+                    }),
+                },
+            ),
+        ] {
+            assert_eq!(
+                PlacementRole::of(&kind),
+                PlacementRole::Boundary,
+                "{position}: B2 must replace the pre-apply export check's operational proof with a conversion verdict"
+            );
+        }
     }
 }

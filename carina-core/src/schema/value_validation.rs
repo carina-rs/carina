@@ -531,6 +531,7 @@ impl ValueValidationFindings {
         self.local_error.iter().chain(&self.additional_local_errors)
     }
 
+    #[cfg(test)]
     pub(super) fn into_errors(self) -> Vec<TypeError> {
         self.local_error
             .into_iter()
@@ -1367,7 +1368,7 @@ pub(crate) fn untyped_symbolic_errors(errors: Vec<TypeError>) -> ValueValidation
 pub(crate) fn classification_error(error: TypeError) -> ValueValidationFindings {
     CheckedValue::rejected(&FieldPath::new(), error).into_findings()
 }
-pub(super) fn validate_value_locally<
+pub(crate) fn validate_value_locally<
     'v,
     P: PlaceholderKind,
     B: BindingAddress,
@@ -1377,8 +1378,9 @@ pub(super) fn validate_value_locally<
     value: &Classification<'v, P, B, T>,
     defs: &BTreeMap<String, CompiledAttributeType>,
     ancestry: FieldAncestry,
+    lookup: Option<CustomTypeLookup<'_>>,
 ) -> ValueValidationFindings {
-    let mut findings = ValueValidator::new(defs, None)
+    let mut findings = ValueValidator::new(defs, lookup)
         .walk(
             attr,
             value.into(),
@@ -1468,6 +1470,7 @@ pub(super) fn select_union_member_on_path<'a>(
     select_union_member_from_knowledge_on_path(members, &knowledge, defs, visited)
 }
 
+#[cfg(test)]
 pub(crate) fn validate_value_with_lookup<
     'v,
     P: PlaceholderKind,
@@ -5040,6 +5043,7 @@ mod tests {
                     .unwrap(),
                 &BTreeMap::new(),
                 FieldAncestry::WRITABLE,
+                None,
             );
             assert_eq!(
                 findings
@@ -5736,6 +5740,7 @@ mod tests {
                 .unwrap(),
             &BTreeMap::new(),
             FieldAncestry::WRITABLE,
+            None,
         );
         assert_eq!(findings.local.len(), 2);
         assert_eq!(findings.local[0].0.to_string(), "entry.a");
@@ -6151,6 +6156,7 @@ mod value_knowledge_failure_contract {
                 .unwrap(),
             &BTreeMap::new(),
             FieldAncestry::WRITABLE,
+            None,
         );
         assert!(
             findings.local_error().is_some(),

@@ -101,7 +101,7 @@ fn mismatched_cursor_is_rejected(apply: bool) {
                             session,
                         )
                     };
-                    context.cursor = if authored {
+                    context.lookup = super::AdmissionLookup::Catalog(if authored {
                         AuthoredCursor::authored(slot.cursor().unwrap())
                     } else {
                         AuthoredCursor::validation_projected(
@@ -109,7 +109,7 @@ fn mismatched_cursor_is_rejected(apply: bool) {
                                 crate::test_utils::no_conversion_proof(),
                             ),
                         )
-                    };
+                    });
                     let error = admit(destination, candidate, &context)
                         .expect_err("proof cannot borrow its cursor's unrelated phase");
                     assert!(

@@ -643,8 +643,14 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             {
                 return Err(ModuleError::ReferenceType(error));
             }
+            // This expansion query cannot project a carried argument. Its
+            // caller-side boundary is judged by the owning validation parse.
+            let source = match argument_judgements[&arg.name].type_projection() {
+                crate::parser::retained::TypeProjection::Available(source) => source,
+                crate::parser::retained::TypeProjection::NoProjection(_) => continue,
+            };
             self.typecheck_context()
-                .check(&resolved_type, value, &argument_judgements[&arg.name])
+                .check(&resolved_type, value, source)
                 .map_err(|mismatch| ModuleError::InvalidArgumentType {
                     module: call.module_name.clone(),
                     argument: arg.name.clone(),
@@ -3691,12 +3697,12 @@ fn check_composition_argument_type<P: crate::resource::PlaceholderKind, B: Bindi
         return Ok(());
     }
 
+    let source = match expression.type_projection() {
+        crate::parser::retained::TypeProjection::Available(source) => source,
+        crate::parser::retained::TypeProjection::NoProjection(_) => return Ok(()),
+    };
     config
-        .check(
-            &resolved_parameter.as_type_expr(),
-            argument.value(),
-            expression,
-        )
+        .check(&resolved_parameter.as_type_expr(), argument.value(), source)
         .map_err(|mismatch| ArgumentSubstitutionError::Evaluation {
             source_file: None,
             line,

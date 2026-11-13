@@ -1,0 +1,33 @@
+{
+  "case": "resource",
+  "count": 2,
+  "errors": [
+    {
+      "message": "cidr_subnet(): cidr_subnet() invalid CIDR format: 'bad' (expected 'address/prefix')",
+      "range": {
+        "end": {
+          "character": 68,
+          "line": 0
+        },
+        "start": {
+          "character": 14,
+          "line": 0
+        }
+      }
+    },
+    {
+      "message": "Invalid expression at line 1: cidr_subnet(): cidr_subnet() invalid CIDR format: 'bad' (expected 'address/prefix')",
+      "range": {
+        "end": {
+          "character": 68,
+          "line": 0
+        },
+        "start": {
+          "character": 14,
+          "line": 0
+        }
+      }
+    }
+  ],
+  "file": "main.crn"
+}

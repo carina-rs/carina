@@ -55,9 +55,7 @@ impl ProviderFactory for UnionDiagnosticFactory {
     fn display_name(&self) -> &str {
         "union validation fixture"
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        ValidatedConfigSchema::default()
-    }
+
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -74,7 +72,7 @@ impl ProviderFactory for UnionDiagnosticFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            ValidatedConfigSchema::default(),
             Default::default(),
             Vec::new(),
         )

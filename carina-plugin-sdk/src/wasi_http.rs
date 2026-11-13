@@ -336,7 +336,7 @@ impl ProvideCredentials for RegisteredAwsCredentials {
 /// ```
 ///
 /// ```
-/// use carina_core::provider::ProviderPlan;
+/// use carina_core::provider::ProviderValidationInputs;
 /// use carina_plugin_sdk::{ProviderDiagnostics, protected_material::{AwsSessionFuture, AwsSessionMaterial, AwsSessionSource}};
 /// use carina_plugin_sdk::wasi_http::AwsSdkParts;
 /// use aws_types::{SdkConfig, region::Region};
@@ -351,9 +351,9 @@ impl ProvideCredentials for RegisteredAwsCredentials {
 ///         })
 ///     }
 /// }
-/// let session = ProviderPlan::state_only().session("aws", None, None);
+/// let inputs = ProviderValidationInputs::for_schema("aws");
 /// let loaded = SdkConfig::builder().region(Region::new("us-east-1")).build();
-/// let config = AwsSdkParts::new(Current, ProviderDiagnostics::from_session(&session))
+/// let config = AwsSdkParts::new(Current, ProviderDiagnostics::for_validation(&inputs))
 ///     .apply(loaded.into_builder()).build();
 /// assert_eq!(config.region().unwrap().as_ref(), "us-east-1");
 /// assert!(config.credentials_provider().is_some());
@@ -1072,7 +1072,7 @@ mod tests {
     #[tokio::test]
     async fn unbuffered_sdk_body_is_rejected_before_send() {
         let session =
-            carina_core::provider::ProviderPlan::state_only().session("native", None, None);
+            carina_core::provider::ProviderPlan::state_only().test_session("native", None, None);
         let connector = WasiHttpConnector {
             diagnostics: crate::ProviderDiagnostics::from_session(&session),
             connect_timeout: None,
@@ -1112,7 +1112,7 @@ mod tests {
     #[tokio::test]
     async fn buffered_sdk_bodies_keep_their_length_framing() {
         let session =
-            carina_core::provider::ProviderPlan::state_only().session("native", None, None);
+            carina_core::provider::ProviderPlan::state_only().test_session("native", None, None);
         let connector = WasiHttpConnector {
             diagnostics: crate::ProviderDiagnostics::from_session(&session),
             connect_timeout: None,
@@ -1166,7 +1166,7 @@ mod tests {
         use carina_core::provider::ProviderPlan;
         use std::time::{Duration, UNIX_EPOCH};
 
-        let session = ProviderPlan::state_only().session("native", None, None);
+        let session = ProviderPlan::state_only().test_session("native", None, None);
         let diagnostics = ProviderDiagnostics::from_session(&session);
         let config = super::AwsSdkParts::new(
             StaticSource(AwsSessionMaterial::new(

@@ -124,10 +124,10 @@ pub(crate) async fn resolve_backend_for_read<P: PlaceholderKind, B: BindingAddre
     Ok(backend)
 }
 
-pub fn verify_for_mutation<P: PlaceholderKind, B: BindingAddress>(
+pub fn verify_for_mutation<'a, P: PlaceholderKind + 'a, B: BindingAddress + 'a>(
     project_dir: &ResolvedPath,
     command_path: &Path,
-    backend_config: Option<&BackendConfig<P, B>>,
+    backend_config: impl Into<carina_state::BackendConfigurationSource<'a, P, B>>,
     command: DriftCommand,
 ) -> Result<VerifiedMutationBackendSelection, AppError> {
     match BackendSelection::verified_for_mutation(project_dir, backend_config)? {
@@ -1202,11 +1202,12 @@ fn validate_and_resolve_configuration(
 
         let export_value_bindings =
             carina_core::binding_index::ResolvedBindings::for_expanded_validation(parsed);
-        let checked_export_values = carina_core::validation::check_export_values_pre_apply_report(
+        let checked_export_values = carina_core::validation::check_export_values_for_validation(
             &parsed.export_params,
             &export_value_bindings,
             enriched_context,
-        );
+        )
+        .into_validation(errors, carina_core::validation::FindingSubject::Root);
         // Expansion-only boundary checks consume the final composition graph
         // without reloading the authored module walk.
         extend_module_call_errors(
@@ -1246,16 +1247,18 @@ fn validate_and_resolve_configuration(
                 finding: Box::new(finding),
             }),
         );
+        let attribute_findings = carina_core::validation::attribute_value_findings(
+            &parsed.attribute_params,
+            enriched_context,
+        )
+        .into_validation(errors, carina_core::validation::FindingSubject::Root);
         errors.extend(
-            carina_core::validation::attribute_value_findings(
-                &parsed.attribute_params,
-                enriched_context,
-            )
-            .into_iter()
-            .map(|finding| AppError::ParameterValue {
-                prefix: None,
-                finding: Box::new(finding),
-            }),
+            attribute_findings
+                .into_iter()
+                .map(|finding| AppError::ParameterValue {
+                    prefix: None,
+                    finding: Box::new(finding),
+                }),
         );
         if let Err(findings) = checked_export_values {
             errors.extend(
@@ -2097,10 +2100,6 @@ child { values = [source] }
             "AWSCC resource create-only enum test provider"
         }
 
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
-
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -2135,6 +2134,7 @@ child { values = [source] }
         fn create_normalizer(
             &self,
             _config: &carina_core::provider::ProviderSession,
+            _: carina_core::provider::InitializeOutcomeMint,
         ) -> carina_core::provider::BoxFuture<
             '_,
             carina_core::provider::ProviderResult<
@@ -2150,7 +2150,7 @@ child { values = [source] }
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                Default::default(),
                 Default::default(),
                 Vec::new(),
             )

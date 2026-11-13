@@ -9,9 +9,7 @@ impl ProviderFactory for BoundaryFactory {
     fn display_name(&self) -> &str {
         "Construction boundary mock"
     }
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
+
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -29,7 +27,7 @@ impl ProviderFactory for BoundaryFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             vec![],
         )

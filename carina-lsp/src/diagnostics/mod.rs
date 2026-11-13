@@ -413,10 +413,6 @@ enum DiagnosticProviderContext {
 
 struct DiagnosticValidationInputs<'a> {
     binding_index: carina_core::binding_index::BindingIndex<'a, RelativeBindingName>,
-    inference_bindings: carina_core::validation::inference::InferenceBindings<
-        ParserPlaceholder,
-        RelativeBindingName,
-    >,
     binding_use_report: carina_core::validation::BindingUseReport,
     export_value_bindings:
         carina_core::binding_index::ResolvedBindings<ParserPlaceholder, RelativeBindingName>,
@@ -722,8 +718,7 @@ impl DiagnosticRun<'_> {
             module_signatures,
             self.provider_context,
         );
-        let inference_bindings =
-            carina_core::validation::inference::bindings_from_parsed(binding_input);
+
         let context = carina_core::validation::ValidationTypeContext::in_session(
             configuration,
             self.provider_context,
@@ -734,7 +729,6 @@ impl DiagnosticRun<'_> {
             carina_core::binding_index::ResolvedBindings::for_authored_validation(binding_input);
         DiagnosticValidationInputs {
             binding_index,
-            inference_bindings,
             binding_use_report,
             export_value_bindings,
         }
@@ -1476,7 +1470,6 @@ impl DiagnosticRun<'_> {
             });
             let DiagnosticValidationInputs {
                 binding_index,
-                inference_bindings,
                 binding_use_report,
                 export_value_bindings,
             } = validation_inputs;
@@ -2592,7 +2585,7 @@ impl DiagnosticRun<'_> {
                 &semantic_view,
                 &binding_index,
                 &known_bindings,
-                &inference_bindings,
+                conversion_validation,
             ));
 
             diagnostics.extend(self.check_exports_blocks(
@@ -2601,7 +2594,7 @@ impl DiagnosticRun<'_> {
                 tree,
                 &semantic_view,
                 &export_value_bindings,
-                expanded_graph,
+                (expanded_graph, conversion_validation),
             ));
 
             if let (Some(configuration), Some(tree)) =

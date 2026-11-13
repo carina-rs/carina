@@ -1,4 +1,4 @@
-use carina_core::provider::{ProviderPlan, ProviderValidationInputs};
+use carina_core::provider::ProviderValidationInputs;
 use carina_core::provider_text::{
     GuestInputInventory, GuestInputStore, GuestStoreData, RedactionSet,
 };
@@ -192,9 +192,7 @@ impl GuestStore {
     ) -> Self {
         let stderr = super::guest_stderr::HostOutput::new(super::host_stderr());
         let provider_name = label.name.clone();
-        let diagnostic_inputs = ProviderPlan::state_only()
-            .session(&provider_name, None, None)
-            .guest_inputs();
+        let diagnostic_inputs = ProviderValidationInputs::for_schema(&provider_name);
         let inputs = diagnostic_inputs.guest_inventory();
         let capabilities = network.runtime_capabilities().cloned();
         let mut http_hooks = AllowListHttpHooks::with_test_route(label, network, http_test_route);

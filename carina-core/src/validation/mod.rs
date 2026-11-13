@@ -13,7 +13,7 @@ pub(crate) mod presentation;
 pub use presentation::{
     ClientFindingKind, ConversionValidation, FindingSubject, OrdinaryFailure, OrdinaryFinding,
     PresentedConversion, PresentedFinding, PresentedFindings, ResourceAdmissionStep,
-    ResourceValidationReport, ValidationClientError, ValidationClientFailure,
+    ResourceValidationReport, SinkFindings, ValidationClientError, ValidationClientFailure,
 };
 pub mod routing;
 pub mod typecheck;
@@ -1266,7 +1266,7 @@ fn reference_value_mismatch<B: BindingAddress>(
 
 fn deferred_value_mismatch<B: BindingAddress>(
     source: ValueSource<'_, B>,
-    expression: &crate::parser::retained::JudgedExpr,
+    expression: &crate::parser::retained::JudgedExprData,
     target: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
     schemas: &SchemaRegistry,
     bindings: &BindingIndex<'_, B>,
@@ -1390,6 +1390,24 @@ fn binding_use_expression<'a, B: BindingAddress>(
     report.expression_in(&use_site.expression_instance, use_site.location())
 }
 
+enum OrdinaryUseSource<'a> {
+    Judged(crate::parser::retained::OrdinaryJudgedExpr<'a>),
+    Missing(crate::parser::retained::MissingEvidence),
+}
+impl<'a> OrdinaryUseSource<'a> {
+    fn read(
+        &self,
+    ) -> Result<
+        crate::parser::retained::OrdinaryJudgedExpr<'a>,
+        crate::parser::retained::MissingEvidence,
+    > {
+        match self {
+            Self::Judged(source) => Ok(*source),
+            Self::Missing(error) => Err(error.clone()),
+        }
+    }
+}
+
 fn precheck_value_source<B: BindingAddress>(
     use_site: &crate::parser::BareBindingUse,
     value: &GenericValue<ParserPlaceholder, B>,
@@ -1397,8 +1415,9 @@ fn precheck_value_source<B: BindingAddress>(
     sink: RefSink<'_>,
     context: &ValidationTypeContext<'_, B>,
     diagnostic_path: &impl Fn(ReferencePathRef<'_, B>) -> ModuleCallDiagnosticPath,
+    ordinary_source: &OrdinaryUseSource<'_>,
 ) -> Option<BindingResolutionError> {
-    let expression = match binding_use_expression(use_site, context) {
+    let expression = match ordinary_source.read() {
         Ok(expression) => expression,
         Err(error) => {
             return Some(BindingResolutionError::DeferredAccess(Box::new(
@@ -1409,18 +1428,20 @@ fn precheck_value_source<B: BindingAddress>(
         }
     };
     let expected = sink.expression_type();
-    let admission =
-        crate::parser::retained::admit_expression(expression, &expected).map_err(|error| {
-            BindingResolutionError::DeferredAccess(Box::new(
-                DeferredAccessTypeError::InvalidAccess { error },
-            ))
-        });
+    let admission = crate::parser::retained::admit_ordinary_with_context(
+        expression,
+        &expected,
+        crate::parser::retained::AdmissionContext::Assignment,
+        context.raw_provider_context(),
+    )
+    .map_err(|error| {
+        BindingResolutionError::DeferredAccess(Box::new(DeferredAccessTypeError::InvalidAccess {
+            error,
+        }))
+    });
     if matches!(
         admission,
-        Ok(
-            crate::parser::retained::ExpressionAdmission::DeferredInterpolation
-                | crate::parser::retained::ExpressionAdmission::ConversionRequired
-        )
+        Ok(crate::parser::retained::ExpressionAdmission::DeferredInterpolation)
     ) {
         return None;
     }
@@ -1457,7 +1478,7 @@ fn precheck_value_source<B: BindingAddress>(
             value,
             declared_type,
         },
-        expression,
+        &expression,
         target,
         context.schemas,
         &context.scope_bindings,
@@ -1470,7 +1491,15 @@ fn precheck_value_source<B: BindingAddress>(
         Err(error) => Some(if expression.assignment_source_type().is_some() {
             diagnostic
                 .or_else(|| {
-                    binding_value_constraints(use_site, value, declared_type, sink, context).err()
+                    binding_value_constraints(
+                        use_site,
+                        value,
+                        declared_type,
+                        sink,
+                        context,
+                        ordinary_source,
+                    )
+                    .err()
                 })
                 .unwrap_or(error)
         } else {
@@ -1487,6 +1516,7 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
     sink: RefSink<'_>,
     context: &ValidationTypeContext<'_, B>,
     diagnostic_path: &impl Fn(ReferencePathRef<'_, B>) -> ModuleCallDiagnosticPath,
+    ordinary_source: &OrdinaryUseSource<'_>,
 ) -> Result<(), BindingResolutionError> {
     let expected = sink.expression_type();
     let builtin_members = binding_use_expression(use_site, context).is_ok_and(|expression| {
@@ -1508,6 +1538,7 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
         sink,
         context,
         diagnostic_path,
+        ordinary_source,
     );
     if let Some(BindingResolutionError::ReferenceType(error)) = &mut prechecked {
         error.declared_constraint = declared_type.is_some()
@@ -1519,7 +1550,14 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
 
     let result = match prechecked {
         Some(error) => Err(error),
-        None => binding_value_constraints(use_site, value, declared_type, sink, context),
+        None => binding_value_constraints(
+            use_site,
+            value,
+            declared_type,
+            sink,
+            context,
+            ordinary_source,
+        ),
     };
     match enum_target_from_sink(sink) {
         Some(target) => {
@@ -1536,6 +1574,7 @@ fn binding_value_constraints<B: BindingAddress>(
     declared_type: Option<&TypeExpr>,
     sink: RefSink<'_>,
     context: &ValidationTypeContext<'_, B>,
+    ordinary_source: &OrdinaryUseSource<'_>,
 ) -> Result<(), BindingResolutionError> {
     if let Some(target) = enum_target_from_sink(sink) {
         let resolver = EnumValueResolver::with_defs(target.attr_type, target.defs);
@@ -1579,16 +1618,13 @@ fn binding_value_constraints<B: BindingAddress>(
         )
         .map_err(BindingResolutionError::Type),
         RefSink::TypeExpr(type_expr) => {
-            let expression = context
-                .expression_report
-                .expression_in(&use_site.expression_instance, use_site.location())
-                .map_err(|error| {
-                    BindingResolutionError::ValueType(Box::new(
-                        typecheck::TypeExprValueError::InvalidAccess {
-                            error: error.into(),
-                        },
-                    ))
-                })?;
+            let expression = ordinary_source.read().map_err(|error| {
+                BindingResolutionError::ValueType(Box::new(
+                    typecheck::TypeExprValueError::InvalidAccess {
+                        error: error.into(),
+                    },
+                ))
+            })?;
             context
                 .provider_context
                 .check_at(
@@ -1814,6 +1850,7 @@ fn resolve_record_against_module<B: BindingAddress>(
     expected: &TypeExpr,
     context: &ValidationTypeContext<'_, B>,
     diagnostic_path: &impl Fn(ReferencePathRef<'_, B>) -> ModuleCallDiagnosticPath,
+    ordinary_source: &OrdinaryUseSource<'_>,
 ) -> Result<(), BindingResolutionError> {
     let Some(resolved) = resolve_module_argument_path_type(
         expected,
@@ -1837,6 +1874,7 @@ fn resolve_record_against_module<B: BindingAddress>(
             RefSink::TypeExpr(&expected),
             context,
             diagnostic_path,
+            ordinary_source,
         ),
         crate::parser::BareBindingSource::Structural(handle) => {
             check_handle_sink(handle, &resolved)
@@ -2039,22 +2077,27 @@ where
                     .map(|expected| expected.as_type_expr())
             }
         };
-        if let Ok(expression) = evidence {
-            let fallback = INTERPOLATION_REF_SINK.clone();
-            match expression.binding_diagnostic_owner(
-                expected.as_ref(),
-                &fallback,
-                context.raw_provider_context(),
-            ) {
-                crate::parser::retained::BindingDiagnosticOwner::AuthoredExpression => {
-                    // The authored walk still checks the complete destination;
-                    // source prechecking does not claim placement authority.
-                    report.expression_owned_uses.push(record.authored.clone());
-                    continue;
+        let ordinary_source = match evidence {
+            Ok(expression) => {
+                let fallback = INTERPOLATION_REF_SINK.clone();
+                match expression.binding_diagnostic_owner(
+                    expected.as_ref(),
+                    &fallback,
+                    context.raw_provider_context(),
+                ) {
+                    crate::parser::retained::BindingDiagnosticOwner::AuthoredExpression => {
+                        // The authored walk still checks the complete destination;
+                        // source prechecking does not claim placement authority.
+                        report.expression_owned_uses.push(record.authored.clone());
+                        continue;
+                    }
+                    crate::parser::retained::BindingDiagnosticOwner::OrdinarySource(source) => {
+                        OrdinaryUseSource::Judged(source)
+                    }
                 }
-                crate::parser::retained::BindingDiagnosticOwner::OrdinarySource => {}
             }
-        }
+            Err(error) => OrdinaryUseSource::Missing(error),
+        };
         let mut result = match &record.authored.owner {
             crate::parser::BindingUseOwner::Resource(address) => {
                 match resource_sink(file, address, &record.authored.path, context.schemas) {
@@ -2069,6 +2112,7 @@ where
                             sink,
                             context,
                             &diagnostic_path,
+                            &ordinary_source,
                         ),
                         crate::parser::BareBindingSource::Structural(handle) => {
                             let existing = BindingResolutionError::Existing(
@@ -2103,9 +2147,13 @@ where
                 argument,
                 value_span: _,
             } => match module_argument_type(file, call, argument, context.module_signatures) {
-                Some(expected) => {
-                    resolve_record_against_module(record, &expected, context, &diagnostic_path)
-                }
+                Some(expected) => resolve_record_against_module(
+                    record,
+                    &expected,
+                    context,
+                    &diagnostic_path,
+                    &ordinary_source,
+                ),
                 None => match &record.source {
                     crate::parser::BareBindingSource::Value { .. } => Ok(()),
                     crate::parser::BareBindingSource::Structural(handle) => {
@@ -2917,7 +2965,7 @@ impl std::fmt::Display for IntegerArithmeticTypeFinding {
 pub fn check_deferred_access_type<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     expected: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
-    expression: &crate::parser::retained::JudgedExpr,
+    expression: &crate::parser::retained::JudgedExprData,
     _schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
 ) -> Result<(), DeferredAccessTypeError> {
@@ -8214,7 +8262,7 @@ pub fn validate_no_exports_in_module<E>(parsed: &crate::parser::File<E>) -> Resu
 /// Validate provider configuration attributes.
 ///
 /// Runs host-side type-level validation using
-/// [`ProviderFactory::provider_config_attribute_types`] first, then
+/// [`ProviderFactory::schema_witness`] first, then
 /// canonicalizes schema-known enum values before delegating to
 /// [`ProviderFactory::validate_config`] for provider-specific semantic checks.
 /// The provider sees only canonical API spellings; literal strings are never
@@ -9493,6 +9541,13 @@ impl ModuleCallChecker<'_> {
                 .id()
                 .argument_value_location(argument)
                 .expect("authored argument expression");
+            let inference = match inference {
+                Ok(expression) => match expression.type_projection() {
+                    crate::parser::retained::TypeProjection::Available(source) => Ok(source),
+                    crate::parser::retained::TypeProjection::NoProjection(_) => continue,
+                },
+                Err(error) => Err(error),
+            };
             let reports_here = !self.findings.iter().any(|finding| finding.anchor.location() == location && finding.owners.contains(&owner))
                 && !inference.as_ref().is_ok_and(|expression| {
                     matches!(expression.static_type(), Err(crate::static_type::InferenceIssue::Failed(error))
@@ -10337,29 +10392,94 @@ impl<P> CheckedExportValues<P> {
     }
 }
 
+type ExportValueResult<E> = Result<Vec<E>, Vec<crate::parser::Located<ParameterValueFinding>>>;
+type SourceCheck<T, R> = (T, Vec<R>);
+trait ExportSource {
+    type Rejection;
+    fn source<'a>(
+        &self,
+        expression: &'a crate::parser::retained::JudgedExpr,
+    ) -> Result<crate::parser::retained::OrdinaryJudgedExpr<'a>, Self::Rejection>;
+}
+struct ValidationExport;
+impl ExportSource for ValidationExport {
+    type Rejection = crate::parser::retained::ConversionRejection;
+    fn source<'a>(
+        &self,
+        expression: &'a crate::parser::retained::JudgedExpr,
+    ) -> Result<crate::parser::retained::OrdinaryJudgedExpr<'a>, Self::Rejection> {
+        expression.ordinary()
+    }
+}
+struct MetadataSource;
+impl ExportSource for MetadataSource {
+    type Rejection = crate::parser::retained::NoTypeProjection;
+    fn source<'a>(
+        &self,
+        expression: &'a crate::parser::retained::JudgedExpr,
+    ) -> Result<crate::parser::retained::OrdinaryJudgedExpr<'a>, Self::Rejection> {
+        match expression.type_projection() {
+            crate::parser::retained::TypeProjection::Available(source) => Ok(source),
+            crate::parser::retained::TypeProjection::NoProjection(reason) => Err(reason),
+        }
+    }
+}
+struct OperationalExport(crate::parser::retained::ProjectedPhase);
+impl ExportSource for OperationalExport {
+    type Rejection = std::convert::Infallible;
+    fn source<'a>(
+        &self,
+        expression: &'a crate::parser::retained::JudgedExpr,
+    ) -> Result<crate::parser::retained::OrdinaryJudgedExpr<'a>, Self::Rejection> {
+        // P1 rejected conversions at exports/function/module boundaries before
+        // this plan/apply check. Preserve authored TypeExpr checking here.
+        Ok(expression.operational_sink(
+            self.0,
+            crate::parser::retained::conversion::flow::OPERATIONAL_EXPORT_BOUNDARY,
+        ))
+    }
+}
+
 fn resolve_and_validate_export_values<E, P: PlaceholderKind, B: BindingAddress>(
     export_params: &[E],
     bindings: &crate::binding_index::ResolvedBindings<P, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    phase: crate::parser::retained::ProjectedPhase,
 ) -> Result<Vec<E>, String>
 where
     E: crate::parser::ExportParamLike<P, B> + Clone,
 {
-    resolve_and_validate_export_values_report(export_params, bindings, config).map_err(|findings| {
+    let (result, impossible) = resolve_and_validate_export_values_report(
+        export_params,
+        bindings,
+        config,
+        OperationalExport(phase),
+    );
+    if let Some(rejection) = impossible.into_iter().next() {
+        match rejection {}
+    }
+    result.map_err(|findings| {
         finding_messages(findings.into_iter().map(|finding| finding.into_parts().1))
     })
 }
 
-fn resolve_and_validate_export_values_report<E, P: PlaceholderKind, B: BindingAddress>(
+fn resolve_and_validate_export_values_report<
+    S: ExportSource,
+    E,
+    P: PlaceholderKind,
+    B: BindingAddress,
+>(
     export_params: &[E],
     bindings: &crate::binding_index::ResolvedBindings<P, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<Vec<E>, Vec<crate::parser::Located<ParameterValueFinding>>>
+    source: S,
+) -> SourceCheck<ExportValueResult<E>, S::Rejection>
 where
     E: crate::parser::ExportParamLike<P, B> + Clone,
 {
     let mut checked = Vec::with_capacity(export_params.len());
     let mut errors = Vec::new();
+    let mut rejections = Vec::new();
 
     for param in export_params {
         let mut resolved_param = param.clone();
@@ -10405,6 +10525,14 @@ where
                                 continue;
                             }
                         };
+                        let expression = match source.source(expression) {
+                            Ok(expression) => expression,
+                            Err(rejection) => {
+                                rejections.push(rejection);
+                                checked.push(resolved_param);
+                                continue;
+                            }
+                        };
                         let provider = typecheck::TypecheckProviderContext::for_session(config);
                         let check = provider.check_at(
                             type_expr,
@@ -10437,9 +10565,9 @@ where
     }
 
     if errors.is_empty() {
-        Ok(checked)
+        (Ok(checked), rejections)
     } else {
-        Err(errors)
+        (Err(errors), rejections)
     }
 }
 
@@ -10450,11 +10578,13 @@ pub fn check_export_values_pre_apply_providerless<E, P: PlaceholderKind, B: Bind
     export_params: &[E],
     bindings: &crate::binding_index::ResolvedBindings<P, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    phase: crate::parser::retained::ProjectedPhase,
 ) -> Result<ExportsCheckedPreApply<E>, String>
 where
     E: crate::parser::ExportParamLike<P, B> + Clone,
 {
-    let display_params = resolve_and_validate_export_values(export_params, bindings, config)?;
+    let display_params =
+        resolve_and_validate_export_values(export_params, bindings, config, phase)?;
     Ok(ExportsCheckedPreApply {
         original_params: export_params.to_vec(),
         display_params,
@@ -10468,11 +10598,13 @@ pub fn check_export_values_pre_apply<E, P: PlaceholderKind, B: BindingAddress>(
     export_params: &[E],
     bindings: &crate::binding_index::ResolvedBindings<P, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    phase: crate::parser::retained::ProjectedPhase,
 ) -> Result<ExportsCheckedPreApply<E>, String>
 where
     E: crate::parser::ExportParamLike<P, B> + Clone,
 {
-    let display_params = resolve_and_validate_export_values(export_params, bindings, config)?;
+    let display_params =
+        resolve_and_validate_export_values(export_params, bindings, config, phase)?;
     Ok(ExportsCheckedPreApply {
         original_params: export_params.to_vec(),
         display_params,
@@ -10480,20 +10612,33 @@ where
 }
 
 /// Collect one typed pre-apply export failure per authored boundary.
-pub fn check_export_values_pre_apply_report<E, P: PlaceholderKind, B: BindingAddress>(
+pub fn check_export_values_for_validation<E, P: PlaceholderKind, B: BindingAddress>(
     export_params: &[E],
     bindings: &crate::binding_index::ResolvedBindings<P, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<ExportsCheckedPreApply<E>, Vec<crate::parser::Located<ParameterValueFinding>>>
+) -> SinkFindings<
+    Result<ExportsCheckedPreApply<E>, Vec<crate::parser::Located<ParameterValueFinding>>>,
+>
 where
     E: crate::parser::ExportParamLike<P, B> + Clone,
 {
-    let display_params =
-        resolve_and_validate_export_values_report(export_params, bindings, config)?;
-    Ok(ExportsCheckedPreApply {
-        original_params: export_params.to_vec(),
-        display_params,
-    })
+    let (result, rejections) = resolve_and_validate_export_values_report(
+        export_params,
+        bindings,
+        config,
+        ValidationExport,
+    );
+    let mut conversions = crate::ConversionChannel::default();
+    for rejection in rejections {
+        conversions.append(rejection.into_channel());
+    }
+    SinkFindings::new(
+        result.map(|display_params| ExportsCheckedPreApply {
+            original_params: export_params.to_vec(),
+            display_params,
+        }),
+        conversions,
+    )
 }
 
 /// Resolve the original export expressions against the post-apply binding
@@ -10503,12 +10648,17 @@ pub fn resolve_export_values_post_apply<E, P: PlaceholderKind, B: BindingAddress
     export_params: &ExportsCheckedPreApply<E>,
     bindings: &crate::binding_index::ResolvedBindings<P, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    phase: crate::parser::retained::ProjectedPhase,
 ) -> Result<CheckedExportValues<E>, String>
 where
     E: crate::parser::ExportParamLike<P, B> + Clone,
 {
-    let params =
-        resolve_and_validate_export_values(&export_params.original_params, bindings, config)?;
+    let params = resolve_and_validate_export_values(
+        &export_params.original_params,
+        bindings,
+        config,
+        phase,
+    )?;
     Ok(CheckedExportValues { params })
 }
 
@@ -10520,7 +10670,7 @@ where
 pub fn validate_attribute_params<P: PlaceholderKind, B: BindingAddress>(
     attribute_params: &[crate::parser::AttributeParameter<TypeExpr, P, B>],
     config: &LoadedProviderContext,
-) -> Result<(), String> {
+) -> SinkFindings<Result<(), String>> {
     validate_attribute_params_impl(
         attribute_params,
         typecheck::TypecheckProviderContext::loaded(config),
@@ -10530,7 +10680,7 @@ pub fn validate_attribute_params<P: PlaceholderKind, B: BindingAddress>(
 pub fn validate_attribute_params_with_context<P: PlaceholderKind, B: BindingAddress>(
     attribute_params: &[crate::parser::AttributeParameter<TypeExpr, P, B>],
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> SinkFindings<Result<(), String>> {
     validate_attribute_params_impl(
         attribute_params,
         typecheck::TypecheckProviderContext::for_session(config),
@@ -10540,30 +10690,37 @@ pub fn validate_attribute_params_with_context<P: PlaceholderKind, B: BindingAddr
 fn validate_attribute_params_impl<P: PlaceholderKind, B: BindingAddress>(
     attribute_params: &[crate::parser::AttributeParameter<TypeExpr, P, B>],
     config: typecheck::TypecheckProviderContext<'_>,
-) -> Result<(), String> {
-    parameter_findings_result(
-        attribute_value_findings_impl(attribute_params, config)
-            .into_iter()
-            .map(|finding| finding.into_parts().1)
-            .collect(),
-    )
+) -> SinkFindings<Result<(), String>> {
+    attribute_value_findings_impl(attribute_params, config).map(|findings| {
+        parameter_findings_result(
+            findings
+                .into_iter()
+                .map(|finding| finding.into_parts().1)
+                .collect(),
+        )
+    })
 }
 
 pub fn attribute_value_findings<P: PlaceholderKind, B: BindingAddress>(
     attribute_params: &[crate::parser::AttributeParameter<TypeExpr, P, B>],
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Vec<crate::parser::Located<ParameterValueFinding>> {
+) -> SinkFindings<Vec<crate::parser::Located<ParameterValueFinding>>> {
     attribute_value_findings_impl(
         attribute_params,
         typecheck::TypecheckProviderContext::for_session(config),
     )
 }
 
-fn attribute_value_findings_impl<P: PlaceholderKind, B: BindingAddress>(
+fn attribute_value_findings_from<S: ExportSource, P: PlaceholderKind, B: BindingAddress>(
     attribute_params: &[crate::parser::AttributeParameter<TypeExpr, P, B>],
     config: typecheck::TypecheckProviderContext<'_>,
-) -> Vec<crate::parser::Located<ParameterValueFinding>> {
+    source: S,
+) -> (
+    Vec<crate::parser::Located<ParameterValueFinding>>,
+    Vec<S::Rejection>,
+) {
     let mut errors = Vec::new();
+    let mut rejections = Vec::new();
 
     for param in attribute_params {
         let invalid = |error, line| {
@@ -10615,6 +10772,13 @@ fn attribute_value_findings_impl<P: PlaceholderKind, B: BindingAddress>(
                     Ok(expression) => expression,
                     Err(error) => {
                         errors.push(invalid(error.clone().into(), None));
+                        continue;
+                    }
+                };
+                let expression = match source.source(expression) {
+                    Ok(source) => source,
+                    Err(rejection) => {
+                        rejections.push(rejection);
                         continue;
                     }
                 };
@@ -10670,6 +10834,32 @@ fn attribute_value_findings_impl<P: PlaceholderKind, B: BindingAddress>(
         }
     }
 
+    (errors, rejections)
+}
+
+fn attribute_value_findings_impl<P: PlaceholderKind, B: BindingAddress>(
+    params: &[crate::parser::AttributeParameter<TypeExpr, P, B>],
+    config: typecheck::TypecheckProviderContext<'_>,
+) -> SinkFindings<Vec<crate::parser::Located<ParameterValueFinding>>> {
+    let (errors, rejections) = attribute_value_findings_from(params, config, ValidationExport);
+    let mut conversions = crate::ConversionChannel::default();
+    for rejection in rejections {
+        conversions.append(rejection.into_channel());
+    }
+    SinkFindings::new(errors, conversions)
+}
+
+/// A separate metadata parse may query ordinary types but cannot publish
+/// conversion findings owned by its foreign NodeIds.
+pub fn query_attribute_value_findings<P: PlaceholderKind, B: BindingAddress>(
+    params: &[crate::parser::AttributeParameter<TypeExpr, P, B>],
+    config: &dyn deferred_types::ProviderTypeCheckContext,
+) -> Vec<crate::parser::Located<ParameterValueFinding>> {
+    let (errors, _unprojectable) = attribute_value_findings_from(
+        params,
+        typecheck::TypecheckProviderContext::for_session(config),
+        MetadataSource,
+    );
     errors
 }
 

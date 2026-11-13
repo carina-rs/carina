@@ -12,7 +12,7 @@ homepage.workspace = true
 workspace = true
 
 [lib]
-doctest = false
+doctest = true
 
 [features]
 test-utils = ["carina-core/test-utils"]

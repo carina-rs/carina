@@ -22,10 +22,6 @@ impl ProviderFactory for RefinedValueFactory {
         "Module argument refinement fixture"
     }
 
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        ValidatedConfigSchema::default()
-    }
-
     fn validate_config(
         &self,
         _: &CanonicalProviderConfigAttributes,
@@ -72,7 +68,7 @@ impl ProviderFactory for RefinedValueFactory {
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            ValidatedConfigSchema::default(),
             Default::default(),
             Vec::new(),
         )

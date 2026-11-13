@@ -30,12 +30,12 @@ fn identity(
 ) -> DestinationIdentity {
     DestinationIdentity {
         declaration: DeclarationIdentity {
-            owner: schema.schema_type_owner().clone(),
+            owner: DeclarationOwner::Provider(schema.schema_type_owner().clone()),
             schema: schema.schema().admission_identity,
         },
         instance: InstanceIdentity::Resource(id.clone()),
         path: vec![],
-        revision: CatalogRevision(catalog.custom_types.clone()),
+        revision: CatalogRevision(CatalogSnapshot::Provider(catalog.custom_types.clone())),
     }
 }
 
@@ -133,13 +133,13 @@ impl crate::schema::OwnerBoundResourceSchema<'_> {
         destination.identity.path.push(ordinal);
         #[cfg(test)]
         super::tests::contract_constructed();
-        destination.contract = Some(Box::new(DestinationContract {
-            schema: self.schema().shared_schema(),
-            attribute: effective.name().into(),
-            owner: self.schema_type_owner().clone(),
-            ancestry: FieldAncestry::from_input_mode(effective.effective_input_mode()),
-            path: LeafPath::from_segments([LeafPathSegment::StructField(attribute.into())]),
-        }));
+        destination.contract = Some(Box::new(DestinationContract::resource(
+            self.schema().shared_schema(),
+            effective.name().into(),
+            self.schema_type_owner().clone(),
+            FieldAncestry::from_input_mode(effective.effective_input_mode()),
+            LeafPath::from_segments([LeafPathSegment::StructField(attribute.into())]),
+        )));
         destination
     }
 }
@@ -500,12 +500,12 @@ pub(crate) fn admit_value_only_attributes<
                 let destination =
                     schema.admission_selected_attribute::<K>(id, name, selected, session.catalog());
                 match destination.contract.as_deref() {
-                    Some(contract) => crate::schema::value_validation::validate_value_with_lookup(
+                    Some(contract) => crate::schema::value_validation::validate_value_locally(
                         contract.attr(),
                         proof,
                         contract.defs(),
                         contract.ancestry,
-                        &contract.lookup(session.catalog()),
+                        Some(&contract.lookup(session.catalog())),
                     ),
                     None => Default::default(),
                 }

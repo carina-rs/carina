@@ -42,6 +42,25 @@ fn event_schema_install_error(error: crate::schema::SchemaRegistryError) -> Host
 /// file.resources.push(Resource::with_provider("aws", "s3.Bucket", "partial", None));
 /// let _ = file.provider_plan();
 /// ```
+///
+/// Construction always requires configuration admitted for its declaration
+/// and instance, including a built-in provider's empty configuration.
+///
+/// ```compile_fail
+/// use carina_core::provider::ProviderPlan;
+/// use carina_core::parser::ConfigurationAttributes;
+/// use carina_core::resource::Value;
+/// fn bypass(plan: &ProviderPlan, raw: &ConfigurationAttributes<Value>) {
+///     let _ = plan.session(raw); // forbidden: raw values are not admitted configuration
+/// }
+/// ```
+/// ```
+/// # use carina_core::provider::ProviderPlan;
+/// # use carina_core::parser::ConfigurationAttributes;
+/// # use carina_core::resource::Value;
+/// # fn bypass(plan: &ProviderPlan, raw: &ConfigurationAttributes<Value>) {
+/// # }
+/// ```
 #[derive(Clone, Debug)]
 pub struct ProviderPlan {
     routes: std::collections::HashMap<ProviderInstanceKey, RedactionSet>,
@@ -92,29 +111,52 @@ impl ProviderPlan {
         /// Mint one configured or built-in provider session from this whole plan.
         fn session(
             &self,
-            provider: &str,
-            binding: Option<&str>,
-            config: Option<&ProviderReadyConfig>,
+            config: &ProviderReadyConfig,
         ) -> ProviderSession {
-            self.session_builder(provider, binding, config).build()
+            self.session_builder(config).build()
         }
     }
     host_api! {
         /// Select host presentation before constructing and sharing a session.
         fn session_builder(
             &self,
-            provider: &str,
-            binding: Option<&str>,
-            config: Option<&ProviderReadyConfig>,
+            config: &ProviderReadyConfig,
         ) -> ProviderSessionBuilder {
             ProviderSessionBuilder {
                 plan: self.clone(),
-                provider: provider.to_owned(),
-                binding: binding.map(str::to_owned),
-                config: config.cloned(),
+                config: config.clone(),
                 sink: super::events::EventSink::Default,
             }
         }
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl ProviderPlan {
+    host_api! {
+    /// Test declarations still admit the complete payload, including empty config.
+    fn test_session(
+        &self,
+        provider: &str,
+        binding: Option<&str>,
+        config: Option<&ProviderReadyConfig>,
+    ) -> ProviderSession {
+        self.test_session_builder(provider, binding, config).build()
+    }
+    }
+    host_api! {
+    fn test_session_builder(
+        &self,
+        provider: &str,
+        binding: Option<&str>,
+        config: Option<&ProviderReadyConfig>,
+    ) -> ProviderSessionBuilder {
+        self.session_builder(
+            &crate::validation::admission::configuration::provider::test_configuration(
+                provider, binding, config,
+            ),
+        )
+    }
     }
 }
 
@@ -123,17 +165,17 @@ impl ProviderPlan {
 ///
 /// ```
 /// # #[cfg(all(feature = "provider-host", not(target_arch = "wasm32")))] {
-/// use carina_core::provider::ProviderPlan;
-/// let session = ProviderPlan::state_only().session_builder("native", None, None)
-///     .with_diagnostic_sink(|_event| {}).build();
-/// let _handle = session.diagnostics();
+/// use carina_core::provider::{ProviderPlan, ProviderReadyConfig};
+/// fn with_sink(config: &ProviderReadyConfig) {
+///     let session = ProviderPlan::state_only().session_builder(config)
+///         .with_diagnostic_sink(|_event| {}).build();
+///     let _handle = session.diagnostics();
+/// }
 /// # }
 /// ```
 pub struct ProviderSessionBuilder {
     plan: ProviderPlan,
-    provider: String,
-    binding: Option<String>,
-    config: Option<ProviderReadyConfig>,
+    config: ProviderReadyConfig,
     sink: super::events::EventSink,
 }
 impl ProviderSessionBuilder {
@@ -155,13 +197,7 @@ impl ProviderSessionBuilder {
         self
     }
     pub fn build(self) -> ProviderSession {
-        ProviderSession::new(
-            &self.plan,
-            &self.provider,
-            self.binding.as_deref(),
-            self.config.as_ref(),
-            self.sink,
-        )
+        ProviderSession::new(&self.plan, &self.config, self.sink)
     }
 }
 
@@ -175,39 +211,10 @@ impl ProviderSessionBuilder {
 /// ```
 #[derive(Clone, Debug)]
 pub struct ProviderSession {
-    config: Option<ProviderReadyConfig>,
-    provider: String,
-    binding: Option<String>,
+    config: ProviderReadyConfig,
     secrets: RedactionSet,
     diagnostics: super::ProviderDiagnosticChannel,
     diagnostic_owner: super::DiagnosticOwner,
-}
-impl PartialEq for ProviderSession {
-    fn eq(&self, other: &Self) -> bool {
-        // Liveness is not part of session value equality; the old Arc<()> owner
-        // also compared equal across independent allocations.
-        let Self {
-            config,
-            provider,
-            binding,
-            secrets,
-            diagnostics,
-            diagnostic_owner: _owner,
-        } = self;
-        let Self {
-            config: other_config,
-            provider: other_provider,
-            binding: other_binding,
-            secrets: other_secrets,
-            diagnostics: other_diagnostics,
-            diagnostic_owner: _other_owner,
-        } = other;
-        config == other_config
-            && provider == other_provider
-            && binding == other_binding
-            && secrets == other_secrets
-            && diagnostics == other_diagnostics
-    }
 }
 impl ProviderSession {
     /// Core-owned call inputs for guest handoff; this does not grant runtime
@@ -224,16 +231,12 @@ impl ProviderSession {
     }
     fn new(
         plan: &ProviderPlan,
-        provider: &str,
-        binding: Option<&str>,
-        config: Option<&ProviderReadyConfig>,
+        config: &ProviderReadyConfig,
         sink: super::events::EventSink,
     ) -> Self {
-        let secrets = RedactionSet::collect(
-            config
-                .iter()
-                .flat_map(|config| config.attributes().values()),
-        );
+        let provider = config.instance().provider();
+        let binding = config.instance().provider_instance();
+        let secrets = RedactionSet::collect(config.attributes().values());
         if let Some(desired) = plan.routes.get(&ProviderInstanceKey::new(
             provider,
             binding.map(str::to_owned),
@@ -255,19 +258,21 @@ impl ProviderSession {
             sink,
         );
         Self {
-            config: config.cloned(),
-            provider: provider.to_owned(),
-            binding: binding.map(str::to_owned),
+            config: config.clone(),
             diagnostics,
             diagnostic_owner,
             secrets,
         }
     }
-    pub fn configuration(&self) -> Option<&ProviderReadyConfig> {
-        self.config.as_ref()
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn replace_test_configuration(&mut self, config: ProviderReadyConfig) {
+        self.config = config;
+    }
+    pub fn configuration(&self) -> &ProviderReadyConfig {
+        &self.config
     }
     pub fn binding(&self) -> Option<&str> {
-        self.binding.as_deref()
+        self.config.instance().provider_instance()
     }
     pub fn redaction_set(&self) -> &RedactionSet {
         &self.secrets
@@ -275,9 +280,12 @@ impl ProviderSession {
     pub fn diagnostics(&self) -> super::ProviderDiagnosticChannel {
         self.diagnostics.clone()
     }
-    fn install_event_schemas(&self, factory: &dyn ProviderFactory) -> HostResult<()> {
+    fn install_event_schemas(
+        &self,
+        witness: &crate::schema::ValidatedProviderSchemaWitness,
+    ) -> HostResult<()> {
         self.diagnostics
-            .set_schema_witness(&factory.schema_witness())
+            .set_schema_witness(witness)
             .map_err(event_schema_install_error)
     }
 }
@@ -291,6 +299,32 @@ pub struct ProviderValidationInputs {
     diagnostic_owner: super::DiagnosticOwner,
 }
 impl ProviderValidationInputs {
+    host_api! {
+        /// Diagnostic inputs for declaration loading. This grants no runtime session.
+        fn for_schema(provider: &str) -> Self {
+            Self::schema_with_sink(provider, super::events::EventSink::Default)
+        }
+    }
+    host_api! {
+        fn for_schema_with_filtered_diagnostic_sink(provider: &str, sink: impl Fn(super::BoundProviderEvent) + Send + Sync + 'static) -> Self {
+            Self::schema_with_sink(provider, super::events::EventSink::Filtered(std::sync::Arc::new(sink)))
+        }
+    }
+    fn schema_with_sink(provider: &str, sink: super::events::EventSink) -> Self {
+        let secrets = RedactionSet::before_request();
+        let (diagnostics, diagnostic_owner) = super::ProviderDiagnosticChannel::with_sink(
+            secrets.clone(),
+            provider.to_owned(),
+            Default::default(),
+            sink,
+        );
+        Self {
+            secrets,
+            diagnostics,
+            diagnostic_owner,
+        }
+    }
+
     pub fn guest_inventory(&self) -> super::GuestInputInventory {
         super::GuestInputInventory::new(self)
     }
@@ -381,7 +415,7 @@ pub(crate) fn prepare_provider_session<S, D>(
     >],
     data_sources: &[DataSource],
 ) -> ProviderSession {
-    ProviderPlan::from_desired(desired, data_sources).session(provider, binding, config)
+    ProviderPlan::from_desired(desired, data_sources).test_session(provider, binding, config)
 }
 
 /// A provider, its normalizer, and their shared append-only redaction set.
@@ -398,18 +432,44 @@ impl ProviderBoundary<'_> {
     }
 }
 impl ProviderBoundary<'static> {
-    pub async fn initialize(
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn initialize_for_test(
         factory: &dyn ProviderFactory,
-        session: &crate::provider::ProviderSession,
+        session: &ProviderSession,
     ) -> HostResult<InitializedProvider> {
-        session.install_event_schemas(factory)?;
+        let construction =
+            crate::validation::admission::configuration::provider::construction_for_test(
+                factory, session,
+            )?;
+        Self::initialize(&construction).await
+    }
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn initialize_normalizer_for_test(
+        factory: &dyn ProviderFactory,
+        session: &ProviderSession,
+    ) -> HostResult<ConfiguredNormalizer> {
+        let construction =
+            crate::validation::admission::configuration::provider::construction_for_test(
+                factory, session,
+            )?;
+        Self::initialize_normalizer(&construction).await
+    }
+
+    pub async fn initialize(
+        construction: &crate::validation::admission::configuration::provider::ProviderConstruction<
+            '_,
+        >,
+    ) -> HostResult<InitializedProvider> {
+        let factory = construction.factory();
+        let session = construction.session();
+        session.install_event_schemas(construction.witness())?;
         let (provider, outcome) = session
             .diagnostics
             .dispatch(|| factory.create_provider(session, InitializeOutcomeMint::new()))
             .await
             .map_err(|error| error.with_secrets(&session.secrets))?
             .into_parts();
-        let normalizer = Self::initialize_normalizer(factory, session).await?;
+        let normalizer = Self::initialize_normalizer(construction).await?;
         Ok(InitializedProvider {
             provider: std::sync::Arc::new(Self {
                 provider,
@@ -422,30 +482,33 @@ impl ProviderBoundary<'static> {
         })
     }
     pub async fn initialize_normalizer(
-        factory: &dyn ProviderFactory,
-        session: &crate::provider::ProviderSession,
+        construction: &crate::validation::admission::configuration::provider::ProviderConstruction<
+            '_,
+        >,
     ) -> HostResult<ConfiguredNormalizer> {
-        session.install_event_schemas(factory)?;
+        let factory = construction.factory();
+        let session = construction.session();
+        session.install_event_schemas(construction.witness())?;
         let ext = session
             .diagnostics
-            .dispatch(|| factory.create_normalizer(session))
+            .dispatch(|| factory.create_normalizer(session, InitializeOutcomeMint::new()))
             .await
             .map_err(|error| error.with_secrets(&session.secrets))?;
         let mut schemas = crate::schema::SchemaRegistry::new();
-        let witness = factory.schema_witness();
+        let witness = construction.witness();
         schemas
-            .insert_provider_witness(factory.name(), &witness)
+            .insert_provider_witness(factory.name(), witness)
             .map_err(event_schema_install_error)?;
-        if session.provider != factory.name() {
+        if session.configuration().instance().provider() != factory.name() {
             schemas
-                .insert_provider_witness(&session.provider, &witness)
+                .insert_provider_witness(session.configuration().instance().provider(), witness)
                 .map_err(event_schema_install_error)?;
         }
         Ok(ConfiguredNormalizer {
             diagnostic_inputs: session.guest_inputs(),
             route: Some(ProviderInstanceKey::new(
-                session.provider.clone(),
-                session.binding.clone(),
+                session.configuration().instance().provider().to_owned(),
+                session.binding().map(str::to_owned),
             )),
             provider_name: factory.name().to_owned(),
             ext,
@@ -691,7 +754,7 @@ impl<'a> ProviderBoundary<'a> {
         self.normalizer.schemas = schemas.clone();
     }
     pub(crate) fn fixture(provider: impl Provider + 'a) -> Self {
-        let session = ProviderPlan::state_only().session("", None, None);
+        let session = ProviderPlan::state_only().test_session("", None, None);
         let diagnostic_inputs = session.guest_inputs();
         let secrets = session.secrets;
         Self {

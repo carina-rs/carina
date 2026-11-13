@@ -406,3 +406,63 @@ fn r5b_read_only_commands_use_mains_ordinary_judge_gate() {
         }
     }
 }
+
+#[test]
+fn r5c_boundary_conversions_stop_before_operational_export_checks() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    let wasm = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
+        .into_iter()
+        .map(|name| workspace.join("target/wasm32-wasip2/debug").join(name))
+        .find(|path| path.is_file())
+        .expect("build the mock WASM fixture");
+    let source = format!("file://{}", wasm.display());
+    write(
+        directory.path(),
+        "providers.crn",
+        &format!("provider mock {{ source = '{source}' }}\n"),
+    );
+    write(
+        directory.path(),
+        "backend.crn",
+        "backend local { path = 'carina.state.json' }\n",
+    );
+    write(directory.path(), "main.crn", "");
+    let init = command(directory.path(), &["init", ".", "--accept-egress", &source]);
+    assert!(init.status.success(), "{}", rendered(&init));
+    for body in [
+        "let value = 'repo'CAST\nexports { result: String = value }\n",
+        "fn echo(value: String): String { value }\nlet result = echo('repo'CAST)\n",
+    ] {
+        for args in [
+            vec!["validate", ".", "--json"],
+            vec!["plan", "."],
+            vec!["state", "refresh", "."],
+        ] {
+            for converted in [false, true] {
+                let cast = if converted {
+                    " as mock.actions.OidcSubject.ClaimKey"
+                } else {
+                    ""
+                };
+                write(directory.path(), "main.crn", &body.replace("CAST", cast));
+                let output = command(directory.path(), &args);
+                let text = rendered(&output);
+                assert_eq!(
+                    output.status.success(),
+                    !converted,
+                    "{args:?}/{converted}: {text}"
+                );
+                assert!(!text.contains("bug in carina"), "{text}");
+                assert_eq!(
+                    text.matches("conversion is not supported at this position")
+                        .count(),
+                    usize::from(converted),
+                    "{args:?}: {text}"
+                );
+            }
+        }
+    }
+}

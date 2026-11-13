@@ -3,7 +3,6 @@
 use super::*;
 use crate::binding_index::RefType;
 use crate::resource::{DeferredValue, ReferencePath};
-use crate::schema::SinkAuthority;
 use crate::schema::assignability::AssignmentRelation;
 
 #[test]
@@ -285,10 +284,7 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
                 .push(SchemaRequirement::Reference);
             return Ok(());
         };
-        let sink = attr.in_schema(contract.defs()).with_authority(
-            &context.provider.catalog().custom_types,
-            SinkAuthority::Owner(&contract.owner),
-        );
+        let sink = contract.sink_type(attr, context.provider.catalog());
         if path == &contract.path
             && let Some((name, declared)) = context.declaration
         {
@@ -469,6 +465,15 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
     candidate: &Candidate<P, B>,
     context: &AdmissionContext<'_, P, B>,
 ) -> Result<AssignmentJudgement<K>, AdmissionErrors> {
+    let cursor = match &context.lookup {
+        super::AdmissionLookup::Catalog(cursor) => cursor,
+        super::AdmissionLookup::Configuration(_) => {
+            return Err(KnowledgeError::<B>::InvalidStage {
+                operation: "configuration input cannot enter authored assignment",
+            }
+            .into());
+        }
+    };
     if candidate.obligations.identity != context.identity {
         return Err(KnowledgeError::<B>::InvalidStage {
             operation: "candidate/proof pairing",
@@ -606,7 +611,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 contract.defs(),
                 contract.ancestry,
                 &lookup,
-                context.cursor.clone(),
+                cursor.clone(),
                 {
                     let callbacks = crate::schema::value_validation::WalkCallbacks::from(
                         crate::schema::value_validation::RequiredAssignmentCallbacks {
@@ -638,7 +643,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 contract.defs(),
                 contract.ancestry,
                 &lookup,
-                context.cursor.clone(),
+                cursor.clone(),
                 crate::schema::value_validation::WalkCallbacks::from(
                     crate::schema::value_validation::RequiredAssignmentCallbacks {
                         ordinary: &|_, _, _, _, _| Ok(Default::default()),
@@ -658,7 +663,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 contract.defs(),
                 contract.ancestry,
                 &lookup,
-                context.cursor.clone(),
+                cursor.clone(),
                 crate::schema::value_validation::WalkCallbacks::from(
                     crate::schema::value_validation::RequiredAssignmentCallbacks {
                         ordinary: &|_, _, _, _, _| Ok(Default::default()),
@@ -863,10 +868,7 @@ mod discharge_tests {
                     let contract = destination.contract.as_deref().unwrap();
                     let crate::schema::TypeAssignability::Unchecked(missing) = source
                         .in_schema(contract.defs())
-                        .assignment_to(contract.attr().in_schema(contract.defs()).with_authority(
-                            &catalog.custom_types,
-                            SinkAuthority::Owner(&contract.owner),
-                        ))
+                        .assignment_to(contract.sink_type(contract.attr(), catalog))
                     else {
                         panic!("unloaded source annotation must defer assignment");
                     };

@@ -48,8 +48,9 @@ async fn probe_calls(
                 )),
             );
     let plan = provider_text_fixtures::plan_for_desired(std::slice::from_ref(&resource));
-    let (session, events) = captured_session(plan.session_builder(provider, None, Some(&config)));
-    let initialized = ProviderBoundary::initialize(&factory, &session)
+    let (session, events) =
+        captured_session(plan.test_session_builder(provider, None, Some(&config)));
+    let initialized = ProviderBoundary::initialize_for_test(&factory, &session)
         .await
         .unwrap();
     events.lock().unwrap().clear();

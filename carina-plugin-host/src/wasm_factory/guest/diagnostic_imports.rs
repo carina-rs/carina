@@ -201,7 +201,8 @@ mod tests {
     async fn rejected_registration_does_not_consume_a_second_host_budget() {
         use carina_provider_protocol::diagnostics::ProtectedMaterial;
         let (session, _events) = captured_session(
-            carina_core::provider::ProviderPlan::state_only().session_builder("mock", None, None),
+            carina_core::provider::ProviderPlan::state_only()
+                .test_session_builder("mock", None, None),
         );
         let engine = Engine::default();
         let mut store = diagnostic_store(&engine);
@@ -239,7 +240,8 @@ mod tests {
     #[tokio::test]
     async fn non_finite_value_masks_its_leaf_and_keeps_the_event() {
         let (session, events) = captured_session(
-            carina_core::provider::ProviderPlan::state_only().session_builder("mock", None, None),
+            carina_core::provider::ProviderPlan::state_only()
+                .test_session_builder("mock", None, None),
         );
         let engine = Engine::default();
         let event = wit::Event {
@@ -277,7 +279,7 @@ mod tests {
             let engine = Engine::default();
             let (session, events) = captured_session(
                 carina_core::provider::ProviderPlan::state_only()
-                    .session_builder("mock", None, None),
+                    .test_session_builder("mock", None, None),
             );
             let mut store = diagnostic_store(&engine);
             store.set_configuration_secrets(session.guest_inputs());
@@ -306,7 +308,7 @@ mod tests {
                 .unwrap();
             assert!(events.lock().unwrap().is_empty());
             let replacement =
-                carina_core::provider::ProviderPlan::state_only().session("mock", None, None);
+                carina_core::provider::ProviderPlan::state_only().test_session("mock", None, None);
             if swap {
                 store.set_secrets(replacement.guest_inputs());
             }

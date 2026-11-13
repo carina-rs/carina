@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn handoff_registers_with_the_installed_store_and_publishes_to_the_call() {
         let engine = wasmtime::Engine::default();
-        let session = ProviderPlan::state_only().session("", None, None);
+        let session = ProviderPlan::state_only().test_session("", None, None);
         let source = session.guest_inputs();
         let store = GuestStoreData::new_store(&engine, (), session.guest_inventory());
         let call = store.data().input_inventory().observe(&source);
@@ -160,7 +160,7 @@ mod tests {
         .into();
         {
             let receiver = ProviderPlan::state_only()
-                .session("", None, None)
+                .test_session("", None, None)
                 .guest_inventory();
             let wire = receiver
                 .handoff(store.data().credential_handoff(&payload))

@@ -886,6 +886,35 @@ pub(crate) enum SyntheticSource {
 }
 
 impl ProjectedPhase {
+    /// A projected export check retains its actual operational stage. A
+    /// validation KnowledgeContext cannot be passed to either constructor.
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_core::{parser::retained::ProjectedPhase, resource::{NoPlaceholder, AbsoluteBindingAddress, knowledge::KnowledgeContext}};
+    /// let validation = KnowledgeContext::<NoPlaceholder, AbsoluteBindingAddress>::validation();
+    /// ProjectedPhase::plan_context(&validation);
+    /// ```
+    pub fn plan_context<P: PlaceholderKind, B: BindingAddress>(
+        _context: &crate::resource::knowledge::KnowledgeContext<
+            '_,
+            P,
+            B,
+            crate::resource::knowledge::Plan,
+        >,
+    ) -> Self {
+        Self(ProjectedOrigin::Plan)
+    }
+    pub fn apply_context<P: PlaceholderKind, B: BindingAddress>(
+        _context: &crate::resource::knowledge::KnowledgeContext<
+            '_,
+            P,
+            B,
+            crate::resource::knowledge::Apply,
+        >,
+    ) -> Self {
+        Self(ProjectedOrigin::Apply)
+    }
+
     pub fn plan<P: PlaceholderKind, B: BindingAddress>(_proof: &PlanResolved<'_, P, B>) -> Self {
         Self(ProjectedOrigin::Plan)
     }

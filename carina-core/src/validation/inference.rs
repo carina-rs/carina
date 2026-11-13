@@ -1199,54 +1199,74 @@ where
         .export_params
         .iter()
         .map(|parameter| {
-            let static_type = match (&parameter.static_type, &parameter.value) {
-                (Some(type_expr @ (TypeExpr::Ref(_) | TypeExpr::DottedUnresolved(_))), _) => {
-                    ExportStaticType::Declared(type_expr.clone())
+            let static_type = match parameter
+                .judgement()
+                .map(|expression| expression.type_projection())
+            {
+                Ok(crate::parser::retained::TypeProjection::NoProjection(_)) => {
+                    ExportStaticType::Inferred(StaticType::Unchecked(
+                        InferredUncheckedReason::NotInferable(NotInferableReason::ValueDependent {
+                            reason: "type unavailable for a conversion-carrying metadata query"
+                                .into(),
+                        }),
+                    ))
                 }
-                (_, Some(crate::parser::BoundaryExpression::Handle(handle))) => {
-                    ExportStaticType::Inferred(StaticType::Known(TypeExpr::Ref(
-                        handle.resource_type().clone(),
-                    )))
-                }
-                (Some(type_expr), _) => ExportStaticType::Declared(type_expr.clone()),
-                (None, value) => match value {
-                    None => ExportStaticType::Inferred(StaticType::Unchecked(
-                        InferredUncheckedReason::NotInferable(NotInferableReason::MissingValue),
-                    )),
-                    Some(crate::parser::BoundaryExpression::Value(_value)) => {
-                        let inferred = parameter
-                            .value_location()
-                            .ok_or_else(|| {
-                                crate::parser::retained::MissingEvidence::new(
-                                    "export value location",
-                                )
-                            })
-                            .and_then(|location| report.expression(location))
-                            .map_err(|error| InferenceIssue::Failed(error.into()))
-                            .and_then(|expression| expression.static_type().cloned());
-                        match inferred {
-                            Ok(type_expr) => {
-                                ExportStaticType::Inferred(StaticType::Known(type_expr))
-                            }
-                            // The expression itself is valid. An unannotated
-                            // export additionally requires a static type, so
-                            // this boundary owns the annotation failure.
-                            Err(InferenceIssue::NotInferable(
-                                NotInferableReason::ValueDependent { reason },
-                            )) => ExportStaticType::Inferred(StaticType::Unchecked(
-                                InferredUncheckedReason::InferenceFailed(
-                                    InferenceError::UnknownType { reason },
+                Ok(crate::parser::retained::TypeProjection::Available(_)) | Err(_) => {
+                    match (&parameter.static_type, &parameter.value) {
+                        (
+                            Some(type_expr @ (TypeExpr::Ref(_) | TypeExpr::DottedUnresolved(_))),
+                            _,
+                        ) => ExportStaticType::Declared(type_expr.clone()),
+                        (_, Some(crate::parser::BoundaryExpression::Handle(handle))) => {
+                            ExportStaticType::Inferred(StaticType::Known(TypeExpr::Ref(
+                                handle.resource_type().clone(),
+                            )))
+                        }
+                        (Some(type_expr), _) => ExportStaticType::Declared(type_expr.clone()),
+                        (None, value) => match value {
+                            None => ExportStaticType::Inferred(StaticType::Unchecked(
+                                InferredUncheckedReason::NotInferable(
+                                    NotInferableReason::MissingValue,
                                 ),
                             )),
-                            Err(issue) => {
-                                ExportStaticType::Inferred(StaticType::Unchecked(issue.into()))
+                            Some(crate::parser::BoundaryExpression::Value(_value)) => {
+                                let inferred = parameter
+                                    .value_location()
+                                    .ok_or_else(|| {
+                                        crate::parser::retained::MissingEvidence::new(
+                                            "export value location",
+                                        )
+                                    })
+                                    .and_then(|location| report.expression(location))
+                                    .map_err(|error| InferenceIssue::Failed(error.into()))
+                                    .and_then(|expression| expression.static_type().cloned());
+                                match inferred {
+                                    Ok(type_expr) => {
+                                        ExportStaticType::Inferred(StaticType::Known(type_expr))
+                                    }
+                                    // The expression itself is valid. An unannotated
+                                    // export additionally requires a static type, so
+                                    // this boundary owns the annotation failure.
+                                    Err(InferenceIssue::NotInferable(
+                                        NotInferableReason::ValueDependent { reason },
+                                    )) => ExportStaticType::Inferred(StaticType::Unchecked(
+                                        InferredUncheckedReason::InferenceFailed(
+                                            InferenceError::UnknownType { reason },
+                                        ),
+                                    )),
+                                    Err(issue) => ExportStaticType::Inferred(
+                                        StaticType::Unchecked(issue.into()),
+                                    ),
+                                }
                             }
-                        }
+                            Some(crate::parser::BoundaryExpression::Handle(_handle)) => {
+                                unreachable!(
+                                    "handle expressions are classified before value inference"
+                                )
+                            }
+                        },
                     }
-                    Some(crate::parser::BoundaryExpression::Handle(_handle)) => {
-                        unreachable!("handle expressions are classified before value inference")
-                    }
-                },
+                }
             };
             let value = parameter
                 .value
@@ -1456,6 +1476,28 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn r5c_metadata_export_projection_has_no_type_for_a_carried_value() {
+        let parsed =
+            crate::parser::parse_and_resolve("exports { answer = 'ready' as mock.Name }\n")
+                .unwrap();
+        let tree = crate::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+        let schemas = ProviderLoadedSchemaRegistry::for_test(SchemaRegistry::new());
+        let inferred = infer_export_params_with_loaded_provider_schemas(
+            &tree,
+            &schemas,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
+        assert!(
+            matches!(
+                inferred.parameters()[0].static_type,
+                ExportStaticType::Inferred(StaticType::Unchecked(_))
+            ),
+            "{:?}",
+            inferred.parameters()[0]
+        );
+    }
 
     #[test]
     fn export_inference_returns_inferred_type() {

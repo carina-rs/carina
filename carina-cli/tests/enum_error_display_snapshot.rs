@@ -91,10 +91,6 @@ impl ProviderFactory for SnapshotSchemaFactory {
         "snapshot schema provider"
     }
 
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        ValidatedConfigSchema::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -114,7 +110,7 @@ impl ProviderFactory for SnapshotSchemaFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            ValidatedConfigSchema::default(),
             Default::default(),
             Vec::new(),
         )

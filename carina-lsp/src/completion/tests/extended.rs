@@ -13,9 +13,7 @@ impl ProviderFactory for NamedAnnotationCompletionFactory {
     fn display_name(&self) -> &str {
         "named annotation completion fixture"
     }
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
+
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -3353,9 +3351,7 @@ for _, account_id in orgs.accounts {
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
             self.0.clone()
         }
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
+
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
@@ -3847,9 +3843,7 @@ fn completion_uses_the_directory_partial_catalog_instead_of_the_document_catalog
         fn display_name(&self) -> &str {
             "completion catalog fixture"
         }
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
+
         fn validate_config(
             &self,
             _: &carina_core::provider::CanonicalProviderConfigAttributes,

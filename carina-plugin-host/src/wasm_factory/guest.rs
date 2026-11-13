@@ -3,6 +3,7 @@ use super::diagnostics::{
     MetadataWasmChain, WasmNormalizerResultCountError, WasmNormalizerResultKeysError,
 };
 use super::*;
+use carina_core::schema::ValidatedConfigSchema;
 mod desired_normalization;
 mod diagnostic_imports;
 pub(super) mod guest_stderr;
@@ -6981,25 +6982,31 @@ pub(super) mod tests {
         });
     }
 
-    #[tokio::test]
-    async fn round5_missing_configuration_returns_errors_without_panicking() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_configuration_empty_session_is_admitted_for_wasm_initialization() {
         let factory = rebuildable_state_test_factory()
             .await
             .expect("mock WASM fixture is required");
-        let session =
-            carina_core::provider::ProviderPlan::state_only().session(factory.name(), None, None);
-        assert!(session.configuration().is_none());
-        let error = carina_core::provider::ProviderBoundary::initialize(&factory, &session)
+        let construction =
+            carina_core::validation::admission::configuration::provider::empty_construction(
+                &factory,
+                &carina_core::provider::ProviderInstanceKey::new(factory.name(), None),
+                &carina_core::provider::ProviderPlan::state_only(),
+            )
+            .unwrap();
+        assert!(
+            construction
+                .session()
+                .configuration()
+                .attributes()
+                .is_empty()
+        );
+        carina_core::provider::ProviderBoundary::initialize(&construction)
             .await
-            .err()
-            .expect("configured factory requires configuration");
-        assert!(error.to_string().contains("require checked configuration"));
-        let error =
-            carina_core::provider::ProviderBoundary::initialize_normalizer(&factory, &session)
-                .await
-                .err()
-                .expect("configured normalizer requires configuration");
-        assert!(error.to_string().contains("require checked configuration"));
+            .unwrap();
+        carina_core::provider::ProviderBoundary::initialize_normalizer(&construction)
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -9756,7 +9763,7 @@ pub(super) mod tests {
         };
         let mut state = RebuildableState {
             inputs: carina_core::provider::ProviderPlan::state_only()
-                .session("", None, None)
+                .test_session("", None, None)
                 .guest_inventory(),
             instance: ValidationInstanceState::Poisoned {
                 reason: reason.clone(),
@@ -10206,7 +10213,7 @@ pub(super) mod tests {
         let fingerprint_key = [9_u8; 32];
         let context = ValidationContextFingerprint::validate_config(&fingerprint_key, &[]);
         let diagnostic_inputs = carina_core::provider::ProviderPlan::state_only()
-            .session("rebuild-test", None, None)
+            .test_session("rebuild-test", None, None)
             .guest_inputs();
         let instance = RebuildableInstance {
             notices: WasmLoadNoticeSink::new(|_| {}),
@@ -10522,22 +10529,22 @@ pub(super) mod tests {
         ) -> ProviderResult<()> {
             Err(self.0.lock().unwrap().take().unwrap())
         }
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            carina_core::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from(
-                [(
-                    "password".into(),
-                    carina_core::schema::PatternAttributeType::string(),
-                )],
-            ))
-            .unwrap()
-        }
+
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
             Vec::new()
         }
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 Vec::new(),
-                self.provider_config_attribute_types(),
+                {
+                    carina_core::schema::ValidatedConfigSchema::validate(
+                        std::collections::BTreeMap::from([(
+                            "password".into(),
+                            carina_core::schema::PatternAttributeType::string(),
+                        )]),
+                    )
+                    .unwrap()
+                },
                 Default::default(),
                 Vec::new(),
             )
@@ -10567,7 +10574,6 @@ pub(super) mod tests {
             &factory,
             "review",
             &((attributes.clone()).into()),
-            &factory.provider_config_attribute_types(),
         )
         .unwrap_err()
         .provider_error()

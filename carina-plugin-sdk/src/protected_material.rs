@@ -49,10 +49,10 @@ impl GithubTokenMaterial {
 /// fn expose(token: RegisteredGithubToken) { let _ = format!("{token}"); }
 /// ```
 /// ```
-/// use carina_core::provider::ProviderPlan;
+/// use carina_core::provider::ProviderValidationInputs;
 /// use carina_plugin_sdk::{ProviderDiagnostics, protected_material::{GithubTokenMaterial, RegisteredRequest}};
-/// let session = ProviderPlan::state_only().session("example", None, None);
-/// let diagnostics = ProviderDiagnostics::from_session(&session);
+/// let inputs = ProviderValidationInputs::for_schema("example");
+/// let diagnostics = ProviderDiagnostics::for_validation(&inputs);
 /// let token = diagnostics.register_github_token(GithubTokenMaterial::new("token".into())).unwrap();
 /// assert!(!format!("{token:?}").contains("token"));
 /// let _: RegisteredRequest = token.authorize(http::Request::new(Vec::new())).unwrap();

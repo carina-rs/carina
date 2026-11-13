@@ -69,9 +69,9 @@ pub(crate) use cursor::{
 
 /// The existing authored walk owns source diagnostics for expressions that
 /// require its policy. This is diagnostic ownership, not an admission proof.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BindingDiagnosticOwner {
-    OrdinarySource,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum BindingDiagnosticOwner<'a> {
+    OrdinarySource(OrdinaryJudgedExpr<'a>),
     AuthoredExpression,
 }
 
@@ -2887,11 +2887,13 @@ use judgement::ConversionEvidence;
 pub(crate) use judgement::judge_expressions;
 pub(in crate::parser) use judgement::unjudged as missing_judgement;
 pub(crate) use judgement::{
-    AdmissionContext, EmptyCoalesceDefault, admit_with_context, coalesce_type,
+    AdmissionContext, EmptyCoalesceDefault, admit_ordinary_with_context, admit_with_context,
+    coalesce_type,
 };
 pub use judgement::{
     CollectionKind, ExpressionAdmission, ExpressionCheckOwner, ExpressionReport, JudgedExpr,
-    NoConversion, ProviderAuthorityUnavailable, SinkJudgedExpr, admit_expression,
+    JudgedExprData, NoConversion, NoTypeProjection, OrdinaryJudgedExpr,
+    ProviderAuthorityUnavailable, SinkJudgedExpr, TypeProjection, admit_expression,
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn value_dependent_judgement_for_test() -> JudgedExpr {
@@ -2900,6 +2902,7 @@ pub(crate) fn value_dependent_judgement_for_test() -> JudgedExpr {
 
 // Constructors for judgement evidence are confined to this module. In
 // particular, the syntax compiler and provisional evaluators cannot mint it.
+pub use conversion::flow::{ConversionRejection, SinkRejection};
 mod judgement {
     #[cfg(test)]
     mod round2_tests;
@@ -3167,6 +3170,87 @@ mod judgement {
             &self.data
         }
     }
+    /// A metadata query has no authority to admit a carrying expression.
+    pub enum TypeProjection<'a> {
+        Available(OrdinaryJudgedExpr<'a>),
+        NoProjection(NoTypeProjection),
+    }
+    pub struct NoTypeProjection {
+        _private: (),
+    }
+    /// A conversion-free source frame. The flag owner alone can construct it.
+    /// Child selections stay within that frame, including declaration metadata
+    /// behind a deliberate NonCrossed edge.
+    ///
+    /// ```compile_fail,E0451
+    /// use carina_core::parser::retained::OrdinaryJudgedExpr;
+    /// let _ = OrdinaryJudgedExpr { data: unreachable!(), proof: unreachable!() };
+    /// ```
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct OrdinaryJudgedExpr<'a> {
+        data: &'a JudgedExprData,
+        proof: NoConversion,
+    }
+    impl std::ops::Deref for OrdinaryJudgedExpr<'_> {
+        type Target = JudgedExprData;
+        fn deref(&self) -> &Self::Target {
+            self.data
+        }
+    }
+    impl<'a> OrdinaryJudgedExpr<'a> {
+        pub(crate) fn element(self, index: usize) -> Result<Self, MissingEvidence> {
+            self.data.element(index).map(|child| Self {
+                data: &child.data,
+                proof: self.proof,
+            })
+        }
+        pub(crate) fn field(self, key: &str) -> Result<Self, MissingEvidence> {
+            self.data.field(key).map(|child| Self {
+                data: &child.data,
+                proof: self.proof,
+            })
+        }
+        pub(crate) fn branch(self, index: usize) -> Result<Self, MissingEvidence> {
+            self.data.branch(index).map(|child| Self {
+                data: &child.data,
+                proof: self.proof,
+            })
+        }
+        pub(crate) fn coalesce_operand(self, index: usize) -> Result<Self, MissingEvidence> {
+            self.data.coalesce_operand(index).map(|child| Self {
+                data: &child.data,
+                proof: self.proof,
+            })
+        }
+        pub(crate) fn for_sink<'s>(
+            &'s self,
+            sink: &'s TypeExpr,
+            config: &'s super::super::ProviderContext,
+        ) -> OrdinarySinkJudgedExpr<'s> {
+            OrdinarySinkJudgedExpr {
+                expression: self.data.for_sink(sink, config),
+                proof: self.proof,
+            }
+        }
+    }
+    pub(crate) struct OrdinarySinkJudgedExpr<'a> {
+        expression: SinkJudgedExpr<'a>,
+        proof: NoConversion,
+    }
+    impl<'a> std::ops::Deref for OrdinarySinkJudgedExpr<'a> {
+        type Target = SinkJudgedExpr<'a>;
+        fn deref(&self) -> &Self::Target {
+            &self.expression
+        }
+    }
+    impl OrdinarySinkJudgedExpr<'_> {
+        pub(crate) fn source(&self) -> OrdinaryJudgedExpr<'_> {
+            OrdinaryJudgedExpr {
+                data: &self.expression.expression,
+                proof: self.proof,
+            }
+        }
+    }
     impl PartialEq for JudgedExpr {
         fn eq(&self, other: &Self) -> bool {
             self.data == other.data
@@ -3281,6 +3365,37 @@ mod judgement {
         pub(super) fn judgement_stamp(&self) -> usize {
             Arc::as_ptr(&self.data) as usize
         }
+        /// Metadata queries cannot publish findings for this parse's NodeIds.
+        pub fn type_projection(&self) -> TypeProjection<'_> {
+            match self.conversion_evidence() {
+                ConversionEvidence::Free(proof) => TypeProjection::Available(OrdinaryJudgedExpr {
+                    data: &self.data,
+                    proof,
+                }),
+                ConversionEvidence::Carried(_) => {
+                    TypeProjection::NoProjection(NoTypeProjection { _private: () })
+                }
+            }
+        }
+        pub(crate) fn operational_sink(
+            &self,
+            phase: super::ProjectedPhase,
+            _boundary: conversion::flow::OperationalExportBoundary,
+        ) -> OrdinaryJudgedExpr<'_> {
+            OrdinaryJudgedExpr {
+                data: &self.data,
+                proof: NoConversion::operational(phase),
+            }
+        }
+        pub fn ordinary(&self) -> Result<OrdinaryJudgedExpr<'_>, ConversionRejection> {
+            match self.no_conversion() {
+                Some(proof) => Ok(OrdinaryJudgedExpr {
+                    data: &self.data,
+                    proof,
+                }),
+                None => Err(ConversionRejection::at_sink(self)),
+            }
+        }
         pub fn no_conversion(&self) -> Option<NoConversion> {
             match self.conversion_evidence() {
                 ConversionEvidence::Free(proof) => Some(proof),
@@ -3324,7 +3439,9 @@ mod judgement {
         pub(crate) fn contains_any_conversion(&self) -> bool {
             !self.conversions.is_empty()
         }
+    }
 
+    impl JudgedExprData {
         /// Interpret builtin evidence as an ordinary result at other sinks.
         /// This also preserves the original collection diagnostic granularity.
         pub fn for_sink<'a>(
@@ -3383,8 +3500,10 @@ mod judgement {
             ) && !string_sink(actual, &sink)
             {
                 let mut ordinary = self.clone();
-                ordinary.set_kind(InferredKind::Ordinary);
-                ordinary.data_mut().member = None;
+                if let ExprJudgement::Typed { kind, .. } = &mut ordinary.judgement {
+                    *kind = InferredKind::Ordinary(kind.knowledge());
+                }
+                ordinary.member = None;
                 std::borrow::Cow::Owned(ordinary)
             } else {
                 std::borrow::Cow::Borrowed(self)
@@ -3395,9 +3514,6 @@ mod judgement {
                 config,
             }
         }
-
-        // Intrinsic reference provenance controls single-reference unwrapping.
-        // It does not interpret construction evidence or admit a sink.
     }
 
     trait InferenceMut: std::ops::Deref<Target = JudgedExprData> + Sized {
@@ -3682,13 +3798,13 @@ mod judgement {
     /// Expression evidence interpreted at a particular sink. Only this view
     /// exposes construction and assignment categories.
     pub struct SinkJudgedExpr<'a> {
-        expression: std::borrow::Cow<'a, JudgedExpr>,
+        expression: std::borrow::Cow<'a, JudgedExprData>,
         sink: &'a TypeExpr,
         config: &'a super::super::ProviderContext,
     }
 
     impl std::ops::Deref for SinkJudgedExpr<'_> {
-        type Target = JudgedExpr;
+        type Target = JudgedExprData;
         fn deref(&self) -> &Self::Target {
             &self.expression
         }
@@ -3700,10 +3816,14 @@ mod judgement {
             expected: Option<&TypeExpr>,
             fallback: &TypeExpr,
             config: &crate::parser::ProviderContext,
-        ) -> BindingDiagnosticOwner {
-            if self.contains_any_conversion() {
+        ) -> BindingDiagnosticOwner<'_> {
+            let Some(proof) = self.no_conversion() else {
                 return BindingDiagnosticOwner::AuthoredExpression;
-            }
+            };
+            let ordinary = OrdinaryJudgedExpr {
+                data: &self.data,
+                proof,
+            };
             let view = self.for_sink(expected.unwrap_or(fallback), config);
             if view.is_interpolation()
                 || (view.is_single_string_construction()
@@ -3711,7 +3831,7 @@ mod judgement {
             {
                 BindingDiagnosticOwner::AuthoredExpression
             } else {
-                BindingDiagnosticOwner::OrdinarySource
+                BindingDiagnosticOwner::OrdinarySource(ordinary)
             }
         }
     }
@@ -3842,9 +3962,6 @@ mod judgement {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum ExpressionAdmission {
         ValueCheck,
-        /// This expression must be judged by the conversion policy; ordinary
-        /// value admission has no NoConversion proof for it.
-        ConversionRequired,
         DeferredInterpolation,
         ProviderPending(ProviderAuthorityUnavailable),
     }
@@ -3853,17 +3970,8 @@ mod judgement {
         left: ExpressionAdmission,
         right: ExpressionAdmission,
     ) -> ExpressionAdmission {
-        use ExpressionAdmission::{
-            ConversionRequired, DeferredInterpolation, ProviderPending, ValueCheck,
-        };
+        use ExpressionAdmission::{DeferredInterpolation, ProviderPending, ValueCheck};
         match (left, right) {
-            (
-                ConversionRequired,
-                ValueCheck | ConversionRequired | DeferredInterpolation | ProviderPending(_),
-            )
-            | (ValueCheck | DeferredInterpolation | ProviderPending(_), ConversionRequired) => {
-                ConversionRequired
-            }
             (
                 pending @ ProviderPending(_),
                 ValueCheck | DeferredInterpolation | ProviderPending(_),
@@ -3888,15 +3996,17 @@ mod judgement {
     pub fn admit_expression(
         expression: &JudgedExpr,
         sink: &TypeExpr,
-    ) -> Result<ExpressionAdmission, InferenceError> {
+    ) -> Result<ExpressionAdmission, SinkRejection<InferenceError>> {
         match &expression.authority {
             Some(authority) => {
                 admit_with_context(expression, sink, AdmissionContext::Assignment, authority)
             }
-            None => Err(MissingEvidence::new("expression judgement authority").into()),
+            None => Err(InferenceError::from(MissingEvidence::new(
+                "expression judgement authority",
+            ))
+            .into()),
         }
     }
-
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub(crate) enum AdmissionContext {
         Assignment,
@@ -3911,11 +4021,26 @@ mod judgement {
         sink: &TypeExpr,
         context: AdmissionContext,
         config: &super::super::ProviderContext,
+    ) -> Result<ExpressionAdmission, SinkRejection<InferenceError>> {
+        let source = expression.ordinary().map_err(SinkRejection::Conversion)?;
+        admit_ordinary_with_context(source, sink, context, config).map_err(SinkRejection::Ordinary)
+    }
+    pub(crate) fn admit_ordinary_with_context(
+        source: OrdinaryJudgedExpr<'_>,
+        sink: &TypeExpr,
+        context: AdmissionContext,
+        config: &super::super::ProviderContext,
+    ) -> Result<ExpressionAdmission, InferenceError> {
+        admit_ordinary_data(source.data, source.proof, sink, context, config)
+    }
+    fn admit_ordinary_data(
+        expression: &JudgedExprData,
+        no_conversion: NoConversion,
+        sink: &TypeExpr,
+        context: AdmissionContext,
+        config: &super::super::ProviderContext,
     ) -> Result<ExpressionAdmission, InferenceError> {
         use ExpressionAdmission::{DeferredInterpolation, ProviderPending, ValueCheck};
-        let Some(no_conversion) = expression.no_conversion() else {
-            return Ok(ExpressionAdmission::ConversionRequired);
-        };
         let expression = expression.for_sink(sink, config);
         let (ty, kind, concrete) = match &expression.judgement {
             ExprJudgement::Failed { error, .. } | ExprJudgement::Rejected { error, .. } => {
@@ -3939,7 +4064,7 @@ mod judgement {
                 .try_fold(ValueCheck, |admission, branch| {
                     Ok(combine_admission(
                         admission,
-                        admit_with_context(branch, sink, context, config)?,
+                        admit_ordinary_data(branch, no_conversion, sink, context, config)?,
                     ))
                 });
         }
@@ -3989,7 +4114,9 @@ mod judgement {
             }
             return members
                 .iter()
-                .find_map(|member| admit_with_context(&expression, member, context, config).ok())
+                .find_map(|member| {
+                    admit_ordinary_data(&expression, no_conversion, member, context, config).ok()
+                })
                 .ok_or_else(|| assignment_error(&expression, sink));
         }
         if let Some(shape) = expression.collection_kind() {
@@ -4036,7 +4163,7 @@ mod judgement {
                 .try_fold(ValueCheck, |admission, (child, sink)| {
                     Ok(combine_admission(
                         admission,
-                        admit_with_context(child, sink, child_context, config)?,
+                        admit_ordinary_data(child, no_conversion, sink, child_context, config)?,
                     ))
                 });
         }
@@ -4175,7 +4302,7 @@ mod judgement {
         }))
     }
 
-    fn assignment_error(expression: &JudgedExpr, sink: &TypeExpr) -> InferenceError {
+    fn assignment_error(expression: &JudgedExprData, sink: &TypeExpr) -> InferenceError {
         InferenceError::UnknownType {
             reason: expression.static_type().map_or_else(
                 |_| format!("expected {sink}, got collection"),
@@ -4413,6 +4540,13 @@ mod judgement {
             };
             let admission = admit_expression(expression, sink);
             if let Err(error) = admission {
+                let error = match error {
+                    SinkRejection::Ordinary(error) => error,
+                    SinkRejection::Conversion(rejection) => {
+                        Arc::make_mut(&mut self.placements).append(rejection.into_channel());
+                        return;
+                    }
+                };
                 let owner = expression.sink_owner(sink);
                 let owner = if owner == FailureOwner::Expression {
                     Arc::make_mut(&mut self.findings)
@@ -5258,12 +5392,18 @@ mod judgement {
             owner: &DeclarationLocation,
             context: &str,
         ) -> Option<InferredExpr> {
-            let error = crate::validation::typecheck::admit_function_expression(
+            let error = match crate::validation::typecheck::admit_function_expression(
                 expression,
                 sink,
                 self.config,
-            )
-            .err()?;
+            ) {
+                Ok(_) => return None,
+                Err(SinkRejection::Conversion(rejection)) => {
+                    self.placements.append_rejection(rejection);
+                    return Some(InferredExpr::from(expression));
+                }
+                Err(SinkRejection::Ordinary(error)) => error,
+            };
             let error = match error {
                 crate::validation::typecheck::FunctionExpressionError::Annotation(error) => {
                     let mut failed = declared(
@@ -6102,8 +6242,14 @@ mod judgement {
                             );
                             let value = child.authored.sink_value().expect("named sink value");
                             let judged = self.judge(value);
-                            let admission = admit_with_context(
-                                &judged,
+                            // Source preparation does not admit a carrying slot;
+                            // only the schema cursor policy can do that.
+                            let source = match judged.type_projection() {
+                                TypeProjection::Available(source) => source,
+                                TypeProjection::NoProjection(_) => continue,
+                            };
+                            let admission = admit_ordinary_with_context(
+                                source,
                                 &expected,
                                 AdmissionContext::Resource,
                                 self.config,
@@ -6498,10 +6644,13 @@ mod judgement {
         let mut expression = constraint_fixture();
         expression.data_mut().authority = None;
         assert!(
-            admit_expression(&expression, &TypeExpr::String)
-                .unwrap_err()
-                .to_string()
-                .contains("expression judgement authority")
+            crate::test_utils::ordinary_sink_result_for_test(admit_expression(
+                &expression,
+                &TypeExpr::String
+            ))
+            .unwrap_err()
+            .to_string()
+            .contains("expression judgement authority")
         );
     }
 

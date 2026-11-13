@@ -1,0 +1,2 @@
+provider mock {}
+let state_bucket = cidr_subnet('bad', 8, 1)

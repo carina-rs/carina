@@ -1,0 +1,12 @@
+{
+  "text": {
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: $DIR/functions.crn: Recursive function call detected: recurse\n"
+  },
+  "json": {
+    "status": 1,
+    "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Recursive function call detected: recurse\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"$DIR/functions.crn\",\n        \"range\": null\n      }\n    }\n  ]\n}\n",
+    "stderr": ""
+  }
+}

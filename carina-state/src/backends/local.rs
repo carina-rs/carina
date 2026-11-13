@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::time::sleep as async_sleep;
 
 use crate::backend::{BackendError, BackendResult, RawState, StateBackend};
-use crate::backend_config::LocalBackendSettings;
+use crate::backend_config::{LocalBackendLocation, LocalBackendSettings};
 use crate::lock::LockInfo;
 use crate::state::{self, LoadedState, MigrationInfo, StateFile, log_state_migration_once};
 
@@ -27,6 +27,30 @@ enum AcquireTestPhase {
 }
 
 /// Local file backend for development and simple use cases
+/// Locations carry a pin derived from admitted settings or an explicit native address.
+///
+/// ```
+/// use carina_core::{paths::ResolvedPath, parser::BackendConfig, resource::NoPlaceholder};
+/// use carina_state::{BackendSelection, BackendResult};
+/// async fn construct(dir: &ResolvedPath, raw: &BackendConfig<NoPlaceholder>) -> BackendResult<()> {
+///     let selected = BackendSelection::for_read(dir, Some(raw))?;
+///     let _ = selected.resolve_with_drift_warning(|_| {}).await?;
+///     Ok(())
+/// }
+/// ```
+/// ```compile_fail
+/// use carina_core::paths::ResolvedPath;
+/// use carina_state::{backends::LocalBackend, LocalBackendSettings};
+/// fn bypass(settings: &LocalBackendSettings, base: &ResolvedPath) {
+///     let _ = LocalBackend::from_config(settings, base); // forbidden: the existing constructor is crate-private
+/// }
+/// ```
+/// ```
+/// # use carina_core::paths::ResolvedPath;
+/// # use carina_state::{backends::LocalBackend, LocalBackendSettings};
+/// # fn bypass(settings: &LocalBackendSettings, base: &ResolvedPath) {
+/// # }
+/// ```
 pub struct LocalBackend {
     /// Path to the state file
     state_path: ResolvedPath,
@@ -87,11 +111,14 @@ impl LocalBackend {
     /// [`BackendSelection`](crate::BackendSelection).
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn with_path(state_path: PathBuf) -> Self {
-        Self::with_resolved_path(ResolvedPath::new(state_path).expect("resolve test state path"))
-            .expect("resolve test lock path")
+        Self::from_location(
+            LocalBackendLocation::for_file(&state_path).expect("admit test state path"),
+        )
+        .expect("resolve test lock path")
     }
 
-    pub(crate) fn with_resolved_path(state_path: ResolvedPath) -> BackendResult<Self> {
+    pub(crate) fn from_location(location: LocalBackendLocation) -> BackendResult<Self> {
+        let state_path = location.into_path();
         let lock_path = state_path
             .sibling_with_extension("lock")
             .map_err(|error| BackendError::Io(format!("Failed to locate lock file: {error}")))?;
@@ -126,10 +153,8 @@ impl LocalBackend {
         config: &LocalBackendSettings,
         base_dir: &ResolvedPath,
     ) -> BackendResult<Self> {
-        let path = base_dir
-            .join(config.path().unwrap_or(Self::DEFAULT_STATE_FILE))
-            .map_err(|error| BackendError::Io(format!("Failed to locate state file: {error}")))?;
-        Self::with_resolved_path(path)
+        let location = config.pin(base_dir)?;
+        Self::from_location(location)
     }
 
     /// The state file's diagnostic spelling.

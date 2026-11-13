@@ -10,9 +10,6 @@ impl ProviderFactory for ConversionFactory {
     fn display_name(&self) -> &str {
         "Mock"
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        Default::default()
-    }
     fn validate_config(
         &self,
         _: &CanonicalProviderConfigAttributes,
@@ -30,13 +27,14 @@ impl ProviderFactory for ConversionFactory {
     fn create_normalizer(
         &self,
         _: &ProviderSession,
+        _: InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -708,9 +706,6 @@ impl ProviderFactory for Round4ReloadFactory {
     fn display_name(&self) -> &str {
         self.inner.display_name()
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        self.inner.provider_config_attribute_types()
-    }
     fn validate_config(
         &self,
         attributes: &CanonicalProviderConfigAttributes,
@@ -728,13 +723,14 @@ impl ProviderFactory for Round4ReloadFactory {
     fn create_normalizer(
         &self,
         session: &ProviderSession,
+        mint: InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
-        self.inner.create_normalizer(session)
+        self.inner.create_normalizer(session, mint)
     }
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -1119,4 +1115,87 @@ fn round4_directory_module_failure_stops_admission_when_an_unrelated_file_is_ope
         "{diagnostics:?}"
     );
     assert!(!diagnostics.iter().any(|finding| finding.code.as_ref().is_some_and(|code| matches!(code, tower_lsp::lsp_types::NumberOrString::String(code) if code.starts_with("conversion_")))), "{diagnostics:?}");
+}
+
+#[test]
+fn r5c_configuration_boundaries_reject_once_in_cli_and_lsp() {
+    fn configuration_factories() -> Vec<Box<dyn ProviderFactory>> {
+        vec![Box::new(
+            carina_core::test_utils::configuration::ConfigFactory::new(
+                ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
+                    "setting".to_owned(),
+                    AttributeType::string(),
+                )]))
+                .unwrap(),
+            )
+            .named("mock"),
+        )]
+    }
+
+    for (plain, converted) in [
+        (
+            "provider mock { setting = 'ok' }",
+            "provider mock { setting = 'ok' as mock.Name }",
+        ),
+        (
+            "provider mock {}\nbackend local { path = 'ok' }",
+            "provider mock {}\nbackend local { path = 'ok' as mock.Name }",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("main.crn");
+        let loaded = loaded_provider_snapshot_from_factories(
+            Arc::new(configuration_factories()),
+            SchemaRegistry::new(),
+            carina_core::EnvironmentSnapshot::empty(),
+        );
+        let engine =
+            carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+        for (source, rejected) in [(plain, false), (converted, true)] {
+            std::fs::write(&path, source).unwrap();
+            let cli = carina_cli::commands::validate::validate_diagnostics_with_factories(
+                &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+                carina_cli::wiring::LoadedProviderFactory::for_test(configuration_factories()),
+                HashMap::new(),
+            );
+            let document = carina_lsp::document::Document::new_with_path(
+                source.into(),
+                path.clone(),
+                Arc::new(carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                )),
+            );
+            let diagnostics = engine.analyze(&document, Some(&path));
+            let lsp = diagnostics
+                .iter()
+                .filter(|finding| finding.severity == Some(DiagnosticSeverity::ERROR))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                cli.errors.len(),
+                usize::from(rejected),
+                "{source}: {}",
+                cli.json
+            );
+            assert_eq!(
+                lsp.len(),
+                usize::from(rejected),
+                "{source}: {diagnostics:?}"
+            );
+            if rejected {
+                assert_eq!(
+                    cli.json["errors"][0]["code"],
+                    "conversion_unsupported_position"
+                );
+                assert!(
+                    lsp[0]
+                        .message
+                        .contains("not supported at this position yet"),
+                    "{lsp:?}"
+                );
+                assert_eq!(cli.json["errors"][0]["message"], lsp[0].message);
+            } else {
+                assert_eq!(cli.json["status"], "ok");
+            }
+        }
+    }
 }

@@ -1,0 +1,4 @@
+backend s3 {
+  bucket = other.name
+  key = 'state.json'
+}

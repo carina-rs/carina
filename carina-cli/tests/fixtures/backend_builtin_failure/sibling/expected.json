@@ -1,0 +1,12 @@
+{
+  "text": {
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: $DIR/backend.crn:2:3: Invalid expression at line 2: cidr_subnet(): cidr_subnet() invalid CIDR format: 'bad' (expected 'address/prefix')\n"
+  },
+  "json": {
+    "status": 1,
+    "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"cidr_subnet(): cidr_subnet() invalid CIDR format: 'bad' (expected 'address/prefix')\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"$DIR/backend.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 3\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 9\n          }\n        }\n      }\n    }\n  ]\n}\n",
+    "stderr": ""
+  }
+}

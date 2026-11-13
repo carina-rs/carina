@@ -6,8 +6,8 @@ use carina_core::{
     },
     schema::{
         AttributeSchema, AttributeType, PatternMatch, PatternSpec, ResourceSchema, SchemaRegistry,
-        StringIdentityLayer, StringMemberConstraints, TypeIdentity, ValidatedConfigSchema,
-        ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+        StringIdentityLayer, StringMemberConstraints, TypeIdentity, ValidatedProviderSchemaWitness,
+        ValidatedResourceSchema,
     },
 };
 use std::{path::Path, sync::Arc};
@@ -20,9 +20,7 @@ impl ProviderFactory for Factory {
     fn display_name(&self) -> &str {
         "account annotation fixture"
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        Default::default()
-    }
+
     fn validate_config(
         &self,
         _: &CanonicalProviderConfigAttributes,
@@ -185,9 +183,11 @@ pub fn validate(dir: &Path, snapshot: &LoadedProviderSnapshot) -> Result<(), Str
             .join("\n")
     })?;
     carina_core::validation::validate_user_function_ref_types_with_bindings(parsed, &bindings)?;
-    carina_core::validation::validate_attribute_params(
-        &parsed.attribute_params,
-        snapshot.provider_context(),
+    carina_core::test_utils::ordinary_sink_findings_for_test(
+        carina_core::validation::validate_attribute_params(
+            &parsed.attribute_params,
+            snapshot.provider_context(),
+        ),
     )?;
     use carina_core::parser::ExportParamLike;
     for export in &parsed.export_params {
@@ -196,13 +196,15 @@ pub fn validate(dir: &Path, snapshot: &LoadedProviderSnapshot) -> Result<(), Str
             expression.static_type().map_err(|e| e.to_string())?;
         }
         if let (Some(ty), Some(value)) = (export.type_expr_opt(), export.value()) {
-            carina_core::parser::retained::admit_expression(expression, ty)
-                .map_err(|e| e.to_string())?;
+            carina_core::test_utils::ordinary_sink_result_for_test(
+                carina_core::parser::retained::admit_expression(expression, ty),
+            )
+            .map_err(|error| error.to_string())?;
             carina_core::validation::typecheck::check_type_expr_value(
                 ty,
                 value,
                 snapshot.provider_context(),
-                expression,
+                (expression).ordinary().unwrap(),
             )
             .require_provider_schemas()
             .map_err(|e| e.to_string())?;

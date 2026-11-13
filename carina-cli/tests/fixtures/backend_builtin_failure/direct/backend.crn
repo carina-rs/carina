@@ -1,0 +1,4 @@
+backend s3 {
+  bucket = cidr_subnet('bad', 8, 1)
+  key = 'state.json'
+}

@@ -34,7 +34,7 @@ fn emit_wire(store: &mut Store<HostState>, body: carina_provider_protocol::diagn
 async fn panic_flood_is_bounded_and_exemption_resets_each_call() {
     use carina_provider_protocol::diagnostics as wire;
     let (session, events) = captured_session(
-        carina_core::provider::ProviderPlan::state_only().session_builder("mock", None, None),
+        carina_core::provider::ProviderPlan::state_only().test_session_builder("mock", None, None),
     );
     let engine = Engine::default();
     let mut store = diagnostic_store(&engine);
@@ -115,7 +115,7 @@ async fn panic_flood_is_bounded_and_exemption_resets_each_call() {
 async fn oversized_panic_text_is_masked_without_losing_the_event() {
     use carina_provider_protocol::diagnostics as wire;
     let (session, events) = captured_session(
-        carina_core::provider::ProviderPlan::state_only().session_builder("mock", None, None),
+        carina_core::provider::ProviderPlan::state_only().test_session_builder("mock", None, None),
     );
     let engine = Engine::default();
     let mut store = diagnostic_store(&engine);
@@ -165,7 +165,7 @@ async fn oversized_panic_text_is_masked_without_losing_the_event() {
 async fn a_later_call_delivers_panic_message_and_location_after_a_flood() {
     use carina_provider_protocol::diagnostics as wire;
     let (session, events) = captured_session(
-        carina_core::provider::ProviderPlan::state_only().session_builder("mock", None, None),
+        carina_core::provider::ProviderPlan::state_only().test_session_builder("mock", None, None),
     );
     let engine = Engine::default();
     let mut store = diagnostic_store(&engine);
@@ -208,7 +208,7 @@ async fn a_later_call_delivers_panic_message_and_location_after_a_flood() {
 async fn call_end_reports_exactly_one_suppression_count_and_keeps_the_panic() {
     use carina_provider_protocol::diagnostics as wire;
     let (session, events) = captured_session(
-        carina_core::provider::ProviderPlan::state_only().session_builder("mock", None, None),
+        carina_core::provider::ProviderPlan::state_only().test_session_builder("mock", None, None),
     );
     let engine = Engine::default();
     let mut store = diagnostic_store(&engine);
@@ -269,12 +269,12 @@ async fn metadata_fallback_retains_the_installed_sink_and_schemas() {
             Value::Concrete(ConcreteValue::String("ordinary".into())),
         );
     let plan = crate::provider_text_fixtures::plan_for_desired(&[resource]);
-    let (session, events) = captured_session(plan.session_builder("mock", None, None));
+    let (session, events) = captured_session(plan.test_session_builder("mock", None, None));
     let factory = carina_provider_mock::ConfiguredBuiltinMock::new(
         Default::default(),
         carina_provider_mock::MockScope::memory(),
     );
-    let _normalizer = ProviderBoundary::initialize_normalizer(&factory, &session)
+    let _normalizer = ProviderBoundary::initialize_normalizer_for_test(&factory, &session)
         .await
         .unwrap();
     let engine = Engine::default();
@@ -282,7 +282,7 @@ async fn metadata_fallback_retains_the_installed_sink_and_schemas() {
     store.set_input_inventory(session.guest_inventory());
     for round in 0..2 {
         if round == 1 {
-            store.set_input_inventory(plan.session("mock", None, None).guest_inventory());
+            store.set_input_inventory(plan.test_session("mock", None, None).guest_inventory());
         }
         store
             .call(|store| async move {
@@ -331,7 +331,7 @@ async fn metadata_fallback_retains_the_installed_sink_and_schemas() {
 fn http_fields_are_structurally_masked_without_registered_material() {
     use carina_provider_protocol::diagnostics as wire;
     let (session, events) = captured_session(
-        carina_core::provider::ProviderPlan::state_only().session_builder("mock", None, None),
+        carina_core::provider::ProviderPlan::state_only().test_session_builder("mock", None, None),
     );
     session.diagnostics().receive_wire(wire::Event {
         severity: wire::Level::Trace, context: None,
@@ -376,7 +376,7 @@ fn raw_wasi_stdout_and_stderr_have_no_outward_sink_at_any_lifecycle_stage() {
         let host_output = guest_stderr::HostOutput::new(capture.clone());
         let engine = Engine::default();
         let inventory = carina_core::provider::ProviderPlan::state_only()
-            .session("raw-test", None, None)
+            .test_session("raw-test", None, None)
             .guest_inventory();
         let owner = carina_core::provider_text::GuestStoreData::new_store(&engine, (), inventory);
         let mut wasi = build_sandboxed_wasi_ctx_for_store(owner.data(), None, |_key| None);
@@ -422,7 +422,7 @@ async fn sdk_hook_precedes_provider_construction_during_metadata_loading() {
         source: identity.source().clone(),
     });
     let (session, events) = captured_session(
-        carina_core::provider::ProviderPlan::state_only().session_builder("mock", None, None),
+        carina_core::provider::ProviderPlan::state_only().test_session_builder("mock", None, None),
     );
     let result = create_instance(
         &engine,
@@ -446,7 +446,7 @@ async fn sdk_hook_precedes_provider_construction_during_metadata_loading() {
 fn masked_http_fields_still_consume_the_input_size_budget() {
     use carina_provider_protocol::diagnostics as wire;
     let (session, events) = captured_session(
-        carina_core::provider::ProviderPlan::state_only().session_builder("mock", None, None),
+        carina_core::provider::ProviderPlan::state_only().test_session_builder("mock", None, None),
     );
     session.diagnostics().receive_wire(
         wire::Event {
