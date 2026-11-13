@@ -502,7 +502,7 @@ mod review_r2_source_tests {
     use super::*;
 
     #[tokio::test]
-    async fn review_r2_backend_locate_error_exposes_original_io_source() {
+    async fn backend_locate_error_retains_terminal_io_cause() {
         let path = "bad\0state.json";
         let errors = [
             load_local_state_file(&LocalStateFile::parse(path).unwrap())
@@ -513,9 +513,11 @@ mod review_r2_source_tests {
                 .unwrap_err(),
         ];
         for error in errors {
-            let cause = std::error::Error::source(&error)
-                .expect("the BackendError returned to its caller must retain its IO source");
-            let io = cause.downcast_ref::<std::io::Error>().unwrap();
+            assert!(std::error::Error::source(&error).is_none());
+            let BackendError::LocateLocal(error) = error else {
+                panic!("locate")
+            };
+            let io = error.io_error();
             assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput);
             assert_eq!(
                 io.to_string(),

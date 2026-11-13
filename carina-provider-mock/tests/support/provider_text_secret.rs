@@ -317,14 +317,6 @@ impl ProviderFactory for EchoFactory {
         "Provider text secret regression fixture"
     }
 
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        ValidatedConfigSchema::validate(BTreeMap::from([(
-            "password".into(),
-            AttributeType::string(),
-        )]))
-        .unwrap()
-    }
-
     fn validate_config(
         &self,
         attributes: &CanonicalProviderConfigAttributes,
@@ -379,7 +371,13 @@ impl ProviderFactory for EchoFactory {
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            {
+                ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "password".into(),
+                    AttributeType::string(),
+                )]))
+                .unwrap()
+            },
             Default::default(),
             Vec::new(),
         )

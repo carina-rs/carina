@@ -6,8 +6,7 @@ use carina_core::provider::{
 };
 use carina_core::schema::{
     AssignabilityEdge, AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry,
-    TypeIdentity, ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
-    legacy_validator,
+    TypeIdentity, ValidatedProviderSchemaWitness, ValidatedResourceSchema, legacy_validator,
 };
 
 pub fn identity(kind: &str) -> TypeIdentity {
@@ -30,9 +29,7 @@ impl ProviderFactory for EdgeFactory {
     fn display_name(&self) -> &str {
         self.owner
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        Default::default()
-    }
+
     fn validate_config(
         &self,
         _: &CanonicalProviderConfigAttributes,
@@ -111,7 +108,7 @@ impl ProviderFactory for EdgeFactory {
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             if self.edges {
                 [

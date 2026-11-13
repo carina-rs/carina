@@ -122,32 +122,6 @@ impl LocatedResourceStateEncodingError {
     }
 }
 
-/// CLI rendering policy for a retained, inspectable backend failure.
-/// Locate failures already include their IO cause in Display; other backend
-/// failures retain their established source-chain rendering.
-#[derive(Debug)]
-pub struct BackendDiagnostic {
-    error: BackendError,
-}
-impl BackendDiagnostic {
-    pub fn backend_error(&self) -> &BackendError {
-        &self.error
-    }
-}
-impl std::fmt::Display for BackendDiagnostic {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.error, f)
-    }
-}
-impl std::error::Error for BackendDiagnostic {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match &self.error {
-            BackendError::LocateLocal(_) => None,
-            error => std::error::Error::source(error),
-        }
-    }
-}
-
 /// A backend error rendered with the concrete project directory available at
 /// the CLI boundary.
 #[derive(Debug)]
@@ -1359,7 +1333,7 @@ pub enum AppError {
 
     /// State backend errors (lock contention, I/O, serialization, etc.)
     #[error(transparent)]
-    Backend(BackendDiagnostic),
+    Backend(#[from] BackendError),
 
     /// `state forget` was asked to remove anything other than an
     /// outcome-unknown create row.
@@ -1738,12 +1712,6 @@ pub enum AppError {
     StateLockLost { error: BackendError },
 }
 
-impl From<BackendError> for AppError {
-    fn from(error: BackendError) -> Self {
-        Self::Backend(BackendDiagnostic { error })
-    }
-}
-
 impl From<crate::commands::init::InitError> for AppError {
     fn from(error: crate::commands::init::InitError) -> Self {
         Self::Init(Box::new(error))
@@ -1811,12 +1779,10 @@ impl AppError {
     /// Enrich legacy-state recovery guidance with the command's project path.
     pub fn with_project_dir(self, project_dir: &Path) -> Self {
         match self {
-            Self::Backend(source)
-                if source.backend_error().invalid_resource_identity().is_some() =>
-            {
+            Self::Backend(source) if source.invalid_resource_identity().is_some() => {
                 match carina_core::paths::DisplayPath::new(project_dir) {
                     Ok(project_dir) => Self::ProjectBackend(Box::new(ProjectBackendError::new(
-                        source.error,
+                        source,
                         project_dir,
                     ))),
                     Err(_) => Self::Backend(source),
@@ -2284,7 +2250,7 @@ mod tests {
         let app_err: AppError = backend_err.into();
         assert!(matches!(
             app_err,
-            AppError::Backend(ref report) if matches!(report.backend_error(), BackendError::Configuration(_))
+            AppError::Backend(ref report) if matches!(report, BackendError::Configuration(_))
         ));
         assert!(app_err.to_string().contains("missing bucket"));
     }
@@ -2569,7 +2535,7 @@ mod tests {
         let app_err: AppError = locked.into();
         assert!(matches!(
             app_err,
-            AppError::Backend(ref report) if matches!(report.backend_error(), BackendError::Locked { .. })
+            AppError::Backend(ref report) if matches!(report, BackendError::Locked { .. })
         ));
     }
 
@@ -2870,15 +2836,52 @@ mod review_r2_backend_diagnostic_tests {
         let backend = BackendError::from(carina_state::LocalStateLocateError::from(
             std::io::Error::other("typed locate cause"),
         ));
-        assert!(std::error::Error::source(&backend).is_some());
+        assert!(std::error::Error::source(&backend).is_none());
         let error = AppError::from(backend);
         let AppError::Backend(diagnostic) = &error else {
             panic!("typed backend diagnostic")
         };
-        assert!(std::error::Error::source(diagnostic.backend_error()).is_some());
+        assert!(std::error::Error::source(diagnostic).is_none());
         assert_eq!(
             format_error_with_source_chain(&error),
             "I/O error: Failed to locate state file: typed locate cause",
+        );
+    }
+}
+
+#[cfg(test)]
+mod round3_terminal_backend_error_tests {
+    use super::*;
+
+    fn locate() -> BackendError {
+        carina_state::LocalStateLocateError::from(std::io::Error::other("round3 locate cause"))
+            .into()
+    }
+
+    #[test]
+    fn round3_locate_is_terminal_with_main_display() {
+        let error = locate();
+        assert_eq!(
+            error.to_string(),
+            "I/O error: Failed to locate state file: round3 locate cause"
+        );
+        assert!(std::error::Error::source(&error).is_none());
+        let BackendError::LocateLocal(locate) = error else {
+            panic!("locate")
+        };
+        assert!(std::error::Error::source(&locate).is_none());
+        assert_eq!(locate.io_error().kind(), std::io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn round3_generic_backend_chain_renders_locate_cause_once() {
+        let error =
+            StateBucketSeedError::new("bucket".into(), "aws.s3.Bucket.bucket".into(), locate());
+        let rendered = format_error_with_source_chain(&error);
+        assert_eq!(
+            rendered.matches("round3 locate cause").count(),
+            1,
+            "{rendered}"
         );
     }
 }

@@ -272,7 +272,7 @@ pub struct LocalBackendSettings {
 }
 
 /// Failure to pin a local state address, retaining the original IO cause.
-/// Display is terminal; transparent backend errors retain its source for inspection.
+/// Display includes the IO cause once; `io_error()` retains typed inspection.
 #[derive(Debug)]
 pub struct LocalStateLocateError {
     cause: std::io::Error,
@@ -300,15 +300,18 @@ impl std::fmt::Display for LocalStateLocateError {
         write!(f, "I/O error: {context}{}", self.cause)
     }
 }
-impl std::error::Error for LocalStateLocateError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.cause)
-    }
-}
+impl std::error::Error for LocalStateLocateError {}
 impl LocalStateLocateError {
-    pub(crate) fn address(mut self) -> Self {
-        self.context = LocateContext::Address;
-        self
+    /// Original filesystem failure included in this terminal diagnostic.
+    pub fn io_error(&self) -> &std::io::Error {
+        &self.cause
+    }
+
+    pub(crate) fn address(cause: std::io::Error) -> Self {
+        Self {
+            cause,
+            context: LocateContext::Address,
+        }
     }
 }
 
@@ -331,6 +334,14 @@ impl LocalBackendLocation {
     pub(crate) fn for_file(
         path: impl AsRef<std::path::Path>,
     ) -> Result<Self, LocalStateLocateError> {
+        Self::native_file(path).map_err(LocalStateLocateError::from)
+    }
+    pub(crate) fn for_address(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, LocalStateLocateError> {
+        Self::native_file(path).map_err(LocalStateLocateError::address)
+    }
+    fn native_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
         Ok(Self::NativeFile(NativeFileAddress {
             path: ResolvedPath::new(path)?,
         }))
@@ -354,6 +365,17 @@ impl LocalBackendSettings {
         &self,
         base: &ResolvedPath,
     ) -> Result<LocalBackendLocation, LocalStateLocateError> {
+        self.locate(base).map_err(LocalStateLocateError::from)
+    }
+
+    pub(crate) fn pin_address(
+        &self,
+        base: &ResolvedPath,
+    ) -> Result<LocalBackendLocation, LocalStateLocateError> {
+        self.locate(base).map_err(LocalStateLocateError::address)
+    }
+
+    fn locate(&self, base: &ResolvedPath) -> std::io::Result<LocalBackendLocation> {
         let path = crate::backends::anchored_local_path(self, base)?;
         Ok(LocalBackendLocation::Configured(PinnedLocalSettings {
             path,

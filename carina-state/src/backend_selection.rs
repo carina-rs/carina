@@ -399,17 +399,12 @@ impl BackendSelection {
 
     /// Resolve the old and new backend addresses carried by a proven drift.
     pub async fn for_migration(drift: &BackendDrift) -> BackendResult<MigrationBackends> {
-        let project_dir = drift.project_dir.clone();
-        let source = ConfiguredBackend::new(
-            AdmittedBackendOrigin::Locked(drift.existing.to_state_config()?),
-            project_dir.clone(),
-        );
-        let target = ConfiguredBackend::new(
-            AdmittedBackendOrigin::Declared(drift.configured.to_state_config()?),
-            project_dir,
-        );
-        let (source, local_source_path) = source.resolve_migration_backend().await?;
-        let (target, local_target_path) = target.resolve_migration_backend().await?;
+        let (source, local_source_path) =
+            resolve_migration_backend(&drift.existing.to_state_config()?, &drift.project_dir)
+                .await?;
+        let (target, local_target_path) =
+            resolve_migration_backend(&drift.configured.to_state_config()?, &drift.project_dir)
+                .await?;
         if let (Some(source), Some(target)) = (&local_source_path, &local_target_path)
             && source.identity() == target.identity()
         {
@@ -480,24 +475,44 @@ impl ConfiguredBackend {
     pub(crate) fn config(&self) -> &BackendConfig {
         self.origin.config()
     }
-    pub(crate) fn base_dir(&self) -> &ResolvedPath {
-        &self.base_dir
-    }
-    /// Migration's alias check and IO consume the same pin.
-    async fn resolve_migration_backend(
-        &self,
-    ) -> BackendResult<(Box<dyn crate::StateBackend>, Option<ResolvedPath>)> {
+    pub(crate) async fn open(&self) -> BackendResult<Box<dyn crate::StateBackend>> {
         match self.config() {
+            BackendConfig::S3(settings) => Ok(Box::new(
+                crate::backends::S3Backend::from_config(settings).await?,
+            )),
             BackendConfig::Local(settings) => {
-                let location = settings
-                    .pin(&self.base_dir)
-                    .map_err(BackendError::bare_local_locate)?;
-                let path = location.path().clone();
-                let backend = crate::backends::LocalBackend::from_location(location)?;
-                Ok((Box::new(backend), Some(path)))
+                let backend = match self.origin {
+                    AdmittedBackendOrigin::Implicit(_) => {
+                        crate::backends::LocalBackend::from_location(
+                            settings.pin_address(&self.base_dir)?,
+                        )?
+                    }
+                    AdmittedBackendOrigin::Declared(_) | AdmittedBackendOrigin::Locked(_) => {
+                        crate::backends::LocalBackend::from_config(settings, &self.base_dir)?
+                    }
+                };
+                Ok(Box::new(backend))
             }
-            BackendConfig::S3(_) => Ok((crate::backends::create_backend(self).await?, None)),
         }
+    }
+}
+
+/// Migration's alias check and IO consume the same pin, regardless of origin.
+async fn resolve_migration_backend(
+    config: &BackendConfig,
+    base: &ResolvedPath,
+) -> BackendResult<(Box<dyn crate::StateBackend>, Option<ResolvedPath>)> {
+    match config {
+        BackendConfig::Local(settings) => {
+            let location = settings.pin_address(base)?;
+            let path = location.path().clone();
+            let backend = crate::backends::LocalBackend::from_location(location)?;
+            Ok((Box::new(backend), Some(path)))
+        }
+        BackendConfig::S3(settings) => Ok((
+            Box::new(crate::backends::S3Backend::from_config(settings).await?),
+            None,
+        )),
     }
 }
 
@@ -736,7 +751,7 @@ mod tests {
             None::<&ParserBackendConfig>,
         )
         .unwrap();
-        let base_dir = selected.configured.base_dir();
+        let base_dir = &selected.configured.base_dir;
         assert_eq!(base_dir.display().to_string(), alias.display().to_string());
     }
 }
@@ -756,7 +771,9 @@ mod default_admission_cleanup_tests {
             matches!(selected.config(), BackendConfig::Local(_)),
             "implicit selection must contain admitted local settings"
         );
-        let (_, path) = selected.resolve_migration_backend().await.unwrap();
+        let (_, path) = resolve_migration_backend(selected.config(), &selected.base_dir)
+            .await
+            .unwrap();
         assert_eq!(
             path.unwrap().identity(),
             ResolvedPath::new(root.path().join("carina.state.json"))
@@ -847,7 +864,10 @@ mod review_r1_selection_tests {
         };
         let io = crate::backends::anchored_local_path(local, &base).unwrap_err();
         let selected = ConfiguredBackend::new(AdmittedBackendOrigin::Declared(settings), base);
-        let error = selected.resolve_migration_backend().await.err().unwrap();
+        let error = resolve_migration_backend(selected.config(), &selected.base_dir)
+            .await
+            .err()
+            .unwrap();
         assert_eq!(error.to_string(), format!("I/O error: {io}"));
     }
 
@@ -864,5 +884,21 @@ mod review_r1_selection_tests {
         let read = BackendSelection::for_read(&base, None::<&ParserBackendConfig>).unwrap();
         let error = read.resolve_with_drift_warning(|_| {}).await.err().unwrap();
         assert_eq!(error.to_string(), format!("I/O error: {io}"));
+    }
+}
+
+#[cfg(test)]
+mod round3_migration_origin_tests {
+    use super::*;
+    #[tokio::test]
+    async fn round3_migration_consumes_settings_without_labeling_an_origin() {
+        let root = tempfile::tempdir().unwrap();
+        let base = ResolvedPath::new(root.path()).unwrap();
+        let config = BackendConfig::Local(BackendConfig::implicit_local());
+        let (_, path) = resolve_migration_backend(&config, &base).await.unwrap();
+        assert_eq!(
+            path.unwrap().identity(),
+            base.join("carina.state.json").unwrap().identity()
+        );
     }
 }

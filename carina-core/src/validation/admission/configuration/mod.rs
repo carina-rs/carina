@@ -62,7 +62,7 @@ impl ConfigurationDeclaration {
         })
     }
 
-    fn destination<K: DestinationKind>(
+    fn destination<K: ConfigurationKind>(
         &self,
         key: &crate::parser::AttributeKey,
         instance: InstanceIdentity,
@@ -160,7 +160,7 @@ pub(super) fn admit_field<K: DestinationKind, P: PlaceholderKind, B: BindingAddr
     }
 }
 
-fn field<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
+fn field<K: ConfigurationKind, P: PlaceholderKind, B: BindingAddress>(
     destination: &Destination<K>,
     value: &Value<P, B>,
     session: &dyn ProviderTypeCheckContext,
@@ -173,7 +173,7 @@ fn field<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
     admit(destination, candidate, &context)
 }
 
-fn complete_field<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
+fn complete_field<K: ConfigurationKind, P: PlaceholderKind, B: BindingAddress>(
     destination: &Destination<K>,
     value: &Value<P, B>,
     session: &dyn ProviderTypeCheckContext,

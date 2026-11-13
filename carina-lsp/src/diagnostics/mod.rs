@@ -753,10 +753,7 @@ impl DiagnosticRun<'_> {
         } else {
             false
         };
-        let (mut merged_result, directory_error) = match merged_attempt.transpose() {
-            Ok(result) => (result, None),
-            Err(error) => (None, Some(error)),
-        };
+        let mut merged_result = merged_attempt.and_then(Result::ok);
         // Keep the parsed input stable while module-analysis results are filled
         // in. Cloning this Arc preserves the exact sealed directory without
         // cloning or revalidating the AST.
@@ -954,26 +951,7 @@ impl DiagnosticRun<'_> {
         // sibling call that binds a structural handle and then uses the
         // parameter bare). Resolution retains the parser-owned expression
         // location through the merged pass.
-        let backend_failure_reported = directory_error_emitted
-            && match (
-                directory_error
-                    .as_ref()
-                    .and_then(|error| error.element_diagnostic()),
-                current_parsed.and_then(|parsed| parsed.backend.as_ref()),
-                current_analysis.as_ref(),
-            ) {
-                (Some(finding), Some(backend), Some(tree)) => backend
-                    .attributes
-                    .keys()
-                    .any(|key| tree.backend_attribute_location(key) == finding.location()),
-                _ => false,
-            };
-        let strict_analysis = match merged_analysis.as_ref() {
-            Some(tree) => Some(tree),
-            None if !backend_failure_reported => current_analysis.as_ref(),
-            // The backend field already has its declaration-owned diagnostic.
-            None => None,
-        };
+        let strict_analysis = merged_analysis.as_ref().or(current_analysis.as_ref());
         if let Some(tree) = strict_analysis
             && let Err(error) = carina_core::parser::resolve_resource_refs_from_analysis(
                 tree,

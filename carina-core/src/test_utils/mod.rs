@@ -364,9 +364,7 @@ pub fn loaded_fixture_snapshot(
         fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
             self.witness.clone()
         }
-        fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-            Default::default()
-        }
+
         fn validate_config(
             &self,
             _: &crate::provider::CanonicalProviderConfigAttributes,

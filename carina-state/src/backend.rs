@@ -569,10 +569,6 @@ fn write_cause_line(out: &mut String, source: &(dyn std::error::Error + 'static)
 }
 
 impl BackendError {
-    pub(crate) fn bare_local_locate(error: crate::LocalStateLocateError) -> Self {
-        Self::LocateLocal(error.address())
-    }
-
     /// Create a Locked error from a LockInfo
     pub fn locked(lock: &LockInfo) -> Self {
         Self::Locked {

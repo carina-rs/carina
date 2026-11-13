@@ -2453,17 +2453,12 @@ impl PlanFile {
         } = &self.contents;
 
         provider_configs.contains_redacted_secret()
-            || {
-                let backend = backend_config.candidate();
-                let BackendConfig {
-                    backend_type: _backend_type,
-                    attributes,
-                    attribute_spans: _attribute_spans,
-                } = backend;
-                attributes
+            || backend_config.candidate().is_some_and(|backend| {
+                backend
+                    .attributes
                     .values()
                     .any(carina_core::value::contains_redacted_secret)
-            }
+            })
             || plan.contains_redacted_secret_placeholders()
             || sorted_resources.iter().any(resource_contains)
             || unresolved_resources.iter().any(resource_contains)
@@ -5915,7 +5910,10 @@ pub(crate) async fn run_plan_using(
 
     {
         let config = plan_backend.selected_config();
-        let bucket_exists = plan_backend.bucket_exists().await.map_err(AppError::from)?;
+        let bucket_exists = plan_backend
+            .bucket_exists()
+            .await
+            .map_err(AppError::Backend)?;
 
         if bucket_exists {
             // Try to load state from backend. `plan` is read-only and
@@ -5926,7 +5924,7 @@ pub(crate) async fn run_plan_using(
             state_file = plan_backend
                 .read_state()
                 .await
-                .map_err(AppError::from)?
+                .map_err(AppError::Backend)?
                 .map(|loaded| loaded.into_state());
         } else if use_locked_backend {
             return Err(AppError::Config(
@@ -7093,7 +7091,7 @@ pub(crate) async fn load_selected_upstream_states<B: carina_core::resource::Bind
         let (backend, metadata) = backend_result?;
 
         let published_exports = backend.read_published_exports().await.map_err(|error| {
-            AppError::from(carina_state::BackendError::UpstreamExportRead(Box::new(
+            AppError::Backend(carina_state::BackendError::UpstreamExportRead(Box::new(
                 carina_state::backend::UpstreamExportReadError {
                     binding: us.binding.to_string(),
                     error,
@@ -7730,9 +7728,7 @@ mod load_upstream_states_tests {
         fn display_name(&self) -> &str {
             "mock enum metadata"
         }
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
+
         fn validate_config(
             &self,
             _: &carina_core::provider::CanonicalProviderConfigAttributes,

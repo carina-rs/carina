@@ -57,8 +57,7 @@ use carina_core::resource::Resource;
 use carina_core::resource::Value;
 use carina_core::resource::{ResourceId, ResourceIdentityState, SnapshotState, State};
 use carina_core::schema::{
-    CompletionValue, TypeIdentity, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
-    ValidatedResourceSchema,
+    CompletionValue, TypeIdentity, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
 use carina_core::wait::BindingPattern;
 use carina_core::wait::predicate::AttrPath;
@@ -4357,10 +4356,6 @@ impl ProviderFactory for SchemaOnlyWasmProviderFactory {
         &self.display_name
     }
 
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        self.schema_witness.config().clone()
-    }
-
     fn validate_config(
         &self,
         _attributes: &CanonicalProviderConfigAttributes,
@@ -4418,10 +4413,6 @@ impl ProviderFactory for WasmProviderFactory {
 
     fn display_name(&self) -> &str {
         &self.display_name
-    }
-
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        self.schema_witness.config().clone()
     }
 
     fn validate_config(

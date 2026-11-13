@@ -826,9 +826,7 @@ fn round4_transient_classification_survives_boundary_and_executor() {
 #[test]
 fn round4_state_only_destroy_uses_config_and_desired_set() {
     use carina_core::provider::*;
-    use carina_core::schema::{
-        ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
-    };
+    use carina_core::schema::{ValidatedProviderSchemaWitness, ValidatedResourceSchema};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -841,9 +839,7 @@ fn round4_state_only_destroy_uses_config_and_desired_set() {
         fn display_name(&self) -> &str {
             "Mock"
         }
-        fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-            EchoFactory(Failure::StateOnly).provider_config_attribute_types()
-        }
+
         fn schemas(&self) -> Vec<ValidatedResourceSchema> {
             EchoFactory(Failure::StateOnly).schemas()
         }

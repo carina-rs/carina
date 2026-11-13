@@ -82,7 +82,7 @@ pub fn map_lock_error(e: BackendError, project_dir: &Path) -> AppError {
             operation,
             ProjectCommand::new("force-unlock", project_dir).with_argument(lock_id.as_str())
         )),
-        other => AppError::from(other),
+        other => AppError::Backend(other),
     }
 }
 
@@ -640,7 +640,10 @@ pub async fn run_state_forget(
         backend_config.as_ref(),
         DriftCommand::ForgetState,
     )?;
-    let backend = verified_backend.resolve().await.map_err(AppError::from)?;
+    let backend = verified_backend
+        .resolve()
+        .await
+        .map_err(AppError::Backend)?;
 
     println!("{}", "Acquiring state lock...".cyan(color_mode));
     let lock = backend
@@ -802,7 +805,7 @@ pub async fn run_force_unlock(
             "Lock ID mismatch. Expected '{}', found '{}'.",
             expected, actual
         ))),
-        Err(e) => Err(AppError::from(e)),
+        Err(e) => Err(AppError::Backend(e)),
     }
 }
 
@@ -821,11 +824,11 @@ async fn load_state_file(
 ) -> Result<Option<StateFile>, AppError> {
     let color_mode = runtime.color_mode();
     if let Some(raw) = state_url {
-        let url = StateUrl::parse(raw).map_err(AppError::from)?;
+        let url = StateUrl::parse(raw).map_err(AppError::Backend)?;
         return load_state_from_url(&url)
             .await
             .map(Some)
-            .map_err(AppError::from);
+            .map_err(AppError::Backend);
     }
 
     let default_path = PathBuf::from(".");
@@ -860,7 +863,7 @@ async fn load_state_file(
         .read_state()
         .await
         .map(|state| state.map(|loaded| loaded.into_state()))
-        .map_err(AppError::from)
+        .map_err(AppError::Backend)
 }
 
 fn require_state_file(state: Option<StateFile>) -> Result<StateFile, AppError> {
@@ -1512,7 +1515,7 @@ async fn run_state_bucket_delete(
         .ok_or("No backend configuration found.")?;
     let state_config = StateBackendConfig::try_from(backend_config)
         .map_err(carina_state::BackendError::from)
-        .map_err(AppError::from)?;
+        .map_err(AppError::Backend)?;
     let settings = state_config
         .as_s3()
         .ok_or("The configured backend does not manage an S3 bucket")?;
@@ -1744,8 +1747,10 @@ pub async fn run_state_refresh(
     )?;
 
     // Create backend
-    let backend: Box<dyn StateBackend> =
-        verified_backend.resolve().await.map_err(AppError::from)?;
+    let backend: Box<dyn StateBackend> = verified_backend
+        .resolve()
+        .await
+        .map_err(AppError::Backend)?;
 
     // Acquire lock (unless --lock=false)
     let state_lock = if lock {
@@ -4058,10 +4063,6 @@ mod tests {
             "state refresh module constraint provider"
         }
 
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
-
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -4085,7 +4086,7 @@ mod tests {
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                Default::default(),
                 Default::default(),
                 Vec::new(),
             )
@@ -4203,10 +4204,6 @@ mod tests {
             "cancelling state refresh provider"
         }
 
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
-
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -4234,7 +4231,7 @@ mod tests {
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                Default::default(),
                 Default::default(),
                 Vec::new(),
             )

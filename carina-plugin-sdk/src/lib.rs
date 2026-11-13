@@ -1951,9 +1951,7 @@ mod tests {
             fn schemas(&self) -> Vec<ValidatedResourceSchema> {
                 self.0.schemas().to_vec()
             }
-            fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-                self.0.config().clone()
-            }
+
             fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
                 self.0.witness().clone()
             }

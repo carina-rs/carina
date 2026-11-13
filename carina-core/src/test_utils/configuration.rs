@@ -67,9 +67,7 @@ impl ProviderFactory for ConfigFactory {
     fn display_name(&self) -> &str {
         &self.name
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        self.schema.clone()
-    }
+
     fn validate_config(
         &self,
         attributes: &CanonicalProviderConfigAttributes,

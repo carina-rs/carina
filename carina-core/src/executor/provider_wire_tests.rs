@@ -398,9 +398,7 @@ impl ProviderFactory for ConfigFactory {
     fn display_name(&self) -> &str {
         "wire boundary fixture"
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        ValidatedConfigSchema::validate(BTreeMap::new()).unwrap()
-    }
+
     fn validate_config(
         &self,
         _: &CanonicalProviderConfigAttributes,
@@ -422,7 +420,7 @@ impl ProviderFactory for ConfigFactory {
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            ValidatedConfigSchema::validate(BTreeMap::new()).unwrap(),
             Default::default(),
             Vec::new(),
         )

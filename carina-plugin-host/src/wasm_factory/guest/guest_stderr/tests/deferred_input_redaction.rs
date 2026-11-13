@@ -16,9 +16,7 @@ impl ProviderFactory for LateFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         StderrConfigFactory.schema_witness()
     }
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        StderrConfigFactory.provider_config_attribute_types()
-    }
+
     fn validate_config(
         &self,
         _: &CanonicalProviderConfigAttributes,

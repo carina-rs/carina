@@ -116,10 +116,11 @@ fn review_r1_native_file_origin_is_explicit_and_not_admitted_settings() {
 }
 
 #[test]
-fn review_r1_locate_error_keeps_the_io_source() {
+fn locate_error_retains_terminal_io_cause() {
     let error: LocalStateLocateError =
         LocalBackendLocation::for_file(std::path::Path::new("bad\0state")).unwrap_err();
-    assert!(std::error::Error::source(&error).is_some());
+    assert!(std::error::Error::source(&error).is_none());
+    assert_eq!(error.io_error().kind(), std::io::ErrorKind::InvalidInput);
 }
 
 #[test]

@@ -2720,9 +2720,7 @@ impl ProviderFactory for ReferenceValidationFactory {
     fn display_name(&self) -> &str {
         "Reference validation fixture"
     }
-    fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-        Default::default()
-    }
+
     fn schemas(&self) -> Vec<ValidatedResourceSchema> {
         vec![
             crate::schema::ResourceSchema::new("keys.Resource")
@@ -2747,7 +2745,7 @@ impl ProviderFactory for ReferenceValidationFactory {
     fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
         crate::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )

@@ -26,9 +26,7 @@ impl ProviderFactory for NamedFactory {
         )
         .unwrap()
     }
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
+
     fn validate_config(
         &self,
         _: &CanonicalProviderConfigAttributes,

@@ -1103,10 +1103,6 @@ impl ProviderFactory for FixtureProviderConfigFactory {
         "Fixture provider config schema"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        fixture_region_attribute_types(self.provider)
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -1126,7 +1122,7 @@ impl ProviderFactory for FixtureProviderConfigFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            fixture_region_attribute_types(self.provider),
             Default::default(),
             Vec::new(),
         )
@@ -1157,10 +1153,6 @@ impl ProviderFactory for ResolvedValueConstraintFixtureFactory {
         "Resolved value constraint fixture provider"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -1180,7 +1172,7 @@ impl ProviderFactory for ResolvedValueConstraintFixtureFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -1232,10 +1224,6 @@ impl ProviderFactory for BestFirstPairingFixtureFactory {
         "AWS Cloud Control fixture provider"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        fixture_region_attribute_types(self.name())
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -1255,7 +1243,7 @@ impl ProviderFactory for BestFirstPairingFixtureFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            fixture_region_attribute_types(self.name()),
             Default::default(),
             Vec::new(),
         )
@@ -1312,10 +1300,6 @@ impl ProviderFactory for ReplaceCreateOnlyFixtureFactory {
         "Test fixture provider"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -1335,7 +1319,7 @@ impl ProviderFactory for ReplaceCreateOnlyFixtureFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -1385,10 +1369,6 @@ impl ProviderFactory for PlanImageFixtureFactory {
         "Plan image fixture provider"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -1408,7 +1388,7 @@ impl ProviderFactory for PlanImageFixtureFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -1448,10 +1428,6 @@ impl ProviderFactory for MovedClaimsPrecedeHeuristicsFixtureFactory {
         "AWS Cloud Control fixture provider"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        fixture_region_attribute_types(self.name())
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -1471,7 +1447,7 @@ impl ProviderFactory for MovedClaimsPrecedeHeuristicsFixtureFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            fixture_region_attribute_types(self.name()),
             Default::default(),
             Vec::new(),
         )
@@ -1510,10 +1486,6 @@ impl ProviderFactory for EnumDisplayFixtureFactory {
         "AWS Cloud Control fixture provider"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        fixture_region_attribute_types(self.name())
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -1533,7 +1505,7 @@ impl ProviderFactory for EnumDisplayFixtureFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            fixture_region_attribute_types(self.name()),
             Default::default(),
             Vec::new(),
         )
@@ -1580,10 +1552,6 @@ impl ProviderFactory for DynamicEnumFixtureFactory {
         "Fixture provider"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -1603,7 +1571,7 @@ impl ProviderFactory for DynamicEnumFixtureFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -1638,10 +1606,6 @@ impl ProviderFactory for Route53HostedZoneFixtureFactory {
         "Fixture provider"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -1661,7 +1625,7 @@ impl ProviderFactory for Route53HostedZoneFixtureFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )

@@ -29,9 +29,7 @@ impl ProviderFactory for DeferredPopulateTestFactory {
     fn display_name(&self) -> &str {
         "AWS (deferred-populate test stub)"
     }
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
+
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -67,7 +65,7 @@ impl ProviderFactory for DeferredPopulateTestFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )

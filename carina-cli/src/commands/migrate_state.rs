@@ -89,7 +89,7 @@ async fn perform_state_migration(
     let state = backends
         .read_source_state()
         .await
-        .map_err(AppError::from)?
+        .map_err(AppError::Backend)?
         .map(|loaded| loaded.into_state())
         .ok_or_else(|| {
             AppError::Config(format!(
@@ -105,7 +105,7 @@ async fn perform_state_migration(
     if let Some(existing) = backends
         .read_target_state()
         .await
-        .map_err(AppError::from)?
+        .map_err(AppError::Backend)?
         .map(|loaded| loaded.into_state())
         && (existing.lineage != state.lineage || !existing.resources().is_empty())
         && !force
@@ -123,7 +123,7 @@ async fn perform_state_migration(
     backends
         .write_target_state(&state)
         .await
-        .map_err(AppError::from)?;
+        .map_err(AppError::Backend)?;
 
     // Verify the copy landed before we rewrite the lock / delete the
     // source — a migration that silently lost resources is the worst
@@ -131,7 +131,7 @@ async fn perform_state_migration(
     let roundtrip = backends
         .read_target_state()
         .await
-        .map_err(AppError::from)?
+        .map_err(AppError::Backend)?
         .map(|loaded| loaded.into_state())
         .ok_or_else(|| {
             AppError::Config(
@@ -190,7 +190,7 @@ pub async fn run_init_migrate_state(
     // at the project directory.
     let backends = BackendSelection::for_migration(&drift)
         .await
-        .map_err(AppError::from)?;
+        .map_err(AppError::Backend)?;
 
     let state = perform_state_migration(&backends, force, project_dir).await?;
     println!(
@@ -216,7 +216,7 @@ pub async fn run_init_migrate_state(
     drift
         .configured()
         .save(project_dir)
-        .map_err(AppError::from)?;
+        .map_err(AppError::Backend)?;
     println!("  {} updated backend lock", "✓".green(color_mode));
 
     // A local source is deleted after the commit (matches the retired

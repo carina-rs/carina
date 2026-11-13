@@ -3,9 +3,7 @@ use carina_core::provider::{
     BoxFuture, CanonicalProviderConfigAttributes, InitializeOutcomeMint, ProviderFactory,
     ProviderInitialization, ProviderResult,
 };
-use carina_core::schema::{
-    ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
-};
+use carina_core::schema::{ValidatedProviderSchemaWitness, ValidatedResourceSchema};
 
 #[path = "../../carina-core/tests/support/secret_origin.rs"]
 mod fixture;
@@ -25,13 +23,11 @@ impl ProviderFactory for SecretFactory {
             fixture::schema()
         }]
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        Default::default()
-    }
+
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )

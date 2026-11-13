@@ -164,16 +164,14 @@ impl ProviderFactory for NativeFactory {
     ) -> ProviderResult<()> {
         Ok(())
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        ValidatedConfigSchema::default()
-    }
+
     fn schemas(&self) -> Vec<ValidatedResourceSchema> {
         self.schemas.clone()
     }
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas.clone(),
-            self.provider_config_attribute_types(),
+            ValidatedConfigSchema::default(),
             Default::default(),
             Vec::new(),
         )

@@ -7131,9 +7131,7 @@ impl InitializedProvider {
             fn display_name(&self) -> &str {
                 "Fixture"
             }
-            fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-                ValidatedConfigSchema::default()
-            }
+
             fn validate_config(
                 &self,
                 _: &CanonicalProviderConfigAttributes,
@@ -8527,18 +8525,6 @@ pub trait ProviderFactory: Send + Sync {
     /// Display name for user-facing messages (e.g., "AWS provider", "AWS Cloud Control provider")
     fn display_name(&self) -> &str;
 
-    /// Return the validated schema witness for the provider block's
-    /// configuration attributes (e.g., `region`).
-    ///
-    /// These are used by the host to validate provider config attributes
-    /// against their effective path types *before* calling `validate_config`.
-    /// Keeping format validation (namespace structure, enum membership) on
-    /// the host side means fixes to generic validation logic in
-    /// `carina-core` take effect without rebuilding provider binaries.
-    fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-        self.schema_witness().config().clone()
-    }
-
     /// Validate provider-specific configuration semantics that cannot be
     /// expressed in the attribute type schema (e.g., cross-attribute
     /// consistency checks). Host type checks use the configuration declaration
@@ -8636,9 +8622,8 @@ pub trait ProviderFactory: Send + Sync {
 
     /// Return the provider-level aggregate schema witness.
     ///
-    /// Registry ownership, custom-type recognition, and reference forms must
-    /// all be derived from this one snapshot rather than reloading the three
-    /// declaration sources independently.
+    /// Configuration admission, registry ownership, custom-type recognition
+    /// and reference forms all derive from this one snapshot.
     fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness;
 
     /// Attribute names (beyond schema create-only properties) that contribute
@@ -10141,9 +10126,7 @@ mod tests {
             fn schemas(&self) -> Vec<ValidatedResourceSchema> {
                 panic!("snapshot must use the aggregate witness")
             }
-            fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-                panic!("snapshot must use the aggregate witness")
-            }
+
             fn validate_config(
                 &self,
                 _: &CanonicalProviderConfigAttributes,
@@ -11087,7 +11070,18 @@ mod tests {
         fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
             crate::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                {
+                    ValidatedConfigSchema::validate(BTreeMap::from([(
+                        "endpoint".to_string(),
+                        PatternAttributeType::refined_string(
+                            Some(TypeIdentity::new(Some("test"), ["config"], "Endpoint")),
+                            None,
+                            None,
+                            None,
+                        ),
+                    )]))
+                    .expect("config-only custom type must validate")
+                },
                 Default::default(),
                 Vec::new(),
             )
@@ -11096,19 +11090,6 @@ mod tests {
 
         fn schemas(&self) -> Vec<ValidatedResourceSchema> {
             Vec::new()
-        }
-
-        fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-            ValidatedConfigSchema::validate(BTreeMap::from([(
-                "endpoint".to_string(),
-                PatternAttributeType::refined_string(
-                    Some(TypeIdentity::new(Some("test"), ["config"], "Endpoint")),
-                    None,
-                    None,
-                    None,
-                ),
-            )]))
-            .expect("config-only custom type must validate")
         }
 
         fn validate_config(
@@ -11144,9 +11125,7 @@ mod tests {
             fn schemas(&self) -> Vec<ValidatedResourceSchema> {
                 Vec::new()
             }
-            fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-                ConfigOnlyCustomTypeFactory.provider_config_attribute_types()
-            }
+
             fn validate_config(
                 &self,
                 _: &CanonicalProviderConfigAttributes,
@@ -11183,7 +11162,7 @@ mod tests {
             None,
             None,
         ));
-        let schema = DiagnosticFactory.provider_config_attribute_types();
+        let schema = DiagnosticFactory.schema_witness().config().clone();
         let declaration =
             crate::parser::IdentifiedCustomTypeDeclaration::new(&schema.parts()["endpoint"])
                 .unwrap();
@@ -11217,7 +11196,7 @@ mod tests {
     #[test]
     fn declaration_validation_helper_returns_pending_projection_error() {
         let factory = ConfigOnlyCustomTypeFactory;
-        let schema = factory.provider_config_attribute_types();
+        let schema = factory.schema_witness().config().clone();
         let declaration =
             crate::parser::IdentifiedCustomTypeDeclaration::new(&schema.parts()["endpoint"])
                 .unwrap();
@@ -11459,15 +11438,11 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                ValidatedConfigSchema::default(),
                 Default::default(),
                 Vec::new(),
             )
             .expect("snapshot fixture must expose one valid aggregate witness")
-        }
-
-        fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-            ValidatedConfigSchema::default()
         }
 
         fn validate_config(
@@ -16097,9 +16072,7 @@ mod tests {
             fn display_name(&self) -> &str {
                 "Failing provider"
             }
-            fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-                Default::default()
-            }
+
             fn validate_config(
                 &self,
                 _attrs: &CanonicalProviderConfigAttributes,
@@ -16123,7 +16096,7 @@ mod tests {
             fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
                 crate::schema::ValidatedProviderSchemaWitness::new(
                     self.schemas(),
-                    self.provider_config_attribute_types(),
+                    Default::default(),
                     Default::default(),
                     Vec::new(),
                 )
@@ -16197,9 +16170,7 @@ mod tests {
             fn display_name(&self) -> &str {
                 "Capturing provider"
             }
-            fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-                Default::default()
-            }
+
             fn validate_config(
                 &self,
                 _attrs: &CanonicalProviderConfigAttributes,
@@ -16224,7 +16195,7 @@ mod tests {
             fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
                 crate::schema::ValidatedProviderSchemaWitness::new(
                     self.schemas(),
-                    self.provider_config_attribute_types(),
+                    Default::default(),
                     Default::default(),
                     Vec::new(),
                 )
@@ -16604,9 +16575,7 @@ mod provider_text_route_tests {
         fn display_name(&self) -> &str {
             "Route probe"
         }
-        fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-            Default::default()
-        }
+
         fn validate_config(
             &self,
             _: &CanonicalProviderConfigAttributes,

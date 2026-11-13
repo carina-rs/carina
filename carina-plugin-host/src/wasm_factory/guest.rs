@@ -3,6 +3,7 @@ use super::diagnostics::{
     MetadataWasmChain, WasmNormalizerResultCountError, WasmNormalizerResultKeysError,
 };
 use super::*;
+use carina_core::schema::ValidatedConfigSchema;
 mod desired_normalization;
 mod diagnostic_imports;
 pub(super) mod guest_stderr;
@@ -10528,22 +10529,22 @@ pub(super) mod tests {
         ) -> ProviderResult<()> {
             Err(self.0.lock().unwrap().take().unwrap())
         }
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            carina_core::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from(
-                [(
-                    "password".into(),
-                    carina_core::schema::PatternAttributeType::string(),
-                )],
-            ))
-            .unwrap()
-        }
+
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
             Vec::new()
         }
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 Vec::new(),
-                self.provider_config_attribute_types(),
+                {
+                    carina_core::schema::ValidatedConfigSchema::validate(
+                        std::collections::BTreeMap::from([(
+                            "password".into(),
+                            carina_core::schema::PatternAttributeType::string(),
+                        )]),
+                    )
+                    .unwrap()
+                },
                 Default::default(),
                 Vec::new(),
             )

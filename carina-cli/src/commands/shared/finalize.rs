@@ -66,7 +66,7 @@ pub(crate) async fn release_lock_after_execute(
         "state lock release failed",
     )
     .await
-    .map_err(AppError::from)
+    .map_err(AppError::Backend)
 }
 
 /// Finish a lock-owning command, releasing only when ownership survived.

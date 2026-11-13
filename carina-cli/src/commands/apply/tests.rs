@@ -2465,10 +2465,6 @@ impl ProviderFactory for FailBCreateFactory {
         "Mock provider with B create failure"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -2499,7 +2495,7 @@ impl ProviderFactory for FailBCreateFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -3284,10 +3280,6 @@ impl ProviderFactory for ApplyTimeReadFactory {
         "Mock provider for apply-time data-source reads"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -3319,7 +3311,7 @@ impl ProviderFactory for ApplyTimeReadFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -3492,10 +3484,6 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
         "AWSCC apply cascade test provider"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -3527,7 +3515,7 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -8400,8 +8388,8 @@ async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
     );
     assert!(matches!(
         error.seed_error(),
-        Some(AppError::Backend(report))
-            if matches!(report.backend_error(), carina_state::BackendError::Configuration(message) if message == "seed write failed")
+        Some(AppError::Backend(carina_state::BackendError::Configuration(message)))
+            if message == "seed write failed"
     ));
     assert_eq!(error.to_string(), "Failed to create state bucket");
     let seed_error = std::error::Error::source(error)
@@ -8462,14 +8450,13 @@ fn saved_plan_backend_cross_check_preserves_typed_config_error() {
     assert!(
         matches!(
             &error,
-            AppError::Backend(report) if matches!(report.backend_error(),
-                carina_state::BackendError::InvalidConfig(carina_state::BackendConfigError::Invalid(errors))
-                if errors.errors().iter().any(|error| matches!(
-                    error,
-                    carina_state::BackendAttributeError::InvalidAttribute { attribute, .. }
-                        if attribute == "bucket"
-                ))
-            )
+            AppError::Backend(carina_state::BackendError::InvalidConfig(
+                carina_state::BackendConfigError::Invalid(errors)
+            )) if errors.errors().iter().any(|error| matches!(
+                error,
+                carina_state::BackendAttributeError::InvalidAttribute { attribute, .. }
+                    if attribute == "bucket"
+            ))
         ),
         "typed backend error was erased: {error:?}"
     );

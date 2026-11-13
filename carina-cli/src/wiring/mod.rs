@@ -4043,7 +4043,7 @@ fn detect_anonymous_to_named_moves_with_ctx(
         providers,
         &|provider_name| {
             provider_mod::find_factory(ctx.factories(), provider_name)
-                .map(ProviderFactory::provider_config_attribute_types)
+                .map(|factory| factory.schema_witness().config().clone())
         },
     )?;
     Ok(identifier::detect_anonymous_to_named_renames(

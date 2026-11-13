@@ -87,9 +87,7 @@ impl ProviderFactory for WireConfigFactory {
     fn display_name(&self) -> &str {
         "native wire fixture"
     }
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        carina_core::schema::ValidatedConfigSchema::validate(Default::default()).unwrap()
-    }
+
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -113,7 +111,7 @@ impl ProviderFactory for WireConfigFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            carina_core::schema::ValidatedConfigSchema::validate(Default::default()).unwrap(),
             Default::default(),
             Vec::new(),
         )
@@ -7676,7 +7674,9 @@ async fn review_r1_measure_undeclared_provider_keys() {
     for key in attrs.keys() {
         assert!(
             !factory
-                .provider_config_attribute_types()
+                .schema_witness()
+                .config()
+                .clone()
                 .parts()
                 .contains_key(key)
         );
@@ -7688,7 +7688,7 @@ async fn review_r1_measure_undeclared_provider_keys() {
         Default::default(),
         carina_provider_mock::MockScope::memory(),
     );
-    assert!(native.provider_config_attribute_types().parts().is_empty());
+    assert!(native.schema_witness().config().clone().parts().is_empty());
     let ready = ready_config(&native, &attrs);
     native.initialize_fixture(None, &ready).await.unwrap();
     let rejected = indexmap::IndexMap::from([(

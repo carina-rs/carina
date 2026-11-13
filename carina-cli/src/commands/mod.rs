@@ -252,7 +252,7 @@ pub fn ensure_backend_lock<P: PlaceholderKind, B: BindingAddress>(
     }
     BackendLock::for_config(backend_config)?
         .save(&resolved)
-        .map_err(AppError::from)
+        .map_err(AppError::Backend)
 }
 
 /// Collapse an accumulated error Vec into a single `AppError`.
@@ -500,7 +500,7 @@ pub(crate) fn validate_root_backend<E>(parsed: &carina_core::parser::File<E>) ->
         && let Some(backend) = &parsed.backend
         && let Err(error) = StateBackendConfig::try_from(backend)
     {
-        vec![AppError::from(carina_state::BackendError::from(error))]
+        vec![AppError::Backend(error.into())]
     } else {
         Vec::new()
     }
@@ -1613,14 +1613,13 @@ mod tests {
         assert!(errors.iter().any(|error| {
             matches!(
                 error,
-                AppError::Backend(report) if matches!(report.backend_error(),
-                    BackendError::InvalidConfig(carina_state::BackendConfigError::Invalid(errors))
-                    if errors.errors().iter().any(|error| matches!(
-                        error,
-                        carina_state::BackendAttributeError::InvalidAttribute { attribute, .. }
-                            if attribute == "region"
-                    ))
-                )
+                AppError::Backend(BackendError::InvalidConfig(
+                    carina_state::BackendConfigError::Invalid(errors)
+                )) if errors.errors().iter().any(|error| matches!(
+                    error,
+                    carina_state::BackendAttributeError::InvalidAttribute { attribute, .. }
+                        if attribute == "region"
+                ))
             )
         }));
     }
@@ -2039,10 +2038,6 @@ child { values = [source] }
             "AWSCC resource create-only enum test provider"
         }
 
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
-
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -2093,7 +2088,7 @@ child { values = [source] }
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                Default::default(),
                 Default::default(),
                 Vec::new(),
             )

@@ -12,9 +12,7 @@ impl ProviderFactory for NativeConfigErrorFactory {
     fn display_name(&self) -> &str {
         "native configuration error fixture"
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        ValidatedConfigSchema::default()
-    }
+
     fn validate_config(
         &self,
         _: &CanonicalProviderConfigAttributes,
@@ -28,7 +26,7 @@ impl ProviderFactory for NativeConfigErrorFactory {
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            ValidatedConfigSchema::default(),
             Default::default(),
             Vec::new(),
         )

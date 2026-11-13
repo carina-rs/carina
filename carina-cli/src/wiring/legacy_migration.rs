@@ -162,7 +162,7 @@ impl<E> ClassifiedLegacyGraph<E> {
             Self::Migrating(migration) => {
                 let validated = migration
                     .report_and_validate(|warning| report_legacy_warning(color_mode, warning))
-                    .map_err(|error| AppError::from(carina_state::BackendError::from(error)))?;
+                    .map_err(|error| AppError::Backend(error.into()))?;
                 Ok(ValidatedLegacyGraph {
                     graph: validated.graph,
                     classification: Some(validated.classification),
@@ -201,7 +201,7 @@ pub(crate) fn classify_legacy_state<E>(
         let outcome = state
             .clone()
             .classify_legacy_graph(graph, moves, offline_unmaterialized)
-            .map_err(|error| AppError::from(carina_state::BackendError::from(error)))?;
+            .map_err(|error| AppError::Backend(error.into()))?;
         match outcome {
             LegacyClassificationOutcome::Classified(migration) => {
                 Ok(LegacyClassificationOutcome::Classified(
@@ -228,7 +228,7 @@ pub(crate) fn replay_legacy_migration(
         .replay_legacy_graph(classification)
         .report_and_validate(|warning| report_legacy_warning(color_mode, warning))
         .map(|validated| validated.state)
-        .map_err(|error| AppError::from(carina_state::BackendError::from(error)))
+        .map_err(|error| AppError::Backend(error.into()))
 }
 
 fn report_legacy_warning(
