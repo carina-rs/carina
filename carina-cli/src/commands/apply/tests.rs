@@ -12722,5 +12722,21 @@ fn saved_plan_walk_failure_retains_its_source_instead_of_reporting_unavailable()
         std::error::Error::source(&error)
             .is_some_and(|source| source.is::<carina_core::value_walk::WalkError>())
     );
-    assert!(!error.to_string().contains("could not be evaluated"));
+    let expected = "Value traversal failed while verifying mock.test.resource.example.token\nvalue traversal rejected by its algebra";
+    assert_eq!(
+        crate::error::format_error_with_source_chain(&error),
+        expected
+    );
+    let prepared = saved_plan_secret_preparation_error(
+        error,
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("plan.json"),
+            source_dir: Path::new("."),
+        },
+    );
+    assert!(matches!(&prepared, AppError::ValueWalk { .. }));
+    assert_eq!(
+        crate::error::format_error_with_source_chain(&prepared),
+        expected
+    );
 }

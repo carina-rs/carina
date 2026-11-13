@@ -49,8 +49,7 @@ use crate::wiring::{
     validate_module_attribute_refs_after_expansion_failure, validate_module_internal_ref_types,
     validate_no_backend_in_modules, validate_no_exports_in_modules,
     validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
-    validate_no_upstream_states_in_modules, validate_provider_region_with_ctx,
-    validate_wait_bindings_with_ctx,
+    validate_no_upstream_states_in_modules, validate_wait_bindings_with_ctx,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -700,8 +699,7 @@ fn validate_and_resolve_configuration(
         errors.push(AppError::Validation(msg));
     }
 
-    // Validate provider region
-    errors.extend(validate_provider_region_with_ctx(ctx, parsed.parsed()));
+    errors.extend(access.check_provider_configuration(ctx, parsed.parsed()));
 
     errors.extend(validate_root_backend(parsed.parsed()));
 
