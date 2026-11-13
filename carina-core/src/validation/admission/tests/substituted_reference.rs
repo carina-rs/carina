@@ -697,8 +697,7 @@ fn substituted_reference_known_and_unknown_sources_use_the_same_rule() {
                     }
                 };
                 let unknown = run("");
-                let accepted =
-                    sink == "ReferenceSink" || matches!(source, "Reference" | "Identity");
+                let accepted = sink == "ReferenceSink" || source == "Identity";
                 assert_eq!(
                     unknown.is_empty(),
                     accepted,
@@ -726,14 +725,16 @@ fn substituted_reference_matches_the_unknown_computed_source_control() {
 }
 
 #[test]
-fn substituted_reference_known_and_unknown_reference_sources_stay_accepted() {
+fn substituted_reference_known_and_unknown_reference_sources_reject_a_different_string_identity() {
     for value in ["", "name = 'abc'"] {
-        assert!(
+        assert_eq!(
             check(
                 &format!("let a = mock.Reference {{ {value} }}\n"),
                 "let sink = mock.Sink { value = a.name }\n",
-            )
-            .is_empty()
+            ),
+            [
+                "mock.Sink.sink: cannot assign mock.OtherReference to 'value': expected mock.RecoveryProbe, got mock.OtherReference (from a.name)"
+            ]
         );
     }
 }
