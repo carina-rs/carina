@@ -16274,3 +16274,41 @@ async fn provider_config_directory_builtin_rejects_undeclared_values() {
         assert!(error.to_string().contains("Unknown attribute 'opaque'"));
     }
 }
+
+fn builtin_normalization_fixture() -> (WiringContext, ResolvedProviderConfigs) {
+    let configs = carina_core::test_utils::configuration::provider_directory(
+        "provider mock { validate_config_trap = true }",
+        "let sibling = 'value'",
+    );
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let ctx = WiringContext::new_for_test_with_provider_phase(
+        &runtime,
+        vec![],
+        configs.as_provider_configs(),
+    );
+    (ctx, configs)
+}
+
+#[test]
+fn state_normalization_does_not_construct_the_builtin_provider() {
+    let (ctx, configs) = builtin_normalization_fixture();
+    normalize_state_with_ctx(
+        &ctx,
+        &configs,
+        &mut HashMap::new(),
+        &provider_mod::ProviderPlan::state_only(),
+    )
+    .expect("native state normalization has no provider factory call");
+}
+
+#[tokio::test]
+async fn builtin_normalization_uses_only_its_dedicated_factory() {
+    let (ctx, configs) = builtin_normalization_fixture();
+    create_normalizers_from_configs_with_ctx(
+        &ctx,
+        &configs,
+        &provider_mod::ProviderPlan::state_only(),
+    )
+    .await
+    .expect("native normalization admits the dedicated factory's empty configuration");
+}

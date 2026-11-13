@@ -1,4 +1,6 @@
 //! Integration tests for the general mock and the isolated wasi:http probe guests.
+#[path = "support/configuration_schema.rs"]
+mod configuration_schema_fixture;
 #[path = "wasm_integration/provider_diagnostics.rs"]
 mod provider_diagnostics;
 
@@ -127,6 +129,40 @@ impl ProviderFactory for MalformedConfigFactory {
             Vec::new(),
         )
         .unwrap()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn configuration_duration_overflow_fails_before_native_and_wasm_hooks() {
+    let wasm = wasm_path().expect("mock WASM fixture must be built");
+    let (factory, _cache) = load_factory(&wasm).await;
+    let attributes = indexmap::IndexMap::from([(
+        "duration".into(),
+        Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+            u64::MAX,
+        ))),
+    )]);
+    let config = resolved_provider_config("mock", attributes);
+    for factory in [&factory as &dyn ProviderFactory, &MalformedConfigFactory] {
+        let declared = configuration_schema_fixture::DurationConfiguration(factory);
+        let error =
+            carina_core::executor::prepare_provider_ready_config(&declared, &config).unwrap_err();
+        let carina_core::executor::ProviderConfigPreparationError::Wire(wire) = &error else {
+            panic!("expected shared configuration wire overflow: {error:?}");
+        };
+        assert!(matches!(
+            wire.conversion_error(),
+            carina_core::protocol_convert::ProtocolConvertError::DurationOutOfRange
+        ));
+        assert_eq!(
+            wire.target(),
+            &carina_core::provider::ProviderWireTarget::Configuration {
+                provider: "mock".into()
+            }
+        );
+        assert_eq!(wire.attribute(), "duration");
+        assert!(!error.to_string().contains(&u64::MAX.to_string()));
+        assert!(std::error::Error::source(&error).is_none());
     }
 }
 
@@ -7659,11 +7695,7 @@ async fn undeclared_provider_config_keys_reject_before_native_and_wasm_factories
         Default::default(),
         carina_provider_mock::MockScope::memory(),
     );
-    let attrs = indexmap::IndexMap::from([
-        (
-            "undeclared_probe".into(),
-            Value::Concrete(ConcreteValue::String("not printed".into())),
-        ),
+    let wasm_attributes = indexmap::IndexMap::from([
         (
             "__mock_reference_scope_region__".into(),
             Value::Concrete(ConcreteValue::String("region".into())),
@@ -7675,16 +7707,32 @@ async fn undeclared_provider_config_keys_reject_before_native_and_wasm_factories
             )),
         ),
     ]);
-    for factory in [
-        &factory as &dyn ProviderFactory,
-        &native as &dyn ProviderFactory,
+    let native_attributes = indexmap::IndexMap::from([(
+        "configuration_label".into(),
+        Value::Concrete(ConcreteValue::String("label".into())),
+    )]);
+    for (factory, mut attrs, declared_key) in [
+        (
+            &factory as &dyn ProviderFactory,
+            wasm_attributes,
+            "__mock_reference_scope_region__",
+        ),
+        (
+            &native as &dyn ProviderFactory,
+            native_attributes,
+            "configuration_label",
+        ),
     ] {
+        attrs.insert(
+            "undeclared_probe".into(),
+            Value::Concrete(ConcreteValue::String("not printed".into())),
+        );
         assert!(
             factory
                 .schema_witness()
                 .config()
                 .parts()
-                .contains_key("__mock_reference_scope_region__")
+                .contains_key(declared_key)
         );
         assert!(
             !factory
@@ -7693,7 +7741,7 @@ async fn undeclared_provider_config_keys_reject_before_native_and_wasm_factories
                 .parts()
                 .contains_key("undeclared_probe")
         );
-        let config = resolved_provider_config("mock", attrs.clone());
+        let config = resolved_provider_config("mock", attrs);
         let error = carina_core::executor::prepare_provider_ready_config(factory, &config)
             .expect_err("an undeclared field cannot produce factory construction authority");
         assert!(matches!(error, carina_core::executor::provider_ready::ProviderConfigPreparationError::UnknownAttributes(_)));

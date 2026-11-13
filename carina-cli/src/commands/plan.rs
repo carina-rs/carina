@@ -9608,7 +9608,7 @@ mod run_plan_out_tests {
         fs::write(
             dir.join("main.crn"),
             r#"
-                provider mock { reference_table = bucket.name }
+                provider mock { configuration_label = bucket.name }
                 let bucket = mock.test.resource { name_prefix = "pref-" }
             "#,
         )
@@ -9660,7 +9660,7 @@ mod run_plan_out_tests {
         assert_eq!(
             saved.provider_configs.as_provider_configs()[0]
                 .attributes
-                .get("reference_table"),
+                .get("configuration_label"),
             Some(&Value::Concrete(ConcreteValue::String(
                 "pref-existing".into()
             )))

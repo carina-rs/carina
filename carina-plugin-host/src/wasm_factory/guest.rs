@@ -4,6 +4,9 @@ use super::diagnostics::{
 };
 use super::*;
 use carina_core::schema::ValidatedConfigSchema;
+#[cfg(test)]
+#[path = "../../tests/support/configuration_schema.rs"]
+mod configuration_schema_fixture;
 mod desired_normalization;
 mod diagnostic_imports;
 pub(super) mod guest_stderr;
@@ -9490,6 +9493,43 @@ pub(super) mod tests {
             !rendered.to_lowercase().contains("credential"),
             "{rendered}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn configuration_wire_overflow_prevents_wasm_instance_creation() {
+        let mut factory = rebuildable_state_test_factory()
+            .await
+            .expect("mock WASM fixture is required");
+        factory.schema_witness = Arc::new(
+            configuration_schema_fixture::DurationConfiguration(&factory).schema_witness(),
+        );
+        let error = prepare_test_config(
+            &factory,
+            IndexMap::from([(
+                "duration".into(),
+                Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+                    u64::MAX,
+                ))),
+            )]),
+        )
+        .unwrap_err();
+        let carina_core::executor::ProviderConfigPreparationError::Wire(wire) = &error else {
+            panic!("expected configuration wire overflow: {error:?}");
+        };
+        assert!(matches!(
+            wire.conversion_error(),
+            carina_core::protocol_convert::ProtocolConvertError::DurationOutOfRange
+        ));
+        assert_eq!(
+            wire.target(),
+            &carina_core::provider::ProviderWireTarget::Configuration {
+                provider: "mock".into()
+            }
+        );
+        assert_eq!(wire.attribute(), "duration");
+        assert!(!error.to_string().contains(&u64::MAX.to_string()));
+        assert!(std::error::Error::source(&error).is_none());
+        assert!(factory.shared_instances.lock().await.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

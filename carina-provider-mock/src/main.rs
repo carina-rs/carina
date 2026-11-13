@@ -952,7 +952,35 @@ impl CarinaProvider for MockProcessProvider {
     }
 
     fn provider_config_attribute_types(&self) -> CoreValidatedConfigSchema {
-        let mut attributes = carina_provider_mock::control_config_attributes();
+        let mut attributes = std::collections::BTreeMap::from([
+            (
+                "__mock_reference_scope_region__".into(),
+                CoreAttributeType::string(),
+            ),
+            (
+                "__mock_validate_config_cause__".into(),
+                CoreAttributeType::string(),
+            ),
+            (
+                "__mock_validate_config_captured_cause__".into(),
+                CoreAttributeType::string(),
+            ),
+            (
+                "__mock_initialize_cause__".into(),
+                CoreAttributeType::string(),
+            ),
+            (
+                "__mock_validate_config_trap__".into(),
+                CoreAttributeType::bool(),
+            ),
+            ("validate_config_trap".into(), CoreAttributeType::bool()),
+            (
+                "__mock_initialize_error__".into(),
+                CoreAttributeType::bool(),
+            ),
+            ("validate_delay_millis".into(), CoreAttributeType::int()),
+            ("reference_table".into(), CoreAttributeType::string()),
+        ]);
         attributes.extend(BTreeMap::from([(
             "unique_values".to_string(),
             CoreAttributeType::refined_list(
@@ -2167,3 +2195,43 @@ fn main() {}
 
 // Share the original panic site so public diagnostic coordinates stay stable.
 const CONFIG_TRAP: &str = "validate_config_trap";
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::*;
+    use carina_core::resource::{ConcreteValue, Value as CoreValue};
+
+    #[test]
+    fn wasm_configuration_controls_have_the_types_the_guest_reads() {
+        let schema = MockProcessProvider::default().provider_config_attribute_types();
+        for (key, value) in [
+            (
+                "__mock_reference_scope_region__",
+                ConcreteValue::String("region".into()),
+            ),
+            (
+                "__mock_validate_config_cause__",
+                ConcreteValue::String("cause".into()),
+            ),
+            (
+                "__mock_validate_config_captured_cause__",
+                ConcreteValue::String("cause".into()),
+            ),
+            (
+                "__mock_initialize_cause__",
+                ConcreteValue::String("cause".into()),
+            ),
+            ("__mock_validate_config_trap__", ConcreteValue::Bool(true)),
+            ("validate_config_trap", ConcreteValue::Bool(true)),
+            ("__mock_initialize_error__", ConcreteValue::Bool(true)),
+            ("validate_delay_millis", ConcreteValue::Int(1)),
+            ("reference_table", ConcreteValue::String("table".into())),
+        ] {
+            let ty = schema.rootless_type(key).unwrap();
+            let value: CoreValue = CoreValue::Concrete(value);
+            ty.validate(&value).unwrap();
+            let wrong: CoreValue = CoreValue::Concrete(ConcreteValue::Map(Default::default()));
+            assert!(ty.validate(&wrong).is_err(), "{key}");
+        }
+    }
+}

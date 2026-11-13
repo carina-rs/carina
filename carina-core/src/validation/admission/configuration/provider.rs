@@ -305,7 +305,7 @@ impl std::fmt::Display for UnknownProviderConfigAttributes {
     }
 }
 
-fn unknown_attributes<'a>(
+fn unknown_attribute_report<'a>(
     provider: &str,
     keys: impl IntoIterator<Item = &'a crate::parser::AttributeKey>,
     schema: &ValidatedConfigSchema,
@@ -313,7 +313,6 @@ fn unknown_attributes<'a>(
     let known: Vec<_> = schema.parts().keys().map(String::as_str).collect();
     let mut errors: Vec<_> = keys
         .into_iter()
-        .filter(|key| key.lookup(schema.parts()).is_none())
         .map(|key| {
             (
                 key.clone(),
@@ -330,6 +329,41 @@ fn unknown_attributes<'a>(
     })
 }
 
+struct ResolvedProviderField<'a, P: crate::resource::ValueKind, B: BindingAddress> {
+    key: crate::parser::AttributeKey,
+    value: Value<P, B>,
+    declared: DeclaredConfigurationField<'a, kind::ProviderConfigAttribute>,
+}
+
+fn resolve_fields<'a, P: crate::resource::ValueKind, B: BindingAddress>(
+    provider: &str,
+    declaration: &'a ConfigurationDeclaration,
+    instance: &ProviderInstanceKey,
+    revision: CatalogRevision,
+    attributes: &ConfigurationAttributes<Value<P, B>>,
+) -> Result<Vec<ResolvedProviderField<'a, P, B>>, ProviderConfigPreparationError> {
+    let mut fields = Vec::with_capacity(attributes.len());
+    let mut unknown = Vec::new();
+    for (key, value) in attributes {
+        match declaration.field(
+            key,
+            InstanceIdentity::Provider(instance.clone()),
+            revision.clone(),
+        ) {
+            Some(declared) => fields.push(ResolvedProviderField {
+                key: key.clone(),
+                value: value.clone(),
+                declared,
+            }),
+            None => unknown.push(key),
+        }
+    }
+    if let Some(error) = unknown_attribute_report(provider, unknown, &declaration.schema) {
+        return Err(error);
+    }
+    Ok(fields)
+}
+
 /// Check persisted declarations before secret rehydration. This grants no
 /// construction authority; complete values still enter `construction()`.
 pub fn validate_keys<P: crate::resource::ValueKind, B: BindingAddress>(
@@ -342,11 +376,19 @@ pub fn validate_keys<P: crate::resource::ValueKind, B: BindingAddress>(
             let factory = factories
                 .iter()
                 .find(|factory| factory.name() == config.name)?;
-            unknown_attributes(
+            let declaration = ConfigurationDeclaration::provider(
+                factory.name(),
+                factory.schema_witness().config().clone(),
+            );
+            let catalog = ProviderContext::new(crate::EnvironmentSnapshot::new([]));
+            resolve_fields(
                 &config.name,
-                config.attributes.keys(),
-                factory.schema_witness().config(),
+                &declaration,
+                &ProviderInstanceKey::new(&config.name, config.binding.clone()),
+                CatalogRevision(CatalogSnapshot::Provider(catalog.custom_types.clone())),
+                &config.attributes,
             )
+            .err()
         })
         .collect();
     ProviderConfigPreparationError::collect(errors)
@@ -376,50 +418,47 @@ fn prepare_fields<M: PreparationPhase, P: PlaceholderKind, B: BindingAddress>(
     attributes: &ConfigurationAttributes<Value<P, B>>,
     schema: &ValidatedConfigSchema,
 ) -> Result<M::Output, ProviderConfigPreparationError> {
-    if let Some(error) = unknown_attributes(provider_name, attributes.keys(), schema) {
-        return Err(error);
-    }
     let declaration = ConfigurationDeclaration::provider(factory.name(), schema.clone());
-    let canonical = crate::value::canonicalize_provider_config_attributes_with_types(
-        provider_name,
-        attributes,
-        schema.parts(),
-    )
-    .map_err(|error| {
-        let (provider, attribute, error) = error.into_parts();
-        ProviderConfigPreparationError::InvalidAttribute {
-            provider,
-            attribute,
-            error: vec![error].into(),
-        }
-    })?;
-    let inputs = ProviderValidationInputs::collect(provider_name, canonical.values());
-    let lookup = crate::parser::custom_type_lookup_for_factory(factory, &inputs);
     let catalog = ProviderContext::new(crate::EnvironmentSnapshot::new([]));
     let instance = ProviderInstanceKey::new(provider_name, binding.map(str::to_owned));
+    let mut fields = resolve_fields(
+        provider_name,
+        &declaration,
+        &instance,
+        CatalogRevision(CatalogSnapshot::Provider(catalog.custom_types.clone())),
+        attributes,
+    )?;
+    for field in &mut fields {
+        field.value = crate::value::canonicalize_provider_config_with_type_and_ancestry(
+            provider_name,
+            field.value.clone(),
+            field.declared.attr_type,
+            crate::schema::empty_defs_for_schema_walks(),
+            FieldAncestry::WRITABLE,
+        )
+        .map_err(|error| ProviderConfigPreparationError::InvalidAttribute {
+            provider: provider_name.to_owned(),
+            attribute: field.key.clone(),
+            error: vec![error].into(),
+        })?;
+    }
+    let inputs =
+        ProviderValidationInputs::collect(provider_name, fields.iter().map(|field| &field.value));
+    let lookup = crate::parser::custom_type_lookup_for_factory(factory, &inputs);
     let checked = crate::validation::deferred_types::TypeCheckSession::run(&catalog, |session| {
         let mut aggregate = ConfigurationBuilder::new(Arc::clone(&declaration), instance.clone());
-        for (key, value) in &canonical {
-            let destination = declaration
-                .destination::<kind::ProviderConfigAttribute>(
-                    key,
-                    InstanceIdentity::Provider(instance.clone()),
-                    CatalogRevision(CatalogSnapshot::Provider(
-                        session.catalog().custom_types.clone(),
-                    )),
-                )
-                .ok_or_else(|| {
-                    unknown_attributes(provider_name, std::iter::once(key), schema)
-                        .expect("a missing destination has an undeclared key")
-                })?;
+        for entry in &fields {
+            let key = &entry.key;
+            let value = &entry.value;
+            let destination = &entry.declared.destination;
             if let Some(known) = value
                 .to_expanded()
                 .and_then(Value::try_into_address_free_absolute)
             {
-                M::declared(&destination, key, &known, session, &lookup, &mut aggregate)
+                M::declared(destination, key, &known, session, &lookup, &mut aggregate)
                     .map_err(|error| attribute_error(provider_name, key, error))?;
             } else {
-                field(&destination, value, session, &lookup)
+                field(destination, value, session, &lookup)
                     .map_err(|error| attribute_error(provider_name, key, error))?;
                 M::unresolved(value).map_err(|error| attribute_error(provider_name, key, error))?;
             }

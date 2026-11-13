@@ -2860,7 +2860,7 @@ async fn apply_verifies_backend_before_loading_bootstrap_provider_upstreams() {
     std::fs::write(
         downstream.join("main.crn"),
         r#"
-            provider mock { reference_table = mgmt.target }
+            provider mock { configuration_label = mgmt.target }
             let mgmt = upstream_state { source = "../upstream" }
         "#,
     )
@@ -5137,7 +5137,7 @@ async fn saved_plan_provider_validation_preserves_typed_source_and_replan_hint()
         provider_configs: deserialize_saved_provider_configs(vec![ProviderConfig {
             name: "mock".to_string(),
             attributes: (IndexMap::<String, _>::from([(
-                "reference_table".to_string(),
+                "configuration_label".to_string(),
                 root_resource_ref("mgmt", "region"),
             )]))
             .into(),

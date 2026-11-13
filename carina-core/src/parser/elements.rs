@@ -916,8 +916,14 @@ impl std::hash::Hash for ReferenceProvenance {
 pub(crate) struct ProviderDeclaration {
     pub(crate) name: String,
     pub(crate) binding: Option<String>,
-    pub(crate) attributes: Vec<Located<super::AttributeKey>>,
-    pub(crate) keys: Vec<Located<super::AttributeKey>>,
+    pub(crate) attributes: Vec<ProviderAttributeLocations>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderAttributeLocations {
+    pub(crate) key: super::AttributeKey,
+    pub(crate) key_location: DeclarationLocation,
+    pub(crate) value_location: DeclarationLocation,
 }
 
 fn provider_declaration(
@@ -929,20 +935,16 @@ fn provider_declaration(
     let mut parts = pair.into_inner();
     let name = parts.next().expect("provider name");
     let mut attributes = Vec::new();
-    let mut keys = Vec::new();
     for attribute in parts.filter(|pair| pair.as_rule() == Rule::attribute) {
         let mut parts = attribute.into_inner();
         let key_pair = parts.next().expect("provider attribute key");
         let key = super::AttributeKey::authored_in_file(key_pair.clone(), file);
-        keys.push(Located::new(
-            DeclarationLocation::from_pair(&key_pair, file, source),
-            key.clone(),
-        ));
         let value = parts.next().expect("provider attribute value");
-        attributes.push(Located::new(
-            DeclarationLocation::from_pair(&value, file, source),
+        attributes.push(ProviderAttributeLocations {
             key,
-        ));
+            key_location: DeclarationLocation::from_pair(&key_pair, file, source),
+            value_location: DeclarationLocation::from_pair(&value, file, source),
+        });
     }
     Located::new(
         DeclarationLocation::from_pair(&name, file, source),
@@ -950,7 +952,6 @@ fn provider_declaration(
             name: name.as_str().to_string(),
             binding,
             attributes,
-            keys,
         },
     )
 }

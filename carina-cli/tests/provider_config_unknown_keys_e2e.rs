@@ -35,5 +35,39 @@ fn provider_config_unknown_keys_are_errors_in_directory_validate_text_and_json()
     for message in messages {
         assert!(stderr.contains(message), "{stderr}");
     }
-    assert!(stderr.contains("did you mean 'validate_delay_millis'?"));
+}
+
+#[test]
+fn builtin_mock_rejects_wasm_only_configuration_controls() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/builtin_mock_unknown_controls");
+    std::fs::copy(fixture.join("main.crn"), directory.path().join("main.crn")).unwrap();
+    for (key, value) in [("validate_config_trap", "true"), ("reference_table", "'x'")] {
+        std::fs::write(
+            directory.path().join("providers.crn"),
+            format!("provider mock {{ {key} = {value} }}\n"),
+        )
+        .unwrap();
+        for json in [false, true] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_carina"));
+            command.arg("validate").arg(directory.path());
+            if json {
+                command.arg("--json");
+            }
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(1), "{key}: {output:?}");
+            let expected = format!("provider mock: {key}: Unknown attribute '{key}'");
+            if json {
+                let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(report["errors"][0]["message"], expected);
+                assert_eq!(report["errors"].as_array().unwrap().len(), 1);
+            } else {
+                assert_eq!(
+                    String::from_utf8(output.stderr).unwrap(),
+                    format!("Error: {expected}\n")
+                );
+            }
+        }
+    }
 }

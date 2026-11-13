@@ -1,7 +1,7 @@
 {
   "errors": [
     "provider mock: regoin: Unknown attribute 'regoin'",
-    "provider mock: validate_delay_milis: Unknown attribute 'validate_delay_milis', did you mean 'validate_delay_millis'?",
+    "provider mock: validate_delay_milis: Unknown attribute 'validate_delay_milis'",
     "provider mock: another_typo: Unknown attribute 'another_typo'"
   ],
   "keys": [

@@ -4936,7 +4936,7 @@ pub fn normalize_state_with_ctx(
         .build()
         .expect("failed to build tokio runtime for normalize_state");
     let mut router = ProviderRouter::new();
-    for factory in ctx.configuration_factories() {
+    for factory in ctx.factories() {
         let implicit = provider_configs.provider_or_implicit(factory.name());
         let mut configs = provider_configs
             .iter()
@@ -4947,7 +4947,9 @@ pub fn normalize_state_with_ctx(
         }
         for resolved_config in configs {
             let construction = rt
-                .block_on(async { prepare_provider_construction(factory, resolved_config, plan) })
+                .block_on(async {
+                    prepare_provider_construction(factory.as_ref(), resolved_config, plan)
+                })
                 .map_err(HostError::from)?;
             router.add_initialized_normalizer(rt.block_on(
                 provider_mod::ProviderBoundary::initialize_normalizer(&construction),
@@ -5552,7 +5554,7 @@ pub(crate) async fn create_normalizers_from_configs_with_ctx(
     let mut router = NormalizerRouter::new();
 
     for config in configs.iter() {
-        if let Some(factory) = ctx.configuration_factory(config.name()) {
+        if let Some(factory) = provider_mod::find_factory(ctx.factories(), config.name()) {
             let construction = prepare_provider_construction(factory, config, plan)?;
             router.add_initialized_normalizer(
                 provider_mod::ProviderBoundary::initialize_normalizer(&construction).await?,

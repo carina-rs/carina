@@ -696,39 +696,15 @@ pub fn generated_attribute(
     }
 }
 
-/// Control settings shared by native and component mock declarations.
-pub fn control_config_attributes() -> std::collections::BTreeMap<String, AttributeType> {
-    std::collections::BTreeMap::from([
-        (
-            "__mock_reference_scope_region__".into(),
-            AttributeType::string(),
-        ),
-        (
-            "__mock_validate_config_cause__".into(),
-            AttributeType::string(),
-        ),
-        (
-            "__mock_validate_config_captured_cause__".into(),
-            AttributeType::string(),
-        ),
-        ("__mock_initialize_cause__".into(), AttributeType::string()),
-        (
-            "__mock_validate_config_trap__".into(),
-            AttributeType::bool(),
-        ),
-        ("validate_config_trap".into(), AttributeType::bool()),
-        ("__mock_initialize_error__".into(), AttributeType::bool()),
-        ("validate_delay_millis".into(), AttributeType::int()),
-        ("reference_table".into(), AttributeType::string()),
-    ])
-}
-
 /// Aggregate schema witness exposed by Carina's built-in mock provider.
 pub fn builtin_schema_witness() -> ValidatedProviderSchemaWitness {
     ValidatedProviderSchemaWitness::new(
         builtin_schemas(),
-        ValidatedConfigSchema::validate(control_config_attributes())
-            .expect("mock control configuration must be valid"),
+        ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
+            "configuration_label".into(),
+            AttributeType::string(),
+        )]))
+        .expect("native mock label declaration must be valid"),
         Default::default(),
         Vec::new(),
     )
@@ -741,12 +717,20 @@ pub struct MockProvider {
     telemetry: Arc<scope::UpdateTelemetry>,
 }
 
+/// One initialization's admitted label and destination instance.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MockConfigurationLabel {
+    pub instance: carina_core::provider::ProviderInstanceKey,
+    pub label: Value,
+}
+
 /// One invocation owns the storage scope and update telemetry shared by all aliases.
 #[derive(Clone)]
 pub struct ConfiguredBuiltinMock {
     behavior: MockBehavior,
     scope: MockScope,
     telemetry: Arc<scope::UpdateTelemetry>,
+    configuration_labels: Arc<std::sync::Mutex<Vec<MockConfigurationLabel>>>,
 }
 
 impl ConfiguredBuiltinMock {
@@ -756,8 +740,14 @@ impl ConfiguredBuiltinMock {
             behavior,
             scope,
             telemetry,
+            configuration_labels: Arc::default(),
         }
     }
+    /// Labels actually consumed by provider initializations, in arrival order.
+    pub fn configuration_labels(&self) -> Vec<MockConfigurationLabel> {
+        self.configuration_labels.lock().unwrap().clone()
+    }
+
     pub fn create_provider(&self) -> MockProvider {
         MockProvider {
             behavior: self.behavior.clone(),
@@ -794,9 +784,22 @@ impl carina_core::provider::ProviderFactory for ConfiguredBuiltinMock {
     }
     fn create_provider(
         &self,
-        _: &carina_core::provider::ProviderSession,
+        session: &carina_core::provider::ProviderSession,
         _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
+        if let Some(label) = session
+            .configuration()
+            .attributes()
+            .get("configuration_label")
+        {
+            self.configuration_labels
+                .lock()
+                .unwrap()
+                .push(MockConfigurationLabel {
+                    instance: session.configuration().instance().clone(),
+                    label: label.clone(),
+                });
+        }
         let provider = self.create_provider();
         Box::pin(async move {
             Ok(carina_core::provider::InitializeOutcome::unavailable()
@@ -831,7 +834,13 @@ impl carina_core::provider::ProviderFactory for MockNormalizer {
         builtin_schemas()
     }
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
-        builtin_schema_witness()
+        ValidatedProviderSchemaWitness::new(
+            builtin_schemas(),
+            ValidatedConfigSchema::default(),
+            Default::default(),
+            Vec::new(),
+        )
+        .expect("the normalizer has no configuration fields")
     }
     fn create_provider(
         &self,
@@ -2116,41 +2125,60 @@ mod tests {
     use carina_core::resource::NoPlaceholder;
     use std::time::Duration;
 
-    #[test]
-    fn mock_configuration_control_types_are_declared() {
-        let witness = builtin_schema_witness();
-        for (key, value) in [
-            (
-                "__mock_reference_scope_region__",
-                ConcreteValue::String("region".into()),
-            ),
-            (
-                "__mock_validate_config_cause__",
-                ConcreteValue::String("cause".into()),
-            ),
-            (
-                "__mock_validate_config_captured_cause__",
-                ConcreteValue::String("cause".into()),
-            ),
-            (
-                "__mock_initialize_cause__",
-                ConcreteValue::String("cause".into()),
-            ),
-            ("__mock_validate_config_trap__", ConcreteValue::Bool(true)),
-            ("validate_config_trap", ConcreteValue::Bool(true)),
-            ("__mock_initialize_error__", ConcreteValue::Bool(true)),
-            ("validate_delay_millis", ConcreteValue::Int(1)),
-            ("reference_table", ConcreteValue::String("table".into())),
-        ] {
-            let ty = witness.config().rootless_type(key).expect(key);
-            let value: Value = Value::Concrete(value);
-            ty.validate(&value).unwrap();
-            let wrong: Value = Value::Concrete(ConcreteValue::Map(Default::default()));
-            assert!(
-                ty.validate(&wrong).is_err(),
-                "{key} must have its actual scalar type"
-            );
+    #[tokio::test]
+    async fn native_configuration_labels_are_recorded_per_instance() {
+        use carina_core::provider::{ProviderBoundary, ProviderInstanceKey, ProviderPlan};
+        let factory = ConfiguredBuiltinMock::new(Default::default(), MockScope::memory());
+        let configs = carina_core::test_utils::configuration::provider_directory(
+            "let east = provider mock { configuration_label = 'east-label' }\nlet west = provider mock { configuration_label = 'west-label' }",
+            "let sibling = 'value'",
+        );
+        assert!(factory.configuration_labels().is_empty());
+        for config in configs.iter() {
+            let construction =
+                carina_core::validation::admission::configuration::provider::construction(
+                    &factory,
+                    config,
+                    &ProviderPlan::state_only(),
+                )
+                .expect("the native factory declares the label it records");
+            ProviderBoundary::initialize(&construction).await.unwrap();
         }
+        assert_eq!(
+            factory.configuration_labels(),
+            vec![
+                MockConfigurationLabel {
+                    instance: ProviderInstanceKey::new("mock", Some("east".into())),
+                    label: Value::Concrete(ConcreteValue::String("east-label".into()))
+                },
+                MockConfigurationLabel {
+                    instance: ProviderInstanceKey::new("mock", Some("west".into())),
+                    label: Value::Concrete(ConcreteValue::String("west-label".into()))
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn native_configuration_schema_declares_only_the_recorded_label() {
+        let witness = builtin_schema_witness();
+        assert_eq!(
+            witness
+                .config()
+                .parts()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["configuration_label"]
+        );
+        let ty = witness
+            .config()
+            .rootless_type("configuration_label")
+            .unwrap();
+        let value: Value = Value::Concrete(ConcreteValue::String("label".into()));
+        ty.validate(&value).unwrap();
+        let wrong: Value = Value::Concrete(ConcreteValue::Bool(true));
+        assert!(ty.validate(&wrong).is_err());
     }
 
     #[test]
@@ -2224,6 +2252,7 @@ mod tests {
     fn mock_boundary(provider: &MockProvider) -> carina_core::provider::ProviderBoundary<'static> {
         crate::provider_text_fixtures::boundary(Box::new(
             ConfiguredBuiltinMock {
+                configuration_labels: Arc::default(),
                 behavior: provider.behavior.clone(),
                 scope: provider.scope.clone(),
                 telemetry: provider.telemetry.clone(),
@@ -2263,6 +2292,7 @@ mod tests {
                     carina_core::executor::prepare_create_request(resource, &preparation).await;
                 let request = request.expect("mock test resource should pass create preparation");
                 let factory = ConfiguredBuiltinMock {
+                    configuration_labels: Arc::default(),
                     behavior: provider.behavior.clone(),
                     scope: provider.scope.clone(),
                     telemetry: provider.telemetry.clone(),
