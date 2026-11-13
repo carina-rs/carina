@@ -1065,9 +1065,15 @@ pub(crate) fn canonical_secret_hash_material<P: PlaceholderKind>(
             Err(error) => return Err(error),
         },
     };
-    serde_json::to_vec(&canonical).map_err(|_| SerializationError::SecretNotAllowed {
-        context: SerializationContext::SecretRedaction,
-    })
+    let material =
+        serde_json::to_vec(&canonical).map_err(|_| SerializationError::SecretNotAllowed {
+            context: SerializationContext::SecretRedaction,
+        });
+    #[cfg(feature = "test-utils")]
+    if let Ok(bytes) = &material {
+        crate::identity_recording::secret_material(bytes);
+    }
+    material
 }
 
 fn canonical_enum_to_json(c: &CanonicalEnumValue, tag: &str) -> serde_json::Value {

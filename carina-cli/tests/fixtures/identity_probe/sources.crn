@@ -1,0 +1,3 @@
+let a = probe.Source { name = "known-a" }
+let b = probe.Source { name = a.name }
+let unknown_b = probe.Source {}

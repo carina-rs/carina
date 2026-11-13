@@ -262,6 +262,11 @@ impl LoopSource {
     }
 }
 
+#[cfg(not(feature = "test-utils"))]
+type LoopIdentityHasher = Sha256;
+#[cfg(feature = "test-utils")]
+type LoopIdentityHasher = crate::identity_recording::RecordingSha256;
+
 fn loop_system_identity(
     file_or_parent_identity: &str,
     start: usize,
@@ -269,12 +274,17 @@ fn loop_system_identity(
     kind: LoopKind,
     module_scope: Option<&str>,
 ) -> ResourceIdentity {
-    fn component(hasher: &mut Sha256, value: &[u8]) {
+    fn component(hasher: &mut LoopIdentityHasher, value: &[u8]) {
         hasher.update((value.len() as u64).to_be_bytes());
         hasher.update(value);
     }
 
-    let mut hasher = Sha256::new();
+    let hasher = Sha256::new();
+    #[cfg(not(feature = "test-utils"))]
+    let mut hasher = hasher;
+    #[cfg(feature = "test-utils")]
+    let mut hasher =
+        crate::identity_recording::RecordingSha256::new(hasher, "loop-system-identity");
     component(&mut hasher, file_or_parent_identity.as_bytes());
     hasher.update((start as u64).to_be_bytes());
     hasher.update((end as u64).to_be_bytes());

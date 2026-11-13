@@ -4101,6 +4101,10 @@ pub fn instance_prefix_for_call(call: &ModuleCall) -> String {
         return name.to_string();
     }
 
+    #[cfg(feature = "test-utils")]
+    let _recording_context = crate::identity_recording::context(|| {
+        crate::identity_recording::module_context_key(call.id())
+    });
     let mut features: BTreeMap<String, String> = BTreeMap::new();
     features.insert("_module".to_string(), call.module_name.clone());
     for (k, v) in call.arguments() {
