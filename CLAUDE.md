@@ -335,6 +335,12 @@ run. When in doubt, run `scripts/verify.sh` without `--local`.
 Use `scripts/validate-parity.py` for main/candidate text and JSON parity (carina#4394).
 Run `python3 scripts/validate-parity.py --main <main> --candidate <candidate>
 --repo . --infra ../../../infra --evidence <dir>`.
+Use `--binary <path> --repeat 8 --repo . --evidence <dir>` to compare fresh
+processes of the same binary over every tracked configuration directory without
+reordering output. The `carina-cli` nextest `validate_diagnostic_order` integration
+tests retain this gate in four checked shards; each shard reports validation,
+provider-not-installed, and setup failure counts and must reach validation for
+every named `diagnostic_order/*` fixture it owns.
 
 CI keeps its parallel jobs by selecting kinds from `scripts/verify.sh`.
 The archive job builds the WASM mock fixtures and host test archive once;
@@ -715,7 +721,10 @@ A struct type represents a nested object with typed fields.
   `admit_apply_data_source`. Provider/backend configuration enters `admit()` through
   `validation/admission/configuration/`, including compact-list callbacks.
   Complete admissions own the canonical payload and placements; analysis cannot
-  authorize construction. Opaque provider keys retain factory validation.
+  authorize construction. Undeclared keys are rejected before value checks or
+  factory validation, using resource unknown-attribute suggestions. The payload
+  contains exactly its placed fields. The native mock has no configuration
+  fields; WASM mock controls belong to its own declaration.
   Provider construction binds admitted configuration to its factory and instance.
   Core owns the S3/local declarations; state extracts settings only from
   `AdmittedConfiguration<BackendAttribute>`. Native file addresses retain their

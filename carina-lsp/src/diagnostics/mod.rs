@@ -5,6 +5,7 @@ mod validation;
 #[cfg(test)]
 mod tests;
 
+use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -51,7 +52,7 @@ fn select_admission_inputs<'r, 'a>(
             &'r carina_core::parser::AnalysisResourceRef<'a>,
         >,
     >,
-    values: &HashMap<String, Value>,
+    values: &IndexMap<String, Value>,
     report: &carina_core::parser::retained::ExpressionReport,
 ) -> (
     &'r carina_core::parser::AnalysisResourceRef<'a>,
@@ -434,7 +435,7 @@ impl ExpandedDiagnosticValidationInputs<'_> {
                     .filter(|value| inputs.value(name).is_some_and(|source| source != value))
                     .map(|value| (name.clone(), value))
             })
-            .collect::<HashMap<_, _>>();
+            .collect::<IndexMap<_, _>>();
         let mut evaluated_inputs = inputs.clone();
         let (evaluated_inputs, updated) = evaluated_inputs.materialize_and_classify(
             &evaluated,
@@ -522,6 +523,7 @@ pub struct DiagnosticEngine {
     provider_names: Vec<String>,
     known_provider_names: HashSet<String>,
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
+    configuration_factories: Vec<Box<dyn ProviderFactory>>,
     /// Providers that failed to load: name -> error reason.
     provider_errors: HashMap<String, String>,
     /// Cached provider context with custom type validators from schemas.
@@ -1757,8 +1759,8 @@ impl DiagnosticRun<'_> {
                     let bn_map = schema.block_name_map();
                     let resolved_attrs = semantic_resource_attributes
                         .as_ref()
-                        .map(carina_core::resource::attrs_to_hashmap)
-                        .unwrap_or_else(|| rref.resolved_attributes());
+                        .cloned()
+                        .unwrap_or_else(|| rref.attributes().into_owned());
                     let (admission_resource, inputs) = select_admission_inputs(
                         rref,
                         authored_resources.as_ref(),
@@ -1810,7 +1812,7 @@ impl DiagnosticRun<'_> {
                             })
                             .map(|value| (name.clone(), value))
                         })
-                        .collect::<HashMap<_, _>>();
+                        .collect::<IndexMap<_, _>>();
                     let mut evaluated_inputs = inputs.clone();
                     let (evaluated_inputs, updated) = evaluated_inputs.materialize_and_classify(
                         &evaluated_attrs,
@@ -2511,6 +2513,7 @@ impl DiagnosticEngine {
             provider_names: Vec::new(),
             known_provider_names: HashSet::new(),
             factories: Arc::new(Vec::new()),
+            configuration_factories: Vec::new(),
             provider_errors: HashMap::new(),
             provider_context: DiagnosticProviderContext::Unloaded(Arc::new(
                 carina_core::parser::ProviderContext::new(environment),
@@ -2534,6 +2537,7 @@ impl DiagnosticEngine {
             provider_names,
             known_provider_names,
             factories,
+            configuration_factories: Vec::new(),
             provider_errors: HashMap::new(),
             provider_context,
         }
@@ -2541,6 +2545,13 @@ impl DiagnosticEngine {
 
     pub fn schema_count(&self) -> usize {
         self.schemas.len()
+    }
+
+    /// Host-owned resources retain their catalog; configuration still needs
+    /// the native factory's declaration and semantic admission hook.
+    pub(crate) fn with_configuration_factory(mut self, factory: Box<dyn ProviderFactory>) -> Self {
+        self.configuration_factories.push(factory);
+        self
     }
 
     pub fn with_provider_errors(mut self, errors: HashMap<String, String>) -> Self {

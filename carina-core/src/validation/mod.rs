@@ -28,7 +28,6 @@ use crate::parser::{
     ForBinding, LoadedProviderContext, ModuleCall, ModuleCallId, ParsedValue as Value,
     ProviderContext, ResourceRef, ResourceTypePath, SourceFileId, SourceSpan, TypeExpr,
 };
-use crate::provider::ProviderFactory;
 use crate::resource::{
     AbsoluteBindingAddress, BindingAddress, CompositionCallPath, EnumValueResolver, ModuleSource,
     ParserPlaceholder, PlaceholderKind, RawEnumIdentifier, ReferencePath, ReferencePathRef,
@@ -8090,50 +8089,6 @@ pub fn validate_no_exports_in_module<E>(parsed: &crate::parser::File<E>) -> Resu
         return Err(
             "exports blocks are not allowed inside modules. Define exports at the root configuration level.".to_string(),
         );
-    }
-    Ok(())
-}
-
-/// Validate provider configuration attributes.
-///
-/// Runs host-side type-level validation using
-/// [`ProviderFactory::schema_witness`] first, then
-/// canonicalizes schema-known enum values before delegating to
-/// [`ProviderFactory::validate_config`] for provider-specific semantic checks.
-/// The provider sees only canonical API spellings; literal strings are never
-/// decoded by textual shape.
-///
-/// Attributes containing unresolved references (e.g.
-/// `assume_role = { role_arn = upstream.arn }` at validate time, before
-/// plan/apply has fetched upstream state) are passed through host-side
-/// type validation — the config witness's [`crate::schema::EffectiveType`]
-/// validator is deferred-aware and no-ops on `crate::resource::Value::Deferred` — but
-/// **excluded from the plugin-side
-/// `validate_config` call**, because the WASM serializer rejects
-/// deferred values. The same `validate_config` runs again at the typed
-/// provider-construction boundary once the refs have been substituted by
-/// [`resolve_provider_attributes_with_remote`], so no plugin-side check
-/// is permanently lost. carina#3182.
-pub fn validate_provider_config<E>(
-    parsed: &crate::parser::File<E>,
-    factories: &[Box<dyn ProviderFactory>],
-) -> Result<(), String> {
-    validate_provider_config_report(parsed, factories).map_err(|error| error.to_string())
-}
-
-pub fn validate_provider_config_report<E>(
-    parsed: &crate::parser::File<E>,
-    factories: &[Box<dyn ProviderFactory>],
-) -> Result<(), crate::executor::provider_ready::ProviderConfigPreparationError> {
-    for provider in &parsed.providers {
-        let Some(factory) = factories.iter().find(|f| f.name() == provider.name) else {
-            continue;
-        };
-        crate::executor::provider_ready::validate_parser_provider_config(
-            factory.as_ref(),
-            &provider.name,
-            &provider.attributes,
-        )?;
     }
     Ok(())
 }

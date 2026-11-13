@@ -1,0 +1,2 @@
+fn zebra(): String { "first" }
+fn mango(): String { "mango" }

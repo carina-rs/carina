@@ -844,6 +844,12 @@ impl ProviderConfigValidationError {
 /// Failure while preparing configuration for provider construction.
 #[derive(Debug, Error)]
 pub enum ProviderConfigPreparationError {
+    #[error("{0}")]
+    UnknownAttributes(
+        crate::validation::admission::configuration::provider::UnknownProviderConfigAttributes,
+    ),
+    #[error("{0}")]
+    Multiple(ProviderConfigPreparationErrors),
     /// Provider semantic validation and initialization require wire values.
     #[error("{0}")]
     Wire(ProviderWireError),
@@ -862,6 +868,70 @@ pub enum ProviderConfigPreparationError {
     },
 }
 
+/// A terminal collection; individual typed diagnostics remain inspectable.
+#[derive(Debug)]
+pub struct ProviderConfigPreparationErrors {
+    errors: Vec<ProviderConfigPreparationError>,
+}
+
+impl fmt::Display for ProviderConfigPreparationErrors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, diagnostic) in self
+            .errors
+            .iter()
+            .flat_map(|error| error.diagnostics())
+            .enumerate()
+        {
+            if index > 0 {
+                f.write_str("\n")?;
+            }
+            fmt::Display::fmt(&diagnostic, f)?;
+        }
+        Ok(())
+    }
+}
+
+/// A configuration owner's diagnostic, retaining its exact authored key.
+#[derive(Debug, Clone, Copy)]
+pub enum ProviderConfigDiagnostic<'a> {
+    Preparation(&'a ProviderConfigPreparationError),
+    Attribute {
+        provider: &'a str,
+        attribute: &'a crate::parser::AttributeKey,
+        error: &'a TypeError,
+    },
+}
+
+impl ProviderConfigDiagnostic<'_> {
+    pub fn attribute(&self) -> Option<&crate::parser::AttributeKey> {
+        match self {
+            Self::Preparation(error) => error.attribute(),
+            Self::Attribute { attribute, .. } => Some(attribute),
+        }
+    }
+    pub fn schema_error(&self) -> Option<&TypeError> {
+        match self {
+            Self::Preparation(_) => None,
+            Self::Attribute { error, .. } => Some(error),
+        }
+    }
+}
+
+impl fmt::Display for ProviderConfigDiagnostic<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preparation(error) => fmt::Display::fmt(error, f),
+            Self::Attribute {
+                provider,
+                attribute,
+                error,
+            } => {
+                write!(f, "provider {provider}: {attribute}: {error}")
+            }
+        }
+    }
+}
+
 impl From<ProviderWireError> for ProviderConfigPreparationError {
     fn from(error: ProviderWireError) -> Self {
         Self::Wire(error)
@@ -878,19 +948,56 @@ impl From<ProviderConfigPreparationError> for crate::provider::HostError {
 }
 
 impl ProviderConfigPreparationError {
+    pub fn into_diagnostics(self) -> Vec<Self> {
+        match self {
+            Self::UnknownAttributes(errors) => errors.into_diagnostics(),
+            Self::Multiple(errors) => errors
+                .errors
+                .into_iter()
+                .flat_map(Self::into_diagnostics)
+                .collect(),
+            error @ (Self::Wire(_)
+            | Self::InvalidAttribute { .. }
+            | Self::ProviderValidation { .. }) => vec![error],
+        }
+    }
+
+    pub(crate) fn collect(mut errors: Vec<Self>) -> Result<(), Self> {
+        match errors.pop() {
+            None => Ok(()),
+            Some(error) if errors.is_empty() => Err(error),
+            Some(error) => {
+                errors.push(error);
+                Err(Self::Multiple(ProviderConfigPreparationErrors { errors }))
+            }
+        }
+    }
+
+    pub fn diagnostics(&self) -> Vec<ProviderConfigDiagnostic<'_>> {
+        match self {
+            Self::UnknownAttributes(errors) => errors.diagnostics().collect(),
+            Self::Multiple(errors) => errors.errors.iter().flat_map(Self::diagnostics).collect(),
+            Self::Wire(_) | Self::InvalidAttribute { .. } | Self::ProviderValidation { .. } => {
+                vec![ProviderConfigDiagnostic::Preparation(self)]
+            }
+        }
+    }
+
     /// Attribute responsible for a host-side type/canonicalization failure.
     pub fn attribute(&self) -> Option<&crate::parser::AttributeKey> {
         match self {
             Self::Wire(error) => Some(error.attribute()),
             Self::InvalidAttribute { attribute, .. } => Some(attribute),
-            Self::ProviderValidation { .. } => None,
+            Self::ProviderValidation { .. } | Self::UnknownAttributes(_) | Self::Multiple(_) => {
+                None
+            }
         }
     }
 
     /// Typed provider failure when provider-specific validation was reached.
     pub fn provider_error(&self) -> Option<&crate::provider::HostError> {
         match self {
-            Self::Wire(_) => None,
+            Self::Wire(_) | Self::UnknownAttributes(_) | Self::Multiple(_) => None,
             Self::InvalidAttribute { .. } => None,
             Self::ProviderValidation { error, .. } => Some(error.provider_error()),
         }
@@ -1272,7 +1379,7 @@ fn validate_known_provider_values(
         }
         ApplyAdmissionErrors::Constraints(report) => ProviderPreparationError::ValueConstraint {
             resource: Box::new(id.clone()),
-            errors: ProviderValueConstraintErrors::from_admission(report),
+            errors: ProviderValueConstraintErrors::from_admission(*report),
         },
     })
 }
@@ -4183,7 +4290,7 @@ mod provider_config_tests {
     }
 
     #[test]
-    fn prepare_provider_ready_config_ignores_undeclared_region() {
+    fn prepare_provider_ready_config_rejects_undeclared_region() {
         let factory = RefinedConfigFactory {
             validate_calls: AtomicUsize::new(0),
         };
@@ -4191,10 +4298,11 @@ mod provider_config_tests {
             "us-west-2".into(),
         ))));
 
-        let ready = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
-            .expect("undeclared attributes must not imply a region schema");
+        let error = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
+            .expect_err("undeclared attributes cannot reach the provider");
 
-        assert_eq!(ready.region(), None);
+        assert!(error.to_string().contains("Unknown attribute 'region'"));
+        assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

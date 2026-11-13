@@ -1,8 +1,8 @@
 //! Declaration-owned admission for configuration payloads.
 //!
-//! The payload retains its declared field placements and explicitly named
-//! opaque factory-owned passthrough. There is no constructor accepting a
-//! checked marker and a replacement map.
+//! Every payload entry is derived from its declared field placement. There is
+//! no constructor accepting unchecked entries or a checked marker plus a
+//! replacement map.
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -51,6 +51,11 @@ mod aggregate;
 pub use aggregate::AdmittedConfiguration;
 use aggregate::ConfigurationBuilder;
 
+struct DeclaredConfigurationField<'a, K: ConfigurationKind> {
+    destination: Destination<K>,
+    attr_type: &'a crate::schema::CompiledAttributeType,
+}
+
 impl ConfigurationDeclaration {
     fn provider(owner: &str, schema: ValidatedConfigSchema) -> Arc<Self> {
         Arc::new(Self {
@@ -68,31 +73,44 @@ impl ConfigurationDeclaration {
         instance: InstanceIdentity,
         revision: CatalogRevision,
     ) -> Option<Destination<K>> {
-        let (ordinal, (name, _)) = self
+        self.field(key, instance, revision)
+            .map(|field| field.destination)
+    }
+
+    fn field<K: ConfigurationKind>(
+        &self,
+        key: &crate::parser::AttributeKey,
+        instance: InstanceIdentity,
+        revision: CatalogRevision,
+    ) -> Option<DeclaredConfigurationField<'_, K>> {
+        let (ordinal, (name, attr_type)) = self
             .schema
             .parts()
             .iter()
             .enumerate()
             .find(|(_, (name, _))| key.matches(name))?;
-        Some(Destination {
-            identity: Box::new(DestinationIdentity {
-                declaration: DeclarationIdentity {
+        Some(DeclaredConfigurationField {
+            attr_type,
+            destination: Destination {
+                identity: Box::new(DestinationIdentity {
+                    declaration: DeclarationIdentity {
+                        owner: self.owner.clone(),
+                        schema: self.identity,
+                    },
+                    instance,
+                    path: vec![ordinal],
+                    revision,
+                }),
+                label: key.to_string(),
+                contract: Some(Box::new(DestinationContract {
+                    schema: ContractSchema::Configuration(Arc::clone(&self.schema)),
+                    attribute: name.clone(),
                     owner: self.owner.clone(),
-                    schema: self.identity,
-                },
-                instance,
-                path: vec![ordinal],
-                revision,
-            }),
-            label: key.to_string(),
-            contract: Some(Box::new(DestinationContract {
-                schema: ContractSchema::Configuration(Arc::clone(&self.schema)),
-                attribute: name.clone(),
-                owner: self.owner.clone(),
-                ancestry: FieldAncestry::WRITABLE,
-                path: LeafPath::from_segments([]),
-            })),
-            kind: PhantomData,
+                    ancestry: FieldAncestry::WRITABLE,
+                    path: LeafPath::from_segments([]),
+                })),
+                kind: PhantomData,
+            },
         })
     }
 }

@@ -589,7 +589,7 @@ fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType 
 
 fn module_arguments(
     values: impl IntoIterator<Item = (String, Value)>,
-) -> HashMap<String, ModuleArgument> {
+) -> indexmap::IndexMap<String, ModuleArgument> {
     values
         .into_iter()
         .map(|(name, value)| (name, ModuleArgument::new(value)))
@@ -839,7 +839,7 @@ fn empty_parsed() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: Vec::new(),
-        user_functions: HashMap::new(),
+        user_functions: indexmap::IndexMap::new(),
         upstream_states: Vec::new(),
         wait_bindings: Vec::new(),
         requires: Vec::new(),
@@ -9582,7 +9582,28 @@ impl crate::provider::ProviderFactory for RecordingFactory {
     fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
         crate::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            Default::default(),
+            crate::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from([
+                ("region".into(), crate::schema::AttributeType::string()),
+                (
+                    "assume_role".into(),
+                    crate::schema::AttributeType::struct_(
+                        "AssumeRole",
+                        vec![
+                            crate::schema::StructField::required(
+                                "role_arn",
+                                crate::schema::AttributeType::string(),
+                            )
+                            .build(),
+                            crate::schema::StructField::optional(
+                                "session_name",
+                                crate::schema::AttributeType::string(),
+                            )
+                            .build(),
+                        ],
+                    ),
+                ),
+            ]))
+            .unwrap(),
             Default::default(),
             Vec::new(),
         )
@@ -9641,7 +9662,11 @@ fn validate_provider_config_skips_attributes_with_deferred_refs() {
     let (factory, seen_handle) = RecordingFactory::new("aws");
     let factories: Vec<Box<dyn crate::provider::ProviderFactory>> = vec![Box::new(factory)];
 
-    validate_provider_config(&parsed, &factories).expect("validate must not error");
+    admission::configuration::provider::analyze_configs(
+        &parsed.providers,
+        &factories.iter().map(Box::as_ref).collect::<Vec<_>>(),
+    )
+    .expect("validate must not error");
 
     let seen = seen_handle
         .lock()
@@ -9747,7 +9772,11 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
             seen: std::sync::Arc::clone(&seen),
         })];
 
-    validate_provider_config(&parsed, &factories).expect("enum config must validate");
+    admission::configuration::provider::analyze_configs(
+        &parsed.providers,
+        &factories.iter().map(Box::as_ref).collect::<Vec<_>>(),
+    )
+    .expect("enum config must validate");
 
     let calls = seen.lock().unwrap();
     assert!(matches!(

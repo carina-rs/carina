@@ -292,6 +292,37 @@ impl std::fmt::Display for SavedPlanSchemaMismatchError {
 
 impl std::error::Error for SavedPlanSchemaMismatchError {}
 
+/// Terminal saved-plan configuration report, retaining typed owner diagnostics.
+#[derive(Debug)]
+pub struct SavedPlanProviderConfigurationError {
+    pub error: Box<carina_core::executor::provider_ready::ProviderConfigPreparationError>,
+    pub replan_command: String,
+}
+
+impl SavedPlanProviderConfigurationError {
+    pub fn configuration_error(
+        &self,
+    ) -> &carina_core::executor::provider_ready::ProviderConfigPreparationError {
+        &self.error
+    }
+}
+
+impl std::fmt::Display for SavedPlanProviderConfigurationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Saved plan provider configuration is invalid:")?;
+        for diagnostic in self.error.diagnostics() {
+            write!(f, "\n  - {diagnostic}")?;
+        }
+        write!(
+            f,
+            "\nRe-run `{}` to produce a new saved plan before applying.",
+            self.replan_command
+        )
+    }
+}
+
+impl std::error::Error for SavedPlanProviderConfigurationError {}
+
 /// Recorded and currently loaded artifact summaries for one provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedPlanProviderArtifactDifference {
@@ -1160,6 +1191,8 @@ pub enum AppError {
     ProviderConfiguration(
         Box<carina_core::executor::provider_ready::ProviderConfigPreparationError>,
     ),
+    #[error("{0}")]
+    SavedPlanProviderConfiguration(Box<SavedPlanProviderConfigurationError>),
 
     #[error("{}", validation_finding_display(prefix.as_deref(), finding.detail()))]
     ParameterReference {

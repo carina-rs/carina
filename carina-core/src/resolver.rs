@@ -4959,7 +4959,7 @@ mod runtime_provider_type_tests {
                 &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .unwrap();
-            let mut function = parsed.user_functions.remove("f").unwrap();
+            let mut function = parsed.user_functions.shift_remove("f").unwrap();
             function.body.source_file = Some(std::path::PathBuf::from("/project/functions.crn"));
             let arguments = [crate::resource::FunctionArgument::from_value(
                 crate::resource::AuthoredValue::Concrete(

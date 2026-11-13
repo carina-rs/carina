@@ -1,0 +1,1 @@
+fn alpha(value: mock.test.sdk_validator.Guarded): String { "alpha" }

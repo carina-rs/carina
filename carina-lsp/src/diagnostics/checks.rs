@@ -768,7 +768,12 @@ impl DiagnosticRun<'_> {
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         for (index, provider) in tree.providers().iter().enumerate() {
-            let Some(factory) = self.factories.iter().find(|f| f.name() == provider.name) else {
+            let Some(factory) = self
+                .factories
+                .iter()
+                .chain(self.configuration_factories.iter())
+                .find(|f| f.name() == provider.name)
+            else {
                 continue;
             };
             let validation = carina_core::executor::provider_ready::validate_parser_provider_config(
@@ -782,17 +787,34 @@ impl DiagnosticRun<'_> {
                 }) {
                     continue;
                 }
-                let location = error
-                    .attribute()
-                    .map(|key| tree.provider_attribute_location(index, key))
-                    .unwrap_or_else(|| tree.provider_attribute_location(index, "region"));
-                let finding = carina_core::parser::Located::new(location.clone(), error);
-                diagnostics.extend(render_merged(
-                    doc,
-                    &finding,
-                    DiagnosticSeverity::WARNING,
-                    finding.detail().to_string(),
-                ));
+                for diagnostic in error.diagnostics() {
+                    let unknown = matches!(
+                        diagnostic.schema_error(),
+                        Some(carina_core::schema::TypeError::UnknownAttribute { .. })
+                    );
+                    let location = diagnostic
+                        .attribute()
+                        .map(|key| {
+                            if unknown {
+                                tree.provider_attribute_key_location(index, key)
+                            } else {
+                                tree.provider_attribute_location(index, key)
+                            }
+                        })
+                        .unwrap_or_else(|| tree.provider_attribute_location(index, "region"));
+                    let severity = if unknown {
+                        DiagnosticSeverity::ERROR
+                    } else {
+                        DiagnosticSeverity::WARNING
+                    };
+                    let finding = carina_core::parser::Located::new(location.clone(), diagnostic);
+                    diagnostics.extend(render_merged(
+                        doc,
+                        &finding,
+                        severity,
+                        finding.detail().to_string(),
+                    ));
+                }
             }
         }
         diagnostics
@@ -1906,7 +1928,7 @@ impl DiagnosticRun<'_> {
                             let known_attrs: Vec<&str> =
                                 known_attributes.iter().map(String::as_str).collect();
                             let suggestion =
-                                suggest_similar_name(&diagnostic_attribute, &known_attrs)
+                                suggest_similar_name(&diagnostic_attribute, &known_attrs, &[])
                                     .map(|suggestion| format!(" Did you mean '{}'?", suggestion))
                                     .unwrap_or_default();
                             format!(
@@ -1928,9 +1950,10 @@ impl DiagnosticRun<'_> {
                                 .attribute_location(&diagnostic_binding, &diagnostic_attribute);
                             let known_attrs: Vec<&str> =
                                 known_attributes.iter().map(String::as_str).collect();
-                            let suffix = suggest_similar_name(&diagnostic_attribute, &known_attrs)
-                                .map(|suggestion| format!(". Did you mean '{}'?", suggestion))
-                                .unwrap_or_else(|| ".".to_string());
+                            let suffix =
+                                suggest_similar_name(&diagnostic_attribute, &known_attrs, &[])
+                                    .map(|suggestion| format!(". Did you mean '{}'?", suggestion))
+                                    .unwrap_or_else(|| ".".to_string());
                             format!(
                                 "Unknown attribute '{}' on '{}'{}",
                                 diagnostic_attribute, diagnostic_binding, suffix,

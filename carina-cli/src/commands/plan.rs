@@ -3952,6 +3952,10 @@ pub(crate) struct ReloadedPlanFile<
 }
 
 impl UnresolvedReloadedPlanFile {
+    pub(crate) fn provider_configs(&self) -> &SavedProviderConfigs {
+        &self.contents.provider_configs
+    }
+
     pub(crate) fn legacy_dependency_classification(
         &self,
     ) -> Option<&LegacyDependencyClassification> {
@@ -9604,7 +9608,7 @@ mod run_plan_out_tests {
         fs::write(
             dir.join("main.crn"),
             r#"
-                provider mock { target = bucket.name }
+                provider mock { source = 'file://in-process-test.wasm' target = bucket.name }
                 let bucket = mock.test.resource { name_prefix = "pref-" }
             "#,
         )
@@ -9635,7 +9639,7 @@ mod run_plan_out_tests {
         .unwrap();
 
         let plan_path = dir.join("plan.json");
-        run_plan(
+        run_plan_using(
             &runtime,
             dir,
             Some(&plan_path),
@@ -9648,6 +9652,15 @@ mod run_plan_out_tests {
             false,
             false,
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            |runtime, providers, _| {
+                Ok(crate::wiring::ProviderLoad::for_test_with_provider_phase(
+                    runtime,
+                    crate::wiring::LoadedProviderFactory::for_test(vec![Box::new(
+                        crate::test_support::ConfigurableMockFactory::with_string_setting("target"),
+                    )]),
+                    providers,
+                ))
+            },
         )
         .await
         .expect("plan should resolve provider attributes after name reconciliation");

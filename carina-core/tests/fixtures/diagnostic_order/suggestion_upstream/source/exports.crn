@@ -1,0 +1,4 @@
+exports {
+  cat: String = "a"
+  bat: String = "b"
+}

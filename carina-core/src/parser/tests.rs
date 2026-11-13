@@ -1405,7 +1405,7 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
     file.module_calls.push(ModuleCall::test(
         "example_module",
         Some("component".to_string()),
-        HashMap::from([("input".to_string(), ModuleArgument::new(empty()))]),
+        indexmap::IndexMap::from([("input".to_string(), ModuleArgument::new(empty()))]),
     ));
     file.arguments.push(ArgumentParameter {
         name: "input".to_string(),
@@ -21866,7 +21866,7 @@ fn round6_interpolated_attribute_keys_keep_authored_identity() {
     assert_eq!(
         diagnostic_keys
             .iter()
-            .map(|key| key.detail())
+            .map(|attribute| &attribute.key)
             .collect::<HashSet<_>>()
             .len(),
         2
@@ -21874,7 +21874,7 @@ fn round6_interpolated_attribute_keys_keep_authored_identity() {
     assert_eq!(
         diagnostic_keys
             .iter()
-            .map(|key| key.detail().to_string())
+            .map(|attribute| attribute.key.to_string())
             .collect::<Vec<_>>(),
         ["\"${secret(<redacted>)}\"", "\"${secret(<redacted>)}\""]
     );

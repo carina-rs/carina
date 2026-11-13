@@ -2455,7 +2455,7 @@ fn parse_local_variable_union(
     config: &ProviderContext,
     seeds: &[parser::BindingSeed<'_>],
     local_variables_by_file: &[HashSet<String>],
-    user_functions: &HashMap<String, parser::UserFunction>,
+    user_functions: &IndexMap<String, parser::UserFunction>,
 ) -> Result<DirectorySeedState, LocatedParseError> {
     let mut variables = IndexMap::new();
     let mut metadata = crate::parser::ParserSeedMetadata::default();

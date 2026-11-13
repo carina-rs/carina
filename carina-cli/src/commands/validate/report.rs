@@ -1177,3 +1177,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod provider_configuration_tests;

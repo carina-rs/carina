@@ -4286,11 +4286,7 @@ async fn provider_progress_uses_schema_region() {
     let configs = validated_provider_configs(vec![
         ProviderConfig {
             name: "test".to_string(),
-            attributes: (IndexMap::<String, _>::from([(
-                "region".to_string(),
-                Value::Concrete(ConcreteValue::String("us-west-2".into())),
-            )]))
-            .into(),
+            attributes: Default::default(),
             default_tags: Default::default(),
             source: None,
             version: None,
@@ -5430,7 +5426,13 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                Default::default(),
+                carina_core::schema::ValidatedConfigSchema::validate(
+                    std::collections::BTreeMap::from([(
+                        "region".into(),
+                        carina_core::schema::AttributeType::string(),
+                    )]),
+                )
+                .unwrap(),
                 Default::default(),
                 Vec::new(),
             )
@@ -5558,7 +5560,13 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                Default::default(),
+                carina_core::schema::ValidatedConfigSchema::validate(
+                    std::collections::BTreeMap::from([(
+                        "region".into(),
+                        carina_core::schema::AttributeType::string(),
+                    )]),
+                )
+                .unwrap(),
                 Default::default(),
                 Vec::new(),
             )
@@ -16206,7 +16214,7 @@ fn retry_policy_inherits_transient_causes_and_respects_explicit_overrides() {
 }
 
 #[tokio::test]
-async fn provider_config_directory_builtin_keeps_ignored_opaque_values() {
+async fn provider_config_directory_builtin_rejects_undeclared_values() {
     for declaration in ["provider mock", "let east = provider mock"] {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -16254,19 +16262,70 @@ async fn provider_config_directory_builtin_keeps_ignored_opaque_values() {
         .unwrap()
         .into_complete()
         .unwrap();
-        let router = get_provider_with_ctx(
+        let error = get_provider_with_ctx(
             &load.context,
             &resolved,
             ProgressSink::Human,
             &carina_core::provider::ProviderPlan::state_only(),
         )
         .await
-        .unwrap();
-        assert!(!router.is_empty());
-        if declaration.starts_with("let ") {
-            assert!(router.provider_scopes().contains_key(
-                &provider_mod::ProviderInstanceKey::new("mock", Some("east".into()))
-            ));
-        }
+        .err()
+        .expect("undeclared keys must fail before wire conversion");
+        assert!(error.to_string().contains("Unknown attribute 'opaque'"));
+    }
+}
+
+fn builtin_normalization_fixture() -> (WiringContext, ResolvedProviderConfigs) {
+    let configs = carina_core::test_utils::configuration::provider_directory(
+        "provider mock { validate_config_trap = true }",
+        "let sibling = 'value'",
+    );
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let ctx = WiringContext::new_for_test_with_provider_phase(
+        &runtime,
+        vec![],
+        configs.as_provider_configs(),
+    );
+    (ctx, configs)
+}
+
+#[test]
+fn state_normalization_does_not_construct_the_builtin_provider() {
+    let (ctx, configs) = builtin_normalization_fixture();
+    normalize_state_with_ctx(
+        &ctx,
+        &configs,
+        &mut HashMap::new(),
+        &provider_mod::ProviderPlan::state_only(),
+    )
+    .expect("native state normalization has no provider factory call");
+}
+
+#[tokio::test]
+async fn builtin_normalization_uses_only_its_dedicated_factory() {
+    let (ctx, configs) = builtin_normalization_fixture();
+    create_normalizers_from_configs_with_ctx(
+        &ctx,
+        &configs,
+        &provider_mod::ProviderPlan::state_only(),
+    )
+    .await
+    .expect("native normalization admits the dedicated factory's empty configuration");
+}
+
+#[test]
+fn schema_override_errors_choose_the_first_argument() {
+    for _ in 0..64 {
+        let overrides = [
+            ("zulu".to_owned(), PathBuf::from("missing-zulu.wasm")),
+            ("alpha".to_owned(), PathBuf::from("missing-alpha.wasm")),
+        ]
+        .into_iter()
+        .collect();
+        let error = schema_check_provider_configs(&[], &overrides).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "provider schema override names undeclared default provider 'zulu'"
+        );
     }
 }

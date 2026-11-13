@@ -471,7 +471,19 @@ fn check_loaded_providers(
                     replan_command: apply_target.replan_command().to_string(),
                 })
             },
-        )
+        )?;
+    carina_core::validation::admission::configuration::provider::validate_keys(
+        plan_file.provider_configs().as_provider_configs(),
+        &ctx.configuration_factories(),
+    )
+    .map_err(|error| {
+        AppError::SavedPlanProviderConfiguration(Box::new(
+            crate::error::SavedPlanProviderConfigurationError {
+                error: Box::new(error),
+                replan_command: apply_target.replan_command().to_string(),
+            },
+        ))
+    })
 }
 
 /// Deserialized saved plan whose typed placeholders still need fresh desired
@@ -1532,6 +1544,37 @@ mod tests {
                 .expect("reload saved plan"),
             schema_references,
         }
+    }
+
+    #[test]
+    fn saved_plan_undeclared_provider_key_is_terminal_and_requires_replanning() {
+        let context = builtin_context();
+        let mut config = provider_config("mock");
+        config.source = None;
+        config.attributes.insert(
+            "regoin",
+            Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
+        );
+        let plan = plan_recorded_with(&context, vec![config]);
+        let bytes = serde_json::to_vec(&plan).unwrap();
+        let decoded: PlanFile = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&decoded).unwrap(),
+            bytes,
+            "wire round-trip must remain exact"
+        );
+        let loaded = builtin_load().into_complete().unwrap();
+        let error = reloaded(decoded)
+            .verify_provider_load(loaded, apply_target())
+            .err()
+            .expect("a decoded undeclared key cannot authorize saved-plan execution");
+        let message = crate::error::format_error_with_source_chain(&error);
+        assert!(message.contains("Unknown attribute 'regoin'"), "{message}");
+        assert!(
+            message.contains("Re-run `carina plan --out reviewed-plan.json`"),
+            "{message}"
+        );
+        assert_eq!(message.matches("Unknown attribute 'regoin'").count(), 1);
     }
 
     fn schema_checked_move_plan(

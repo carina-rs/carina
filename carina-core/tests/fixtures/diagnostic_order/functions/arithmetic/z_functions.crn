@@ -1,0 +1,2 @@
+fn alpha(value: Float): Int { value + 3 }
+fn bravo(value: Float): Int { value + 4 }
