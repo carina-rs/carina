@@ -1,5 +1,6 @@
 //! Root requirements are rejected at the shared directory admission boundary.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -455,7 +456,7 @@ fn saved_plan_secret_verification_matches_module_policy() {
             let directory = Directory::new("true");
             directory.clear_root_require();
             let comment = if has_secret {
-                "comment = secret('ROUND1_SECRET_VALUE')"
+                "comment = secret('SAVED_PLAN_SECRET_VALUE')"
             } else {
                 ""
             };
@@ -486,7 +487,7 @@ fn saved_plan_secret_verification_matches_module_policy() {
             } else {
                 success(&output);
             }
-            assert!(!output_text(&output).contains("ROUND1_SECRET_VALUE"));
+            assert!(!output_text(&output).contains("SAVED_PLAN_SECRET_VALUE"));
         }
     }
 }
@@ -497,7 +498,7 @@ fn root_require_saved_plan_secret_failure_exposes_the_cause() {
     directory.clear_root_require();
     fs::write(
         directory.project.join("main.crn"),
-        "let r = mock.test.resource { name = 'root' comment = secret('ROUND2_PRIVATE_VALUE') }\n",
+        "let r = mock.test.resource { name = 'root' comment = secret('SAVED_PLAN_PRIVATE_VALUE') }\n",
     )
     .unwrap();
     success(&directory.run(&["plan", "--out", "saved.plan", "."]));
@@ -520,7 +521,7 @@ fn root_require_saved_plan_secret_failure_exposes_the_cause() {
         )
     );
     assert_eq!(stderr.matches(ROOT_REQUIRE_ERROR).count(), 1);
-    assert!(!output_text(&output).contains("ROUND2_PRIVATE_VALUE"));
+    assert!(!output_text(&output).contains("SAVED_PLAN_PRIVATE_VALUE"));
     assert_eq!(saved, fs::read(plan).unwrap());
     assert_eq!(
         before,
@@ -868,6 +869,190 @@ fn root_require_bootstrap_commands_do_not_publish_retained_rejection() {
         assert_eq!(String::from_utf8(output.stderr).unwrap(), "", "{args:?}");
         assert_eq!(before, paths.each_ref().map(|path| fs::read(path).unwrap()));
     }
+}
+
+#[test]
+fn root_require_state_subcommands_follow_validation_paths() {
+    let directory = Directory::new("true");
+    directory.clear_root_require();
+    fs::write(
+        directory.project.join("main.crn"),
+        "let r = mock.test.resource { name = 'root' }\nexports { value: String = 'published' }\n",
+    )
+    .unwrap();
+    success(&directory.run(&["apply", "--auto-approve", "."]));
+    fs::write(directory.project.join("guards.crn"), "require true, 'x'\n").unwrap();
+    let state_path = directory.project.join("carina.state.json");
+    let mock_path = directory.home.join("mock-state.json");
+    let state_bytes = fs::read(&state_path).unwrap();
+    let mock_bytes = fs::read(&mock_path).unwrap();
+    let current: Value = serde_json::from_slice(&state_bytes).unwrap();
+    let mut legacy = current.clone();
+    legacy["version"] = json!(20);
+    for row in legacy["resources"].as_array_mut().unwrap() {
+        row["dependency_bindings"] = json!([]);
+        row["directives"]["depends_on"] = json!([]);
+    }
+    let legacy_path = directory.project.join("legacy.json");
+    let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+    fs::write(&legacy_path, &legacy_bytes).unwrap();
+    assert!(
+        carina_state::check_and_migrate(std::str::from_utf8(&legacy_bytes).unwrap())
+            .unwrap()
+            .into_state()
+            .requires_legacy_dependency_migration()
+    );
+    let root_error = format!("Error: ./guards.crn at line 1\nError: {ROOT_REQUIRE_ERROR}\n");
+    let migration_error = format!(
+        "Warning: state file legacy.json is v20 on disk; migration toward v21 was loaded in memory. Legacy dependency names, if present, will be classified against the expanded configuration and the disk state will be rewritten by the next apply, destroy, or state refresh.\n{root_error}"
+    );
+    let cases: &[(&[&str], i32, &str, &str)] = &[
+        (&["state", "list", "."], 0, "mock.test.resource r\n", ""),
+        (&["state", "lookup", "r.name", "."], 0, "root\n", ""),
+        (
+            &["state", "show", "."],
+            0,
+            "# mock.test.resource (r)\n  identifier = 'root-id'\n  name = 'root'\n",
+            "",
+        ),
+        (&["state", "refresh", "."], 1, "", &root_error),
+        (
+            &[
+                "state",
+                "migrate",
+                "--check",
+                ".",
+                "--state-url",
+                "carina.state.json",
+            ],
+            0,
+            "State dependency migration check passed: state is already version 21.\n",
+            "",
+        ),
+        (
+            &[
+                "state",
+                "migrate",
+                "--check",
+                ".",
+                "--state-url",
+                "legacy.json",
+            ],
+            1,
+            "",
+            &migration_error,
+        ),
+        (
+            &[
+                "state",
+                "forget",
+                "mock.test.resource",
+                "r",
+                "--auto-approve",
+                ".",
+            ],
+            1,
+            "Acquiring state lock...\n  ✓ Lock acquired\n  ✓ Lock released\n",
+            "Error: no state row at this address is a create whose outcome is unknown; `carina state forget mock.test.resource r` only accepts create-outcome-unknown rows; use `removed { from = mock.test.resource 'r' }` for ordinary state removal\n",
+        ),
+        (
+            &[
+                "state",
+                "bucket-delete",
+                "root-require-state",
+                "--force",
+                ".",
+            ],
+            1,
+            "",
+            "Error: The configured backend does not manage an S3 bucket\n",
+        ),
+    ];
+    let command =
+        <carina_cli::commands::state::StateCommands as clap::Subcommand>::augment_subcommands(
+            clap::Command::new("state"),
+        );
+    let declared: BTreeSet<_> = command
+        .get_subcommands()
+        .map(|command| command.get_name())
+        .collect();
+    let covered: BTreeSet<_> = cases.iter().map(|(args, ..)| args[1]).collect();
+    assert_eq!(
+        declared, covered,
+        "every declared state subcommand needs a measured outcome"
+    );
+    for (args, exit, stdout, stderr) in cases {
+        let output = directory.run(args);
+        assert_eq!(
+            output.status.code(),
+            Some(*exit),
+            "{args:?}: {}",
+            output_text(&output)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            *stdout,
+            "{args:?}"
+        );
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            *stderr,
+            "{args:?}"
+        );
+        assert_eq!(fs::read(&state_path).unwrap(), state_bytes);
+        assert_eq!(fs::read(&mock_path).unwrap(), mock_bytes);
+        assert_eq!(fs::read(&legacy_path).unwrap(), legacy_bytes);
+    }
+
+    // These inert settings exercise selection and validation only. The sole
+    // configured provider is the builtin mock. The placement error precedes
+    // bucket-provider construction, confirmation and any backend operation.
+    fs::write(directory.project.join("providers.crn"), "backend s3 { bucket = 'root-require-state' key = 'state.json' region = 'ap-northeast-1' }\nprovider mock {}\n").unwrap();
+    for (bucket, expected) in [
+        ("root-require-state", root_error.as_str()),
+        (
+            "different-state",
+            "Error: Bucket name 'different-state' does not match backend configuration bucket 'root-require-state'.\n",
+        ),
+    ] {
+        let output = directory.run(&["state", "bucket-delete", bucket, "--force", "."]);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+        assert_eq!(String::from_utf8(output.stderr).unwrap(), expected);
+        assert_eq!(fs::read(&state_path).unwrap(), state_bytes);
+        assert_eq!(fs::read(&mock_path).unwrap(), mock_bytes);
+    }
+    fs::write(
+        directory.project.join("providers.crn"),
+        "backend local { path = 'carina.state.json' }\nprovider mock {}\n",
+    )
+    .unwrap();
+    let mut unknown = current.clone();
+    unknown["resources"].as_array_mut().unwrap().push(json!({
+        "provider": "mock", "resource_type": "test.resource", "identity": "pending", "binding": "pending",
+        "current": { "kind": "create_outcome_unknown", "started_at": "2026-10-30T03:00:00Z" }
+    }));
+    fs::write(&state_path, serde_json::to_vec_pretty(&unknown).unwrap()).unwrap();
+    let output = directory.run(&[
+        "state",
+        "forget",
+        "mock.test.resource",
+        "pending",
+        "--auto-approve",
+        ".",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", output_text(&output));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "Acquiring state lock...\n  ✓ Lock acquired\nCreate-outcome-unknown row: mock.test.resource 'pending'\nThis row has no provider identifier and cannot be destroyed safely.\nForgot create-outcome-unknown current instance: mock.test.resource 'pending'\n  ✓ Lock released\n"
+    );
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), "");
+    let mut forgotten: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(forgotten["serial"], current["serial"].as_u64().unwrap() + 1);
+    forgotten["serial"] = current["serial"].clone();
+    assert_eq!(forgotten, current);
+    assert_eq!(fs::read(&mock_path).unwrap(), mock_bytes);
+    assert_eq!(fs::read(&legacy_path).unwrap(), legacy_bytes);
 }
 
 #[test]

@@ -10,7 +10,7 @@ fn config() -> ProviderContext {
     ProviderContext::new(crate::EnvironmentSnapshot::empty())
 }
 
-fn assert_round4_buffer_membership(buffer_text: &str, disk_text: &str, expected_template: bool) {
+fn assert_buffer_membership(buffer_text: &str, disk_text: &str, expected_template: bool) {
     let directory = tempfile::tempdir().unwrap();
     let file = directory.path().join("guards.crn");
     std::fs::write(&file, disk_text).unwrap();
@@ -54,8 +54,8 @@ fn assert_round4_buffer_membership(buffer_text: &str, disk_text: &str, expected_
 }
 
 #[test]
-fn round4_unsaved_template_cannot_be_admitted_as_disk_directory() {
-    assert_round4_buffer_membership(
+fn unsaved_template_cannot_be_admitted_as_disk_directory() {
+    assert_buffer_membership(
         "arguments { n: Int }\nrequire false, 'guard'\n",
         "require false, 'guard'\n",
         true,
@@ -63,8 +63,8 @@ fn round4_unsaved_template_cannot_be_admitted_as_disk_directory() {
 }
 
 #[test]
-fn round4_unsaved_directory_cannot_inherit_disk_template_scope() {
-    assert_round4_buffer_membership(
+fn unsaved_directory_cannot_inherit_disk_template_scope() {
+    assert_buffer_membership(
         "require false, 'guard'\n",
         "arguments { n: Int }\nrequire false, 'guard'\n",
         false,
@@ -72,7 +72,7 @@ fn round4_unsaved_directory_cannot_inherit_disk_template_scope() {
 }
 
 #[test]
-fn round3_test_utils_constructor_cannot_mint_directory_completeness() {
+fn test_utils_constructor_cannot_mint_directory_completeness() {
     let directory = tempfile::tempdir().unwrap();
     let source = "require false, 'partial guard'\n";
     let guard = directory.path().join("guards.crn");
@@ -96,7 +96,7 @@ fn round3_test_utils_constructor_cannot_mint_directory_completeness() {
 
 #[cfg(unix)]
 #[test]
-fn round3_non_utf8_sibling_is_preserved_in_recovery_discovery() {
+fn non_utf8_sibling_is_preserved_in_recovery_discovery() {
     use std::os::unix::ffi::OsStringExt;
     let directory = tempfile::tempdir().unwrap();
     let source = "require false, 'guard'\n";
@@ -160,7 +160,7 @@ fn round3_non_utf8_sibling_is_preserved_in_recovery_discovery() {
 
 #[cfg(unix)]
 #[test]
-fn round3_unreadable_sibling_has_a_typed_source_failure_and_no_witness() {
+fn unreadable_sibling_has_a_typed_source_failure_and_no_witness() {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let source = "require false, 'guard'\n";
@@ -209,7 +209,7 @@ fn round3_unreadable_sibling_has_a_typed_source_failure_and_no_witness() {
 }
 
 #[test]
-fn round2_partial_declarations_cannot_grant_directory_require_admission() {
+fn partial_declarations_cannot_grant_directory_require_admission() {
     let schemas = SchemaRegistry::new();
     for condition in ["false", "n > 0"] {
         let source = format!("require {condition}, 'guard'\n");
@@ -232,7 +232,7 @@ fn round2_partial_declarations_cannot_grant_directory_require_admission() {
 }
 
 #[test]
-fn round2_recovery_uses_sibling_declaration_evidence() {
+fn recovery_uses_sibling_declaration_evidence() {
     let directory = tempfile::tempdir().unwrap();
     let source = "require false, 'guard'\n";
     let guard = directory.path().join("guards.crn");
@@ -311,7 +311,7 @@ fn root_require_retained_rejection_cannot_be_erased() {
 }
 
 #[test]
-fn round1_strict_require_error_retains_location_and_typed_cause() {
+fn strict_require_error_retains_location_and_typed_cause() {
     use std::error::Error;
     let directory = tempfile::tempdir().unwrap();
     let upstream_dir = directory.path().join("upstream");

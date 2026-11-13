@@ -443,21 +443,21 @@ require cidr_block != '', 'CIDR block cannot be empty'
 
 A `require` outside a module is a validation error:
 `` `require` is only allowed inside a module ``. In a root configuration
-(directory with no `arguments` or `attributes` block), `carina validate`,
-`carina lint`, `carina plan` (including `--out`), live `carina apply`,
-`carina destroy`, and `carina state refresh` reject each `require`, whether
-its condition is true or false. Parsing still checks the
+(directory with no `arguments` or `attributes` block), the configuration
+validation step that checks declarations and expressions rejects each
+`require`, whether its condition is true or false. Parsing still checks the
 condition's syntax and parse-time restrictions; a parse error is reported
 before the placement check. After parsing succeeds, the root rejection
 replaces general expression inference inside the condition, and the condition
-is never evaluated. These validating commands and the language server
+is never evaluated. Configuration validation and the language server
 report the rejection at the `require` keyword with
 a range covering the authored statement, including declarations in sibling files.
 
-Bootstrap and metadata loads can retain the same placement finding during
-judgement. `init`, `fmt`, `export`, `module`, and state subcommands other than
-`refresh` do not publish or reject those retained findings; they do not reject
-a `require` for its placement. Saved-plan apply follows the
+Loading configuration can retain the placement finding without reporting it.
+A command rejects the root `require` when it runs configuration validation;
+merely loading the files does not reject it. Whether validation runs can
+depend on the selected operation and the state being processed. Saved-plan
+apply follows the
 [saved-plan validation rules](/reference/dsl/modules/#when-constraints-run).
 
 A directory with no `arguments` or `attributes` block is a root configuration
