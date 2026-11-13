@@ -2677,6 +2677,9 @@ where
     pub fn backend_location(&self) -> Option<&'a DeclarationLocation> {
         self.backend_location
     }
+    pub fn backend_attribute_value(&self, name: &super::AttributeKey) -> Option<&'a Value<P, B>> {
+        self.file.backend.as_ref()?.attributes.get(name)
+    }
     pub fn backend_attribute_location<Q: indexmap::Equivalent<super::AttributeKey> + ?Sized>(
         &self,
         name: &Q,

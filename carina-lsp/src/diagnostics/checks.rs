@@ -2,7 +2,7 @@
 
 use carina_core::parser::ExportParamLike;
 use carina_core::validation::admission::configuration::backend::{
-    self as backend_admission, BackendAttributeError, LocatedBackendError,
+    BackendAttributeError, LocatedBackendError,
 };
 use std::collections::HashSet;
 
@@ -668,7 +668,7 @@ impl DiagnosticRun<'_> {
         // CLI validation reports only the structural backend-in-module error
         // for a module-definition directory. Keep editor diagnostics at the
         // same layer instead of adding backend-schema errors.
-        if carina_core::validation::is_module_definition(&merged.directory.parsed) {
+        if tree.is_module_definition() {
             return Vec::new();
         }
         // A duplicate backend has no single semantic owner. The parser
@@ -676,10 +676,7 @@ impl DiagnosticRun<'_> {
         if merged.directory.sole_backend_file.is_none() {
             return Vec::new();
         }
-        let Some(backend) = merged.directory.parsed.backend.as_ref() else {
-            return Vec::new();
-        };
-        let Err(error) = backend_admission::admit(backend) else {
+        let Some(Err(findings)) = tree.admit_backend() else {
             return Vec::new();
         };
 
@@ -691,9 +688,8 @@ impl DiagnosticRun<'_> {
                 // Suppress only those calls, including nested ones. A deferred
                 // builtin with unresolved arguments is still a genuine value-type
                 // mismatch and must remain visible, matching CLI validation.
-                if backend
-                    .attributes
-                    .get(error.attribute())
+                if tree
+                    .backend_attribute_value(error.attribute())
                     .is_some_and(|value| {
                         contains_matching_function_call(value, &|name| {
                             merged.directory.parsed.user_functions.contains_key(name)
@@ -706,8 +702,7 @@ impl DiagnosticRun<'_> {
                 render_merged(doc, &finding, DiagnosticSeverity::ERROR, error.to_string())
             };
 
-        error
-            .into_located(tree)
+        findings
             .into_iter()
             .filter_map(|finding| match finding {
                 LocatedBackendError::Attribute(finding) => attribute_diagnostic(finding),

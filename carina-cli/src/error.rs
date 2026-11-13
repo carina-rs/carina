@@ -1341,6 +1341,12 @@ pub enum AppError {
         >,
     ),
 
+    /// One backend failure when analysis cannot provide an authored location.
+    #[error("{0}")]
+    UnlocatedBackend(
+        Box<carina_core::validation::admission::configuration::backend::UnlocatedBackendError>,
+    ),
+
     /// An unsupported backend at its authored block.
     #[error("{0}")]
     UnsupportedBackend(

@@ -103,40 +103,77 @@ pub struct UnsupportedBackendError {
 }
 
 /// Backend failures located by their sole core-owned diagnostic conversion.
+/// An independently admitted error cannot be paired with an arbitrary tree.
+///
+/// ```compile_fail,E0599
+/// use carina_core::parser::AnalysisTree;
+/// use carina_core::validation::admission::configuration::backend::BackendConfigError;
+/// fn locate_unrelated(error: BackendConfigError, tree: &AnalysisTree<'_>) {
+///     error.into_located(tree);
+/// }
+/// ```
 #[derive(Debug)]
 pub enum LocatedBackendError {
     Attribute(parser::Located<BackendAttributeError>),
     Unsupported(parser::Located<UnsupportedBackendError>),
 }
 
+/// One typed backend failure when no authored analysis tree is available.
+#[derive(Debug, Error)]
+pub enum UnlocatedBackendError {
+    #[error(transparent)]
+    Attribute(#[from] BackendAttributeError),
+    #[error(transparent)]
+    Unsupported(#[from] UnsupportedBackendError),
+}
+
 impl BackendConfigError {
-    pub fn into_located<P: ValueKind, T: ValueKind, D, B: BindingAddress, E>(
-        self,
-        tree: &parser::AnalysisTree<'_, P, T, D, B, E>,
-    ) -> Vec<LocatedBackendError>
-    where
-        D: parser::DeferredForPhaseTraversal<P, T, B>,
-    {
+    /// Preserve individual failures when analysis cannot provide locations.
+    pub fn into_unlocated(self) -> Vec<UnlocatedBackendError> {
         match self {
             Self::Invalid(errors) => errors
                 .errors
                 .into_iter()
-                .map(|error| {
-                    LocatedBackendError::Attribute(parser::Located::new(
-                        tree.backend_attribute_location(error.attribute()).clone(),
-                        error,
-                    ))
-                })
+                .map(UnlocatedBackendError::Attribute)
                 .collect(),
-            Self::UnsupportedBackend(error) => {
-                vec![LocatedBackendError::Unsupported(parser::Located::new(
-                    tree.backend_location()
-                        .expect("backend declaration provenance")
-                        .clone(),
-                    error,
-                ))]
-            }
+            Self::UnsupportedBackend(error) => vec![UnlocatedBackendError::Unsupported(error)],
         }
+    }
+}
+
+impl<P: PlaceholderKind, T: ValueKind, D, B: BindingAddress, E>
+    parser::AnalysisTree<'_, P, T, D, B, E>
+where
+    D: parser::DeferredForPhaseTraversal<P, T, B>,
+{
+    /// Admit and locate this tree's own backend declaration, if present.
+    pub fn admit_backend(
+        &self,
+    ) -> Option<Result<AdmittedConfiguration<kind::BackendAttribute>, Vec<LocatedBackendError>>>
+    {
+        let backend = self.file().backend.as_ref()?;
+        Some(admit(backend).map_err(|error| {
+            error
+                .into_unlocated()
+                .into_iter()
+                .map(|error| match error {
+                    UnlocatedBackendError::Attribute(error) => {
+                        LocatedBackendError::Attribute(parser::Located::new(
+                            self.backend_attribute_location(error.attribute()).clone(),
+                            error,
+                        ))
+                    }
+                    UnlocatedBackendError::Unsupported(error) => {
+                        LocatedBackendError::Unsupported(parser::Located::new(
+                            self.backend_location()
+                                .expect("backend declaration provenance")
+                                .clone(),
+                            error,
+                        ))
+                    }
+                })
+                .collect()
+        }))
     }
 }
 

@@ -1,5 +1,73 @@
 use super::*;
 
+#[test]
+fn backend_admission_is_owned_by_its_analysis_tree() {
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let absent = parser::parse_file(
+        "let count = 1\n",
+        std::path::Path::new("main.crn"),
+        &context,
+    )
+    .unwrap();
+    let tree = parser::AnalysisTree::try_from_file(&absent).unwrap();
+    assert!(tree.admit_backend().is_none());
+
+    let path = std::path::Path::new("backend.crn");
+    let invalid = parser::parse_file(
+        "backend local {\n  path = 1\n  typo = true\n}\n",
+        path,
+        &context,
+    )
+    .unwrap();
+    let tree = parser::AnalysisTree::try_from_file(&invalid).unwrap();
+    let errors = tree.admit_backend().unwrap().unwrap_err();
+    assert_eq!(errors.len(), 2);
+    for (index, (finding, expected)) in errors
+        .into_iter()
+        .zip([
+            "Invalid attribute 'path' for backend type 'local': Type mismatch: expected String, got Int",
+            "Unknown attribute 'typo' for backend type 'local'",
+        ])
+        .enumerate()
+    {
+        let LocatedBackendError::Attribute(finding) = finding else {
+            panic!("expected an attribute failure")
+        };
+        assert_eq!(finding.detail().to_string(), expected);
+        assert_eq!(finding.location().file().path(), path);
+        assert_eq!(finding.location().span().start_line(), index + 2);
+        assert_eq!(finding.location().span().start_column(), 3);
+    }
+
+    let path = std::path::Path::new("unsupported.crn");
+    let unsupported = parser::parse_file("\nbackend gcs {}\n", path, &context).unwrap();
+    let tree = parser::AnalysisTree::try_from_file(&unsupported).unwrap();
+    let errors = tree.admit_backend().unwrap().unwrap_err();
+    assert_eq!(errors.len(), 1);
+    let LocatedBackendError::Unsupported(finding) = &errors[0] else {
+        panic!("expected an unsupported backend")
+    };
+    assert_eq!(
+        finding.detail().to_string(),
+        "Unsupported backend type: gcs"
+    );
+    assert_eq!(finding.location().file().path(), path);
+    assert_eq!(finding.location().span().start_line(), 2);
+    assert_eq!(finding.location().span().start_column(), 1);
+
+    let valid = parser::parse_file(
+        "backend local { path = 'state.json' }\n",
+        std::path::Path::new("valid.crn"),
+        &context,
+    )
+    .unwrap();
+    let tree = parser::AnalysisTree::try_from_file(&valid).unwrap();
+    assert_eq!(
+        tree.admit_backend().unwrap().unwrap().backend_kind(),
+        BackendKind::Local
+    );
+}
+
 fn classification_errors() -> Vec<(KnowledgeError<AbsoluteBindingAddress>, &'static str)> {
     vec![
         (
