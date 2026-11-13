@@ -1,12 +1,12 @@
-use carina_core::provider::{ProviderPlan, ProviderValidationInputs};
+use carina_core::provider::{ProviderPlan, ProviderReadyConfig, ProviderValidationInputs};
 use carina_core::provider_text::GuestInputInventory;
 use carina_core::schema::ValidatedProviderSchemaWitness;
 
-pub fn fresh_session(plan: &ProviderPlan) {
-    let _ = plan.session("provider", None, None);
+pub fn fresh_session(plan: &ProviderPlan, config: &ProviderReadyConfig) {
+    let _ = plan.session(config);
 }
-pub fn fresh_builder(plan: &ProviderPlan) {
-    let _ = plan.session_builder("provider", None, None);
+pub fn fresh_builder(plan: &ProviderPlan, config: &ProviderReadyConfig) {
+    let _ = plan.session_builder(config);
 }
 pub fn inherit(inputs: &ProviderValidationInputs) {
     let _ = inputs.inherit_diagnostic_host(inputs);

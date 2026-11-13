@@ -355,7 +355,8 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
             )]))
             .into(),
             attribute_spans: Default::default(),
-        }),
+        })
+        .into(),
         plan: plan.to_snapshot(),
         sorted_resources: sorted_resources
             .iter()
@@ -497,7 +498,8 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
             )]))
             .into(),
             attribute_spans: Default::default(),
-        }),
+        })
+        .into(),
         plan: plan.to_snapshot(),
         sorted_resources: vec![],
         sorted_value_destroy_dependencies: vec![],

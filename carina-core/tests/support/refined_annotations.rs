@@ -6,8 +6,8 @@ use carina_core::{
     },
     schema::{
         AttributeSchema, AttributeType, PatternMatch, PatternSpec, ResourceSchema, SchemaRegistry,
-        StringIdentityLayer, StringMemberConstraints, TypeIdentity, ValidatedConfigSchema,
-        ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+        StringIdentityLayer, StringMemberConstraints, TypeIdentity, ValidatedProviderSchemaWitness,
+        ValidatedResourceSchema,
     },
 };
 use std::{path::Path, sync::Arc};
@@ -20,9 +20,7 @@ impl ProviderFactory for Factory {
     fn display_name(&self) -> &str {
         "account annotation fixture"
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        Default::default()
-    }
+
     fn validate_config(
         &self,
         _: &CanonicalProviderConfigAttributes,

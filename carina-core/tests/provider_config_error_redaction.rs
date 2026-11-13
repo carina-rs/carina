@@ -51,7 +51,6 @@ fn assert_config_redaction_with_retryability(
         &support::NativeConfigErrorFactory(error),
         "mock",
         &((attributes.clone()).into()),
-        &Default::default(),
     )
     .unwrap_err();
     let error = failure.provider_error().unwrap().clone();

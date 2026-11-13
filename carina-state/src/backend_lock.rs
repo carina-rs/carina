@@ -119,24 +119,14 @@ impl BackendLock {
     pub fn for_config<P: PlaceholderKind, B: BindingAddress>(
         backend_config: Option<&carina_core::parser::BackendConfig<P, B>>,
     ) -> BackendResult<Self> {
-        match backend_config {
-            Some(cfg) => BackendConfig::try_from(cfg)
-                .map(|config| Self::from_config(&config))
-                .map_err(BackendError::from),
-            None => Ok(Self::local_default()),
-        }
+        crate::BackendConfigurationSource::from(backend_config).backend_lock()
     }
 
     /// Expanded-config counterpart of [`BackendLock::for_config`].
     pub fn for_expanded_config(
         backend_config: Option<&carina_core::parser::ExpandedBackendConfig>,
     ) -> BackendResult<Self> {
-        match backend_config {
-            Some(cfg) => BackendConfig::try_from(cfg)
-                .map(|config| Self::from_config(&config))
-                .map_err(BackendError::from),
-            None => Ok(Self::local_default()),
-        }
+        Self::for_config(backend_config)
     }
 
     /// Path to the lock file under `base_dir` (project root).

@@ -1,5 +1,6 @@
 //! Fixtures available to downstream tests with the `test-utils` feature.
 
+pub mod configuration;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod loopback;
 
@@ -363,9 +364,7 @@ pub fn loaded_fixture_snapshot(
         fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
             self.witness.clone()
         }
-        fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-            Default::default()
-        }
+
         fn validate_config(
             &self,
             _: &crate::provider::CanonicalProviderConfigAttributes,

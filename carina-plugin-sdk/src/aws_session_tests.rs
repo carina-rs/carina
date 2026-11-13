@@ -53,7 +53,7 @@ fn config(source: Generations, diagnostics: ProviderDiagnostics) -> aws_types::S
 
 #[tokio::test]
 async fn aws_session_source_preserves_credential_expiry() {
-    let session = ProviderPlan::state_only().session("aws", None, None);
+    let session = ProviderPlan::state_only().test_session("aws", None, None);
     let config = config(
         Generations::default(),
         ProviderDiagnostics::from_session(&session),
@@ -70,7 +70,7 @@ async fn aws_session_source_preserves_credential_expiry() {
 #[tokio::test]
 async fn aws_session_source_refreshes_and_masks_every_generation() {
     let (session, events) =
-        captured_session(ProviderPlan::state_only().session_builder("aws", None, None));
+        captured_session(ProviderPlan::state_only().test_session_builder("aws", None, None));
     let diagnostics = ProviderDiagnostics::from_session(&session);
     let source = Generations::default();
     let config = config(source.clone(), diagnostics.clone());
@@ -110,7 +110,7 @@ async fn aws_session_source_refreshes_and_masks_every_generation() {
 
 #[tokio::test]
 async fn aws_session_source_registration_failure_preserves_its_cause() {
-    let session = ProviderPlan::state_only().session("aws", None, None);
+    let session = ProviderPlan::state_only().test_session("aws", None, None);
     let config = config(
         Generations::default(),
         ProviderDiagnostics::from_session(&session),
@@ -165,7 +165,7 @@ fn metadata_credentials() -> Credentials {
     credentials
 }
 async fn credentials_from_parts(credentials: Credentials) -> Credentials {
-    let session = ProviderPlan::state_only().session("aws", None, None);
+    let session = ProviderPlan::state_only().test_session("aws", None, None);
     let config = AwsSdkParts::new(
         SdkCredentialsSource(credentials),
         ProviderDiagnostics::from_session(&session),

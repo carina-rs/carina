@@ -1362,7 +1362,7 @@ mod writer_tests {
         const CHILD: &str = "CARINA_4334_FIX4_WRITER_CHILD";
         if std::env::var_os(CHILD).is_some() {
             let session = crate::provider::ProviderPlan::state_only()
-                .session_builder("writer-test", None, None)
+                .test_session_builder("writer-test", None, None)
                 .with_diagnostic_sink(write_default_event)
                 .build();
             let (inputs, call) = session.guest_inventory().for_diagnostic_call();

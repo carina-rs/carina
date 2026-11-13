@@ -3,7 +3,6 @@
 use super::*;
 use crate::binding_index::RefType;
 use crate::resource::{DeferredValue, ReferencePath};
-use crate::schema::SinkAuthority;
 use crate::schema::assignability::AssignmentRelation;
 
 #[test]
@@ -284,10 +283,7 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
                 .push(SchemaRequirement::Reference);
             return Ok(());
         };
-        let sink = attr.in_schema(contract.defs()).with_authority(
-            &context.provider.catalog().custom_types,
-            SinkAuthority::Owner(&contract.owner),
-        );
+        let sink = contract.sink_type(attr, context.provider.catalog());
         if path == &contract.path
             && let Some((name, declared)) = context.declaration
         {
@@ -819,10 +815,7 @@ mod discharge_tests {
                     let contract = destination.contract.as_deref().unwrap();
                     let crate::schema::TypeAssignability::Unchecked(missing) = source
                         .in_schema(contract.defs())
-                        .assignment_to(contract.attr().in_schema(contract.defs()).with_authority(
-                            &catalog.custom_types,
-                            SinkAuthority::Owner(&contract.owner),
-                        ))
+                        .assignment_to(contract.sink_type(contract.attr(), catalog))
                     else {
                         panic!("unloaded source annotation must defer assignment");
                     };

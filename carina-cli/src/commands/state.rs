@@ -60,7 +60,7 @@ use crate::cursor::CursorReveal;
 use crate::error::AppError;
 use crate::wiring::{
     MigrationCheckProviderLoad, ProviderLoad, ValidatedConfig, get_read_only_provider_with_ctx,
-    prepare_default_provider_ready_config, refresh_loaded_orphan_with_retry,
+    prepare_default_provider_construction, refresh_loaded_orphan_with_retry,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -1701,13 +1701,11 @@ async fn create_state_bucket_delete_provider<R>(
     let ctx = validated_config.context();
     let factory = provider_mod::find_factory(ctx.factories(), provider_name)
         .ok_or_else(|| format!("No provider factory found for '{provider_name}'"))?;
-    let config = prepare_default_provider_ready_config(factory, provider_name, provider_configs)?;
-    provider_mod::ProviderBoundary::initialize(
-        factory,
-        &plan.session(provider_name, None, Some(&config)),
-    )
-    .await
-    .map_err(AppError::Provider)
+    let construction =
+        prepare_default_provider_construction(factory, provider_name, provider_configs, plan)?;
+    provider_mod::ProviderBoundary::initialize(&construction)
+        .await
+        .map_err(AppError::Provider)
 }
 
 /// Run state refresh command
@@ -4065,10 +4063,6 @@ mod tests {
             "state refresh module constraint provider"
         }
 
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
-
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -4092,7 +4086,7 @@ mod tests {
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                Default::default(),
                 Default::default(),
                 Vec::new(),
             )
@@ -4210,10 +4204,6 @@ mod tests {
             "cancelling state refresh provider"
         }
 
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
-
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -4241,7 +4231,7 @@ mod tests {
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                Default::default(),
                 Default::default(),
                 Vec::new(),
             )

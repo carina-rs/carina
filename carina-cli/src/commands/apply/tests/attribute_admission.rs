@@ -82,7 +82,7 @@ async fn saved_plan_unknown_role_arn_is_checked_before_schedule_dispatch() {
             state_lineage: None,
             state_serial: None,
             provider_configs: saved_provider_configs(configs.clone()),
-            backend_config: None,
+            backend_config: crate::commands::plan::SavedBackendConfig::default(),
             plan: planned.plan.to_snapshot(),
             sorted_resources: planned
                 .desired_resources
@@ -304,7 +304,7 @@ fn saved_plan_layered_scalars_reload_and_validate_both_layers() {
                 unresolved_attributes: Default::default(),
                 binding: None,
             }]),
-            backend_config: None,
+            backend_config: crate::commands::plan::SavedBackendConfig::default(),
             plan: carina_core::plan::SnapshotPlan::default(),
             sorted_resources: vec![resolved(resource).as_inner().to_snapshot()],
             sorted_value_destroy_dependencies: vec![Default::default()],

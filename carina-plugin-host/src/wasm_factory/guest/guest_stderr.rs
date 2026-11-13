@@ -171,17 +171,19 @@ mod tests {
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            carina_core::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::new())
-                .unwrap()
-        }
+
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
             Vec::new()
         }
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 Vec::new(),
-                self.provider_config_attribute_types(),
+                {
+                    carina_core::schema::ValidatedConfigSchema::validate(
+                        std::collections::BTreeMap::new(),
+                    )
+                    .unwrap()
+                },
                 Default::default(),
                 Vec::new(),
             )

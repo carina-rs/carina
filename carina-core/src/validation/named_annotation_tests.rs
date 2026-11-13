@@ -25,9 +25,7 @@ impl ProviderFactory for Factory {
     fn display_name(&self) -> &str {
         self.owner
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        ValidatedConfigSchema::validate(self.config.clone()).unwrap()
-    }
+
     fn validate_config(
         &self,
         _: &CanonicalProviderConfigAttributes,
@@ -56,7 +54,7 @@ impl ProviderFactory for Factory {
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            ValidatedConfigSchema::validate(self.config.clone()).unwrap(),
             Default::default(),
             vec![],
         )

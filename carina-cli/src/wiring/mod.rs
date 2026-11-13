@@ -73,6 +73,9 @@ use carina_core::effect::{AddressedMoves, ResolvedExplicitMove, ResolvedMovePair
 use carina_core::paths::ResolvedPath;
 use carina_core::provider::{MetadataComparisonResolver, ResourceComparisonResolver};
 use carina_core::resource::PersistedDirectives;
+use carina_core::validation::admission::configuration::provider::{
+    construction as prepare_provider_construction, empty_construction,
+};
 use legacy_migration::DeferredForExpansionWitness;
 pub(crate) use legacy_migration::{
     MaterializedConfiguration, classify_legacy_state, replay_legacy_migration,
@@ -111,8 +114,7 @@ use carina_core::executor::normalized::{
     apply_host_desired_normalization_slice, states_contain_unknown,
 };
 use carina_core::executor::{
-    ProviderReadyConfig, UnresolvedDataSourceInput, UnresolvedResource,
-    prepare_provider_ready_config, unresolved_data_source_inputs,
+    UnresolvedDataSourceInput, UnresolvedResource, unresolved_data_source_inputs,
 };
 use carina_core::hint::ProjectCommand;
 use carina_core::identifier::{
@@ -4041,7 +4043,7 @@ fn detect_anonymous_to_named_moves_with_ctx(
         providers,
         &|provider_name| {
             provider_mod::find_factory(ctx.factories(), provider_name)
-                .map(ProviderFactory::provider_config_attribute_types)
+                .map(|factory| factory.schema_witness().config().clone())
         },
     )?;
     Ok(identifier::detect_anonymous_to_named_renames(
@@ -4925,14 +4927,13 @@ pub fn normalize_state_with_ctx(
             configs.push(implicit.as_ref());
         }
         for resolved_config in configs {
-            let config = rt
+            let construction = rt
                 .block_on(async {
-                    prepare_provider_ready_config(factory.as_ref(), resolved_config)
+                    prepare_provider_construction(factory.as_ref(), resolved_config, plan)
                 })
                 .map_err(HostError::from)?;
-            let session = plan.session(factory.name(), resolved_config.binding(), Some(&config));
             router.add_initialized_normalizer(rt.block_on(
-                provider_mod::ProviderBoundary::initialize_normalizer(factory.as_ref(), &session),
+                provider_mod::ProviderBoundary::initialize_normalizer(&construction),
             )?);
         }
     }
@@ -5280,16 +5281,21 @@ async fn build_provider_router<C: ProviderConfigurations>(
         progress_sink.line("Using mock provider".cyan(color_mode));
         router.add_provider(
             BUILTIN_PROVIDER_NAME.to_string(),
-            provider_mod::ProviderBoundary::initialize(
+            provider_mod::ProviderBoundary::initialize(&empty_construction(
                 builtin_mock,
-                &plan.session(BUILTIN_PROVIDER_NAME, None, None),
-            )
+                &provider_mod::ProviderInstanceKey::new(BUILTIN_PROVIDER_NAME, None),
+                plan,
+            )?)
             .await?,
         );
         router.add_provider(
             String::new(),
-            provider_mod::ProviderBoundary::initialize(builtin_mock, &plan.session("", None, None))
-                .await?,
+            provider_mod::ProviderBoundary::initialize(&empty_construction(
+                builtin_mock,
+                &provider_mod::ProviderInstanceKey::new("", None),
+                plan,
+            )?)
+            .await?,
         );
     }
 
@@ -5316,14 +5322,22 @@ fn kind_default_source<'a, C: ProviderConfigurations>(
 ///
 /// Both state-bucket bootstrap and deletion route through this typed seam, so
 /// neither can recover an attribute map from `parsed.providers`. Providers
-/// without a declared block retain the historical empty-config fallback.
-pub(crate) fn prepare_default_provider_ready_config<C: ProviderConfigurations>(
-    factory: &dyn ProviderFactory,
+/// without a declared block use admitted empty configuration.
+pub(crate) fn prepare_default_provider_construction<'a, C: ProviderConfigurations>(
+    factory: &'a dyn ProviderFactory,
     provider_name: &str,
     configs: &C,
-) -> Result<ProviderReadyConfig, carina_core::executor::ProviderConfigPreparationError> {
+    plan: &provider_mod::ProviderPlan,
+) -> Result<
+    carina_core::validation::admission::configuration::provider::ProviderConstruction<'a>,
+    carina_core::executor::ProviderConfigPreparationError,
+> {
     let config = configs.provider_or_implicit(provider_name);
-    prepare_provider_ready_config(factory, config.as_ref())
+    carina_core::validation::admission::configuration::provider::default_construction(
+        factory,
+        config.as_ref(),
+        plan,
+    )
 }
 
 /// Format the "Using <provider>" announcement emitted by both the
@@ -5374,10 +5388,10 @@ async fn instantiate_provider_into_router(
     let color_mode = ctx.runtime().color_mode();
     let binding = provider_config.binding();
     if let Some(factory) = provider_mod::find_factory(ctx.factories(), provider_config.name()) {
-        let config = prepare_provider_ready_config(factory, provider_config)?;
+        let construction = prepare_provider_construction(factory, provider_config, plan)?;
+        let config = construction.session().configuration();
         let displayed_source = provider_config.source().or(inherited_source);
-        let session = plan.session(factory.name(), binding, Some(&config));
-        let provider = provider_mod::ProviderBoundary::initialize(factory, &session)
+        let provider = provider_mod::ProviderBoundary::initialize(&construction)
             .await
             .map_err(|e| e.for_provider(provider_config.name().to_string()))?;
         progress_sink.line(
@@ -5400,10 +5414,15 @@ async fn instantiate_provider_into_router(
                 provider_config.name(),
                 binding.map(str::to_owned),
             ),
-            provider_mod::ProviderBoundary::initialize(
+            // Built-in mock consumes admitted empty configuration.
+            provider_mod::ProviderBoundary::initialize(&empty_construction(
                 builtin_mock,
-                &plan.session(provider_config.name(), binding, None),
-            )
+                &provider_mod::ProviderInstanceKey::new(
+                    provider_config.name(),
+                    binding.map(str::to_owned),
+                ),
+                plan,
+            )?)
             .await?,
         );
     } else if let Some(message) = missing_provider_message(provider_config, inherited_source) {
@@ -5529,25 +5548,22 @@ pub(crate) async fn create_normalizers_from_configs_with_ctx(
 
     for config in configs.iter() {
         if let Some(factory) = provider_mod::find_factory(ctx.factories(), config.name()) {
-            let ready = prepare_provider_ready_config(factory, config)?;
+            let construction = prepare_provider_construction(factory, config, plan)?;
             router.add_initialized_normalizer(
-                provider_mod::ProviderBoundary::initialize_normalizer(
-                    factory,
-                    &plan.session(factory.name(), config.binding(), Some(&ready)),
-                )
-                .await?,
+                provider_mod::ProviderBoundary::initialize_normalizer(&construction).await?,
             );
         }
     }
 
     if let Some(builtin_mock) = ctx.builtin_mock() {
-        let session = plan.session(BUILTIN_PROVIDER_NAME, None, None);
+        let factory = builtin_mock.create_normalizer();
+        let construction = empty_construction(
+            &factory,
+            &provider_mod::ProviderInstanceKey::new(BUILTIN_PROVIDER_NAME, None),
+            plan,
+        )?;
         router.add_initialized_normalizer(
-            provider_mod::ProviderBoundary::initialize_normalizer(
-                &builtin_mock.create_normalizer(),
-                &session,
-            )
-            .await?,
+            provider_mod::ProviderBoundary::initialize_normalizer(&construction).await?,
         );
     }
     Ok(router)

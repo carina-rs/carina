@@ -23,9 +23,7 @@ impl ProviderFactory for Factory {
     fn display_name(&self) -> &str {
         "replacement order fixture"
     }
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
+
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -47,13 +45,14 @@ impl ProviderFactory for Factory {
     fn create_normalizer(
         &self,
         _: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -341,7 +340,7 @@ async fn plan(fixture: &ApplyCancellationFixture, cloud: &Cloud) -> PlanFile {
         &source,
         planned.resources().parsed(),
         prepared.provider_inputs.configs(),
-        None,
+        crate::commands::plan::SavedBackendConfig::default(),
         &state,
         planned.resources(),
         &planned,

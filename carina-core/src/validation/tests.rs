@@ -9556,10 +9556,6 @@ impl crate::provider::ProviderFactory for RecordingFactory {
         &self.name
     }
 
-    fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         attributes: &crate::provider::CanonicalProviderConfigAttributes,
@@ -9586,7 +9582,7 @@ impl crate::provider::ProviderFactory for RecordingFactory {
     fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
         crate::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -9680,20 +9676,6 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
             "awscc"
         }
 
-        fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-            crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
-                "region".to_string(),
-                PatternAttributeType::enum_(
-                    crate::schema::enum_identity("Region", Some("aws")),
-                    Some(vec!["ap-northeast-1".to_string()]),
-                    vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
-                    None,
-                    None,
-                ),
-            )]))
-            .expect("test provider config schema must be valid")
-        }
-
         fn validate_config(
             &self,
             attributes: &crate::provider::CanonicalProviderConfigAttributes,
@@ -9720,7 +9702,17 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
         fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
             crate::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "region".to_string(),
+                    PatternAttributeType::enum_(
+                        crate::schema::enum_identity("Region", Some("aws")),
+                        Some(vec!["ap-northeast-1".to_string()]),
+                        vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
+                        None,
+                        None,
+                    ),
+                )]))
+                .expect("test provider config schema must be valid"),
                 Default::default(),
                 Vec::new(),
             )

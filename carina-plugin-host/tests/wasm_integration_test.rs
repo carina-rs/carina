@@ -87,9 +87,7 @@ impl ProviderFactory for WireConfigFactory {
     fn display_name(&self) -> &str {
         "native wire fixture"
     }
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        carina_core::schema::ValidatedConfigSchema::validate(Default::default()).unwrap()
-    }
+
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -113,7 +111,7 @@ impl ProviderFactory for WireConfigFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            carina_core::schema::ValidatedConfigSchema::validate(Default::default()).unwrap(),
             Default::default(),
             Vec::new(),
         )
@@ -6738,12 +6736,12 @@ async fn test_wasm_normalize_state_trap_is_an_error_and_does_not_mutate_state() 
     let attributes = indexmap::IndexMap::new();
     let config = ready_config(&factory, &attributes);
     let session =
-        carina_core::provider::ProviderPlan::state_only().session("mock", None, Some(&config));
-    let provider = carina_core::provider::ProviderBoundary::initialize(&factory, &session)
+        carina_core::provider::ProviderPlan::state_only().test_session("mock", None, Some(&config));
+    let provider = carina_core::provider::ProviderBoundary::initialize_for_test(&factory, &session)
         .await
         .expect("provider should initialize");
     let normalizer =
-        carina_core::provider::ProviderBoundary::initialize_normalizer(&factory, &session)
+        carina_core::provider::ProviderBoundary::initialize_normalizer_for_test(&factory, &session)
             .await
             .expect("normalizer should initialize");
     let id = ResourceId::with_provider_identity(
@@ -6921,12 +6919,12 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
     let attributes = indexmap::IndexMap::new();
     let config = ready_config(&factory, &attributes);
     let session =
-        carina_core::provider::ProviderPlan::state_only().session("mock", None, Some(&config));
-    let provider = carina_core::provider::ProviderBoundary::initialize(&factory, &session)
+        carina_core::provider::ProviderPlan::state_only().test_session("mock", None, Some(&config));
+    let provider = carina_core::provider::ProviderBoundary::initialize_for_test(&factory, &session)
         .await
         .expect("provider should initialize");
     let normalizer =
-        carina_core::provider::ProviderBoundary::initialize_normalizer(&factory, &session)
+        carina_core::provider::ProviderBoundary::initialize_normalizer_for_test(&factory, &session)
             .await
             .expect("normalizer should initialize");
 
@@ -7657,4 +7655,47 @@ async fn wasm_pattern_modes_preserve_matching_and_reason() {
             }
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn undeclared_provider_config_keys_reach_native_and_wasm_factories() {
+    let path = wasm_path()
+        .expect("mock WASM fixture must be built for opaque configuration passthrough tests");
+    let (factory, _cache) = load_factory(&path).await;
+    let attrs = indexmap::IndexMap::from([
+        (
+            "undeclared_probe".into(),
+            Value::Concrete(ConcreteValue::String("accepted".into())),
+        ),
+        (
+            "__mock_reference_scope_region__".into(),
+            Value::Concrete(ConcreteValue::String("probe-region".into())),
+        ),
+    ]);
+    for key in attrs.keys() {
+        assert!(
+            !factory
+                .schema_witness()
+                .config()
+                .clone()
+                .parts()
+                .contains_key(key)
+        );
+    }
+    let ready = ready_config(&factory, &attrs);
+    let initialized = factory.initialize_fixture(None, &ready).await.unwrap();
+    assert!(format!("{:?}", initialized.reference_scope()).contains("probe-region"));
+    let native = carina_provider_mock::ConfiguredBuiltinMock::new(
+        Default::default(),
+        carina_provider_mock::MockScope::memory(),
+    );
+    assert!(native.schema_witness().config().clone().parts().is_empty());
+    let ready = ready_config(&native, &attrs);
+    native.initialize_fixture(None, &ready).await.unwrap();
+    let rejected = indexmap::IndexMap::from([(
+        "__mock_validate_config_cause__".into(),
+        Value::Concrete(ConcreteValue::String("sentinel rejection".into())),
+    )]);
+    let config = resolved_provider_config("mock", rejected);
+    assert!(carina_core::executor::prepare_provider_ready_config(&factory, &config).is_err());
 }

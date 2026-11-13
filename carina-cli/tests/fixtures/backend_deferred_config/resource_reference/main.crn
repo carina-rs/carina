@@ -1,0 +1,1 @@
+let other = mock.test.resource { name = 'other' }

@@ -518,9 +518,13 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
         .expect("load mock HTTP WASM provider")
         .with_http_test_route("phase-test.invalid", server_address);
     let fresh_ready = mock_http_ready_config(&fresh_factory);
-    let fresh_initialized = carina_core::provider::ProviderBoundary::initialize(
+    let fresh_initialized = carina_core::provider::ProviderBoundary::initialize_for_test(
         &fresh_factory,
-        &carina_core::provider::ProviderPlan::state_only().session("aws", None, Some(&fresh_ready)),
+        &carina_core::provider::ProviderPlan::state_only().test_session(
+            "aws",
+            None,
+            Some(&fresh_ready),
+        ),
     )
     .await
     .expect("initialize mock HTTP provider");
@@ -598,9 +602,9 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
         .expect("load replacement mock HTTP WASM provider")
         .with_http_test_route("phase-test.invalid", server_address);
     let replacement_ready = mock_http_ready_config(&replacement_factory);
-    let replacement_initialized = carina_core::provider::ProviderBoundary::initialize(
+    let replacement_initialized = carina_core::provider::ProviderBoundary::initialize_for_test(
         &replacement_factory,
-        &carina_core::provider::ProviderPlan::state_only().session(
+        &carina_core::provider::ProviderPlan::state_only().test_session(
             "aws",
             None,
             Some(&replacement_ready),
@@ -1181,7 +1185,7 @@ for account_id in orgs.accounts {
             unresolved_attributes: Default::default(),
             binding: None,
         }]),
-        backend_config: None,
+        backend_config: crate::commands::plan::SavedBackendConfig::default(),
         plan: plan.to_snapshot(),
         sorted_resources: (vec![resource.clone().into_value_snapshot()])
             .into_iter()
@@ -1316,7 +1320,7 @@ async fn run_saved_plan_schema_fingerprint_case(
             unresolved_attributes: Default::default(),
             binding: None,
         }]),
-        backend_config: None,
+        backend_config: crate::commands::plan::SavedBackendConfig::default(),
         plan: carina_core::value::redact_secrets_in_plan(&plan)
             .expect("redact saved-plan secret fixture"),
         sorted_resources: vec![
@@ -1588,7 +1592,7 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
             unresolved_attributes: Default::default(),
             binding: None,
         }]),
-        backend_config: None,
+        backend_config: crate::commands::plan::SavedBackendConfig::default(),
         plan: carina_core::plan::SnapshotPlan::default(),
         sorted_resources: Vec::new(),
         unresolved_resources: Vec::new(),
@@ -1892,7 +1896,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         state_lineage: None,
         state_serial: None,
         provider_configs: saved_provider_configs(Vec::new()),
-        backend_config: None,
+        backend_config: crate::commands::plan::SavedBackendConfig::default(),
         plan: carina_core::plan::SnapshotPlan::default(),
         sorted_resources: Vec::new(),
         unresolved_resources: Vec::new(),
@@ -2034,7 +2038,7 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
         state_lineage: None,
         state_serial: None,
         provider_configs: saved_provider_configs(Vec::new()),
-        backend_config: None,
+        backend_config: crate::commands::plan::SavedBackendConfig::default(),
         plan: carina_core::plan::SnapshotPlan::default(),
         sorted_resources: Vec::new(),
         unresolved_resources: Vec::new(),
@@ -2203,7 +2207,7 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
             unresolved_attributes: Default::default(),
             binding: None,
         }]),
-        backend_config: None,
+        backend_config: crate::commands::plan::SavedBackendConfig::default(),
         plan: carina_core::plan::SnapshotPlan::default(),
         sorted_resources: (vec![resolved_inner(resource.clone())])
             .into_iter()
@@ -2369,7 +2373,7 @@ async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write
             unresolved_attributes: Default::default(),
             binding: None,
         }]),
-        backend_config: None,
+        backend_config: crate::commands::plan::SavedBackendConfig::default(),
         plan: carina_core::plan::SnapshotPlan::default(),
         sorted_resources: (vec![
             resolved_inner(dependency.clone()),
@@ -2461,10 +2465,6 @@ impl ProviderFactory for FailBCreateFactory {
         "Mock provider with B create failure"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -2487,6 +2487,7 @@ impl ProviderFactory for FailBCreateFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -2494,7 +2495,7 @@ impl ProviderFactory for FailBCreateFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -2562,7 +2563,7 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
         state_lineage: None,
         state_serial: None,
         provider_configs: saved_provider_configs(vec![provider_config]),
-        backend_config: None,
+        backend_config: crate::commands::plan::SavedBackendConfig::default(),
         plan: carina_core::plan::SnapshotPlan::default(),
         sorted_resources: Vec::new(),
         unresolved_resources: Vec::new(),
@@ -2664,7 +2665,7 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
         state_lineage: None,
         state_serial: None,
         provider_configs: deserialize_saved_provider_configs(provider_configs),
-        backend_config: None,
+        backend_config: crate::commands::plan::SavedBackendConfig::default(),
         plan: carina_core::plan::SnapshotPlan::default(),
         sorted_resources: Vec::new(),
         unresolved_resources: Vec::new(),
@@ -3279,10 +3280,6 @@ impl ProviderFactory for ApplyTimeReadFactory {
         "Mock provider for apply-time data-source reads"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -3306,6 +3303,7 @@ impl ProviderFactory for ApplyTimeReadFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -3313,7 +3311,7 @@ impl ProviderFactory for ApplyTimeReadFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -3486,10 +3484,6 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
         "AWSCC apply cascade test provider"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -3513,6 +3507,7 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -3520,7 +3515,7 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -4801,7 +4796,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         state_lineage: None,
         state_serial: None,
         provider_configs,
-        backend_config: None,
+        backend_config: crate::commands::plan::SavedBackendConfig::default(),
         plan: plan.to_snapshot(),
         sorted_resources: (vec![
             target.clone().into_value_snapshot(),
@@ -4977,7 +4972,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
             unresolved_attributes: Default::default(),
             binding: None,
         }]),
-        backend_config: None,
+        backend_config: crate::commands::plan::SavedBackendConfig::default(),
         plan: plan.to_snapshot(),
         sorted_resources: (vec![resolved_inner(producer.clone()), consumer_for_sorted])
             .into_iter()
@@ -5075,7 +5070,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         state_lineage: None,
         state_serial: None,
         provider_configs: saved_provider_configs(Vec::new()),
-        backend_config: None,
+        backend_config: crate::commands::plan::SavedBackendConfig::default(),
         plan: carina_core::plan::SnapshotPlan::default(),
         sorted_resources: Vec::new(),
         sorted_value_destroy_dependencies: Vec::new(),
@@ -5153,7 +5148,7 @@ async fn saved_plan_provider_validation_preserves_typed_source_and_replan_hint()
             unresolved_attributes: Default::default(),
             binding: None,
         }]),
-        backend_config: None,
+        backend_config: crate::commands::plan::SavedBackendConfig::default(),
         plan: carina_core::plan::SnapshotPlan::default(),
         sorted_resources: Vec::new(),
         unresolved_resources: Vec::new(),
@@ -5682,7 +5677,7 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
             unresolved_attributes: Default::default(),
             binding: None,
         }]),
-        backend_config: None,
+        backend_config: crate::commands::plan::SavedBackendConfig::default(),
         plan: plan.to_snapshot(),
         sorted_resources: (vec![resource.clone().into_value_snapshot()])
             .into_iter()
@@ -11874,7 +11869,7 @@ mod saved_plan_version_tests {
             state_lineage: None,
             state_serial: None,
             provider_configs: saved_provider_configs(Vec::new()),
-            backend_config: None,
+            backend_config: crate::commands::plan::SavedBackendConfig::default(),
             plan: plan.to_snapshot(),
             sorted_resources: (vec![resolved_inner(resource.clone())])
                 .into_iter()
