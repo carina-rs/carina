@@ -403,31 +403,6 @@ fn fingerprints_pin_sha256_and_byte_length() {
 }
 
 #[test]
-fn probe_secret_observations_use_production_payload_and_snapshot_hashes() {
-    let payload: SecretPayload<
-        crate::resource::NoPlaceholder,
-        crate::resource::AbsoluteBindingAddress,
-    > = Box::new(Value::Concrete(ConcreteValue::String(
-        "producer-canary".into(),
-    )))
-    .into();
-    let (_, production) = record(|| payload.hash(None).unwrap());
-    let (_, observed) = record(|| observe_secret(&payload).unwrap());
-    assert_eq!(observed, production);
-    assert_eq!(
-        observed[0].owner,
-        InputOwner::SecretProducer(SecretProducer::PayloadHash)
-    );
-    let (_, snapshot) = record(|| observe_snapshot_secret(&payload).unwrap());
-    assert_eq!(snapshot.len(), 1);
-    assert_eq!(
-        snapshot[0].owner,
-        InputOwner::SecretProducer(SecretProducer::SnapshotHash)
-    );
-    assert_eq!(snapshot[0].writes, production[0].writes);
-}
-
-#[test]
 fn module_source_recording_is_an_additive_provided_method() {
     struct ExternalModuleSource;
     impl crate::resource::AnonymousIdentityModuleSource for ExternalModuleSource {
@@ -458,7 +433,7 @@ fn address_key_observations_preserve_the_production_address_and_source_binding_n
             "named.safe_private_key['private-key.with space']"
         );
         assert_eq!(
-            address_parts(&format!("module.{unsafe_key}.child")),
+            address_parts(&format!("module.{unsafe_key}.child")).unwrap(),
             [
                 AddressPart::Literal("module.named".into()),
                 AddressPart::MapKey("safe_private_key".into()),
@@ -467,4 +442,9 @@ fn address_key_observations_preserve_the_production_address_and_source_binding_n
             ]
         );
     });
+}
+
+#[test]
+fn address_parts_require_an_active_recorder() {
+    assert!(address_parts("named.private_key").is_none());
 }

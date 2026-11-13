@@ -1259,28 +1259,6 @@ expression: first
             {
               "boundary": "secret-material",
               "context": [
-                "snapshot-secret-hash"
-              ],
-              "feature_count": null,
-              "finishes": [],
-              "output": null,
-              "writes": [
-                {
-                  "hex": "226c69746572616c2d73656372657422",
-                  "operation": "canonical-json"
-                }
-              ]
-            }
-          ],
-          "path": "literal",
-          "producer": "snapshot-secret-hash",
-          "status": "available"
-        },
-        {
-          "inputs": [
-            {
-              "boundary": "secret-material",
-              "context": [
                 "secret-payload-hash"
               ],
               "feature_count": null,
@@ -1299,70 +1277,10 @@ expression: first
           "status": "available"
         },
         {
-          "inputs": [
-            {
-              "boundary": "secret-material",
-              "context": [
-                "snapshot-secret-hash"
-              ],
-              "feature_count": null,
-              "finishes": [],
-              "output": null,
-              "writes": [
-                {
-                  "hex": "226b6e6f776e2d6122",
-                  "operation": "canonical-json"
-                }
-              ]
-            }
-          ],
-          "path": "known",
-          "producer": "snapshot-secret-hash",
-          "status": "available"
-        },
-        {
-          "inputs": [
-            {
-              "boundary": "secret-material",
-              "context": [
-                "secret-payload-hash"
-              ],
-              "feature_count": null,
-              "finishes": [],
-              "output": null,
-              "writes": [
-                {
-                  "hex": "7b226b696e64223a227265736f757263655f726566222c2276616c7565223a7b22617474726962757465223a226e616d65222c2262696e64696e67223a22756e6b6e6f776e5f62227d7d",
-                  "operation": "canonical-json"
-                }
-              ]
-            }
-          ],
           "path": "unknown",
           "producer": "secret-payload-hash",
-          "status": "available"
-        },
-        {
-          "inputs": [
-            {
-              "boundary": "secret-material",
-              "context": [
-                "snapshot-secret-hash"
-              ],
-              "feature_count": null,
-              "finishes": [],
-              "output": null,
-              "writes": [
-                {
-                  "hex": "7b226b696e64223a227265736f757263655f726566222c2276616c7565223a7b22617474726962757465223a226e616d65222c2262696e64696e67223a22756e6b6e6f776e5f62227d7d",
-                  "operation": "canonical-json"
-                }
-              ]
-            }
-          ],
-          "path": "unknown",
-          "producer": "snapshot-secret-hash",
-          "status": "available"
+          "reason": "secret is not known offline",
+          "status": "unavailable"
         }
       ]
     },
@@ -1742,6 +1660,10 @@ expression: first
     }
   ],
   "secret_producers": {},
+  "status": {
+    "deferred": [],
+    "kind": "ok"
+  },
   "unattributed": [
     {
       "input": {

@@ -1129,10 +1129,6 @@ impl<P: ValueKind, B: BindingAddress> ProtectedSecret<'_, P, B> {
         &self,
         previous: Option<&crate::resource::RedactedSecretHash>,
     ) -> Result<crate::resource::RedactedSecretHash, WalkError> {
-        #[cfg(feature = "test-utils")]
-        let _recording = crate::identity_recording::secret_producer_context(
-            crate::identity_recording::SecretProducer::SnapshotHash,
-        );
         let value: Value<S, B> = self
             .payload
             .expose_plaintext()
@@ -1160,23 +1156,6 @@ impl<P: ValueKind, B: BindingAddress> ProtectedSecret<'_, P, B> {
             &material, previous,
         ))
     }
-}
-
-/// Test-only entry to the existing snapshot producer; no state backend needed.
-#[cfg(feature = "test-utils")]
-pub(crate) fn observe_snapshot_secret<
-    P: crate::resource::PlaceholderKind + serde::de::DeserializeOwned,
->(
-    payload: &SecretPayload<P, AbsoluteBindingAddress>,
-) -> Result<(), WalkError> {
-    let snapshot =
-        match payload.try_map(|value| Ok::<_, std::convert::Infallible>(value.to_snapshot())) {
-            Ok(snapshot) => snapshot,
-            Err(never) => match never {},
-        };
-    ProtectedSecret { payload: &snapshot }
-        .hash_snapshot::<P>(None)
-        .map(|_| ())
 }
 
 impl<P: ValueKind, B: BindingAddress> SecretChild<'_, Transform, P, B> {

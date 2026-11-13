@@ -23,7 +23,7 @@ fn resources() -> Vec<PreparedResource> {
         .zip(["first", "second"])
         .enumerate()
         .map(|(ordinal, (resource, address))| PreparedResource {
-            dump: json!({ "ordinal": ordinal, "address": address, "secret_material": [] }),
+            dump: json!({ "ordinal": ordinal, "address": address, "secret_material": [], "declaration": { "file": "fixture.crn", "start_byte": ordinal * 32 } }),
             key: identity_recording::resource_key(resource).unwrap(),
             loop_identities: Vec::new(),
             requires_identity: true,
@@ -58,9 +58,8 @@ fn reordered_inputs_follow_system_ids_and_keep_distinct_call_order() {
     ];
     let dump = complete_dump(
         PreparedProbe {
-            missing: Vec::new(),
             resources,
-            compositions: Vec::new(),
+            ..PreparedProbe::default()
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
@@ -83,9 +82,8 @@ fn reordered_inputs_follow_system_ids_and_keep_distinct_call_order() {
 fn missing_or_off_thread_identity_recording_is_incomplete() {
     let error = complete_dump(
         PreparedProbe {
-            missing: Vec::new(),
             resources: resources(),
-            compositions: Vec::new(),
+            ..PreparedProbe::default()
         },
         Vec::new(),
         &SourcePaths::new(Path::new(".")).unwrap(),
@@ -96,7 +94,7 @@ fn missing_or_off_thread_identity_recording_is_incomplete() {
         ProbeError::Incomplete(message) => assert!(
             message
                 .to_string()
-                .starts_with("missing identity hash inputs for resource ordinal 0"),
+                .starts_with("missing identity hash inputs for fixture.crn:0"),
             "{message}"
         ),
         error => panic!("wrong probe error: {error:?}"),
@@ -111,9 +109,8 @@ fn foreign_inputs_are_reported_and_make_the_probe_incomplete() {
     let inputs = vec![input(&resources[0], 1), input(&resources[1], 2), foreign];
     let document = super::finish_dump(
         PreparedProbe {
-            missing: Vec::new(),
             resources,
-            compositions: Vec::new(),
+            ..PreparedProbe::default()
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
@@ -142,9 +139,8 @@ fn observed_simhash_result_cannot_hide_missing_feature_inputs() {
     let inputs = vec![aggregate, input(&resources[1], 2)];
     let error = complete_dump(
         PreparedProbe {
-            missing: Vec::new(),
             resources,
-            compositions: Vec::new(),
+            ..PreparedProbe::default()
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
@@ -176,9 +172,8 @@ fn loop_association_does_not_depend_on_digest_or_identity_format() {
     let inputs = vec![loop_input, input(&resources[0], 1), input(&resources[1], 2)];
     let dump = complete_dump(
         PreparedProbe {
-            missing: Vec::new(),
             resources,
-            compositions: Vec::new(),
+            ..PreparedProbe::default()
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
@@ -207,9 +202,8 @@ fn missing_anonymous_module_prefix_recording_is_incomplete() {
     let inputs = vec![input(&resources[0], 1), input(&resources[1], 2)];
     let error = complete_dump(
         PreparedProbe {
-            missing: Vec::new(),
             resources,
-            compositions: Vec::new(),
+            ..PreparedProbe::default()
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
@@ -220,7 +214,7 @@ fn missing_anonymous_module_prefix_recording_is_incomplete() {
         ProbeError::Incomplete(message) => assert!(
             message
                 .to_string()
-                .starts_with("missing module prefix hash inputs for resource ordinal 0"),
+                .starts_with("missing module prefix hash inputs for fixture.crn:0"),
             "{message}"
         ),
         error => panic!("wrong probe error: {error:?}"),
@@ -231,30 +225,42 @@ fn missing_anonymous_module_prefix_recording_is_incomplete() {
 fn directory_walk_collects_failures_and_writes_every_success() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("infra");
-    for relative in [
+    let directories: Vec<_> = [
         "aws/management/bad-first",
         "aws/management/good",
         "aws/management/bad-last",
+        "aws/management/deferred",
         "envs/registry/example/good",
         "envs/registry/example/empty",
-    ] {
+    ]
+    .into_iter()
+    .map(|relative| {
         let directory = root.join(relative);
         std::fs::create_dir_all(&directory).unwrap();
         if !relative.ends_with("empty") {
             std::fs::write(directory.join("main.crn"), "fixture").unwrap();
         }
-    }
+        directory
+    })
+    .collect();
     let output = temporary.path().join("dumps");
-    let error = write_directory_dumps(&root, &output, |directory| {
+    let error = write_directory_dumps(&root, &directories, &output, |directory| {
         let name = directory.file_name().unwrap().to_str().unwrap();
         match name {
             "bad-first" => Ok(ProbeDocument {
+                deferred: Vec::new(),
                 dump: "{\"partial-canary\":true}\n".into(),
                 missing: vec!["missing fixture observation".into()],
             }),
             "bad-last" => Err(ProbeError::incomplete("fixture failure")),
+            "deferred" => Ok(ProbeDocument {
+                deferred: vec![DeferredSite { file: "main.crn".into(), span: 10..20 }],
+                dump: "{\"status\":{\"kind\":\"partial\",\"deferred\":[{\"file\":\"main.crn\",\"span\":{\"start\":10,\"end\":20}}]}}\n".into(),
+                missing: Vec::new(),
+            }),
             "empty" => panic!("empty directory must be skipped before probing"),
             _ => Ok(ProbeDocument {
+                deferred: Vec::new(),
                 dump: "{\"redaction\":\"sha256\"}\n".into(),
                 missing: Vec::new(),
             }),
@@ -264,6 +270,7 @@ fn directory_walk_collects_failures_and_writes_every_success() {
     match &error {
         ProbeError::DirectoryFailures(failures) => {
             assert_eq!(failures.failures().count(), 2);
+            assert!(failures.report().results().iter().any(|result| matches!(&result.status, DirectoryStatus::Partial { deferred } if deferred == &[DeferredSite { file: "main.crn".into(), span: 10..20 }])));
             assert!(
                 failures
                     .report()
@@ -296,6 +303,11 @@ fn directory_walk_collects_failures_and_writes_every_success() {
     assert!(!message.contains("partial-canary"));
     assert!(message.contains("partial dump:"));
     assert!(message.contains("bad-first") && message.contains("bad-last"));
+    assert!(
+        output
+            .join("aws/management/deferred/identity.json")
+            .exists()
+    );
     assert_eq!(
         std::fs::read_to_string(output.join("aws/management/bad-first/identity.json")).unwrap(),
         "{\"partial-canary\":true}\n"
@@ -318,7 +330,7 @@ fn directory_walk_collects_failures_and_writes_every_success() {
             );
         }
     }
-    let stale = write_directory_dumps(&root, &output, |_| {
+    let stale = write_directory_dumps(&root, &directories, &output, |_| {
         panic!("must reject non-empty output before probing")
     })
     .unwrap_err();
@@ -344,9 +356,8 @@ fn round_two_consecutive_repeats_collapse_per_owner_without_reordering_distinct_
     ];
     let dump = complete_dump(
         PreparedProbe {
-            missing: Vec::new(),
             resources,
-            compositions: Vec::new(),
+            ..PreparedProbe::default()
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
@@ -361,32 +372,6 @@ fn round_two_consecutive_repeats_collapse_per_owner_without_reordering_distinct_
         .map(|input| input["writes"][0]["hex"].as_str().unwrap())
         .collect();
     assert_eq!(writes, ["02", "01", "02"]);
-}
-
-#[test]
-fn round_two_nonempty_output_root_is_rejected_before_any_probe() {
-    let temporary = tempfile::tempdir().unwrap();
-    let root = temporary.path().join("infra");
-    std::fs::create_dir_all(root.join("aws/management/fixture")).unwrap();
-    std::fs::create_dir_all(root.join("envs/registry/test/fixture")).unwrap();
-    let output = temporary.path().join("dumps");
-    std::fs::create_dir_all(&output).unwrap();
-    std::fs::write(output.join("stale.json"), "stale").unwrap();
-    let error = write_directory_dumps(&root, &output, |_| {
-        panic!("must reject stale output before probing")
-    })
-    .unwrap_err();
-    match error {
-        ProbeError::Incomplete(message) => assert!(
-            message.to_string().contains("output root is not empty"),
-            "{message}"
-        ),
-        error => panic!("wrong output-root error: {error:?}"),
-    }
-    assert_eq!(
-        std::fs::read_to_string(output.join("stale.json")).unwrap(),
-        "stale"
-    );
 }
 
 #[test]
@@ -411,9 +396,8 @@ fn round_two_unattributed_contexts_outside_root_are_relative() {
     let inputs = vec![input(&resources[0], 1), input(&resources[1], 2), template];
     let dump = complete_dump(
         PreparedProbe {
-            missing: Vec::new(),
             resources,
-            compositions: Vec::new(),
+            ..PreparedProbe::default()
         },
         inputs,
         &SourcePaths::new(&root).unwrap(),
@@ -446,9 +430,8 @@ fn production_secret_hashes_outside_resources_have_a_named_owner() {
     inputs.extend(producer_inputs);
     let dump = complete_dump(
         PreparedProbe {
-            missing: Vec::new(),
             resources,
-            compositions: Vec::new(),
+            ..PreparedProbe::default()
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
@@ -518,8 +501,8 @@ fn secret_paths_keep_schema_fields_readable_and_fingerprint_only_map_keys() {
     .unwrap();
     assert_eq!(
         observations.len(),
-        2,
-        "both production producers must be observed"
+        1,
+        "the production payload producer must be observed"
     );
     for observation in &observations {
         assert_eq!(observation["path"][0], json!({"attribute": "settings"}));
@@ -528,4 +511,61 @@ fn secret_paths_keep_schema_fields_readable_and_fingerprint_only_map_keys() {
     }
     let dump = serde_json::to_string(&observations).unwrap();
     assert!(!dump.contains("private-path-canary") && !dump.contains("value-canary"));
+}
+
+#[test]
+fn repeated_simhash_computations_collapse_as_units_and_distinct_order_is_kept() {
+    let resources = resources();
+    let mut simhash = input(&resources[0], 0);
+    simhash.boundary = "simhash";
+    simhash.feature_count = Some(2);
+    let mut first = input(&resources[0], 1);
+    first.boundary = "simhash-feature";
+    let mut second = input(&resources[0], 2);
+    second.boundary = "simhash-feature";
+    let repeated = vec![
+        simhash.clone(),
+        first.clone(),
+        second.clone(),
+        simhash,
+        first,
+        second,
+    ];
+    assert_eq!(collapse_observations(&repeated).len(), 3);
+    let distinct = vec![
+        input(&resources[0], 1),
+        input(&resources[0], 2),
+        input(&resources[0], 1),
+        input(&resources[0], 2),
+    ];
+    assert_eq!(collapse_observations(&distinct).len(), 4);
+}
+
+#[test]
+fn application_error_reporting_does_not_quote_authored_values() {
+    let error = ProbeError::from(AppError::Validation("AUTHORED_PRIVATE_CANARY".to_owned()));
+    let message = DirectoryFailures(DirectoryReport(vec![DirectoryResult {
+        directory: PathBuf::from("fixture"),
+        status: DirectoryStatus::Failed(error),
+    }]))
+    .to_string();
+    assert!(!message.contains("AUTHORED_PRIVATE_CANARY"));
+    assert!(message.contains("Application"));
+}
+
+#[test]
+fn keyed_address_rendering_requires_all_expected_map_keys() {
+    let (result, _) =
+        identity_recording::record(|| render_address("named.private_key", 1, Disclosure::Sha256));
+    match result {
+        Err(ProbeError::Incomplete(details)) => assert_eq!(
+            details.missing,
+            ["address map-key observations: expected at least 1, found 0"]
+        ),
+        other => panic!("unrecorded map key must fail closed, got {other:?}"),
+    }
+    assert!(matches!(
+        render_address("named", 0, Disclosure::Sha256),
+        Err(ProbeError::Incomplete(_))
+    ));
 }

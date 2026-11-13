@@ -142,13 +142,6 @@ fn probe(
     probe_directory(directory, &EnvironmentSnapshot::empty(), mode)
 }
 
-#[test]
-fn offline_identity_dump_is_deterministic() {
-    let first = probe(&fixture(), synthetic()).unwrap();
-    let second = probe(&fixture(), synthetic()).unwrap();
-    assert_eq!(first, second);
-}
-
 fn copy_fixture(destination: &Path) {
     fn copy(source: &Path, destination: &Path) {
         fs::create_dir_all(destination).unwrap();
@@ -197,16 +190,54 @@ fn temporary_root_paths_preserve_resource_results_and_normalize_all_contexts() {
 }
 
 #[test]
-fn offline_identity_probe_rejects_incomplete_expansion() {
+fn deferred_loop_body_is_covered_when_the_iterable_becomes_known() {
     let copied = tempfile::tempdir().unwrap();
     copy_fixture(copied.path());
     fs::write(
-        copied.path().join("deferred.crn"),
-        "for name in unknown_b.names { probe.Declared { name = name } }\n",
+        copied.path().join("iterable.crn"),
+        "let names = unknown_b.names\n",
     )
     .unwrap();
-    let result = probe(copied.path(), synthetic());
-    expect_incomplete(result, "deferred expansion remains");
+    fs::write(
+        copied.path().join("deferred.crn"),
+        "for name in names { probe.Declared { name = name } }\n",
+    )
+    .unwrap();
+    let pending: serde_json::Value =
+        serde_json::from_str(&probe(copied.path(), synthetic()).unwrap()).unwrap();
+    assert_eq!(pending["status"]["kind"], "partial");
+    assert_eq!(pending["status"]["deferred"][0]["file"], "deferred.crn");
+    assert!(pending["status"]["deferred"][0]["span"]["start"].is_number());
+    assert!(
+        pending["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|resource| resource["declaration"]["file"] != "deferred.crn")
+    );
+    fs::write(
+        copied.path().join("iterable.crn"),
+        "let names = ['body-known-locally']\n",
+    )
+    .unwrap();
+    let expanded: serde_json::Value =
+        serde_json::from_str(&probe(copied.path(), synthetic()).unwrap()).unwrap();
+    assert_eq!(expanded["status"]["kind"], "ok");
+    let body = expanded["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|resource| resource["declaration"]["file"] == "deferred.crn")
+        .expect("known iterable must emit the body");
+    for boundary in ["declared-identity", "loop-system-identity"] {
+        assert!(
+            body["hash_inputs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|input| input["boundary"] == boundary)
+        );
+    }
 }
 
 #[test]
@@ -223,7 +254,7 @@ fn offline_identity_probe_rejects_empty_directories_and_missing_schemas() {
     );
     expect_incomplete(
         probe(&fixture(), OfflineProviders::Factories(Vec::new())),
-        "missing schema for probe.Declared.<pending>",
+        "missing schema at main.crn:0",
     );
     expect_incomplete(
         probe(
@@ -264,13 +295,10 @@ fn offline_identity_probe_uses_only_the_supplied_environment() {
     }
     let environment =
         EnvironmentSnapshot::new([("PROBE_KNOWN_NAME".to_owned(), "env-known".into())]);
-    let OfflineProviders::Factories(factories) = synthetic() else {
-        unreachable!()
-    };
     let dump = probe_directory(
         copied.path(),
         &environment,
-        RedactionMode::RawSynthetic(factories),
+        RedactionMode::RawSynthetic(vec![Box::new(ProbeFactory)]),
     )
     .unwrap();
     let dump: serde_json::Value = serde_json::from_str(&dump).unwrap();
@@ -302,7 +330,20 @@ fn real_directory_identity_probe() {
     // This ignored test is the executable boundary for a local probe run.
     #[expect(clippy::disallowed_methods)]
     let environment = EnvironmentSnapshot::capture_process();
-    let result = probe_real_directories(&root, &artifacts, &output, &environment);
+    let children = |directory: &Path| {
+        let mut paths: Vec<_> = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_dir())
+            .collect();
+        paths.sort();
+        paths
+    };
+    let mut directories = children(&root.join("aws/management"));
+    for registry in children(&root.join("envs/registry")) {
+        directories.extend(children(&registry));
+    }
+    let result = probe_real_directories(&root, &directories, &artifacts, &output, &environment);
     let report = match &result {
         Ok(report) => report,
         Err(ProbeError::DirectoryFailures(failures)) => failures.report(),
@@ -319,6 +360,13 @@ fn real_directory_identity_probe() {
             }
             carina_cli::identity_probe::DirectoryStatus::Skipped => {
                 println!("{}: skipped (no .crn files)", directory.display())
+            }
+            carina_cli::identity_probe::DirectoryStatus::Partial { deferred } => {
+                println!(
+                    "{}: partial ({} deferred sites)",
+                    directory.display(),
+                    deferred.len()
+                )
             }
             carina_cli::identity_probe::DirectoryStatus::Failed(error) => {
                 println!("{}: failed ({error})", directory.display())
@@ -389,15 +437,7 @@ fn module_loop_instances_keep_distinct_system_resource_owners() {
         "\nfor name in ['module-loop-first', 'module-loop-second'] { child { name = name } }\n",
     );
     fs::write(main, source).unwrap();
-    let OfflineProviders::Factories(factories) = synthetic() else {
-        unreachable!()
-    };
-    let dump = probe_directory(
-        temporary.path(),
-        &EnvironmentSnapshot::empty(),
-        RedactionMode::RawSynthetic(factories),
-    )
-    .unwrap();
+    let dump = probe(temporary.path(), synthetic()).unwrap();
     let dump: serde_json::Value = serde_json::from_str(&dump).unwrap();
     let instances: Vec<_> = dump["resources"]
         .as_array()
@@ -441,15 +481,7 @@ fn nested_modules_are_associated_by_the_full_call_ancestry() {
         "let nested = use { source = './nested' }\nnested { name = \"${name}-nested\" }\n",
     )
     .unwrap();
-    let OfflineProviders::Factories(factories) = synthetic() else {
-        unreachable!()
-    };
-    let dump = probe_directory(
-        temporary.path(),
-        &EnvironmentSnapshot::empty(),
-        RedactionMode::RawSynthetic(factories),
-    )
-    .unwrap();
+    let dump = probe(temporary.path(), synthetic()).unwrap();
     let dump: serde_json::Value = serde_json::from_str(&dump).unwrap();
     let nested: Vec<_> = dump["resources"]
         .as_array()
@@ -509,15 +541,7 @@ fn empty_simhash_records_its_empty_input_and_result() {
     )
     .unwrap();
     fs::write(temporary.path().join("main.crn"), "probe.Mutable {}\n").unwrap();
-    let OfflineProviders::Factories(factories) = synthetic() else {
-        unreachable!()
-    };
-    let dump = probe_directory(
-        temporary.path(),
-        &EnvironmentSnapshot::empty(),
-        RedactionMode::RawSynthetic(factories),
-    )
-    .unwrap();
+    let dump = probe(temporary.path(), synthetic()).unwrap();
     let dump: serde_json::Value = serde_json::from_str(&dump).unwrap();
     let inputs = dump["resources"][0]["hash_inputs"].as_array().unwrap();
     assert_eq!(inputs.len(), 1);
@@ -529,19 +553,12 @@ fn empty_simhash_records_its_empty_input_and_result() {
 
 #[test]
 fn offline_identity_ordered_observations_snapshot() {
-    let raw = || {
-        let OfflineProviders::Factories(factories) = synthetic() else {
-            unreachable!()
-        };
-        probe_directory(
-            &fixture(),
-            &EnvironmentSnapshot::empty(),
-            RedactionMode::RawSynthetic(factories),
-        )
-        .unwrap()
-    };
-    let first = raw();
-    assert_eq!(first, raw(), "the entire v2 dump must be deterministic");
+    let first = probe(&fixture(), synthetic()).unwrap();
+    assert_eq!(
+        first,
+        probe(&fixture(), synthetic()).unwrap(),
+        "the entire v2 dump must be deterministic"
+    );
     let observations: serde_json::Value = serde_json::from_str(&first).unwrap();
     assert_eq!(observations["format"], "carina-identity-probe-v2");
     assert_eq!(observations["redaction"], "raw-synthetic");
@@ -616,9 +633,9 @@ fn round_two_fingerprint_mode_hides_environment_map_loop_keys() {
                 r#"
 let environment_key = env('PROBE_PRIVATE_KEY')
 let keyed = {{ {key} = 'map-loop-name' }}
-for key, name in keyed {{ probe.Declared {{ name = "${{name}}-anonymous" }} }}
+let other_named = for key, name in keyed {{ probe.Declared {{ name = "${{name}}-anonymous" }} }}
 let named = for key, name in keyed {{ probe.Declared {{ name = "${{name}}-anonymous" }} }}
-for key, name in keyed {{ child {{ name = "${{name}}-module" }} }}
+let module_named = for key, name in keyed {{ child {{ name = "${{name}}-module" }} }}
 "#
             ),
         )
@@ -630,13 +647,10 @@ for key, name in keyed {{ child {{ name = "${{name}}-module" }} }}
         )
         .unwrap();
         assert_no_plaintext_or_hex(&dump, private);
-        let OfflineProviders::Factories(factories) = synthetic() else {
-            unreachable!()
-        };
         let raw = probe_directory(
             temporary.path(),
             &environment,
-            RedactionMode::RawSynthetic(factories),
+            RedactionMode::RawSynthetic(vec![Box::new(ProbeFactory)]),
         )
         .unwrap();
         assert!(
@@ -722,18 +736,21 @@ fn assert_no_absolute_paths(value: &serde_json::Value) {
 }
 
 #[test]
-fn incomplete_expansion_keeps_completed_resource_inputs_attributed() {
-    let copied = tempfile::tempdir().unwrap();
-    copy_fixture(copied.path());
+fn missing_schema_error_identifies_declaration_without_a_loop_key() {
+    let directory = tempfile::tempdir().unwrap();
     fs::write(
-        copied.path().join("deferred.crn"),
-        "for name in unknown_b.names { probe.Declared { name = name } }\n",
+        directory.path().join("providers.crn"),
+        "provider probe {}\n",
     )
     .unwrap();
-    match probe(copied.path(), synthetic()) {
-        Err(ProbeError::Incomplete(details)) => {
-            assert_eq!(details.missing, ["deferred expansion remains"])
-        }
-        other => panic!("expected only the deferred-expansion failure, got {other:?}"),
-    }
+    fs::write(directory.path().join("keyed.crn"), "let xs = { 'PRIVATE_LOOP_KEY_CANARY' = 'one' }\nlet items = for key, value in xs { probe.Declared { name = value } }\n").unwrap();
+    let error = probe_directory(
+        directory.path(),
+        &EnvironmentSnapshot::empty(),
+        RedactionMode::Sha256(OfflineProviders::Factories(Vec::new())),
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(!message.contains("PRIVATE_LOOP_KEY_CANARY"));
+    assert!(message.contains("keyed.crn:"));
 }

@@ -71,14 +71,12 @@ pub enum InputOwner {
 pub enum SecretProducer {
     PayloadHash,
     PayloadVerification,
-    SnapshotHash,
 }
 impl SecretProducer {
     pub fn name(self) -> &'static str {
         match self {
             Self::PayloadHash => "secret-payload-hash",
             Self::PayloadVerification => "secret-payload-verification",
-            Self::SnapshotHash => "snapshot-secret-hash",
         }
     }
 }
@@ -401,21 +399,6 @@ pub fn fingerprint(bytes: &[u8]) -> Fingerprint {
     }
 }
 
-pub fn observe_secret<P: crate::resource::PlaceholderKind>(
-    payload: &crate::resource::SecretPayload<P, crate::resource::AbsoluteBindingAddress>,
-) -> Result<(), crate::value::SerializationError> {
-    payload.hash(None).map(|_| ())
-}
-
-/// Exercise the production snapshot binding adapter and material producer.
-pub fn observe_snapshot_secret<
-    P: crate::resource::PlaceholderKind + serde::de::DeserializeOwned,
->(
-    payload: &crate::resource::SecretPayload<P, crate::resource::AbsoluteBindingAddress>,
-) -> Result<(), crate::value_walk::WalkError> {
-    crate::value_walk::observe_snapshot_secret(payload)
-}
-
 pub(crate) fn secret_producer_context(producer: SecretProducer) -> ContextGuard {
     owner_context(|frame| {
         let owner = frame
@@ -442,7 +425,7 @@ pub(crate) fn address_key(address: &str, parent: &str, key: &str) {
 
 /// Split only producer-observed map expansions; literal source identifiers
 /// retain their exact spelling. Longer expansions win so nested keys recurse.
-pub fn address_parts(address: &str) -> Vec<AddressPart> {
+pub fn address_parts(address: &str) -> Option<Vec<AddressPart>> {
     fn split(address: &str, keys: &[AddressKey]) -> Vec<AddressPart> {
         let candidate = keys
             .iter()
@@ -475,10 +458,9 @@ pub fn address_parts(address: &str) -> Vec<AddressPart> {
     }
     ACTIVE.with(|active| {
         let active = active.borrow();
-        match active.as_ref() {
-            Some(frame) => split(address, &frame.borrow().address_keys),
-            None => vec![AddressPart::Literal(address.to_owned())],
-        }
+        active
+            .as_ref()
+            .map(|frame| split(address, &frame.borrow().address_keys))
     })
 }
 
@@ -496,17 +478,7 @@ pub fn resource_key<S: AnonymousIdentityModuleSource, P: ValueKind, B: BindingAd
         Some(source) => source.recording_module_calls()?,
         None => Vec::new(),
     };
-    let loops = resource
-        .loop_provenance
-        .direct_origin()
-        .into_iter()
-        .chain(
-            resource
-                .loop_provenance
-                .module_prefixes()
-                .iter()
-                .map(|prefix| prefix.origin()),
-        )
+    let loops = loop_origins(&resource.loop_provenance)
         .map(|origin| {
             (
                 origin.source().scheduler_identity().clone(),
@@ -521,20 +493,36 @@ pub fn resource_key<S: AnonymousIdentityModuleSource, P: ValueKind, B: BindingAd
     })
 }
 
+fn loop_origins(
+    provenance: &crate::resource::LoopProvenance,
+) -> impl Iterator<Item = &crate::resource::LoopElementOrigin> {
+    provenance.direct_origin().into_iter().chain(
+        provenance
+            .module_prefixes()
+            .iter()
+            .map(|prefix| prefix.origin()),
+    )
+}
+
 pub fn loop_system_identities(
     provenance: &crate::resource::LoopProvenance,
 ) -> Vec<ResourceIdentity> {
-    provenance
-        .direct_origin()
-        .into_iter()
-        .chain(
-            provenance
-                .module_prefixes()
-                .iter()
-                .map(|prefix| prefix.origin()),
-        )
+    loop_origins(provenance)
         .map(|origin| origin.source().scheduler_identity().clone())
         .collect()
+}
+
+pub fn keyed_for_elements(provenance: &crate::resource::LoopProvenance) -> usize {
+    loop_origins(provenance)
+        .filter(|origin| {
+            matches!(
+                origin.kind(),
+                LoopOriginKind::For {
+                    element: crate::resource::ForLoopElement::Key(_)
+                }
+            )
+        })
+        .count()
 }
 
 #[cfg(test)]

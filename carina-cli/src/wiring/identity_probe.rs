@@ -5,10 +5,22 @@
 //! User-derived loop/map keys, address key parts, expansion discriminators and
 //! secret-path map keys are fingerprinted too. Source-level resource types,
 //! binding names, schema-declared attribute/field names and relative files stay
-//! readable. Exact consecutive observations per owner collapse; distinct
-//! observations retain their original order, without pinning pass counts.
-//! Secret observations drive both `SecretPayload::hash(None)` and the production
-//! snapshot producer (`ProtectedSecret::hash_snapshot`, including map_bindings).
+//! readable. Exact consecutive computations per owner (including SimHash
+//! features) collapse; distinct computations retain their original order,
+//! without pinning pass counts.
+//! Secret material comes from `SecretPayload::hash(None)`. The production
+//! persistence routes `merge_secrets_into_provider_json_inner -> inner.hash`
+//! and `persist_secret_json -> hash_secret_value -> payload.hash` use the same
+//! PayloadHash hook. Their `state_value_snapshot(..).to_value_at("secret")`
+//! preparation before hashing is not observed by this probe.
+//!
+//! A deferred `for` contributes nothing from its body: no resource entries,
+//! anonymous or loop-element identities, keyed addresses, module prefixes, or
+//! secret material. Secrets not known offline have `status: unavailable`.
+//! Deferred directories are covered by plan parity (`scripts/validate-parity.py`),
+//! not by this probe. Partial dumps identify exactly which iterable sites defer.
+//! Application diagnostics are reported by error kind only. Run `carina validate`
+//! on the directory for details; those diagnostics may quote authored values.
 //! No provider runtime, backend, state read, plan, or download is involved.
 
 use super::{LoadedProviderFactory, ProviderLoad, ProviderNoticeSink, WiringContext};
@@ -46,8 +58,8 @@ enum Disclosure {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProbeError {
-    #[error(transparent)]
-    Application(#[from] Box<AppError>),
+    #[error("Application")]
+    Application(#[source] Box<AppError>),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -89,10 +101,17 @@ impl ProbeError {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct DeferredSite {
+    pub file: String,
+    pub span: std::ops::Range<usize>,
+}
+
 #[derive(Debug)]
 pub enum DirectoryStatus {
     Ok,
     Skipped,
+    Partial { deferred: Vec<DeferredSite> },
     Failed(ProbeError),
 }
 #[derive(Debug)]
@@ -139,7 +158,9 @@ impl std::error::Error for DirectoryFailures {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.failures().find_map(|result| match &result.status {
             DirectoryStatus::Failed(error) => Some(error as &(dyn std::error::Error + 'static)),
-            DirectoryStatus::Ok | DirectoryStatus::Skipped => None,
+            DirectoryStatus::Ok | DirectoryStatus::Skipped | DirectoryStatus::Partial { .. } => {
+                None
+            }
         })
     }
 }
@@ -147,6 +168,7 @@ impl std::error::Error for DirectoryFailures {
 struct ProbeDocument {
     dump: String,
     missing: Vec<String>,
+    deferred: Vec<DeferredSite>,
 }
 impl ProbeDocument {
     fn complete(self, dump_path: Option<PathBuf>) -> Result<String, ProbeError> {
@@ -168,10 +190,12 @@ struct PreparedResource {
     requires_identity: bool,
     required_modules: Vec<ModuleKey>,
 }
+#[derive(Default)]
 struct PreparedProbe {
     resources: Vec<PreparedResource>,
     compositions: Vec<ModuleKey>,
     missing: Vec<String>,
+    deferred: Vec<DeferredSite>,
 }
 
 /// Run synchronously outside an async runtime. Provider schemas and environment
@@ -208,27 +232,15 @@ fn capture_directory(
         });
         match prepared {
             Ok(prepared) => finish_dump(prepared, inputs, &paths, disclosure),
-            Err(ProbeError::Incomplete(details)) => {
-                let mut document = finish_dump(
-                    PreparedProbe {
-                        resources: Vec::new(),
-                        compositions: Vec::new(),
-                        missing: Vec::new(),
-                    },
-                    inputs,
-                    &paths,
-                    disclosure,
-                )?;
-                let mut missing = details.missing;
-                missing.extend(document.missing);
-                let mut seen = HashSet::new();
-                missing.retain(|message| seen.insert(message.clone()));
-                document.missing = missing;
-                let mut partial: Json = serde_json::from_str(&document.dump)?;
-                partial["preparation"] = json!("incomplete");
-                document.dump = format!("{}\n", serde_json::to_string_pretty(&partial)?);
-                Ok(document)
-            }
+            Err(ProbeError::Incomplete(details)) => finish_dump(
+                PreparedProbe {
+                    missing: details.missing,
+                    ..PreparedProbe::default()
+                },
+                inputs,
+                &paths,
+                disclosure,
+            ),
             Err(error) => Err(error),
         }
     })
@@ -263,8 +275,8 @@ fn prepare(
     for resource in &loaded.parsed.resources {
         if context.schemas().get_for(resource).is_none() {
             return Err(ProbeError::incomplete(format!(
-                "missing schema for {}",
-                resource.id
+                "missing schema at {}",
+                paths.declaration(identity_recording::resource_location(resource))?
             )));
         }
     }
@@ -280,36 +292,45 @@ fn prepare(
         &loaded.duplicate_declarations,
     )?;
     let parsed = validated.resources().parsed();
+    let deferred = parsed
+        .deferred_for_expressions()
+        .iter()
+        .map(|expression| {
+            let location = expression
+                .location()
+                .recording_iterable_location()
+                .ok_or_else(|| ProbeError::incomplete("deferred site has no parser span"))?;
+            Ok(DeferredSite {
+                file: paths.relative(location.file().path()),
+                span: location.span().start_byte()..location.span().end_byte(),
+            })
+        })
+        .collect::<Result<Vec<_>, ProbeError>>()?;
     let mut missing = Vec::new();
-    if parsed.resources.is_empty() {
+    if parsed.resources.is_empty() && deferred.is_empty() {
         missing.push("zero resources enumerated".to_owned());
-    }
-    if !parsed.deferred_for_expressions().is_empty() {
-        missing.push("deferred expansion remains".to_owned());
     }
     let mut resources = Vec::new();
     for (ordinal, resource) in parsed.resources.iter().enumerate() {
         let prepared = (|| {
+            let location = identity_recording::resource_location(resource)
+                .ok_or_else(|| ProbeError::incomplete("resource has no declaration location"))?;
+            let declaration = paths.declaration(Some(location))?;
             if validated.context().schemas().get_for(resource).is_none() {
                 return Err(ProbeError::incomplete(format!(
-                    "missing schema for {}",
-                    resource.id
+                    "missing schema at {declaration}"
                 )));
             }
             if resource.id.identity().is_none() {
                 return Err(ProbeError::incomplete(format!(
-                    "unassigned resource identity: {}",
-                    resource.id
+                    "unassigned resource identity at {declaration}"
                 )));
             }
             let key = identity_recording::resource_key(resource).ok_or_else(|| {
                 ProbeError::incomplete(format!(
-                    "resource has no parser-assigned identity: {}",
-                    resource.id
+                    "resource has no parser-assigned identity at {declaration}"
                 ))
             })?;
-            let location = identity_recording::resource_location(resource)
-                .ok_or_else(|| ProbeError::incomplete("resource has no declaration location"))?;
             let span = location.span();
             let mut instances = Vec::new();
             let mut required_modules = Vec::new();
@@ -325,7 +346,7 @@ fn prepare(
                         required_modules.push(key);
                     }
                     let location = call.id.declaration_location();
-                    instances.push(json!({ "instance": render_address(&call.instance, disclosure), "declaration": paths.relative(location.file().path()), "start_byte": location.span().start_byte() }));
+                    instances.push(json!({ "instance": render_address(&call.instance, 0, disclosure)?, "declaration": paths.relative(location.file().path()), "start_byte": location.span().start_byte() }));
                 }
             }
             let basis = if resource.binding.is_some() {
@@ -381,12 +402,14 @@ fn prepare(
                 })
                 .collect();
             let mut provenance = serde_json::to_value(&resource.loop_provenance)?;
-            paths.loop_provenance(&mut provenance, disclosure);
+            paths.loop_provenance(&mut provenance, disclosure)?;
+            let keyed = identity_recording::keyed_for_elements(&resource.loop_provenance);
             let mut resource_id = serde_json::to_value(&resource.id)?;
             resource_id["identity"] = render_address(
                 resource.id.identity_str().expect("resolved identity"),
+                keyed,
                 disclosure,
-            );
+            )?;
             Ok::<_, ProbeError>(PreparedResource {
                 key,
                 loop_identities: identity_recording::loop_system_identities(
@@ -398,7 +421,7 @@ fn prepare(
                     "ordinal": ordinal,
                     "declaration": { "file": paths.relative(location.file().path()), "start_byte": span.start_byte(), "end_byte": span.end_byte(), "line": span.start_line(), "column": span.start_column() },
                     "expansion": { "instances": instances, "loop": provenance },
-                    "identity_basis": basis, "resource_id": resource_id, "address": render_address(&resource.id.to_string(), disclosure),
+                    "identity_basis": basis, "resource_id": resource_id, "address": render_address(&resource.id.to_string(), keyed, disclosure)?,
                     "resolved_prefixes": prefixes, "secret_material": secrets,
                 }),
             })
@@ -420,6 +443,7 @@ fn prepare(
         resources,
         compositions,
         missing,
+        deferred,
     })
 }
 
@@ -433,11 +457,18 @@ fn finish_dump(
         mut resources,
         compositions,
         missing: mut failures,
+        deferred,
     } = prepared;
     let mut claimed = vec![false; inputs.len()];
     let mut keys = HashSet::new();
     for resource in &mut resources {
-        let address = format!("resource ordinal {}", resource.dump["ordinal"]);
+        let address = format!(
+            "{}:{}",
+            resource.dump["declaration"]["file"]
+                .as_str()
+                .expect("declaration file"),
+            resource.dump["declaration"]["start_byte"]
+        );
         if !keys.insert(resource.key.clone()) {
             failures.push(format!("duplicate system resource identity for {address}"));
         }
@@ -585,6 +616,8 @@ fn finish_dump(
         "resources": resources.into_iter().map(|resource| resource.dump).collect::<Vec<_>>(),
         "unattributed": unattributed,
         "secret_producers": producers,
+        "status": { "kind": if !failures.is_empty() { "failed" }
+            else if deferred.is_empty() { "ok" } else { "partial" }, "deferred": deferred },
     });
     let dump = format!("{}\n", serde_json::to_string_pretty(&dump)?);
     let mut seen = HashSet::new();
@@ -592,17 +625,35 @@ fn finish_dump(
     Ok(ProbeDocument {
         dump,
         missing: failures,
+        deferred,
     })
 }
 
 fn collapse_observations<'a>(
     observations: impl IntoIterator<Item = &'a HashInput>,
 ) -> Vec<&'a HashInput> {
+    let items: Vec<_> = observations.into_iter().collect();
     let mut previous = HashMap::new();
-    observations
-        .into_iter()
-        .filter(|input| previous.insert(&input.owner, *input) != Some(*input))
-        .collect()
+    let mut result = Vec::new();
+    let mut start = 0;
+    while start < items.len() {
+        let input = items[start];
+        let mut end = start + 1;
+        if input.boundary == "simhash" {
+            while end < items.len()
+                && items[end].owner == input.owner
+                && items[end].boundary == "simhash-feature"
+            {
+                end += 1;
+            }
+        }
+        let computation = &items[start..end];
+        if previous.insert(&input.owner, computation) != Some(computation) {
+            result.extend_from_slice(computation);
+        }
+        start = end;
+    }
+    result
 }
 
 #[derive(Clone)]
@@ -664,18 +715,14 @@ fn observe_secrets(
 ) -> Result<(), ProbeError> {
     match value {
         Value::Deferred(DeferredValue::Secret(payload)) => {
-            for producer in [identity_recording::SecretProducer::PayloadHash, identity_recording::SecretProducer::SnapshotHash] {
-                let (available, inputs) = identity_recording::record(|| match producer {
-                    identity_recording::SecretProducer::PayloadHash => identity_recording::observe_secret(payload).is_ok(),
-                    identity_recording::SecretProducer::SnapshotHash => identity_recording::observe_snapshot_secret(payload).is_ok(),
-                    identity_recording::SecretProducer::PayloadVerification => unreachable!("probe selects hash producers"),
-                });
-                if available {
-                    if inputs.is_empty() { return Err(ProbeError::incomplete(format!("missing {} secret material recording", producer.name()))); }
-                    out.push(json!({ "path": path.render(disclosure), "producer": producer.name(), "status": "available", "inputs": collapse_observations(&inputs).into_iter().map(|input| render_input(input, paths, disclosure)).collect::<Vec<_>>() }));
-                } else {
-                    out.push(json!({ "path": path.render(disclosure), "producer": producer.name(), "status": "unavailable", "reason": "production producer cannot obtain material offline" }));
-                }
+            let known = value.knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation()).ok().and_then(|proof| proof.into_classification().into_known().ok()).is_some();
+            let (available, inputs) = if known { identity_recording::record(|| payload.hash(None).is_ok()) } else { (false, Vec::new()) };
+            let producer = identity_recording::SecretProducer::PayloadHash.name();
+            if available {
+                if inputs.is_empty() { return Err(ProbeError::incomplete("missing secret material recording")); }
+                out.push(json!({ "path": path.render(disclosure), "producer": producer, "status": "available", "inputs": collapse_observations(&inputs).into_iter().map(|input| render_input(input, paths, disclosure)).collect::<Vec<_>>() }));
+            } else {
+                out.push(json!({ "path": path.render(disclosure), "producer": producer, "status": "unavailable", "reason": "secret is not known offline" }));
             }
         }
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -701,18 +748,32 @@ fn observe_secrets(
     Ok(())
 }
 
-fn render_address(address: &str, disclosure: Disclosure) -> Json {
+fn render_address(
+    address: &str,
+    required_keys: usize,
+    disclosure: Disclosure,
+) -> Result<Json, ProbeError> {
     match disclosure {
-        Disclosure::Raw => json!(address),
+        Disclosure::Raw => Ok(json!(address)),
         Disclosure::Sha256 => {
-            let parts = identity_recording::address_parts(address);
+            let parts = identity_recording::address_parts(address)
+                .ok_or_else(|| ProbeError::incomplete("address recorder is not active"))?;
+            let found = parts
+                .iter()
+                .filter(|part| matches!(part, AddressPart::MapKey(_)))
+                .count();
+            if found < required_keys {
+                return Err(ProbeError::incomplete(format!(
+                    "address map-key observations: expected at least {required_keys}, found {found}"
+                )));
+            }
             if parts
                 .iter()
                 .all(|part| matches!(part, AddressPart::Literal(_)))
             {
-                return json!(address);
+                return Ok(json!(address));
             }
-            json!(
+            Ok(json!(
                 parts
                     .into_iter()
                     .map(|part| match part {
@@ -721,7 +782,7 @@ fn render_address(address: &str, disclosure: Disclosure) -> Json {
                             json!({"map_key": bytes(key.as_bytes(), disclosure)}),
                     })
                     .collect::<Vec<_>>()
-            )
+            ))
         }
     }
 }
@@ -828,6 +889,18 @@ impl SourcePaths {
             root: carina_core::paths::PersistedPath::new(directory)?,
         })
     }
+    fn declaration(
+        &self,
+        location: Option<&carina_core::parser::DeclarationLocation>,
+    ) -> Result<String, ProbeError> {
+        let location = location
+            .ok_or_else(|| ProbeError::incomplete("resource has no declaration location"))?;
+        Ok(format!(
+            "{}:{}",
+            self.relative(location.file().path()),
+            location.span().start_byte()
+        ))
+    }
     fn relative(&self, path: &Path) -> String {
         carina_core::paths::PersistedPath::new(path)
             .expect("parser source locator")
@@ -893,7 +966,7 @@ impl SourcePaths {
             }
         }
     }
-    fn loop_provenance(&self, value: &mut Json, disclosure: Disclosure) {
+    fn loop_provenance(&self, value: &mut Json, disclosure: Disclosure) -> Result<(), ProbeError> {
         match value {
             Json::Object(fields) => {
                 let map_key = fields.get("kind").and_then(Json::as_str) == Some("key");
@@ -916,18 +989,19 @@ impl SourcePaths {
                         (
                             "legacy" | "current_parent" | "current_prefix" | "system_identity",
                             Some(address),
-                        ) => *value = render_address(address, disclosure),
-                        _ => self.loop_provenance(value, disclosure),
+                        ) => *value = render_address(address, 0, disclosure)?,
+                        _ => self.loop_provenance(value, disclosure)?,
                     }
                 }
             }
             Json::Array(values) => {
                 for value in values {
-                    self.loop_provenance(value, disclosure);
+                    self.loop_provenance(value, disclosure)?;
                 }
             }
             Json::Null | Json::Bool(_) | Json::Number(_) | Json::String(_) => {}
         }
+        Ok(())
     }
 }
 
@@ -968,11 +1042,12 @@ fn hex(bytes: &[u8]) -> String {
 /// Every directory is attempted; successes are written even if others fail.
 pub fn probe_real_directories(
     root: &Path,
+    directories: &[PathBuf],
     artifacts: &Path,
     output: &Path,
     environment: &carina_core::EnvironmentSnapshot,
 ) -> Result<DirectoryReport, ProbeError> {
-    write_directory_dumps(root, output, |directory| {
+    write_directory_dumps(root, directories, output, |directory| {
         // A checkout may keep a separate installed/locked provider set in each
         // configuration. Reuse that exact set, with no aggregate or download.
         let installed = artifacts
@@ -991,23 +1066,9 @@ pub fn probe_real_directories(
     })
 }
 
-fn children(directory: &Path) -> Result<Vec<PathBuf>, ProbeError> {
-    let mut children = Vec::new();
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        if entry.path().is_dir() {
-            children.push(entry.path());
-        }
-    }
-    children.sort();
-    if children.is_empty() {
-        return Err(ProbeError::incomplete("no directories enumerated"));
-    }
-    Ok(children)
-}
-
 fn write_directory_dumps(
     root: &Path,
+    directories: &[PathBuf],
     output: &Path,
     mut probe: impl FnMut(&Path) -> Result<ProbeDocument, ProbeError>,
 ) -> Result<DirectoryReport, ProbeError> {
@@ -1027,47 +1088,39 @@ fn write_directory_dumps(
     }
     std::fs::create_dir_all(output)?;
     let mut report = DirectoryReport::default();
-    let mut directories = Vec::new();
-    let mut collect = |directory: &Path| match children(directory) {
-        Ok(children) => children,
-        Err(error) => {
-            report.0.push(DirectoryResult {
-                directory: directory.to_path_buf(),
-                status: DirectoryStatus::Failed(error),
-            });
-            Vec::new()
-        }
-    };
-    directories.extend(collect(&root.join("aws/management")));
-    for registry in collect(&root.join("envs/registry")) {
-        directories.extend(collect(&registry));
-    }
-    directories.sort();
     for directory in directories {
         let result = (|| {
-            if carina_core::paths::ResolvedPath::new(&directory)?
+            if carina_core::paths::ResolvedPath::new(directory)?
                 .crn_files()?
                 .is_empty()
             {
                 return Err(ProbeError::NoConfiguration);
             }
-            let document = probe(&directory)?;
-            let destination = output.join(
-                directory
-                    .strip_prefix(root)
-                    .expect("walked directory below root"),
-            );
+            let relative = directory.strip_prefix(root).map_err(|_| {
+                ProbeError::incomplete("probe directory is outside the supplied root")
+            })?;
+            let mut document = probe(directory)?;
+            let destination = output.join(relative);
             std::fs::create_dir_all(&destination)?;
             let dump_path = destination.join("identity.json");
             write_private_dump(&dump_path, document.dump.as_bytes())?;
-            document.complete(Some(dump_path)).map(|_| ())
+            let deferred = std::mem::take(&mut document.deferred);
+            document.complete(Some(dump_path))?;
+            Ok(if deferred.is_empty() {
+                DirectoryStatus::Ok
+            } else {
+                DirectoryStatus::Partial { deferred }
+            })
         })();
         let status = match result {
-            Ok(()) => DirectoryStatus::Ok,
+            Ok(status) => status,
             Err(ProbeError::NoConfiguration) => DirectoryStatus::Skipped,
             Err(error) => DirectoryStatus::Failed(error),
         };
-        report.0.push(DirectoryResult { directory, status });
+        report.0.push(DirectoryResult {
+            directory: directory.clone(),
+            status,
+        });
     }
     if report
         .0
