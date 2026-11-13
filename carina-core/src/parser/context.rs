@@ -833,8 +833,8 @@ impl ExpressionMode<'_> {
 }
 
 impl<'a> ExpressionMode<'a> {
-    /// An as operand keeps its structural projection owner, but the wrapper's
-    /// policy owns admission rather than a second ordinary bare-binding use.
+    /// Conversion owns the type judgement. Structural uses and pending slots
+    /// still belong to the ordinary bare-handle gate, even for an operand.
     pub(super) fn conversion_operand(&self) -> Self {
         Self {
             binding_uses: BindingUseRecording::ProjectionOnly,
@@ -1097,7 +1097,16 @@ impl<'a> ExpressionMode<'a> {
                 owner: sink.owner.clone(),
                 path: sink.root_path.clone(),
             });
-        if let BindingUseRecording::Ordinary = self.binding_uses {
+        let record_use = match self.binding_uses {
+            BindingUseRecording::Ordinary => true,
+            BindingUseRecording::ProjectionOnly => match &source {
+                BareBindingSource::Structural(_) => true,
+                // Value sources have no pending/bare-handle gate; only their
+                // duplicate type precheck belongs to the conversion policy.
+                BareBindingSource::Value { .. } => false,
+            },
+        };
+        if record_use {
             ctx.parsed_binding_uses
                 .borrow_mut()
                 .record(authored, source, pending_slot.clone());

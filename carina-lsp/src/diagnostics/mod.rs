@@ -86,6 +86,7 @@ fn select_admission_inputs<'r, 'a>(
     >,
     values: &HashMap<String, Value>,
     report: &carina_core::parser::retained::ExpressionReport,
+    prechecks: carina_core::validation::admission::attributes::SlotPrechecks<'_>,
 ) -> (
     &'r carina_core::parser::AnalysisResourceRef<'a>,
     carina_core::validation::admission::attributes::ResourceAttributeInputs<RelativeBindingName>,
@@ -97,7 +98,7 @@ fn select_admission_inputs<'r, 'a>(
     match authored.and_then(|source| {
         ResourceAttributeInputs::from_resolved(source, values, report)
             .ok()
-            .map(|inputs| (source, inputs))
+            .map(|inputs| (source, inputs.with_prechecks(prechecks)))
     }) {
         Some(authored) => authored,
         // Main checks the expanded owner against its resolved values. Only
@@ -111,7 +112,8 @@ fn select_admission_inputs<'r, 'a>(
                 carina_core::parser::retained::NoAuthoredEvidence::for_resource(
                     authored.unwrap_or(resource),
                 ),
-            ),
+            )
+            .with_prechecks(prechecks),
         ),
     }
 }
@@ -412,6 +414,7 @@ enum DiagnosticProviderContext {
 }
 
 struct DiagnosticValidationInputs<'a> {
+    binding_use_context: carina_core::validation::ValidationTypeContext<'a>,
     binding_index: carina_core::binding_index::BindingIndex<'a, RelativeBindingName>,
     binding_use_report: carina_core::validation::BindingUseReport,
     export_value_bindings:
@@ -456,6 +459,7 @@ impl ExpandedDiagnosticValidationInputs<'_> {
         &mut self,
         validation: &mut carina_core::validation::ConversionValidation<F>,
         resource_id: &carina_core::resource::ResourceId,
+        prechecks: &carina_core::validation::BindingUseReport,
         session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Option<carina_core::schema::ResourceValueValidation> {
         let resource = *self.resources.get(resource_id)?;
@@ -466,7 +470,10 @@ impl ExpandedDiagnosticValidationInputs<'_> {
                 resource,
                 self.configuration.report(),
             )
-            .ok()?;
+            .ok()?
+            .with_prechecks(
+                carina_core::validation::admission::attributes::SlotPrechecks::Reported(prechecks),
+            );
         let mut classified = inputs.classify(
             &carina_core::resource::knowledge::KnowledgeContext::validation(),
             |_, _| {},
@@ -728,6 +735,7 @@ impl DiagnosticRun<'_> {
         let export_value_bindings =
             carina_core::binding_index::ResolvedBindings::for_authored_validation(binding_input);
         DiagnosticValidationInputs {
+            binding_use_context: context,
             binding_index,
             binding_use_report,
             export_value_bindings,
@@ -1477,6 +1485,7 @@ impl DiagnosticRun<'_> {
                 })
             });
             let DiagnosticValidationInputs {
+                binding_use_context,
                 binding_index,
                 binding_use_report,
                 export_value_bindings,
@@ -1512,6 +1521,8 @@ impl DiagnosticRun<'_> {
                 .uses()
                 .filter(|use_site| {
                     carina_core::validation::binding_use_authority_owns_use(
+                        parsed,
+                        &binding_use_context,
                         &binding_use_report,
                         use_site,
                     )
@@ -1789,6 +1800,7 @@ impl DiagnosticRun<'_> {
                     let Some(report) = inputs.resource_admissions_in(
                         conversion_validation,
                         &resource.id,
+                        &binding_use_report,
                         self.provider_context,
                     ) else {
                         continue;
@@ -1948,6 +1960,9 @@ impl DiagnosticRun<'_> {
                         authored_resources.as_ref(),
                         &resolved_attrs,
                         expression_report,
+                        carina_core::validation::admission::attributes::SlotPrechecks::Reported(
+                            &binding_use_report,
+                        ),
                     );
                     let knowledge_context =
                         carina_core::resource::knowledge::KnowledgeContext::validation();
@@ -2014,7 +2029,7 @@ impl DiagnosticRun<'_> {
                     });
                     let mut value_validation = expanded_validation_inputs.as_mut()
                         .filter(|_| uses_composition_output)
-                        .and_then(|inputs| inputs.resource_admissions_in(conversion_validation, admission_resource.id(), self.provider_context))
+                        .and_then(|inputs| inputs.resource_admissions_in(conversion_validation, admission_resource.id(), &binding_use_report, self.provider_context))
                         .unwrap_or_else(|| conversion_validation.admit_resource(carina_core::validation::admission::attributes::ResourceAdmissionRequest {
                             resource: admission_resource, parsed, schema: validated_schema, attributes: &classified_attrs,
                             quoted: resource_quoted_string_attrs, inputs: evaluated_inputs, bindings: &binding_index,
@@ -2575,6 +2590,9 @@ impl DiagnosticRun<'_> {
                     inputs.configuration,
                     &inputs.binding_index,
                     self.provider_context,
+                    carina_core::validation::admission::attributes::SlotPrechecks::Reported(
+                        &binding_use_report,
+                    ),
                 );
             }
             if let Some(authored_tree) = &authored_tree {
@@ -2583,6 +2601,9 @@ impl DiagnosticRun<'_> {
                     pre_expansion_configuration.judged(),
                     &binding_index,
                     self.provider_context,
+                    carina_core::validation::admission::attributes::SlotPrechecks::Reported(
+                        &binding_use_report,
+                    ),
                 );
             }
             // Check the current buffer's attributes against directory-wide

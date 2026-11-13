@@ -1648,6 +1648,12 @@ impl<B: BindingAddress> AuthoredSlots<B> {
         })
     }
 
+    pub(crate) fn iter(
+        &self,
+    ) -> impl Iterator<Item = (&crate::parser::AttributeKey, &JudgedSlot<B>)> {
+        self.slots.iter()
+    }
+
     pub(crate) fn iter_mut(
         &mut self,
     ) -> impl Iterator<Item = (&crate::parser::AttributeKey, &mut JudgedSlot<B>)> {

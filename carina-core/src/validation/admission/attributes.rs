@@ -7,7 +7,7 @@ use crate::schema::{LeafPathSegment, SchemaKind, SchemaRegistry};
 
 mod inputs;
 use inputs::AttributeInput;
-pub use inputs::ResourceAttributeInputs;
+pub use inputs::{ResourceAttributeInputs, SlotPrechecks};
 
 /// A catalog descriptor requires a registered schema owner.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -427,6 +427,7 @@ pub(crate) fn admit_validation_attributes<
         }
         SchemaInputSource::Authored(slots) => slots,
     };
+    coverage.record_conversions(inputs::missing_schema_inputs(slots, attributes, report));
     let candidate = |name: &str, proof| {
         if let Some(projection) = slots.projected_phase(name) {
             return Ok(Box::new(Candidate::validation_projected(
@@ -698,6 +699,8 @@ type ResourceAdmissionCandidate<'a, B> = (
 );
 
 trait ResourceAdmissionPass {
+    fn missing_source(source: &crate::parser::retained::JudgedExpr) -> crate::ConversionChannel;
+
     fn candidate<'a, B: BindingAddress>(
         slot: &'a crate::parser::retained::JudgedSlot<B>,
         proof: crate::resource::knowledge::Classification<'a, ParserPlaceholder, B>,
@@ -708,6 +711,10 @@ trait ResourceAdmissionPass {
 struct LiveResource;
 struct TemplateResource;
 impl ResourceAdmissionPass for LiveResource {
+    fn missing_source(source: &crate::parser::retained::JudgedExpr) -> crate::ConversionChannel {
+        crate::parser::retained::ConversionVerdict::unavailable_source(source)
+    }
+
     fn candidate<'a, B: BindingAddress>(
         slot: &'a crate::parser::retained::JudgedSlot<B>,
         proof: crate::resource::knowledge::Classification<'a, ParserPlaceholder, B>,
@@ -718,6 +725,11 @@ impl ResourceAdmissionPass for LiveResource {
     }
 }
 impl ResourceAdmissionPass for TemplateResource {
+    fn missing_source(_source: &crate::parser::retained::JudgedExpr) -> crate::ConversionChannel {
+        // This separate parse is suppress-only; live instances admit values.
+        Default::default()
+    }
+
     fn candidate<'a, B: BindingAddress>(
         slot: &'a crate::parser::retained::JudgedSlot<B>,
         proof: crate::resource::knowledge::Classification<'a, ParserPlaceholder, B>,
@@ -758,6 +770,9 @@ where
     if let Err(missing) = inputs.authored_evidence() {
         coverage.no_authored_evidence(missing);
     }
+    coverage.record_conversions(
+        inputs.prepare_missing::<Pass>(inputs.report(parsed.expression_report())),
+    );
     let visits = std::cell::RefCell::new(std::mem::take(coverage));
     let findings = if uses_resource_attribute_admission(resource.kind()) {
         typed_resource_attribute_admissions::<Pass, kind::ResourceAttribute, _, _, _>(
@@ -1218,6 +1233,7 @@ pub(crate) fn unrendered_resource_conversion_admissions<E, D, B: BindingAddress>
     judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     bindings: &BindingIndex<'_, B>,
     session: &dyn ProviderTypeCheckContext,
+    prechecks: SlotPrechecks<'_>,
     coverage: &mut WalkCoverage,
 ) where
     E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
@@ -1228,7 +1244,7 @@ pub(crate) fn unrendered_resource_conversion_admissions<E, D, B: BindingAddress>
         >,
 {
     unrendered_resource_admissions::<LiveResource, E, D, B>(
-        resource, judged, bindings, session, coverage,
+        resource, judged, bindings, session, prechecks, coverage,
     );
 }
 
@@ -1243,6 +1259,7 @@ fn unrendered_resource_admissions<Pass: ResourceAdmissionPass, E, D, B: BindingA
     judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     bindings: &BindingIndex<'_, B>,
     session: &dyn ProviderTypeCheckContext,
+    prechecks: SlotPrechecks<'_>,
     coverage: &mut WalkCoverage,
 ) where
     E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
@@ -1259,7 +1276,8 @@ fn unrendered_resource_admissions<Pass: ResourceAdmissionPass, E, D, B: BindingA
     let mut inputs = ResourceAttributeInputs::for_resource(resource, judged.report())
         .unwrap_or_else(|_| {
             ResourceAttributeInputs::from_report(resource, &values, judged.report())
-        });
+        })
+        .with_prechecks(prechecks);
     inputs.scope = crate::schema::value_validation::AssignmentScope::ClaimedValues;
     let attributes = inputs.classify(&KnowledgeContext::validation(), |_, _| {});
     resource_admissions_for_pass::<Pass, E, D, B>(

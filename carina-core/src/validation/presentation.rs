@@ -541,6 +541,7 @@ impl<E: ValidationClientError> ConversionValidation<E> {
         judged: &crate::parser::retained::JudgedFile<'_, T, D, B>,
         bindings: &crate::binding_index::BindingIndex<'_, B>,
         session: &dyn super::deferred_types::ProviderTypeCheckContext,
+        prechecks: super::admission::attributes::SlotPrechecks<'_>,
     ) where
         B: BindingAddress,
         T: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
@@ -572,7 +573,7 @@ impl<E: ValidationClientError> ConversionValidation<E> {
             }
             self.walk_resource(resource, |coverage| {
                 super::admission::attributes::unrendered_resource_conversion_admissions(
-                    resource, judged, bindings, session, coverage,
+                    resource, judged, bindings, session, prechecks, coverage,
                 )
             });
             self.record_admitted_resource(resource);

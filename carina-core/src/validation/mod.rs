@@ -809,7 +809,8 @@ impl std::error::Error for BindingUseFinding {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BindingUseReport {
     findings: Vec<BindingUseFinding>,
-    expression_owned_uses: Vec<crate::parser::BareBindingUse>,
+    slot_findings:
+        Option<std::sync::Arc<HashSet<(crate::resource::ResourceId, crate::parser::AttributeKey)>>>,
 }
 
 impl std::fmt::Display for BindingUseReport {
@@ -896,6 +897,16 @@ pub enum ResolveFileError {
 }
 
 impl BindingUseReport {
+    pub(crate) fn has_slot_finding(
+        &self,
+        resource: &crate::resource::ResourceId,
+        name: &str,
+    ) -> bool {
+        self.slot_findings
+            .as_ref()
+            .is_some_and(|findings| findings.contains(&(resource.clone(), name.into())))
+    }
+
     pub fn findings(&self) -> &[BindingUseFinding] {
         &self.findings
     }
@@ -1850,7 +1861,7 @@ fn resolve_record_against_module<B: BindingAddress>(
     expected: &TypeExpr,
     context: &ValidationTypeContext<'_, B>,
     diagnostic_path: &impl Fn(ReferencePathRef<'_, B>) -> ModuleCallDiagnosticPath,
-    ordinary_source: &OrdinaryUseSource<'_>,
+    ordinary_source: Option<&OrdinaryUseSource<'_>>,
 ) -> Result<(), BindingResolutionError> {
     let Some(resolved) = resolve_module_argument_path_type(
         expected,
@@ -1867,15 +1878,18 @@ fn resolve_record_against_module<B: BindingAddress>(
         crate::parser::BareBindingSource::Value {
             value,
             declared_type,
-        } => resolve_value_source_against_sink(
-            &record.authored,
-            value,
-            declared_type.as_deref(),
-            RefSink::TypeExpr(&expected),
-            context,
-            diagnostic_path,
-            ordinary_source,
-        ),
+        } => match ordinary_source {
+            Some(source) => resolve_value_source_against_sink(
+                &record.authored,
+                value,
+                declared_type.as_deref(),
+                RefSink::TypeExpr(&expected),
+                context,
+                diagnostic_path,
+                source,
+            ),
+            None => Ok(()), // Only the type judgement is delegated to the expression walk.
+        },
         crate::parser::BareBindingSource::Structural(handle) => {
             check_handle_sink(handle, &resolved)
                 .map_err(|error| BindingResolutionError::Existing(error.to_string()))
@@ -1910,6 +1924,8 @@ pub fn binding_use_authority_owns_module_argument<E, D, B: BindingAddress>(
     report: &BindingUseReport,
     call: &crate::parser::ModuleCallId,
     argument: &str,
+    expected: Option<&TypeExpr>,
+    config: &ProviderContext,
 ) -> bool {
     file.bare_binding_uses().uses().any(|use_site| {
         matches!(
@@ -1919,26 +1935,75 @@ pub fn binding_use_authority_owns_module_argument<E, D, B: BindingAddress>(
                 argument: owner_argument,
                 value_span: _,
             } if owner == call && owner_argument == argument
-        ) && binding_use_authority_owns_use(report, use_site)
+        ) && {
+            let source = file
+                .expression_report()
+                .expression_in(&use_site.expression_instance, use_site.location())
+                .ok();
+            let expected = expected
+                .and_then(|expected| {
+                    resolve_module_argument_path_type(expected, &use_site.path, config)
+                        .ok()
+                        .flatten()
+                })
+                .map(|ty| ty.as_type_expr());
+            binding_use_authority_owns_source(report, use_site, source, expected.as_ref(), config)
+        }
     })
 }
 
 /// Whether binding-use validation owns this sink. A single builtin string
 /// construction transfers ownership after admission against the actual sink.
 /// Collections retain main's binding and per-element value checks.
-pub fn binding_use_authority_owns_use(
+pub fn binding_use_authority_owns_use<E, D, B: BindingAddress>(
+    source_file: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    context: &ValidationTypeContext<'_, B>,
     report: &BindingUseReport,
     use_site: &crate::parser::BareBindingUse,
+) -> bool
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    // A buffer and its directory have separate resource owners. Ownership is
+    // still a judgement query: use the directory's existing lexical judgement
+    // when the buffer's resource id has no per-resource report in that context.
+    let source = binding_use_expression(use_site, context)
+        .or_else(|_| {
+            context
+                .expression_report
+                .expression_in(&use_site.expression_instance, use_site.location())
+        })
+        .ok();
+    let expected = source_file.expected_at_use(use_site, context);
+    binding_use_authority_owns_source(
+        report,
+        use_site,
+        source,
+        expected.as_ref(),
+        context.raw_provider_context(),
+    )
+}
+
+fn binding_use_authority_owns_source(
+    report: &BindingUseReport,
+    use_site: &crate::parser::BareBindingUse,
+    source: Option<&crate::parser::retained::JudgedExpr>,
+    expected: Option<&TypeExpr>,
+    config: &ProviderContext,
 ) -> bool {
-    !report
-        .expression_owned_uses
-        .iter()
-        .any(|owned| same_authored_use(owned, use_site))
-        && (use_site.path.segments().len() == 1
-            || report
-                .findings()
-                .iter()
-                .any(|finding| same_authored_use(&finding.use_site, use_site)))
+    if source.is_some_and(|source| {
+        matches!(
+            source.binding_diagnostic_owner(expected, &INTERPOLATION_REF_SINK, config),
+            crate::parser::retained::BindingDiagnosticOwner::AuthoredExpression
+        )
+    }) {
+        return false;
+    }
+    use_site.path.segments().len() == 1
+        || report
+            .findings()
+            .iter()
+            .any(|finding| same_authored_use(&finding.use_site, use_site))
 }
 
 /// Whether parsing reserved this entire module argument because a structural
@@ -1961,6 +2026,11 @@ pub fn module_argument_has_pending_binding_use<E, D, B: BindingAddress>(
 }
 
 trait BindingUseInput<B: BindingAddress> {
+    fn expected_at_use(
+        &self,
+        use_site: &crate::parser::BareBindingUse,
+        context: &ValidationTypeContext<'_, B>,
+    ) -> Option<TypeExpr>;
     fn value_at_use(
         &self,
         use_site: &crate::parser::BareBindingUse,
@@ -1978,6 +2048,32 @@ impl<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 > BindingUseInput<B> for crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>
 {
+    fn expected_at_use(
+        &self,
+        use_site: &crate::parser::BareBindingUse,
+        context: &ValidationTypeContext<'_, B>,
+    ) -> Option<TypeExpr> {
+        match &use_site.owner {
+            crate::parser::BindingUseOwner::Resource(address) => {
+                resource_sink(self, address, &use_site.path, context.schemas)
+                    .map(RefSink::expression_type)
+            }
+            crate::parser::BindingUseOwner::ModuleArgument { call, argument, .. } => {
+                module_argument_type(self, call, argument, context.module_signatures)
+                    .and_then(|expected| {
+                        resolve_module_argument_path_type(
+                            &expected,
+                            &use_site.path,
+                            context.raw_provider_context(),
+                        )
+                        .ok()
+                        .flatten()
+                    })
+                    .map(|expected| expected.as_type_expr())
+            }
+        }
+    }
+
     fn value_at_use(
         &self,
         use_site: &crate::parser::BareBindingUse,
@@ -2042,7 +2138,7 @@ where
 {
     let mut report = BindingUseReport {
         findings: Vec::new(),
-        expression_owned_uses: Vec::new(),
+        slot_findings: None,
     };
 
     for record in file.bare_binding_uses().records() {
@@ -2058,25 +2154,7 @@ where
                 record.authored.location(),
             )
         });
-        let expected = match &record.authored.owner {
-            crate::parser::BindingUseOwner::Resource(address) => {
-                resource_sink(file, address, &record.authored.path, context.schemas)
-                    .map(RefSink::expression_type)
-            }
-            crate::parser::BindingUseOwner::ModuleArgument { call, argument, .. } => {
-                module_argument_type(file, call, argument, context.module_signatures)
-                    .and_then(|expected| {
-                        resolve_module_argument_path_type(
-                            &expected,
-                            &record.authored.path,
-                            context.raw_provider_context(),
-                        )
-                        .ok()
-                        .flatten()
-                    })
-                    .map(|expected| expected.as_type_expr())
-            }
-        };
+        let expected = file.expected_at_use(&record.authored, context);
         let ordinary_source = match evidence {
             Ok(expression) => {
                 let fallback = INTERPOLATION_REF_SINK.clone();
@@ -2086,17 +2164,16 @@ where
                     context.raw_provider_context(),
                 ) {
                     crate::parser::retained::BindingDiagnosticOwner::AuthoredExpression => {
-                        // The authored walk still checks the complete destination;
-                        // source prechecking does not claim placement authority.
-                        report.expression_owned_uses.push(record.authored.clone());
-                        continue;
+                        // Delegate only type admission. Structural/pending uses
+                        // must still reach the ordinary bare-handle gate below.
+                        None
                     }
                     crate::parser::retained::BindingDiagnosticOwner::OrdinarySource(source) => {
-                        OrdinaryUseSource::Judged(source)
+                        Some(OrdinaryUseSource::Judged(source))
                     }
                 }
             }
-            Err(error) => OrdinaryUseSource::Missing(error),
+            Err(error) => Some(OrdinaryUseSource::Missing(error)),
         };
         let mut result = match &record.authored.owner {
             crate::parser::BindingUseOwner::Resource(address) => {
@@ -2105,15 +2182,18 @@ where
                         crate::parser::BareBindingSource::Value {
                             value,
                             declared_type,
-                        } => resolve_value_source_against_sink(
-                            &record.authored,
-                            value,
-                            declared_type.as_deref(),
-                            sink,
-                            context,
-                            &diagnostic_path,
-                            &ordinary_source,
-                        ),
+                        } => match ordinary_source.as_ref() {
+                            Some(source) => resolve_value_source_against_sink(
+                                &record.authored,
+                                value,
+                                declared_type.as_deref(),
+                                sink,
+                                context,
+                                &diagnostic_path,
+                                source,
+                            ),
+                            None => Ok(()),
+                        },
                         crate::parser::BareBindingSource::Structural(handle) => {
                             let existing = BindingResolutionError::Existing(
                                 authored_bare_handle_error(record, handle).to_string(),
@@ -2152,7 +2232,7 @@ where
                     &expected,
                     context,
                     &diagnostic_path,
-                    &ordinary_source,
+                    ordinary_source.as_ref(),
                 ),
                 None => match &record.source {
                     crate::parser::BareBindingSource::Value { .. } => Ok(()),
@@ -2188,6 +2268,15 @@ where
                 .iter()
                 .any(|existing| same_authored_finding(existing, &finding))
             {
+                if let crate::parser::BindingUseOwner::Resource(address) = &finding.use_site.owner {
+                    std::sync::Arc::make_mut(
+                        report.slot_findings.get_or_insert_with(Default::default),
+                    )
+                    .insert((
+                        address.resource_id().clone(),
+                        finding.use_site.path.root_name(),
+                    ));
+                }
                 report.findings.push(finding);
             }
         }
@@ -9398,6 +9487,8 @@ impl ModuleCallChecker<'_> {
                 binding_use_report,
                 authored_call.id(),
                 argument,
+                parameter.static_type.known(),
+                self.provider_context.as_provider_context(),
             ) {
                 continue;
             }
@@ -9647,6 +9738,16 @@ impl ModuleCallChecker<'_> {
                     binding_use_report,
                     authored_call.id(),
                     &error.identity.argument,
+                    signatures
+                        .get(&authored_call.module_name)
+                        .and_then(|signature| {
+                            signature
+                                .arguments
+                                .iter()
+                                .find(|parameter| parameter.name == error.identity.argument)
+                        })
+                        .and_then(|parameter| parameter.static_type.known()),
+                    self.provider_context.as_provider_context(),
                 )
                 || signatures
                     .get(&authored_call.module_name)

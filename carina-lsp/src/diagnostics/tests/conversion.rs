@@ -315,9 +315,16 @@ fn conversion_report_fallback_preserves_ordinary_errors_and_detects_missing_outc
                         empty_configuration.judged(),
                         &bindings,
                         session,
+                        carina_core::validation::admission::attributes::SlotPrechecks::Unreported,
                     );
                 } else {
-                    validation.admit_remaining_resources(&tree, judged, &bindings, session);
+                    validation.admit_remaining_resources(
+                        &tree,
+                        judged,
+                        &bindings,
+                        session,
+                        carina_core::validation::admission::attributes::SlotPrechecks::Unreported,
+                    );
                 }
             });
             let presented = validation.complete().into_presented();

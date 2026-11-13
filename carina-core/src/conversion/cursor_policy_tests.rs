@@ -144,7 +144,13 @@ fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots()
     });
     assert_eq!(resources, 2);
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-        validation.admit_remaining_resources(&tree, judged, &bindings, session);
+        validation.admit_remaining_resources(
+            &tree,
+            judged,
+            &bindings,
+            session,
+            crate::validation::admission::attributes::SlotPrechecks::Unreported,
+        );
     });
     let conversions = validation.complete().into_presented();
     assert_eq!(conversion_errors(&conversions).len(), 1);
@@ -256,6 +262,7 @@ fn conversion_unrendered_coverage_does_not_repeat_native_map_key_or_value_checks
             judged,
             &bindings,
             session,
+            crate::validation::admission::attributes::SlotPrechecks::Unreported,
             &mut Default::default(),
         );
     });
@@ -466,7 +473,13 @@ fn conversion_no_authored_evidence_cannot_admit_a_converted_slot() {
         assert_eq!(report.errors().count(), 0, "{report:?}");
         assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-            validation.admit_remaining_resources(&tree, judged, &bindings, session);
+            validation.admit_remaining_resources(
+                &tree,
+                judged,
+                &bindings,
+                session,
+                crate::validation::admission::attributes::SlotPrechecks::Unreported,
+            );
         });
         let conversions = validation.complete().into_presented();
         assert_eq!(conversion_errors(&conversions).len(), 1, "{conversions:?}");
@@ -712,6 +725,31 @@ fn r7_pending_syntax(
     expression: &str,
     destination: AttributeType,
 ) -> crate::validation::PresentedFindings {
+    r9_syntax_with_values(expression, destination, R9Projection::Pending)
+}
+
+#[derive(Clone, Copy)]
+enum R9Projection {
+    Pending,
+    Absent,
+}
+
+fn r9_syntax_with_values(
+    expression: &str,
+    destination: AttributeType,
+    projection: R9Projection,
+) -> crate::validation::PresentedFindings {
+    let values = match projection {
+        R9Projection::Pending => std::collections::HashMap::from([(
+            "target".into(),
+            crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(
+                crate::resource::ApplyTimeUnknown::PendingReRead(
+                    crate::resource::PendingReRead::not_found(),
+                ),
+            )),
+        )]),
+        R9Projection::Absent => Default::default(),
+    };
     let catalog = super::tests::catalog();
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -733,14 +771,6 @@ fn r7_pending_syntax(
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
-    let values = std::collections::HashMap::from([(
-        "target".into(),
-        crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(
-            crate::resource::ApplyTimeUnknown::PendingReRead(
-                crate::resource::PendingReRead::not_found(),
-            ),
-        )),
-    )]);
     let inputs = crate::validation::admission::attributes::ResourceAttributeInputs::from_resolved(
         resource,
         &values,
@@ -751,10 +781,13 @@ fn r7_pending_syntax(
         &crate::resource::knowledge::KnowledgeContext::validation(),
         |_, _| {},
     );
-    assert!(matches!(
-        classified["target"],
-        crate::resource::knowledge::Classification::Pending(_)
-    ));
+    match projection {
+        R9Projection::Pending => assert!(matches!(
+            classified["target"],
+            crate::resource::knowledge::Classification::Pending(_)
+        )),
+        R9Projection::Absent => assert!(classified.is_empty()),
+    }
     let bindings =
         crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
     let mut run: crate::validation::ConversionValidation =
@@ -1366,7 +1399,13 @@ fn conversion_one_authored_alias_use_cannot_cover_another_use_without_evidence()
             }
         });
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-            validation.admit_remaining_resources(&tree, judged, &bindings, session);
+            validation.admit_remaining_resources(
+                &tree,
+                judged,
+                &bindings,
+                session,
+                crate::validation::admission::attributes::SlotPrechecks::Unreported,
+            );
         });
         let conversions = validation.complete().into_presented();
         assert_eq!(
@@ -1617,4 +1656,25 @@ fn r7_no_as_opaque_pairing_keeps_main_validation_then_plan_field_error() {
             "{findings:?}"
         );
     });
+}
+
+#[test]
+fn r9_authored_slot_without_a_value_fails_closed_unless_conversion_free() {
+    for converted in [false, true] {
+        let expression = if converted {
+            "'ok' as mock.Name"
+        } else {
+            "'ok'"
+        };
+        let presented = r9_syntax_with_values(expression, named(), R9Projection::Absent);
+        let conversions = conversion_errors(&presented);
+        assert_eq!(conversions.len(), usize::from(converted), "{presented:?}");
+        if let Some(error) = conversions.first() {
+            assert_eq!(
+                error.diagnostic_message(),
+                "conversion cannot be checked here"
+            );
+        }
+        assert_eq!(presented.len(), usize::from(converted), "{presented:?}");
+    }
 }

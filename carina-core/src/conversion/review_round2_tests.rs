@@ -137,7 +137,13 @@ fn conversion_unrendered_no_as_walk_cannot_emit_or_add_shared_sink_findings() {
                 crate::validation::ConversionValidation::new(judged.report());
             if walk_siblings {
                 // The production sibling driver has no ordinary findings output.
-                let (): () = run.admit_remaining_resources(&tree, judged, &bindings, session);
+                let (): () = run.admit_remaining_resources(
+                    &tree,
+                    judged,
+                    &bindings,
+                    session,
+                    crate::validation::admission::attributes::SlotPrechecks::Unreported,
+                );
             }
             assert!(run.complete().into_presented().is_empty());
         });
@@ -181,7 +187,13 @@ fn r5b_no_as_sibling_driver_does_no_extra_walks() {
         let before = run.walk_in(crate::validation::FindingSubject::Root, |coverage| {
             coverage.work()
         });
-        run.admit_remaining_resources(&tree, judged, &bindings, session);
+        run.admit_remaining_resources(
+            &tree,
+            judged,
+            &bindings,
+            session,
+            crate::validation::admission::attributes::SlotPrechecks::Unreported,
+        );
         let after = run.walk_in(crate::validation::FindingSubject::Root, |coverage| {
             coverage.work()
         });
@@ -272,7 +284,13 @@ fn r5b_sibling_driver_does_not_repeat_a_completed_conversion_validator() {
         let work = run.walk_in(crate::validation::FindingSubject::Root, |coverage| {
             coverage.work()
         });
-        run.admit_remaining_resources(&tree, judged, &bindings, session);
+        run.admit_remaining_resources(
+            &tree,
+            judged,
+            &bindings,
+            session,
+            crate::validation::admission::attributes::SlotPrechecks::Unreported,
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
             after,

@@ -11,6 +11,14 @@ use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Ordinary prechecks already reported by the caller for this source scope.
+/// Without reported prechecks an omitted carrying input fails closed.
+#[derive(Clone, Copy)]
+pub enum SlotPrechecks<'a> {
+    Reported(&'a crate::validation::BindingUseReport),
+    Unreported,
+}
+
 /// Producer-owned attribute projections and their authored authority.
 ///
 /// Classify `values()` after producing/evaluating these inputs. Admission only
@@ -20,7 +28,7 @@ pub struct ResourceAttributeInputs<B: BindingAddress> {
     owner: ResourceId,
     pub(super) scope: crate::schema::value_validation::AssignmentScope,
     report: Option<Arc<crate::parser::retained::ExpressionReport<B>>>,
-    inputs: IndexMap<String, StoredInput<B>>,
+    inputs: IndexMap<String, PreparedAttribute<B>>,
     evidence: ResourceEvidence,
 }
 
@@ -34,6 +42,30 @@ pub(super) enum AttributeInput<'a, B: BindingAddress> {
     Authored { slot: &'a JudgedSlot<B> },
     Projected { phase: ValidationProjection },
     Reported { source: JudgedExpr },
+}
+
+/// Joining slots with values preserves an omitted value as an input, rather
+/// than treating omission as successful admission.
+#[derive(Clone)]
+enum PreparedAttribute<B: BindingAddress, V = StoredInput<B>> {
+    WithValue(V),
+    WithoutValue {
+        slot: Arc<JudgedSlot<B>>,
+        precheck: SlotPrecheck,
+    },
+}
+#[derive(Clone)]
+enum SlotPrecheck {
+    NoOrdinaryFinding,
+    OrdinaryFinding,
+}
+impl<B: BindingAddress> PreparedAttribute<B> {
+    fn value(&self) -> Option<&Value<ParserPlaceholder, B>> {
+        match self {
+            Self::WithValue(input) => Some(input.value()),
+            Self::WithoutValue { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -148,7 +180,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        Self {
+        let mut prepared = Self {
             owner: resource.id().clone(),
             scope: crate::schema::value_validation::AssignmentScope::Full,
             evidence: ResourceEvidence::NoAuthoredEvidence(Arc::new(unchecked)),
@@ -158,14 +190,16 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
                 .map(|(name, value)| {
                     (
                         name.clone(),
-                        StoredInput::Reported {
+                        PreparedAttribute::WithValue(StoredInput::Reported {
                             value: Arc::new(value.clone()),
                             source: source_judgement(resource, name),
-                        },
+                        }),
                     )
                 })
                 .collect(),
-        }
+        };
+        prepared.join_slots(resource);
+        prepared
     }
 
     pub(super) fn report<'a>(
@@ -178,11 +212,14 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     }
 
     pub(super) fn is_reported(&self, name: &str) -> bool {
-        matches!(self.inputs.get(name), Some(StoredInput::Reported { .. }))
+        matches!(
+            self.inputs.get(name),
+            Some(PreparedAttribute::WithValue(StoredInput::Reported { .. }))
+        )
     }
 
-    /// Produce inputs for exactly the resolved attribute key set. Evaluation
-    /// owns this materialization; admission still borrows each slot's value.
+    /// Resolved values are joined with every authored attribute slot. Evaluation
+    /// owns materialization; a slot without a value remains an admission input.
     pub fn from_resolved<D>(
         resource: &crate::parser::AnalysisResourceRef<
             '_,
@@ -275,21 +312,72 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
                 };
                 (
                     name.clone(),
-                    prepare().unwrap_or_else(|error| StoredInput::Unavailable {
-                        value: Arc::new(value.clone()),
-                        error,
-                        source: source_judgement(resource, name),
-                    }),
+                    PreparedAttribute::WithValue(prepare().unwrap_or_else(|error| {
+                        StoredInput::Unavailable {
+                            value: Arc::new(value.clone()),
+                            error,
+                            source: source_judgement(resource, name),
+                        }
+                    })),
                 )
             })
             .collect();
-        Self {
+        let mut prepared = Self {
             owner: resource.id().clone(),
             scope: crate::schema::value_validation::AssignmentScope::Full,
             report: None,
             inputs,
             evidence: ResourceEvidence::Slots,
+        };
+        prepared.join_slots(resource);
+        prepared
+    }
+
+    fn join_slots<D>(
+        &mut self,
+        resource: &crate::parser::AnalysisResourceRef<
+            '_,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            B,
+        >,
+    ) where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        if let Some(slots) = resource.authored_slots() {
+            join_slots(slots, &mut self.inputs);
         }
+    }
+
+    /// Carry actual slot precheck results, without inferring them from messages
+    /// or an expectation that a later pass will report the error.
+    pub fn with_prechecks(mut self, prechecks: SlotPrechecks<'_>) -> Self {
+        for (name, input) in &mut self.inputs {
+            match input {
+                PreparedAttribute::WithValue(_) => {}
+                PreparedAttribute::WithoutValue { precheck, .. } => {
+                    *precheck = match prechecks {
+                        SlotPrechecks::Reported(report)
+                            if report.has_slot_finding(&self.owner, name) =>
+                        {
+                            SlotPrecheck::OrdinaryFinding
+                        }
+                        SlotPrechecks::Reported(_) | SlotPrechecks::Unreported => {
+                            SlotPrecheck::NoOrdinaryFinding
+                        }
+                    };
+                }
+            }
+        }
+        self
+    }
+
+    pub(super) fn prepare_missing<Pass: ResourceAdmissionPass>(
+        &self,
+        report: &crate::parser::retained::ExpressionReport<B>,
+    ) -> crate::ConversionChannel {
+        prepare_missing::<Pass, _, _>(self.inputs.values(), report)
     }
 
     /// Input provenance, distinct from candidate sealing or successful admission.
@@ -304,11 +392,11 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     pub fn values(&self) -> impl Iterator<Item = (&str, &Value<ParserPlaceholder, B>)> {
         self.inputs
             .iter()
-            .map(|(name, input)| (name.as_str(), input.value()))
+            .filter_map(|(name, input)| input.value().map(|value| (name.as_str(), value)))
     }
 
     pub fn value(&self, name: &str) -> Option<&Value<ParserPlaceholder, B>> {
-        self.inputs.get(name).map(StoredInput::value)
+        self.inputs.get(name).and_then(PreparedAttribute::value)
     }
 
     pub fn classify<'a, S: ClassificationStage>(
@@ -339,12 +427,12 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         for (name, _) in self.unmatched_materializations(values) {
             self.inputs.insert(
                 name.clone(),
-                StoredInput::Reported {
+                PreparedAttribute::WithValue(StoredInput::Reported {
                     value: Arc::new(values[&name].clone()),
                     source: Err(MissingEvidence::new(
                         "new materialized attribute has no source judgement",
                     )),
-                },
+                }),
             );
         }
         self.apply_materializations(values);
@@ -398,10 +486,33 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             let Some(value) = values.get(name) else {
                 continue;
             };
-            if input.value() == value {
+            if input.value() == Some(value) {
                 continue;
             }
-            match input {
+            let stored = match input {
+                PreparedAttribute::WithValue(stored) => stored,
+                PreparedAttribute::WithoutValue { slot, .. } => {
+                    let stored = match &self.evidence {
+                        ResourceEvidence::Slots => StoredInput::Authored {
+                            source_generation: slot.generation(),
+                            slot: Arc::new(slot.materialized(value)),
+                        },
+                        ResourceEvidence::NoAuthoredEvidence(_) => StoredInput::Reported {
+                            value: Arc::new(value.clone()),
+                            source: match self.report.as_deref() {
+                                Some(report) => slot
+                                    .source_judgement_in(report)
+                                    .or_else(|_| slot.source_judgement())
+                                    .cloned(),
+                                None => slot.source_judgement().cloned(),
+                            },
+                        },
+                    };
+                    *input = PreparedAttribute::WithValue(stored);
+                    continue;
+                }
+            };
+            match stored {
                 StoredInput::Authored { slot, .. } => *slot = Arc::new(slot.materialized(value)),
                 StoredInput::Projected {
                     value: projection, ..
@@ -439,6 +550,12 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             .inputs
             .get(name)
             .ok_or_else(|| MissingEvidence::new(format!("prepared attribute {name}")))?;
+        let input = match input {
+            PreparedAttribute::WithValue(input) => input,
+            PreparedAttribute::WithoutValue { .. } => {
+                return Err(MissingEvidence::new("attribute has no runtime value"));
+            }
+        };
         match input {
             StoredInput::Authored {
                 slot,
@@ -473,6 +590,69 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             }),
         }
     }
+}
+
+// The same preparation seam is used when legacy schema admission supplies
+// classifications directly, rather than producer-owned resolved inputs.
+pub(super) fn missing_schema_inputs<B: BindingAddress, V>(
+    slots: &crate::parser::retained::AuthoredSlots<B>,
+    attributes: &HashMap<String, V>,
+    report: &crate::parser::retained::ExpressionReport<B>,
+) -> crate::ConversionChannel {
+    let mut inputs = attributes
+        .iter()
+        .map(|(name, value)| (name.clone(), PreparedAttribute::WithValue(value)))
+        .collect();
+    join_slots(slots, &mut inputs);
+    prepare_missing::<LiveResource, _, _>(inputs.values(), report)
+}
+
+fn join_slots<B: BindingAddress, V>(
+    slots: &crate::parser::retained::AuthoredSlots<B>,
+    inputs: &mut IndexMap<String, PreparedAttribute<B, V>>,
+) {
+    // This ephemeral join includes canonical block aliases. It does not record
+    // visits or transfer responsibility to a future walk.
+    let paired = inputs
+        .keys()
+        .filter_map(|name| slots.get(name).ok())
+        .map(|slot| (slot.occurrence(), slot.instance()))
+        .collect::<std::collections::HashSet<_>>();
+    for (name, slot) in slots.iter() {
+        if !paired.contains(&(slot.occurrence(), slot.instance())) {
+            inputs.insert(
+                name.transport_identity().to_owned(),
+                PreparedAttribute::WithoutValue {
+                    slot: Arc::new(slot.clone()),
+                    precheck: SlotPrecheck::NoOrdinaryFinding,
+                },
+            );
+        }
+    }
+}
+
+fn prepare_missing<'a, Pass: ResourceAdmissionPass, B: BindingAddress + 'a, V: 'a>(
+    inputs: impl Iterator<Item = &'a PreparedAttribute<B, V>>,
+    report: &crate::parser::retained::ExpressionReport<B>,
+) -> crate::ConversionChannel {
+    let mut findings = crate::ConversionChannel::default();
+    for input in inputs {
+        match input {
+            PreparedAttribute::WithValue(_) => {}
+            PreparedAttribute::WithoutValue { slot, precheck } => match precheck {
+                SlotPrecheck::OrdinaryFinding => {}
+                SlotPrecheck::NoOrdinaryFinding => {
+                    if let Ok(source) = slot
+                        .source_judgement_in(report)
+                        .or_else(|_| slot.source_judgement())
+                    {
+                        findings.append(Pass::missing_source(source));
+                    }
+                }
+            },
+        }
+    }
+    findings
 }
 
 fn source_judgement<B: BindingAddress, D>(
@@ -518,5 +698,43 @@ where
                 .cloned()
         }
         AnalysisItemKind::Wait => Err(MissingEvidence::new("wait is not an attribute producer")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn r9_report_only_omitted_input_cannot_gain_authored_authority_by_materializing() {
+        let catalog = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_file(
+            "mock.Sink { attr = 'ok' }",
+            std::path::Path::new("report-materialization.crn"),
+            &catalog,
+        )
+        .unwrap()
+        .resolve_root_for_test();
+        let schemas = SchemaRegistry::new();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let judged = configuration.judged();
+        let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let mut inputs =
+            ResourceAttributeInputs::from_report(resource, &HashMap::new(), judged.report());
+        inputs
+            .materialize(&HashMap::from([(
+                "attr".into(),
+                Value::Concrete(crate::resource::ConcreteValue::String("ok".into())),
+            )]))
+            .unwrap();
+        assert!(matches!(
+            inputs
+                .input(resource, "attr", judged.report(), None)
+                .unwrap(),
+            AttributeInput::Reported { .. }
+        ));
+        assert!(inputs.authored_evidence().is_err());
     }
 }

@@ -279,6 +279,15 @@ impl ConversionVerdict {
         }
     }
     fn unchecked(source: &JudgedExpr, carried: flow::CarriedConversion<'_>) -> Self {
+        Self(Box::new(Decision::Rejected(AssignmentFindings {
+            conversions: Self::unavailable_conversion(source, carried),
+            ..Default::default()
+        })))
+    }
+    fn unavailable_conversion(
+        source: &JudgedExpr,
+        carried: flow::CarriedConversion<'_>,
+    ) -> crate::ConversionChannel {
         let site = carried.first();
         let error = ConversionError::new(
             Kind::UnsupportedPosition,
@@ -286,15 +295,19 @@ impl ConversionVerdict {
             "conversion cannot be checked here",
         )
         .owned_by(site.node);
-        Self(Box::new(Decision::Rejected(AssignmentFindings {
-            conversions: std::iter::once(if source.diagnostic_is_secret() {
-                error.inside_secret()
-            } else {
-                error
-            })
-            .collect(),
-            ..Default::default()
-        })))
+        std::iter::once(if source.diagnostic_is_secret() {
+            error.inside_secret()
+        } else {
+            error
+        })
+        .collect()
+    }
+    /// The same proof failure as a validation projection without navigation.
+    pub(crate) fn unavailable_source(source: &JudgedExpr) -> crate::ConversionChannel {
+        match source.conversion_evidence() {
+            ConversionEvidence::Free(_proof) => Default::default(),
+            ConversionEvidence::Carried(carried) => Self::unavailable_conversion(source, carried),
+        }
     }
     pub(crate) fn proof_mismatch<B: BindingAddress>(
         cursor: &AuthoredCursor<'_, B>,
