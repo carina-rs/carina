@@ -139,6 +139,7 @@ use crate::schema::{CompiledAttributeType, FieldAncestry, LeafPath, TypeError};
 
 mod assignment;
 pub mod attributes;
+pub mod configuration;
 pub mod final_input;
 #[cfg(test)]
 mod tests;
@@ -183,7 +184,8 @@ pub trait DestinationKind: sealed::Sealed {
 
 pub mod kind {
     macro_rules! rechecks {
-        ($($name:ident),+ $(,)?) => {$(
+        ($($(#[$meta:meta])* $name:ident),+ $(,)?) => {$(
+            $(#[$meta])*
             #[derive(Debug, Clone, Copy, PartialEq, Eq)]
             pub struct $name;
             impl super::sealed::Sealed for $name {
@@ -218,6 +220,23 @@ pub mod kind {
     rechecks!(
         ResourceAttribute,
         DataSourceAttribute,
+        /// Provider fields consume only provider placements.
+        ///
+        /// ```
+        /// use carina_core::validation::admission::{TypedSlot, PlacedValue, kind::ProviderConfigAttribute};
+        /// fn place(slot: &mut TypedSlot<ProviderConfigAttribute>, value: PlacedValue<ProviderConfigAttribute>) { slot.place(value).unwrap(); }
+        /// ```
+        /// ```compile_fail
+        /// use carina_core::validation::admission::{TypedSlot, PlacedValue, kind::{ProviderConfigAttribute, BackendAttribute}};
+        /// fn place(slot: &mut TypedSlot<ProviderConfigAttribute>, value: PlacedValue<BackendAttribute>) {
+        ///     slot.place(value).unwrap(); // forbidden: provider and backend placements have distinct kinds
+        /// }
+        /// ```
+        /// ```
+        /// # use carina_core::validation::admission::{TypedSlot, PlacedValue, kind::{ProviderConfigAttribute, BackendAttribute}};
+        /// # fn place(slot: &mut TypedSlot<ProviderConfigAttribute>, value: PlacedValue<BackendAttribute>) {
+        /// # }
+        /// ```
         ProviderConfigAttribute,
         BackendAttribute,
         ModuleArgument,
@@ -256,27 +275,51 @@ impl Default for DeclarationId {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct CatalogRevision(CatalogSnapshot);
+
 #[derive(Clone)]
-struct CatalogRevision(crate::parser::ProviderCustomTypes);
-impl PartialEq for CatalogRevision {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.same_snapshot(&other.0)
+enum CatalogSnapshot {
+    Provider(crate::parser::ProviderCustomTypes),
+    Backend(DeclarationId),
+}
+impl CatalogSnapshot {
+    // Resource assignment compares only provider snapshots. Backend admission
+    // has its own declaration revision and never enters that resource path.
+    fn same_snapshot(&self, catalog: &crate::parser::ProviderCustomTypes) -> bool {
+        matches!(self, Self::Provider(snapshot) if snapshot.same_snapshot(catalog))
     }
 }
-impl Eq for CatalogRevision {}
+impl PartialEq for CatalogSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Provider(left), Self::Provider(right)) => left.same_snapshot(right),
+            (Self::Backend(left), Self::Backend(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+impl Eq for CatalogSnapshot {}
 impl std::fmt::Debug for CatalogRevision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CatalogRevision")
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum DeclarationOwner {
+    Provider(crate::parser::SchemaTypeOwner),
+    Backend(configuration::backend::BackendKind),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DeclarationIdentity {
-    owner: crate::parser::SchemaTypeOwner,
+    owner: DeclarationOwner,
     schema: DeclarationId,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InstanceIdentity {
     Resource(crate::resource::ResourceId),
+    Provider(crate::provider::ProviderInstanceKey),
+    Backend(configuration::backend::BackendKind),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DestinationIdentity {
@@ -289,27 +332,74 @@ struct DestinationIdentity {
 
 #[derive(Debug, Clone)]
 pub(crate) struct DestinationContract {
-    schema: std::sync::Arc<crate::schema::CompiledResourceSchema>,
+    schema: ContractSchema,
     attribute: String,
-    owner: crate::parser::SchemaTypeOwner,
+    owner: DeclarationOwner,
     ancestry: FieldAncestry,
     path: LeafPath,
 }
+#[derive(Debug, Clone)]
+enum ContractSchema {
+    Resource(std::sync::Arc<crate::schema::CompiledResourceSchema>),
+    Configuration(std::sync::Arc<crate::schema::ValidatedConfigSchema>),
+}
 impl DestinationContract {
+    fn resource(
+        schema: std::sync::Arc<crate::schema::CompiledResourceSchema>,
+        attribute: String,
+        owner: crate::parser::SchemaTypeOwner,
+        ancestry: FieldAncestry,
+        path: LeafPath,
+    ) -> Self {
+        Self {
+            schema: ContractSchema::Resource(schema),
+            attribute,
+            owner: DeclarationOwner::Provider(owner),
+            ancestry,
+            path,
+        }
+    }
+
     fn attr(&self) -> &CompiledAttributeType {
-        &self.schema.attributes()[&self.attribute].attr_type
+        match &self.schema {
+            ContractSchema::Resource(schema) => &schema.attributes()[&self.attribute].attr_type,
+            ContractSchema::Configuration(schema) => &schema.parts()[&self.attribute],
+        }
     }
 
     fn defs(&self) -> &std::collections::BTreeMap<String, CompiledAttributeType> {
-        self.schema.defs()
+        match &self.schema {
+            ContractSchema::Resource(schema) => schema.defs(),
+            ContractSchema::Configuration(_) => crate::schema::empty_defs_for_schema_walks(),
+        }
     }
 
     fn lookup<'a>(
         &'a self,
         catalog: &'a ProviderContext,
     ) -> impl crate::schema::ValidatedCustomTypeLookup + 'a {
-        let crate::parser::SchemaTypeOwner::Provider(owner) = &self.owner;
+        let DeclarationOwner::Provider(crate::parser::SchemaTypeOwner::Provider(owner)) =
+            &self.owner
+        else {
+            unreachable!("backend configuration owns its builtin lookup")
+        };
         crate::parser::custom_type_lookup_for_owner(catalog.custom_type_resolver(), owner)
+    }
+
+    fn sink_type<'a>(
+        &'a self,
+        attr: &'a CompiledAttributeType,
+        catalog: &'a ProviderContext,
+    ) -> crate::schema::AssignmentSink<'a, crate::schema::Compiled> {
+        let DeclarationOwner::Provider(owner) = &self.owner else {
+            // Built-in backends enter configuration admission, which consumes
+            // concrete settings and never judges resource references.
+            unreachable!("backend configuration has no resource assignment sink")
+        };
+        attr.in_schema(self.defs()).with_authority(
+            &catalog.custom_types,
+            crate::schema::SinkAuthority::Owner(owner),
+        )
     }
 }
 
@@ -377,6 +467,11 @@ enum AdmissionProof<'a, P: PlaceholderKind, B: BindingAddress> {
     Apply(KnownValue<'a, P, B>),
 }
 
+enum AdmissionLookup<'a> {
+    Catalog,
+    Configuration(&'a dyn crate::schema::ValidatedCustomTypeLookup),
+}
+
 /// Main's ordinary assignment work requires a current, expression-origin value.
 /// Authored policy instead uses AssignmentCheck, including discarded positions.
 type OrdinaryAssignmentCheck<'a, P, B> =
@@ -410,6 +505,7 @@ pub struct AdmissionContext<
     proof: AdmissionProof<'a, P, B>,
     bindings: Option<&'a BindingIndex<'a, B>>,
     provider: &'a dyn ProviderTypeCheckContext,
+    lookup: AdmissionLookup<'a>,
     assignment: AssignmentChecks<'a, P, B>,
     cursor: crate::parser::retained::AuthoredCursor<'a, B>,
     coverage: std::cell::RefCell<crate::schema::value_validation::WalkCoverage>,
@@ -507,6 +603,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
             proof: AdmissionProof::Apply(proof.clone()),
             bindings: None,
             provider,
+            lookup: AdmissionLookup::Catalog,
             assignment: Default::default(),
             cursor: crate::parser::retained::AuthoredCursor::projected(phase),
             coverage: Default::default(),
@@ -529,6 +626,41 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
         provider: &'a dyn ProviderTypeCheckContext,
         cursor: crate::parser::retained::AuthoredCursor<'a, B>,
     ) -> (Self, AdmissionContext<'a, P, B>) {
+        Self::paired_in(
+            value,
+            proof,
+            bindings,
+            provider,
+            cursor,
+            AdmissionLookup::Catalog,
+        )
+    }
+
+    fn configuration<'a>(
+        value: &'a Value<P, B>,
+        provider: &'a dyn ProviderTypeCheckContext,
+        lookup: &'a dyn crate::schema::ValidatedCustomTypeLookup,
+        proof: crate::resource::knowledge::Classification<'a, P, B>,
+    ) -> (Self, AdmissionContext<'a, P, B>) {
+        let phase = crate::parser::retained::ProjectedPhase::classified(&proof);
+        Self::paired_in(
+            value.clone(),
+            AdmissionProof::Validation(proof),
+            None,
+            provider,
+            crate::parser::retained::AuthoredCursor::projected(phase),
+            AdmissionLookup::Configuration(lookup),
+        )
+    }
+
+    fn paired_in<'a>(
+        value: Value<P, B>,
+        proof: AdmissionProof<'a, P, B>,
+        bindings: Option<&'a BindingIndex<'a, B>>,
+        provider: &'a dyn ProviderTypeCheckContext,
+        cursor: crate::parser::retained::AuthoredCursor<'a, B>,
+        lookup: AdmissionLookup<'a>,
+    ) -> (Self, AdmissionContext<'a, P, B>) {
         #[cfg(test)]
         tests::candidate_constructed();
         let identity = DeclarationId::default();
@@ -545,6 +677,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
                 proof,
                 bindings,
                 provider,
+                lookup,
                 assignment: Default::default(),
                 cursor,
                 coverage: Default::default(),
@@ -929,6 +1062,9 @@ pub fn admit<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
     candidate: Candidate<P, B>,
     context: &AdmissionContext<'_, P, B>,
 ) -> Result<Admission<K, P, B>, AdmissionErrors> {
+    if let AdmissionLookup::Configuration(lookup) = context.lookup {
+        return configuration::admit_field(destination, candidate, context, lookup);
+    }
     if context.is_apply() {
         return admit_apply(destination, candidate, context).map(Admission::Ready);
     }

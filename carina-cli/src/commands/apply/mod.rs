@@ -38,7 +38,7 @@ use carina_core::resource::{ConcreteValue, State};
 use carina_core::shutdown::ShutdownToken;
 use carina_core::upstream_exports::AdmittedRemoteBindings;
 use carina_core::value::{RenderedKey, render_value};
-use carina_state::{BackendLock, LockInfo, RowBasis, StateBackend, StateFile};
+use carina_state::{LockInfo, RowBasis, StateBackend, StateFile};
 
 #[cfg(test)]
 use carina_core::parser::ProviderConfig;
@@ -85,7 +85,7 @@ use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     AddressedDataSourceReadInputs, ProjectedPhase1RefreshInputs, ProviderLoad, ValidatedConfig,
     create_normalizers_from_configs_with_ctx, create_providers_from_configs_with_ctx,
-    get_provider_with_ctx, module_constraint_plan_errors, prepare_default_provider_ready_config,
+    get_provider_with_ctx, module_constraint_plan_errors, prepare_default_provider_construction,
     read_managed_state_with_retry, refresh_loaded_orphan_with_retry,
 };
 #[cfg(test)]
@@ -2287,11 +2287,11 @@ async fn create_state_bucket_bootstrap_provider<R>(
     let ctx = validated_config.context();
     let factory = provider_mod::find_factory(ctx.factories(), provider_name)
         .ok_or_else(|| format!("No provider factory found for '{provider_name}'"))?;
-    let config = prepare_default_provider_ready_config(factory, provider_name, provider_configs)?;
-    let session = plan.session(provider_name, None, Some(&config));
-    let provider = provider_mod::ProviderBoundary::initialize(factory, &session).await?;
+    let construction =
+        prepare_default_provider_construction(factory, provider_name, provider_configs, plan)?;
+    let provider = provider_mod::ProviderBoundary::initialize(&construction).await?;
     let normalizer =
-        Box::new(provider_mod::ProviderBoundary::initialize_normalizer(factory, &session).await?)
+        Box::new(provider_mod::ProviderBoundary::initialize_normalizer(&construction).await?)
             as Box<dyn carina_core::provider::HostNormalizer>;
     let mut router = ProviderRouter::new();
     router.add_provider(provider_name.to_string(), provider);
@@ -3210,13 +3210,19 @@ async fn run_apply_locked_canonical(
     finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await
 }
 
-fn ensure_saved_plan_backend_matches_current(
-    plan_backend_config: Option<&carina_core::parser::ExpandedBackendConfig>,
-    current_backend_config: Option<&carina_core::parser::ExpandedBackendConfig>,
+fn ensure_saved_plan_backend_matches_current<'a>(
+    plan_backend_config: impl Into<carina_state::BackendConfigurationSource<'a>>,
+    current_backend_config: impl Into<carina_state::BackendConfigurationSource<'a>>,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
-    let planned = BackendLock::for_config(plan_backend_config).map_err(AppError::Backend)?;
-    let current = BackendLock::for_config(current_backend_config).map_err(AppError::Backend)?;
+    let planned = plan_backend_config
+        .into()
+        .backend_lock()
+        .map_err(AppError::Backend)?;
+    let current = current_backend_config
+        .into()
+        .backend_lock()
+        .map_err(AppError::Backend)?;
 
     if planned == current {
         Ok(())
@@ -3930,8 +3936,8 @@ async fn run_apply_from_plan_with_observer_factory(
     };
     let current_backend = parsed_backend.as_ref().map(Option::as_ref);
     let backend_config = match current_backend {
-        Some(current_backend) => current_backend,
-        None => inspected_plan.backend_config(),
+        Some(current_backend) => current_backend.into(),
+        None => inspected_plan.backend_config().selection_source(),
     };
     let verified_backend =
         verify_for_mutation(base_dir, &source_path, backend_config, DriftCommand::Apply)?;
@@ -3941,7 +3947,7 @@ async fn run_apply_from_plan_with_observer_factory(
     // backend gates pass is the state lock acquired.
     if let Some(current_backend) = current_backend {
         ensure_saved_plan_backend_matches_current(
-            inspected_plan.backend_config(),
+            inspected_plan.backend_config().selection_source(),
             current_backend,
             apply_target,
         )?;

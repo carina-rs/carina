@@ -7068,8 +7068,8 @@ impl InitializeOutcome {
     }
 }
 
-/// One-shot capability supplied only while a provider factory initializes an
-/// instance. Its private field prevents callers from minting an available
+/// One-shot capability supplied only while the admitted construction owner
+/// initializes a provider or its normalizer. Its private field prevents callers from minting an available
 /// initialization outcome outside that transition.
 #[doc(hidden)]
 pub struct InitializeOutcomeMint {
@@ -7131,9 +7131,7 @@ impl InitializedProvider {
             fn display_name(&self) -> &str {
                 "Fixture"
             }
-            fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-                ValidatedConfigSchema::default()
-            }
+
             fn validate_config(
                 &self,
                 _: &CanonicalProviderConfigAttributes,
@@ -7165,12 +7163,12 @@ impl InitializedProvider {
                 })
             }
         }
-        futures::executor::block_on(ProviderBoundary::initialize(
+        futures::executor::block_on(ProviderBoundary::initialize_for_test(
             &Factory {
                 provider: std::sync::Mutex::new(Some(provider)),
                 scope: reference_scope,
             },
-            &ProviderPlan::state_only().session("", None, None),
+            &ProviderPlan::state_only().test_session("", None, None),
         ))
         .unwrap()
     }
@@ -7227,7 +7225,7 @@ impl NormalizerRouter {
 #[cfg(test)]
 impl<N> ConfiguredNormalizer<N> {
     pub(crate) fn fixture(ext: N) -> Self {
-        let session = ProviderPlan::state_only().session("", None, None);
+        let session = ProviderPlan::state_only().test_session("", None, None);
         Self {
             diagnostic_inputs: session.guest_inputs(),
             route: None,
@@ -7260,7 +7258,7 @@ impl NormalizerRouter {
         ext: Box<dyn ProviderNormalizer>,
     ) {
         let provider_name = provider_name.into();
-        let session = ProviderPlan::state_only().session(&provider_name, None, None);
+        let session = ProviderPlan::state_only().test_session(&provider_name, None, None);
         self.add_initialized_normalizer(ConfiguredNormalizer {
             diagnostic_inputs: session.guest_inputs(),
             route: None,
@@ -8527,20 +8525,10 @@ pub trait ProviderFactory: Send + Sync {
     /// Display name for user-facing messages (e.g., "AWS provider", "AWS Cloud Control provider")
     fn display_name(&self) -> &str;
 
-    /// Return the validated schema witness for the provider block's
-    /// configuration attributes (e.g., `region`).
-    ///
-    /// These are used by the host to validate provider config attributes
-    /// against their effective path types *before* calling `validate_config`.
-    /// Keeping format validation (namespace structure, enum membership) on
-    /// the host side means fixes to generic validation logic in
-    /// `carina-core` take effect without rebuilding provider binaries.
-    fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema;
-
     /// Validate provider-specific configuration semantics that cannot be
     /// expressed in the attribute type schema (e.g., cross-attribute
-    /// consistency checks). Type-level validation is handled by the host
-    /// using [`provider_config_attribute_types`] before this is called.
+    /// consistency checks). Host type checks use the configuration declaration
+    /// in [`Self::schema_witness`] before this is called.
     ///
     /// A raw attribute map cannot be passed to this boundary:
     ///
@@ -8624,6 +8612,7 @@ pub trait ProviderFactory: Send + Sync {
     fn create_normalizer(
         &self,
         _config: &crate::provider::ProviderSession,
+        _: crate::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -8633,9 +8622,8 @@ pub trait ProviderFactory: Send + Sync {
 
     /// Return the provider-level aggregate schema witness.
     ///
-    /// Registry ownership, custom-type recognition, and reference forms must
-    /// all be derived from this one snapshot rather than reloading the three
-    /// declaration sources independently.
+    /// Configuration admission, registry ownership, custom-type recognition
+    /// and reference forms all derive from this one snapshot.
     fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness;
 
     /// Attribute names (beyond schema create-only properties) that contribute
@@ -10138,9 +10126,7 @@ mod tests {
             fn schemas(&self) -> Vec<ValidatedResourceSchema> {
                 panic!("snapshot must use the aggregate witness")
             }
-            fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-                panic!("snapshot must use the aggregate witness")
-            }
+
             fn validate_config(
                 &self,
                 _: &CanonicalProviderConfigAttributes,
@@ -11084,7 +11070,16 @@ mod tests {
         fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
             crate::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "endpoint".to_string(),
+                    PatternAttributeType::refined_string(
+                        Some(TypeIdentity::new(Some("test"), ["config"], "Endpoint")),
+                        None,
+                        None,
+                        None,
+                    ),
+                )]))
+                .expect("config-only custom type must validate"),
                 Default::default(),
                 Vec::new(),
             )
@@ -11093,19 +11088,6 @@ mod tests {
 
         fn schemas(&self) -> Vec<ValidatedResourceSchema> {
             Vec::new()
-        }
-
-        fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-            ValidatedConfigSchema::validate(BTreeMap::from([(
-                "endpoint".to_string(),
-                PatternAttributeType::refined_string(
-                    Some(TypeIdentity::new(Some("test"), ["config"], "Endpoint")),
-                    None,
-                    None,
-                    None,
-                ),
-            )]))
-            .expect("config-only custom type must validate")
         }
 
         fn validate_config(
@@ -11141,9 +11123,7 @@ mod tests {
             fn schemas(&self) -> Vec<ValidatedResourceSchema> {
                 Vec::new()
             }
-            fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-                ConfigOnlyCustomTypeFactory.provider_config_attribute_types()
-            }
+
             fn validate_config(
                 &self,
                 _: &CanonicalProviderConfigAttributes,
@@ -11175,12 +11155,12 @@ mod tests {
                 Box::pin(async { Err(ProviderError::internal("not used")) })
             }
         }
-        let (session, events) = captured_session(ProviderPlan::state_only().session_builder(
+        let (session, events) = captured_session(ProviderPlan::state_only().test_session_builder(
             "config-owner",
             None,
             None,
         ));
-        let schema = DiagnosticFactory.provider_config_attribute_types();
+        let schema = DiagnosticFactory.schema_witness().config().clone();
         let declaration =
             crate::parser::IdentifiedCustomTypeDeclaration::new(&schema.parts()["endpoint"])
                 .unwrap();
@@ -11214,7 +11194,7 @@ mod tests {
     #[test]
     fn declaration_validation_helper_returns_pending_projection_error() {
         let factory = ConfigOnlyCustomTypeFactory;
-        let schema = factory.provider_config_attribute_types();
+        let schema = factory.schema_witness().config().clone();
         let declaration =
             crate::parser::IdentifiedCustomTypeDeclaration::new(&schema.parts()["endpoint"])
                 .unwrap();
@@ -11456,15 +11436,11 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                ValidatedConfigSchema::default(),
                 Default::default(),
                 Vec::new(),
             )
             .expect("snapshot fixture must expose one valid aggregate witness")
-        }
-
-        fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-            ValidatedConfigSchema::default()
         }
 
         fn validate_config(
@@ -13244,7 +13220,7 @@ mod tests {
         Arc<std::sync::Mutex<Vec<crate::provider_text::BoundProviderEvent>>>,
     ) {
         let (session, events) =
-            captured_session(ProviderPlan::state_only().session_builder("mock", None, None));
+            captured_session(ProviderPlan::state_only().test_session_builder("mock", None, None));
         let mut boundary = ProviderBoundary::fixture(AsyncDiagnosticFloodProvider {
             diagnostics: session.diagnostics(),
             emission,
@@ -13422,7 +13398,7 @@ mod tests {
     #[tokio::test]
     async fn native_calls_have_independent_budgets_and_one_notice_each() {
         let (session, events) =
-            captured_session(ProviderPlan::state_only().session_builder("mock", None, None));
+            captured_session(ProviderPlan::state_only().test_session_builder("mock", None, None));
         let mut boundary = ProviderBoundary::fixture(DiagnosticFloodProvider {
             diagnostics: session.diagnostics(),
             inner: MockProvider,
@@ -16094,9 +16070,7 @@ mod tests {
             fn display_name(&self) -> &str {
                 "Failing provider"
             }
-            fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-                Default::default()
-            }
+
             fn validate_config(
                 &self,
                 _attrs: &CanonicalProviderConfigAttributes,
@@ -16120,7 +16094,7 @@ mod tests {
             fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
                 crate::schema::ValidatedProviderSchemaWitness::new(
                     self.schemas(),
-                    self.provider_config_attribute_types(),
+                    Default::default(),
                     Default::default(),
                     Vec::new(),
                 )
@@ -16139,7 +16113,7 @@ mod tests {
         let config =
             crate::executor::prepare_provider_ready_config(&factory, resolved_config.as_ref())
                 .unwrap();
-        let result = ProviderBoundary::initialize(
+        let result = ProviderBoundary::initialize_for_test(
             &factory,
             &crate::provider::prepare_provider_session::<
                 crate::resource::ModuleSource,
@@ -16194,9 +16168,7 @@ mod tests {
             fn display_name(&self) -> &str {
                 "Capturing provider"
             }
-            fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-                Default::default()
-            }
+
             fn validate_config(
                 &self,
                 _attrs: &CanonicalProviderConfigAttributes,
@@ -16221,7 +16193,7 @@ mod tests {
             fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
                 crate::schema::ValidatedProviderSchemaWitness::new(
                     self.schemas(),
-                    self.provider_config_attribute_types(),
+                    Default::default(),
                     Default::default(),
                     Vec::new(),
                 )
@@ -16240,7 +16212,7 @@ mod tests {
         let config =
             crate::executor::prepare_provider_ready_config(&factory, resolved_config.as_ref())
                 .unwrap();
-        let _ = ProviderBoundary::initialize(
+        let _ = ProviderBoundary::initialize_for_test(
             &factory,
             &crate::provider::prepare_provider_session::<
                 crate::resource::ModuleSource,
@@ -16249,7 +16221,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let _ = ProviderBoundary::initialize(
+        let _ = ProviderBoundary::initialize_for_test(
             &factory,
             &crate::provider::prepare_provider_session::<
                 crate::resource::ModuleSource,
@@ -16258,7 +16230,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let _ = ProviderBoundary::initialize(
+        let _ = ProviderBoundary::initialize_for_test(
             &factory,
             &crate::provider::prepare_provider_session::<
                 crate::resource::ModuleSource,
@@ -16601,9 +16573,7 @@ mod provider_text_route_tests {
         fn display_name(&self) -> &str {
             "Route probe"
         }
-        fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-            Default::default()
-        }
+
         fn validate_config(
             &self,
             _: &CanonicalProviderConfigAttributes,
@@ -16633,6 +16603,7 @@ mod provider_text_route_tests {
         fn create_normalizer(
             &self,
             _: &ProviderSession,
+            _: crate::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
             let probe = Probe(self.0.clone());
             Box::pin(async move { Ok(Box::new(probe) as Box<dyn ProviderNormalizer>) })
@@ -16654,9 +16625,10 @@ mod provider_text_route_tests {
         }
         let session = prepare_provider_session("route-probe", Some("first"), None, &desired, &[]);
         let seen = Arc::new(Seen::default());
-        let normalizer = ProviderBoundary::initialize_normalizer(&Factory(seen.clone()), &session)
-            .await
-            .unwrap();
+        let normalizer =
+            ProviderBoundary::initialize_normalizer_for_test(&Factory(seen.clone()), &session)
+                .await
+                .unwrap();
         let mut router = NormalizerRouter::new();
         router.add_initialized_normalizer(normalizer);
         let mut resources = desired

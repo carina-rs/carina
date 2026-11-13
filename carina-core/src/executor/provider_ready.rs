@@ -6,11 +6,16 @@
 //! boundary without value-constraint validation.
 
 #[cfg(test)]
+use crate::provider::ProviderFactory;
+#[cfg(test)]
 use crate::provider::ProviderNormalizer;
+#[cfg(test)]
+use crate::resource::ParserPlaceholder;
+
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use indexmap::IndexMap;
 use thiserror::Error;
@@ -21,20 +26,18 @@ pub use crate::module_resolver::ModuleConstraintFailure;
 use crate::module_resolver::{
     evaluate_live_pending_constraints, evaluate_saved_pending_constraints,
 };
-use crate::parser::{ProviderConfig, ProviderConfiguration};
+use crate::parser::ProviderConfig;
 use crate::provider::{
-    CreateRequest, HostNormalizer, ProviderDirectives, ProviderFactory, ProviderWireError,
-    ProviderWireTarget, ResourceWirePayload, UpdateRequest, WireAttributes, WireReady,
+    CreateRequest, HostNormalizer, ProviderDirectives, ProviderWireError, ProviderWireTarget,
+    ResourceWirePayload, UpdateRequest, WireAttributes, WireReady,
 };
 use crate::resource::{
-    AbsoluteBindingAddress, BindingAddress, DataSource, LiveComposition, NoPlaceholder,
-    ParserPlaceholder, PlaceholderKind, ProviderDataSource, ProviderModuleSource, ProviderResource,
-    RelativeBindingName, ResolvedDataSource, ResolvedResource, Resource, ResourceId,
-    SavedComposition, Value,
+    AbsoluteBindingAddress, DataSource, LiveComposition, NoPlaceholder, ProviderDataSource,
+    ProviderModuleSource, ProviderResource, ResolvedDataSource, ResolvedResource, Resource,
+    ResourceId, SavedComposition, Value,
 };
 use crate::schema::{
     CompiledResourceSchema as ResourceSchema, SchemaKind, SchemaRegistry, TypeError,
-    ValidatedConfigSchema,
 };
 use crate::validation::admission::{
     RechecksResolved,
@@ -329,85 +332,9 @@ impl ProviderReadyResource {
 pub type ProviderReadyDataSource =
     ProviderReady<ResolvedDataSource<ProviderModuleSource>, kind::DataSourceAttribute>;
 
-/// Provider configuration attributes whose schema-known enum leaves are in
-/// host-resolved API spelling.
-///
-/// The field is private and the only producer is
-/// [`validate_and_canonicalize_provider_config`], which also runs host type
-/// checks and provider semantic validation before returning the value.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CanonicalProviderConfigAttributes {
-    attributes: WireReady<crate::parser::ConfigurationAttributes<Value>>,
-}
-
-impl CanonicalProviderConfigAttributes {
-    pub fn attributes(&self) -> &crate::parser::ConfigurationAttributes<Value> {
-        self.attributes.as_inner()
-    }
-
-    pub fn wire_attributes(&self) -> &WireAttributes {
-        self.attributes.wire()
-    }
-}
-
-impl Deref for CanonicalProviderConfigAttributes {
-    type Target = crate::parser::ConfigurationAttributes<Value>;
-
-    fn deref(&self) -> &Self::Target {
-        self.attributes()
-    }
-}
-
-/// Provider configuration that passed every provider-boundary check.
-///
-/// The attributes remain private so a provider instance cannot be created
-/// from unchecked values. There is no `new`, `From`, `Default`, or
-/// deserialization path; [`prepare_provider_ready_config`] is the sole
-/// constructor.
-///
-/// ```compile_fail,E0451
-/// use carina_core::provider::ProviderReadyConfig;
-///
-/// let _ready = ProviderReadyConfig { inner: todo!() };
-/// ```
-///
-/// A raw attribute map cannot cross the provider construction boundary.
-///
-/// ```compile_fail,E0308
-/// use carina_core::parser::ConfigurationAttributes;
-/// use carina_core::provider::{ProviderBoundary, ProviderFactory};
-/// use carina_core::resource::Value;
-///
-/// fn bypass(factory: &dyn ProviderFactory, attributes: &ConfigurationAttributes<Value>) {
-///     let _ = ProviderBoundary::initialize(factory, attributes);
-/// }
-/// ```
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProviderReadyConfig {
-    inner: Arc<ProviderReadyConfigInner>,
-}
-
-#[derive(Debug, PartialEq)]
-struct ProviderReadyConfigInner {
-    attributes: CanonicalProviderConfigAttributes,
-    region: Option<String>,
-}
-
-impl ProviderReadyConfig {
-    /// Borrow the checked provider configuration attributes.
-    pub fn attributes(&self) -> &crate::parser::ConfigurationAttributes<Value> {
-        self.inner.attributes.attributes()
-    }
-
-    pub fn wire_attributes(&self) -> &WireAttributes {
-        self.inner.attributes.wire_attributes()
-    }
-
-    /// Borrow the resolved region when the provider config schema declares it.
-    pub fn region(&self) -> Option<&str> {
-        self.inner.region.as_deref()
-    }
-}
+pub use crate::validation::admission::configuration::provider::{
+    CanonicalProviderConfigAttributes, ProviderReadyConfig,
+};
 
 /// Dependencies shared by every checked provider-boundary preparation.
 ///
@@ -894,6 +821,21 @@ pub struct ProviderConfigValidationError {
 }
 
 impl ProviderConfigValidationError {
+    pub(crate) fn deferred(
+        diagnostics: Vec<crate::validation::deferred_types::ProviderTypeCheckDiagnostic>,
+    ) -> Self {
+        Self::new(crate::provider::HostError::invalid_input_caused_by(
+            "provider configuration type checks remain unsettled",
+            crate::provider_text::HostDiagnostic::capture_host_or_provider(PreparationDiagnostics(
+                diagnostics,
+            )),
+        ))
+    }
+
+    pub(crate) fn new(error: crate::provider::HostError) -> Self {
+        Self { error }
+    }
+
     pub fn provider_error(&self) -> &crate::provider::HostError {
         &self.error
     }
@@ -955,186 +897,11 @@ impl ProviderConfigPreparationError {
     }
 }
 
-fn canonicalize_provider_config_attributes<P: PlaceholderKind, B: BindingAddress>(
-    provider_name: &str,
-    attributes: &crate::parser::ConfigurationAttributes<Value<P, B>>,
-    attr_types: &crate::schema::ValidatedConfigSchema,
-) -> Result<crate::parser::ConfigurationAttributes<Value<P, B>>, ProviderConfigPreparationError> {
-    let attributes = crate::value::canonicalize_provider_config_attributes_with_types(
-        provider_name,
-        attributes,
-        attr_types.parts(),
-    )
-    .map_err(|error| {
-        let (provider, attribute, error) = error.into_parts();
-        ProviderConfigPreparationError::InvalidAttribute {
-            provider,
-            attribute,
-            error: vec![error].into(),
-        }
-    })?;
-    Ok(attributes)
-}
-
-fn validate_canonical_provider_config(
-    factory: &dyn ProviderFactory,
-    provider_name: &str,
-    attributes: crate::parser::ConfigurationAttributes<Value>,
-) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
-    let attributes = WireReady::try_new(
-        attributes,
-        ProviderWireTarget::Configuration {
-            provider: provider_name.to_string(),
-        },
-    )?;
-    let canonical = CanonicalProviderConfigAttributes { attributes };
-    let session =
-        crate::provider::ProviderValidationInputs::collect(provider_name, canonical.values());
-    session
-        .diagnostics()
-        .dispatch_sync(|| factory.validate_config(&canonical, &session))
-        .map_err(|error| {
-            let error = if canonical.values().any(crate::value::contains_secret) {
-                error.with_redacted_message("configuration containing a secret failed validation")
-            } else {
-                error
-            };
-            ProviderConfigPreparationError::ProviderValidation {
-                provider: provider_name.to_string(),
-                error: ProviderConfigValidationError {
-                    error: error.with_secrets(session.redaction_set()),
-                },
-            }
-        })?;
-    Ok(canonical)
-}
-
-/// Validate and canonicalize one provider configuration through the single
-/// host-to-provider seam.
-///
-/// The complete authored map is first canonicalized with provider-config enum
-/// namespace rules, then host type checks run over that canonical map.
-/// Attributes containing unresolved references are withheld from the provider
-/// validator (the construction-time call has no such values), while every
-/// remaining schema-known enum reaches [`ProviderFactory::validate_config`] in
-/// API spelling.
-pub fn validate_and_canonicalize_provider_config(
-    factory: &dyn ProviderFactory,
-    provider_name: &str,
-    attributes: &crate::parser::ConfigurationAttributes<Value>,
-    config_schema: &ValidatedConfigSchema,
-) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
-    let canonical =
-        canonicalize_provider_config_attributes(provider_name, attributes, config_schema)?;
-    validate_provider_config_attributes(factory, provider_name, &canonical, config_schema)?;
-
-    let serializable = canonical
-        .into_iter()
-        .filter_map(|(name, value)| {
-            value
-                .try_into_address_free_absolute()
-                .map(|value| (name, value))
-        })
-        .collect();
-    validate_canonical_provider_config(factory, provider_name, serializable)
-}
-
-pub fn validate_parser_provider_config(
-    factory: &dyn ProviderFactory,
-    provider_name: &str,
-    attributes: &crate::parser::ConfigurationAttributes<
-        Value<ParserPlaceholder, RelativeBindingName>,
-    >,
-) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
-    let config_schema = factory.provider_config_attribute_types();
-    let canonical =
-        canonicalize_provider_config_attributes(provider_name, attributes, &config_schema)?;
-    validate_provider_config_attributes(factory, provider_name, &canonical, &config_schema)?;
-
-    let serializable = canonical
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_expanded()?
-                .try_into_address_free_absolute()
-                .map(|value| (name.clone(), value))
-        })
-        .collect();
-    validate_canonical_provider_config(factory, provider_name, serializable)
-}
-
-/// Prepare provider configuration for construction and normalization.
-///
-/// The sealed [`ProviderConfiguration`] view guarantees that every construction-
-/// time attribute is fully resolved for either desired or read/delete use.
-/// This boundary checks each attribute against the provider's host-side schema, replaces enum spellings
-/// with canonical API values, and only then runs the provider-specific
-/// configuration validator. This is the sole constructor for
-/// [`ProviderReadyConfig`].
-///
-/// A raw parser config cannot skip the provider-resolution capability.
-///
-/// ```compile_fail
-/// use carina_core::executor::prepare_provider_ready_config;
-/// use carina_core::parser::ProviderConfig;
-/// use carina_core::provider::ProviderFactory;
-///
-/// fn bypass(factory: &dyn ProviderFactory, raw: &ProviderConfig) {
-///     let _ = prepare_provider_ready_config(factory, raw);
-/// }
-/// ```
-pub fn prepare_provider_ready_config(
-    factory: &dyn ProviderFactory,
-    config: &dyn ProviderConfiguration,
-) -> Result<ProviderReadyConfig, ProviderConfigPreparationError> {
-    let provider_name = config.name();
-    let attributes = config.attributes();
-    let config_schema = factory.provider_config_attribute_types();
-    let canonical_attributes = validate_and_canonicalize_provider_config(
-        factory,
-        provider_name,
-        attributes,
-        &config_schema,
-    )?;
-    let region = config_schema
-        .rootless_type("region")
-        .and_then(|_| crate::utils::region_from_attrs(canonical_attributes.attributes()));
-
-    Ok(ProviderReadyConfig {
-        inner: Arc::new(ProviderReadyConfigInner {
-            attributes: canonical_attributes,
-            region,
-        }),
-    })
-}
-
-/// Run the host-owned provider configuration type checks.
-///
-/// The static validation phase calls this directly because unresolved values
-/// are intentionally allowed there. Provider construction calls it only after
-/// proving the complete map resolved.
-fn validate_provider_config_attributes<P: PlaceholderKind, B: BindingAddress>(
-    factory: &dyn ProviderFactory,
-    provider_name: &str,
-    attributes: &crate::parser::ConfigurationAttributes<Value<P, B>>,
-    attr_types: &crate::schema::ValidatedConfigSchema,
-) -> Result<(), ProviderConfigPreparationError> {
-    let inputs =
-        crate::provider::ProviderValidationInputs::collect(provider_name, attributes.values());
-    let lookup = crate::parser::custom_type_lookup_for_factory(factory, &inputs);
-    for (attribute, value) in attributes {
-        if let Some(attr_type) = attribute.schema_type(attr_types) {
-            attr_type
-                .validate_with_lookup(value, &lookup)
-                .map_err(|errors| ProviderConfigPreparationError::InvalidAttribute {
-                    provider: provider_name.to_string(),
-                    attribute: attribute.clone(),
-                    error: errors.into(),
-                })?;
-        }
-    }
-    Ok(())
-}
+#[cfg(any(test, feature = "test-utils"))]
+pub use crate::validation::admission::configuration::provider::prepare as prepare_provider_ready_config;
+pub use crate::validation::admission::configuration::provider::{
+    analysis as validate_and_canonicalize_provider_config, validate_parser_provider_config,
+};
 
 /// Typed collection of schema failures from one provider-boundary check.
 ///
@@ -1511,12 +1278,17 @@ fn validate_known_provider_values(
 }
 
 #[cfg(test)]
+#[path = "provider_ready/compact_list_configuration_tests.rs"]
+mod compact_list_configuration_tests;
+
+#[cfg(test)]
 mod provider_config_tests {
     use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
+    use std::sync::Arc;
 
     use std::collections::{BTreeMap, HashMap};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
 
     use futures::future::BoxFuture;
     use indexmap::IndexMap;
@@ -1528,7 +1300,8 @@ mod provider_config_tests {
         ConcreteValue, DeferredValue, ParsedIgnorePath, ParsedIgnorePathSegment,
     };
     use crate::schema::{
-        CompiledAttributeType as AttributeType, RootlessType, TypeIdentity, legacy_validator,
+        CompiledAttributeType as AttributeType, RootlessType, TypeIdentity, ValidatedConfigSchema,
+        legacy_validator,
     };
 
     fn assert_final_wire_shape<T: ResourceWirePayload>(
@@ -1915,20 +1688,6 @@ mod provider_config_tests {
             "enum config test provider"
         }
 
-        fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-            crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
-                "region".to_string(),
-                PatternAttributeType::enum_(
-                    crate::schema::TypeIdentity::new(Some("test"), Vec::<String>::new(), "Region"),
-                    Some(vec!["ap-northeast-1".to_string()]),
-                    vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
-                    None,
-                    None,
-                ),
-            )]))
-            .expect("test provider config schema must be valid")
-        }
-
         fn validate_config(
             &self,
             attributes: &CanonicalProviderConfigAttributes,
@@ -1957,7 +1716,21 @@ mod provider_config_tests {
         fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
             crate::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "region".to_string(),
+                    PatternAttributeType::enum_(
+                        crate::schema::TypeIdentity::new(
+                            Some("test"),
+                            Vec::<String>::new(),
+                            "Region",
+                        ),
+                        Some(vec!["ap-northeast-1".to_string()]),
+                        vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
+                        None,
+                        None,
+                    ),
+                )]))
+                .expect("test provider config schema must be valid"),
                 Default::default(),
                 Vec::new(),
             )
@@ -3288,10 +3061,6 @@ mod provider_config_tests {
             self.name
         }
 
-        fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-            crate::schema::ValidatedConfigSchema::default()
-        }
-
         fn validate_config(
             &self,
             _attributes: &CanonicalProviderConfigAttributes,
@@ -3333,7 +3102,7 @@ mod provider_config_tests {
         fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
             crate::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                crate::schema::ValidatedConfigSchema::default(),
                 Default::default(),
                 Vec::new(),
             )
@@ -3968,11 +3737,14 @@ mod provider_config_tests {
                 Value::Concrete(ConcreteValue::String("bad".into())),
             ])),
         )]);
-        let error = validate_provider_config_attributes(
+        let factory = crate::test_utils::configuration::ConfigFactory::new(schema)
+            .with_custom_validation(move |identity, value, inputs| {
+                factory.validate_custom_type(identity, value, inputs)
+            });
+        let error = validate_and_canonicalize_provider_config(
             &factory,
             "owner",
             &((attributes.clone()).into()),
-            &schema,
         )
         .unwrap_err();
         assert!(matches!(
@@ -4181,23 +3953,6 @@ mod provider_config_tests {
             "refined config test provider"
         }
 
-        fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-            crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
-                "endpoint".to_string(),
-                PatternAttributeType::refined_string(
-                    Some(TypeIdentity::new(
-                        Some("shared"),
-                        Vec::<String>::new(),
-                        "Endpoint",
-                    )),
-                    None,
-                    None,
-                    None,
-                ),
-            )]))
-            .expect("test provider config schema must be valid")
-        }
-
         fn validate_config(
             &self,
             _attributes: &CanonicalProviderConfigAttributes,
@@ -4231,7 +3986,20 @@ mod provider_config_tests {
         fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
             crate::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "endpoint".to_string(),
+                    PatternAttributeType::refined_string(
+                        Some(TypeIdentity::new(
+                            Some("shared"),
+                            Vec::<String>::new(),
+                            "Endpoint",
+                        )),
+                        None,
+                        None,
+                        None,
+                    ),
+                )]))
+                .expect("test provider config schema must be valid"),
                 Default::default(),
                 Vec::new(),
             )
@@ -4253,12 +4021,10 @@ mod provider_config_tests {
             Value::Concrete(ConcreteValue::String("valid".into())),
         )]);
 
-        let config_schema = factory.provider_config_attribute_types();
         validate_and_canonicalize_provider_config(
             &factory,
             "owner",
             &((attributes.clone()).into()),
-            &config_schema,
         )
         .expect("the owning factory must validate its decoded refined config type");
 
@@ -4275,12 +4041,10 @@ mod provider_config_tests {
             Value::Concrete(ConcreteValue::String("valid".into())),
         )]);
 
-        let config_schema = factory.provider_config_attribute_types();
         validate_and_canonicalize_provider_config(
             &factory,
             "display-alias",
             &((attributes.clone()).into()),
-            &config_schema,
         )
         .expect("the already-selected factory is the provider-config routing authority");
 
@@ -4319,22 +4083,6 @@ mod provider_config_tests {
             "provider config preparation test provider"
         }
 
-        fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-            crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
-                "region".to_string(),
-                PatternAttributeType::refined_string(
-                    None,
-                    Some(crate::schema::PatternSpec::new(
-                        r"^good-[a-z]+$".to_string(),
-                        crate::schema::PatternMatch::Full,
-                    )),
-                    None,
-                    None,
-                ),
-            )]))
-            .expect("test provider config schema must be valid")
-        }
-
         fn validate_config(
             &self,
             _attributes: &CanonicalProviderConfigAttributes,
@@ -4362,7 +4110,19 @@ mod provider_config_tests {
         fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
             crate::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "region".to_string(),
+                    PatternAttributeType::refined_string(
+                        None,
+                        Some(crate::schema::PatternSpec::new(
+                            r"^good-[a-z]+$".to_string(),
+                            crate::schema::PatternMatch::Full,
+                        )),
+                        None,
+                        None,
+                    ),
+                )]))
+                .expect("test provider config schema must be valid"),
                 Default::default(),
                 Vec::new(),
             )
@@ -4450,14 +4210,6 @@ mod provider_config_tests {
                 "string region config test provider"
             }
 
-            fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-                ValidatedConfigSchema::validate(BTreeMap::from([(
-                    "region".to_string(),
-                    PatternAttributeType::string(),
-                )]))
-                .expect("test provider config schema must be valid")
-            }
-
             fn validate_config(
                 &self,
                 _attributes: &CanonicalProviderConfigAttributes,
@@ -4478,7 +4230,11 @@ mod provider_config_tests {
             fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
                 crate::schema::ValidatedProviderSchemaWitness::new(
                     self.schemas(),
-                    self.provider_config_attribute_types(),
+                    ValidatedConfigSchema::validate(BTreeMap::from([(
+                        "region".to_string(),
+                        PatternAttributeType::string(),
+                    )]))
+                    .expect("test provider config schema must be valid"),
                     Default::default(),
                     Vec::new(),
                 )

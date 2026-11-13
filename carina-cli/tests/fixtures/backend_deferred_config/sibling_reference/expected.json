@@ -1,0 +1,5 @@
+{
+  "status": 1,
+  "stdout": "Validating...\n",
+  "stderr": "Error: Invalid attribute 'bucket' for backend type 's3': Type mismatch: expected String, got ResourceRef(other.name)\n"
+}

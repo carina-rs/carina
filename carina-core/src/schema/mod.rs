@@ -2020,6 +2020,7 @@ impl RootlessType {
     /// Validate a rootless value with the same recursive local/provider walk
     /// used by resource values. Rootless configuration retains only its primary
     /// local error; resource validation also reports sibling provider findings.
+    #[cfg(test)]
     pub(crate) fn validate_with_lookup<P: PlaceholderKind, B: BindingAddress>(
         &self,
         value: &Value<P, B>,
@@ -4148,10 +4149,10 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     /// Anonymous String/Int/Float refinements occur only in provider schema slots;
     /// annotations, module/export boundaries and function signatures use identified
     /// refinements or unconstrained scalars. Resolved resource/data-source inputs
-    /// pass through `admit_apply_resource`/`admit_apply_data_source`; provider config
-    /// uses `validate_provider_config_attributes` on resolved values. These checks
-    /// validate the full destination declaration before dispatch, preserving
-    /// #2218's safety without static containment. Function parameters/returns also
+    /// pass through `admit_apply_resource`/`admit_apply_data_source`; provider/backend
+    /// configuration enters `admit()` through `validation/admission/configuration/`.
+    /// These checks validate the full destination declaration before dispatch,
+    /// preserving #2218's safety without static containment. Function parameters/returns also
     /// have runtime constraint checks; backend schemas have no anonymous refinements.
     ///
     /// Preserve the #4362 invariant: adding constraints to a source never reduces
@@ -15641,21 +15642,6 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 /// use carina_core::schema::no_lookup;
 ///
 /// let _ = no_lookup();
-/// ```
-///
-/// A rootless config type likewise cannot accept an arbitrary lookup:
-///
-/// ```compile_fail,E0624
-/// use std::collections::BTreeMap;
-/// use carina_core::resource::{ConcreteValue, Value};
-/// use carina_core::schema::{AttributeType, ValidatedConfigSchema};
-///
-/// let config = ValidatedConfigSchema::validate(BTreeMap::from([
-///     ("name".to_string(), AttributeType::string()),
-/// ])).unwrap();
-/// let rootless = config.rootless_type("name").unwrap();
-/// let value = Value::Concrete(ConcreteValue::String("ok".into()));
-/// let _ = rootless.validate_with_lookup(&value, &|_, _| Ok(()));
 /// ```
 ///
 /// Resource attributes must enter admission with boundary evidence; an

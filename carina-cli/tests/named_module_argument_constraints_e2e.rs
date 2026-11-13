@@ -11,8 +11,8 @@ use carina_core::provider::{
     ProviderInitialization, ProviderResult,
 };
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, ValidatedConfigSchema,
-    ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+    AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, ValidatedProviderSchemaWitness,
+    ValidatedResourceSchema,
 };
 use tempfile::TempDir;
 
@@ -25,10 +25,6 @@ impl ProviderFactory for AwsTestFactory {
 
     fn display_name(&self) -> &str {
         "AWS (carina#4248 validation stub)"
-    }
-
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        Default::default()
     }
 
     fn validate_config(
@@ -50,7 +46,7 @@ impl ProviderFactory for AwsTestFactory {
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )

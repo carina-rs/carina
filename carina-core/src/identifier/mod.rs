@@ -1142,7 +1142,7 @@ pub fn compute_anonymous_identifiers_with_factories<
     let providers =
         crate::value::canonicalize_provider_configs_with_schemas(providers, &|provider_name| {
             crate::provider::find_factory(factories, provider_name)
-                .map(ProviderFactory::provider_config_attribute_types)
+                .map(|factory| factory.schema_witness().config().clone())
         })?;
     compute_anonymous_identifiers_with_provider_configs(
         resources,

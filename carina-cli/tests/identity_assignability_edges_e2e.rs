@@ -22,8 +22,8 @@ use carina_core::provider::{
 };
 use carina_core::resource::{ConcreteValue, Current, ResourceId, State, Value};
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, ValidatedConfigSchema,
-    ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+    AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, ValidatedProviderSchemaWitness,
+    ValidatedResourceSchema,
 };
 use carina_state::{ResourceState, StateFile};
 use tempfile::TempDir;
@@ -96,15 +96,13 @@ impl ProviderFactory for RuntimeEdgeFactory {
         .schema_witness();
         ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             edges.assignability_edges().to_vec(),
         )
         .unwrap()
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        Default::default()
-    }
+
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -277,9 +275,7 @@ impl ProviderFactory for ForwardFactory {
         )
         .unwrap()
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        Default::default()
-    }
+
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,

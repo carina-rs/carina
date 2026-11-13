@@ -262,6 +262,10 @@ pub enum BackendError {
     #[error("State write failed after {attempts} conditional-write conflicts")]
     StateWriteConflict { attempts: usize },
 
+    /// A local state address could not be pinned.
+    #[error(transparent)]
+    LocateLocal(#[from] crate::LocalStateLocateError),
+
     /// Network or I/O error
     #[error("I/O error: {0}")]
     Io(String),

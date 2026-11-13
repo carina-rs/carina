@@ -8097,7 +8097,7 @@ pub fn validate_no_exports_in_module<E>(parsed: &crate::parser::File<E>) -> Resu
 /// Validate provider configuration attributes.
 ///
 /// Runs host-side type-level validation using
-/// [`ProviderFactory::provider_config_attribute_types`] first, then
+/// [`ProviderFactory::schema_witness`] first, then
 /// canonicalizes schema-known enum values before delegating to
 /// [`ProviderFactory::validate_config`] for provider-specific semantic checks.
 /// The provider sees only canonical API spellings; literal strings are never

@@ -2826,3 +2826,62 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod terminal_locate_rendering_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_locate_rendering_keeps_inspectable_cause_once() {
+        let backend = BackendError::from(carina_state::LocalStateLocateError::from(
+            std::io::Error::other("typed locate cause"),
+        ));
+        assert!(std::error::Error::source(&backend).is_none());
+        let error = AppError::from(backend);
+        let AppError::Backend(locate) = &error else {
+            panic!("terminal locate error")
+        };
+        assert!(std::error::Error::source(locate).is_none());
+        assert_eq!(
+            format_error_with_source_chain(&error),
+            "I/O error: Failed to locate state file: typed locate cause",
+        );
+    }
+}
+
+#[cfg(test)]
+mod backend_locate_chain_tests {
+    use super::*;
+
+    fn locate() -> BackendError {
+        carina_state::LocalStateLocateError::from(std::io::Error::other("native locate cause"))
+            .into()
+    }
+
+    #[test]
+    fn backend_locate_is_terminal_with_file_context() {
+        let error = locate();
+        assert_eq!(
+            error.to_string(),
+            "I/O error: Failed to locate state file: native locate cause"
+        );
+        assert!(std::error::Error::source(&error).is_none());
+        let BackendError::LocateLocal(locate) = error else {
+            panic!("locate")
+        };
+        assert!(std::error::Error::source(&locate).is_none());
+        assert_eq!(locate.io_error().kind(), std::io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn generic_backend_chain_renders_locate_cause_once() {
+        let error =
+            StateBucketSeedError::new("bucket".into(), "aws.s3.Bucket.bucket".into(), locate());
+        let rendered = format_error_with_source_chain(&error);
+        assert_eq!(
+            rendered.matches("native locate cause").count(),
+            1,
+            "{rendered}"
+        );
+    }
+}

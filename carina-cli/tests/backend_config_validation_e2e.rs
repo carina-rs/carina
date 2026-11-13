@@ -140,3 +140,118 @@ fn validate_module_backend_reports_only_the_structural_error() {
         "CLI validate must match the LSP module-directory diagnostic"
     );
 }
+
+#[test]
+fn deferred_backend_directory_text_and_status_match_snapshot() {
+    for case in ["resource_reference", "sibling_reference", "sibling_literal"] {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/backend_deferred_config")
+            .join(case);
+        let expected: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(directory.join("expected.json")).unwrap(),
+        )
+        .unwrap();
+        let run = std::process::Command::new(env!("CARGO_BIN_EXE_carina"))
+            .args(["validate"])
+            .arg(&directory)
+            .env("NO_COLOR", "1")
+            .env_remove("CLICOLOR_FORCE")
+            .output()
+            .unwrap();
+        assert_eq!(
+            run.status.code(),
+            expected["status"].as_i64().map(|n| n as i32),
+            "{case}"
+        );
+        assert_eq!(
+            String::from_utf8(run.stdout).unwrap(),
+            expected["stdout"].as_str().unwrap(),
+            "{case}"
+        );
+        assert_eq!(
+            String::from_utf8(run.stderr).unwrap(),
+            expected["stderr"].as_str().unwrap(),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn backend_builtin_failure_text_and_json_match_snapshot() {
+    for case in ["direct", "sibling"] {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/backend_builtin_failure")
+            .join(case);
+        let expected: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(directory.join("expected.json")).unwrap(),
+        )
+        .unwrap();
+        for mode in ["text", "json"] {
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_carina"));
+            command
+                .arg("validate")
+                .arg(&directory)
+                .env("NO_COLOR", "1")
+                .env_remove("CLICOLOR_FORCE");
+            if mode == "json" {
+                command.arg("--json");
+            }
+            let run = command.output().unwrap();
+            assert_eq!(
+                run.status.code(),
+                expected[mode]["status"].as_i64().map(|n| n as i32),
+                "{case}/{mode}"
+            );
+            for (name, bytes) in [("stdout", run.stdout), ("stderr", run.stderr)] {
+                let output = String::from_utf8(bytes)
+                    .unwrap()
+                    .replace(directory.to_str().unwrap(), "$DIR");
+                assert_eq!(
+                    output,
+                    expected[mode][name].as_str().unwrap(),
+                    "{case}/{mode}/{name}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn recursive_configuration_text_and_json_match_snapshot() {
+    for case in ["backend_cycle", "provider_cycle"] {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/configuration_classification")
+            .join(case);
+        let expected: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(directory.join("expected.json")).unwrap(),
+        )
+        .unwrap();
+        for mode in ["text", "json"] {
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_carina"));
+            command
+                .arg("validate")
+                .arg(&directory)
+                .env("NO_COLOR", "1")
+                .env_remove("CLICOLOR_FORCE");
+            if mode == "json" {
+                command.arg("--json");
+            }
+            let run = command.output().unwrap();
+            assert_eq!(
+                run.status.code(),
+                expected[mode]["status"].as_i64().map(|n| n as i32),
+                "{case}/{mode}"
+            );
+            for (name, bytes) in [("stdout", run.stdout), ("stderr", run.stderr)] {
+                let output = String::from_utf8(bytes)
+                    .unwrap()
+                    .replace(directory.to_str().unwrap(), "$DIR");
+                assert_eq!(
+                    output,
+                    expected[mode][name].as_str().unwrap(),
+                    "{case}/{mode}/{name}"
+                );
+            }
+        }
+    }
+}

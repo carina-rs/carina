@@ -110,68 +110,30 @@ impl S3Backend {
     /// redirects, so any region from the chain reaches buckets in other
     /// regions.
     pub(crate) async fn from_config(config: &S3BackendSettings) -> BackendResult<Self> {
-        let bucket = config.bucket().to_string();
-        let key = config.key().to_string();
-        let encrypt = config.encrypt();
-        let auto_create = config.auto_create();
-
         let sdk_region = sdk_chain_region().await;
         let region = resolve_region(config.region(), sdk_region.as_deref())?;
         let client = build_s3_client(&region).await;
-
-        Ok(Self::from_client(
-            client,
-            bucket,
-            key,
-            region,
-            encrypt,
-            auto_create,
-        ))
+        Ok(Self::from_client(client, config, region))
     }
 
-    /// Construct an `S3Backend` from a bucket + key pair, resolving the
-    /// region through the AWS SDK default chain.
-    ///
-    /// This is the URL-addressed entry point (carina#3336): it goes
-    /// through the same region resolution and SDK client construction
-    /// as [`Self::from_config`] but skips the `BackendConfig` round-trip
-    /// that callers without a DSL `backend { ... }` block would otherwise
-    /// have to fabricate. `auto_create` is forced off — a read-only URL
-    /// lookup must never create infrastructure as a side effect.
-    /// `encrypt` is left at the production default (`true`) so any future
-    /// fallback write would match `from_config`'s behavior.
+    /// URL origin retains encryption and forbids automatic bucket creation.
+    /// The URL's candidate enters the same declared-settings admission path.
     pub(crate) async fn from_url_parts(bucket: String, key: String) -> BackendResult<Self> {
-        let sdk_region = sdk_chain_region().await;
-        let region = resolve_region(None, sdk_region.as_deref())?;
-        let client = build_s3_client(&region).await;
-        Ok(Self::from_client(client, bucket, key, region, true, false))
+        let settings = S3BackendSettings::from_url_parts(bucket, key)?;
+        Self::from_config(&settings).await
     }
 
-    /// Construct an `S3Backend` over a caller-supplied `aws_sdk_s3::Client`.
-    ///
-    /// `from_config` is the production entry point — it resolves the
-    /// region and builds the SDK client itself. This constructor exists
-    /// so a test can inject a client wired to an in-process AWS mock
-    /// (`winterbaume`, library mode) and exercise the `StateBackend` I/O
-    /// path with no real AWS and no external process (#3203). It does
-    /// not touch the AWS SDK config chain; the `region` argument is used
-    /// verbatim (it still drives the `create_bucket` location
-    /// constraint).
-    pub(crate) fn from_client(
-        client: Client,
-        bucket: String,
-        key: String,
-        region: String,
-        encrypt: bool,
-        auto_create: bool,
-    ) -> Self {
+    /// Inject an SDK client while retaining declaration-owned configuration.
+    /// Tests supply an in-process client; production resolves the SDK region
+    /// chain above.
+    pub(crate) fn from_client(client: Client, config: &S3BackendSettings, region: String) -> Self {
         Self {
             client,
-            bucket,
-            key,
+            bucket: config.bucket().to_owned(),
+            key: config.key().to_owned(),
             region,
-            encrypt,
-            auto_create,
+            encrypt: config.encrypt(),
+            auto_create: config.auto_create(),
             migration_logged: OnceLock::new(),
             state_etag: Mutex::new(CachedStateEtag::Unknown),
         }

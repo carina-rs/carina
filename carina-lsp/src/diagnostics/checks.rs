@@ -1,6 +1,9 @@
 //! Semantic checks: provider region, module calls, unused bindings, undefined references.
 
 use carina_core::parser::ExportParamLike;
+use carina_core::validation::admission::configuration::backend::{
+    self as backend_admission, BackendAttributeError, BackendConfigError,
+};
 use std::collections::HashSet;
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
@@ -676,11 +679,11 @@ impl DiagnosticRun<'_> {
         let Some(backend) = merged.directory.parsed.backend.as_ref() else {
             return Vec::new();
         };
-        let Err(error) = carina_state::BackendConfig::try_from(backend) else {
+        let Err(error) = backend_admission::admit(backend) else {
             return Vec::new();
         };
 
-        let attribute_diagnostic = |error: &carina_state::BackendAttributeError| {
+        let attribute_diagnostic = |error: &BackendAttributeError| {
             // Directory resolution deliberately retains user-function calls
             // that failed evaluation so other editor checks can continue.
             // Suppress only those calls, including nested ones. A deferred
@@ -706,12 +709,12 @@ impl DiagnosticRun<'_> {
         };
 
         match error {
-            carina_state::BackendConfigError::Invalid(errors) => errors
+            BackendConfigError::Invalid(errors) => errors
                 .errors()
                 .iter()
                 .filter_map(attribute_diagnostic)
                 .collect(),
-            unsupported @ carina_state::BackendConfigError::UnsupportedBackend(_) => {
+            unsupported @ BackendConfigError::UnsupportedBackend(_) => {
                 let finding = carina_core::parser::Located::new(
                     tree.backend_location()
                         .expect("backend declaration provenance")
@@ -1847,7 +1850,7 @@ impl DiagnosticRun<'_> {
             .iter()
             .filter(|factory| declared_providers.contains(factory.name()))
         {
-            for attr_type in factory.provider_config_attribute_types().parts().values() {
+            for attr_type in factory.schema_witness().config().parts().values() {
                 collect_enum_provider_namespaces(attr_type, &mut enum_namespaces);
             }
         }
