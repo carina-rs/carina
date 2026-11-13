@@ -298,7 +298,7 @@ pub enum RedactionMode {
 #[derive(thiserror::Error)]
 pub enum ProbeError {
     #[error("Application")]
-    Application(#[source] Box<AppError>),
+    Application(Box<AppError>),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -337,6 +337,15 @@ impl std::fmt::Display for IncompleteProbe {
     }
 }
 impl ProbeError {
+    /// Application diagnostics are available explicitly, never through error rendering.
+    pub fn application_error(&self) -> Option<&AppError> {
+        if let Self::Application(error) = self {
+            Some(error)
+        } else {
+            None
+        }
+    }
+
     fn incomplete(message: impl Into<String>) -> Self {
         Self::Incomplete(IncompleteProbe {
             missing: vec![message.into()],
@@ -566,11 +575,13 @@ fn prepare(
         })
         .collect::<Result<Vec<_>, ProbeError>>()?;
     let mut missing = Vec::new();
-    if parsed.resources.is_empty() && deferred.is_empty() {
+    let no_resources = parsed.resources.is_empty(); // allow: direct — display/reporting; deferred for-bodies are Partial, not dumped
+    if no_resources && deferred.is_empty() {
         missing.push("zero resources enumerated".to_owned());
     }
     let mut resources = Vec::new();
-    for (ordinal, resource) in parsed.resources.iter().enumerate() {
+    let materialized = parsed.resources.iter(); // allow: direct — display/reporting; deferred for-bodies are Partial, not dumped
+    for (ordinal, resource) in materialized.enumerate() {
         let prepared = (|| {
             let location = identity_recording::resource_location(resource)
                 .ok_or_else(|| ProbeError::incomplete("resource has no declaration location"))?;

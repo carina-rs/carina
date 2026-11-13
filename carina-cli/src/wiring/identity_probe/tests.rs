@@ -613,14 +613,15 @@ fn complete_addresses_are_fingerprinted_without_a_recorder() {
 }
 
 #[test]
-fn application_debug_and_status_never_quote_authored_values_but_retain_the_source() {
+fn application_debug_and_status_never_quote_authored_values_but_retain_application_detail() {
     use std::error::Error;
     let error = ProbeError::from(AppError::Validation("ERROR_PRIVATE_CANARY".into()));
     assert_eq!(format!("{error:?}"), "Application");
     assert_eq!(error.to_string(), "Application");
+    assert!(error.source().is_none());
     assert!(
         error
-            .source()
+            .application_error()
             .unwrap()
             .to_string()
             .contains("ERROR_PRIVATE_CANARY")
