@@ -24,10 +24,6 @@ fn backend_constructor_all_origins_require_admitted_settings() {
     let BackendConfig::Local(settings) = &checked else {
         panic!("local settings")
     };
-    assert_eq!(
-        settings.configuration().backend_kind(),
-        backend::BackendKind::Local
-    );
     assert_eq!(settings.path(), Some("state.json"));
     // Both persistent representations are candidates, never saved authority.
     let saved = checked.to_parser_config();
@@ -36,11 +32,9 @@ fn backend_constructor_all_origins_require_admitted_settings() {
     assert_eq!(lock.to_state_config().unwrap(), checked);
 
     let default = BackendConfig::implicit_local();
-    assert!(default.configuration().attributes().is_empty());
     assert_eq!(default.path(), None);
 
     let url = S3BackendSettings::from_url_parts("bucket".into(), "key".into()).unwrap();
-    assert_eq!(url.configuration().backend_kind(), backend::BackendKind::S3);
     assert!(url.encrypt());
     assert!(!url.auto_create());
     assert_eq!(url.region(), None, "URL region stays with the SDK chain");
@@ -62,7 +56,6 @@ async fn backend_local_location_pins_the_admitted_path_once() {
     symlink(&first, &alias).unwrap();
     let path = alias.join("state.json");
     let location = LocalBackendSettings::for_file(&path).unwrap();
-    assert_eq!(location.settings().path(), path.to_str());
     std::fs::remove_file(&alias).unwrap();
     symlink(&second, &alias).unwrap();
     let backend = crate::backends::LocalBackend::from_location(location).unwrap();
@@ -70,4 +63,31 @@ async fn backend_local_location_pins_the_admitted_path_once() {
     assert!(first.join("state.json").exists());
     assert!(!second.join("state.json").exists());
     assert_eq!(backend.state_path().to_string(), path.display().to_string());
+}
+
+#[cfg(unix)]
+#[test]
+fn backend_local_native_address_pin_preserves_non_utf8_bytes() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root
+        .path()
+        .join(std::ffi::OsString::from_vec(b"state-\xff.json".to_vec()));
+    let location = LocalBackendSettings::for_file(&path).unwrap();
+    assert_eq!(
+        location.path().identity(),
+        ResolvedPath::new(&path).unwrap().identity()
+    );
+    assert_ne!(
+        location.path().identity(),
+        ResolvedPath::new(path.to_string_lossy().as_ref())
+            .unwrap()
+            .identity()
+    );
+    let backend = crate::backends::LocalBackend::from_location(location).unwrap();
+    assert_eq!(
+        backend.state_path(),
+        &carina_core::paths::DisplayPath::new(&path).unwrap()
+    );
 }

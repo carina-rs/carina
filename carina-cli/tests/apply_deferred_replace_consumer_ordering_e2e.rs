@@ -428,7 +428,8 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
             )]))
             .into(),
             attribute_spans: Default::default(),
-        }),
+        })
+        .into(),
         plan: plan.to_snapshot(),
         sorted_resources: sorted_resources
             .iter()

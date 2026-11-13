@@ -1,121 +1,51 @@
 use super::*;
-use crate::parser::{ProviderConfig, ResolvedProviderConfigs};
 use crate::provider::*;
 use crate::resource::{AbsoluteBindingAddress, ConcreteValue, NoPlaceholder};
-use crate::schema::{AttributeType, DslTransform, TypeIdentity, ValidatedProviderSchemaWitness};
+use crate::schema::{AttributeType, DslTransform, TypeIdentity};
 use std::collections::BTreeMap;
-use std::sync::{
-    Mutex,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::atomic::Ordering;
 
-struct Factory {
-    schema: ValidatedConfigSchema,
-    seen: Mutex<Vec<ConfigurationAttributes<Value>>>,
-    witnesses: AtomicUsize,
-    initialized: AtomicUsize,
-}
+use crate::test_utils::configuration::{ConfigFactory as Factory, provider_directory as directory};
 
-impl Factory {
-    fn new(schema: ValidatedConfigSchema) -> Self {
-        Self {
-            schema,
-            seen: Default::default(),
-            witnesses: AtomicUsize::new(0),
-            initialized: AtomicUsize::new(0),
-        }
-    }
-}
-
-impl ProviderFactory for Factory {
-    fn name(&self) -> &str {
-        "owner"
-    }
-    fn display_name(&self) -> &str {
-        "owner"
-    }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        self.schema.clone()
-    }
-    fn validate_config(
-        &self,
-        attributes: &CanonicalProviderConfigAttributes,
-        _: &ProviderValidationInputs,
-    ) -> ProviderResult<()> {
-        self.seen
-            .lock()
-            .unwrap()
-            .push(attributes.attributes().clone());
-        Ok(())
-    }
-    fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
-        vec![]
-    }
-    fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
-        self.witnesses.fetch_add(1, Ordering::SeqCst);
-        ValidatedProviderSchemaWitness::new(vec![], self.schema.clone(), Default::default(), vec![])
-            .unwrap()
-    }
-    fn create_provider(
-        &self,
-        session: &ProviderSession,
-        _: InitializeOutcomeMint,
-    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
-        assert_eq!(
-            self.seen.lock().unwrap().last().unwrap(),
-            session.configuration().attributes()
-        );
-        self.initialized.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async {
-            Ok(InitializeOutcome::unavailable()
-                .with_provider(crate::test_utils::provider_text::idle_provider()))
-        })
-    }
-}
-
-fn directory(providers: &str, values: &str) -> ResolvedProviderConfigs {
-    let directory = tempfile::tempdir().unwrap();
-    std::fs::write(directory.path().join("providers.crn"), providers).unwrap();
-    std::fs::write(directory.path().join("values.crn"), values).unwrap();
-    let loaded = crate::config_loader::load_configuration_with_config(
-        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+#[test]
+fn operational_provider_configuration_never_omits_unresolved_fields() {
+    let root = crate::test_utils::configuration::ConfigurationDirectory::new(&[
+        ("providers.crn", "provider owner { value = producer.id }"),
+        (
+            "main.crn",
+            "let producer = mock.test.resource { name = 'producer' }",
+        ),
+    ]);
+    let parsed = crate::config_loader::parse_directory(
+        &crate::paths::ResolvedPath::new(root.path()).unwrap(),
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        &crate::schema::SchemaRegistry::new(),
     )
     .unwrap();
-    ResolvedProviderConfigs::from_test_configs(
-        loaded
-            .parsed
-            .providers
-            .iter()
-            .map(
-                |config| ProviderConfig::<NoPlaceholder, AbsoluteBindingAddress> {
-                    name: config.name.clone(),
-                    binding: config.binding.clone(),
-                    attributes: config
-                        .attributes
-                        .iter()
-                        .map(|(key, value)| {
-                            (
-                                key.clone(),
-                                value
-                                    .to_expanded()
-                                    .unwrap()
-                                    .try_into_address_free_absolute()
-                                    .unwrap(),
-                            )
-                        })
-                        .collect(),
-                    default_tags: Default::default(),
-                    source: None,
-                    version: None,
-                    revision: None,
-                    unresolved_attributes: Default::default(),
-                },
-            )
-            .collect(),
-    )
-    .unwrap()
+    let attributes = &parsed.parsed().providers[0].attributes;
+    for declared in [false, true] {
+        let schema = if declared {
+            ValidatedConfigSchema::validate(BTreeMap::from([(
+                "value".into(),
+                AttributeType::string(),
+            )]))
+            .unwrap()
+        } else {
+            ValidatedConfigSchema::default()
+        };
+        let factory = Factory::new(schema.clone());
+        let error = admitted(&factory, "owner", None, attributes, &schema, true)
+            .expect_err("operational admission must not drop an unresolved value");
+        let ProviderConfigPreparationError::InvalidAttribute { error, .. } = error else {
+            panic!("typed attribute error")
+        };
+        assert!(matches!(error.errors()[0], TypeError::Knowledge { .. }));
+        assert!(factory.seen.lock().unwrap().is_empty());
+        assert!(
+            admitted(&factory, "owner", None, attributes, &schema, false)
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
 
 #[test]
@@ -139,7 +69,7 @@ fn provider_config_admission_owns_exact_canonical_payload() {
     let source = configs.iter().next().unwrap();
     let route = ProviderInstanceKey::new("owner", Some("east".into()));
     let construction =
-        provider::construction(&factory, source, &route, &ProviderPlan::state_only()).unwrap();
+        provider::construction(&factory, source, &ProviderPlan::state_only()).unwrap();
     let ready = construction.session().configuration();
     assert_eq!(ready.instance(), &route);
     assert_eq!(ready.region(), Some("us-east-1"));
@@ -147,10 +77,8 @@ fn provider_config_admission_owns_exact_canonical_payload() {
         ready.attributes()["extension"],
         Value::Concrete(ConcreteValue::String("kept".into()))
     );
-    assert_eq!(ready.inner.canonical.admitted.fields.len(), 1);
-    let mut replacement = ready.attributes().clone();
-    replacement.insert("extension", Value::Concrete(ConcreteValue::Bool(false)));
-    assert_ne!(&replacement, ready.attributes());
+    assert_eq!(ready.inner.canonical.admitted.placements().len(), 1);
+    assert_eq!(ready.inner.canonical.admitted.opaque_passthrough().len(), 1);
     crate::test_utils::provider_text::block_on(ProviderBoundary::initialize(&construction))
         .unwrap();
     assert_eq!(factory.initialized.load(Ordering::SeqCst), 1);
@@ -178,28 +106,45 @@ fn provider_config_receipt_rejects_other_declaration_instance_revision() {
     let route = ProviderInstanceKey::new("owner", Some("east".into()));
     let key = crate::parser::AttributeKey::from("value");
     let expected = declaration
-        .destination::<kind::ProviderConfigAttribute>(&key, &route, &catalog)
+        .destination::<kind::ProviderConfigAttribute>(
+            &key,
+            InstanceIdentity::Provider(route.clone()),
+            CatalogRevision(CatalogSnapshot::Provider(catalog.custom_types.clone())),
+        )
         .unwrap();
     let different = [
         (
             declaration
                 .destination(
                     &key,
-                    &ProviderInstanceKey::new("owner", Some("west".into())),
-                    &catalog,
+                    InstanceIdentity::Provider(ProviderInstanceKey::new(
+                        "owner",
+                        Some("west".into()),
+                    )),
+                    CatalogRevision(CatalogSnapshot::Provider(catalog.custom_types.clone())),
                 )
                 .unwrap(),
             SlotMismatch::Instance,
         ),
         (
             other_declaration
-                .destination(&key, &route, &catalog)
+                .destination(
+                    &key,
+                    InstanceIdentity::Provider(route.clone()),
+                    CatalogRevision(CatalogSnapshot::Provider(catalog.custom_types.clone())),
+                )
                 .unwrap(),
             SlotMismatch::Declaration,
         ),
         (
             declaration
-                .destination(&key, &route, &other_catalog)
+                .destination(
+                    &key,
+                    InstanceIdentity::Provider(route.clone()),
+                    CatalogRevision(CatalogSnapshot::Provider(
+                        other_catalog.custom_types.clone(),
+                    )),
+                )
                 .unwrap(),
             SlotMismatch::CatalogRevision,
         ),
@@ -239,7 +184,6 @@ fn provider_config_directory_preserves_opaque_keys_and_optional_fields() {
     let construction = provider::construction(
         &factory,
         configs.iter().next().unwrap(),
-        &ProviderInstanceKey::new("owner", None),
         &ProviderPlan::state_only(),
     )
     .unwrap();
@@ -258,17 +202,22 @@ fn provider_config_directory_preserves_opaque_keys_and_optional_fields() {
 fn provider_config_directory_empty_and_named_sessions_are_admitted() {
     let factory = Factory::new(ValidatedConfigSchema::default());
     let configs = directory("let east = provider owner {}\n", "let Unused = 'sibling'\n");
-    for route in [
-        ProviderInstanceKey::new("owner", None),
-        ProviderInstanceKey::new("owner", Some("east".into())),
-    ] {
-        let construction = provider::construction(
-            &factory,
-            configs.iter().next().unwrap(),
-            &route,
-            &ProviderPlan::state_only(),
-        )
+    for default_route in [true, false] {
+        let source = configs.iter().next().unwrap();
+        let construction = if default_route {
+            provider::default_construction(&factory, source, &ProviderPlan::state_only())
+        } else {
+            provider::construction(&factory, source, &ProviderPlan::state_only())
+        }
         .unwrap();
+        let route = ProviderInstanceKey::new(
+            "owner",
+            if default_route {
+                None
+            } else {
+                Some("east".into())
+            },
+        );
         assert_eq!(construction.session().configuration().instance(), &route);
         assert!(
             construction
@@ -384,7 +333,6 @@ fn provider_config_directory_checks_full_destination_after_resolution() {
             let result = provider::construction(
                 &factory,
                 configs.iter().next().unwrap(),
-                &ProviderInstanceKey::new("owner", None),
                 &ProviderPlan::state_only(),
             );
             assert_eq!(

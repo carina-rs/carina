@@ -4929,15 +4929,7 @@ pub fn normalize_state_with_ctx(
         for resolved_config in configs {
             let construction = rt
                 .block_on(async {
-                    prepare_provider_construction(
-                        factory.as_ref(),
-                        resolved_config,
-                        &provider_mod::ProviderInstanceKey::new(
-                            factory.name(),
-                            resolved_config.binding().map(str::to_owned),
-                        ),
-                        plan,
-                    )
+                    prepare_provider_construction(factory.as_ref(), resolved_config, plan)
                 })
                 .map_err(HostError::from)?;
             router.add_initialized_normalizer(rt.block_on(
@@ -5330,27 +5322,7 @@ fn kind_default_source<'a, C: ProviderConfigurations>(
 ///
 /// Both state-bucket bootstrap and deletion route through this typed seam, so
 /// neither can recover an attribute map from `parsed.providers`. Providers
-/// without a declared block retain the historical empty-config fallback.
-#[cfg(test)]
-pub(crate) fn prepare_default_provider_ready_config<C: ProviderConfigurations>(
-    factory: &dyn ProviderFactory,
-    provider_name: &str,
-    configs: &C,
-) -> Result<
-    carina_core::provider::ProviderReadyConfig,
-    carina_core::executor::ProviderConfigPreparationError,
-> {
-    Ok(prepare_default_provider_construction(
-        factory,
-        provider_name,
-        configs,
-        &provider_mod::ProviderPlan::state_only(),
-    )?
-    .session()
-    .configuration()
-    .clone())
-}
-
+/// without a declared block use admitted empty configuration.
 pub(crate) fn prepare_default_provider_construction<'a, C: ProviderConfigurations>(
     factory: &'a dyn ProviderFactory,
     provider_name: &str,
@@ -5361,10 +5333,9 @@ pub(crate) fn prepare_default_provider_construction<'a, C: ProviderConfiguration
     carina_core::executor::ProviderConfigPreparationError,
 > {
     let config = configs.provider_or_implicit(provider_name);
-    prepare_provider_construction(
+    carina_core::validation::admission::configuration::provider::default_construction(
         factory,
         config.as_ref(),
-        &provider_mod::ProviderInstanceKey::new(provider_name, None),
         plan,
     )
 }
@@ -5417,12 +5388,7 @@ async fn instantiate_provider_into_router(
     let color_mode = ctx.runtime().color_mode();
     let binding = provider_config.binding();
     if let Some(factory) = provider_mod::find_factory(ctx.factories(), provider_config.name()) {
-        let construction = prepare_provider_construction(
-            factory,
-            provider_config,
-            &provider_mod::ProviderInstanceKey::new(factory.name(), binding.map(str::to_owned)),
-            plan,
-        )?;
+        let construction = prepare_provider_construction(factory, provider_config, plan)?;
         let config = construction.session().configuration();
         let displayed_source = provider_config.source().or(inherited_source);
         let provider = provider_mod::ProviderBoundary::initialize(&construction)
@@ -5448,9 +5414,7 @@ async fn instantiate_provider_into_router(
                 provider_config.name(),
                 binding.map(str::to_owned),
             ),
-            // Built-in mock has always ignored provider-block config. Admit its
-            // actual empty construction input, preserving opaque values that
-            // need not be representable by a transport this factory never uses.
+            // Built-in mock consumes admitted empty configuration.
             provider_mod::ProviderBoundary::initialize(&empty_construction(
                 builtin_mock,
                 &provider_mod::ProviderInstanceKey::new(
@@ -5584,15 +5548,7 @@ pub(crate) async fn create_normalizers_from_configs_with_ctx(
 
     for config in configs.iter() {
         if let Some(factory) = provider_mod::find_factory(ctx.factories(), config.name()) {
-            let construction = prepare_provider_construction(
-                factory,
-                config,
-                &provider_mod::ProviderInstanceKey::new(
-                    factory.name(),
-                    config.binding().map(str::to_owned),
-                ),
-                plan,
-            )?;
+            let construction = prepare_provider_construction(factory, config, plan)?;
             router.add_initialized_normalizer(
                 provider_mod::ProviderBoundary::initialize_normalizer(&construction).await?,
             );

@@ -5638,14 +5638,23 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
         config("second-named-region", Some("secondary")),
         config("default-region", None),
     ]);
-    let ready = prepare_default_provider_ready_config(&CaptureFactory, "capture", &configs)
-        .expect("the default provider instance must win");
+    let construction = prepare_default_provider_construction(
+        &CaptureFactory,
+        "capture",
+        &configs,
+        &provider_mod::ProviderPlan::state_only(),
+    )
+    .expect("the default provider instance must win");
     assert_eq!(
-        ready.instance(),
+        construction.session().configuration().instance(),
         &provider_mod::ProviderInstanceKey::new("capture", None)
     );
     assert_eq!(
-        ready.attributes().get("region"),
+        construction
+            .session()
+            .configuration()
+            .attributes()
+            .get("region"),
         Some(&Value::Concrete(ConcreteValue::String(
             "default-region".into()
         )))
@@ -5655,25 +5664,45 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
         config("first-named-region", Some("main")),
         config("second-named-region", Some("secondary")),
     ]);
-    let ready = prepare_default_provider_ready_config(&CaptureFactory, "capture", &configs)
-        .expect("the first named provider instance must supply backend config");
+    let construction = prepare_default_provider_construction(
+        &CaptureFactory,
+        "capture",
+        &configs,
+        &provider_mod::ProviderPlan::state_only(),
+    )
+    .expect("the first named provider instance must supply backend config");
     assert_eq!(
-        ready.instance(),
+        construction.session().configuration().instance(),
         &provider_mod::ProviderInstanceKey::new("capture", None)
     );
     assert_eq!(
-        ready.attributes().get("region"),
+        construction
+            .session()
+            .configuration()
+            .attributes()
+            .get("region"),
         Some(&Value::Concrete(ConcreteValue::String(
             "first-named-region".into()
         )))
     );
 
     let configs = validated_provider_configs(Vec::new());
-    let ready = prepare_default_provider_ready_config(&CaptureFactory, "capture", &configs)
-        .expect("an undeclared provider kind must retain the empty fallback");
-    assert!(ready.attributes().is_empty());
+    let construction = prepare_default_provider_construction(
+        &CaptureFactory,
+        "capture",
+        &configs,
+        &provider_mod::ProviderPlan::state_only(),
+    )
+    .expect("an undeclared provider kind must retain the empty fallback");
+    assert!(
+        construction
+            .session()
+            .configuration()
+            .attributes()
+            .is_empty()
+    );
     assert_eq!(
-        ready.instance(),
+        construction.session().configuration().instance(),
         &provider_mod::ProviderInstanceKey::new("capture", None)
     );
 }

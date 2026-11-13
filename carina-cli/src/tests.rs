@@ -982,7 +982,8 @@ fn plan_file_serde_round_trip() {
                 ]))
                 .into(),
                 attribute_spans: Default::default(),
-            }),
+            })
+            .into(),
             plan: plan.to_snapshot(),
             sorted_resources: sorted_resources
                 .iter()
@@ -1072,7 +1073,7 @@ fn plan_file_serde_round_trip() {
         deserialized.provider_configs.as_provider_configs()[0].name,
         "aws"
     );
-    assert!(deserialized.backend_config.is_some());
+    assert_eq!(deserialized.backend_config.candidate().backend_type, "s3");
     assert_eq!(deserialized.plan.effects().len(), 3);
     assert_eq!(deserialized.sorted_resources.len(), 1);
     assert_eq!(deserialized.unresolved_resources.len(), 1);
@@ -4002,7 +4003,7 @@ fn plan_file_serialization_redacts_secrets() {
             provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
                 "awscc",
             )]),
-            backend_config: None,
+            backend_config: crate::commands::plan::SavedBackendConfig::implicit_local(),
             plan: redact_secrets_in_plan(&plan).unwrap(),
             sorted_resources: vec![
                 redact_secrets_in_resource(&resolved_inner(resource_with_secret.clone())).unwrap(),
@@ -4069,7 +4070,7 @@ fn plan_file_serialization_rejects_pending_resource_identity() {
             provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
                 "mock",
             )]),
-            backend_config: None,
+            backend_config: crate::commands::plan::SavedBackendConfig::implicit_local(),
             plan: carina_core::plan::SnapshotPlan::default(),
             sorted_resources: (vec![
                 Resource::pending_with_provider("mock", "test.resource", None)
@@ -4117,7 +4118,7 @@ fn plan_file_validation_rejects_missing_resource_identity() {
             provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
                 "mock",
             )]),
-            backend_config: None,
+            backend_config: crate::commands::plan::SavedBackendConfig::implicit_local(),
             plan: carina_core::plan::SnapshotPlan::default(),
             sorted_resources: (vec![resolved_inner(Resource::with_provider(
                 "mock",
@@ -4195,7 +4196,7 @@ fn plan_file_with_deferred_effect(effect: Effect) -> PlanFile {
             provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
                 "mock",
             )]),
-            backend_config: None,
+            backend_config: crate::commands::plan::SavedBackendConfig::implicit_local(),
             plan: plan.to_snapshot(),
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
@@ -4552,7 +4553,7 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
         state_lineage: None,
         state_serial: None,
         provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test("mock")]),
-        backend_config: None,
+        backend_config: crate::commands::plan::SavedBackendConfig::implicit_local(),
         plan: plan.to_snapshot(),
         sorted_resources: (vec![managed_target.into_inner()])
             .into_iter()
@@ -4684,7 +4685,7 @@ fn plan_file_validation_rejects_blocked_data_source_without_plan_errors() {
             provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
                 "mock",
             )]),
-            backend_config: None,
+            backend_config: crate::commands::plan::SavedBackendConfig::implicit_local(),
             plan: plan.to_snapshot(),
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),

@@ -1,30 +1,20 @@
 use super::*;
-use carina_core::provider::{
-    BoxFuture, CanonicalCustomTypeValue, CanonicalProviderConfigAttributes, InitializeOutcomeMint,
-    ProviderError, ProviderInitialization, ProviderResult, ProviderValidationInputs,
-};
-use carina_core::schema::{
-    AttributeType, TypeIdentity, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
-    ValidatedResourceSchema,
-};
+use carina_core::provider::ProviderError;
+use carina_core::schema::{AttributeType, TypeIdentity, ValidatedConfigSchema};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
-struct ConfigFactory {
-    semantic: Arc<AtomicUsize>,
-}
-impl ProviderFactory for ConfigFactory {
-    fn name(&self) -> &str {
-        "owner"
-    }
-    fn display_name(&self) -> &str {
-        "owner"
-    }
-    fn schemas(&self) -> Vec<ValidatedResourceSchema> {
-        vec![]
-    }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        ValidatedConfigSchema::validate(BTreeMap::from([(
+use carina_core::test_utils::configuration::{ConfigFactory, ConfigurationDirectory};
+
+#[test]
+fn provider_config_directory_compact_callback_parity() {
+    for (value, rejected) in [("bad", true), ("good", false)] {
+        let source = "provider owner { endpoints = [Endpoint] }\n";
+        let values = format!("let Endpoint = '{value}'\n");
+        let directory =
+            ConfigurationDirectory::new(&[("providers.crn", source), ("values.crn", &values)]);
+        let path = directory.path().join("providers.crn");
+        let schema = ValidatedConfigSchema::validate(BTreeMap::from([(
             "endpoints".into(),
             AttributeType::union(vec![
                 AttributeType::string(),
@@ -40,65 +30,19 @@ impl ProviderFactory for ConfigFactory {
                 )),
             ]),
         )]))
-        .unwrap()
-    }
-    fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
-        ValidatedProviderSchemaWitness::new(
-            vec![],
-            self.provider_config_attribute_types(),
-            Default::default(),
-            vec![],
-        )
-        .unwrap()
-    }
-    fn validate_config(
-        &self,
-        _: &CanonicalProviderConfigAttributes,
-        _: &ProviderValidationInputs,
-    ) -> ProviderResult<()> {
-        self.semantic.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-    fn validate_custom_type(
-        &self,
-        _: &TypeIdentity,
-        value: &CanonicalCustomTypeValue,
-        _: &ProviderValidationInputs,
-    ) -> ProviderResult<()> {
-        if value.as_str() == "bad" {
-            Err(ProviderError::invalid_input(
-                "Endpoint callback rejects bad",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-    fn create_provider(
-        &self,
-        _: &carina_core::provider::ProviderSession,
-        _: InitializeOutcomeMint,
-    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
-        panic!("LSP must not initialize providers")
-    }
-}
-
-#[test]
-fn provider_config_directory_compact_callback_parity() {
-    for (value, rejected) in [("bad", true), ("good", false)] {
-        let directory = tempfile::tempdir().unwrap();
-        let source = "provider owner { endpoints = [Endpoint] }\n";
-        let path = directory.path().join("providers.crn");
-        std::fs::write(&path, source).unwrap();
-        std::fs::write(
-            directory.path().join("values.crn"),
-            format!("let Endpoint = '{value}'\n"),
-        )
         .unwrap();
-        let semantic = Arc::new(AtomicUsize::new(0));
+        let factory = ConfigFactory::new(schema).with_custom_validation(|_, value, _| {
+            if value.as_str() == "bad" {
+                Err(ProviderError::invalid_input(
+                    "Endpoint callback rejects bad",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        let semantic = Arc::clone(&factory.semantic_calls);
         let engine = DiagnosticEngine::new(
-            loaded_providers_from_factories(vec![Box::new(ConfigFactory {
-                semantic: Arc::clone(&semantic),
-            })]),
+            loaded_providers_from_factories(vec![Box::new(factory)]),
             vec!["owner".into()],
         );
         let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));

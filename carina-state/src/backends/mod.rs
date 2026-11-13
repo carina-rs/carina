@@ -33,13 +33,9 @@ pub(crate) async fn create_backend(
     selection: &BackendSelection,
 ) -> BackendResult<Box<dyn StateBackend>> {
     match selection.target() {
-        BackendTarget::Configured { config, base_dir } => match config {
-            Some(config) => create_configured_backend(config, base_dir).await,
-            None => Ok(Box::new(LocalBackend::from_config(
-                &BackendConfig::implicit_local(),
-                base_dir,
-            )?)),
-        },
+        BackendTarget::Configured { config, base_dir } => {
+            create_configured_backend(config, base_dir).await
+        }
         BackendTarget::ExplicitUrl(StateUrl::S3 { bucket, key }) => Ok(Box::new(
             S3Backend::from_url_parts(bucket.clone(), key.clone()).await?,
         )),

@@ -46,8 +46,8 @@ pub use provider_ready::{
     ModuleConstraintGateError, ModuleConstraintViolations, ProviderConfigPreparationError,
     ProviderConfigValidationError, ProviderPreparationContext, ProviderPreparationError,
     ProviderReadyConfig, ProviderValueConstraintErrors, prepare_create_request,
-    prepare_data_source_query, prepare_provider_ready_config, prepare_provider_ready_data_source,
-    prepare_provider_ready_resource, prepare_update_request,
+    prepare_data_source_query, prepare_provider_ready_data_source, prepare_provider_ready_resource,
+    prepare_update_request,
 };
 /// Phase of an executor scheduler endpoint after deferred replacements have
 /// been expanded.
@@ -2289,3 +2289,6 @@ async fn execute_test_runtime_plan(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use provider_ready::prepare_provider_ready_config;

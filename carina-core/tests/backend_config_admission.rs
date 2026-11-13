@@ -1,9 +1,6 @@
 //! Built-in backend admission uses the resolved directory, without providers.
 
-use carina_core::config_loader::load_configuration_with_config;
 use carina_core::parser::ProviderContext;
-use carina_core::paths::ResolvedPath;
-use carina_core::schema::SchemaRegistry;
 use carina_core::validation::admission::configuration::backend::{self, BackendKind};
 
 fn directory(
@@ -16,15 +13,11 @@ fn directory(
     >,
     backend::BackendConfigError,
 > {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::write(root.path().join("backend.crn"), source).unwrap();
-    std::fs::write(root.path().join("values.crn"), values).unwrap();
-    let loaded = load_configuration_with_config(
-        &ResolvedPath::new(root.path()).unwrap(),
-        context,
-        &SchemaRegistry::new(),
-    )
-    .unwrap();
+    let root = carina_core::test_utils::configuration::ConfigurationDirectory::new(&[
+        ("backend.crn", source),
+        ("values.crn", values),
+    ]);
+    let loaded = root.load(context);
     backend::admit(loaded.parsed.backend.as_ref().unwrap())
 }
 
@@ -74,9 +67,33 @@ fn backend_config_directory_admits_before_concrete_extraction() {
             "awscc.Region.us_east_1",
         ),
         ("backend gcs {}", "Unsupported backend type: gcs"),
+        ("backend local { path = missing.path }", "Type mismatch"),
+        (
+            "backend local { path = secret('do-not-show') }",
+            "Type mismatch",
+        ),
+        (
+            "backend s3 { bucket = 'b' key = 'k' encrypt = missing.flag region = missing.region }",
+            "Type mismatch",
+        ),
     ] {
-        let error = directory(source, "", &context).unwrap_err().to_string();
-        assert!(error.contains(expected), "{source}: {error}");
+        let root = carina_core::test_utils::configuration::ConfigurationDirectory::new(&[
+            ("backend.crn", source),
+            ("values.crn", "let ordinary_value = 'value'\n"),
+        ]);
+        // Exercise raw-candidate admission too: the directory resolver already
+        // rejects secret-derived fields before this boundary can see them.
+        let path = root.path().join("backend.crn");
+        let parsed = carina_core::parser::parse_file(
+            &std::fs::read_to_string(&path).unwrap(),
+            &path,
+            &context,
+        )
+        .unwrap();
+        let error = backend::admit(parsed.backend.as_ref().unwrap()).unwrap_err();
+        let rendered = format!("{error:?} {error}");
+        assert!(error.to_string().contains(expected), "{source}: {rendered}");
+        assert!(!rendered.contains("do-not-show"));
     }
 }
 

@@ -1,50 +1,38 @@
 use super::*;
 
-fn directory(
-    source: &str,
-) -> Result<AdmittedConfiguration<kind::BackendAttribute>, BackendConfigError> {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("backend.crn");
-    std::fs::write(&path, source).unwrap();
-    std::fs::write(
-        root.path().join("values.crn"),
-        "let ordinary_value = 'value'\n",
-    )
-    .unwrap();
-    let parsed = parser::parse_file(
-        &std::fs::read_to_string(&path).unwrap(),
-        &path,
-        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-    )
-    .unwrap();
-    admit(parsed.backend.as_ref().unwrap())
-}
-
 #[test]
-fn backend_config_directory_rejects_pending_and_secret_before_construction() {
-    for source in [
-        "backend local { path = missing.path }",
-        "backend local { path = secret('do-not-show') }",
-        "backend s3 { bucket = 'b' key = 'k' encrypt = missing.flag region = missing.region }",
-    ] {
-        let error = directory(source).unwrap_err();
-        let BackendConfigError::Invalid(errors) = &error else {
-            panic!("attribute errors: {error}")
-        };
-        assert!(!errors.errors().is_empty());
-        assert!(!format!("{error:?} {error}").contains("do-not-show"));
-        assert!(
-            error.to_string().contains("Type mismatch"),
-            "{source}: {error}"
-        );
-    }
+fn backend_admission_failure_retains_its_typed_cause_once() {
+    let original = ResolutionError::from(KnowledgeError::<AbsoluteBindingAddress>::InvalidStage {
+        operation: "backend fixture",
+    });
+    let diagnostic = attribute_error(BackendKind::Local, &"path".into(), original.clone().into());
+    let BackendAttributeError::Admission { error, .. } = &diagnostic else {
+        panic!("original non-constraint cause must survive")
+    };
+    assert_eq!(error.as_ref(), &original);
+    assert_eq!(
+        diagnostic
+            .to_string()
+            .matches(&original.to_string())
+            .count(),
+        1
+    );
+    assert!(
+        std::error::Error::source(&diagnostic).is_none(),
+        "terminal diagnostics render their cause without exposing it twice"
+    );
 }
 
 #[test]
 fn backend_receipts_keep_the_declaration_field_instance_and_revision() {
-    let admitted = directory("backend s3 { bucket = 'b' key = 'k' }").unwrap();
-    assert_eq!(admitted.fields.len(), admitted.attributes().len());
-    for placed in &admitted.fields {
+    let root = crate::test_utils::configuration::ConfigurationDirectory::new(&[
+        ("backend.crn", "backend s3 { bucket = 'b' key = 'k' }"),
+        ("values.crn", "let ordinary = 'value'"),
+    ]);
+    let loaded = root.load(&ProviderContext::new(crate::EnvironmentSnapshot::empty()));
+    let admitted = admit(loaded.parsed.backend.as_ref().unwrap()).unwrap();
+    assert_eq!(admitted.placements().len(), admitted.attributes().len());
+    for placed in admitted.placements().values() {
         assert_eq!(
             placed.value(),
             &admitted.attributes()[placed
@@ -57,7 +45,7 @@ fn backend_receipts_keep_the_declaration_field_instance_and_revision() {
                 .as_str()]
         );
     }
-    let placed = admitted.fields[0].clone();
+    let placed = admitted.placements().values().next().unwrap().clone();
     let destination = placed.inner.destination.clone();
     for (mismatch, different) in [
         (SlotMismatch::Declaration, 0),

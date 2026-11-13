@@ -313,6 +313,8 @@ aws-vault exec <profile> -- cargo run -- plan
 
 ## Verify Protocol
 
+`scripts/validate-parity.py` compares `validate` and `validate --json` for every tracked `.crn` directory in a repository and optional infra checkout. Run `python3 scripts/validate-parity.py --main <main-binary> --candidate <candidate-binary> --repo . --infra ../../../infra --evidence <directory>`; `--list-only` prints the directory count. It strips credentials and normalizes absolute root paths. Only the two carina#4394 fixtures allow diagnostic ordering differences: text lines and the JSON `errors` array compare as multisets; exit status, stderr in JSON mode, and all other data stay exact.
+
 `scripts/verify.sh` requires Bash 4.4 or newer, cargo-nextest and cargo-hack
 for its full check set. Rustup automatically reads `rust-toolchain.toml` to
 select the pinned toolchain, `clippy`, `rustfmt` and `wasm32-wasip2` target.

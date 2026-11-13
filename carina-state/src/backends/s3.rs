@@ -125,7 +125,7 @@ impl S3Backend {
 
     /// Inject an SDK client while retaining declaration-owned configuration.
     /// Tests supply an in-process client; production resolves the SDK region
-    /// chain above. No raw bucket/key/flag constructor exists.
+    /// chain above.
     pub(crate) fn from_client(client: Client, config: &S3BackendSettings, region: String) -> Self {
         Self {
             client,

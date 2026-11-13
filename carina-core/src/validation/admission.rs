@@ -184,7 +184,8 @@ pub trait DestinationKind: sealed::Sealed {
 
 pub mod kind {
     macro_rules! rechecks {
-        ($($name:ident),+ $(,)?) => {$(
+        ($($(#[$meta:meta])* $name:ident),+ $(,)?) => {$(
+            $(#[$meta])*
             #[derive(Debug, Clone, Copy, PartialEq, Eq)]
             pub struct $name;
             impl super::sealed::Sealed for $name {
@@ -219,6 +220,16 @@ pub mod kind {
     rechecks!(
         ResourceAttribute,
         DataSourceAttribute,
+        /// Provider fields consume only provider placements.
+        ///
+        /// ```
+        /// use carina_core::validation::admission::{TypedSlot, PlacedValue, kind::ProviderConfigAttribute};
+        /// fn place(slot: &mut TypedSlot<ProviderConfigAttribute>, value: PlacedValue<ProviderConfigAttribute>) { slot.place(value).unwrap(); }
+        /// ```
+        /// ```compile_fail,E0308
+        /// use carina_core::validation::admission::{TypedSlot, PlacedValue, kind::{ProviderConfigAttribute, BackendAttribute}};
+        /// fn place(slot: &mut TypedSlot<ProviderConfigAttribute>, value: PlacedValue<BackendAttribute>) { slot.place(value).unwrap(); }
+        /// ```
         ProviderConfigAttribute,
         BackendAttribute,
         ModuleArgument,
@@ -360,43 +371,12 @@ impl DestinationContract {
         &'a self,
         catalog: &'a ProviderContext,
     ) -> impl crate::schema::ValidatedCustomTypeLookup + 'a {
-        enum Lookup<L> {
-            Provider(L),
-            Backend,
-        }
-        impl<L: crate::schema::ValidatedCustomTypeLookup> crate::schema::ValidatedCustomTypeLookup
-            for Lookup<L>
-        {
-            fn validate(
-                &self,
-                value: crate::schema::LocallyValidatedCustomType<'_>,
-            ) -> Result<(), TypeError> {
-                match self {
-                    Self::Provider(lookup) => lookup.validate(value),
-                    Self::Backend => Ok(()),
-                }
-            }
-
-            fn canonicalization_error(
-                &self,
-                declaration: crate::parser::IdentifiedCustomTypeDeclaration<'_>,
-                error: TypeError,
-            ) -> TypeError {
-                match self {
-                    Self::Provider(lookup) => lookup.canonicalization_error(declaration, error),
-                    Self::Backend => error,
-                }
-            }
-        }
-        match &self.owner {
-            DeclarationOwner::Provider(crate::parser::SchemaTypeOwner::Provider(owner)) => {
-                Lookup::Provider(crate::parser::custom_type_lookup_for_owner(
-                    catalog.custom_type_resolver(),
-                    owner,
-                ))
-            }
-            DeclarationOwner::Backend(_) => Lookup::Backend,
-        }
+        let DeclarationOwner::Provider(crate::parser::SchemaTypeOwner::Provider(owner)) =
+            &self.owner
+        else {
+            unreachable!("backend configuration owns its builtin lookup")
+        };
+        crate::parser::custom_type_lookup_for_owner(catalog.custom_type_resolver(), owner)
     }
 
     fn sink_type<'a>(
@@ -639,6 +619,50 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
         provider: &'a dyn ProviderTypeCheckContext,
         cursor: crate::parser::retained::AuthoredCursor<'a, B>,
     ) -> (Self, AdmissionContext<'a, P, B>) {
+        Self::paired_in(
+            value,
+            proof,
+            bindings,
+            provider,
+            cursor,
+            AdmissionLookup::Catalog,
+        )
+    }
+
+    fn configuration<'a>(
+        value: &'a Value<P, B>,
+        provider: &'a dyn ProviderTypeCheckContext,
+        lookup: &'a dyn crate::schema::ValidatedCustomTypeLookup,
+        operational: bool,
+    ) -> Result<(Self, AdmissionContext<'a, P, B>), AdmissionErrors> {
+        let proof = if operational {
+            crate::resource::knowledge::Classification::Known(Self::known_at_apply(
+                value.knowledge(&KnowledgeContext::apply(&ResolvedBindings::default()))?,
+            )?)
+        } else {
+            value
+                .knowledge(&KnowledgeContext::validation())?
+                .into_classification()
+        };
+        let phase = crate::parser::retained::ProjectedPhase::classified(&proof);
+        Ok(Self::paired_in(
+            value.clone(),
+            AdmissionProof::Validation(proof),
+            None,
+            provider,
+            crate::parser::retained::AuthoredCursor::projected(phase),
+            AdmissionLookup::Configuration(lookup),
+        ))
+    }
+
+    fn paired_in<'a>(
+        value: Value<P, B>,
+        proof: AdmissionProof<'a, P, B>,
+        bindings: Option<&'a BindingIndex<'a, B>>,
+        provider: &'a dyn ProviderTypeCheckContext,
+        cursor: crate::parser::retained::AuthoredCursor<'a, B>,
+        lookup: AdmissionLookup<'a>,
+    ) -> (Self, AdmissionContext<'a, P, B>) {
         #[cfg(test)]
         tests::candidate_constructed();
         let identity = DeclarationId::default();
@@ -655,7 +679,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
                 proof,
                 bindings,
                 provider,
-                lookup: AdmissionLookup::Catalog,
+                lookup,
                 assignment: Default::default(),
                 cursor,
                 coverage: Default::default(),
@@ -1040,12 +1064,8 @@ pub fn admit<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
     candidate: Candidate<P, B>,
     context: &AdmissionContext<'_, P, B>,
 ) -> Result<Admission<K, P, B>, AdmissionErrors> {
-    if destination
-        .contract
-        .as_ref()
-        .is_some_and(|contract| matches!(contract.schema, ContractSchema::Configuration(_)))
-    {
-        return configuration::admit_field(destination, candidate, context);
+    if let AdmissionLookup::Configuration(lookup) = context.lookup {
+        return configuration::admit_field(destination, candidate, context, lookup);
     }
     if context.is_apply() {
         return admit_apply(destination, candidate, context).map(Admission::Ready);
@@ -1086,19 +1106,6 @@ fn admit_apply<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
             operation: "apply admission",
         }
         .into());
-    }
-    if destination
-        .contract
-        .as_ref()
-        .is_some_and(|contract| matches!(contract.schema, ContractSchema::Configuration(_)))
-    {
-        return match configuration::admit_field(destination, candidate, context)? {
-            Admission::Ready(value) => Ok(value),
-            Admission::Pending(_) => Err(KnowledgeError::<B>::UnresolvedAtBoundary {
-                sites: context.sites(),
-            }
-            .into()),
-        };
     }
     let assignment::AssignmentJudgement { verdict, findings } =
         assignment::judge_with_findings(destination, &candidate, context)?;

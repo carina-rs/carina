@@ -8,9 +8,8 @@ use crate::executor::provider_ready::{
 };
 use crate::parser::ProviderConfiguration;
 use crate::provider::{ProviderFactory, ProviderValidationInputs};
-use crate::resource::{ParserPlaceholder, RelativeBindingName};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct CanonicalProviderConfigAttributes {
     admitted: AdmittedConfiguration<kind::ProviderConfigAttribute>,
 }
@@ -55,11 +54,11 @@ impl Deref for CanonicalProviderConfigAttributes {
 /// use carina_core::provider::ProviderReadyConfig;
 /// fn replace(config: &mut ProviderReadyConfig) { config.attributes().clear(); }
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ProviderReadyConfig {
     inner: Arc<ReadyConfiguration>,
 }
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 struct ReadyConfiguration {
     canonical: CanonicalProviderConfigAttributes,
     region: Option<String>,
@@ -101,6 +100,10 @@ fn attribute_error(
                 error => error,
             })
             .collect(),
+        ResolutionError::Knowledge(error) => vec![TypeError::Knowledge {
+            error,
+            attribute: None,
+        }],
         error => vec![TypeError::Reference {
             error: Box::new(crate::resource::SecretDiagnosticError::Public(
                 super::super::AdmissionReferenceError::Resolution(Box::new(error)),
@@ -142,61 +145,71 @@ fn admitted<P: PlaceholderKind, B: BindingAddress>(
     let catalog = ProviderContext::new(crate::EnvironmentSnapshot::new([]));
     let instance = ProviderInstanceKey::new(provider_name, binding.map(str::to_owned));
     let checked = crate::validation::deferred_types::TypeCheckSession::run(&catalog, |session| {
-        let mut payload = ConfigurationAttributes::new();
-        let mut fields = Vec::new();
+        let mut aggregate = ConfigurationBuilder::new(Arc::clone(&declaration), instance.clone());
         for (key, value) in &canonical {
+            let destination = declaration.destination::<kind::ProviderConfigAttribute>(
+                key,
+                InstanceIdentity::Provider(instance.clone()),
+                CatalogRevision(CatalogSnapshot::Provider(
+                    session.catalog().custom_types.clone(),
+                )),
+            );
             if let Some(known) = value
                 .to_expanded()
                 .and_then(Value::try_into_address_free_absolute)
             {
-                if let Some(destination) =
-                    declaration.destination(key, &instance, session.catalog())
-                {
+                if let Some(destination) = destination {
                     match field(&destination, &known, session, &lookup, operational)
                         .map_err(|error| attribute_error(provider_name, key, error))?
                     {
-                        Admission::Ready(placed) => {
-                            let mut slot = TypedSlot::new(destination);
-                            slot.place(placed.clone())
-                                .expect("declaration-owned config slot");
-                            payload.insert(key.clone(), placed.value().clone());
-                            fields.push(placed);
+                        Admission::Ready(placed) => aggregate.place(key.clone(), placed),
+                        Admission::Pending(pending) if operational => {
+                            return Err(attribute_error(
+                                provider_name,
+                                key,
+                                KnowledgeError::<AbsoluteBindingAddress>::UnresolvedAtBoundary {
+                                    sites: pending.inner.sites,
+                                }
+                                .into(),
+                            ));
                         }
                         Admission::Pending(_) => {}
                     }
                 } else {
-                    payload.insert(key.clone(), known);
+                    aggregate.passthrough(key.clone(), known);
                 }
-            } else if let Some(destination) = declaration
-                .destination::<kind::ProviderConfigAttribute>(key, &instance, session.catalog())
-            {
-                field(&destination, value, session, &lookup, false)
-                    .map_err(|error| attribute_error(provider_name, key, error))?;
+            } else {
+                if let Some(destination) = destination {
+                    field(&destination, value, session, &lookup, false)
+                        .map_err(|error| attribute_error(provider_name, key, error))?;
+                }
+                if operational {
+                    let proof = value
+                        .knowledge(&KnowledgeContext::validation())
+                        .map_err(|error| attribute_error(provider_name, key, error.into()))?;
+                    return Err(attribute_error(
+                        provider_name,
+                        key,
+                        KnowledgeError::<B>::UnresolvedAtBoundary {
+                            sites: proof.sites().collect(),
+                        }
+                        .into(),
+                    ));
+                }
             }
         }
-        Ok::<_, ProviderConfigPreparationError>((payload, fields))
+        Ok::<_, ProviderConfigPreparationError>(aggregate)
     });
     let mut deferred = Vec::new();
-    let (payload, fields) = checked.publish(&mut deferred)?;
+    let aggregate = checked.publish(&mut deferred)?;
     if !deferred.is_empty() {
         return Err(ProviderConfigPreparationError::ProviderValidation {
             provider: provider_name.to_owned(),
             error: ProviderConfigValidationError::deferred(deferred),
         });
     }
-    let payload = WireReady::try_new(
-        payload,
-        ProviderWireTarget::Configuration {
-            provider: provider_name.to_owned(),
-        },
-    )?;
     let canonical = CanonicalProviderConfigAttributes {
-        admitted: AdmittedConfiguration {
-            payload,
-            fields,
-            declaration,
-            instance,
-        },
+        admitted: aggregate.admit_payload()?,
     };
     let session = ProviderValidationInputs::collect(provider_name, canonical.values());
     session
@@ -218,7 +231,7 @@ fn admitted<P: PlaceholderKind, B: BindingAddress>(
     Ok(canonical)
 }
 
-pub(crate) fn analysis<P: PlaceholderKind, B: BindingAddress>(
+fn analyze<P: PlaceholderKind, B: BindingAddress>(
     factory: &dyn ProviderFactory,
     provider_name: &str,
     attributes: &ConfigurationAttributes<Value<P, B>>,
@@ -234,25 +247,34 @@ pub(crate) fn analysis<P: PlaceholderKind, B: BindingAddress>(
     )
 }
 
-pub(crate) fn parser_analysis(
+pub fn analysis(
     factory: &dyn ProviderFactory,
     provider_name: &str,
-    attributes: &ConfigurationAttributes<Value<ParserPlaceholder, RelativeBindingName>>,
+    attributes: &ConfigurationAttributes<Value>,
 ) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
-    analysis(factory, provider_name, attributes)
+    analyze(factory, provider_name, attributes)
+}
+pub fn validate_parser_provider_config(
+    factory: &dyn ProviderFactory,
+    provider_name: &str,
+    attributes: &ConfigurationAttributes<
+        Value<crate::resource::ParserPlaceholder, crate::resource::RelativeBindingName>,
+    >,
+) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
+    analyze(factory, provider_name, attributes)
 }
 
-pub(crate) fn prepare(
+fn ready(
     factory: &dyn ProviderFactory,
-    config: &dyn ProviderConfiguration,
+    instance: &ProviderInstanceKey,
+    attributes: &ConfigurationAttributes<Value>,
+    schema: &ValidatedConfigSchema,
 ) -> Result<ProviderReadyConfig, ProviderConfigPreparationError> {
-    let witness = factory.schema_witness();
-    let schema = witness.config();
     let canonical = admitted(
         factory,
-        config.name(),
-        config.binding(),
-        config.attributes(),
+        instance.provider(),
+        instance.provider_instance(),
+        attributes,
         schema,
         true,
     )?;
@@ -260,6 +282,19 @@ pub(crate) fn prepare(
         .rootless_type("region")
         .and_then(|_| crate::utils::region_from_attrs(canonical.attributes()));
     Ok(ProviderReadyConfig::new(canonical, region))
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn prepare(
+    factory: &dyn ProviderFactory,
+    config: &dyn ProviderConfiguration,
+) -> Result<ProviderReadyConfig, ProviderConfigPreparationError> {
+    ready(
+        factory,
+        &ProviderInstanceKey::new(config.name(), config.binding().map(str::to_owned)),
+        config.attributes(),
+        factory.schema_witness().config(),
+    )
 }
 
 /// The selected factory and the exact configuration admitted by it stay together.
@@ -304,34 +339,30 @@ impl ProviderConstruction<'_> {
 }
 
 crate::provider_text::host_api! {
-/// Admit the selected source configuration for its effective operational route.
-/// Source selection remains the responsibility of the resolved collection.
-fn construction<'a>(
+/// Admit the configuration for the route it declares.
+fn construction<'a>(factory: &'a dyn ProviderFactory, config: &dyn ProviderConfiguration, plan: &crate::provider::ProviderPlan) -> Result<ProviderConstruction<'a>, ProviderConfigPreparationError> {
+    construct(factory, &ProviderInstanceKey::new(config.name(), config.binding().map(str::to_owned)), config.attributes(), plan)
+}
+}
+crate::provider_text::host_api! {
+/// Admit the selected source for an implicit operation's default route.
+fn default_construction<'a>(factory: &'a dyn ProviderFactory, config: &dyn ProviderConfiguration, plan: &crate::provider::ProviderPlan) -> Result<ProviderConstruction<'a>, ProviderConfigPreparationError> {
+    construct(factory, &ProviderInstanceKey::new(config.name(), None), config.attributes(), plan)
+}
+}
+fn construct<'a>(
     factory: &'a dyn ProviderFactory,
-    config: &dyn ProviderConfiguration,
-    route: &ProviderInstanceKey,
+    instance: &ProviderInstanceKey,
+    attributes: &ConfigurationAttributes<Value>,
     plan: &crate::provider::ProviderPlan,
 ) -> Result<ProviderConstruction<'a>, ProviderConfigPreparationError> {
     let witness = factory.schema_witness();
-    let schema = witness.config();
-    let canonical = admitted(
-        factory,
-        route.provider(),
-        route.provider_instance(),
-        config.attributes(),
-        schema,
-        true,
-    )?;
-    let region = schema
-        .rootless_type("region")
-        .and_then(|_| crate::utils::region_from_attrs(canonical.attributes()));
-    let ready = ProviderReadyConfig::new(canonical, region);
+    let ready = ready(factory, instance, attributes, witness.config())?;
     Ok(ProviderConstruction {
         factory,
         witness,
         session: plan.session(&ready),
     })
-}
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -339,21 +370,13 @@ pub fn construction_for_test<'a>(
     factory: &'a dyn ProviderFactory,
     session: &crate::provider::ProviderSession,
 ) -> Result<ProviderConstruction<'a>, ProviderConfigPreparationError> {
-    let route = session.configuration().instance();
     let witness = factory.schema_witness();
-    let schema = witness.config();
-    let canonical = admitted(
+    let ready = ready(
         factory,
-        route.provider(),
-        route.provider_instance(),
+        session.configuration().instance(),
         session.configuration().attributes(),
-        schema,
-        true,
+        witness.config(),
     )?;
-    let region = schema
-        .rootless_type("region")
-        .and_then(|_| crate::utils::region_from_attrs(canonical.attributes()));
-    let ready = ProviderReadyConfig::new(canonical, region);
     let mut session = session.clone();
     session.replace_test_configuration(ready);
     Ok(ProviderConstruction {
@@ -369,49 +392,10 @@ pub(crate) fn test_configuration(
     binding: Option<&str>,
     config: Option<&ProviderReadyConfig>,
 ) -> ProviderReadyConfig {
-    struct FixtureDeclaration<'a>(&'a str);
-    impl ProviderFactory for FixtureDeclaration<'_> {
-        fn name(&self) -> &str {
-            self.0
-        }
-        fn display_name(&self) -> &str {
-            self.0
-        }
-        fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-            ValidatedConfigSchema::validate(Default::default()).unwrap()
-        }
-        fn validate_config(
-            &self,
-            _: &CanonicalProviderConfigAttributes,
-            _: &crate::provider::ProviderValidationInputs,
-        ) -> crate::provider::ProviderResult<()> {
-            Ok(())
-        }
-        fn create_provider(
-            &self,
-            _: &crate::provider::ProviderSession,
-            _: crate::provider::InitializeOutcomeMint,
-        ) -> crate::provider::BoxFuture<
-            '_,
-            crate::provider::ProviderResult<crate::provider::ProviderInitialization>,
-        > {
-            panic!("fixture declaration cannot initialize providers")
-        }
-        fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
-            vec![]
-        }
-        fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
-            crate::schema::ValidatedProviderSchemaWitness::new(
-                vec![],
-                self.provider_config_attribute_types(),
-                Default::default(),
-                vec![],
-            )
-            .unwrap()
-        }
-    }
     let empty = ConfigurationAttributes::new();
-    let factory = FixtureDeclaration(provider);
+    let factory =
+        crate::test_utils::configuration::ConfigFactory::new(ValidatedConfigSchema::default())
+            .named(provider);
     let canonical = admitted(
         &factory,
         provider,
@@ -434,22 +418,7 @@ fn empty_construction<'a>(
     route: &ProviderInstanceKey,
     plan: &crate::provider::ProviderPlan,
 ) -> Result<ProviderConstruction<'a>, ProviderConfigPreparationError> {
-    let witness = factory.schema_witness();
-    let schema = witness.config();
-    let canonical = admitted(
-        factory,
-        route.provider(),
-        route.provider_instance(),
-        &ConfigurationAttributes::<Value>::new(),
-        schema,
-        true,
-    )?;
-    let ready = ProviderReadyConfig::new(canonical, None);
-    Ok(ProviderConstruction {
-        factory,
-        witness,
-        session: plan.session(&ready),
-    })
+    construct(factory, route, &ConfigurationAttributes::new(), plan)
 }
 }
 

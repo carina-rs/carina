@@ -14,7 +14,6 @@ use carina_core::validation::admission::{
     kind::BackendAttribute,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
 
 pub use backend::{BackendAttributeError, BackendConfigError, BackendConfigErrors};
 
@@ -144,7 +143,6 @@ impl BackendConfig {
 /// use carina_state::S3BackendSettings;
 ///
 /// let _ = S3BackendSettings {
-///     configuration: todo!(),
 ///     bucket: todo!(),
 ///     key: todo!(),
 ///     region: None,
@@ -152,9 +150,8 @@ impl BackendConfig {
 ///     auto_create: None,
 /// };
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S3BackendSettings {
-    configuration: Arc<AdmittedConfiguration<BackendAttribute>>,
     bucket: ValueString,
     key: ValueString,
     region: Option<String>,
@@ -162,30 +159,7 @@ pub struct S3BackendSettings {
     auto_create: Option<bool>,
 }
 
-impl PartialEq for S3BackendSettings {
-    fn eq(&self, other: &Self) -> bool {
-        (
-            &self.bucket,
-            &self.key,
-            &self.region,
-            self.encrypt,
-            self.auto_create,
-        ) == (
-            &other.bucket,
-            &other.key,
-            &other.region,
-            other.encrypt,
-            other.auto_create,
-        )
-    }
-}
-impl Eq for S3BackendSettings {}
-
 impl S3BackendSettings {
-    pub fn configuration(&self) -> &AdmittedConfiguration<BackendAttribute> {
-        &self.configuration
-    }
-
     pub(crate) fn from_url_parts(bucket: String, key: String) -> Result<Self, BackendConfigError> {
         let raw = parser::BackendConfig::<NoPlaceholder> {
             backend_type: S3_BACKEND_TYPE.into(),
@@ -254,78 +228,62 @@ impl S3BackendSettings {
 ///
 /// ```compile_fail,E0451
 /// use carina_state::LocalBackendSettings;
-/// let _ = LocalBackendSettings { configuration: todo!(), path: None };
+/// let _ = LocalBackendSettings { path: None };
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalBackendSettings {
-    configuration: Arc<AdmittedConfiguration<BackendAttribute>>,
     path: Option<ValueString>,
 }
 
-impl PartialEq for LocalBackendSettings {
-    fn eq(&self, other: &Self) -> bool {
-        self.path == other.path
-    }
-}
-impl Eq for LocalBackendSettings {}
-
-/// An admitted local configuration and the address pinned from that input.
-/// No constructor accepts an unrelated receipt and replacement path.
+/// A local address pinned from admitted settings or native operation context.
 pub(crate) struct LocalBackendLocation {
-    settings: LocalBackendSettings,
     path: ResolvedPath,
 }
 impl LocalBackendLocation {
     pub(crate) fn path(&self) -> &ResolvedPath {
         &self.path
     }
-    #[cfg(test)]
-    pub(crate) fn settings(&self) -> &LocalBackendSettings {
-        &self.settings
-    }
-    pub(crate) fn into_parts(self) -> (LocalBackendSettings, ResolvedPath) {
-        (self.settings, self.path)
+    pub(crate) fn into_path(self) -> ResolvedPath {
+        self.path
     }
 }
 
 impl LocalBackendSettings {
-    pub fn configuration(&self) -> &AdmittedConfiguration<BackendAttribute> {
-        &self.configuration
-    }
-
     pub(crate) fn pin(&self, base: &ResolvedPath) -> crate::BackendResult<LocalBackendLocation> {
-        let path = crate::backends::anchored_local_path(self, base).map_err(|error| {
-            crate::BackendError::Io(format!("Failed to locate state file: {error}"))
-        })?;
-        Ok(LocalBackendLocation {
-            settings: self.clone(),
-            path,
-        })
+        let path = crate::backends::anchored_local_path(self, base)
+            .map_err(|error| crate::BackendError::Io(error.to_string()))?;
+        Ok(LocalBackendLocation { path })
     }
 
     pub(crate) fn for_file(path: &std::path::Path) -> crate::BackendResult<LocalBackendLocation> {
-        let raw = parser::BackendConfig::<NoPlaceholder> {
-            backend_type: LOCAL_BACKEND_TYPE.into(),
-            attributes: [(
-                "path".to_string(),
-                Value::Concrete(ConcreteValue::String(
-                    path.to_string_lossy().into_owned().into(),
-                )),
-            )]
-            .into_iter()
-            .collect(),
-            attribute_spans: Default::default(),
-        };
-        let BackendConfig::Local(settings) = BackendConfig::try_from(&raw)? else {
-            unreachable!()
-        };
-        // Keep the native address and its diagnostic spelling, including OS
-        // paths accepted by test-utils; admission's text projection never
-        // replaces the original path used for the single pin.
-        let path = ResolvedPath::new(path).map_err(|error| {
-            crate::BackendError::Io(format!("Failed to locate state file: {error}"))
-        })?;
-        Ok(LocalBackendLocation { settings, path })
+        let path = if let Some(text) = path.to_str() {
+            let raw = parser::BackendConfig::<NoPlaceholder> {
+                backend_type: LOCAL_BACKEND_TYPE.into(),
+                attributes: [(
+                    "path".to_owned(),
+                    Value::Concrete(ConcreteValue::String(text.into())),
+                )]
+                .into_iter()
+                .collect(),
+                attribute_spans: Default::default(),
+            };
+            let BackendConfig::Local(settings) = BackendConfig::try_from(&raw)? else {
+                unreachable!()
+            };
+            ResolvedPath::new(settings.path().expect("admitted file address"))
+        } else {
+            // Native OS addresses cannot inhabit a declared String field.
+            // Admit the local kind's empty settings and pin this address as
+            // operation context; no path-field receipt or lossy text is made.
+            let settings = BackendConfig::implicit_local();
+            settings.pin_native_file(path)
+        }
+        .map_err(|error| crate::BackendError::Io(error.to_string()))?;
+        Ok(LocalBackendLocation { path })
+    }
+
+    fn pin_native_file(self, path: &std::path::Path) -> std::io::Result<ResolvedPath> {
+        ResolvedPath::new(path)
     }
 
     pub fn path(&self) -> Option<&str> {
@@ -333,59 +291,25 @@ impl LocalBackendSettings {
     }
 }
 
-fn take_string(
-    attributes: &mut parser::ConfigurationAttributes<Value>,
-    key: &str,
-) -> Option<ValueString> {
-    attributes.shift_remove(key).map(|value| match value {
-        Value::Concrete(ConcreteValue::String(value)) => value,
-        _ => unreachable!("admitted concrete String backend setting"),
-    })
-}
-
-fn take_bool(attributes: &mut parser::ConfigurationAttributes<Value>, key: &str) -> Option<bool> {
-    attributes.shift_remove(key).map(|value| match value {
-        Value::Concrete(ConcreteValue::Bool(value)) => value,
-        _ => unreachable!("admitted concrete Bool backend setting"),
-    })
-}
-
 impl From<AdmittedConfiguration<BackendAttribute>> for BackendConfig {
     fn from(configuration: AdmittedConfiguration<BackendAttribute>) -> Self {
-        let mut attributes = configuration.attributes().clone();
-        let kind = configuration.backend_kind();
-        let configuration = Arc::new(configuration);
-        match kind {
-            BackendKind::S3 => {
-                let bucket =
-                    take_string(&mut attributes, "bucket").expect("admitted required bucket");
-                let key = take_string(&mut attributes, "key").expect("admitted required key");
-                let region = attributes.shift_remove("region").map(|value| match value {
-                    Value::Concrete(ConcreteValue::CanonicalEnum(value)) => {
-                        value.api_value().to_owned()
-                    }
-                    _ => unreachable!("admitted canonical backend region"),
-                });
-                let encrypt = take_bool(&mut attributes, "encrypt");
-                let auto_create = take_bool(&mut attributes, "auto_create");
-                debug_assert!(attributes.is_empty());
-                Self::S3(S3BackendSettings {
-                    configuration,
-                    bucket,
-                    key,
-                    region,
-                    encrypt,
-                    auto_create,
-                })
-            }
-            BackendKind::Local => {
-                let path = take_string(&mut attributes, "path");
-                debug_assert!(attributes.is_empty());
-                Self::Local(LocalBackendSettings {
-                    configuration,
-                    path,
-                })
-            }
+        match configuration.backend_kind() {
+            BackendKind::S3 => Self::S3(S3BackendSettings {
+                bucket: configuration
+                    .string("bucket")
+                    .expect("required backend bucket")
+                    .clone(),
+                key: configuration
+                    .string("key")
+                    .expect("required backend key")
+                    .clone(),
+                region: configuration.enum_api_value("region").map(str::to_owned),
+                encrypt: configuration.boolean("encrypt"),
+                auto_create: configuration.boolean("auto_create"),
+            }),
+            BackendKind::Local => Self::Local(LocalBackendSettings {
+                path: configuration.string("path").cloned(),
+            }),
         }
     }
 }

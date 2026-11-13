@@ -204,10 +204,10 @@ impl ProviderBoundPlanFile {
         Self::NeedsSecretVerification { plan, providers }
     }
 
-    pub(super) fn backend_config(&self) -> Option<&BackendConfig> {
+    pub(super) fn backend_config(&self) -> &BackendConfig {
         match self {
-            Self::Verified { plan, .. } => plan.plan_file.backend_config.as_ref(),
-            Self::NeedsSecretVerification { plan, .. } => plan.plan_file.backend_config.as_ref(),
+            Self::Verified { plan, .. } => plan.plan_file.backend_config.candidate(),
+            Self::NeedsSecretVerification { plan, .. } => plan.plan_file.backend_config.candidate(),
         }
     }
 
@@ -1441,7 +1441,7 @@ mod tests {
             state_lineage: None,
             state_serial: None,
             provider_configs: saved_provider_configs(provider_configs),
-            backend_config: None,
+            backend_config: crate::commands::plan::SavedBackendConfig::implicit_local(),
             plan: carina_core::plan::SnapshotPlan::default(),
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
@@ -2069,7 +2069,7 @@ mod tests {
             state_serial: None,
             provider_configs: serde_json::from_value(serde_json::json!([]))
                 .expect("empty saved provider configs"),
-            backend_config: None,
+            backend_config: crate::commands::plan::SavedBackendConfig::implicit_local(),
             plan: plan.clone().to_snapshot(),
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),

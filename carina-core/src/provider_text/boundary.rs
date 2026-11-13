@@ -202,38 +202,9 @@ impl ProviderSessionBuilder {
 #[derive(Clone, Debug)]
 pub struct ProviderSession {
     config: ProviderReadyConfig,
-    provider: String,
-    binding: Option<String>,
     secrets: RedactionSet,
     diagnostics: super::ProviderDiagnosticChannel,
     diagnostic_owner: super::DiagnosticOwner,
-}
-impl PartialEq for ProviderSession {
-    fn eq(&self, other: &Self) -> bool {
-        // Liveness is not part of session value equality; the old Arc<()> owner
-        // also compared equal across independent allocations.
-        let Self {
-            config,
-            provider,
-            binding,
-            secrets,
-            diagnostics,
-            diagnostic_owner: _owner,
-        } = self;
-        let Self {
-            config: other_config,
-            provider: other_provider,
-            binding: other_binding,
-            secrets: other_secrets,
-            diagnostics: other_diagnostics,
-            diagnostic_owner: _other_owner,
-        } = other;
-        config == other_config
-            && provider == other_provider
-            && binding == other_binding
-            && secrets == other_secrets
-            && diagnostics == other_diagnostics
-    }
 }
 impl ProviderSession {
     /// Core-owned call inputs for guest handoff; this does not grant runtime
@@ -278,8 +249,6 @@ impl ProviderSession {
         );
         Self {
             config: config.clone(),
-            provider: provider.to_owned(),
-            binding: binding.map(str::to_owned),
             diagnostics,
             diagnostic_owner,
             secrets,
@@ -293,7 +262,7 @@ impl ProviderSession {
         &self.config
     }
     pub fn binding(&self) -> Option<&str> {
-        self.binding.as_deref()
+        self.config.instance().provider_instance()
     }
     pub fn redaction_set(&self) -> &RedactionSet {
         &self.secrets
@@ -520,16 +489,16 @@ impl ProviderBoundary<'static> {
         schemas
             .insert_provider_witness(factory.name(), witness)
             .map_err(event_schema_install_error)?;
-        if session.provider != factory.name() {
+        if session.configuration().instance().provider() != factory.name() {
             schemas
-                .insert_provider_witness(&session.provider, witness)
+                .insert_provider_witness(session.configuration().instance().provider(), witness)
                 .map_err(event_schema_install_error)?;
         }
         Ok(ConfiguredNormalizer {
             diagnostic_inputs: session.guest_inputs(),
             route: Some(ProviderInstanceKey::new(
-                session.provider.clone(),
-                session.binding.clone(),
+                session.configuration().instance().provider().to_owned(),
+                session.binding().map(str::to_owned),
             )),
             provider_name: factory.name().to_owned(),
             ext,

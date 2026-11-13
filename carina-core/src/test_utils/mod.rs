@@ -1,5 +1,6 @@
 //! Fixtures available to downstream tests with the `test-utils` feature.
 
+pub mod configuration;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod loopback;
 

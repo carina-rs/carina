@@ -1,7 +1,8 @@
 //! Declaration-owned admission for configuration payloads.
 //!
-//! The payload and its field placements stay together. There is no constructor
-//! accepting a checked marker and a replacement map.
+//! The payload retains its declared field placements and explicitly named
+//! opaque factory-owned passthrough. There is no constructor accepting a
+//! checked marker and a replacement map.
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ pub mod provider;
 /// The two sealed configuration destinations and their exact payloads.
 /// Backend settings do not acquire a provider transport or provider identity.
 pub trait ConfigurationKind: DestinationKind {
-    type Payload: std::fmt::Debug + Clone + PartialEq;
+    type Payload: std::fmt::Debug + Clone;
     type Instance: std::fmt::Debug + Clone + PartialEq;
     #[doc(hidden)]
     fn attributes(payload: &Self::Payload) -> &ConfigurationAttributes<Value>;
@@ -46,62 +47,9 @@ struct ConfigurationDeclaration {
     schema: Arc<ValidatedConfigSchema>,
 }
 
-/// A provider slot cannot consume backend admission.
-///
-/// ```
-/// use carina_core::validation::admission::{TypedSlot, PlacedValue, kind::ProviderConfigAttribute};
-/// fn place(slot: &mut TypedSlot<ProviderConfigAttribute>, value: PlacedValue<ProviderConfigAttribute>) { slot.place(value).unwrap(); }
-/// ```
-/// ```compile_fail,E0308
-/// use carina_core::validation::admission::{TypedSlot, PlacedValue, kind::{ProviderConfigAttribute, BackendAttribute}};
-/// fn place(slot: &mut TypedSlot<ProviderConfigAttribute>, value: PlacedValue<BackendAttribute>) { slot.place(value).unwrap(); }
-/// ```
-/// An immutable, exact configuration payload admitted to its declaration.
-///
-/// ```compile_fail,E0451
-/// use carina_core::validation::admission::{configuration::AdmittedConfiguration, kind::ProviderConfigAttribute};
-/// fn forge() -> AdmittedConfiguration<ProviderConfigAttribute> {
-///     AdmittedConfiguration { payload: unreachable!() }
-/// }
-/// ```
-#[derive(Debug, Clone)]
-pub struct AdmittedConfiguration<K: ConfigurationKind> {
-    payload: K::Payload,
-    fields: Vec<PlacedValue<K>>,
-    declaration: Arc<ConfigurationDeclaration>,
-    instance: K::Instance,
-}
-
-impl<K: ConfigurationKind> PartialEq for AdmittedConfiguration<K> {
-    fn eq(&self, other: &Self) -> bool {
-        self.payload == other.payload
-            && self.instance == other.instance
-            && self.declaration.identity == other.declaration.identity
-            && self.fields == other.fields
-    }
-}
-
-impl<K: ConfigurationKind> AdmittedConfiguration<K> {
-    pub fn attributes(&self) -> &ConfigurationAttributes<Value> {
-        K::attributes(&self.payload)
-    }
-}
-
-impl AdmittedConfiguration<kind::ProviderConfigAttribute> {
-    pub fn wire_attributes(&self) -> &WireAttributes {
-        self.payload.wire()
-    }
-
-    pub fn instance(&self) -> &ProviderInstanceKey {
-        &self.instance
-    }
-}
-
-impl AdmittedConfiguration<kind::BackendAttribute> {
-    pub fn backend_kind(&self) -> backend::BackendKind {
-        self.instance
-    }
-}
+mod aggregate;
+pub use aggregate::AdmittedConfiguration;
+use aggregate::ConfigurationBuilder;
 
 impl ConfigurationDeclaration {
     fn provider(owner: &str, schema: ValidatedConfigSchema) -> Arc<Self> {
@@ -115,19 +63,6 @@ impl ConfigurationDeclaration {
     }
 
     fn destination<K: DestinationKind>(
-        &self,
-        key: &crate::parser::AttributeKey,
-        instance: &ProviderInstanceKey,
-        catalog: &ProviderContext,
-    ) -> Option<Destination<K>> {
-        self.destination_for(
-            key,
-            InstanceIdentity::Provider(instance.clone()),
-            CatalogRevision(CatalogSnapshot::Provider(catalog.custom_types.clone())),
-        )
-    }
-
-    fn destination_for<K: DestinationKind>(
         &self,
         key: &crate::parser::AttributeKey,
         instance: InstanceIdentity,
@@ -169,56 +104,22 @@ pub(super) fn admit_field<K: DestinationKind, P: PlaceholderKind, B: BindingAddr
     destination: &Destination<K>,
     candidate: Candidate<P, B>,
     context: &AdmissionContext<'_, P, B>,
+    lookup: &dyn ValidatedCustomTypeLookup,
 ) -> Result<Admission<K, P, B>, AdmissionErrors> {
-    if context.identity != candidate.obligations.identity {
-        return Err(constraints(vec![AdmissionFinding {
-            path: LeafPath::from_segments([]),
-            error: TypeError::ValidationFailed {
-                message: "configuration candidate belongs to another proof".into(),
-            },
-        }]));
-    }
-    let AdmissionLookup::Configuration(lookup) = context.lookup else {
-        return Err(constraints(vec![AdmissionFinding {
-            path: LeafPath::from_segments([]),
-            error: TypeError::ValidationFailed {
-                message: "configuration destination requires its declaration owner".into(),
-            },
-        }]));
-    };
     let contract = destination
         .contract
         .as_ref()
         .expect("configuration destination contract");
-    let checked = match &context.proof {
-        AdmissionProof::Validation(proof) => {
-            crate::schema::value_validation::validate_final_provider_value(
-                contract.attr(),
-                proof,
-                contract.defs(),
-                contract.ancestry,
-                lookup,
-            )
-        }
-        AdmissionProof::Plan(proof) => {
-            crate::schema::value_validation::validate_final_provider_value(
-                contract.attr(),
-                proof.knowledge(),
-                contract.defs(),
-                contract.ancestry,
-                lookup,
-            )
-        }
-        AdmissionProof::Apply(proof) => {
-            crate::schema::value_validation::validate_final_provider_value(
-                contract.attr(),
-                &crate::resource::knowledge::Classification::<P, B>::Known(proof.clone()),
-                contract.defs(),
-                contract.ancestry,
-                lookup,
-            )
-        }
+    let AdmissionProof::Validation(proof) = &context.proof else {
+        unreachable!("configuration context is constructed from one classification")
     };
+    let checked = crate::schema::value_validation::validate_final_provider_value(
+        contract.attr(),
+        proof,
+        contract.defs(),
+        contract.ancestry,
+        lookup,
+    );
     // Keep rootless configuration's established primary-local-error policy.
     let findings = match checked.local_error() {
         Some(error) => vec![AdmissionFinding {
@@ -266,21 +167,6 @@ fn field<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
     lookup: &dyn ValidatedCustomTypeLookup,
     operational: bool,
 ) -> Result<Admission<K, P, B>, AdmissionErrors> {
-    let bindings = ResolvedBindings::default();
-    let (candidate, mut context) = if operational {
-        Candidate::apply(
-            value.knowledge(&KnowledgeContext::apply(&bindings))?,
-            session,
-        )?
-    } else {
-        Candidate::validation_classified(
-            value
-                .knowledge(&KnowledgeContext::validation())?
-                .into_classification(),
-            None,
-            session,
-        )
-    };
-    context.lookup = AdmissionLookup::Configuration(lookup);
+    let (candidate, context) = Candidate::configuration(value, session, lookup, operational)?;
     admit(destination, candidate, &context)
 }

@@ -44,8 +44,6 @@ enum AcquireTestPhase {
 /// fn bypass(path: ResolvedPath) { let _ = LocalBackend::with_resolved_path(path); }
 /// ```
 pub struct LocalBackend {
-    /// Own the admitted configuration bound to this pinned filesystem address.
-    _configuration: LocalBackendSettings,
     /// Path to the state file
     state_path: ResolvedPath,
     /// Path to the lock file
@@ -112,7 +110,7 @@ impl LocalBackend {
     }
 
     pub(crate) fn from_location(location: LocalBackendLocation) -> BackendResult<Self> {
-        let (configuration, state_path) = location.into_parts();
+        let state_path = location.into_path();
         let lock_path = state_path
             .sibling_with_extension("lock")
             .map_err(|error| BackendError::Io(format!("Failed to locate lock file: {error}")))?;
@@ -122,7 +120,6 @@ impl LocalBackend {
                 BackendError::Io(format!("Failed to locate recovery claim: {error}"))
             })?;
         Ok(Self {
-            _configuration: configuration,
             recovery_path,
             state_path,
             lock_path,
@@ -148,7 +145,13 @@ impl LocalBackend {
         config: &LocalBackendSettings,
         base_dir: &ResolvedPath,
     ) -> BackendResult<Self> {
-        Self::from_location(config.pin(base_dir)?)
+        let location = config.pin(base_dir).map_err(|error| match error {
+            BackendError::Io(message) => {
+                BackendError::Io(format!("Failed to locate state file: {message}"))
+            }
+            error => error,
+        })?;
+        Self::from_location(location)
     }
 
     /// The state file's diagnostic spelling.

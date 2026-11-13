@@ -3931,7 +3931,7 @@ async fn run_apply_from_plan_with_observer_factory(
     let current_backend = parsed_backend.as_ref().map(Option::as_ref);
     let backend_config = match current_backend {
         Some(current_backend) => current_backend,
-        None => inspected_plan.backend_config(),
+        None => Some(inspected_plan.backend_config()),
     };
     let verified_backend =
         verify_for_mutation(base_dir, &source_path, backend_config, DriftCommand::Apply)?;
@@ -3941,7 +3941,7 @@ async fn run_apply_from_plan_with_observer_factory(
     // backend gates pass is the state lock acquired.
     if let Some(current_backend) = current_backend {
         ensure_saved_plan_backend_matches_current(
-            inspected_plan.backend_config(),
+            Some(inspected_plan.backend_config()),
             current_backend,
             apply_target,
         )?;

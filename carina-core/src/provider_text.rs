@@ -72,7 +72,7 @@ thread_local! { static REDACTION_PASSES: std::cell::Cell<usize> = const { std::c
 ///
 /// ```compile_fail,E0451
 /// use carina_core::provider::ProviderSession;
-/// let _ = ProviderSession { config: None, provider: String::new(), binding: None, secrets: todo!() };
+/// let _ = ProviderSession { config: todo!(), secrets: todo!(), diagnostics: todo!(), diagnostic_owner: todo!() };
 /// ```
 /// Boundaries cannot be constructed externally.
 ///

@@ -342,7 +342,7 @@ async fn plan(fixture: &ApplyCancellationFixture, cloud: &Cloud) -> PlanFile {
         &source,
         planned.resources().parsed(),
         prepared.provider_inputs.configs(),
-        None,
+        crate::commands::plan::SavedBackendConfig::implicit_local(),
         &state,
         planned.resources(),
         &planned,

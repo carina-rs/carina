@@ -1,6 +1,5 @@
 //! Built-in backend declarations and their sole configuration admission owner.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 use thiserror::Error;
@@ -11,7 +10,6 @@ use crate::resource::ConcreteValue;
 use crate::schema::{AttributeType, DslTransform, TypeIdentity};
 
 const AWS_PROVIDER_NAME: &str = "aws";
-const AWS_REGION_TYPE_NAME: &str = "aws.Region";
 
 /// A built-in destination, independent of installed providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,21 +26,64 @@ impl BackendKind {
         }
     }
 
-    fn declaration(self) -> &'static Arc<ConfigurationDeclaration> {
-        static S3: OnceLock<Arc<ConfigurationDeclaration>> = OnceLock::new();
-        static LOCAL: OnceLock<Arc<ConfigurationDeclaration>> = OnceLock::new();
-        let (slot, schema): (_, fn() -> ValidatedConfigSchema) = match self {
-            Self::S3 => (&S3, s3_schema),
-            Self::Local => (&LOCAL, local_schema),
+    fn declaration(self) -> &'static BackendDeclaration {
+        static S3: OnceLock<BackendDeclaration> = OnceLock::new();
+        static LOCAL: OnceLock<BackendDeclaration> = OnceLock::new();
+        let slot = match self {
+            Self::S3 => &S3,
+            Self::Local => &LOCAL,
         };
         slot.get_or_init(|| {
-            Arc::new(ConfigurationDeclaration {
-                identity: DeclarationId::default(),
-                owner: DeclarationOwner::Backend(self),
-                schema: Arc::new(schema()),
-            })
+            let fields = match self {
+                Self::S3 => vec![
+                    ("bucket", AttributeType::string(), true),
+                    ("key", AttributeType::string(), true),
+                    (
+                        "region",
+                        AttributeType::enum_(
+                            TypeIdentity::new(
+                                Some(AWS_PROVIDER_NAME),
+                                Vec::<String>::new(),
+                                "Region",
+                            ),
+                            None,
+                            vec![],
+                            None,
+                            Some(DslTransform::HyphenToUnderscore),
+                        ),
+                        false,
+                    ),
+                    ("encrypt", AttributeType::bool(), false),
+                    ("auto_create", AttributeType::bool(), false),
+                ],
+                Self::Local => vec![("path", AttributeType::string(), false)],
+            };
+            let required = fields
+                .iter()
+                .filter(|(_, _, required)| *required)
+                .map(|(name, _, _)| *name)
+                .collect();
+            let schema = ValidatedConfigSchema::validate(
+                fields
+                    .into_iter()
+                    .map(|(name, ty, _)| (name.to_owned(), ty))
+                    .collect(),
+            )
+            .expect("built-in backend declaration");
+            BackendDeclaration {
+                configuration: Arc::new(ConfigurationDeclaration {
+                    identity: DeclarationId::default(),
+                    owner: DeclarationOwner::Backend(self),
+                    schema: Arc::new(schema),
+                }),
+                required,
+            }
         })
     }
+}
+struct BackendDeclaration {
+    configuration: Arc<ConfigurationDeclaration>,
+    required: Vec<&'static str>,
 }
 
 /// Failure to resolve a raw backend block through its declared schema.
@@ -94,6 +135,12 @@ impl std::error::Error for BackendConfigErrors {}
 /// One schema failure associated with a backend attribute.
 #[derive(Debug, Error)]
 pub enum BackendAttributeError {
+    #[error("Invalid attribute '{attribute}' for backend type '{backend_type}': {error}")]
+    Admission {
+        backend_type: String,
+        attribute: crate::parser::AttributeKey,
+        error: Box<ResolutionError>,
+    },
     #[error("Unknown attribute '{attribute}' for backend type '{backend_type}'")]
     UnknownAttribute {
         backend_type: String,
@@ -115,7 +162,8 @@ pub enum BackendAttributeError {
 impl BackendAttributeError {
     pub fn attribute(&self) -> &crate::parser::AttributeKey {
         match self {
-            Self::UnknownAttribute { attribute, .. }
+            Self::Admission { attribute, .. }
+            | Self::UnknownAttribute { attribute, .. }
             | Self::MissingRequiredAttribute { attribute, .. }
             | Self::InvalidAttribute { attribute, .. } => attribute,
         }
@@ -125,37 +173,9 @@ impl BackendAttributeError {
         match self {
             Self::UnknownAttribute { .. } => 0,
             Self::MissingRequiredAttribute { .. } => 1,
-            Self::InvalidAttribute { .. } => 2,
+            Self::InvalidAttribute { .. } | Self::Admission { .. } => 2,
         }
     }
-}
-
-fn s3_schema() -> ValidatedConfigSchema {
-    ValidatedConfigSchema::validate(BTreeMap::from([
-        ("bucket".to_string(), AttributeType::string()),
-        ("key".to_string(), AttributeType::string()),
-        (
-            "region".to_string(),
-            AttributeType::enum_(
-                TypeIdentity::new(Some(AWS_PROVIDER_NAME), Vec::<String>::new(), "Region"),
-                None,
-                Vec::new(),
-                None,
-                Some(DslTransform::HyphenToUnderscore),
-            ),
-        ),
-        ("encrypt".to_string(), AttributeType::bool()),
-        ("auto_create".to_string(), AttributeType::bool()),
-    ]))
-    .expect("the built-in S3 backend config schema must be valid")
-}
-
-fn local_schema() -> ValidatedConfigSchema {
-    ValidatedConfigSchema::validate(BTreeMap::from([(
-        "path".to_string(),
-        AttributeType::string(),
-    )]))
-    .expect("the built-in local backend config schema must be valid")
 }
 
 struct BuiltinLookup;
@@ -166,39 +186,78 @@ impl ValidatedCustomTypeLookup for BuiltinLookup {
     }
 }
 
+fn attribute_error(
+    kind: BackendKind,
+    key: &AttributeKey,
+    error: AdmissionErrors,
+) -> BackendAttributeError {
+    match error.into_resolution_error() {
+        ResolutionError::AdmissionConstraints(findings) => {
+            BackendAttributeError::InvalidAttribute {
+                backend_type: kind.name().into(),
+                attribute: key.clone(),
+                error: Box::new(findings.findings()[0].error.clone()),
+            }
+        }
+        error => BackendAttributeError::Admission {
+            backend_type: kind.name().into(),
+            attribute: key.clone(),
+            error: Box::new(error),
+        },
+    }
+}
+
 fn invalid_shape<P: PlaceholderKind, B: BindingAddress>(
     kind: BackendKind,
     key: &AttributeKey,
+    ty: &crate::schema::CompiledAttributeType,
     value: &Value<P, B>,
 ) -> BackendAttributeError {
-    let expected = match (kind, key.transport_identity()) {
-        (BackendKind::S3, "region") => AWS_REGION_TYPE_NAME,
-        (BackendKind::S3, "encrypt" | "auto_create") => "Bool",
-        _ => "String",
-    };
     BackendAttributeError::InvalidAttribute {
         backend_type: kind.name().into(),
         attribute: key.clone(),
         error: Box::new(TypeError::value_type_mismatch(
-            expected.into(),
+            ty.type_name(),
             value.type_name(),
         )),
     }
 }
-
 fn concrete_setting<P: PlaceholderKind, B: BindingAddress>(
-    kind: BackendKind,
-    key: &AttributeKey,
+    ty: &crate::schema::CompiledAttributeType,
     value: &Value<P, B>,
 ) -> bool {
-    match (kind, key.transport_identity()) {
-        (BackendKind::S3, "region") => {
-            matches!(value, Value::Concrete(ConcreteValue::CanonicalEnum(_)))
+    matches!(
+        (ty.kind(), value),
+        (
+            crate::schema::AttrTypeKind::String { .. },
+            Value::Concrete(ConcreteValue::String(_))
+        ) | (
+            crate::schema::AttrTypeKind::Bool,
+            Value::Concrete(ConcreteValue::Bool(_))
+        ) | (
+            crate::schema::AttrTypeKind::Enum { .. },
+            Value::Concrete(ConcreteValue::CanonicalEnum(_)),
+        )
+    )
+}
+impl AdmittedConfiguration<kind::BackendAttribute> {
+    pub fn string(&self, name: &str) -> Option<&crate::resource::ValueString> {
+        match self.field(name)?.value() {
+            Value::Concrete(ConcreteValue::String(value)) => Some(value),
+            _ => None,
         }
-        (BackendKind::S3, "encrypt" | "auto_create") => {
-            matches!(value, Value::Concrete(ConcreteValue::Bool(_)))
+    }
+    pub fn boolean(&self, name: &str) -> Option<bool> {
+        match self.field(name)?.value() {
+            Value::Concrete(ConcreteValue::Bool(value)) => Some(*value),
+            _ => None,
         }
-        _ => matches!(value, Value::Concrete(ConcreteValue::String(_))),
+    }
+    pub fn enum_api_value(&self, name: &str) -> Option<&str> {
+        match self.field(name)?.value() {
+            Value::Concrete(ConcreteValue::CanonicalEnum(value)) => Some(value.api_value()),
+            _ => None,
+        }
     }
 }
 
@@ -224,25 +283,23 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
         "local" => BackendKind::Local,
         other => return Err(BackendConfigError::UnsupportedBackend(other.into())),
     };
-    let declaration = kind.declaration();
+    let backend = kind.declaration();
+    let declaration = &backend.configuration;
     let mut errors = Vec::new();
-    if kind == BackendKind::S3 {
-        for attribute in ["bucket", "key"] {
-            if !config.attributes.contains_key(attribute) {
-                errors.push(BackendAttributeError::MissingRequiredAttribute {
-                    backend_type: kind.name().into(),
-                    attribute: attribute.into(),
-                });
-            }
+    for attribute in &backend.required {
+        if !config.attributes.contains_key(*attribute) {
+            errors.push(BackendAttributeError::MissingRequiredAttribute {
+                backend_type: kind.name().into(),
+                attribute: (*attribute).into(),
+            });
         }
     }
     let catalog = ProviderContext::new(crate::EnvironmentSnapshot::new([]));
     let lookup = BuiltinLookup;
     let checked = crate::validation::deferred_types::TypeCheckSession::run(&catalog, |session| {
-        let mut payload = ConfigurationAttributes::new();
-        let mut fields = Vec::new();
+        let mut aggregate = ConfigurationBuilder::new(Arc::clone(declaration), kind);
         for (key, value) in &config.attributes {
-            let Some(destination) = declaration.destination_for::<kind::BackendAttribute>(
+            let Some(destination) = declaration.destination::<kind::BackendAttribute>(
                 key,
                 InstanceIdentity::Backend(kind),
                 CatalogRevision(CatalogSnapshot::Backend(declaration.identity)),
@@ -253,6 +310,11 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
                 });
                 continue;
             };
+            let ty = destination
+                .contract
+                .as_ref()
+                .expect("backend field contract")
+                .attr();
             // The enum's actual namespace is intentional: backend regions do
             // not use provider-block aliases or depend on provider loading.
             let canonical = match key
@@ -273,31 +335,18 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
             let admission = match field(&destination, &canonical, session, &lookup, false) {
                 Ok(admission) => admission,
                 Err(error) => {
-                    let error = match error.into_resolution_error() {
-                        ResolutionError::AdmissionConstraints(findings) => {
-                            findings.findings()[0].error.clone()
-                        }
-                        _ => {
-                            errors.push(invalid_shape(kind, key, &canonical));
-                            continue;
-                        }
-                    };
-                    errors.push(BackendAttributeError::InvalidAttribute {
-                        backend_type: kind.name().into(),
-                        attribute: key.clone(),
-                        error: Box::new(error),
-                    });
+                    errors.push(attribute_error(kind, key, error));
                     continue;
                 }
             };
             // Preserve the backend boundary's existing concrete extraction
             // policy, including rejection of pending and Secret wrappers.
-            if !concrete_setting(kind, key, &canonical) {
-                errors.push(invalid_shape(kind, key, &canonical));
+            if !concrete_setting(ty, &canonical) {
+                errors.push(invalid_shape(kind, key, ty, &canonical));
                 continue;
             }
             let Admission::Ready(placed) = admission else {
-                errors.push(invalid_shape(kind, key, &canonical));
+                errors.push(invalid_shape(kind, key, ty, &canonical));
                 continue;
             };
             // This changes only phase/address parameters on the exact checked
@@ -308,16 +357,12 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
                 .and_then(Value::try_into_address_free_absolute)
                 .expect("concrete backend setting");
             let placed = PlacedValue::admitted(&destination, value, placed.inner.findings);
-            let mut slot = TypedSlot::new(destination);
-            slot.place(placed.clone())
-                .expect("backend declaration slot");
-            payload.insert(key.clone(), placed.value().clone());
-            fields.push(placed);
+            aggregate.place(key.clone(), placed);
         }
-        (payload, fields)
+        aggregate
     });
     let mut deferred = Vec::new();
-    let (payload, fields) = checked.publish(&mut deferred);
+    let aggregate = checked.publish(&mut deferred);
     assert!(
         deferred.is_empty(),
         "built-in backend declaration has no remote types"
@@ -325,12 +370,7 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
     if !errors.is_empty() {
         return Err(BackendConfigErrors::new(errors).into());
     }
-    Ok(AdmittedConfiguration {
-        payload,
-        fields,
-        declaration: Arc::clone(declaration),
-        instance: kind,
-    })
+    Ok(aggregate.admit_payload())
 }
 
 #[cfg(test)]

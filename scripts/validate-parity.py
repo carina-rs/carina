@@ -10,8 +10,8 @@ from pathlib import Path
 import subprocess
 
 
-# carina#4394: only these main fixtures have order-nondeterministic TEXT diagnostics.
-TEXT_DIAGNOSTIC_LINE_MULTISET = {
+# carina#4394: these fixtures vary in text order and JSON errors-array order.
+ORDER_NONDETERMINISTIC_FIXTURES = {
     "carina-cli/tests/fixtures/value_knowledge/apply_operand_timing",
     "carina-cli/tests/fixtures/value_knowledge/guarded_failure_siblings",
 }
@@ -94,8 +94,15 @@ def main():
                 outputs.append((status, normalize(stdout), normalize(stderr)))
             relative = directory.relative_to(roots[0]).as_posix() if directory.is_relative_to(roots[0]) else None
             comparable = outputs
-            if not json_output and relative in TEXT_DIAGNOSTIC_LINE_MULTISET:
-                comparable = [(code, Counter(out.splitlines(keepends=True)), Counter(err.splitlines(keepends=True))) for code, out, err in outputs]
+            if relative in ORDER_NONDETERMINISTIC_FIXTURES:
+                if json_output:
+                    comparable = []
+                    for code, out, err in outputs:
+                        document = json.loads(out)
+                        errors = Counter(json.dumps(error, sort_keys=True) for error in document.pop("errors")) if "errors" in document else None
+                        comparable.append((code, json.dumps(document, sort_keys=True), errors, err))
+                else:
+                    comparable = [(code, Counter(out.splitlines(keepends=True)), Counter(err.splitlines(keepends=True))) for code, out, err in outputs]
             record = {"directory": str(directory), "json": json_output, "statuses": [o[0] for o in outputs], "identical": comparable[0] == comparable[1] and all(o[0] != 124 for o in outputs)}
             results.append(record)
             if not record["identical"]:
