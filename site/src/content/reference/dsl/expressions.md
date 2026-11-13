@@ -472,7 +472,9 @@ arguments {
 }
 ```
 
-Function calls can be used in validate expressions:
+Use `length` in validate expressions. Root `require` conditions also accept
+`len` as an alias. Evaluating other direct function calls, including `env`
+and user-defined functions, produces an error:
 
 ```crn
 arguments {
@@ -497,6 +499,16 @@ arguments {
 
 require min_size <= max_size, 'min_size must not exceed max_size'
 ```
+
+At the root of a configuration directory, `require` has no arguments in scope.
+Use literal booleans, integers, floats, durations, strings, or `null`, together
+with operators, parentheses, `len`, and `length`. A condition must return a
+boolean. `len` and `length` count string bytes; constraint strings retain
+their authored escape spelling, so `length("a\nb")` is `4`. Collection literals
+are not part of validate expressions; field access and indexing require a module
+argument as their base. Root references to lets, resources, or other names
+are errors, including in a branch that would otherwise short-circuit.
+Root requirements are always decided during validation.
 
 Validate expressions are evaluated when their referenced values become known.
 Literal arguments are checked during validation; reference values are checked

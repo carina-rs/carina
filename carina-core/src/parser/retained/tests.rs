@@ -10,6 +10,337 @@ fn config() -> ProviderContext {
     ProviderContext::new(crate::EnvironmentSnapshot::empty())
 }
 
+fn assert_round4_buffer_membership(buffer_text: &str, disk_text: &str, expected_template: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("guards.crn");
+    std::fs::write(&file, disk_text).unwrap();
+    let context = config();
+    let buffer =
+        crate::config_loader::ParsedSourceBuffer::parse(buffer_text, &file, &context).unwrap();
+    let schemas = SchemaRegistry::new();
+    let pinned = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    for overrides in [
+        Default::default(),
+        crate::config_loader::SourceOverrides::from([(file.clone(), disk_text.to_string())]),
+    ] {
+        let snapshot = crate::config_loader::DirectoryBufferSnapshot::capture(
+            &pinned,
+            buffer.clone(),
+            &overrides,
+        )
+        .unwrap();
+        let configuration = crate::config_loader::load_buffer_configuration_in_directory(
+            snapshot, &schemas, &context,
+        );
+        if expected_template {
+            assert!(matches!(
+                require_scope(configuration.parsed()),
+                RequireScope::ModuleTemplate { .. }
+            ));
+            assert!(configuration.judged().report().findings().is_empty());
+        } else {
+            let findings = configuration.judged().report().findings();
+            assert_eq!(
+                findings.len(),
+                1,
+                "a different on-disk template must not suppress the buffer guard"
+            );
+            assert_eq!(findings[0].detail().to_string(), "require failed: guard");
+        }
+    }
+}
+
+#[test]
+fn round4_unsaved_template_cannot_be_admitted_as_disk_directory() {
+    assert_round4_buffer_membership(
+        "arguments { n: Int }\nrequire false, 'guard'\n",
+        "require false, 'guard'\n",
+        true,
+    );
+}
+
+#[test]
+fn round4_unsaved_directory_cannot_inherit_disk_template_scope() {
+    assert_round4_buffer_membership(
+        "require false, 'guard'\n",
+        "arguments { n: Int }\nrequire false, 'guard'\n",
+        false,
+    );
+}
+
+#[test]
+fn round3_test_utils_constructor_cannot_mint_directory_completeness() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = "require false, 'partial guard'\n";
+    let guard = directory.path().join("guards.crn");
+    std::fs::write(&guard, source).unwrap();
+    std::fs::write(
+        directory.path().join("arguments.crn"),
+        "arguments { n: Int }\n",
+    )
+    .unwrap();
+    let parsed = crate::parser::parse_file(source, &guard, &config()).unwrap();
+    let root = crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed);
+    let schemas = SchemaRegistry::new();
+    let buffer =
+        crate::config_loader::load_buffer_configuration(root.parsed(), &schemas, &config());
+    assert!(matches!(
+        require_scope(buffer.parsed()),
+        RequireScope::Unknown
+    ));
+    assert!(buffer.judged().report().findings().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn round3_non_utf8_sibling_is_preserved_in_recovery_discovery() {
+    use std::os::unix::ffi::OsStringExt;
+    let directory = tempfile::tempdir().unwrap();
+    let source = "require false, 'guard'\n";
+    let guard = directory.path().join("guards.crn");
+    let arguments = directory
+        .path()
+        .join(std::ffi::OsString::from_vec(b"\xff.crn".to_vec()));
+    std::fs::write(&guard, source).unwrap();
+    // Unsaved buffers exercise raw Unix paths even on filesystems which
+    // cannot create non-UTF-8 names. Use the physical sibling when supported.
+    let physical = std::fs::write(&arguments, "arguments { n: Int }\n").is_ok();
+    let overrides = crate::config_loader::SourceOverrides::from([
+        (guard.clone(), source.to_string()),
+        (arguments, "arguments { n: Int }\n".to_string()),
+    ]);
+    let context = config();
+    let parsed = crate::config_loader::ParsedSourceBuffer::parse(source, &guard, &context).unwrap();
+    let schemas = SchemaRegistry::new();
+    let pinned = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let snapshot =
+        crate::config_loader::DirectoryBufferSnapshot::capture(&pinned, parsed, &overrides)
+            .unwrap();
+    let buffer =
+        crate::config_loader::load_buffer_configuration_in_directory(snapshot, &schemas, &context);
+    assert!(matches!(
+        require_scope(buffer.parsed()),
+        RequireScope::ModuleTemplate { .. }
+    ));
+    assert!(buffer.judged().report().findings().is_empty());
+    if physical {
+        let cli = crate::config_loader::load_configuration_with_config(&pinned, &context, &schemas)
+            .unwrap();
+        let lsp = crate::config_loader::parse_directory_with_overrides_and_diagnostics(
+            &pinned,
+            &context,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            require_scope(cli.parsed.parsed()),
+            RequireScope::ModuleTemplate { .. }
+        ));
+        assert!(matches!(
+            require_scope(lsp.parsed.parsed()),
+            RequireScope::ModuleTemplate { .. }
+        ));
+        let cli_buffer = crate::config_loader::load_buffer_configuration(
+            cli.parsed.parsed(),
+            &schemas,
+            &context,
+        );
+        let lsp_buffer = crate::config_loader::load_buffer_configuration(
+            lsp.parsed.parsed(),
+            &schemas,
+            &context,
+        );
+        assert!(cli_buffer.judged().report().findings().is_empty());
+        assert!(lsp_buffer.judged().report().findings().is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn round3_unreadable_sibling_has_a_typed_source_failure_and_no_witness() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let source = "require false, 'guard'\n";
+    let guard = directory.path().join("guards.crn");
+    let blocked = directory.path().join("blocked.crn");
+    std::fs::write(&guard, source).unwrap();
+    std::fs::write(&blocked, "let n = 1\n").unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Privileged Unix runners may read mode-000 files. Invalid UTF-8 still
+    // makes the source unreadable as configuration text on those runners.
+    if std::fs::read_to_string(&blocked).is_ok() {
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&blocked, [0xff]).unwrap();
+    }
+    let context = config();
+    let pinned = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let failure = crate::config_loader::parse_directory_for_metadata_report(
+        &pinned,
+        &context,
+        &Default::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect_err("an unreadable source must fail directory loading");
+    let parsed = crate::config_loader::ParsedSourceBuffer::parse(source, &guard, &context).unwrap();
+    let schemas = SchemaRegistry::new();
+    let snapshot = crate::config_loader::DirectoryBufferSnapshot::capture(
+        &pinned,
+        parsed,
+        &Default::default(),
+    )
+    .unwrap();
+    let buffer =
+        crate::config_loader::load_buffer_configuration_in_directory(snapshot, &schemas, &context);
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(matches!(
+        require_scope(buffer.parsed()),
+        RequireScope::Unknown
+    ));
+    assert!(buffer.judged().report().findings().is_empty());
+    assert_eq!(failure.source_file(), Some(blocked.as_path()));
+    assert!(matches!(
+        failure.io_error().unwrap().kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidData
+    ));
+    assert!(std::error::Error::source(&failure).is_none());
+}
+
+#[test]
+fn round2_partial_declarations_cannot_grant_directory_require_admission() {
+    let schemas = SchemaRegistry::new();
+    for condition in ["false", "n > 0"] {
+        let source = format!("require {condition}, 'guard'\n");
+        let parsed =
+            crate::parser::parse_file(&source, std::path::Path::new("guards.crn"), &config())
+                .unwrap();
+        let buffer = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config());
+        assert!(buffer.judged().report().findings().is_empty());
+
+        // A caller-supplied source batch does not prove that siblings are absent.
+        let files = crate::config_loader::parse_directory_files(
+            &[("guards.crn".into(), source)],
+            &config(),
+        )
+        .unwrap();
+        let parsed = files.into_iter().next().unwrap().1.into_inner();
+        let buffer = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config());
+        assert!(buffer.judged().report().findings().is_empty());
+    }
+}
+
+#[test]
+fn round2_recovery_uses_sibling_declaration_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = "require false, 'guard'\n";
+    let guard = directory.path().join("guards.crn");
+    std::fs::write(&guard, source).unwrap();
+    let arguments = directory.path().join("arguments.crn");
+    std::fs::write(&arguments, "arguments { n: Int }\n").unwrap();
+    let broken = directory.path().join("broken.crn");
+    std::fs::write(&broken, "let broken = [\n").unwrap();
+    let context = config();
+    let parsed = crate::config_loader::ParsedSourceBuffer::parse(source, &guard, &context).unwrap();
+    let schemas = SchemaRegistry::new();
+    let pinned = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let overrides = crate::config_loader::SourceOverrides::from([(guard, source.to_string())]);
+    let load = || {
+        let snapshot = crate::config_loader::DirectoryBufferSnapshot::capture(
+            &pinned,
+            parsed.clone(),
+            &overrides,
+        )
+        .unwrap();
+        crate::config_loader::load_buffer_configuration_in_directory(snapshot, &schemas, &context)
+    };
+    let template = load();
+    assert!(matches!(
+        require_scope(template.parsed()),
+        RequireScope::ModuleTemplate { .. }
+    ));
+    assert!(template.judged().report().findings().is_empty());
+
+    std::fs::remove_file(arguments).unwrap();
+    let incomplete = load();
+    assert!(incomplete.judged().report().findings().is_empty());
+
+    // The absent sibling must be established by discovery, including a buffer
+    // whose on-disk copy has not yet been saved.
+    std::fs::remove_file(broken).unwrap();
+    std::fs::remove_file(directory.path().join("guards.crn")).unwrap();
+    let complete = load();
+    let findings = complete.judged().report().findings();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].detail().to_string(), "require failed: guard");
+}
+
+#[test]
+fn round1_retained_require_cannot_lose_its_evaluation_obligation() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("guards.crn"),
+        "require false, 'retained guard'\n",
+    )
+    .unwrap();
+    let parsed = crate::config_loader::parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &config(),
+    )
+    .unwrap();
+    let mut parsed = parsed.into_parsed();
+    parsed.requires.clear();
+    let schemas = SchemaRegistry::new();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config());
+    let findings = configuration.judged().report().findings();
+    assert_eq!(
+        findings.len(),
+        1,
+        "removing the public AST list must not erase the retained obligation"
+    );
+    assert_eq!(
+        findings[0].detail().to_string(),
+        "require failed: retained guard"
+    );
+    assert!(findings[0].location().file().path().ends_with("guards.crn"));
+}
+
+#[test]
+fn round1_strict_require_error_retains_location_and_typed_cause() {
+    use std::error::Error;
+    let parsed = crate::parser::parse_file(
+        "require false, 'chain guard'\n",
+        std::path::Path::new("upstream/guards.crn"),
+        &config(),
+    )
+    .unwrap();
+    let require = &parsed.requires[0];
+    let diagnostic = crate::module_resolver::evaluate_directory_require(require).unwrap();
+    let error = crate::module_resolver::ModuleError::DirectoryConstraint(Box::new(
+        crate::parser::Located::new(require.condition_location().clone(), diagnostic),
+    ));
+    assert!(error.to_string().contains("upstream/guards.crn:1:9"));
+    let located = error
+        .directory_constraint()
+        .expect("the located error remains available as a typed cause");
+    assert!(
+        located
+            .location()
+            .file()
+            .path()
+            .ends_with("upstream/guards.crn")
+    );
+    assert_eq!(located.detail().to_string(), "require failed: chain guard");
+    assert!(error.source().is_none());
+    let upstream = crate::upstream_exports::UpstreamExportSourceError::Module {
+        base: std::path::PathBuf::from("upstream"),
+        error: Box::new(error),
+    };
+    let (base, module) = upstream.module_failure().unwrap();
+    assert_eq!(base, std::path::Path::new("upstream"));
+    assert!(module.directory_constraint().is_some());
+    assert!(upstream.source().is_none());
+}
+
 #[test]
 fn heterogeneous_record_keeps_its_field_constraint_checks() {
     let parsed =

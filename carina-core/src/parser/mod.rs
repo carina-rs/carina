@@ -32,6 +32,7 @@ mod dependencies;
 mod element_tests;
 mod elements;
 pub use dependencies::{UnexpandedDependencies, UnexpandedDependencyOperand};
+pub(crate) use elements::ModuleDeclarationBlocks;
 pub(crate) use elements::{AccessLocations, AccessProvenance};
 pub use elements::{
     AttributeKeyLocation, ConfigurationBlock, DeclarationAnnotation, DeclarationRecord,
