@@ -749,9 +749,6 @@ impl<B: BindingAddress> Expressions<B> {
         self.roots.extend(other.roots);
         self.definitions.extend(other.definitions);
         self.arguments.extend(other.arguments);
-        if self.require_scope.is_none() {
-            self.require_scope = other.require_scope;
-        }
         Arc::make_mut(&mut self.projections).extend(Arc::unwrap_or_clone(other.projections));
         Arc::make_mut(&mut self.report).extend(Arc::unwrap_or_clone(other.report));
     }

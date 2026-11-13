@@ -82,11 +82,12 @@ fn upstream_root_require_keeps_backend_evidence_in_related_information() {
         .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
         .collect();
     assert_eq!(errors.len(), 1, "{diagnostics:#?}");
-    assert!(
-        errors[0]
-            .message
-            .contains("`require` is only allowed inside a module"),
-        "{diagnostics:#?}"
+    assert_eq!(
+        errors[0].message,
+        format!(
+            "upstream_state `previous`: failed to parse source `../upstream`: {}:1:1: `require` is only allowed inside a module",
+            caller.join("../upstream/guards.crn").display()
+        )
     );
     assert!(!errors[0].message.contains("PRIVATE_GUARD"));
     let related = errors[0]
@@ -100,7 +101,7 @@ fn upstream_root_require_keeps_backend_evidence_in_related_information() {
     );
     assert_eq!(
         related[0].location.uri,
-        tower_lsp::lsp_types::Url::from_file_path(caller.join("../upstream/backend.crn")).unwrap()
+        tower_lsp::lsp_types::Url::from_file_path(&backend).unwrap()
     );
     assert_eq!(
         related[0].location.range,
@@ -561,5 +562,59 @@ fn root_require_unreadable_sibling_keeps_unknown_scope() {
             Position::new(0, 0),
             Position::new(0, source.trim_end().encode_utf16().count() as u32)
         )
+    );
+}
+
+#[test]
+fn broken_sibling_keeps_module_buffer_provider_and_backend_checks_provisional() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("main.crn");
+    let source = "arguments { x: String }\nunknown.test.resource { name = x }\nbackend s3 { bucket = 'x' key = 'state' region = 'invalid' }\n";
+    std::fs::write(&path, source).unwrap();
+    std::fs::write(directory.path().join("broken.crn"), "let broken = {\n").unwrap();
+    let diagnostics = test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert!(
+        diagnostics
+            .iter()
+            .all(|d| d.severity != Some(DiagnosticSeverity::ERROR)),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn relative_document_path_keeps_root_evidence_in_its_directory() {
+    let directory = tempfile::Builder::new()
+        .prefix("root-evidence-")
+        .tempdir_in(".")
+        .unwrap();
+    let providers = directory.path().join("providers.crn");
+    std::fs::write(&providers, "provider mock {}\n").unwrap();
+    let absolute = directory.path().join("main.crn");
+    let path = absolute
+        .strip_prefix(std::env::current_dir().unwrap())
+        .unwrap()
+        .to_path_buf();
+    assert!(path.is_relative());
+    let source = "require true, 'PRIVATE_GUARD'\n";
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    let rejection = diagnostics
+        .iter()
+        .find(|d| d.message == "`require` is only allowed inside a module")
+        .unwrap();
+    assert_eq!(
+        rejection
+            .related_information
+            .as_ref()
+            .expect("relative document paths need located evidence")[0]
+            .location
+            .uri,
+        tower_lsp::lsp_types::Url::from_file_path(
+            carina_core::paths::ResolvedPath::new(providers)
+                .unwrap()
+                .persisted_path()
+                .to_path_buf()
+        )
+        .unwrap()
     );
 }

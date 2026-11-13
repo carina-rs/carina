@@ -266,6 +266,14 @@ pub(crate) fn collapse_errors(errors: Vec<AppError>) -> AppError {
     if errors.len() == 1 {
         return errors.into_iter().next().unwrap();
     }
+    if errors
+        .iter()
+        .any(|error| !crate::error::root_placement_notes(error).is_empty())
+    {
+        return AppError::RootPlacementGroup(Box::new(crate::error::RootPlacementErrors::new(
+            errors,
+        )));
+    }
     AppError::Validation(
         errors
             .iter()
@@ -496,8 +504,12 @@ fn extend_module_resolution_errors(
 
 /// Backend checks depend on authored values, even when provider loading fails.
 pub(crate) fn validate_root_backend<E>(parsed: &carina_core::parser::File<E>) -> Vec<AppError> {
-    if !parsed.directory_verdict().is_module_template()
-        && let Some(backend) = &parsed.backend
+    match parsed.directory_verdict() {
+        carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
+        | carina_core::config_loader::DirectoryVerdict::Unknown => return Vec::new(),
+        carina_core::config_loader::DirectoryVerdict::Root(_) => {}
+    }
+    if let Some(backend) = &parsed.backend
         && let Err(error) = StateBackendConfig::try_from(backend)
     {
         vec![AppError::Backend(error.into())]
@@ -692,7 +704,7 @@ fn validate_and_resolve_configuration(
     if let Err(msg) =
         carina_core::validation::validate_no_module_declarations_in_root(parsed.parsed())
     {
-        errors.push(AppError::Validation(msg));
+        errors.push(AppError::RootDeclaration(Box::new(msg)));
     }
 
     // Validate provider region
@@ -1049,10 +1061,14 @@ fn validate_and_resolve_configuration(
     // This is the sole parser-placeholder boundary. Standalone module
     // definitions intentionally retain typed module-argument slots until a
     // caller expands them; root configurations must be fully expanded.
-    let placeholder_boundary = if parsed.directory_verdict().is_module_template() {
-        carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
-    } else {
-        carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
+    let placeholder_boundary = match parsed.directory_verdict() {
+        carina_core::config_loader::DirectoryVerdict::Root(_) => {
+            carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
+        }
+        carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
+        | carina_core::config_loader::DirectoryVerdict::Unknown => {
+            carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
+        }
     };
     let directive_errors = parsed.directive_resolution_errors(
         placeholder_boundary,
@@ -1569,22 +1585,23 @@ mod tests {
     #[test]
     fn backend_validation_keeps_the_typed_error() {
         let runtime = crate::test_support::TestCommandRuntime::new();
-        let raw = carina_core::parser::parse_file(
+        let base = tempfile::tempdir().unwrap();
+        std::fs::write(
+            base.path().join("backend.crn"),
             r#"backend s3 {
                 bucket = "state"
                 key = "state.json"
                 region = true
             }"#,
-            std::path::Path::new("backend.crn"),
-            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .unwrap();
-        let parsed = carina_core::validation::inference::apply_inference(
-            raw,
-            &carina_core::schema::SchemaRegistry::new(),
+        let parsed = carina_core::config_loader::load_configuration_with_config(
+            &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-        );
-        let base = tempfile::tempdir().unwrap();
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .unwrap()
+        .parsed;
         let providers = ProviderLoad::load(
             &runtime,
             &parsed.providers,
@@ -1593,8 +1610,6 @@ mod tests {
         )
         .unwrap();
 
-        let parsed =
-            carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed);
         let errors = validate_and_resolve_errors(
             &parsed,
             &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),

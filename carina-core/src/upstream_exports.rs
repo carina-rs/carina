@@ -588,6 +588,20 @@ impl UpstreamResolveFailure {
             _ => None,
         }
     }
+    /// Editor projection keeps located root evidence in related information.
+    pub fn lsp_message(&self) -> String {
+        if let Some((_, error)) = self.module_failure()
+            && let Some(rejection) = error.root_cause().require_outside_module()
+        {
+            let message = crate::parser::Located::new(
+                rejection.location().clone(),
+                rejection.detail().lsp_message(),
+            );
+            return std::fmt::from_fn(|formatter| self.legacy.fmt_reason(formatter, &message))
+                .to_string();
+        }
+        self.to_string()
+    }
     fn into_legacy(mut self) -> UpstreamResolveError {
         // Only the explicit compatibility API requests a location-free String
         // container. Diagnostic callers retain typed causes via the accessors.
@@ -1937,8 +1951,8 @@ mod tests {
             assert_eq!(finding.location().span().start_column(), 1);
             assert_eq!(finding.location().span().end_column(), 32);
             assert_eq!(
-                finding.detail().to_string().lines().next().unwrap(),
-                "`require` is only allowed inside a module"
+                finding.detail().to_string(),
+                "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
             );
             if physical {
                 let (_, errors) = super::resolve_upstream_exports_report_with_overrides(

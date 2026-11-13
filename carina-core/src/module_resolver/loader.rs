@@ -14,8 +14,16 @@ use super::error::ModuleError;
 /// A parsed module plus non-blocking diagnostics discovered while its sibling
 /// files were still separate.
 pub struct LoadedModule {
+    directory: ResolvedPath,
     pub parsed: ParsedFile,
     pub duplicate_declarations: Vec<crate::config_loader::DuplicateDeclaration>,
+}
+
+impl LoadedModule {
+    /// Directory selected by the module loader, pinned before parsing its siblings.
+    pub fn directory(&self) -> &ResolvedPath {
+        &self.directory
+    }
 }
 
 /// Get parsed file info for display (supports both module definitions and root configs)
@@ -121,7 +129,7 @@ fn load_directory_module_with_diagnostics_and_config(
     let duplicate_declarations =
         crate::config_loader::find_duplicate_declarations(&dir_path.source_label(), &parsed_files);
 
-    let mut merged = ParsedFile::default();
+    let mut merged = parsed_files.empty_assembly();
     for (_, parsed) in parsed_files {
         crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
     }
@@ -131,6 +139,7 @@ fn load_directory_module_with_diagnostics_and_config(
         None
     } else {
         Some(LoadedModule {
+            directory: dir_path.clone(),
             parsed: merged,
             duplicate_declarations,
         })
@@ -192,7 +201,7 @@ pub fn load_module_from_directory(
         .parse_from_root(config, &dir.source_label())
         .map_err(|e| format!("Failed to parse directory {}: {}", dir.display(), e.error))?;
 
-    let mut merged = ParsedFile::default();
+    let mut merged = parsed_files.empty_assembly();
     for (_, parsed) in parsed_files {
         crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
     }
@@ -222,7 +231,10 @@ mod tests {
         let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let loaded =
             load_module_from_directory(&ResolvedPath::new(dir.path()).unwrap(), &config).unwrap();
-        assert!(loaded.directory_verdict().is_root());
+        assert!(matches!(
+            loaded.directory_verdict(),
+            crate::config_loader::DirectoryVerdict::Root(_)
+        ));
         let schemas = crate::schema::SchemaRegistry::new();
         let judged = crate::config_loader::load_buffer_configuration(&loaded, &schemas, &config);
         assert_eq!(judged.judged().report().findings().len(), 1);

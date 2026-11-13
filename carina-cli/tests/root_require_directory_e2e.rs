@@ -522,7 +522,7 @@ fn root_require_saved_plan_secret_failure_exposes_the_cause() {
     assert_eq!(
         stderr,
         format!(
-            "Error: Saved-plan secret verification failed because the current configuration could not be evaluated (for example, an environment variable or decryption key may be unavailable); re-run `carina plan --out saved.plan {project}` after restoring the required inputs: {project}/guards.crn at line 2\nError: {ROOT_REQUIRE_ERROR}\nError: Note: directory is a root configuration because of the backend block at {project}/providers.crn:1.\n",
+            "Error: Saved-plan secret verification failed because the current configuration could not be evaluated (for example, an environment variable or decryption key may be unavailable); re-run `carina plan --out saved.plan {project}` after restoring the required inputs: {project}/guards.crn at line 2\nError: {ROOT_REQUIRE_ERROR}\n  Note: directory is a root configuration because of the backend block at {project}/providers.crn:1.\n",
             project = directory.project.display(),
         )
     );
@@ -624,7 +624,7 @@ fn assert_root_declaration_rejected(block: &str, declaration: &str, same_file: b
     assert_eq!(
         String::from_utf8(human.stderr).unwrap(),
         format!(
-            "Error: {block_error}\nError: {evidence_note}\nError: ./guards.crn at line {require_line}\nError: {ROOT_REQUIRE_ERROR}\nError: {evidence_note}\n"
+            "Error: {block_error}\n  {evidence_note}\nError: guards.crn at line {require_line}\nError: {ROOT_REQUIRE_ERROR}\n  {evidence_note}\n"
         )
     );
 
@@ -675,7 +675,7 @@ fn assert_root_declaration_rejected(block: &str, declaration: &str, same_file: b
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
             format!(
-                "Error: {block_error}\nError: {evidence_note}\nError: ./guards.crn at line {require_line}\nError: {ROOT_REQUIRE_ERROR}\nError: {evidence_note}\n"
+                "Error: {block_error}\n  {evidence_note}\nError: guards.crn at line {require_line}\nError: {ROOT_REQUIRE_ERROR}\n  {evidence_note}\n"
             ),
             "{command:?}"
         );
@@ -837,7 +837,7 @@ fn assert_state_command_rejects_root_require(args: &[&str]) {
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         format!(
-            "Error: ./guards.crn at line 2\nError: {ROOT_REQUIRE_ERROR}\nError: {ROOT_BACKEND_NOTE}\n"
+            "Error: guards.crn at line 2\nError: {ROOT_REQUIRE_ERROR}\n  {ROOT_BACKEND_NOTE}\n"
         )
     );
     assert_eq!(before, paths.each_ref().map(|path| fs::read(path).unwrap()));
@@ -1058,7 +1058,7 @@ fn root_require_lint_matches_validate() {
             assert_eq!(
                 String::from_utf8(output.stderr).unwrap(),
                 format!(
-                    "Error: Module resolution error: ./{file}:{line}:1: {ROOT_REQUIRE_ERROR}\nError: {ROOT_BACKEND_NOTE}\n"
+                    "Error: Module resolution error: {file}:{line}:1: {ROOT_REQUIRE_ERROR}\n  {ROOT_BACKEND_NOTE}\n"
                 )
             );
         }
@@ -1147,7 +1147,7 @@ fn root_require_state_subcommands_follow_validation_paths() {
             .requires_legacy_dependency_migration()
     );
     let root_error = format!(
-        "Error: ./guards.crn at line 1\nError: {ROOT_REQUIRE_ERROR}\nError: {ROOT_BACKEND_NOTE}\n"
+        "Error: guards.crn at line 1\nError: {ROOT_REQUIRE_ERROR}\n  {ROOT_BACKEND_NOTE}\n"
     );
     let migration_error = format!(
         "Warning: state file legacy.json is v20 on disk; migration toward v21 was loaded in memory. Legacy dependency names, if present, will be classified against the expanded configuration and the disk state will be rewritten by the next apply, destroy, or state refresh.\n{root_error}"
@@ -1402,5 +1402,74 @@ fn root_require_parse_time_errors_precede_placement() {
         } else {
             assert_eq!(errors[0]["location"]["range"], Value::Null);
         }
+    }
+}
+
+#[test]
+fn root_require_note_belongs_to_the_single_error() {
+    let directory = Directory::new("true");
+    for args in [vec!["validate", "."], vec!["plan", "."], vec!["lint", "."]] {
+        let output = directory.run(&args);
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains(&format!("\n  {ROOT_BACKEND_NOTE}\n")),
+            "{args:?}: {stderr}"
+        );
+        assert!(!stderr.contains("Error: Note:"), "{stderr}");
+    }
+}
+
+#[test]
+fn module_info_consumes_the_directory_verdict() {
+    let directory = Directory::new("true");
+    for (root_block, expected, populated) in [
+        (Some("provider mock {}\n"), "File:", false),
+        (
+            Some("backend local { path = 'state.json' }\n"),
+            "File:",
+            false,
+        ),
+        (None, "Module:", false),
+        (None, "Module:", true),
+    ] {
+        let module = directory.project.join("info");
+        fs::create_dir_all(&module).unwrap();
+        fs::write(
+            module.join("arguments.crn"),
+            if root_block.is_some() || populated {
+                "arguments { x: String }\n"
+            } else {
+                "arguments {}\n"
+            },
+        )
+        .unwrap();
+        let evidence = module.join("root.crn");
+        if let Some(source) = root_block {
+            fs::write(&evidence, source).unwrap();
+        } else if evidence.exists() {
+            fs::remove_file(&evidence).unwrap();
+        }
+        let output = directory.run(&["module", "info", "info"]);
+        success(&output);
+        let text = String::from_utf8(output.stdout).unwrap();
+        let header = format!("\u{1b}[1m{expected}\u{1b}[0m \u{1b}[36minfo\u{1b}[0m\n\n");
+        let empty = "  \u{1b}[2m(none)\u{1b}[0m\n\n";
+        let sections = if expected == "File:" {
+            format!(
+                "\u{1b}[1m=== IMPORTS ===\u{1b}[0m\n\n{empty}\u{1b}[1m=== CREATES ===\u{1b}[0m\n\n{empty}"
+            )
+        } else {
+            let arguments = if populated {
+                "  \u{1b}[97mx\u{1b}[0m: \u{1b}[32mString\u{1b}[0m  \u{1b}[33m(required)\u{1b}[0m\n\n"
+            } else {
+                empty
+            };
+            format!(
+                "\u{1b}[1m=== ARGUMENTS ===\u{1b}[0m\n\n{arguments}\u{1b}[1m=== CREATES ===\u{1b}[0m\n\n{empty}\u{1b}[1m=== ATTRIBUTES ===\u{1b}[0m\n\n{empty}"
+            )
+        };
+        assert_eq!(text, format!("{header}{sections}"));
+        assert!(output.stderr.is_empty());
     }
 }

@@ -42,8 +42,18 @@ fn root_evidence_prevents_module_declarations_from_exempting_require() {
             let findings = parsed.expression_report().findings();
             assert_eq!(findings.len(), 1, "{findings:?}");
             assert_eq!(
-                findings[0].detail().to_string().lines().next().unwrap(),
-                "`require` is only allowed inside a module"
+                findings[0].detail().to_string(),
+                format!(
+                    "`require` is only allowed inside a module\nNote: directory is a root configuration because of the {} block at {}:1.",
+                    if root.starts_with("backend") {
+                        "backend"
+                    } else {
+                        "provider"
+                    },
+                    crate::paths::DisplayPath::for_diagnostics(
+                        directory.path().join("providers.crn")
+                    )
+                )
             );
         }
     }
@@ -85,8 +95,8 @@ fn assert_buffer_membership(buffer_text: &str, disk_text: &str, expected_templat
                 "a different on-disk template must not suppress the buffer guard"
             );
             assert_eq!(
-                findings[0].detail().to_string().lines().next().unwrap(),
-                "`require` is only allowed inside a module"
+                findings[0].detail().to_string(),
+                "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
             );
         }
     }
@@ -313,8 +323,8 @@ fn recovery_uses_sibling_declaration_evidence() {
     let findings = complete.judged().report().findings();
     assert_eq!(findings.len(), 1);
     assert_eq!(
-        findings[0].detail().to_string().lines().next().unwrap(),
-        "`require` is only allowed inside a module"
+        findings[0].detail().to_string(),
+        "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
     );
 }
 
@@ -343,8 +353,8 @@ fn root_require_retained_rejection_cannot_be_erased() {
         "removing the public AST list must not erase the retained obligation"
     );
     assert_eq!(
-        findings[0].detail().to_string().lines().next().unwrap(),
-        "`require` is only allowed inside a module"
+        findings[0].detail().to_string(),
+        "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
     );
     assert!(findings[0].location().file().path().ends_with("guards.crn"));
 }
@@ -382,8 +392,8 @@ fn strict_require_error_retains_location_and_typed_cause() {
             .ends_with("upstream/guards.crn")
     );
     assert_eq!(
-        located.detail().to_string().lines().next().unwrap(),
-        "`require` is only allowed inside a module"
+        located.detail().to_string(),
+        "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
     );
     assert!(error.source().is_none());
     let upstream = crate::upstream_exports::UpstreamExportSourceError::Module {
@@ -1271,4 +1281,24 @@ fn issue_4282_round2_collection_members_never_become_a_single_construction() {
             assert!(result.for_sink(&strings, &config).has_constructed_members());
         }
     }
+}
+
+#[test]
+fn merging_another_directory_cannot_adopt_its_verdict() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("arguments.crn"), "arguments {}\n").unwrap();
+    let context = config();
+    let loaded = crate::config_loader::load_configuration_with_config(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &context,
+        &SchemaRegistry::new(),
+    )
+    .unwrap();
+    let mut target = crate::parser::File::<crate::parser::InferredExportParam>::default();
+    target.merge_from(loaded.parsed.into_parsed());
+    assert!(matches!(require_scope(&target), RequireScope::Unknown));
+    assert!(matches!(
+        target.directory_verdict(),
+        crate::config_loader::DirectoryVerdict::Unknown
+    ));
 }

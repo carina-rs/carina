@@ -119,14 +119,17 @@ fn assert_empty_template(blocks: &str) {
             snapshot, &schemas, &context,
         );
         assert_eq!(
-            configuration.parsed().directory_verdict().is_unknown(),
+            matches!(
+                configuration.parsed().directory_verdict(),
+                crate::config_loader::DirectoryVerdict::Unknown
+            ),
             broken
         );
         assert_eq!(
-            configuration
-                .parsed()
-                .directory_verdict()
-                .is_module_template(),
+            matches!(
+                configuration.parsed().directory_verdict(),
+                crate::config_loader::DirectoryVerdict::ModuleTemplate(_)
+            ),
             !broken
         );
         assert!(configuration.judged().report().findings().is_empty());
@@ -295,8 +298,13 @@ fn root_require_directory_rejected_and_module_evaluated() {
             assert_eq!(diagnostic.location().span().start_line(), 1);
             assert_eq!(diagnostic.location().span().start_column(), 1);
             assert_eq!(
-                diagnostic.detail().to_string().lines().next().unwrap(),
-                "`require` is only allowed inside a module"
+                diagnostic.detail().to_string(),
+                format!(
+                    "`require` is only allowed inside a module\nNote: directory is a root configuration because of the backend block at {}:1.",
+                    crate::paths::DisplayPath::for_diagnostics(
+                        directory.path().join("providers.crn")
+                    )
+                )
             );
         });
     }
@@ -11964,15 +11972,8 @@ fn root_require_template_apis_need_declaration_evidence() {
             };
             let error = result.expect_err("a template API cannot manufacture module declarations");
             assert_eq!(
-                error
-                    .require_outside_module()
-                    .unwrap()
-                    .detail()
-                    .to_string()
-                    .lines()
-                    .next()
-                    .unwrap(),
-                "`require` is only allowed inside a module"
+                error.require_outside_module().unwrap().detail().to_string(),
+                "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
             );
         }
     });
@@ -12036,8 +12037,8 @@ fn root_require_public_strict_resolvers_keep_admission_verdict() {
                 result.expect_err("public resolution must preserve the root require verdict");
             let finding = error.require_outside_module().unwrap();
             assert_eq!(
-                finding.detail().to_string().lines().next().unwrap(),
-                "`require` is only allowed inside a module"
+                finding.detail().to_string(),
+                "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
             );
             assert_eq!(
                 finding.location().file().path(),
@@ -12088,4 +12089,50 @@ fn module_require_diagnostic_keeps_direct_constraint_type_and_message() {
         );
         assert_eq!(findings[0].anchor().location().span().start_line(), 2);
     });
+}
+
+#[test]
+fn expanded_unknown_directory_keeps_its_own_verdict() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("child")).unwrap();
+    fs::write(
+        directory.path().join("child/main.crn"),
+        "arguments { n: Int }\nattributes { value: Int = n }\n",
+    )
+    .unwrap();
+    let context = LoadedProviderContext::empty_for_test();
+    let parsed = crate::parser::parse_file(
+        "let child = use { source = './child' }\nlet result = child { n = 1 }\n",
+        &directory.path().join("main.crn"),
+        context.as_provider_context(),
+    )
+    .unwrap();
+    let root = crate::config_loader::RootDirectoryParse::from_parsed_for_test(parsed);
+    let schemas = crate::schema::SchemaRegistry::new();
+    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        let expanded = super::resolve_modules_with_providerless_config(
+            root.admit(&schemas, session),
+            &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            expanded.directory_verdict(),
+            crate::config_loader::DirectoryVerdict::Unknown
+        ));
+    });
+}
+
+#[test]
+fn empty_directory_metadata_keeps_the_complete_root_verdict() {
+    let directory = tempfile::tempdir().unwrap();
+    let context = LoadedProviderContext::empty_for_test();
+    let parsed = super::load_module_from_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        context.as_provider_context(),
+    )
+    .unwrap();
+    assert!(matches!(
+        parsed.directory_verdict(),
+        crate::config_loader::DirectoryVerdict::Root(_)
+    ));
 }

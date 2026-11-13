@@ -574,8 +574,12 @@ impl ValidateReport {
                     if matches!(error, AppError::Interrupted) {
                         continue;
                     }
-                    for line in format_error_with_source_chain(error).lines() {
-                        writeln!(stderr, "{prefix} {line}")?;
+                    for (note, line) in crate::error::human_error_lines(error) {
+                        if note {
+                            writeln!(stderr, "  {line}")?;
+                        } else {
+                            writeln!(stderr, "{prefix} {line}")?;
+                        }
                     }
                 }
             }

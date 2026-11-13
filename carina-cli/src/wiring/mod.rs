@@ -5124,7 +5124,7 @@ pub(crate) fn validate_module_internal_ref_types(
 pub(crate) fn validate_no_provider_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {
-        if let Err(message) = validation::validate_no_provider_in_module(&module.loaded().parsed) {
+        if let Err(message) = validation::validate_no_provider_in_module(module.loaded()) {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
                 module.diagnostic_label()
@@ -5142,9 +5142,7 @@ pub(crate) fn validate_no_provider_in_modules(module_walk: &ModuleWalk) -> Vec<A
 pub(crate) fn validate_no_state_blocks_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {
-        if let Err(message) =
-            validation::validate_no_state_blocks_in_module(&module.loaded().parsed)
-        {
+        if let Err(message) = validation::validate_no_state_blocks_in_module(module.loaded()) {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
                 module.diagnostic_label()
@@ -5161,7 +5159,7 @@ pub(crate) fn validate_no_state_blocks_in_modules(module_walk: &ModuleWalk) -> V
 pub(crate) fn validate_no_backend_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {
-        if let Err(message) = validation::validate_no_backend_in_module(&module.loaded().parsed) {
+        if let Err(message) = validation::validate_no_backend_in_module(module.loaded()) {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
                 module.diagnostic_label()
@@ -5178,9 +5176,7 @@ pub(crate) fn validate_no_backend_in_modules(module_walk: &ModuleWalk) -> Vec<Ap
 pub(crate) fn validate_no_upstream_states_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {
-        if let Err(message) =
-            validation::validate_no_upstream_states_in_module(&module.loaded().parsed)
-        {
+        if let Err(message) = validation::validate_no_upstream_states_in_module(module.loaded()) {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
                 module.diagnostic_label()
@@ -5197,7 +5193,7 @@ pub(crate) fn validate_no_upstream_states_in_modules(module_walk: &ModuleWalk) -
 pub(crate) fn validate_no_exports_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {
-        if let Err(message) = validation::validate_no_exports_in_module(&module.loaded().parsed) {
+        if let Err(message) = validation::validate_no_exports_in_module(module.loaded()) {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
                 module.diagnostic_label()

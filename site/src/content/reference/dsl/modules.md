@@ -28,10 +28,11 @@ or output attribute; empty blocks alone do not make a directory callable.
 
 If a sibling cannot be read or parsed, or an editor buffer has no directory
 snapshot, the scope is unknown. Carina issues no scope verdict in that case;
-ordinary expression checks still run.
+ordinary expression checks still run. `module info` displays neutral file metadata
+for an unknown snapshot, without classifying it as a module or root.
 
 Each root-placement diagnostic explains the directory verdict. With a provider
-or backend block, the CLI includes a note naming that block's file and line;
+or backend block, the CLI includes an indented note under the error naming that block's file and line;
 the language server attaches its location as related information to the same
 diagnostic. Without either block, the diagnostic explains that the complete
 directory has no `arguments` or `attributes` block, without inventing a source

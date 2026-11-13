@@ -151,4 +151,42 @@ boundary_test!(round15_export, Export);
 boundary_test!(round15_module_argument, ModuleArgument);
 boundary_test!(round15_function_parameter, FunctionParameter);
 boundary_test!(round15_function_return, FunctionReturn);
-boundary_test!(round15_attributes_block, Attributes);
+#[test]
+fn round15_attributes_block() {
+    let snapshot = fixture::snapshot();
+    for length in [None, Some(5), Some(50)] {
+        let result = destinations::check(destinations::Boundary::Attributes, &snapshot, length);
+        assert_eq!(result.is_ok(), length != Some(50), "{result:?}");
+        let dir = destinations::directory(destinations::Boundary::Attributes, length);
+        let path = dir.path().join("main.crn");
+        let doc = Document::new_with_path(
+            std::fs::read_to_string(&path).unwrap(),
+            path.clone(),
+            Arc::new(snapshot.provider_context().as_provider_context().clone()),
+        );
+        let diagnostics =
+            DiagnosticEngine::new(Arc::new(fixture::snapshot()), vec!["awscc".into()])
+                .analyze(&doc, Some(&path));
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR))
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1 + usize::from(length == Some(50)),
+            "{diagnostics:#?}"
+        );
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|d| d.message.contains("outside allowed range"))
+                .count(),
+            usize::from(length == Some(50))
+        );
+        assert!(errors.iter().any(|d| d.message == "attributes blocks are only valid inside module definitions, not in root configurations."), "{diagnostics:#?}");
+    }
+}
+boundary_test!(
+    imported_module_attributes_preserve_member_constraints,
+    ModuleAttributes
+);

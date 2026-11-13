@@ -302,8 +302,10 @@ pub struct AuthoredBindingView {
 }
 
 impl AuthoredBindingView {
-    pub(crate) fn from_directory_files(files: &[(PathBuf, DirectoryResolvedFile)]) -> Self {
-        let mut parsed = ParsedFile::default();
+    pub(crate) fn from_directory_files(
+        files: &[(PathBuf, DirectoryResolvedFile)],
+        mut parsed: ParsedFile,
+    ) -> Self {
         for (_, file) in files {
             merge_parsed_file(&mut parsed, file.parsed.clone());
         }
@@ -324,7 +326,10 @@ impl AuthoredBindingView {
         let files = vec![(source_file.to_path_buf(), source.to_string())];
         let parsed_files =
             parse_directory_files_located(&files, config).map_err(|located| *located.error)?;
-        Ok(Self::from_directory_files(&parsed_files))
+        Ok(Self::from_directory_files(
+            &parsed_files,
+            ParsedFile::default(),
+        ))
     }
 
     #[cfg(test)]
@@ -463,25 +468,18 @@ pub struct ModuleTemplateDeclarations(());
 pub enum RootEvidence {
     Provider {
         location: parser::DeclarationLocation,
+        file: crate::paths::PersistedPath,
         utf16_columns: (u32, u32),
     },
     Backend {
         location: parser::DeclarationLocation,
+        file: crate::paths::PersistedPath,
         utf16_columns: (u32, u32),
     },
     CompleteDirectoryWithoutModuleDeclarations,
 }
 
 impl DirectoryVerdict {
-    pub fn is_root(&self) -> bool {
-        matches!(self, Self::Root(_))
-    }
-    pub fn is_module_template(&self) -> bool {
-        matches!(self, Self::ModuleTemplate(_))
-    }
-    pub fn is_unknown(&self) -> bool {
-        matches!(self, Self::Unknown)
-    }
     pub fn root(&self) -> Option<&RootDirectoryVerdict> {
         match self {
             Self::Root(root) => Some(root),
@@ -507,6 +505,14 @@ impl RootDirectoryVerdict {
 }
 
 impl RootEvidence {
+    /// Absolute logical source captured by directory discovery. Rendering never
+    /// resolves an authored relative label from the process working directory.
+    pub fn file_locator(&self) -> Option<&crate::paths::PersistedPath> {
+        match self {
+            Self::Provider { file, .. } | Self::Backend { file, .. } => Some(file),
+            Self::CompleteDirectoryWithoutModuleDeclarations => None,
+        }
+    }
     pub fn location(&self) -> Option<&parser::DeclarationLocation> {
         match self {
             Self::Provider { location, .. } | Self::Backend { location, .. } => Some(location),
@@ -568,12 +574,19 @@ impl DirectoryRequireScope {
 
 fn mark_complete_directory_files(
     files: &mut [(PathBuf, DirectoryResolvedFile)],
+    sources: &[(ResolvedPath, String)],
     config: &ProviderContext,
-) {
+) -> DirectoryRequireScope {
     let scope = CompleteDirectoryInventories {
         inventories: files
             .iter()
-            .map(|(_, file)| file.parsed.parser_binding_metadata.syntax())
+            .zip(sources)
+            .map(|((_, file), (source, _))| {
+                (
+                    file.parsed.parser_binding_metadata.syntax(),
+                    source.persisted_path(),
+                )
+            })
             .collect(),
     }
     .require_scope();
@@ -585,13 +598,14 @@ fn mark_complete_directory_files(
             config,
         );
     }
+    scope
 }
 
 /// Constructible only after every member of one sealed source snapshot has
 /// yielded a complete syntax inventory. Both semantic loading and recovery
 /// use this single issuer; recovery need not evaluate sibling values.
 struct CompleteDirectoryInventories<'a> {
-    inventories: Vec<&'a parser::SyntaxInventory>,
+    inventories: Vec<(&'a parser::SyntaxInventory, &'a crate::paths::PersistedPath)>,
 }
 
 impl CompleteDirectoryInventories<'_> {
@@ -599,18 +613,20 @@ impl CompleteDirectoryInventories<'_> {
         use parser::ConfigurationBlock;
         let mut evidence = None;
         let mut module_block = false;
-        for inventory in self.inventories {
+        for (inventory, file) in self.inventories {
             for block in inventory.configuration_blocks() {
                 match block.detail().kind() {
                     ConfigurationBlock::Provider if evidence.is_none() => {
                         evidence = Some(RootEvidence::Provider {
                             location: block.location().clone(),
+                            file: file.clone(),
                             utf16_columns: block.detail().utf16_columns(),
                         })
                     }
                     ConfigurationBlock::Backend if evidence.is_none() => {
                         evidence = Some(RootEvidence::Backend {
                             location: block.location().clone(),
+                            file: file.clone(),
                             utf16_columns: block.detail().utf16_columns(),
                         })
                     }
@@ -983,7 +999,15 @@ impl DirectoryBufferSnapshot {
             .collect::<Vec<_>>();
         if inventories.iter().all(Option::is_some) {
             CompleteDirectoryInventories {
-                inventories: inventories.iter().filter_map(Option::as_ref).collect(),
+                inventories: inventories
+                    .iter()
+                    .zip(&self.sources)
+                    .filter_map(|(inventory, source)| {
+                        inventory
+                            .as_ref()
+                            .map(|inventory| (inventory, source.file.persisted_path()))
+                    })
+                    .collect(),
             }
             .require_scope()
         } else {
@@ -1045,6 +1069,33 @@ impl DirectoryResolvedFile {
 
     pub fn into_inner(self) -> ParsedFile {
         self.parsed
+    }
+}
+
+/// A complete parse and its single issued directory authority. The scope is
+/// carried independently of the members, including an empty directory.
+pub(crate) struct ParsedDirectoryFiles {
+    files: Vec<(PathBuf, DirectoryResolvedFile)>,
+    scope: DirectoryRequireScope,
+}
+impl ParsedDirectoryFiles {
+    pub(crate) fn empty_assembly(&self) -> ParsedFile {
+        let mut parsed = ParsedFile::default();
+        crate::parser::retained::set_directory_require_scope(&mut parsed, self.scope.clone());
+        parsed
+    }
+}
+impl std::ops::Deref for ParsedDirectoryFiles {
+    type Target = [(PathBuf, DirectoryResolvedFile)];
+    fn deref(&self) -> &Self::Target {
+        &self.files
+    }
+}
+impl IntoIterator for ParsedDirectoryFiles {
+    type Item = (PathBuf, DirectoryResolvedFile);
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.files.into_iter()
     }
 }
 
@@ -1216,20 +1267,13 @@ impl DirectorySourceReadFailure {
 }
 
 impl DirectoryInputs {
-    fn parse(
-        &self,
-        config: &ProviderContext,
-    ) -> Result<Vec<(PathBuf, DirectoryResolvedFile)>, LocatedParseError> {
-        let inputs = self
-            .sources
-            .iter()
-            .map(|(file, source)| (file.source_label(), source.clone()))
-            .collect::<Vec<_>>();
+    fn parse(&self, config: &ProviderContext) -> Result<ParsedDirectoryFiles, LocatedParseError> {
+        let first_label = self.sources.first().map(|(file, _)| file.source_label());
         self.parse_from_root(
             config,
-            inputs
-                .first()
-                .and_then(|(path, _)| path.parent())
+            first_label
+                .as_deref()
+                .and_then(Path::parent)
                 .unwrap_or_else(|| Path::new("")),
         )
     }
@@ -1238,15 +1282,18 @@ impl DirectoryInputs {
         &self,
         config: &ProviderContext,
         display_root: &Path,
-    ) -> Result<Vec<(PathBuf, DirectoryResolvedFile)>, LocatedParseError> {
+    ) -> Result<ParsedDirectoryFiles, LocatedParseError> {
         let inputs = self
             .sources
             .iter()
             .map(|(file, source)| (file.source_label(), source.clone()))
             .collect::<Vec<_>>();
         let mut parsed = parse_directory_files_located_from_root(&inputs, config, display_root)?;
-        mark_complete_directory_files(&mut parsed, config);
-        Ok(parsed)
+        let scope = mark_complete_directory_files(&mut parsed, &self.sources, config);
+        Ok(ParsedDirectoryFiles {
+            files: parsed,
+            scope,
+        })
     }
 }
 
@@ -1518,10 +1565,11 @@ fn load_configuration_in_context(
                 return Err(ConfigurationLoadFailure::located(located, path));
             }
         };
-        let authored_bindings = AuthoredBindingView::from_directory_files(&parsed_files);
+        let authored_bindings =
+            AuthoredBindingView::from_directory_files(&parsed_files, parsed_files.empty_assembly());
         let duplicate_declarations = find_duplicate_declarations(path, &parsed_files);
 
-        let empty_parsed = ParsedFile::default;
+        let empty_parsed = || parsed_files.empty_assembly();
         let mut merged = empty_parsed();
         let mut unresolved_merged = empty_parsed();
         let mut parse_errors: Vec<ConfigurationLoadFailure> = Vec::new();
@@ -2002,7 +2050,8 @@ fn parse_directory_with_overrides_impl(
             ));
         }
     };
-    let authored_bindings = AuthoredBindingView::from_directory_files(&parsed_files);
+    let authored_bindings =
+        AuthoredBindingView::from_directory_files(&parsed_files, parsed_files.empty_assembly());
     let duplicate_declarations = find_duplicate_declarations(dir, &parsed_files);
     let semantic_files = if resolution.is_diagnostics() {
         parsed_files
@@ -2036,7 +2085,7 @@ fn parse_directory_with_overrides_impl(
         Vec::new()
     };
 
-    let mut merged = ParsedFile::default();
+    let mut merged = parsed_files.empty_assembly();
     let mut saw_backend = false;
     let mut sole_backend_file = None;
     for (file, resolved) in parsed_files {

@@ -102,3 +102,7 @@ boundary_test!(round15_module_argument, ModuleArgument);
 boundary_test!(round15_function_parameter, FunctionParameter);
 boundary_test!(round15_function_return, FunctionReturn);
 boundary_test!(round15_attributes_block, Attributes);
+boundary_test!(
+    imported_module_attributes_preserve_member_constraints,
+    ModuleAttributes
+);

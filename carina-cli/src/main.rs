@@ -817,7 +817,16 @@ fn render_app_error(
             }
         }
         _ => AppErrorRendering {
-            stderr: format_error_lines(color_mode, &error::format_error_with_source_chain(e)),
+            stderr: error::human_error_lines(e)
+                .into_iter()
+                .map(|(note, line)| {
+                    if note {
+                        format!("  {line}\n")
+                    } else {
+                        format!("{} {line}\n", "Error:".red(color_mode).bold(color_mode))
+                    }
+                })
+                .collect(),
             exit_code: 1,
         },
     }

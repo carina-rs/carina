@@ -200,7 +200,7 @@ pub enum ModuleError {
     #[error(transparent)]
     Constraint(Box<ModuleConstraintDiagnostic>),
 
-    #[error("{0}")]
+    #[error("{}:{}:{}: {}", crate::paths::DisplayPath::for_diagnostics(.0.location().file().path()), .0.location().span().start_line(), .0.location().span().start_column(), .0.detail())]
     RequireOutsideModule(
         Box<crate::parser::Located<super::validation::RequireOutsideModuleDiagnostic>>,
     ),

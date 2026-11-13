@@ -1119,9 +1119,6 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
         self.providers.extend(other.providers);
         self.upstream_sources.extend(other.upstream_sources);
         self.configuration_blocks.extend(other.configuration_blocks);
-        if self.directory_verdict.is_unknown() {
-            self.directory_verdict = other.directory_verdict;
-        }
         self.backend_keys.extend(other.backend_keys);
         self.anonymous_headers.extend(other.anonymous_headers);
         self.loops.extend(other.loops);

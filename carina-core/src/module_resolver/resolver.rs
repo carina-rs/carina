@@ -1338,7 +1338,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
                 None => ModuleError::Parse(*located.error),
             })?;
 
-        let mut merged = ParsedFile::default();
+        let mut merged = parsed_files.empty_assembly();
         for (_, parsed) in parsed_files {
             crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
         }
@@ -1831,10 +1831,7 @@ fn finish_root_expansion<E: ResolveExportBindingPhase<ParserPlaceholder>>(
 ) -> BindingResolvedFile<E::Absolute> {
     let mut expanded = parsed.resolve_root(root);
     for contribution in contributions {
-        crate::config_loader::merge_parsed_file(
-            &mut expanded,
-            crate::config_loader::relabel_export_phase(contribution),
-        );
+        expanded.merge_from(crate::config_loader::relabel_export_phase(contribution));
     }
     let mut provider_warnings = Vec::new();
     expanded.warnings.retain(|warning| {

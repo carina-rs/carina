@@ -20,3 +20,4 @@ ratatui = "0.29"
 carina-core = { path = "../carina-core", features = ["test-utils"] }
 indexmap = "2"
 insta = "1"
+tempfile = "3"

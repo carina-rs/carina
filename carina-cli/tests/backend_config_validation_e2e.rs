@@ -110,6 +110,45 @@ fn validate_accepts_backend_enum_region_from_sibling_file() {
 #[test]
 fn validate_module_backend_reports_only_the_structural_error() {
     let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        "arguments {\n  name: String\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.path().join("backend.crn"),
+        r#"backend s3 {
+  bucket = "state"
+  key = "state.json"
+  typo = true
+}
+"#,
+    )
+    .unwrap();
+
+    let diagnostics = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        Vec::new(),
+    );
+
+    assert_eq!(
+        diagnostics,
+        vec![
+            format!(
+                "arguments blocks are only valid inside module definitions, not in root configurations.\nNote: directory is a root configuration because of the backend block at {}:1.",
+                carina_core::paths::DisplayPath::for_diagnostics(
+                    fixture.path().join("backend.crn")
+                )
+            ),
+            "Unknown attribute 'typo' for backend type 's3'".to_string(),
+        ],
+        "CLI validate must match the LSP module-directory diagnostic"
+    );
+}
+
+#[test]
+fn validate_module_backend_reports_only_the_structural_error_in_directory() {
+    let fixture = tempfile::tempdir().unwrap();
     let module = fixture.path().join("module");
     std::fs::create_dir(&module).unwrap();
     std::fs::write(

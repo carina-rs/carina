@@ -1139,6 +1139,41 @@ fn validation_finding_display(prefix: Option<&str>, finding: &impl std::fmt::Dis
     }
 }
 
+fn expression_source_label(
+    finding: &carina_core::parser::Located<carina_core::static_type::InferenceError>,
+) -> String {
+    match finding.detail() {
+        carina_core::static_type::InferenceError::RequireOutsideModule(_) => {
+            carina_core::paths::DisplayPath::for_diagnostics(finding.location().file().path())
+                .to_string()
+        }
+        _ => finding.location().file().path().display().to_string(),
+    }
+}
+
+/// Terminal transport for a group containing root-placement findings.
+/// Its members retain their own diagnostics; it introduces no additional cause.
+#[derive(Debug)]
+pub struct RootPlacementErrors {
+    errors: Vec<AppError>,
+}
+impl RootPlacementErrors {
+    pub(crate) fn new(errors: Vec<AppError>) -> Self {
+        Self { errors }
+    }
+}
+impl std::fmt::Display for RootPlacementErrors {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, error) in self.errors.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str("\n")?;
+            }
+            formatter.write_str(&format_error_with_source_chain(error))?;
+        }
+        Ok(())
+    }
+}
+
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -1148,6 +1183,12 @@ pub enum AppError {
     UpstreamReference(Box<UpstreamReferenceFailure>),
     #[error("{0}")]
     ModuleResolution(Box<ModuleResolutionFailure>),
+    /// Lint aborts expansion with the typed resolver failure and original path presentation.
+    #[error("Module resolution error: {}", error.display_relative_to(base))]
+    LintModuleResolution {
+        error: Box<carina_core::module_resolver::ModuleError>,
+        base: PathBuf,
+    },
     #[error("{0}")]
     UpstreamResolution(
         Box<carina_core::parser::Located<carina_core::upstream_exports::UpstreamResolveFailure>>,
@@ -1548,7 +1589,7 @@ pub enum AppError {
     #[error(transparent)]
     AnalysisInvariant(#[from] carina_core::parser::AnalysisTreeError),
 
-    #[error("{} at line {}\n{}", .0.location().file().path().display(), .0.location().span().start_line(), .0.detail())]
+    #[error("{} at line {}\n{}", expression_source_label(.0), .0.location().span().start_line(), .0.detail())]
     ExpressionType(Box<carina_core::parser::Located<carina_core::static_type::InferenceError>>),
 
     #[error("{0}")]
@@ -1577,6 +1618,14 @@ pub enum AppError {
     /// Validation errors (schema mismatch, invalid config, etc.)
     #[error("{0}")]
     Validation(String),
+
+    /// A misplaced root declaration retains the loader-issued evidence.
+    #[error("{0}")]
+    RootDeclaration(Box<carina_core::validation::ConfigurationPlacementDiagnostic>),
+
+    /// Multiple findings retain typed root evidence until final presentation.
+    #[error("{0}")]
+    RootPlacementGroup(Box<RootPlacementErrors>),
 
     /// Configuration errors (missing attributes, invalid paths, etc.)
     #[error("{0}")]
@@ -1854,6 +1903,80 @@ pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static))
         messages.push(format!("Re-run `{command}` to create a new plan."));
     }
     messages.join("\n")
+}
+
+/// Render only typed root-placement evidence as a continuation of its error.
+/// Other multiline diagnostics keep the existing per-line error rendering.
+pub(crate) fn root_placement_notes(error: &AppError) -> Vec<String> {
+    fn module_notes(error: &carina_core::module_resolver::ModuleError, notes: &mut Vec<String>) {
+        for finding in error.individual_errors() {
+            if let Some(rejection) = finding.error.require_outside_module() {
+                notes.push(format!(
+                    "Note: {}",
+                    rejection.detail().root_evidence().note()
+                ));
+            }
+        }
+    }
+    let mut notes = Vec::new();
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if let Some(app) = current.downcast_ref::<AppError>() {
+            match app {
+                AppError::SavedPlanSecretVerification(failure) => {
+                    if let SavedPlanSecretVerificationError::EvaluationUnavailable {
+                        error, ..
+                    } = failure.as_ref()
+                    {
+                        notes.extend(root_placement_notes(error));
+                    }
+                }
+                AppError::LintModuleResolution { error, .. } => module_notes(error, &mut notes),
+                AppError::RootPlacementGroup(group) => {
+                    for error in &group.errors {
+                        notes.extend(root_placement_notes(error));
+                    }
+                }
+                AppError::RootDeclaration(finding) => {
+                    if let Some(evidence) = finding.root_evidence() {
+                        notes.push(format!("Note: {}", evidence.note()));
+                    }
+                }
+                AppError::ExpressionType(finding) => {
+                    if let carina_core::static_type::InferenceError::RequireOutsideModule(
+                        rejection,
+                    ) = finding.detail()
+                    {
+                        notes.push(format!("Note: {}", rejection.root_evidence().note()));
+                    }
+                }
+                AppError::ModuleResolution(failure) => {
+                    for finding in failure.individual_errors() {
+                        module_notes(finding.error, &mut notes);
+                    }
+                }
+                AppError::UpstreamResolution(finding) => {
+                    if let Some((_, error)) = finding.detail().module_failure() {
+                        module_notes(error, &mut notes);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(module) = current.downcast_ref::<carina_core::module_resolver::ModuleError>() {
+            module_notes(module, &mut notes);
+        }
+        source = current.source();
+    }
+    notes
+}
+
+pub fn human_error_lines(error: &AppError) -> Vec<(bool, String)> {
+    let notes = root_placement_notes(error);
+    format_error_with_source_chain(error)
+        .lines()
+        .map(|line| (notes.iter().any(|note| note == line), line.to_string()))
+        .collect()
 }
 
 impl From<carina_core::resource::ResolvedResourceError> for AppError {

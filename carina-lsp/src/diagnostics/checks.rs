@@ -669,13 +669,10 @@ impl DiagnosticRun<'_> {
         // CLI validation reports only the structural backend-in-module error
         // for a module-definition directory. Keep editor diagnostics at the
         // same layer instead of adding backend-schema errors.
-        if merged
-            .directory
-            .parsed
-            .directory_verdict()
-            .is_module_template()
-        {
-            return Vec::new();
+        match merged.directory.parsed.directory_verdict() {
+            carina_core::config_loader::DirectoryVerdict::Root(_) => {}
+            carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
+            | carina_core::config_loader::DirectoryVerdict::Unknown => return Vec::new(),
         }
         // A duplicate backend has no single semantic owner. The parser
         // inventory still supplies every declaration for placement checks.
@@ -1218,7 +1215,7 @@ impl DiagnosticRun<'_> {
                     doc,
                     finding,
                     DiagnosticSeverity::ERROR,
-                    finding.detail().to_string(),
+                    finding.detail().lsp_message(),
                 )?;
                 if let Some((_, error)) = finding.detail().module_failure()
                     && let Some(rejection) = error.root_cause().require_outside_module()

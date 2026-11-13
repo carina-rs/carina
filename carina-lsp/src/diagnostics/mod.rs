@@ -213,15 +213,14 @@ fn attach_root_evidence(
     else {
         return;
     };
-    let path = location.file().path();
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .expect("LSP working directory")
-            .join(path)
+    let Some(file) = evidence.file_locator() else {
+        return;
     };
-    let Ok(uri) = tower_lsp::lsp_types::Url::from_file_path(absolute) else {
+    let Ok(uri) = tower_lsp::lsp_types::Url::from_file_path(file.to_path_buf()) else {
+        return;
+    };
+    // URL parsing removes dot segments while retaining percent-encoded OS bytes.
+    let Ok(uri) = tower_lsp::lsp_types::Url::parse(uri.as_str()) else {
         return;
     };
     let span = location.span();
@@ -1764,6 +1763,11 @@ impl DiagnosticRun<'_> {
                             format!("Unknown resource type: {full_resource_type}"),
                         )
                     } else if !provider_loaded {
+                        match preferred_tree.directory_verdict() {
+                            carina_core::config_loader::DirectoryVerdict::Root(_) => {}
+                            carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
+                            | carina_core::config_loader::DirectoryVerdict::Unknown => continue,
+                        }
                         (
                             DiagnosticSeverity::ERROR,
                             format!(

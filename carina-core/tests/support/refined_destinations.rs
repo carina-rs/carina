@@ -21,6 +21,7 @@ pub enum Boundary {
     FunctionParameter,
     FunctionReturn,
     Attributes,
+    ModuleAttributes,
 }
 
 pub fn directory(boundary: Boundary, resolved_length: Option<usize>) -> tempfile::TempDir {
@@ -46,7 +47,7 @@ pub fn directory(boundary: Boundary, resolved_length: Option<usize>) -> tempfile
             None,
         ),
         Boundary::Export => (slot(&input), None),
-        Boundary::Attributes => (
+        Boundary::Attributes | Boundary::ModuleAttributes => (
             format!(
                 "attributes {{ name: aws.Name = {input} }}\n{}",
                 slot(&input)
@@ -69,10 +70,16 @@ pub fn directory(boundary: Boundary, resolved_length: Option<usize>) -> tempfile
         &format!("let source = awscc.MemberSource {{}}\n{main}"),
         &exports,
     );
-    if matches!(boundary, Boundary::Attributes) {
-        // A standalone module inherits provider types from the supplied snapshot.
-        std::fs::remove_file(dir.path().join("providers.crn")).unwrap();
-        std::fs::remove_file(dir.path().join("exports.crn")).unwrap();
+    if matches!(boundary, Boundary::ModuleAttributes) {
+        let module = dir.path().join("outputs");
+        std::fs::create_dir(&module).unwrap();
+        let source = std::fs::read_to_string(dir.path().join("main.crn")).unwrap();
+        std::fs::write(module.join("main.crn"), source).unwrap();
+        std::fs::write(
+            dir.path().join("main.crn"),
+            "let outputs = use { source = './outputs' }\nlet result = outputs {}\n",
+        )
+        .unwrap();
     }
     if let Some(child) = child {
         std::fs::create_dir(dir.path().join("forward")).unwrap();
@@ -173,7 +180,11 @@ pub fn check(
         if let Some(length) = length {
             let mut resolved = ResolvedBindings::default();
             resolved.set(
-                "source",
+                if matches!(boundary, Boundary::ModuleAttributes) {
+                    "result.source"
+                } else {
+                    "source"
+                },
                 HashMap::from([(
                     "name".into(),
                     Value::Concrete(ConcreteValue::String("A".repeat(length).into())),

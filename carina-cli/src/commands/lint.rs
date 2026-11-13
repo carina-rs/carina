@@ -337,7 +337,7 @@ fn lint_result(
             if let Err(error) =
                 carina_core::validation::validate_no_module_declarations_in_root(parsed.parsed())
             {
-                type_findings.push(error);
+                type_findings.push(error.to_string());
             }
             if type_findings.is_empty()
                 && let Err(error) = carina_core::validation::validate_attribute_params_with_context(
@@ -378,11 +378,9 @@ fn lint_result(
                     parsed.admit(schemas, catalog),
                     base_dir,
                 );
-                LintFile::Resolved(resolution.map_err(|e| {
-                    format!(
-                        "Module resolution error: {}",
-                        e.display_relative_to(&base_dir.source_label())
-                    )
+                LintFile::Resolved(resolution.map_err(|error| AppError::LintModuleResolution {
+                    error: Box::new(error),
+                    base: base_dir.source_label(),
                 })?)
             } else {
                 LintFile::Blocked(parsed)
