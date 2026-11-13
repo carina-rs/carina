@@ -187,7 +187,7 @@ fn round5_source_resource_missing_from_report_is_explicitly_unreached() {
 }
 
 #[test]
-fn round2_lsp_missing_expanded_report_selects_main_fallback() {
+fn lsp_missing_expanded_report_selects_main_fallback() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
     let mut actual = Vec::<Option<Vec<String>>>::new();
     for (argument_type, expression, target) in [

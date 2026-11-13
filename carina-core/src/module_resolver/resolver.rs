@@ -1863,9 +1863,9 @@ fn root_expansion_scope() -> RootScope {
 /// Cross the root-directory binding phase without loading module calls.
 ///
 /// This raw-file primitive is crate-private. Public module-resolution entry
-/// points require a [`crate::config_loader::RootDirectoryParse`], whose private field can be
-/// produced only by the directory loader/parser (or the explicitly gated test
-/// constructor). Directory-result methods use the same private primitive for
+/// points require an [`crate::config_loader::AdmittedRootDirectory`], constructed
+/// through [`crate::config_loader::RootDirectoryParse::admit`]. Directory-result
+/// methods use the same private primitive for
 /// editor-only root views of their loader-owned semantic files.
 pub(crate) fn expand_root_directory_file<E: ResolveExportBindingPhase<ParserPlaceholder>>(
     parsed: crate::parser::File<E>,

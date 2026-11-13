@@ -452,7 +452,7 @@ fn root_require_rejected_without_module_calls_and_with_data_sources() {
 #[test]
 fn saved_plan_secret_verification_matches_module_policy() {
     for has_secret in [false, true] {
-        for root_guard in [false, true] {
+        for root_require in [false, true] {
             let directory = Directory::new("true");
             directory.clear_root_require();
             let comment = if has_secret {
@@ -464,7 +464,7 @@ fn saved_plan_secret_verification_matches_module_policy() {
                 "let r = mock.test.resource {{ name = 'root' {comment} }}\nlet checked = use {{ source = './checked' }}\nlet control = checked {{ n = 2 }}\n"
             )).unwrap();
             success(&directory.run(&["plan", "--out", "saved.plan", "."]));
-            let message = if root_guard {
+            let message = if root_require {
                 directory.write_root_require("false");
                 ROOT_REQUIRE_ERROR
             } else {
@@ -593,12 +593,12 @@ fn assert_state_command_rejects_root_require(args: &[&str]) {
     let before = paths.each_ref().map(|path| fs::read(path).unwrap());
     directory.write_root_require("true");
     let output = directory.run(args);
-    rejected(&output, ROOT_REQUIRE_ERROR);
-    let text = output_text(&output);
-    assert_eq!(text.matches(ROOT_REQUIRE_ERROR).count(), 1, "{text}");
-    assert!(text.contains("guards.crn"), "{text}");
-    assert!(text.contains("2:1") || text.contains("line 2"), "{text}");
-    assert!(!text.contains("root guard"), "{text}");
+    assert_eq!(output.status.code(), Some(1), "{}", output_text(&output));
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!("Error: ./guards.crn at line 2\nError: {ROOT_REQUIRE_ERROR}\n")
+    );
     assert_eq!(before, paths.each_ref().map(|path| fs::read(path).unwrap()));
 }
 

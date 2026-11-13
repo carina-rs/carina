@@ -338,7 +338,7 @@ fn round5_live_computed_parts_reach_authored_hook() {
 }
 
 #[test]
-fn round5_module_body_slots_keep_per_instance_authored_roots() {
+fn module_body_slots_keep_per_instance_authored_roots() {
     use crate::resource::AbsoluteBindingAddress;
     use crate::validation::admission::attributes::ResourceAttributeInputs;
     let directory = tempfile::tempdir().unwrap();

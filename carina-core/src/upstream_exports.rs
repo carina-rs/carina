@@ -1892,7 +1892,7 @@ fn visit_subscript_access<B: BindingAddress>(
 mod tests {
     #[cfg(unix)]
     #[test]
-    fn round3_non_utf8_upstream_guard_is_not_omitted() {
+    fn non_utf8_upstream_require_rejection_is_not_omitted() {
         use std::os::unix::ffi::OsStringExt;
         let directory = tempfile::tempdir().unwrap();
         let upstream_dir = directory.path().join("upstream");
