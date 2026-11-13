@@ -626,6 +626,7 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
         | ExprKind::ModuleCall
         | ExprKind::Boolean
         | ExprKind::Declaration
+        | ExprKind::RequireCondition(_)
         | ExprKind::ProviderDeclaration
         | ExprKind::Unsupported(_) => Ok(AuthoredOutcome::Continue(Default::default())),
     }

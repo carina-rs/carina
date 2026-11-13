@@ -2500,6 +2500,10 @@ impl<P: ValueKind, B: BindingAddress> ValidationBlock<P, B> {
         &self.source.file
     }
 
+    pub(crate) fn condition_location(&self) -> &super::DeclarationLocation {
+        &self.source.location
+    }
+
     pub(crate) fn condition_for_module_if_audit(&self) -> &ValidateExpr<P, B> {
         let Self {
             condition,
@@ -2852,6 +2856,10 @@ impl<P: ValueKind, B: BindingAddress> RequireBlock<P, B> {
 
     pub fn source_file(&self) -> &std::path::Path {
         &self.source.file
+    }
+
+    pub(crate) fn condition_location(&self) -> &super::DeclarationLocation {
+        &self.source.location
     }
 
     pub(crate) fn condition_for_module_if_audit(&self) -> &ValidateExpr<P, B> {

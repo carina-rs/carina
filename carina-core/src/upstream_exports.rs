@@ -116,12 +116,12 @@ impl UpstreamDiscoveryContext<'_> {
     fn parse_source(
         &self,
         source: &ResolvedPath,
-        overrides: &HashMap<String, String>,
+        overrides: &crate::config_loader::SourceOverrides,
     ) -> Result<
         crate::config_loader::ParsedRootDirectory,
         crate::config_loader::DirectoryParseFailure,
     > {
-        crate::config_loader::parse_directory_for_metadata_report(
+        crate::config_loader::parse_directory_for_metadata_with_source_overrides_report(
             source,
             self.context.catalog(),
             overrides,
@@ -466,15 +466,25 @@ pub struct UpstreamResolveError {
     pub reason: String,
 }
 
-impl std::fmt::Display for UpstreamResolveError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl UpstreamResolveError {
+    fn fmt_reason(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        reason: &dyn std::fmt::Display,
+    ) -> std::fmt::Result {
         write!(
             f,
             "upstream_state `{}`: failed to parse source `{}`: {}",
             self.binding,
             self.source.display(),
-            self.reason
+            reason
         )
+    }
+}
+
+impl std::fmt::Display for UpstreamResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.fmt_reason(f, &self.reason)
     }
 }
 
@@ -550,7 +560,7 @@ impl UpstreamResolveFailure {
             legacy: UpstreamResolveError {
                 binding,
                 source,
-                reason: error.to_string(),
+                reason: String::new(),
             },
             cause: UpstreamResolveCause::Module {
                 base,
@@ -578,15 +588,27 @@ impl UpstreamResolveFailure {
             _ => None,
         }
     }
-    fn into_legacy(self) -> UpstreamResolveError {
+    fn into_legacy(mut self) -> UpstreamResolveError {
+        // Only the explicit compatibility API requests a location-free String
+        // container. Diagnostic callers retain typed causes via the accessors.
+        if let UpstreamResolveCause::Module { error, .. } = &self.cause {
+            self.legacy.reason = error.to_string();
+        }
         self.legacy
     }
 }
 impl std::fmt::Display for UpstreamResolveFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.legacy.fmt(formatter)
+        match &self.cause {
+            UpstreamResolveCause::Module { error, .. } => {
+                self.legacy.fmt_reason(formatter, error.as_ref())
+            }
+            _ => self.legacy.fmt(formatter),
+        }
     }
 }
+// Display includes the complete cause with upstream context. Keep typed
+// causes in parse_failure/module_failure, not as duplicate rendered links.
 impl std::error::Error for UpstreamResolveFailure {}
 
 /// A reference in the downstream project whose field isn't declared by the
@@ -863,14 +885,12 @@ fn resolve_upstream_exports_context_report<B: BindingAddress>(
         if !source_abs.is_dir() {
             continue;
         }
-        if matches!(source_abs.crn_files(), Ok(files) if files.is_empty()) {
+        if matches!(crate::config_loader::DirectoryFiles::discover(&source_abs, overrides), Ok(files) if files.is_empty())
+        {
             out.insert(us.binding.clone(), HashMap::new());
             continue;
         }
-        match discovery.parse_source(
-            &source_abs,
-            &crate::config_loader::directory_source_overrides(&source_abs, overrides),
-        ) {
+        match discovery.parse_source(&source_abs, overrides) {
             Ok(parsed) => match resolve_upstream_exports_from_parsed(
                 parsed,
                 &source_abs,
@@ -914,6 +934,17 @@ pub enum UpstreamExportSourceError {
 }
 
 impl UpstreamExportSourceError {
+    /// Source directory and typed resolver failure whose complete diagnostic
+    /// is already rendered by this error's Display.
+    pub fn module_failure(
+        &self,
+    ) -> Option<(&std::path::Path, &crate::module_resolver::ModuleError)> {
+        match self {
+            Self::Module { base, error } => Some((base, error)),
+            _ => None,
+        }
+    }
+
     fn into_resolve_failure(
         self,
         binding: String,
@@ -1863,6 +1894,63 @@ fn visit_subscript_access<B: BindingAddress>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn round3_non_utf8_upstream_guard_is_not_omitted() {
+        use std::os::unix::ffi::OsStringExt;
+        let directory = tempfile::tempdir().unwrap();
+        let upstream_dir = directory.path().join("upstream");
+        std::fs::create_dir(&upstream_dir).unwrap();
+        std::fs::write(
+            upstream_dir.join("exports.crn"),
+            "exports { value: Int = 1 }\n",
+        )
+        .unwrap();
+        let guard = upstream_dir.join(std::ffi::OsString::from_vec(b"\xff.crn".to_vec()));
+        let physical = std::fs::write(&guard, "require false, 'upstream guard'\n").is_ok();
+        let overrides = crate::config_loader::SourceOverrides::from([(
+            guard.clone(),
+            "require false, 'upstream guard'\n".to_string(),
+        )]);
+        let project = upstream_project(&[upstream("prior", "./upstream")]);
+        let context = ctx();
+        crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            let (_, errors) = super::resolve_upstream_export_report_inner(
+                &ResolvedPath::new(directory.path()).unwrap(),
+                &AnalysisTree::try_from_file(&project).unwrap(),
+                session,
+                None,
+                &overrides,
+            )
+            .unwrap();
+            assert_eq!(errors.len(), 1, "upstream guard was omitted");
+            let (_, error) = errors[0].detail().module_failure().unwrap();
+            let crate::module_resolver::ModuleError::DirectoryConstraint(finding) =
+                error.root_cause()
+            else {
+                panic!("expected a located directory constraint: {error}");
+            };
+            assert_eq!(finding.location().file().path(), guard);
+            assert_eq!(finding.location().span().start_line(), 1);
+            assert_eq!(finding.location().span().start_column(), 9);
+            assert_eq!(finding.location().span().end_column(), 14);
+            assert_eq!(
+                finding.detail().to_string(),
+                "require failed: upstream guard"
+            );
+            if physical {
+                let (_, errors) = super::resolve_upstream_export_report_inner(
+                    &ResolvedPath::new(directory.path()).unwrap(),
+                    &AnalysisTree::try_from_file(&project).unwrap(),
+                    session,
+                    None,
+                    &Default::default(),
+                )
+                .unwrap();
+                assert_eq!(errors.len(), 1);
+            }
+        });
+    }
     use crate::schema::{
         PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
     };

@@ -4,12 +4,14 @@ use std::sync::Arc;
 use ropey::Rope;
 use tower_lsp::lsp_types::{Position, TextDocumentContentChangeEvent};
 
-use carina_core::parser::{ParseError, ParsedFile, ProviderContext, parse_file};
+use carina_core::config_loader::ParsedSourceBuffer;
+use carina_core::parser::{ParseError, ParsedFile, ProviderContext};
 
 pub struct Document {
     content: Rope,
     source_text: String,
     parsed: Option<ParsedFile>,
+    parsed_buffer: Option<ParsedSourceBuffer>,
     parse_error: Option<ParseError>,
     provider_context: Arc<ProviderContext>,
     source_file: PathBuf,
@@ -31,6 +33,7 @@ impl Document {
             content: Rope::from_str(&content),
             source_text: content,
             parsed: None,
+            parsed_buffer: None,
             parse_error: None,
             provider_context,
             source_file,
@@ -65,13 +68,19 @@ impl Document {
 
     fn reparse(&mut self) {
         self.source_text = self.content.to_string();
-        match parse_file(&self.source_text, &self.source_file, &self.provider_context) {
-            Ok(parsed) => {
-                self.parsed = Some(parsed);
+        match ParsedSourceBuffer::parse(
+            &self.source_text,
+            &self.source_file,
+            &self.provider_context,
+        ) {
+            Ok(buffer) => {
+                self.parsed = Some(buffer.parsed().clone());
+                self.parsed_buffer = Some(buffer);
                 self.parse_error = None;
             }
             Err(e) => {
                 self.parsed = None;
+                self.parsed_buffer = None;
                 self.parse_error = Some(e);
             }
         }
@@ -94,6 +103,10 @@ impl Document {
     #[allow(dead_code)]
     pub fn parsed(&self) -> Option<&ParsedFile> {
         self.parsed.as_ref()
+    }
+
+    pub(crate) fn parsed_buffer(&self) -> Option<&ParsedSourceBuffer> {
+        self.parsed_buffer.as_ref()
     }
 
     /// Provider context the document was parsed with. Exposed so

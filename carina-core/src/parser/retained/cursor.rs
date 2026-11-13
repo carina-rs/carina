@@ -440,6 +440,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             | ExprKind::ModuleCall
             | ExprKind::Boolean
             | ExprKind::Declaration
+            | ExprKind::RequireCondition(_)
             | ExprKind::ProviderDeclaration
             | ExprKind::Unsupported(_)
             | ExprKind::NestedBlock { .. } => AuthoredForm::Computed,
@@ -594,6 +595,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
                 | ExprKind::Integer { .. }
                 | ExprKind::Access(_)
                 | ExprKind::DynamicAccess => AuthoredNavigation::Parts,
+                ExprKind::RequireCondition(_) => AuthoredNavigation::Covered,
                 _ => AuthoredNavigation::Covered,
             },
             AuthoredForm::Forward | AuthoredForm::Literal | AuthoredForm::Reference => {
@@ -607,6 +609,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             ExprKind::Interpolation { .. } => EdgeRole::InterpolationPart,
             ExprKind::Call(_) => EdgeRole::CallArgument,
             ExprKind::Integer { .. } => EdgeRole::ArithmeticOperand,
+            ExprKind::RequireCondition(_) => EdgeRole::Condition,
             ExprKind::Access(_) | ExprKind::DynamicAccess => {
                 if index == 0 {
                     EdgeRole::AccessBase
@@ -1345,6 +1348,7 @@ impl<B: BindingAddress> ExpressionReport<B> {
                 ExprKind::Interpolation { .. } => EdgeRole::InterpolationPart,
                 ExprKind::Call(_) | ExprKind::Function { .. } => EdgeRole::CallArgument,
                 ExprKind::Integer { .. } => EdgeRole::ArithmeticOperand,
+                ExprKind::RequireCondition(_) => EdgeRole::Condition,
                 ExprKind::Access(_) | ExprKind::DynamicAccess => EdgeRole::AccessBase,
                 ExprKind::If => EdgeRole::IfBranch,
                 ExprKind::Coalesce => EdgeRole::CoalesceOperand,

@@ -232,6 +232,9 @@ pub(in crate::parser) fn parse_require_statement(
     // beginning of a potentially multi-line `require` statement.
     let source_span = crate::parser::SourceSpan::from_pest(&condition_pair, preprocessed_file);
     let location = ctx.declaration_location(&condition_pair);
+    let condition_id = ctx
+        .authored_node_id(&condition_pair)
+        .expect("retained require condition");
     let condition = parse_validate_expr(
         condition_pair,
         ctx,
@@ -243,10 +246,7 @@ pub(in crate::parser) fn parse_require_statement(
         ctx,
         crate::parser::ConstraintStringPosition::RequireMessage,
     )?;
-    Ok(RequireBlock::new_in_source(
-        condition,
-        error_message,
-        source_span,
-        location,
-    ))
+    let declaration = RequireBlock::new_in_source(condition, error_message, source_span, location);
+    ctx.retain_require(condition_id, declaration.clone());
+    Ok(declaration)
 }

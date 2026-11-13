@@ -32,6 +32,7 @@ pub(crate) mod loader;
 mod resolver;
 mod signature;
 mod validation;
+pub(crate) use validation::evaluate_directory_require;
 
 pub use error::{ModuleError, ModuleErrorCallSource, ModuleErrorDiagnostic};
 pub(crate) use expander::UnselectedModuleBranch;
@@ -46,9 +47,9 @@ pub(crate) use resolver::{
     resolve_upstream_modules_with_config, resolve_upstream_modules_with_providerless_config,
 };
 pub use resolver::{
-    ModuleCallConstraintReport, ModuleCallConstraintReports, ModuleResolutionDiagnosticResult,
-    ResidualModuleResolutionDiagnostic, ResidualModuleResolutionError,
-    ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
+    ConstraintScopeReport, ModuleCallConstraintReport, ModuleCallConstraintReports,
+    ModuleResolutionDiagnosticResult, ResidualModuleResolutionDiagnostic,
+    ResidualModuleResolutionError, ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
     ResolvedModuleConstraintStatus, ensure_expanded_root_graph, prepare_root_export_validation,
     resolve_module_template_with_config, resolve_module_template_with_providerless_config,
     resolve_modules_providerless, resolve_modules_with_config, resolve_modules_with_diagnostics,
@@ -60,7 +61,8 @@ pub use signature::{
     load_resolved_module_signatures_with_overrides,
 };
 pub use validation::{
-    ConstraintEvaluation, ConstraintOrigin, EvaluatedModuleConstraint, ModuleConstraintCall,
+    ConstraintDiagnostic, ConstraintEvaluation, ConstraintOrigin, ConstraintScopeOwner,
+    DirectoryConstraintDiagnostic, EvaluatedModuleConstraint, ModuleConstraintCall,
     ModuleConstraintDiagnostic, ModuleConstraintFailure, ModuleConstraintKind,
     ModuleConstraintResolutionError, ModuleConstraintViolation, ModuleConstraints,
     evaluate_constraint, evaluate_live_pending_constraints, evaluate_module_constraints,

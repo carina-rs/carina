@@ -200,6 +200,11 @@ pub enum ModuleError {
     #[error(transparent)]
     Constraint(Box<ModuleConstraintDiagnostic>),
 
+    #[error("{0}")]
+    DirectoryConstraint(
+        Box<crate::parser::Located<super::validation::DirectoryConstraintDiagnostic>>,
+    ),
+
     #[error(
         "Module path '{path}' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory."
     )]
@@ -219,6 +224,17 @@ impl From<ParseError> for ModuleError {
 }
 
 impl ModuleError {
+    /// Authored directory guard and location, without exposing the diagnostic
+    /// already included in this error's Display as another source-chain link.
+    pub fn directory_constraint(
+        &self,
+    ) -> Option<&crate::parser::Located<super::validation::DirectoryConstraintDiagnostic>> {
+        match self.root_cause() {
+            Self::DirectoryConstraint(finding) => Some(finding),
+            _ => None,
+        }
+    }
+
     pub(crate) fn with_provider_type_warnings(
         self,
         warnings: Vec<crate::parser::ParseWarning>,
@@ -322,6 +338,7 @@ impl ModuleError {
             | Self::UpstreamStateInModule
             | Self::ExportsInModule
             | Self::Constraint(_)
+            | Self::DirectoryConstraint(_)
             | Self::NotADirectory { .. } => ModuleErrorCallSource::Unavailable,
         }
     }
@@ -380,6 +397,7 @@ impl ModuleError {
             | Self::UpstreamStateInModule
             | Self::ExportsInModule
             | Self::Constraint(_)
+            | Self::DirectoryConstraint(_)
             | Self::NotADirectory { path: _ } => None,
         }
     }
@@ -447,6 +465,7 @@ impl ModuleError {
             | Self::UpstreamStateInModule
             | Self::ExportsInModule
             | Self::Constraint(_)
+            | Self::DirectoryConstraint(_)
             | Self::NotADirectory { .. }) => error,
         }
     }
@@ -563,6 +582,7 @@ impl ModuleError {
             | Self::UpstreamStateInModule
             | Self::ExportsInModule
             | Self::Constraint(_)
+            | Self::DirectoryConstraint(_)
             | Self::NotADirectory { .. } => self.to_string(),
         }
     }
@@ -599,6 +619,7 @@ impl ModuleError {
             | Self::UpstreamStateInModule
             | Self::ExportsInModule
             | Self::Constraint(_)
+            | Self::DirectoryConstraint(_)
             | Self::NotADirectory { .. } => false,
         }
     }

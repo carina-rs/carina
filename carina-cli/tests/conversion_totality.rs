@@ -575,3 +575,213 @@ async fn round4_generated_boundary_totality_is_independent_of_activation() {
     assert_eq!(excluded, 1016);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+fn lsp_findings(
+    generated: &Fixture,
+    directory: &std::path::Path,
+) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+    let loaded = loaded_provider_snapshot_from_factories(
+        Arc::new(factories()),
+        SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
+    );
+    let engine =
+        carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+    generated
+        .files
+        .iter()
+        .flat_map(|(file, source)| {
+            let path = directory.join(file);
+            let document = carina_lsp::document::Document::new_with_path(
+                source.clone(),
+                path.clone(),
+                Arc::new(carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                )),
+            );
+            engine.analyze(&document, Some(&path))
+        })
+        .collect()
+}
+
+#[test]
+fn merge_require_keeps_an_unrelated_conversion_inventory_owner() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut outputs = Vec::new();
+    for converted in [true, false] {
+        let mut generated = fixture(Position::Root, Liveness::Live, Quality::Valid, converted);
+        let source = generated.files.get_mut("main.crn").unwrap();
+        *source = source.replace("let sink = ", "");
+        source.push_str("require 2 == 2, 'root guard'\n");
+        generated.write(directory.path());
+        let cli = validate(directory.path());
+        assert_eq!(cli["status"], "ok", "{cli}");
+        assert_eq!(cli["resource_count"], 1, "{cli}");
+        assert!(cli.get("errors").is_none(), "{cli}");
+        assert!(cli.get("warnings").is_none(), "{cli}");
+        outputs.push(cli);
+        let diagnostics = lsp_findings(&generated, directory.path());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+    assert_eq!(outputs[0], outputs[1], "no-as twin preserves main's output");
+}
+
+fn require_validation_fixture(module: bool, condition: &str, resource: &str) -> Fixture {
+    let mut generated = fixture(Position::Root, Liveness::Live, Quality::Valid, false);
+    let requirement = format!("require {condition}, 'require merge guard'\n");
+    if module {
+        generated.files.insert(
+            "child/main.crn".into(),
+            format!("arguments {{ unused: String }}\n{requirement}{resource}\n"),
+        );
+        generated.files.insert(
+            "main.crn".into(),
+            "let child = use { source = './child' }\nlet net = child { unused = 'ok' }\n".into(),
+        );
+    } else {
+        generated.files.insert("guards.crn".into(), requirement);
+    }
+    generated
+}
+
+#[test]
+fn merge_require_conversions_remain_ordinary_syntax_errors() {
+    use carina_core::parser::{ParseError, ProviderContext, parse_file};
+    use tower_lsp::lsp_types::DiagnosticSeverity;
+    for module in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut cli_shapes = Vec::new();
+        let mut lsp_shapes = Vec::new();
+        for suffix in ["as mock.Name", "unexpected"] {
+            let generated = require_validation_fixture(
+                module,
+                &format!("('ok' {suffix}) == 'ok'"),
+                "mock.Sink { attr = 'ok' }",
+            );
+            generated.write(directory.path());
+            let cli = validate(directory.path());
+            assert_eq!(cli["status"], "error", "{module}/{suffix}: {cli}");
+            assert_eq!(conversion_count(&cli), 0, "{cli}");
+            assert!(!internal(&cli.to_string()), "{cli}");
+            let errors = cli["errors"].as_array().unwrap();
+            assert_eq!(errors.len(), 1, "{cli}");
+            assert!(
+                errors[0]["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Syntax error:"),
+                "{cli}"
+            );
+            assert!(errors[0]["code"].is_null(), "{cli}");
+            assert_eq!(errors[0]["severity"], "error", "{cli}");
+            assert!(errors[0]["location"]["range"]["start"].is_object(), "{cli}");
+            cli_shapes.push((
+                errors[0]["code"].clone(),
+                errors[0]["severity"].clone(),
+                errors[0]["location"].clone(),
+            ));
+
+            let file = if module {
+                "child/main.crn"
+            } else {
+                "guards.crn"
+            };
+            let parsed = parse_file(
+                &generated.files[file],
+                &directory.path().join(file),
+                &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            );
+            assert!(
+                matches!(&parsed, Err(ParseError::Located { error, .. }) if matches!(error.as_ref(), ParseError::Syntax(_))),
+                "unexpected token must retain main's ParseError::Syntax class: {parsed:?}"
+            );
+            let diagnostics = lsp_findings(&generated, directory.path());
+            assert!(!diagnostics.is_empty(), "{module}/{suffix}");
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|diagnostic| internal(&diagnostic.message)),
+                "{diagnostics:?}"
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.code.is_none()),
+                "{diagnostics:?}"
+            );
+            // Main's syntax recovery may also diagnose an unloaded dotted
+            // type in the invalid buffer. Compare the parser diagnostics,
+            // while every diagnostic must remain ordinary and non-internal.
+            let errors: Vec<_> = diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+                        && diagnostic.message.contains("expected")
+                })
+                .collect();
+            assert!(!errors.is_empty(), "{diagnostics:?}");
+            lsp_shapes.push(
+                errors
+                    .iter()
+                    .map(|diagnostic| {
+                        (
+                            diagnostic.severity,
+                            diagnostic.code.clone(),
+                            diagnostic.source.clone(),
+                            diagnostic.range.start,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(
+            cli_shapes[0], cli_shapes[1],
+            "as is the same unexpected-token diagnostic shape: {module}"
+        );
+        assert_eq!(
+            lsp_shapes[0], lsp_shapes[1],
+            "as is the same unexpected-token diagnostic shape: {module}"
+        );
+    }
+}
+
+#[test]
+fn merge_module_require_failure_stops_before_resource_conversion_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    for passes in [false, true] {
+        let condition = if passes { "true" } else { "false" };
+        require_validation_fixture(true, condition, "mock.Sink { attr = 42 as mock.Name }")
+            .write(directory.path());
+        let cli = validate(directory.path());
+        assert_eq!(cli["status"], "error", "{cli}");
+        assert!(!internal(&cli.to_string()), "{cli}");
+        let errors = cli["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{cli}");
+        if passes {
+            assert_eq!(conversion_count(&cli), 1, "{cli}");
+            assert_eq!(errors[0]["code"], "conversion_scalar_kind", "{cli}");
+            assert!(
+                errors[0]["location"]["file"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("child/main.crn"),
+                "{cli}"
+            );
+        } else {
+            assert_eq!(conversion_count(&cli), 0, "{cli}");
+            assert!(errors[0]["code"].is_null(), "{cli}");
+            assert_eq!(
+                errors[0]["message"],
+                "module 'child' (call 'net'): arguments : require merge guard",
+                "{cli}"
+            );
+            require_validation_fixture(true, condition, "mock.Sink { attr = 'ok' }")
+                .write(directory.path());
+            let control = validate(directory.path());
+            assert_eq!(
+                cli, control,
+                "ordinary require failure is exactly main's output with a valid no-as resource"
+            );
+        }
+    }
+}
