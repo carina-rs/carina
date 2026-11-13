@@ -82,7 +82,7 @@ pub fn map_lock_error(e: BackendError, project_dir: &Path) -> AppError {
             operation,
             ProjectCommand::new("force-unlock", project_dir).with_argument(lock_id.as_str())
         )),
-        other => AppError::Backend(other),
+        other => AppError::from(other),
     }
 }
 
@@ -640,10 +640,7 @@ pub async fn run_state_forget(
         backend_config.as_ref(),
         DriftCommand::ForgetState,
     )?;
-    let backend = verified_backend
-        .resolve()
-        .await
-        .map_err(AppError::Backend)?;
+    let backend = verified_backend.resolve().await.map_err(AppError::from)?;
 
     println!("{}", "Acquiring state lock...".cyan(color_mode));
     let lock = backend
@@ -805,7 +802,7 @@ pub async fn run_force_unlock(
             "Lock ID mismatch. Expected '{}', found '{}'.",
             expected, actual
         ))),
-        Err(e) => Err(AppError::Backend(e)),
+        Err(e) => Err(AppError::from(e)),
     }
 }
 
@@ -824,11 +821,11 @@ async fn load_state_file(
 ) -> Result<Option<StateFile>, AppError> {
     let color_mode = runtime.color_mode();
     if let Some(raw) = state_url {
-        let url = StateUrl::parse(raw).map_err(AppError::Backend)?;
+        let url = StateUrl::parse(raw).map_err(AppError::from)?;
         return load_state_from_url(&url)
             .await
             .map(Some)
-            .map_err(AppError::Backend);
+            .map_err(AppError::from);
     }
 
     let default_path = PathBuf::from(".");
@@ -863,7 +860,7 @@ async fn load_state_file(
         .read_state()
         .await
         .map(|state| state.map(|loaded| loaded.into_state()))
-        .map_err(AppError::Backend)
+        .map_err(AppError::from)
 }
 
 fn require_state_file(state: Option<StateFile>) -> Result<StateFile, AppError> {
@@ -1515,7 +1512,7 @@ async fn run_state_bucket_delete(
         .ok_or("No backend configuration found.")?;
     let state_config = StateBackendConfig::try_from(backend_config)
         .map_err(carina_state::BackendError::from)
-        .map_err(AppError::Backend)?;
+        .map_err(AppError::from)?;
     let settings = state_config
         .as_s3()
         .ok_or("The configured backend does not manage an S3 bucket")?;
@@ -1747,10 +1744,8 @@ pub async fn run_state_refresh(
     )?;
 
     // Create backend
-    let backend: Box<dyn StateBackend> = verified_backend
-        .resolve()
-        .await
-        .map_err(AppError::Backend)?;
+    let backend: Box<dyn StateBackend> =
+        verified_backend.resolve().await.map_err(AppError::from)?;
 
     // Acquire lock (unless --lock=false)
     let state_lock = if lock {

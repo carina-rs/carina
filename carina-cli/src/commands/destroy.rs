@@ -170,7 +170,7 @@ pub async fn run_destroy(
     let backend: Arc<dyn StateBackend> = verified_backend
         .resolve()
         .await
-        .map_err(AppError::Backend)?
+        .map_err(AppError::from)?
         .into();
 
     // Get the state bucket name for protection check (S3 backend only)

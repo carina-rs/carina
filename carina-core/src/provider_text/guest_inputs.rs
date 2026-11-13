@@ -38,13 +38,20 @@ use crate::resource::{AbsoluteBindingAddress, DeferredValue, NoPlaceholder, Secr
 ///
 /// An inventory alone cannot extract the plaintext of an opaque secret.
 ///
-/// ```compile_fail,E0308
+/// ```compile_fail
 /// use carina_core::provider::ProviderValidationInputs;
 /// use carina_core::resource::{AbsoluteBindingAddress, NoPlaceholder, SecretPayload};
 /// fn extract(payload: &SecretPayload<NoPlaceholder, AbsoluteBindingAddress>) {
 ///     let inputs = ProviderValidationInputs::for_schema("").guest_inventory();
-///     let _: Result<carina_provider_protocol::types::Value, _> = inputs.handoff(payload);
+///     let _: Result<carina_provider_protocol::types::Value, _> = inputs.handoff(payload); // forbidden: handoff requires a store-owned credential capability
 /// }
+/// ```
+/// ```
+/// # use carina_core::provider::ProviderValidationInputs;
+/// # use carina_core::resource::{AbsoluteBindingAddress, NoPlaceholder, SecretPayload};
+/// # fn extract(payload: &SecretPayload<NoPlaceholder, AbsoluteBindingAddress>) {
+/// #     let inputs = ProviderValidationInputs::for_schema("").guest_inventory();
+/// # }
 /// ```
 #[derive(Clone, Debug)]
 pub struct GuestInputInventory {

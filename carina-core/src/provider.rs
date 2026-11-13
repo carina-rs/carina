@@ -8535,12 +8535,14 @@ pub trait ProviderFactory: Send + Sync {
     /// Keeping format validation (namespace structure, enum membership) on
     /// the host side means fixes to generic validation logic in
     /// `carina-core` take effect without rebuilding provider binaries.
-    fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema;
+    fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
+        self.schema_witness().config().clone()
+    }
 
     /// Validate provider-specific configuration semantics that cannot be
     /// expressed in the attribute type schema (e.g., cross-attribute
-    /// consistency checks). Type-level validation is handled by the host
-    /// using [`provider_config_attribute_types`] before this is called.
+    /// consistency checks). Host type checks use the configuration declaration
+    /// in [`Self::schema_witness`] before this is called.
     ///
     /// A raw attribute map cannot be passed to this boundary:
     ///

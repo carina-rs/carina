@@ -42,13 +42,13 @@ impl MidRunStateWriter {
 
     async fn write_state(&self, state: &mut StateFile) -> Result<(), AppError> {
         match self {
-            Self::Locked(writer) => writer.write_state(state).await.map_err(AppError::Backend),
+            Self::Locked(writer) => writer.write_state(state).await.map_err(AppError::from),
             Self::Unlocked {
                 backend,
                 _disabled: _,
             } => {
                 state.increment_serial();
-                backend.write_state(state).await.map_err(AppError::Backend)
+                backend.write_state(state).await.map_err(AppError::from)
             }
         }
     }
@@ -153,7 +153,11 @@ impl<S: Send + Sync + 'static> IncrementalStateSaver<S> {
                 state.serial = previous_serial;
                 match writer.write_state(&mut state).await {
                     Ok(()) => warned_for_failure_streak = false,
-                    Err(AppError::Backend(BackendError::LockNotHeld(_))) => break,
+                    Err(AppError::Backend(report))
+                        if matches!(report.backend_error(), BackendError::LockNotHeld(_)) =>
+                    {
+                        break;
+                    }
                     Err(error) => {
                         if !warned_for_failure_streak {
                             log::warn!(

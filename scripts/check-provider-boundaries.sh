@@ -58,11 +58,10 @@ check_rust_files() {
             fi
 
             # Core owns the built-in S3 backend declaration even without an
-            # installed provider. Permit only its two enum-namespace constants.
+            # installed provider. Permit only its enum provider namespace.
             if [[ "$file" == carina-core/src/validation/admission/configuration/backend.rs &&
                   "$description" == "carina-core provider string" &&
-                  ( "$stripped" == 'const AWS_PROVIDER_NAME: &str = "aws";' ||
-                    "$stripped" == 'const AWS_REGION_TYPE_NAME: &str = "aws.Region";' ) ]]; then
+                  "$stripped" == 'const AWS_PROVIDER_NAME: &str = "aws";' ]]; then
                 continue
             fi
 

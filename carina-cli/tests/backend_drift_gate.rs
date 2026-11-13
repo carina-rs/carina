@@ -980,3 +980,39 @@ mod backend_drift_gate {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn review_r2_saved_implicit_backend_without_loadable_source_keeps_main_locate_text() {
+    let root = TempDir::new().unwrap();
+    let project = root.path();
+    fs::write(project.join("providers.crn"), "provider mock {}\n").unwrap();
+    fs::write(
+        project.join("main.crn"),
+        "let resource = mock.test.resource { name = 'test' }\n",
+    )
+    .unwrap();
+    let initialized = carina(project, &["init", "."]);
+    assert!(initialized.status.success(), "{initialized:?}");
+    let planned = carina(
+        project,
+        &["plan", "--refresh=false", "--out", "plan.json", "."],
+    );
+    assert!(planned.status.success(), "{planned:?}");
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(project.join("plan.json")).unwrap()).unwrap();
+    assert!(saved["backend_config"].is_null());
+    fs::write(project.join("main.crn"), "let broken =\n").unwrap();
+    std::os::unix::fs::symlink("carina.state.json", project.join("carina.state.json")).unwrap();
+    let cause =
+        carina_core::paths::ResolvedPath::new(project.join("carina.state.json")).unwrap_err();
+    let applied = carina(
+        project,
+        &["apply", "plan.json", "--auto-approve", "--lock=false"],
+    );
+    assert_eq!(applied.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(applied.stderr).unwrap(),
+        format!("Error: I/O error: {cause}\n"),
+    );
+}

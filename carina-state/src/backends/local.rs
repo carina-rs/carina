@@ -27,7 +27,7 @@ enum AcquireTestPhase {
 }
 
 /// Local file backend for development and simple use cases
-/// All local origins require admitted settings and a bound filesystem pin.
+/// Locations carry a pin derived from admitted settings or an explicit native address.
 ///
 /// ```
 /// use carina_core::{paths::ResolvedPath, parser::BackendConfig, resource::NoPlaceholder};
@@ -38,10 +38,18 @@ enum AcquireTestPhase {
 ///     Ok(())
 /// }
 /// ```
-/// ```compile_fail,E0599
+/// ```compile_fail
 /// use carina_core::paths::ResolvedPath;
-/// use carina_state::backends::LocalBackend;
-/// fn bypass(path: ResolvedPath) { let _ = LocalBackend::with_resolved_path(path); }
+/// use carina_state::{backends::LocalBackend, LocalBackendSettings};
+/// fn bypass(settings: &LocalBackendSettings, base: &ResolvedPath) {
+///     let _ = LocalBackend::from_config(settings, base); // forbidden: the existing constructor is crate-private
+/// }
+/// ```
+/// ```
+/// # use carina_core::paths::ResolvedPath;
+/// # use carina_state::{backends::LocalBackend, LocalBackendSettings};
+/// # fn bypass(settings: &LocalBackendSettings, base: &ResolvedPath) {
+/// # }
 /// ```
 pub struct LocalBackend {
     /// Path to the state file

@@ -34,10 +34,10 @@ pub async fn run_export(
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     let exports = if let Some(raw_url) = state_url {
-        let url = StateUrl::parse(raw_url).map_err(AppError::Backend)?;
+        let url = StateUrl::parse(raw_url).map_err(AppError::from)?;
         load_encoded_published_exports_from_url(&url)
             .await
-            .map_err(AppError::Backend)?
+            .map_err(AppError::from)?
     } else {
         let project = carina_core::paths::ResolvedPath::new(path)
             .map_err(|error| AppError::Config(error.to_string()))?;
@@ -65,7 +65,7 @@ pub async fn run_export(
         backend
             .read_published_exports()
             .await
-            .map_err(AppError::Backend)?
+            .map_err(AppError::from)?
             .ok_or_else(|| {
                 AppError::Config(format!(
                     "No state file found. Run `{}` first.",

@@ -1073,7 +1073,12 @@ fn plan_file_serde_round_trip() {
         deserialized.provider_configs.as_provider_configs()[0].name,
         "aws"
     );
-    assert_eq!(deserialized.backend_config.candidate().backend_type, "s3");
+    let carina_state::BackendConfigurationSource::Declared(backend) =
+        deserialized.backend_config.selection_source()
+    else {
+        panic!("saved S3 backend must retain its declared origin")
+    };
+    assert_eq!(backend.backend_type, "s3");
     assert_eq!(deserialized.plan.effects().len(), 3);
     assert_eq!(deserialized.sorted_resources.len(), 1);
     assert_eq!(deserialized.unresolved_resources.len(), 1);

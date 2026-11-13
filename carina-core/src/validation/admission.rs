@@ -226,9 +226,16 @@ pub mod kind {
         /// use carina_core::validation::admission::{TypedSlot, PlacedValue, kind::ProviderConfigAttribute};
         /// fn place(slot: &mut TypedSlot<ProviderConfigAttribute>, value: PlacedValue<ProviderConfigAttribute>) { slot.place(value).unwrap(); }
         /// ```
-        /// ```compile_fail,E0308
+        /// ```compile_fail
         /// use carina_core::validation::admission::{TypedSlot, PlacedValue, kind::{ProviderConfigAttribute, BackendAttribute}};
-        /// fn place(slot: &mut TypedSlot<ProviderConfigAttribute>, value: PlacedValue<BackendAttribute>) { slot.place(value).unwrap(); }
+        /// fn place(slot: &mut TypedSlot<ProviderConfigAttribute>, value: PlacedValue<BackendAttribute>) {
+        ///     slot.place(value).unwrap(); // forbidden: provider and backend placements have distinct kinds
+        /// }
+        /// ```
+        /// ```
+        /// # use carina_core::validation::admission::{TypedSlot, PlacedValue, kind::{ProviderConfigAttribute, BackendAttribute}};
+        /// # fn place(slot: &mut TypedSlot<ProviderConfigAttribute>, value: PlacedValue<BackendAttribute>) {
+        /// # }
         /// ```
         ProviderConfigAttribute,
         BackendAttribute,

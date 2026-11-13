@@ -313,8 +313,6 @@ aws-vault exec <profile> -- cargo run -- plan
 
 ## Verify Protocol
 
-`scripts/validate-parity.py` compares `validate` and `validate --json` for every tracked `.crn` directory in a repository and optional infra checkout. Run `python3 scripts/validate-parity.py --main <main-binary> --candidate <candidate-binary> --repo . --infra ../../../infra --evidence <directory>`; `--list-only` prints the directory count. It strips credentials and normalizes absolute root paths. Only the two carina#4394 fixtures allow diagnostic ordering differences: text lines and the JSON `errors` array compare as multisets; exit status, stderr in JSON mode, and all other data stay exact.
-
 `scripts/verify.sh` requires Bash 4.4 or newer, cargo-nextest and cargo-hack
 for its full check set. Rustup automatically reads `rust-toolchain.toml` to
 select the pinned toolchain, `clippy`, `rustfmt` and `wasm32-wasip2` target.
@@ -333,6 +331,10 @@ run. When in doubt, run `scripts/verify.sh` without `--local`.
    in the workspace, including dependents through dev and build dependencies.
    Use `--base <ref>` to override the helper's default base of `origin/main`.
 2. PR CI must be green before merge.
+
+Use `scripts/validate-parity.py` for main/candidate text and JSON parity (carina#4394).
+Run `python3 scripts/validate-parity.py --main <main> --candidate <candidate>
+--repo . --infra ../../../infra --evidence <dir>`.
 
 CI keeps its parallel jobs by selecting kinds from `scripts/verify.sh`.
 The archive job builds the WASM mock fixtures and host test archive once;
@@ -709,25 +711,18 @@ A struct type represents a nested object with typed fields.
   Declaration compatibility admits types, not resolved-value validity.
   `NeedsLocal` exists only in the admission-facing reference relation, requiring
   a `ReferenceCandidate`; it cannot convert back into general type compatibility.
-  Resource/data-source attributes use `admit_apply_resource`/`admit_apply_data_source`
-  in `executor/provider_ready.rs`. Provider configuration enters `admit()` through
-  `validation/admission/configuration/`, including compact-list custom-type callbacks.
-  Its complete immutable aggregate owns the exact canonical payload and field
-  placements; partial analysis returns `AnalyzedConfiguration`, which cannot
-  authorize construction. Undeclared factory-owned keys remain opaque passthrough.
-  Sessions require admitted configuration, including empty built-in configurations;
-  initialization consumes a construction owner pairing that session with its selected
-  factory. Declaration-loading diagnostics use `ProviderValidationInputs`, which
-  cannot initialize a provider. Built-in backend declarations live in core's
-  `validation/admission/configuration/backend.rs`; state extracts concrete settings
-  only from `AdmittedConfiguration<BackendAttribute>`. Blocks, decoded locks/plans,
-  S3 URLs and the implicit local default enter that owner before construction.
-  URL S3 keeps encryption on and automatic bucket creation off. Local locations
-  distinguish a pin derived from admitted settings from an explicit native file
-  address, preserving non-UTF-8 paths without inventing configuration. CLI and LSP share the
-  same owner. Function parameters/returns additionally use runtime
-  `check_resolved_constraints_at`; backend schemas have no anonymous refinements. Member String failures keep their structured pattern/
-  length category and label the slot's member constraint; identity failures run first.
+  Resource/data-source final inputs use `admit_apply_resource` and
+  `admit_apply_data_source`. Provider/backend configuration enters `admit()` through
+  `validation/admission/configuration/`, including compact-list callbacks.
+  Complete admissions own the canonical payload and placements; analysis cannot
+  authorize construction. Opaque provider keys retain factory validation.
+  Provider construction binds admitted configuration to its factory and instance.
+  Core owns the S3/local declarations; state extracts settings only from
+  `AdmittedConfiguration<BackendAttribute>`. Native file addresses retain their
+  own pins and non-UTF-8 bytes. S3 URLs keep encryption on and auto-creation off.
+  CLI and LSP share the owner. Function parameters/returns use
+  `check_resolved_constraints_at`. Member String failures retain their pattern/
+  length category and member label; identity failures run first.
   Int-to-Float widening between identified scalars uses identity-bound containment
   too. Float pairs with identities on both sides retain strict declaration range
   containment; same-identity Float reference admission retains resolved-value

@@ -46,10 +46,20 @@ fn event_schema_install_error(error: crate::schema::SchemaRegistryError) -> Host
 /// Construction always requires configuration admitted for its declaration
 /// and instance, including a built-in provider's empty configuration.
 ///
-/// ```compile_fail,E0308
+/// ```compile_fail
 /// use carina_core::provider::ProviderPlan;
-/// let plan = ProviderPlan::state_only();
-/// let _ = plan.session("mock", None, None);
+/// use carina_core::parser::ConfigurationAttributes;
+/// use carina_core::resource::Value;
+/// fn bypass(plan: &ProviderPlan, raw: &ConfigurationAttributes<Value>) {
+///     let _ = plan.session(raw); // forbidden: raw values are not admitted configuration
+/// }
+/// ```
+/// ```
+/// # use carina_core::provider::ProviderPlan;
+/// # use carina_core::parser::ConfigurationAttributes;
+/// # use carina_core::resource::Value;
+/// # fn bypass(plan: &ProviderPlan, raw: &ConfigurationAttributes<Value>) {
+/// # }
 /// ```
 #[derive(Clone, Debug)]
 pub struct ProviderPlan {

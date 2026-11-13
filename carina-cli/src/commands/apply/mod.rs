@@ -38,7 +38,7 @@ use carina_core::resource::{ConcreteValue, State};
 use carina_core::shutdown::ShutdownToken;
 use carina_core::upstream_exports::AdmittedRemoteBindings;
 use carina_core::value::{RenderedKey, render_value};
-use carina_state::{BackendLock, LockInfo, RowBasis, StateBackend, StateFile};
+use carina_state::{LockInfo, RowBasis, StateBackend, StateFile};
 
 #[cfg(test)]
 use carina_core::parser::ProviderConfig;
@@ -301,7 +301,7 @@ async fn prepare_bootstrap_permit(
 }
 
 async fn create_auto_bootstrap_bucket(backend: &dyn StateBackend) -> Result<(), AppError> {
-    backend.create_bucket().await.map_err(AppError::Backend)
+    backend.create_bucket().await.map_err(AppError::from)
 }
 
 async fn create_checked_bootstrap_resource(
@@ -431,7 +431,7 @@ carina_state::ResourceState::from_provider_state_for_resource_and_schema(
                             Ok(Some(row)) => seed_protected_bootstrap_resource(backend, row)
                                 .await
                                 .err()
-                                .map(AppError::Backend),
+                                .map(AppError::from),
                             Ok(None) => None,
                             Err(seed_error) => Some(seed_error),
                         };
@@ -1075,7 +1075,7 @@ mod upstream_snapshot_tests {
     #[test]
     fn round2_4_backend_failure_with_diagnostics_is_not_drift() {
         let error = AppError::TypeCheckDiagnostics(Box::new(crate::error::TypeCheckDiagnostics {
-            error: AppError::Backend(carina_state::BackendError::Io("read-marker".into())),
+            error: AppError::from(carina_state::BackendError::Io("read-marker".into())),
             diagnostics: "diagnostic-marker".into(),
         }));
         let error = classify_upstream_snapshot_error(
@@ -1334,12 +1334,12 @@ pub(crate) async fn save_state_locked(
     lock: &LockInfo,
     state: &mut StateFile,
 ) -> Result<(), AppError> {
-    let renewed = backend.renew_lock(lock).await.map_err(AppError::Backend)?;
+    let renewed = backend.renew_lock(lock).await.map_err(AppError::from)?;
     state.increment_serial();
     backend
         .write_state_locked(state, &renewed)
         .await
-        .map_err(AppError::Backend)
+        .map_err(AppError::from)
 }
 
 pub(crate) async fn save_state_locked_after_execute(
@@ -1355,7 +1355,7 @@ pub(crate) async fn save_state_locked_after_execute(
             backend
                 .write_state_locked_for_cleanup(state, lock)
                 .await
-                .map_err(AppError::Backend)
+                .map_err(AppError::from)
         }
     }
 }
@@ -1370,7 +1370,7 @@ pub(crate) async fn save_state_unlocked(
     state: &mut StateFile,
 ) -> Result<(), AppError> {
     state.increment_serial();
-    backend.write_state(state).await.map_err(AppError::Backend)
+    backend.write_state(state).await.map_err(AppError::from)
 }
 
 pub(crate) async fn save_state_unlocked_after_execute(
@@ -1386,7 +1386,7 @@ pub(crate) async fn save_state_unlocked_after_execute(
             backend
                 .write_state_for_cleanup(state)
                 .await
-                .map_err(AppError::Backend)
+                .map_err(AppError::from)
         }
     }
 }
@@ -1413,7 +1413,7 @@ pub(crate) async fn load_state_persist_if_migrated(
     backend: &dyn StateBackend,
     lock: StateLockRef<'_>,
 ) -> Result<Option<StateFile>, AppError> {
-    match backend.read_state().await.map_err(AppError::Backend)? {
+    match backend.read_state().await.map_err(AppError::from)? {
         None => Ok(None),
         Some(carina_state::LoadedState::Pristine(state)) => Ok(Some(state)),
         Some(carina_state::LoadedState::Migrated { mut state, .. }) => {
@@ -1979,7 +1979,7 @@ async fn run_apply_with_observer_factory(
     let backend: Arc<dyn StateBackend> = verified_backend
         .resolve()
         .await
-        .map_err(AppError::Backend)?
+        .map_err(AppError::from)?
         .into();
 
     // Handle bootstrap if S3 backend is configured
@@ -1988,7 +1988,7 @@ async fn run_apply_with_observer_factory(
         .map(|settings| (settings.bucket().to_owned(), settings.auto_create()));
     if let Some((bucket_name, auto_create)) = s3_bootstrap {
         // Check if bucket exists (bootstrap detection)
-        let bucket_exists = backend.bucket_exists().await.map_err(AppError::Backend)?;
+        let bucket_exists = backend.bucket_exists().await.map_err(AppError::from)?;
 
         if !bucket_exists {
             println!(
@@ -2140,7 +2140,7 @@ async fn run_apply_with_observer_factory(
                     backend
                         .write_state(&initial_state)
                         .await
-                        .map_err(AppError::Backend)?;
+                        .map_err(AppError::from)?;
                     println!(
                         "  {} Registered state bucket as protected resource",
                         "✓".green(color_mode)
@@ -3210,13 +3210,19 @@ async fn run_apply_locked_canonical(
     finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await
 }
 
-fn ensure_saved_plan_backend_matches_current(
-    plan_backend_config: Option<&carina_core::parser::ExpandedBackendConfig>,
-    current_backend_config: Option<&carina_core::parser::ExpandedBackendConfig>,
+fn ensure_saved_plan_backend_matches_current<'a>(
+    plan_backend_config: impl Into<carina_state::BackendConfigurationSource<'a>>,
+    current_backend_config: impl Into<carina_state::BackendConfigurationSource<'a>>,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
-    let planned = BackendLock::for_config(plan_backend_config).map_err(AppError::Backend)?;
-    let current = BackendLock::for_config(current_backend_config).map_err(AppError::Backend)?;
+    let planned = plan_backend_config
+        .into()
+        .backend_lock()
+        .map_err(AppError::from)?;
+    let current = current_backend_config
+        .into()
+        .backend_lock()
+        .map_err(AppError::from)?;
 
     if planned == current {
         Ok(())
@@ -3930,8 +3936,8 @@ async fn run_apply_from_plan_with_observer_factory(
     };
     let current_backend = parsed_backend.as_ref().map(Option::as_ref);
     let backend_config = match current_backend {
-        Some(current_backend) => current_backend,
-        None => Some(inspected_plan.backend_config()),
+        Some(current_backend) => current_backend.into(),
+        None => inspected_plan.backend_config().selection_source(),
     };
     let verified_backend =
         verify_for_mutation(base_dir, &source_path, backend_config, DriftCommand::Apply)?;
@@ -3941,7 +3947,7 @@ async fn run_apply_from_plan_with_observer_factory(
     // backend gates pass is the state lock acquired.
     if let Some(current_backend) = current_backend {
         ensure_saved_plan_backend_matches_current(
-            Some(inspected_plan.backend_config()),
+            inspected_plan.backend_config().selection_source(),
             current_backend,
             apply_target,
         )?;
@@ -3951,7 +3957,7 @@ async fn run_apply_from_plan_with_observer_factory(
     let backend: Arc<dyn StateBackend> = verified_backend
         .resolve()
         .await
-        .map_err(AppError::Backend)?
+        .map_err(AppError::from)?
         .into();
 
     // Acquire lock (unless --lock=false)
@@ -4036,7 +4042,7 @@ async fn run_apply_from_plan_locked_owned(
     // on-disk serial (the one the saved plan was diffed against)
     // rather than a +1 bump caused by our own migration persist.
     let (mut state_file, pending_migration) =
-        match try_with_lock!(backend.read_state().await.map_err(AppError::Backend)) {
+        match try_with_lock!(backend.read_state().await.map_err(AppError::from)) {
             None => (None, None),
             Some(carina_state::LoadedState::Pristine(state)) => (Some(state), None),
             Some(carina_state::LoadedState::Migrated { state, info }) => (Some(state), Some(info)),

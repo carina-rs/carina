@@ -5,8 +5,7 @@ use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::differ::{Orphan, Orphans, restore_current_move_source};
 use carina_core::input_rules::{InputAdmissionFailure, InputCheckedPlan, InputTypeContext};
 use carina_core::parser::{
-    ExpandedBackendConfig as BackendConfig, ExpandedInferredExportParam as InferredExportParam,
-    SavedProviderConfigs,
+    ExpandedInferredExportParam as InferredExportParam, SavedProviderConfigs,
 };
 type ExecutableSavedPlan = carina_core::saved_replay::AdmittedSavedPlanReplay;
 use carina_core::provider::{HostProvider, PersistedAttributes, ProviderRouter, ReadRequest};
@@ -204,10 +203,10 @@ impl ProviderBoundPlanFile {
         Self::NeedsSecretVerification { plan, providers }
     }
 
-    pub(super) fn backend_config(&self) -> &BackendConfig {
+    pub(super) fn backend_config(&self) -> &crate::commands::plan::SavedBackendConfig {
         match self {
-            Self::Verified { plan, .. } => plan.plan_file.backend_config.candidate(),
-            Self::NeedsSecretVerification { plan, .. } => plan.plan_file.backend_config.candidate(),
+            Self::Verified { plan, .. } => &plan.plan_file.backend_config,
+            Self::NeedsSecretVerification { plan, .. } => &plan.plan_file.backend_config,
         }
     }
 

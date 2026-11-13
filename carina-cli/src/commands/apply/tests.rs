@@ -8400,8 +8400,8 @@ async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
     );
     assert!(matches!(
         error.seed_error(),
-        Some(AppError::Backend(carina_state::BackendError::Configuration(message)))
-            if message == "seed write failed"
+        Some(AppError::Backend(report))
+            if matches!(report.backend_error(), carina_state::BackendError::Configuration(message) if message == "seed write failed")
     ));
     assert_eq!(error.to_string(), "Failed to create state bucket");
     let seed_error = std::error::Error::source(error)
@@ -8462,13 +8462,14 @@ fn saved_plan_backend_cross_check_preserves_typed_config_error() {
     assert!(
         matches!(
             &error,
-            AppError::Backend(carina_state::BackendError::InvalidConfig(
-                carina_state::BackendConfigError::Invalid(errors)
-            )) if errors.errors().iter().any(|error| matches!(
-                error,
-                carina_state::BackendAttributeError::InvalidAttribute { attribute, .. }
-                    if attribute == "bucket"
-            ))
+            AppError::Backend(report) if matches!(report.backend_error(),
+                carina_state::BackendError::InvalidConfig(carina_state::BackendConfigError::Invalid(errors))
+                if errors.errors().iter().any(|error| matches!(
+                    error,
+                    carina_state::BackendAttributeError::InvalidAttribute { attribute, .. }
+                        if attribute == "bucket"
+                ))
+            )
         ),
         "typed backend error was erased: {error:?}"
     );

@@ -271,9 +271,16 @@ impl AdmittedConfiguration<kind::BackendAttribute> {
 /// let admitted = backend::admit(&raw).unwrap();
 /// assert!(admitted.attributes().is_empty());
 /// ```
-/// ```compile_fail,E0596
+/// ```compile_fail
 /// use carina_core::validation::admission::{configuration::AdmittedConfiguration, kind::BackendAttribute};
-/// fn replace(config: &mut AdmittedConfiguration<BackendAttribute>) { config.attributes().clear(); }
+/// fn replace(config: &mut AdmittedConfiguration<BackendAttribute>) {
+///     config.attributes().clear(); // forbidden: the admitted payload is immutable
+/// }
+/// ```
+/// ```
+/// # use carina_core::validation::admission::{configuration::AdmittedConfiguration, kind::BackendAttribute};
+/// # fn replace(config: &mut AdmittedConfiguration<BackendAttribute>) {
+/// # }
 /// ```
 pub fn admit<P: PlaceholderKind, B: BindingAddress>(
     config: &parser::BackendConfig<P, B>,

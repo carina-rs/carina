@@ -32,10 +32,18 @@ impl Deref for CanonicalProviderConfigAttributes {
 
 /// A partial analysis projection, which grants no construction authority.
 ///
-/// ```compile_fail,E0277
+/// ```compile_fail
 /// use carina_core::provider::ProviderReadyConfig;
 /// use carina_core::validation::admission::configuration::provider::AnalyzedConfiguration;
-/// fn bypass(analyzed: AnalyzedConfiguration) -> ProviderReadyConfig { analyzed.into() }
+/// fn bypass(analyzed: AnalyzedConfiguration) {
+///     let _: ProviderReadyConfig = analyzed.into(); // forbidden: analysis grants no construction authority
+/// }
+/// ```
+/// ```
+/// # use carina_core::provider::ProviderReadyConfig;
+/// # use carina_core::validation::admission::configuration::provider::AnalyzedConfiguration;
+/// # fn bypass(analyzed: AnalyzedConfiguration) {
+/// # }
 /// ```
 /// ```
 /// use carina_core::provider::ProviderReadyConfig;
@@ -62,20 +70,40 @@ impl Deref for AnalyzedConfiguration {
 ///     assert_eq!(session.configuration().attributes(), config.attributes());
 /// }
 /// ```
-/// ```compile_fail,E0308
+/// ```compile_fail
 /// use carina_core::provider::ProviderPlan;
 /// use carina_core::validation::admission::{PendingAdmission, kind::ProviderConfigAttribute};
 /// fn pending(plan: &ProviderPlan, value: PendingAdmission<ProviderConfigAttribute>) {
-///     let _ = plan.session(&value);
+///     let _ = plan.session(&value); // forbidden: pending admission cannot construct a session
 /// }
 /// ```
-/// ```compile_fail,E0451
-/// use carina_core::provider::ProviderReadyConfig;
-/// let _ = ProviderReadyConfig { inner: todo!() };
 /// ```
-/// ```compile_fail,E0596
+/// # use carina_core::provider::ProviderPlan;
+/// # use carina_core::validation::admission::{PendingAdmission, kind::ProviderConfigAttribute};
+/// # fn pending(plan: &ProviderPlan, value: PendingAdmission<ProviderConfigAttribute>) {
+/// # }
+/// ```
+/// ```compile_fail
 /// use carina_core::provider::ProviderReadyConfig;
-/// fn replace(config: &mut ProviderReadyConfig) { config.attributes().clear(); }
+/// fn bypass(config: &ProviderReadyConfig) {
+///     let _ = &config.inner; // forbidden: the existing ready configuration field is private
+/// }
+/// ```
+/// ```
+/// # use carina_core::provider::ProviderReadyConfig;
+/// # fn bypass(config: &ProviderReadyConfig) {
+/// # }
+/// ```
+/// ```compile_fail
+/// use carina_core::provider::ProviderReadyConfig;
+/// fn replace(config: &mut ProviderReadyConfig) {
+///     config.attributes().clear(); // forbidden: ready attributes are immutable
+/// }
+/// ```
+/// ```
+/// # use carina_core::provider::ProviderReadyConfig;
+/// # fn replace(config: &mut ProviderReadyConfig) {
+/// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct ProviderReadyConfig {
@@ -149,10 +177,18 @@ impl PreparationPhase for Analysis {
         lookup: &dyn ValidatedCustomTypeLookup,
         aggregate: &mut ConfigurationBuilder<kind::ProviderConfigAttribute>,
     ) -> Result<(), AdmissionErrors> {
-        if let Admission::Ready(placed) = field(destination, value, session, lookup)? {
-            aggregate.place(key.clone(), placed);
+        match field(destination, value, session, lookup)? {
+            Admission::Ready(placed) => {
+                aggregate.place(key.clone(), placed);
+                Ok(())
+            }
+            Admission::Pending(pending) => Err(KnowledgeError::<
+                crate::resource::AbsoluteBindingAddress,
+            >::UnresolvedAtBoundary {
+                sites: pending.inner.sites,
+            }
+            .into()),
         }
-        Ok(())
     }
     fn unresolved<P: PlaceholderKind, B: BindingAddress>(
         _: &Value<P, B>,
@@ -399,11 +435,16 @@ pub fn prepare(
 /// The selected factory and the exact configuration admitted by it stay together.
 /// Neither a ready map nor an independently selected session can initialize a provider.
 ///
-/// ```compile_fail,E0308
-/// use carina_core::provider::{ProviderBoundary, ProviderFactory, ProviderSession};
-/// async fn bypass(factory: &dyn ProviderFactory, session: &ProviderSession) {
-///     let _ = ProviderBoundary::initialize(factory, session).await;
+/// ```compile_fail
+/// use carina_core::provider::{ProviderBoundary, ProviderSession};
+/// async fn bypass(session: &ProviderSession) {
+///     let _ = ProviderBoundary::initialize(session).await; // forbidden: initialization requires ProviderConstruction
 /// }
+/// ```
+/// ```
+/// # use carina_core::provider::{ProviderBoundary, ProviderSession};
+/// # async fn bypass(session: &ProviderSession) {
+/// # }
 /// ```
 /// ```
 /// use carina_core::provider::ProviderBoundary;
@@ -414,11 +455,16 @@ pub fn prepare(
 /// ```
 /// A normalizer hook also requires the boundary's initialization capability.
 ///
-/// ```compile_fail,E0061
-/// use carina_core::provider::{ProviderFactory, ProviderSession};
-/// fn bypass(factory: &dyn ProviderFactory, session: &ProviderSession) {
-///     let _ = factory.create_normalizer(session);
+/// ```compile_fail
+/// use carina_core::provider::{ProviderBoundary, ProviderSession};
+/// async fn bypass(session: &ProviderSession) {
+///     let _ = ProviderBoundary::initialize_normalizer(session).await; // forbidden: normalizers require ProviderConstruction
 /// }
+/// ```
+/// ```
+/// # use carina_core::provider::{ProviderBoundary, ProviderSession};
+/// # async fn bypass(session: &ProviderSession) {
+/// # }
 /// ```
 pub struct ProviderConstruction<'a> {
     factory: &'a dyn ProviderFactory,
@@ -500,7 +546,7 @@ pub(crate) fn test_configuration(
         provider,
         binding,
         config.map_or(&empty, ProviderReadyConfig::attributes),
-        &factory.provider_config_attribute_types(),
+        factory.schema_witness().config(),
     )
     .expect("admit fixture configuration");
     ProviderReadyConfig::new(

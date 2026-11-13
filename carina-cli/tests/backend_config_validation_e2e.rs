@@ -175,3 +175,43 @@ fn review_r1_deferred_backend_directory_text_and_status_match_main() {
         );
     }
 }
+
+#[test]
+fn review_r2_backend_builtin_failure_text_and_json_match_main() {
+    for case in ["direct", "sibling"] {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/backend_builtin_failure")
+            .join(case);
+        let expected: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(directory.join("expected.json")).unwrap(),
+        )
+        .unwrap();
+        for mode in ["text", "json"] {
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_carina"));
+            command
+                .arg("validate")
+                .arg(&directory)
+                .env("NO_COLOR", "1")
+                .env_remove("CLICOLOR_FORCE");
+            if mode == "json" {
+                command.arg("--json");
+            }
+            let run = command.output().unwrap();
+            assert_eq!(
+                run.status.code(),
+                expected[mode]["status"].as_i64().map(|n| n as i32),
+                "{case}/{mode}"
+            );
+            for (name, bytes) in [("stdout", run.stdout), ("stderr", run.stderr)] {
+                let output = String::from_utf8(bytes)
+                    .unwrap()
+                    .replace(directory.to_str().unwrap(), "$DIR");
+                assert_eq!(
+                    output,
+                    expected[mode][name].as_str().unwrap(),
+                    "{case}/{mode}/{name}"
+                );
+            }
+        }
+    }
+}

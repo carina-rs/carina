@@ -860,7 +860,7 @@ mod error_format_tests {
 
     #[test]
     fn terminal_upstream_errors_render_every_detail_once() {
-        let backend = error::AppError::Backend(carina_state::BackendError::UpstreamExportRead(
+        let backend = error::AppError::from(carina_state::BackendError::UpstreamExportRead(
             Box::new(carina_state::backend::UpstreamExportReadError {
                 binding: "orgs".into(),
                 error: carina_state::BackendError::Io("permission denied".into()),

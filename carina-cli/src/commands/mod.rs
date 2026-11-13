@@ -124,10 +124,10 @@ pub(crate) async fn resolve_backend_for_read<P: PlaceholderKind, B: BindingAddre
     Ok(backend)
 }
 
-pub fn verify_for_mutation<P: PlaceholderKind, B: BindingAddress>(
+pub fn verify_for_mutation<'a, P: PlaceholderKind + 'a, B: BindingAddress + 'a>(
     project_dir: &ResolvedPath,
     command_path: &Path,
-    backend_config: Option<&BackendConfig<P, B>>,
+    backend_config: impl Into<carina_state::BackendConfigurationSource<'a, P, B>>,
     command: DriftCommand,
 ) -> Result<VerifiedMutationBackendSelection, AppError> {
     match BackendSelection::verified_for_mutation(project_dir, backend_config)? {
@@ -252,7 +252,7 @@ pub fn ensure_backend_lock<P: PlaceholderKind, B: BindingAddress>(
     }
     BackendLock::for_config(backend_config)?
         .save(&resolved)
-        .map_err(AppError::Backend)
+        .map_err(AppError::from)
 }
 
 /// Collapse an accumulated error Vec into a single `AppError`.
@@ -500,7 +500,7 @@ pub(crate) fn validate_root_backend<E>(parsed: &carina_core::parser::File<E>) ->
         && let Some(backend) = &parsed.backend
         && let Err(error) = StateBackendConfig::try_from(backend)
     {
-        vec![AppError::Backend(error.into())]
+        vec![AppError::from(carina_state::BackendError::from(error))]
     } else {
         Vec::new()
     }
@@ -1613,13 +1613,14 @@ mod tests {
         assert!(errors.iter().any(|error| {
             matches!(
                 error,
-                AppError::Backend(BackendError::InvalidConfig(
-                    carina_state::BackendConfigError::Invalid(errors)
-                )) if errors.errors().iter().any(|error| matches!(
-                    error,
-                    carina_state::BackendAttributeError::InvalidAttribute { attribute, .. }
-                        if attribute == "region"
-                ))
+                AppError::Backend(report) if matches!(report.backend_error(),
+                    BackendError::InvalidConfig(carina_state::BackendConfigError::Invalid(errors))
+                    if errors.errors().iter().any(|error| matches!(
+                        error,
+                        carina_state::BackendAttributeError::InvalidAttribute { attribute, .. }
+                            if attribute == "region"
+                    ))
+                )
             )
         }));
     }

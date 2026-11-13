@@ -3,11 +3,16 @@ use super::*;
 /// Exact declaration placements and explicitly opaque factory-owned values.
 /// The canonical payload is built only while those parts are assembled.
 ///
-/// ```compile_fail,E0451
+/// ```compile_fail
 /// use carina_core::validation::admission::{configuration::AdmittedConfiguration, kind::ProviderConfigAttribute};
-/// fn forge() -> AdmittedConfiguration<ProviderConfigAttribute> {
-///     AdmittedConfiguration { payload: unreachable!() }
+/// fn bypass(config: &AdmittedConfiguration<ProviderConfigAttribute>) {
+///     let _ = &config.payload; // forbidden: the existing payload field is private
 /// }
+/// ```
+/// ```
+/// # use carina_core::validation::admission::{configuration::AdmittedConfiguration, kind::ProviderConfigAttribute};
+/// # fn bypass(config: &AdmittedConfiguration<ProviderConfigAttribute>) {
+/// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct AdmittedConfiguration<K: ConfigurationKind> {

@@ -1849,7 +1849,7 @@ impl DiagnosticRun<'_> {
             .iter()
             .filter(|factory| declared_providers.contains(factory.name()))
         {
-            for attr_type in factory.provider_config_attribute_types().parts().values() {
+            for attr_type in factory.schema_witness().config().parts().values() {
                 collect_enum_provider_namespaces(attr_type, &mut enum_namespaces);
             }
         }

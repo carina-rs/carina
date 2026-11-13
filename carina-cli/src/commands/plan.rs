@@ -5915,10 +5915,7 @@ pub(crate) async fn run_plan_using(
 
     {
         let config = plan_backend.selected_config();
-        let bucket_exists = plan_backend
-            .bucket_exists()
-            .await
-            .map_err(AppError::Backend)?;
+        let bucket_exists = plan_backend.bucket_exists().await.map_err(AppError::from)?;
 
         if bucket_exists {
             // Try to load state from backend. `plan` is read-only and
@@ -5929,7 +5926,7 @@ pub(crate) async fn run_plan_using(
             state_file = plan_backend
                 .read_state()
                 .await
-                .map_err(AppError::Backend)?
+                .map_err(AppError::from)?
                 .map(|loaded| loaded.into_state());
         } else if use_locked_backend {
             return Err(AppError::Config(
@@ -7096,7 +7093,7 @@ pub(crate) async fn load_selected_upstream_states<B: carina_core::resource::Bind
         let (backend, metadata) = backend_result?;
 
         let published_exports = backend.read_published_exports().await.map_err(|error| {
-            AppError::Backend(carina_state::BackendError::UpstreamExportRead(Box::new(
+            AppError::from(carina_state::BackendError::UpstreamExportRead(Box::new(
                 carina_state::backend::UpstreamExportReadError {
                     binding: us.binding.to_string(),
                     error,

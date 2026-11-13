@@ -751,9 +751,6 @@ impl carina_core::provider::ProviderFactory for ConfiguredBuiltinMock {
     fn display_name(&self) -> &str {
         "Mock provider"
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        ValidatedConfigSchema::default()
-    }
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -794,9 +791,6 @@ impl carina_core::provider::ProviderFactory for MockNormalizer {
     }
     fn display_name(&self) -> &str {
         "Mock normalizer"
-    }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        ValidatedConfigSchema::default()
     }
     fn validate_config(
         &self,

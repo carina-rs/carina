@@ -496,3 +496,33 @@ mod tests {
         assert!(error.contains("EOF"), "{error}");
     }
 }
+
+#[cfg(test)]
+mod review_r2_source_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn review_r2_backend_locate_error_exposes_original_io_source() {
+        let path = "bad\0state.json";
+        let errors = [
+            load_local_state_file(&LocalStateFile::parse(path).unwrap())
+                .await
+                .unwrap_err(),
+            load_state_from_url(&StateUrl::parse(path).unwrap())
+                .await
+                .unwrap_err(),
+        ];
+        for error in errors {
+            let cause = std::error::Error::source(&error)
+                .expect("the BackendError returned to its caller must retain its IO source");
+            let io = cause.downcast_ref::<std::io::Error>().unwrap();
+            assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(
+                io.to_string(),
+                carina_core::paths::ResolvedPath::new(path)
+                    .unwrap_err()
+                    .to_string()
+            );
+        }
+    }
+}

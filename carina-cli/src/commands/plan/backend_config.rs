@@ -3,6 +3,19 @@ use carina_core::parser::ExpandedBackendConfig;
 /// Decoded saved-plan candidate, never backend construction authority.
 /// The legacy wire omission is serialization metadata; the candidate itself
 /// always names a backend and crosses state configuration admission before use.
+/// Selection consumes `selection_source()` so wire omission retains its origin.
+///
+/// ```compile_fail
+/// use carina_cli::commands::plan::SavedBackendConfig;
+/// fn bypass(config: &SavedBackendConfig) {
+///     let _ = config.candidate(); // forbidden: only serialization can access the bare candidate
+/// }
+/// ```
+/// ```
+/// # use carina_cli::commands::plan::SavedBackendConfig;
+/// # fn bypass(config: &SavedBackendConfig) {
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct SavedBackendConfig {
     candidate: ExpandedBackendConfig,
@@ -29,7 +42,14 @@ impl SavedBackendConfig {
             },
         }
     }
-    pub fn candidate(&self) -> &ExpandedBackendConfig {
+    pub fn selection_source(&self) -> carina_state::BackendConfigurationSource<'_> {
+        if self.recorded {
+            carina_state::BackendConfigurationSource::Declared(&self.candidate)
+        } else {
+            carina_state::BackendConfigurationSource::Implicit
+        }
+    }
+    pub(super) fn candidate(&self) -> &ExpandedBackendConfig {
         &self.candidate
     }
     pub(super) fn into_wire(self) -> Option<ExpandedBackendConfig> {

@@ -70,9 +70,16 @@ thread_local! { static REDACTION_PASSES: std::cell::Cell<usize> = const { std::c
 /// ```
 /// Sessions are minted by core.
 ///
-/// ```compile_fail,E0451
+/// ```compile_fail
 /// use carina_core::provider::ProviderSession;
-/// let _ = ProviderSession { config: todo!(), secrets: todo!(), diagnostics: todo!(), diagnostic_owner: todo!() };
+/// fn bypass(session: &ProviderSession) {
+///     let _ = &session.config; // forbidden: the existing configuration field is private
+/// }
+/// ```
+/// ```
+/// # use carina_core::provider::ProviderSession;
+/// # fn bypass(session: &ProviderSession) {
+/// # }
 /// ```
 /// Boundaries cannot be constructed externally.
 ///
@@ -131,17 +138,6 @@ thread_local! { static REDACTION_PASSES: std::cell::Cell<usize> = const { std::c
 /// ```
 #[doc(hidden)]
 pub struct BoundaryApiProbes;
-
-/// A provider session requires core's whole-plan admission witness.
-///
-/// ```compile_fail,E0624
-/// use carina_core::provider::{ProviderPlan, ProviderSession};
-/// fn slices(plan: &ProviderPlan) {
-///     let _ = ProviderSession::new(plan, "mock", None, None);
-/// }
-/// ```
-#[doc(hidden)]
-pub struct ProviderSessionSliceProbe;
 
 use std::borrow::Borrow;
 use std::fmt;

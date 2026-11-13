@@ -742,7 +742,10 @@ impl DiagnosticRun<'_> {
         } else {
             false
         };
-        let mut merged_result = merged_attempt.and_then(Result::ok);
+        let (mut merged_result, directory_error) = match merged_attempt.transpose() {
+            Ok(result) => (result, None),
+            Err(error) => (None, Some(error)),
+        };
         // Keep the parsed input stable while module-analysis results are filled
         // in. Cloning this Arc preserves the exact sealed directory without
         // cloning or revalidating the AST.
@@ -940,7 +943,27 @@ impl DiagnosticRun<'_> {
         // sibling call that binds a structural handle and then uses the
         // parameter bare). Resolution retains the parser-owned expression
         // location through the merged pass.
-        if let Some(tree) = merged_analysis.as_ref()
+        let backend_failure_reported = directory_error_emitted
+            && match (
+                directory_error
+                    .as_ref()
+                    .and_then(|error| error.element_diagnostic()),
+                current_parsed.and_then(|parsed| parsed.backend.as_ref()),
+                current_analysis.as_ref(),
+            ) {
+                (Some(finding), Some(backend), Some(tree)) => backend
+                    .attributes
+                    .keys()
+                    .any(|key| tree.backend_attribute_location(key) == finding.location()),
+                _ => false,
+            };
+        let strict_analysis = match merged_analysis.as_ref() {
+            Some(tree) => Some(tree),
+            None if !backend_failure_reported => current_analysis.as_ref(),
+            // The backend field already has its declaration-owned diagnostic.
+            None => None,
+        };
+        if let Some(tree) = strict_analysis
             && let Err(error) = carina_core::parser::resolve_resource_refs_from_analysis(
                 tree,
                 self.provider_context,
@@ -951,26 +974,10 @@ impl DiagnosticRun<'_> {
         // Every catalog runs the same declaration producers. An incomplete
         // catalog records deferrals; a loaded owner produces strict diagnostics.
         {
-            let custom_type_findings = match merged {
-                Some(_) => type_resolution
-                    .as_ref()
-                    .map(|report| report.diagnostics().to_vec())
-                    .unwrap_or_default(),
-                None => {
-                    if let Some(tree) = current_analysis.as_ref()
-                        && let Err(error) = carina_core::parser::resolve_resource_refs_from_analysis(
-                            tree,
-                            self.provider_context,
-                        )
-                    {
-                        diagnostics.extend(render_analysis_resolution_error(doc, &error));
-                    }
-                    type_resolution
-                        .as_ref()
-                        .map(|report| report.diagnostics().to_vec())
-                        .unwrap_or_default()
-                }
-            };
+            let custom_type_findings = type_resolution
+                .as_ref()
+                .map(|report| report.diagnostics().to_vec())
+                .unwrap_or_default();
             for finding in custom_type_findings {
                 if let Some(diagnostic) = render_merged(
                     doc,

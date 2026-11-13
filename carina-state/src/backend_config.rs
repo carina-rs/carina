@@ -32,24 +32,51 @@ use crate::backend::{LOCAL_BACKEND_TYPE, S3_BACKEND_TYPE};
 /// let checked = BackendConfig::from(backend::admit(&raw).unwrap());
 /// assert!(matches!(checked, BackendConfig::Local(_)));
 /// ```
-/// ```compile_fail,E0277
+/// ```compile_fail
 /// use carina_core::{parser::BackendConfig as Raw, resource::NoPlaceholder};
 /// use carina_state::BackendConfig;
-/// fn bypass(raw: Raw<NoPlaceholder>) { let _ = BackendConfig::from(raw); }
+/// fn bypass(raw: Raw<NoPlaceholder>) {
+///     let _ = BackendConfig::from(raw); // forbidden: extraction requires admitted settings
+/// }
 /// ```
-/// ```compile_fail,E0277
+/// ```
+/// # use carina_core::{parser::BackendConfig as Raw, resource::NoPlaceholder};
+/// # use carina_state::BackendConfig;
+/// # fn bypass(raw: Raw<NoPlaceholder>) {
+/// # }
+/// ```
+/// ```compile_fail
 /// use carina_core::validation::admission::{configuration::AdmittedConfiguration, kind::BackendAttribute};
-/// let _: AdmittedConfiguration<BackendAttribute> = serde_json::from_str("{}").unwrap();
+/// let _: AdmittedConfiguration<BackendAttribute> = serde_json::from_str("{}").unwrap(); // forbidden: admission cannot be deserialized
 /// ```
-/// ```compile_fail,E0277
+/// ```
+/// # use carina_core::validation::admission::{configuration::AdmittedConfiguration, kind::BackendAttribute};
+/// ```
+/// ```compile_fail
 /// use carina_core::validation::admission::{PendingAdmission, kind::BackendAttribute};
 /// use carina_state::BackendConfig;
-/// fn bypass(pending: PendingAdmission<BackendAttribute>) { let _ = BackendConfig::from(pending); }
+/// fn bypass(pending: PendingAdmission<BackendAttribute>) {
+///     let _ = BackendConfig::from(pending); // forbidden: pending values are not constructor authority
+/// }
 /// ```
-/// ```compile_fail,E0277
+/// ```
+/// # use carina_core::validation::admission::{PendingAdmission, kind::BackendAttribute};
+/// # use carina_state::BackendConfig;
+/// # fn bypass(pending: PendingAdmission<BackendAttribute>) {
+/// # }
+/// ```
+/// ```compile_fail
 /// use carina_core::validation::admission::{configuration::AdmittedConfiguration, kind::ProviderConfigAttribute};
 /// use carina_state::BackendConfig;
-/// fn bypass(provider: AdmittedConfiguration<ProviderConfigAttribute>) { let _ = BackendConfig::from(provider); }
+/// fn bypass(provider: AdmittedConfiguration<ProviderConfigAttribute>) {
+///     let _ = BackendConfig::from(provider); // forbidden: provider and backend admissions have distinct kinds
+/// }
+/// ```
+/// ```
+/// # use carina_core::validation::admission::{configuration::AdmittedConfiguration, kind::ProviderConfigAttribute};
+/// # use carina_state::BackendConfig;
+/// # fn bypass(provider: AdmittedConfiguration<ProviderConfigAttribute>) {
+/// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendConfig {
@@ -139,16 +166,18 @@ impl BackendConfig {
 ///
 /// Settings can only be extracted from admitted backend configuration:
 ///
-/// ```compile_fail,E0451
+/// ```compile_fail
 /// use carina_state::S3BackendSettings;
 ///
-/// let _ = S3BackendSettings {
-///     bucket: todo!(),
-///     key: todo!(),
-///     region: None,
-///     encrypt: None,
-///     auto_create: None,
-/// };
+/// fn bypass(settings: &S3BackendSettings) {
+///     let _ = &settings.bucket; // forbidden: the existing field is private
+/// }
+/// ```
+/// ```
+/// # use carina_state::S3BackendSettings;
+/// #
+/// # fn bypass(settings: &S3BackendSettings) {
+/// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S3BackendSettings {
@@ -226,9 +255,16 @@ impl S3BackendSettings {
 
 /// Checked local filesystem backend settings.
 ///
-/// ```compile_fail,E0451
+/// ```compile_fail
 /// use carina_state::LocalBackendSettings;
-/// let _ = LocalBackendSettings { path: None };
+/// fn bypass(settings: &LocalBackendSettings) {
+///     let _ = &settings.path; // forbidden: the existing field is private
+/// }
+/// ```
+/// ```
+/// # use carina_state::LocalBackendSettings;
+/// # fn bypass(settings: &LocalBackendSettings) {
+/// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalBackendSettings {
@@ -236,20 +272,43 @@ pub struct LocalBackendSettings {
 }
 
 /// Failure to pin a local state address, retaining the original IO cause.
-#[derive(Debug, thiserror::Error)]
-#[error("state file address lookup failed")] // error-chain: caller-renders-sources
+/// Display is terminal; transparent backend errors retain its source for inspection.
+#[derive(Debug)]
 pub struct LocalStateLocateError {
-    #[source]
     cause: std::io::Error,
+    context: LocateContext,
+}
+#[derive(Debug)]
+enum LocateContext {
+    File,
+    Address,
 }
 impl From<std::io::Error> for LocalStateLocateError {
     fn from(cause: std::io::Error) -> Self {
-        Self { cause }
+        Self {
+            cause,
+            context: LocateContext::File,
+        }
+    }
+}
+impl std::fmt::Display for LocalStateLocateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let context = match self.context {
+            LocateContext::File => "Failed to locate state file: ",
+            LocateContext::Address => "",
+        };
+        write!(f, "I/O error: {context}{}", self.cause)
+    }
+}
+impl std::error::Error for LocalStateLocateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
     }
 }
 impl LocalStateLocateError {
-    pub(crate) fn io_error(&self) -> &std::io::Error {
-        &self.cause
+    pub(crate) fn address(mut self) -> Self {
+        self.context = LocateContext::Address;
+        self
     }
 }
 

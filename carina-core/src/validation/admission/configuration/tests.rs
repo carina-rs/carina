@@ -358,3 +358,43 @@ fn provider_config_directory_checks_full_destination_after_resolution() {
         }
     }
 }
+
+#[test]
+fn review_r2_analysis_declared_field_cannot_silently_drop_pending() {
+    let factory = Factory::new(
+        ValidatedConfigSchema::validate(BTreeMap::from([(
+            "value".into(),
+            AttributeType::string(),
+        )]))
+        .unwrap(),
+    );
+    let declaration = ConfigurationDeclaration::provider(factory.name(), factory.schema.clone());
+    let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let route = ProviderInstanceKey::new("owner", None);
+    let key = crate::parser::AttributeKey::from("value");
+    let destination = declaration
+        .destination::<kind::ProviderConfigAttribute>(
+            &key,
+            InstanceIdentity::Provider(route.clone()),
+            CatalogRevision(CatalogSnapshot::Provider(catalog.custom_types.clone())),
+        )
+        .unwrap();
+    let inputs = ProviderValidationInputs::for_schema("owner");
+    let lookup = crate::parser::custom_type_lookup_for_factory(&factory, &inputs);
+    let value = Value::root_resource_ref("producer", "id", vec![]);
+    let pending = crate::validation::deferred_types::TypeCheckSession::run(&catalog, |session| {
+        assert!(matches!(
+            field(&destination, &value, session, &lookup).unwrap(),
+            Admission::Pending(_)
+        ));
+        let mut aggregate = ConfigurationBuilder::new(Arc::clone(&declaration), route.clone());
+        let error =
+            Analysis::declared(&destination, &key, &value, session, &lookup, &mut aggregate)
+                .expect_err("a declared-field result must not silently omit Pending");
+        assert!(matches!(
+            error.into_resolution_error(),
+            ResolutionError::Knowledge(_)
+        ));
+    });
+    pending.publish(&mut Vec::new());
+}
