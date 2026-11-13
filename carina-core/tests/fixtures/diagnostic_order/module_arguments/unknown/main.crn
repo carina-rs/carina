@@ -1,0 +1,9 @@
+let x = choice {
+  flag = true
+  zulu_bad = 1
+  alpha_bad = 2
+  quartz_bad = 3
+  bravo_bad = 4
+  mango_bad = 5
+  delta_bad = 6
+}
