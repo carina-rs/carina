@@ -2,7 +2,7 @@
 
 use carina_core::parser::ExportParamLike;
 use carina_core::validation::admission::configuration::backend::{
-    self as backend_admission, BackendAttributeError, BackendConfigError,
+    self as backend_admission, BackendAttributeError, LocatedBackendError,
 };
 use std::collections::HashSet;
 
@@ -706,29 +706,19 @@ impl DiagnosticRun<'_> {
                 render_merged(doc, &finding, DiagnosticSeverity::ERROR, error.to_string())
             };
 
-        match error {
-            BackendConfigError::Invalid(errors) => errors
-                .into_located(|attribute| tree.backend_attribute_location(attribute).clone())
-                .into_iter()
-                .filter_map(attribute_diagnostic)
-                .collect(),
-            unsupported @ BackendConfigError::UnsupportedBackend(_) => {
-                let finding = carina_core::parser::Located::new(
-                    tree.backend_location()
-                        .expect("backend declaration provenance")
-                        .clone(),
-                    unsupported,
-                );
-                render_merged(
+        error
+            .into_located(tree)
+            .into_iter()
+            .filter_map(|finding| match finding {
+                LocatedBackendError::Attribute(finding) => attribute_diagnostic(finding),
+                LocatedBackendError::Unsupported(finding) => render_merged(
                     doc,
                     &finding,
                     DiagnosticSeverity::ERROR,
                     finding.detail().to_string(),
-                )
-                .into_iter()
-                .collect()
-            }
-        }
+                ),
+            })
+            .collect()
     }
 
     /// Check expanded values while retaining the authored provider locations.

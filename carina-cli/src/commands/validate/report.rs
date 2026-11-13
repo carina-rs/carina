@@ -218,7 +218,7 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
             format_error_with_source_chain(finding.detail()),
             finding.location(),
         ),
-        AppError::BackendConfiguration(finding) => Diagnostic::located(
+        AppError::UnsupportedBackend(finding) => Diagnostic::located(
             format_error_with_source_chain(finding.detail()),
             finding.location(),
         ),

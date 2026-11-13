@@ -1332,7 +1332,7 @@ pub enum AppError {
     ResolvedMove(#[from] carina_core::effect::ResolvedMoveMismatch),
 
     /// A backend schema failure at its authored attribute.
-    #[error(transparent)]
+    #[error("{0}")]
     BackendAttribute(
         Box<
             carina_core::parser::Located<
@@ -1342,11 +1342,11 @@ pub enum AppError {
     ),
 
     /// An unsupported backend at its authored block.
-    #[error(transparent)]
-    BackendConfiguration(
+    #[error("{0}")]
+    UnsupportedBackend(
         Box<
             carina_core::parser::Located<
-                carina_core::validation::admission::configuration::backend::BackendConfigError,
+                carina_core::validation::admission::configuration::backend::UnsupportedBackendError,
             >,
         >,
     ),
@@ -1868,17 +1868,7 @@ pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static))
         {
             replan_command.get_or_insert(command);
         }
-        // Located backend errors already display their complete detail. Keep
-        // that detail in the typed source chain without rendering it twice.
-        source = match current.downcast_ref::<AppError>() {
-            Some(AppError::BackendAttribute(finding)) => {
-                std::error::Error::source(finding.detail())
-            }
-            Some(AppError::BackendConfiguration(finding)) => {
-                std::error::Error::source(finding.detail())
-            }
-            _ => current.source(),
-        };
+        source = current.source();
     }
     if let Some(command) = replan_command {
         messages.push(format!("Re-run `{command}` to create a new plan."));

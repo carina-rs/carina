@@ -27,6 +27,7 @@ use carina_core::parser::BackendConfig;
 #[cfg(test)]
 use carina_core::parser::ProviderContext;
 use carina_core::resource::{BindingAddress, PlaceholderKind};
+use carina_core::validation::admission::configuration::backend::LocatedBackendError;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendDrift, BackendLock, BackendSelection,
     MutationBackendSelection, ResolvedReadBackend, VerifiedMutationBackendSelection,
@@ -495,32 +496,37 @@ fn extend_module_resolution_errors(
 /// Backend checks depend on authored values, even when provider loading fails.
 pub(crate) fn validate_root_backend<E: carina_core::parser::ExportParamLike>(
     parsed: &carina_core::parser::File<E>,
+    tree: Option<
+        &carina_core::parser::AnalysisTree<
+            '_,
+            carina_core::resource::ParserPlaceholder,
+            carina_core::resource::ParserPlaceholder,
+            carina_core::parser::ParsedDeferredForPhase,
+            carina_core::resource::RelativeBindingName,
+            E,
+        >,
+    >,
 ) -> Vec<AppError> {
     if !carina_core::validation::is_module_definition(parsed)
         && let Some(backend) = &parsed.backend
         && let Err(error) = StateBackendConfig::try_from(backend)
     {
-        let tree = match carina_core::parser::AnalysisTree::try_from_file(parsed) {
-            Ok(tree) => tree,
-            Err(error) => return vec![AppError::AnalysisInvariant(error)],
+        let Some(tree) = tree else {
+            // A failed analysis seal must not hide independently checked settings.
+            return vec![AppError::Backend(error.into())];
         };
-        match error {
-            carina_state::BackendConfigError::Invalid(errors) => errors
-                .into_located(|attribute| tree.backend_attribute_location(attribute).clone())
-                .into_iter()
-                .map(|finding| AppError::BackendAttribute(Box::new(finding)))
-                .collect(),
-            unsupported @ carina_state::BackendConfigError::UnsupportedBackend(_) => {
-                vec![AppError::BackendConfiguration(Box::new(
-                    carina_core::parser::Located::new(
-                        tree.backend_location()
-                            .expect("backend declaration provenance")
-                            .clone(),
-                        unsupported,
-                    ),
-                ))]
-            }
-        }
+        error
+            .into_located(tree)
+            .into_iter()
+            .map(|finding| match finding {
+                LocatedBackendError::Attribute(finding) => {
+                    AppError::BackendAttribute(Box::new(finding))
+                }
+                LocatedBackendError::Unsupported(finding) => {
+                    AppError::UnsupportedBackend(Box::new(finding))
+                }
+            })
+            .collect()
     } else {
         Vec::new()
     }
@@ -671,27 +677,9 @@ fn validate_and_resolve_configuration(
                 .map(|error| AppError::Parse(Box::new(error))),
         );
     }
-    if !skip_resource_validation {
-        match carina_core::parser::AnalysisTree::try_from_file(parsed.parsed()) {
-            Ok(tree) => errors.extend(
-                carina_core::parser::check_provider_instance_routing(&tree)
-                    .into_iter()
-                    .map(|diagnostic| AppError::ProviderRouting(Box::new(diagnostic))),
-            ),
-            Err(error) => {
-                errors.push(AppError::AnalysisInvariant(error));
-                return Err(non_empty_validation_failure(errors));
-            }
-        }
-    }
-
-    if !skip_resource_validation {
-        errors.extend(duplicate_declaration_errors(
-            duplicate_declarations,
-            &module_walk,
-        ));
-    }
-
+    // Export inference refreshes retained judgements before the shared authored
+    // analysis snapshot. Keep its diagnostics in their original reporting order.
+    let mut export_inference_errors = Vec::new();
     if !skip_resource_validation {
         let schema_checked_exports = match parsed.retry_unchecked_export_inference(
             ctx.loaded_provider_schemas(),
@@ -700,14 +688,31 @@ fn validate_and_resolve_configuration(
             Ok(checked) => checked,
             Err(error) => {
                 errors.push(AppError::AnalysisInvariant(error));
+                errors.extend(validate_root_backend(parsed.parsed(), None));
                 return Err(non_empty_validation_failure(errors));
             }
         };
-        errors.extend(
+        export_inference_errors.extend(
             carina_core::validation::inference::attached_inference_failures(schema_checked_exports)
                 .map(|failure| AppError::Validation(failure.to_string())),
         );
     }
+
+    let analysis = parsed.analysis();
+    if !skip_resource_validation && let Ok(analysis) = &analysis {
+        errors.extend(
+            carina_core::parser::check_provider_instance_routing(analysis.tree())
+                .into_iter()
+                .map(|diagnostic| AppError::ProviderRouting(Box::new(diagnostic))),
+        );
+    }
+    if !skip_resource_validation {
+        errors.extend(duplicate_declaration_errors(
+            duplicate_declarations,
+            &module_walk,
+        ));
+    }
+    errors.extend(export_inference_errors);
 
     // A backend in a module-definition directory is the structural error: the
     // backend is misplaced, so do not also classify the module's arguments as
@@ -723,7 +728,18 @@ fn validate_and_resolve_configuration(
     // Validate provider region
     errors.extend(validate_provider_region_with_ctx(ctx, parsed.parsed()));
 
-    errors.extend(validate_root_backend(parsed.parsed()));
+    let analysis = match analysis {
+        Ok(analysis) => analysis,
+        Err(error) => {
+            errors.push(AppError::AnalysisInvariant(error));
+            errors.extend(validate_root_backend(parsed.parsed(), None));
+            return Err(non_empty_validation_failure(errors));
+        }
+    };
+    errors.extend(validate_root_backend(
+        parsed.parsed(),
+        Some(analysis.tree()),
+    ));
 
     // The catalog retains the schemas available in `ctx`, including explicit
     // unavailable owners when provider loading is skipped.
@@ -739,13 +755,8 @@ fn validate_and_resolve_configuration(
     // removed type cannot ride into apply. The recursive module-call checker
     // below runs this same typed resolver over every imported module.
     let mut root_type_resolution_findings = Vec::new();
-    let type_resolution = match parsed.resolve_type_exprs_report(enriched_context) {
-        Ok(report) => report,
-        Err(error) => {
-            errors.push(AppError::AnalysisInvariant(error));
-            return Err(non_empty_validation_failure(errors));
-        }
-    };
+    let (type_resolved, type_resolution) = analysis.resolve_type_exprs_report(enriched_context);
+    parsed = type_resolved;
     let resolved_argument_types = type_resolution.resolved_argument_types().clone();
     for diagnostic in type_resolution.into_diagnostics() {
         root_type_resolution_findings
@@ -1594,6 +1605,56 @@ mod tests {
     }
 
     #[test]
+    fn recovery_validation_keeps_backend_errors_when_analysis_fails() {
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let base = tempfile::tempdir().unwrap();
+        let base = ResolvedPath::new(base.path()).unwrap();
+        for (backend, expected) in [
+            (
+                "backend local { path = 1 typo = true }",
+                vec![
+                    "Invalid attribute 'path' for backend type 'local': Type mismatch: expected String, got Int",
+                    "Unknown attribute 'typo' for backend type 'local'",
+                ],
+            ),
+            ("backend gcs {}", vec!["Unsupported backend type: gcs"]),
+        ] {
+            let mut parsed = crate::test_support::inferred_fixture(&format!(
+                "{backend}\nprovider mock {{}}\nmock.test.resource {{ name = 'example' }}\n"
+            ));
+            // Simulate a recovery input whose resource lost parser provenance.
+            parsed.resources[0].declaration = Default::default();
+            assert!(carina_core::parser::AnalysisTree::try_from_file(&parsed).is_err());
+            let providers = ProviderLoad::load(
+                &runtime,
+                &parsed.providers,
+                &base,
+                &mut human_provider_notices(runtime.color_mode()),
+            )
+            .unwrap();
+            let parsed =
+                carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed);
+            let errors = validate_and_resolve_errors(&parsed, &base, &providers, true, &[]);
+            assert_eq!(
+                errors
+                    .iter()
+                    .filter(|error| matches!(error, AppError::AnalysisInvariant(_)))
+                    .count(),
+                1,
+                "one analysis invariant must retain the backend failures: {errors:#?}"
+            );
+            let rendered = errors
+                .iter()
+                .map(|error| crate::error::format_error_with_source_chain(error))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for message in expected {
+                assert_eq!(rendered.matches(message).count(), 1, "{rendered}");
+            }
+        }
+    }
+
+    #[test]
     fn backend_validation_keeps_the_typed_error() {
         let runtime = crate::test_support::TestCommandRuntime::new();
         let raw = carina_core::parser::parse_file(
@@ -1643,16 +1704,18 @@ mod tests {
                 )
             })
             .expect("located, typed backend attribute error");
-        assert!(
-            std::error::Error::source(error)
-                .unwrap()
-                .downcast_ref::<carina_state::BackendAttributeError>()
-                .is_some()
-        );
+        let AppError::BackendAttribute(finding) = error else {
+            unreachable!("matched the located backend attribute above")
+        };
+        assert!(matches!(
+            finding.detail(),
+            carina_state::BackendAttributeError::InvalidAttribute { attribute, .. }
+                if attribute == "region"
+        ));
         assert_eq!(
             crate::error::format_error_with_source_chain(error),
             error.to_string(),
-            "the typed source must not repeat the complete located message"
+            "the terminal located finding must render its typed detail once"
         );
     }
 

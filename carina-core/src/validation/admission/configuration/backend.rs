@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use super::*;
 use crate::parser::{self, AttributeKey};
-use crate::resource::ConcreteValue;
+use crate::resource::{ConcreteValue, ValueKind};
 use crate::schema::{AttributeType, DslTransform, TypeIdentity};
 
 const AWS_PROVIDER_NAME: &str = "aws";
@@ -89,10 +89,55 @@ struct BackendDeclaration {
 /// Failure to resolve a raw backend block through its declared schema.
 #[derive(Debug, Error)]
 pub enum BackendConfigError {
-    #[error("Unsupported backend type: {0}")]
-    UnsupportedBackend(String),
+    #[error(transparent)]
+    UnsupportedBackend(#[from] UnsupportedBackendError),
     #[error(transparent)]
     Invalid(#[from] BackendConfigErrors),
+}
+
+/// A backend type with no built-in declaration.
+#[derive(Debug, Error)]
+#[error("Unsupported backend type: {backend_type}")]
+pub struct UnsupportedBackendError {
+    backend_type: String,
+}
+
+/// Backend failures located by their sole core-owned diagnostic conversion.
+#[derive(Debug)]
+pub enum LocatedBackendError {
+    Attribute(parser::Located<BackendAttributeError>),
+    Unsupported(parser::Located<UnsupportedBackendError>),
+}
+
+impl BackendConfigError {
+    pub fn into_located<P: ValueKind, T: ValueKind, D, B: BindingAddress, E>(
+        self,
+        tree: &parser::AnalysisTree<'_, P, T, D, B, E>,
+    ) -> Vec<LocatedBackendError>
+    where
+        D: parser::DeferredForPhaseTraversal<P, T, B>,
+    {
+        match self {
+            Self::Invalid(errors) => errors
+                .errors
+                .into_iter()
+                .map(|error| {
+                    LocatedBackendError::Attribute(parser::Located::new(
+                        tree.backend_attribute_location(error.attribute()).clone(),
+                        error,
+                    ))
+                })
+                .collect(),
+            Self::UnsupportedBackend(error) => {
+                vec![LocatedBackendError::Unsupported(parser::Located::new(
+                    tree.backend_location()
+                        .expect("backend declaration provenance")
+                        .clone(),
+                    error,
+                ))]
+            }
+        }
+    }
 }
 
 /// All attribute-level failures from resolving one backend block.
@@ -113,19 +158,10 @@ impl BackendConfigErrors {
     }
 
     /// Attribute failures in deterministic attribute-name order.
+    /// Test-only introspection for structural admission assertions.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn errors(&self) -> &[BackendAttributeError] {
         &self.errors
-    }
-
-    /// Locate each failure at its authored attribute, preserving diagnostic order.
-    pub fn into_located(
-        self,
-        locate: impl Fn(&AttributeKey) -> parser::DeclarationLocation,
-    ) -> Vec<parser::Located<BackendAttributeError>> {
-        self.errors
-            .into_iter()
-            .map(|error| parser::Located::new(locate(error.attribute()), error))
-            .collect()
     }
 }
 
@@ -289,7 +325,12 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
     let kind = match config.backend_type.as_str() {
         "s3" => BackendKind::S3,
         "local" => BackendKind::Local,
-        other => return Err(BackendConfigError::UnsupportedBackend(other.into())),
+        other => {
+            return Err(UnsupportedBackendError {
+                backend_type: other.into(),
+            }
+            .into());
+        }
     };
     let backend = kind.declaration();
     let declaration = &backend.configuration;
