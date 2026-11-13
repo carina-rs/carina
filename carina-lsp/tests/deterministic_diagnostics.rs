@@ -61,3 +61,41 @@ fn undefined_function_references_keep_sibling_declaration_order() {
         );
     }
 }
+
+#[test]
+fn unknown_module_arguments_keep_authored_order() {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("carina-core/tests/fixtures/diagnostic_order/module_arguments/unknown");
+    let fixture = write_fixture(&[]);
+    std::fs::create_dir(fixture.path().join("choice")).unwrap();
+    for name in [
+        "main.crn",
+        "modules.crn",
+        "providers.crn",
+        "backend.crn",
+        "exports.crn",
+        "choice/arguments.crn",
+        "choice/attributes.crn",
+    ] {
+        std::fs::copy(source.join(name), fixture.path().join(name)).unwrap();
+    }
+    let engine = engine_with_schemas(SchemaRegistry::new());
+    let diagnostics = analyze(&engine, &fixture, "main.crn");
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.starts_with("Unknown argument"))
+            .map(|diagnostic| (diagnostic.message.clone(), diagnostic.range.start.line))
+            .collect::<Vec<_>>(),
+        ["zulu", "alpha", "quartz", "bravo", "mango", "delta"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| (
+                format!("Unknown argument '{name}_bad' for module 'choice'"),
+                index as u32 + 2
+            ))
+            .collect::<Vec<_>>()
+    );
+}

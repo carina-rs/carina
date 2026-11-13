@@ -194,3 +194,29 @@ fn validation_sweep_coverage_accounting() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn duplicate_function_signatures_keep_the_first_declaration() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("carina-core/tests/fixtures/diagnostic_order/functions/duplicate_signatures");
+    for _ in 0..16 {
+        let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+            .arg("validate")
+            .arg(&directory)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({"status": "error", "resource_count": 0, "resources": [], "errors": [{
+                "message": "duplicate function 'zebra': declared in a_functions.crn and z_functions.crn",
+                "severity": "error", "code": null, "location": null
+            }]})
+        );
+    }
+}

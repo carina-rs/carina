@@ -3873,7 +3873,7 @@ mod judgement {
         }
         fn index<'a, B: BindingAddress>(
             expression: &'a ExprValue<ParserPlaceholder, B>,
-            authored: &mut HashMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
+            authored: &mut IndexMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
             visited: &mut std::collections::HashSet<usize>,
         ) {
             if !visited.insert(Arc::as_ptr(&expression.authored) as usize) {
@@ -3886,7 +3886,7 @@ mod judgement {
                 index(child, authored, visited);
             }
         }
-        let mut authored = HashMap::new();
+        let mut authored = IndexMap::new();
         let mut visited = std::collections::HashSet::new();
         for expression in expressions
             .roots
@@ -3895,19 +3895,15 @@ mod judgement {
         {
             index(expression, &mut authored, &mut visited);
         }
-        let functions = authored
-            .values()
-            .filter_map(|expression| {
-                if let ExprKind::Function { name, signature } = &expression.authored.kind {
-                    Some((
-                        (expression.authored.location.instance.clone(), name.clone()),
-                        signature.clone(),
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut functions = HashMap::new();
+        for expression in authored.values() {
+            if let ExprKind::Function { name, signature } = &expression.authored.kind {
+                // Match the parser seed rule when duplicate declarations survive analysis.
+                functions
+                    .entry((expression.authored.location.instance.clone(), name.clone()))
+                    .or_insert_with(|| signature.clone());
+            }
+        }
         let authority = Arc::new(config.clone());
         let mut judge = Judge {
             authority: authority.clone(),
@@ -4038,7 +4034,7 @@ mod judgement {
 
     struct Judge<'a, B: BindingAddress> {
         authority: Arc<super::super::ProviderContext>,
-        authored: HashMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
+        authored: IndexMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
         expressions: &'a Expressions<B>,
         bindings: &'a InferenceBindings<ParserPlaceholder, B>,
         functions: HashMap<(ExpressionInstance, String), Arc<FunctionSignature>>,

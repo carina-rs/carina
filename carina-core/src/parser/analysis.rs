@@ -1274,11 +1274,10 @@ where
     // Graph membership comes from the ordering pass's exact
     // dependency computation. Provenance only anchors those
     // edges; retained references never add graph edges.
-    // Dependency membership has no authored sequence. Order invariant checks
-    // by binding so missing provenance always names the same edge first.
     let mut bindings = crate::deps::get_resource_dependencies(managed)
         .into_iter()
         .collect::<Vec<_>>();
+    // This membership set has no authored order; sorting stabilizes the first invariant error.
     bindings.sort_by(|left, right| left.as_str().cmp(right.as_str()));
     for binding in bindings {
         let explicit = dependencies

@@ -36,6 +36,10 @@ fn retained_module_outputs_keep_call_declaration_order() {
 
 #[test]
 fn retained_expression_instances_keep_call_declaration_order() {
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/diagnostic_order/retained_instances/choice/attributes.crn"
+    ));
     with_report(|report| {
         let location = report
             .expressions
@@ -46,7 +50,9 @@ fn retained_expression_instances_keep_call_declaration_order() {
                     .file()
                     .path()
                     .ends_with("choice/attributes.crn")
-                    && location.authored.span().start_column() == 31
+                    && source.get(
+                        location.authored.span().start_byte()..location.authored.span().end_byte(),
+                    ) == Some("value")
             })
             .expect("module attribute expression")
             .authored
