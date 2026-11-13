@@ -91,6 +91,8 @@ use crate::wiring::{
 #[cfg(test)]
 use crate::wiring::{ValidatedWiring, WiringContext, read_with_retry};
 use carina_core::hint::ProjectCommand;
+#[cfg(test)]
+use saved_plan::rehydrate_desired_plan_file_from_parts;
 use saved_plan::{
     HistoricalResourceAddresses, InputCheckedExecutablePlanFile, InspectedPlanFile,
     ProviderBoundPlanFile, ReloadedProviderBoundPlanFile, SavedPlanSecretCandidates,
@@ -187,7 +189,8 @@ fn saved_plan_secret_preparation_error(
     apply_target: ApplyTarget<'_>,
 ) -> AppError {
     match source {
-        error @ AppError::SavedPlanProviderScopeMismatch(_) => error,
+        error @ (AppError::SavedPlanProviderScopeMismatch(_)
+        | AppError::SavedPlanSecretVerification(_)) => error,
         error => saved_plan_secret_evaluation_error(error, apply_target),
     }
 }
@@ -3395,6 +3398,9 @@ async fn prepare_saved_plan_secret_candidates(
     )
     .await?;
 
+    let verified_inputs = pending_plan.verify_provider_inputs(provider_inputs, apply_target)?;
+    let provider_inputs = verified_inputs.inputs();
+
     // Reuse the exact I/O-free prelude the plan path uses. `candidate_state`
     // is the identity-reconciled state view produced above; the current-state
     // values come from the saved plan's plan-time snapshots, so verification
@@ -3466,7 +3472,7 @@ async fn prepare_saved_plan_secret_candidates(
 
     let candidates = SavedPlanSecretCandidates::from_expansion(
         validated_expansion,
-        provider_inputs,
+        verified_inputs,
         base_dir.clone(),
     );
 
@@ -3481,20 +3487,22 @@ fn rehydrate_desired_plan_file(
     candidates: &SavedPlanSecretCandidates,
     apply_target: ApplyTarget<'_>,
 ) -> Result<ReloadedPlanFile, AppError> {
-    rehydrate_desired_plan_file_from_parts(
+    rehydrate_desired_plan_file_from_verified_parts(
         plan_file,
         candidates.parsed(),
-        candidates.provider_inputs(),
+        candidates.provider_configs(),
         &candidates.source,
         apply_target,
         candidates.provider_context(),
     )
 }
 
-fn rehydrate_desired_plan_file_from_parts(
+fn rehydrate_desired_plan_file_from_verified_parts(
     plan_file: ReloadedPlanFile<SnapshotLeaf>,
     parsed: &carina_core::parser::ExpandedInferredFile,
-    provider_inputs: &ResolvedProviderInputs,
+    provider_configs: &carina_core::parser::SavedProviderConfigs<
+        carina_core::resource::NoPlaceholder,
+    >,
     source: &ResolvedPath,
     apply_target: ApplyTarget<'_>,
     provider_context: &carina_core::parser::LoadedProviderContext,
@@ -3580,12 +3588,6 @@ fn rehydrate_desired_plan_file_from_parts(
                     carina_core::resource::DataSource::to_value_data_source,
                 )?;
 
-                let fresh_provider_configs =
-                    carina_core::parser::SavedProviderConfigs::from(provider_inputs.configs());
-                let provider_configs = plan_file
-                    .provider_configs()
-                    .rehydrate_secrets(&fresh_provider_configs)
-                    .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
                 let upstream_snapshot = plan_file
                     .upstream_snapshot()
                     .iter()
@@ -3614,7 +3616,7 @@ fn rehydrate_desired_plan_file_from_parts(
                     unresolved_resources,
                     compositions,
                     data_source_origins,
-                    provider_configs,
+                    provider_configs: provider_configs.clone(),
                     upstream_snapshot,
                 }))
             },

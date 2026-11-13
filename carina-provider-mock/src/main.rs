@@ -952,7 +952,7 @@ impl CarinaProvider for MockProcessProvider {
     }
 
     fn provider_config_attribute_types(&self) -> CoreValidatedConfigSchema {
-        let mut attributes = std::collections::BTreeMap::from([
+        let attributes = std::collections::BTreeMap::from([
             (
                 "__mock_reference_scope_region__".into(),
                 CoreAttributeType::string(),
@@ -980,16 +980,17 @@ impl CarinaProvider for MockProcessProvider {
             ),
             ("validate_delay_millis".into(), CoreAttributeType::int()),
             ("reference_table".into(), CoreAttributeType::string()),
-        ]);
-        attributes.extend(BTreeMap::from([(
-            "unique_values".to_string(),
-            CoreAttributeType::refined_list(
-                CoreAttributeType::string(),
-                true,
-                None,
-                carina_core::schema::ListElements::Unique,
+            // Schema-only exception: host-side list-uniqueness fixture; the guest does not read it.
+            (
+                "unique_values".into(),
+                CoreAttributeType::refined_list(
+                    CoreAttributeType::string(),
+                    true,
+                    None,
+                    carina_core::schema::ListElements::Unique,
+                ),
             ),
-        )]));
+        ]);
         CoreValidatedConfigSchema::validate(attributes)
             .expect("mock provider config schema must be valid")
     }
@@ -1042,7 +1043,10 @@ impl CarinaProvider for MockProcessProvider {
                 ProviderError::from_diagnostic(ProviderErrorKind::InvalidInput, error)
             })?;
         }
-        if attrs.contains_key("__mock_initialize_error__") {
+        if matches!(
+            attrs.get("__mock_initialize_error__"),
+            Some(Value::Bool(true))
+        ) {
             return Err(Self::configuration_error(
                 "intentional mock initialization failure",
             ));
@@ -2207,10 +2211,15 @@ mod configuration_tests {
 
     #[test]
     fn false_configuration_trap_flags_do_not_trap() {
-        for key in ["__mock_validate_config_trap__", "validate_config_trap"] {
-            MockProcessProvider::default()
-                .validate_config(&BTreeMap::from([(key.into(), Value::Bool(false))]))
-                .unwrap();
+        for key in [
+            "__mock_validate_config_trap__",
+            "validate_config_trap",
+            "__mock_initialize_error__",
+        ] {
+            let attrs = BTreeMap::from([(key.into(), Value::Bool(false))]);
+            let mut provider = MockProcessProvider::default();
+            provider.validate_config(&attrs).unwrap();
+            provider.initialize(&attrs).unwrap();
         }
     }
 

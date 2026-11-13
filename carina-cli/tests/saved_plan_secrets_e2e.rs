@@ -1135,7 +1135,7 @@ fn saved_plan_rejects_changed_provider_config_secret_before_provider_call() {
     )];
     const CHANGED: &[(&str, &str)] = &[(
         "SAVED_PLAN_PROVIDER_ONLY_3861",
-        r#"{"fixture":{"Ok":{"Resolved":"CHANGED_PROVIDER_3861"}}}"#,
+        "CHANGED_PROVIDER_3861_NOT_JSON",
     )];
     let scenario = Scenario::new_with_wasm_provider(
         r#"backend local { path = "carina.state.json" }
@@ -1165,6 +1165,20 @@ mock.test.creation_constrained {
         rendered.contains("secret changed since the plan") && rendered.contains("carina plan"),
         "changed provider secret must produce replan guidance:\n{rendered}",
     );
+    for forbidden in [
+        "InvalidInput",
+        "invalid input",
+        "expected value",
+        "expected ident",
+        "invalid JSON",
+        "JSON parse",
+        "mock initialization failure",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "guest initialization ran before secret verification: {rendered}"
+        );
+    }
     assert_eq!(
         read_json(&scenario.project.join("plan.json"))["provider_artifacts"]["mock"]["kind"],
         "wasm"

@@ -170,13 +170,21 @@ async fn configuration_duration_overflow_fails_before_native_and_wasm_hooks() {
 async fn false_configuration_trap_flags_reach_guest_validation_without_trapping() {
     let path = wasm_path().expect("mock WASM fixture must be built");
     let (factory, _cache) = load_factory(&path).await;
-    for key in ["__mock_validate_config_trap__", "validate_config_trap"] {
+    for key in [
+        "__mock_validate_config_trap__",
+        "validate_config_trap",
+        "__mock_initialize_error__",
+    ] {
         let config = resolved_provider_config(
             "mock",
             indexmap::IndexMap::from([(key.into(), Value::Concrete(ConcreteValue::Bool(false)))]),
         );
-        carina_core::executor::prepare_provider_ready_config(&factory, &config)
+        let ready = carina_core::executor::prepare_provider_ready_config(&factory, &config)
             .expect("false must not request a guest validation trap");
+        factory
+            .initialize_fixture(None, &ready)
+            .await
+            .expect("false must not request a guest initialization failure");
     }
 }
 

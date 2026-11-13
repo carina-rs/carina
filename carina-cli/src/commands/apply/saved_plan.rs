@@ -526,6 +526,31 @@ fn saved_orphan_from_current(current: Current, row: &ResourceState) -> Orphan {
     }
 }
 
+/// Current provider inputs whose secrets match the saved plan. Construction
+/// borrows these inputs, and final rehydration reuses the verified payload.
+pub(super) struct VerifiedSavedPlanProviderInputs {
+    inputs: ResolvedProviderInputs,
+    saved_configs: SavedProviderConfigs<NoPlaceholder>,
+}
+
+impl VerifiedSavedPlanProviderInputs {
+    pub(super) fn inputs(&self) -> &ResolvedProviderInputs {
+        &self.inputs
+    }
+}
+
+fn rehydrate_provider_config_secrets(
+    plan_file: &ReloadedPlanFile<SnapshotLeaf>,
+    inputs: &ResolvedProviderInputs,
+    apply_target: ApplyTarget<'_>,
+) -> Result<SavedProviderConfigs<NoPlaceholder>, AppError> {
+    let fresh = SavedProviderConfigs::from(inputs.configs());
+    plan_file
+        .provider_configs()
+        .rehydrate_secrets(&fresh)
+        .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))
+}
+
 /// Fresh source values whose managed-resource slice is proven to have crossed
 /// the same deferred-`for` expansion seam as plan recording.
 ///
@@ -537,7 +562,7 @@ pub(super) struct SavedPlanSecretCandidates {
     validated: ValidatedConfig<
         ExpandedCanonicalResources<carina_core::parser::ExpandedInferredExportParam>,
     >,
-    provider_inputs: ResolvedProviderInputs,
+    provider_configs: SavedProviderConfigs<NoPlaceholder>,
 }
 
 #[cfg(test)]
@@ -566,13 +591,13 @@ impl SavedPlanSecretCandidates {
         validated: ValidatedConfig<
             ExpandedCanonicalResources<carina_core::parser::ExpandedInferredExportParam>,
         >,
-        provider_inputs: ResolvedProviderInputs,
+        provider_inputs: VerifiedSavedPlanProviderInputs,
         source: carina_core::paths::ResolvedPath,
     ) -> Self {
         Self {
             source,
             validated,
-            provider_inputs,
+            provider_configs: provider_inputs.saved_configs,
         }
     }
 
@@ -591,8 +616,8 @@ impl SavedPlanSecretCandidates {
         self.validated.resources().parsed()
     }
 
-    pub(super) fn provider_inputs(&self) -> &ResolvedProviderInputs {
-        &self.provider_inputs
+    pub(super) fn provider_configs(&self) -> &SavedProviderConfigs<NoPlaceholder> {
+        &self.provider_configs
     }
 }
 
@@ -603,6 +628,19 @@ pub(crate) struct SchemaCheckedPendingPlanFile {
 }
 
 impl SchemaCheckedPendingPlanFile {
+    pub(super) fn verify_provider_inputs(
+        &self,
+        inputs: ResolvedProviderInputs,
+        apply_target: ApplyTarget<'_>,
+    ) -> Result<VerifiedSavedPlanProviderInputs, AppError> {
+        let saved_configs =
+            rehydrate_provider_config_secrets(&self.plan_file, &inputs, apply_target)?;
+        Ok(VerifiedSavedPlanProviderInputs {
+            inputs,
+            saved_configs,
+        })
+    }
+
     pub(super) fn verify_provider_scopes(
         &self,
         provider: &ProviderRouter,
@@ -1260,6 +1298,27 @@ impl std::ops::Deref for InputCheckedExecutablePlanFile<'_> {
     fn deref(&self) -> &Self::Target {
         self.plan_file
     }
+}
+
+#[cfg(test)]
+pub(super) fn rehydrate_desired_plan_file_from_parts(
+    plan_file: ReloadedPlanFile<SnapshotLeaf>,
+    parsed: &carina_core::parser::ExpandedInferredFile,
+    provider_inputs: &ResolvedProviderInputs,
+    source: &ResolvedPath,
+    apply_target: ApplyTarget<'_>,
+    provider_context: &carina_core::parser::LoadedProviderContext,
+) -> Result<ReloadedPlanFile, AppError> {
+    let provider_configs =
+        rehydrate_provider_config_secrets(&plan_file, provider_inputs, apply_target)?;
+    super::rehydrate_desired_plan_file_from_verified_parts(
+        plan_file,
+        parsed,
+        &provider_configs,
+        source,
+        apply_target,
+        provider_context,
+    )
 }
 
 #[cfg(test)]
