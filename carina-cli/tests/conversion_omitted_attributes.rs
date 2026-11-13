@@ -247,8 +247,16 @@ macro_rules! omitted_attribute_case {
         async fn $plan() {
             let fixture = Fixture::new($shape);
             let source = fixture.write(true);
-            let result = fixture.plan().await;
-            assert!(result.is_err(), "{source}\nplan succeeded: {result:?}");
+            let error = fixture
+                .plan()
+                .await
+                .expect_err("an omitted resource operand must fail validation");
+            let rendered = carina_cli::error::format_error_with_source_chain(&error);
+            assert!(rendered.contains(BARE_RESOURCE), "{source}\n{rendered}");
+            assert!(
+                !rendered.contains("conversion cannot be checked here"),
+                "{rendered}"
+            );
         }
 
         #[test]
@@ -344,7 +352,19 @@ async fn r9_converted_alias_keeps_the_ordinary_bare_resource_gate() {
     let errors = json["errors"].as_array().unwrap();
     assert!(errors.iter().any(|error| error["message"] == "'q' is a resource, not a value; reference one of its attributes, e.g. 'q.<attribute>'"), "{json}");
     assert!(errors.iter().all(|error| error["code"].is_null()), "{json}");
-    assert!(fixture.plan().await.is_err());
+    let error = fixture
+        .plan()
+        .await
+        .expect_err("the converted alias is still a bare resource");
+    let rendered = carina_cli::error::format_error_with_source_chain(&error);
+    assert!(
+        rendered.contains("'q' is a resource, not a value"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("conversion cannot be checked here"),
+        "{rendered}"
+    );
     let diagnostics = fixture.lsp(source.into());
     assert!(
         diagnostics.iter().any(

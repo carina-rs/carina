@@ -1678,3 +1678,142 @@ fn r9_authored_slot_without_a_value_fails_closed_unless_conversion_free() {
         assert_eq!(presented.len(), usize::from(converted), "{presented:?}");
     }
 }
+
+#[test]
+fn r10_pending_nested_shape_validation_matches_the_no_as_control() {
+    let mut results = Vec::new();
+    for converted in [false, true] {
+        let expression = if converted {
+            "[['x' as mock.Name]]"
+        } else {
+            "[['x']]"
+        };
+        let catalog = super::tests::catalog();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("Sink")
+                .attribute(
+                    AttributeSchema::optional("target", AttributeType::list(named())).build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let parsed = crate::parser::parse_file(
+            &format!("mock.Sink {{ target = {expression} }}"),
+            Path::new("r10-pending.crn"),
+            &catalog,
+        )
+        .unwrap()
+        .resolve_root_for_test();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let judged = configuration.judged();
+        let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let values = std::collections::HashMap::from([(
+            "target".into(),
+            crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(
+                crate::resource::ApplyTimeUnknown::PendingReRead(
+                    crate::resource::PendingReRead::not_found(),
+                ),
+            )),
+        )]);
+        let inputs =
+            crate::validation::admission::attributes::ResourceAttributeInputs::from_resolved(
+                resource,
+                &values,
+                judged.report(),
+            )
+            .unwrap();
+        let classified = inputs.classify(
+            &crate::resource::knowledge::KnowledgeContext::validation(),
+            |_, _| {},
+        );
+        assert!(matches!(
+            classified["target"],
+            crate::resource::knowledge::Classification::Pending(_)
+        ));
+        let bindings =
+            crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+        let mut run: crate::validation::ConversionValidation =
+            crate::validation::ConversionValidation::new(judged.report());
+        let ordinary =
+            crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+                let result = run.admit_resource(
+                    crate::validation::admission::attributes::ResourceAdmissionRequest {
+                        resource,
+                        parsed: judged.file(),
+                        schema: resource.schema(&schemas).unwrap(),
+                        attributes: &classified,
+                        quoted: resource.quoted_string_attrs(),
+                        inputs: &inputs,
+                        bindings: &bindings,
+                        session,
+                        schemas: &schemas,
+                    },
+                );
+                result.errors().map(ToString::to_string).collect::<Vec<_>>()
+            });
+        let presented = run.complete().into_presented();
+        println!(
+            "R10-PENDING converted={converted}: source={expression}; judge={:?}; ordinary={ordinary:?}; presented={presented:?}",
+            judged.report().findings()
+        );
+        results.push((
+            converted,
+            !ordinary.is_empty() || !presented.is_empty() || !judged.report().findings().is_empty(),
+        ));
+    }
+    // The projected Pending value postpones ordinary shape validation for
+    // both forms; this probe does not establish an as/no-as difference.
+    assert_eq!(results, vec![(false, false), (true, false)]);
+    let value = crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(vec![
+        crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(vec![
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String("x".into())),
+        ])),
+    ]));
+    let catalog = super::tests::catalog();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(AttributeSchema::optional("target", AttributeType::list(named())).build())
+            .validate()
+            .unwrap(),
+    );
+    let resolved = crate::binding_index::ResolvedBindings::default();
+    let proof = crate::resource::knowledge::PlanResolved::try_from(
+        value
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::plan(
+                &resolved,
+            ))
+            .unwrap(),
+    )
+    .unwrap();
+    let attributes = std::collections::HashMap::from([("target".into(), proof)]);
+    let id = crate::resource::ResourceId::pending_with_provider("mock", "Sink", None);
+    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+        let findings = crate::validation::admission::attributes::admit_plan_attributes::<
+            crate::validation::admission::kind::ResourceAttribute,
+        >(
+            schemas
+                .get("mock", "Sink", crate::schema::SchemaKind::Resource)
+                .unwrap(),
+            &id,
+            &attributes,
+            &Default::default(),
+            session,
+        );
+        let errors = findings
+            .errors()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        println!("R10-PENDING operational_plan={errors:?}");
+        assert_eq!(errors.len(), 1, "{findings:?}");
+        assert!(
+            errors[0].contains("expected mock.Name, got List"),
+            "{errors:?}"
+        );
+    });
+}
