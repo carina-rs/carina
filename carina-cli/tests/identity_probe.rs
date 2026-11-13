@@ -4,12 +4,22 @@
 //! CARINA_IDENTITY_PROBE_PROVIDERS (offline artifacts), and
 //! CARINA_IDENTITY_PROBE_OUTPUT (one dump per directory). Real-directory runs
 //! write SHA-256 plus byte length for identity and secret bytes, never raw bytes.
-//! Files are private (0600 on Unix). The output root must be fresh and empty.
+//! Fingerprints are unsalted SHA-256 + length: dictionary attacks recover weak
+//! secrets and low-entropy keys. Real-directory dumps are sensitive local evidence
+//! under 0600;
+//! never attach dumps or captured stderr to PRs or CI artifacts. Publish only
+//! the comparison verdict. The output root must be fresh and empty.
 //! Schema-only installed artifacts are read; provider runtimes, network, AWS and
-//! state backends are never used. Source identifiers stay readable; loop/map and
-//! expansion keys and whole identities/addresses are fingerprints. Consecutive
+//! state backends are never used. Only static literals, in-root source paths,
+//! and schema-backed names stay readable; other strings are fingerprinted.
+//! Consecutive
 //! identical computations collapse.
 //! The whole v2 snapshot includes unattributed observations with stated reasons.
+//! Use the same checkout path for main and candidate: preparatory loop inputs
+//! include absolute root bytes. RawSynthetic accepts any directory; keep raw
+//! runs limited to generated fixtures. The paired pipeline's own stderr warnings
+//! are not controlled by the probe; this test captures worker stderr without
+//! echoing it, and reports only its byte count.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -210,7 +220,10 @@ fn deferred_loop_body_is_covered_when_the_iterable_becomes_known() {
     )
     .unwrap();
     assert_eq!(outcome.deferred.len(), 1);
-    assert_eq!(outcome.deferred[0].file, "deferred.crn");
+    assert_eq!(
+        serde_json::to_value(&outcome.deferred[0].file).unwrap(),
+        "deferred.crn"
+    );
     let pending: serde_json::Value =
         serde_json::from_str(&probe(copied.path(), synthetic()).unwrap()).unwrap();
     assert_eq!(pending["status"]["kind"], "partial");
@@ -332,6 +345,26 @@ fn offline_identity_probe_uses_only_the_supplied_environment() {
 #[test]
 #[ignore = "explicit infra and artifacts required; writes only SHA-256 and lengths, never raw identity or secret bytes"]
 fn real_directory_identity_probe() {
+    if std::env::var_os("CARINA_IDENTITY_PROBE_WORKER").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "real_directory_identity_probe",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("CARINA_IDENTITY_PROBE_WORKER", "1")
+            .output()
+            .unwrap();
+        println!("captured pipeline stderr bytes: {}", output.stderr.len());
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        assert!(
+            output.status.success(),
+            "identity probe worker exited {}",
+            output.status
+        );
+        return;
+    }
     let required = |name| PathBuf::from(std::env::var_os(name).expect(name));
     let root = required("CARINA_IDENTITY_PROBE_ROOT");
     let artifacts = required("CARINA_IDENTITY_PROBE_PROVIDERS");
@@ -604,7 +637,7 @@ fn round_two_fingerprint_mode_hides_environment_map_loop_keys() {
     ] {
         // Keep identical module arguments in separate configurations: combining
         // bound and unbound calls would itself produce an identity collision.
-        for (loops, expected_count) in [
+        for (loops, expected_count, has_unbound) in [
             (
                 r#"
 for key, name in keyed { probe.Declared { name = "${name}-anonymous" } }
@@ -612,6 +645,7 @@ let named = for key, name in keyed { probe.Declared { name = "${name}-anonymous"
 for key, name in keyed { child { name = "${name}-module" } }
 "#,
                 20,
+                true,
             ),
             (
                 r#"
@@ -619,6 +653,7 @@ let other_named = for key, name in keyed { probe.Declared { name = "${name}-anon
 let module_named = for key, name in keyed { child { name = "${name}-module" } }
 "#,
                 19,
+                false,
             ),
         ] {
             let temporary = tempfile::tempdir().unwrap();
@@ -683,10 +718,61 @@ let keyed = {{ {key} = 'map-loop-name' }}
             )
             .unwrap()
             .dump;
+            let raw: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let resources = raw["resources"].as_array().unwrap();
             assert!(
-                raw.contains(private),
-                "fixture must exercise the key-bearing metadata"
+                resources
+                    .iter()
+                    .any(|resource| resource["address"].as_str().unwrap().contains(private)),
+                "raw address must exercise the key"
             );
+            if has_unbound {
+                assert!(
+                    resources
+                        .iter()
+                        .flat_map(|resource| resource["hash_inputs"].as_array().unwrap())
+                        .flat_map(|input| input["context"].as_array().unwrap())
+                        .any(|context| context.as_str().is_some_and(|label| label
+                            .starts_with("module:")
+                            && label.contains(private))),
+                    "raw module expansion must exercise the key (case {expected_count})"
+                );
+            } else {
+                assert!(
+                    resources
+                        .iter()
+                        .flat_map(|resource| resource["expansion"]["instances"].as_array().unwrap())
+                        .any(|instance| instance["instance"].as_str().unwrap().contains(private)),
+                    "raw bound module instance must exercise the key"
+                );
+            }
+            if has_unbound {
+                let origins: Vec<_> = resources
+                    .iter()
+                    .flat_map(|resource| {
+                        let provenance = &resource["expansion"]["loop"];
+                        provenance.get("direct").into_iter().chain(
+                            provenance["module_prefixes"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .map(|prefix| &prefix["origin"]),
+                        )
+                    })
+                    .collect();
+                assert!(
+                    origins
+                        .iter()
+                        .any(|origin| origin["legacy"].as_str().unwrap().contains(private)),
+                    "raw legacy address must exercise the key"
+                );
+                assert!(
+                    origins
+                        .iter()
+                        .any(|origin| origin["kind"]["element"]["value"] == private),
+                    "raw loop element must exercise the key"
+                );
+            }
             let document: serde_json::Value = serde_json::from_str(&dump).unwrap();
             assert_eq!(
                 document["resources"].as_array().unwrap().len(),
@@ -782,4 +868,53 @@ fn missing_schema_error_identifies_declaration_without_a_loop_key() {
     let message = error.to_string();
     assert!(!message.contains("PRIVATE_LOOP_KEY_CANARY"));
     assert!(message.contains("keyed.crn:"));
+}
+
+#[test]
+fn sha_paths_outside_root_hide_the_directory_names() {
+    let temporary = tempfile::tempdir().unwrap();
+    let project = temporary.path().join("project");
+    copy_fixture(&project);
+    fs::rename(
+        project.join("child"),
+        temporary.path().join("PRIVATE_OUTSIDE_DIRECTORY_CANARY"),
+    )
+    .unwrap();
+    let main = fs::read_to_string(project.join("main.crn"))
+        .unwrap()
+        .replace("./child", "../PRIVATE_OUTSIDE_DIRECTORY_CANARY");
+    fs::write(project.join("main.crn"), main).unwrap();
+    let real = probe_directory(
+        &project,
+        &EnvironmentSnapshot::empty(),
+        RedactionMode::Sha256(synthetic()),
+    )
+    .unwrap()
+    .dump;
+    assert!(!real.contains("PRIVATE_OUTSIDE_DIRECTORY_CANARY"));
+    assert!(!real.contains("../"));
+    assert!(real.contains("outside-root"));
+    let raw = probe(&project, synthetic()).unwrap();
+    assert!(raw.contains("../PRIVATE_OUTSIDE_DIRECTORY_CANARY/main.crn"));
+}
+
+#[test]
+fn undeclared_authored_attribute_names_are_fingerprinted() {
+    let temporary = tempfile::tempdir().unwrap();
+    copy_fixture(temporary.path());
+    fs::write(
+        temporary.path().join("unchecked.crn"),
+        "let unchecked = probe.Secrets { unchecked_secret_key_CANARY = secret('fixture-value') }\n",
+    )
+    .unwrap();
+    let real = probe_directory(
+        temporary.path(),
+        &EnvironmentSnapshot::empty(),
+        RedactionMode::Sha256(synthetic()),
+    )
+    .unwrap()
+    .dump;
+    assert!(!real.contains("unchecked_secret_key_CANARY"));
+    let raw = probe(temporary.path(), synthetic()).unwrap();
+    assert!(raw.contains("unchecked_secret_key_CANARY"));
 }

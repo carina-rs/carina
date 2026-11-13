@@ -25,7 +25,19 @@ fn resources() -> Vec<PreparedResource> {
         .zip(["first", "second"])
         .enumerate()
         .map(|(ordinal, (resource, address))| PreparedResource {
-            dump: json!({ "ordinal": ordinal, "address": address, "secret_material": [], "declaration": { "file": "fixture.crn", "start_byte": ordinal * 32 } }),
+            dump: object([
+                ("ordinal", ordinal.into()),
+                ("address", Disclosure::raw().opaque(address)),
+                ("secret_material", array([])),
+                (
+                    "declaration",
+                    object([
+                        ("file", Disclosure::raw().fixed("fixture.crn")),
+                        ("start_byte", (ordinal * 32).into()),
+                    ]),
+                ),
+            ]),
+            address: format!("fixture.crn:{}", ordinal * 32),
             key: identity_recording::resource_key(resource).unwrap(),
             loop_identities: Vec::new(),
             requires_identity: true,
@@ -68,7 +80,7 @@ fn reordered_inputs_follow_system_ids_and_keep_distinct_call_order() {
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
-        Disclosure::Raw,
+        Disclosure::raw(),
     )
     .unwrap();
     let dump: Json = serde_json::from_str(&dump).unwrap();
@@ -92,7 +104,7 @@ fn missing_or_off_thread_identity_recording_is_incomplete() {
         },
         Vec::new(),
         &SourcePaths::new(Path::new(".")).unwrap(),
-        Disclosure::Raw,
+        Disclosure::raw(),
     )
     .unwrap_err();
     match error {
@@ -119,7 +131,7 @@ fn foreign_inputs_are_reported_and_make_the_probe_incomplete() {
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
-        Disclosure::Raw,
+        Disclosure::raw(),
     )
     .unwrap();
     assert_eq!(document.missing, ["unattributed hash inputs"]);
@@ -149,7 +161,7 @@ fn observed_simhash_result_cannot_hide_missing_feature_inputs() {
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
-        Disclosure::Raw,
+        Disclosure::raw(),
     )
     .unwrap_err();
     match error {
@@ -182,7 +194,7 @@ fn loop_association_does_not_depend_on_digest_or_identity_format() {
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
-        Disclosure::Raw,
+        Disclosure::raw(),
     )
     .unwrap();
     let dump: Json = serde_json::from_str(&dump).unwrap();
@@ -212,7 +224,7 @@ fn missing_anonymous_module_prefix_recording_is_incomplete() {
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
-        Disclosure::Raw,
+        Disclosure::raw(),
     )
     .unwrap_err();
     match error {
@@ -259,7 +271,7 @@ fn directory_walk_collects_failures_and_writes_every_success() {
             }),
             "bad-last" => Err(ProbeError::incomplete("fixture failure")),
             "deferred" => Ok(ProbeDocument {
-                deferred: vec![DeferredSite { file: "main.crn".into(), span: 10..20 }],
+                deferred: vec![DeferredSite { file: Disclosure::raw().fixed("main.crn"), span: 10..20 }],
                 dump: "{\"status\":{\"kind\":\"partial\",\"deferred\":[{\"file\":\"main.crn\",\"span\":{\"start\":10,\"end\":20}}]}}\n".into(),
                 missing: Vec::new(),
             }),
@@ -275,7 +287,7 @@ fn directory_walk_collects_failures_and_writes_every_success() {
     match &error {
         ProbeError::DirectoryFailures(failures) => {
             assert_eq!(failures.failures().count(), 2);
-            assert!(failures.report().results().iter().any(|result| matches!(&result.status, DirectoryStatus::Partial { deferred } if deferred == &[DeferredSite { file: "main.crn".into(), span: 10..20 }])));
+            assert!(failures.report().results().iter().any(|result| matches!(&result.status, DirectoryStatus::Partial { deferred } if deferred == &[DeferredSite { file: Disclosure::raw().fixed("main.crn"), span: 10..20 }])));
             assert!(
                 failures
                     .report()
@@ -366,7 +378,7 @@ fn round_two_consecutive_repeats_collapse_per_owner_without_reordering_distinct_
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
-        Disclosure::Raw,
+        Disclosure::raw(),
     )
     .unwrap();
     let document: Json = serde_json::from_str(&dump).unwrap();
@@ -406,7 +418,7 @@ fn round_two_unattributed_contexts_outside_root_are_relative() {
         },
         inputs,
         &SourcePaths::new(&root).unwrap(),
-        Disclosure::Raw,
+        Disclosure::raw(),
     )
     .unwrap();
     assert!(
@@ -496,7 +508,9 @@ fn secret_paths_keep_schema_fields_readable_and_fingerprint_only_map_keys() {
     let mut observations = Vec::new();
     observe_secrets(
         &value,
-        &SecretPath(vec![SecretPathPart::Attribute("settings".into())]),
+        &SecretPath(vec![SecretPathPart::Attribute(
+            Disclosure::Sha256.attribute(&schema, "settings"),
+        )]),
         Some(schema.effective_attribute("settings").unwrap().value_type()),
         &mut observations,
         &SourcePaths::new(Path::new(".")).unwrap(),
@@ -509,6 +523,7 @@ fn secret_paths_keep_schema_fields_readable_and_fingerprint_only_map_keys() {
         "the production payload producer must be observed"
     );
     for observation in &observations {
+        let observation = serde_json::to_value(observation).unwrap();
         assert_eq!(observation["path"][0], json!({"attribute": "settings"}));
         assert_eq!(observation["path"][1], json!({"attribute": "public_field"}));
         assert_eq!(observation["path"][2]["map_key"]["length"], 19);
@@ -565,11 +580,11 @@ fn complete_addresses_are_fingerprinted_without_a_recorder() {
         "module.instance.child",
     ] {
         assert_eq!(
-            Disclosure::Sha256.disclose(DisclosureKind::Fingerprint, address),
+            serde_json::to_value(Disclosure::Sha256.opaque(address)).unwrap(),
             serde_json::to_value(identity_recording::fingerprint(address.as_bytes())).unwrap()
         );
         assert_eq!(
-            Disclosure::Raw.disclose(DisclosureKind::Fingerprint, address),
+            serde_json::to_value(Disclosure::raw().opaque(address)).unwrap(),
             json!(address)
         );
     }
@@ -606,7 +621,7 @@ fn typed_provenance_string_disclosure_does_not_depend_on_json_field_names() {
         .display_origin()
         .unwrap();
     let (_, legacy, _) = origin.recording_parts();
-    let value = Disclosure::Sha256.disclose(DisclosureKind::Fingerprint, legacy);
+    let value = Disclosure::Sha256.opaque(legacy);
     let renamed = json!({"future_provenance_identity": value});
     assert_eq!(
         renamed["future_provenance_identity"],
@@ -615,6 +630,7 @@ fn typed_provenance_string_disclosure_does_not_depend_on_json_field_names() {
     let rendered = SourcePaths::new(Path::new("."))
         .unwrap()
         .loop_provenance(&parsed.resources[0].loop_provenance, Disclosure::Sha256);
+    let rendered = serde_json::to_value(rendered).unwrap();
     assert_eq!(
         rendered["direct"]["legacy"],
         renamed["future_provenance_identity"]
@@ -647,4 +663,58 @@ fn missing_loop_inputs_do_not_disclose_the_identity_in_errors_or_statuses() {
     let status = DirectoryStatus::Failed(error);
     assert!(!status.to_string().contains("PRIVATE_LOOP_IDENTITY_CANARY"));
     assert!(!format!("{status:?}").contains("PRIVATE_LOOP_IDENTITY_CANARY"));
+}
+
+#[test]
+fn typed_dump_nodes_disclose_only_static_schema_or_source_path_text() {
+    let paths = SourcePaths::new(Path::new(".")).unwrap();
+    let outside = paths.relative(
+        &std::env::current_dir()
+            .unwrap()
+            .join("../PRIVATE_PATH_CANARY/main.crn"),
+    );
+    let mut registry = carina_core::schema::SchemaRegistry::new();
+    registry.insert(
+        "probe",
+        carina_core::schema::ResourceSchema::new("Checked")
+            .attribute(
+                carina_core::schema::AttributeSchema::optional(
+                    "declared",
+                    carina_core::schema::AttributeType::string(),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let schema = registry
+        .get(
+            "probe",
+            "Checked",
+            carina_core::schema::SchemaKind::Resource,
+        )
+        .unwrap();
+    let (provider, resource_type) = Disclosure::Sha256.schema_names(schema);
+    let document = object([
+        ("literal", Disclosure::Sha256.fixed("fixed")),
+        ("outside", Disclosure::Sha256.path(&outside)),
+        ("provider", provider),
+        ("type", resource_type),
+        (
+            "declared",
+            Disclosure::Sha256.attribute(schema.schema(), "declared"),
+        ),
+        (
+            "undeclared",
+            Disclosure::Sha256.attribute(schema.schema(), "PRIVATE_ATTRIBUTE_CANARY"),
+        ),
+        ("container", array([true.into(), 7_usize.into()])),
+    ]);
+    let text = serde_json::to_string(&document).unwrap();
+    assert!(!text.contains("PRIVATE_PATH_CANARY"));
+    assert!(!text.contains("PRIVATE_ATTRIBUTE_CANARY"));
+    let value: Json = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["outside"]["kind"], "outside-root");
+    assert_eq!(value["declared"], "declared");
+    assert!(value["undeclared"]["sha256"].is_string());
 }

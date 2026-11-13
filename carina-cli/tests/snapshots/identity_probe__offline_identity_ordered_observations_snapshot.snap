@@ -101,7 +101,7 @@ expression: first
       ],
       "identity_basis": "stable",
       "ordinal": 0,
-      "resolved_prefixes": {},
+      "resolved_prefixes": [],
       "resource_id": {
         "identity": "probe_declared_a40a62db",
         "provider": "probe",
@@ -204,7 +204,7 @@ expression: first
       ],
       "identity_basis": "stable",
       "ordinal": 1,
-      "resolved_prefixes": {},
+      "resolved_prefixes": [],
       "resource_id": {
         "identity": "probe_declared_a0bf5787",
         "provider": "probe",
@@ -307,7 +307,7 @@ expression: first
       ],
       "identity_basis": "stable",
       "ordinal": 2,
-      "resolved_prefixes": {},
+      "resolved_prefixes": [],
       "resource_id": {
         "identity": "probe_declared_a53573df",
         "provider": "probe",
@@ -410,7 +410,7 @@ expression: first
       ],
       "identity_basis": "stable",
       "ordinal": 3,
-      "resolved_prefixes": {},
+      "resolved_prefixes": [],
       "resource_id": {
         "identity": "probe_chained_a0bf5787",
         "provider": "probe",
@@ -485,7 +485,7 @@ expression: first
       ],
       "identity_basis": "stable",
       "ordinal": 4,
-      "resolved_prefixes": {},
+      "resolved_prefixes": [],
       "resource_id": {
         "identity": "probe_create_only_a8162111",
         "provider": "probe",
@@ -560,7 +560,7 @@ expression: first
       ],
       "identity_basis": "stable",
       "ordinal": 5,
-      "resolved_prefixes": {},
+      "resolved_prefixes": [],
       "resource_id": {
         "identity": "probe_create_only_16ca9e65",
         "provider": "probe",
@@ -635,7 +635,7 @@ expression: first
       ],
       "identity_basis": "stable",
       "ordinal": 6,
-      "resolved_prefixes": {},
+      "resolved_prefixes": [],
       "resource_id": {
         "identity": "probe_create_only_b5f83535",
         "provider": "probe",
@@ -729,7 +729,7 @@ expression: first
       ],
       "identity_basis": "attribute-derived",
       "ordinal": 7,
-      "resolved_prefixes": {},
+      "resolved_prefixes": [],
       "resource_id": {
         "identity": "probe_mutable_4041028d90274108",
         "provider": "probe",
@@ -832,9 +832,12 @@ expression: first
       ],
       "identity_basis": "stable",
       "ordinal": 8,
-      "resolved_prefixes": {
-        "name": "fixed-prefix"
-      },
+      "resolved_prefixes": [
+        {
+          "attribute": "name",
+          "value": "fixed-prefix"
+        }
+      ],
       "resource_id": {
         "identity": "probe_declared_da0d6114",
         "provider": "probe",
@@ -995,7 +998,7 @@ expression: first
       ],
       "identity_basis": "stable",
       "ordinal": 9,
-      "resolved_prefixes": {},
+      "resolved_prefixes": [],
       "resource_id": {
         "identity": "probe_declared_bb65fff5",
         "provider": "probe",
@@ -1156,7 +1159,7 @@ expression: first
       ],
       "identity_basis": "stable",
       "ordinal": 10,
-      "resolved_prefixes": {},
+      "resolved_prefixes": [],
       "resource_id": {
         "identity": "probe_declared_b2001f4a",
         "provider": "probe",
@@ -1180,7 +1183,7 @@ expression: first
       "hash_inputs": [],
       "identity_basis": "named",
       "ordinal": 11,
-      "resolved_prefixes": {},
+      "resolved_prefixes": [],
       "resource_id": {
         "identity": "secrets",
         "provider": "probe",
@@ -1253,7 +1256,7 @@ expression: first
       "hash_inputs": [],
       "identity_basis": "named",
       "ordinal": 12,
-      "resolved_prefixes": {},
+      "resolved_prefixes": [],
       "resource_id": {
         "identity": "a",
         "provider": "probe",
@@ -1277,7 +1280,7 @@ expression: first
       "hash_inputs": [],
       "identity_basis": "named",
       "ordinal": 13,
-      "resolved_prefixes": {},
+      "resolved_prefixes": [],
       "resource_id": {
         "identity": "b",
         "provider": "probe",
@@ -1301,7 +1304,7 @@ expression: first
       "hash_inputs": [],
       "identity_basis": "named",
       "ordinal": 14,
-      "resolved_prefixes": {},
+      "resolved_prefixes": [],
       "resource_id": {
         "identity": "unknown_b",
         "provider": "probe",
@@ -1410,7 +1413,7 @@ expression: first
       ],
       "identity_basis": "stable",
       "ordinal": 15,
-      "resolved_prefixes": {},
+      "resolved_prefixes": [],
       "resource_id": {
         "identity": "instance.probe_declared_e4c53e45",
         "provider": "probe",
@@ -1588,7 +1591,7 @@ expression: first
       ],
       "identity_basis": "stable",
       "ordinal": 16,
-      "resolved_prefixes": {},
+      "resolved_prefixes": [],
       "resource_id": {
         "identity": "child_208300a382800445.probe_declared_33f119d0",
         "provider": "probe",

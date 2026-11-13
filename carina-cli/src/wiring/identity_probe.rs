@@ -1,10 +1,15 @@
 //! Offline identity observations for comparing #4400 PR heads.
 //!
-//! Synthetic callers explicitly choose raw bytes or fingerprints. Real mode
-//! fingerprints every complete identity/address and other user-derived string
-//! with SHA-256 plus byte length. Plaintext requires an explicit allow-list kind:
-//! FixedLiteral, RelativePath, SchemaOrTypeName, AttributeName, SourceBindingName.
-//! Typed renderers select every field; serialized structures never pass through.
+//! Real mode uses unsalted SHA-256 plus byte length. Low-entropy keys and weak
+//! secrets are recoverable by dictionary. Real-directory dumps are sensitive
+//! local evidence,
+//! written under 0600; never attach them to PRs or CI artifacts. Publish only
+//! the comparison verdict. RawSynthetic accepts any directory with supplied
+//! factories; use it only for generated fixtures, never private configurations.
+//! Dump nodes accept only Disclosed values, numbers/bools, and their containers.
+//! Plaintext comes only from static literals, in-root source paths, or registered
+//! schema/type/attribute names. Unchecked authored names are fingerprinted.
+//! Outside-root paths disclose only the fixed marker and a path fingerprint.
 //! Exact consecutive computations per owner (including SimHash features)
 //! collapse; distinct computations retain their order without pinning pass counts.
 //! The production directory/module pipeline uses skip-resource-validation mode
@@ -17,11 +22,21 @@
 //!
 //! A deferred `for` contributes nothing from its body: no resource entries,
 //! anonymous or loop-element identities, keyed addresses, module prefixes, or
-//! secret material. Secrets not known offline have `status: unavailable`.
+//! secret material. Secrets not known offline have `status: unavailable`; a
+//! known secret whose production hash fails has `status: hash-error`.
 //! Deferred directories are covered by plan parity (`scripts/validate-parity.py`),
 //! not by this probe. Partial dumps identify exactly which iterable sites defer.
 //! Application diagnostics are reported by error kind only. Run `carina validate`
 //! on the directory for details; those diagnostics may quote authored values.
+//! The paired validation pipeline has no warning-sink parameter: its own stderr
+//! warnings are outside the probe's control. Never publish captured stderr;
+//! the ignored real-directory test captures it without echoing its contents.
+//! Main and candidate must probe the SAME configuration checkout path: preparatory
+//! loop observations include absolute-root bytes. Those production writes are
+//! recorded unchanged, not normalised or re-encoded.
+//! Calls through verify_hash or value_walk::hash_snapshot outside an identity
+//! owner record shared-encoder material as Unattributed and fail the probe closed.
+//! Those producer paths are not deliberately driven here.
 //! No provider runtime, backend, state read, plan, or download is involved.
 
 use super::{LoadedProviderFactory, ProviderLoad, ProviderNoticeSink, WiringContext};
@@ -33,9 +48,219 @@ use carina_core::resource::{
     ConcreteValue, DeferredValue, ForLoopElement, LoopElementOrigin, LoopKind, LoopOriginKind,
     LoopProvenance, ResourceIdentity, Value,
 };
+#[cfg(test)]
 use serde_json::{Value as Json, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+mod disclosure {
+    //! The only constructors for dump strings and containers. No arbitrary JSON enters.
+
+    use carina_core::schema::{EffectiveField, OwnerBoundResourceSchema, ValidatedResourceSchema};
+    use serde::Serialize;
+    use serde_json::Value as Json;
+    use std::path::{Path, PathBuf};
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    #[serde(transparent)]
+    pub struct Disclosed(Json);
+
+    pub(super) fn object(fields: impl IntoIterator<Item = (&'static str, Disclosed)>) -> Disclosed {
+        Disclosed(Json::Object(
+            fields
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value.0))
+                .collect(),
+        ))
+    }
+    pub(super) fn array(values: impl IntoIterator<Item = Disclosed>) -> Disclosed {
+        Disclosed(Json::Array(
+            values.into_iter().map(|value| value.0).collect(),
+        ))
+    }
+    impl Disclosed {
+        pub(super) fn insert(&mut self, key: &'static str, value: Disclosed) {
+            self.0
+                .as_object_mut()
+                .expect("dump object")
+                .insert(key.to_owned(), value.0);
+        }
+    }
+    impl From<usize> for Disclosed {
+        fn from(value: usize) -> Self {
+            Self(Json::from(value))
+        }
+    }
+    impl From<bool> for Disclosed {
+        fn from(value: bool) -> Self {
+            Self(Json::Bool(value))
+        }
+    }
+    impl From<Option<Disclosed>> for Disclosed {
+        fn from(value: Option<Disclosed>) -> Self {
+            value.unwrap_or(Self(Json::Null))
+        }
+    }
+    impl std::fmt::Display for Disclosed {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match &self.0 {
+                Json::String(text) => f.write_str(text),
+                value => value.fmt(f),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    pub(super) struct Raw(());
+    impl Raw {
+        pub(super) fn text(self, value: &str) -> Disclosed {
+            Disclosed(Json::String(value.to_owned()))
+        }
+        pub(super) fn concat(self, parts: impl IntoIterator<Item = Disclosed>) -> Disclosed {
+            self.text(
+                &parts
+                    .into_iter()
+                    .map(|part| part.to_string())
+                    .collect::<String>(),
+            )
+        }
+    }
+    #[derive(Clone, Copy)]
+    pub(super) enum Disclosure {
+        Raw(Raw),
+        Sha256,
+    }
+
+    // These tokens cannot be created by renderers from an arbitrary &str.
+    struct SchemaName<'a>(&'a str);
+    #[derive(Clone, Debug)]
+    pub(super) struct RelativeSourcePath(String);
+    pub(super) struct SourcePaths {
+        root: carina_core::paths::PersistedPath,
+    }
+    impl SourcePaths {
+        pub(super) fn new(directory: &Path) -> std::io::Result<Self> {
+            Ok(Self {
+                root: carina_core::paths::PersistedPath::new(directory)?,
+            })
+        }
+        pub(super) fn relative(&self, path: &Path) -> RelativeSourcePath {
+            RelativeSourcePath(
+                carina_core::paths::PersistedPath::new(path)
+                    .expect("parser source locator")
+                    .lexical_relative_to(&self.root)
+                    .expect("source and root share an anchor")
+                    .to_string(),
+            )
+        }
+        pub(super) fn source_file(&self, file: &str) -> RelativeSourcePath {
+            let path = Path::new(file);
+            let path: PathBuf = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                self.root.to_path_buf().join(path)
+            };
+            self.relative(&path)
+        }
+    }
+
+    enum DisclosureKind<'a> {
+        FixedLiteral(&'static str),
+        RelativePath(&'a RelativeSourcePath),
+        SchemaName(SchemaName<'a>),
+        Fingerprint(&'a str),
+    }
+    impl Disclosure {
+        pub(super) fn raw() -> Self {
+            Self::Raw(Raw(()))
+        }
+        fn disclose(self, kind: DisclosureKind<'_>) -> Disclosed {
+            match kind {
+                DisclosureKind::FixedLiteral(value) => Disclosed(Json::String(value.to_owned())),
+                DisclosureKind::SchemaName(SchemaName(value)) => {
+                    Disclosed(Json::String(value.to_owned()))
+                }
+                DisclosureKind::RelativePath(path) => match self {
+                    Self::Raw(raw) => raw.text(&path.0),
+                    Self::Sha256
+                        if Path::new(&path.0).components().next()
+                            == Some(std::path::Component::ParentDir) =>
+                    {
+                        object([
+                            ("kind", self.fixed("outside-root")),
+                            ("path", fingerprint(path.0.as_bytes())),
+                        ])
+                    }
+                    Self::Sha256 => Disclosed(Json::String(path.0.clone())),
+                },
+                DisclosureKind::Fingerprint(value) => match self {
+                    Self::Raw(raw) => raw.text(value),
+                    Self::Sha256 => fingerprint(value.as_bytes()),
+                },
+            }
+        }
+        pub(super) fn fixed(self, value: &'static str) -> Disclosed {
+            self.disclose(DisclosureKind::FixedLiteral(value))
+        }
+        pub(super) fn path(self, value: &RelativeSourcePath) -> Disclosed {
+            self.disclose(DisclosureKind::RelativePath(value))
+        }
+        pub(super) fn opaque(self, value: &str) -> Disclosed {
+            self.disclose(DisclosureKind::Fingerprint(value))
+        }
+        pub(super) fn schema_names(
+            self,
+            schema: OwnerBoundResourceSchema<'_>,
+        ) -> (Disclosed, Disclosed) {
+            (
+                self.disclose(DisclosureKind::SchemaName(SchemaName(schema.owner()))),
+                self.disclose(DisclosureKind::SchemaName(SchemaName(
+                    schema.schema().as_schema().resource_type(),
+                ))),
+            )
+        }
+        pub(super) fn attribute(
+            self,
+            schema: &ValidatedResourceSchema,
+            authored: &str,
+        ) -> Disclosed {
+            match schema.effective_attribute_by_authored_name(authored) {
+                Some(attribute) => {
+                    self.disclose(DisclosureKind::SchemaName(SchemaName(attribute.name())))
+                }
+                None => self.opaque(authored),
+            }
+        }
+        pub(super) fn field(self, field: &EffectiveField<'_>) -> Disclosed {
+            self.disclose(DisclosureKind::SchemaName(SchemaName(field.name())))
+        }
+    }
+    fn fingerprint(value: &[u8]) -> Disclosed {
+        let carina_core::identity_recording::Fingerprint { sha256, length } =
+            carina_core::identity_recording::fingerprint(value);
+        object([
+            ("sha256", Disclosed(Json::String(sha256))),
+            ("length", length.into()),
+        ])
+    }
+    pub(super) fn bytes(value: &[u8], disclosure: Disclosure) -> Disclosed {
+        match disclosure {
+            Disclosure::Raw(raw) => object([("hex", raw.text(&hex(value)))]),
+            Disclosure::Sha256 => fingerprint(value),
+        }
+    }
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write;
+        let mut hex = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(hex, "{byte:02x}").expect("String");
+        }
+        hex
+    }
+}
+
+pub use disclosure::Disclosed;
+use disclosure::{Disclosure, Raw, SourcePaths, array, bytes, object};
 
 #[cfg(test)]
 mod tests;
@@ -47,44 +272,11 @@ pub enum OfflineProviders {
     ArtifactDirectory(PathBuf),
 }
 
-/// No default. Raw mode accepts only synthetic in-process factories; it cannot
-/// contain an artifact directory. Real-directory runs cannot select raw mode.
+/// No default. RawSynthetic accepts ANY directory with caller-supplied
+/// factories. Real-directory batch runs always select fingerprints.
 pub enum RedactionMode {
     RawSynthetic(Vec<Box<dyn carina_core::provider::ProviderFactory>>),
     Sha256(OfflineProviders),
-}
-
-#[derive(Clone, Copy)]
-enum Disclosure {
-    Raw,
-    Sha256,
-}
-
-/// Only these five explicit classifications can disclose plaintext in real mode.
-#[derive(Clone, Copy)]
-pub enum DisclosureKind {
-    FixedLiteral,
-    RelativePath,
-    SchemaOrTypeName,
-    AttributeName,
-    SourceBindingName,
-    Fingerprint,
-}
-impl Disclosure {
-    fn disclose(self, kind: DisclosureKind, value: &str) -> Json {
-        match (self, kind) {
-            (Self::Raw, _)
-            | (
-                Self::Sha256,
-                DisclosureKind::FixedLiteral
-                | DisclosureKind::RelativePath
-                | DisclosureKind::SchemaOrTypeName
-                | DisclosureKind::AttributeName
-                | DisclosureKind::SourceBindingName,
-            ) => json!(value),
-            (Self::Sha256, DisclosureKind::Fingerprint) => bytes(value.as_bytes(), self),
-        }
-    }
 }
 
 #[derive(thiserror::Error)]
@@ -139,7 +331,7 @@ impl ProbeError {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeferredSite {
-    pub file: String,
+    pub file: Disclosed,
     pub span: std::ops::Range<usize>,
 }
 
@@ -239,7 +431,8 @@ impl ProbeDocument {
 }
 
 struct PreparedResource {
-    dump: Json,
+    dump: Disclosed,
+    address: String,
     key: ResourceKey,
     loop_identities: Vec<ResourceIdentity>,
     requires_identity: bool,
@@ -270,7 +463,7 @@ fn capture_directory(
 ) -> Result<ProbeDocument, ProbeError> {
     let (providers, disclosure) = match mode {
         RedactionMode::RawSynthetic(factories) => {
-            (OfflineProviders::Factories(factories), Disclosure::Raw)
+            (OfflineProviders::Factories(factories), Disclosure::raw())
         }
         RedactionMode::Sha256(providers) => (providers, Disclosure::Sha256),
     };
@@ -331,7 +524,7 @@ fn prepare(
         if context.schemas().get_for(resource).is_none() {
             return Err(ProbeError::incomplete(format!(
                 "missing schema at {}",
-                paths.declaration(identity_recording::resource_location(resource))?
+                paths.declaration(identity_recording::resource_location(resource), disclosure)?
             )));
         }
     }
@@ -356,7 +549,7 @@ fn prepare(
                 .recording_iterable_location()
                 .ok_or_else(|| ProbeError::incomplete("deferred site has no parser span"))?;
             Ok(DeferredSite {
-                file: paths.relative(location.file().path()),
+                file: disclosure.path(&paths.relative(location.file().path())),
                 span: location.span().start_byte()..location.span().end_byte(),
             })
         })
@@ -370,12 +563,16 @@ fn prepare(
         let prepared = (|| {
             let location = identity_recording::resource_location(resource)
                 .ok_or_else(|| ProbeError::incomplete("resource has no declaration location"))?;
-            let declaration = paths.declaration(Some(location))?;
-            if validated.context().schemas().get_for(resource).is_none() {
-                return Err(ProbeError::incomplete(format!(
-                    "missing schema at {declaration}"
-                )));
-            }
+            let declaration = paths.declaration(Some(location), disclosure)?;
+            let bound_schema =
+                validated
+                    .context()
+                    .schemas()
+                    .get_for(resource)
+                    .ok_or_else(|| {
+                        ProbeError::incomplete(format!("missing schema at {declaration}"))
+                    })?;
+            let schema = bound_schema.schema();
             if resource.id.identity().is_none() {
                 return Err(ProbeError::incomplete(format!(
                     "unassigned resource identity at {declaration}"
@@ -401,7 +598,14 @@ fn prepare(
                         required_modules.push(key);
                     }
                     let location = call.id.declaration_location();
-                    instances.push(json!({ "instance": disclosure.disclose(DisclosureKind::Fingerprint, &call.instance), "declaration": disclosure.disclose(DisclosureKind::RelativePath, &paths.relative(location.file().path())), "start_byte": location.span().start_byte() }));
+                    instances.push(object([
+                        ("instance", disclosure.opaque(&call.instance)),
+                        (
+                            "declaration",
+                            disclosure.path(&paths.relative(location.file().path())),
+                        ),
+                        ("start_byte", location.span().start_byte().into()),
+                    ]));
                 }
             }
             let basis = if resource.binding.is_some() {
@@ -427,62 +631,74 @@ fn prepare(
             };
             let mut secrets = Vec::new();
             for (attribute, value) in &resource.attributes {
-                let schema = validated
-                    .context()
-                    .schemas()
-                    .get_for(resource)
-                    .expect("checked schema");
                 let effective = schema
-                    .schema()
-                    .effective_attribute(attribute)
+                    .effective_attribute_by_authored_name(attribute)
                     .map(|attribute| attribute.value_type());
                 observe_secrets(
                     value,
-                    &SecretPath(vec![SecretPathPart::Attribute(attribute.clone())]),
+                    &SecretPath(vec![SecretPathPart::Attribute(
+                        disclosure.attribute(schema, attribute),
+                    )]),
                     effective,
                     &mut secrets,
                     paths,
                     disclosure,
                 )?;
             }
-            let prefixes: BTreeMap<_, _> = resource
-                .prefixes
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        disclosure
-                            .disclose(DisclosureKind::AttributeName, name)
-                            .as_str()
-                            .expect("attribute name")
-                            .to_owned(),
-                        disclosure.disclose(DisclosureKind::Fingerprint, value),
-                    )
-                })
-                .collect();
+            let mut prefixes: Vec<_> = resource.prefixes.iter().collect();
+            prefixes.sort_by_key(|(name, _)| *name);
+            let prefixes = array(prefixes.into_iter().map(|(name, value)| {
+                object([
+                    ("attribute", disclosure.attribute(schema, name)),
+                    ("value", disclosure.opaque(value)),
+                ])
+            }));
             let provenance = paths.loop_provenance(&resource.loop_provenance, disclosure);
-            let mut resource_id = json!({
-                "provider": disclosure.disclose(DisclosureKind::SchemaOrTypeName, &resource.id.provider),
-                "resource_type": disclosure.disclose(DisclosureKind::SchemaOrTypeName, &resource.id.resource_type),
-                "identity": disclosure.disclose(DisclosureKind::Fingerprint, resource.id.identity_str().expect("resolved identity")),
-            });
+            let (provider, resource_type) = disclosure.schema_names(bound_schema);
+            let mut resource_id = object([
+                ("provider", provider),
+                ("resource_type", resource_type),
+                (
+                    "identity",
+                    disclosure.opaque(resource.id.identity_str().expect("resolved identity")),
+                ),
+            ]);
             if let Some(binding) = &resource.id.provider_instance {
-                resource_id["provider_instance"] =
-                    disclosure.disclose(DisclosureKind::Fingerprint, binding);
+                resource_id.insert("provider_instance", disclosure.opaque(binding));
             }
             Ok::<_, ProbeError>(PreparedResource {
+                address: declaration,
                 key,
                 loop_identities: identity_recording::loop_system_identities(
                     &resource.loop_provenance,
                 ),
                 requires_identity: resource.binding.is_none(),
                 required_modules,
-                dump: json!({
-                    "ordinal": ordinal,
-                    "declaration": { "file": disclosure.disclose(DisclosureKind::RelativePath, &paths.relative(location.file().path())), "start_byte": span.start_byte(), "end_byte": span.end_byte(), "line": span.start_line(), "column": span.start_column() },
-                    "expansion": { "instances": instances, "loop": provenance },
-                    "identity_basis": disclosure.disclose(DisclosureKind::FixedLiteral, basis), "resource_id": resource_id, "address": disclosure.disclose(DisclosureKind::Fingerprint, &resource.id.to_string()),
-                    "resolved_prefixes": prefixes, "secret_material": secrets,
-                }),
+                dump: object([
+                    ("ordinal", ordinal.into()),
+                    (
+                        "declaration",
+                        object([
+                            (
+                                "file",
+                                disclosure.path(&paths.relative(location.file().path())),
+                            ),
+                            ("start_byte", span.start_byte().into()),
+                            ("end_byte", span.end_byte().into()),
+                            ("line", span.start_line().into()),
+                            ("column", span.start_column().into()),
+                        ]),
+                    ),
+                    (
+                        "expansion",
+                        object([("instances", array(instances)), ("loop", provenance)]),
+                    ),
+                    ("identity_basis", disclosure.fixed(basis)),
+                    ("resource_id", resource_id),
+                    ("address", disclosure.opaque(&resource.id.to_string())),
+                    ("resolved_prefixes", prefixes),
+                    ("secret_material", array(secrets)),
+                ]),
             })
         })();
         match prepared {
@@ -521,13 +737,7 @@ fn finish_dump(
     let mut claimed = vec![false; inputs.len()];
     let mut keys = HashSet::new();
     for resource in &mut resources {
-        let address = format!(
-            "{}:{}",
-            resource.dump["declaration"]["file"]
-                .as_str()
-                .expect("declaration file"),
-            resource.dump["declaration"]["start_byte"]
-        );
+        let address = &resource.address;
         if !keys.insert(resource.key.clone()) {
             failures.push(format!("duplicate system resource identity for {address}"));
         }
@@ -591,11 +801,13 @@ fn finish_dump(
         if resource.requires_identity && !primary {
             failures.push(format!("missing identity hash inputs for {address}"));
         }
-        resource.dump["hash_inputs"] = Json::Array(
-            collapse_observations(rendered)
-                .into_iter()
-                .map(|input| render_input(input, paths, disclosure))
-                .collect(),
+        resource.dump.insert(
+            "hash_inputs",
+            array(
+                collapse_observations(rendered)
+                    .into_iter()
+                    .map(|input| render_input(input, paths, disclosure)),
+            ),
         );
     }
     // A SimHash result alone cannot prove that feature hashing was observed:
@@ -647,17 +859,59 @@ fn finish_dump(
         if reason.is_none() {
             failures.push("unattributed hash inputs".to_owned());
         }
-        unattributed
-            .push(json!({ "reason": reason.map(|reason| disclosure.disclose(DisclosureKind::FixedLiteral, reason)), "input": render_input(input, paths, disclosure) }));
+        unattributed.push(object([
+            (
+                "reason",
+                reason.map(|reason| disclosure.fixed(reason)).into(),
+            ),
+            ("input", render_input(input, paths, disclosure)),
+        ]));
     }
-    let dump = json!({
-        "format": disclosure.disclose(DisclosureKind::FixedLiteral, "carina-identity-probe-v2"),
-        "redaction": disclosure.disclose(DisclosureKind::FixedLiteral, match disclosure { Disclosure::Raw => "raw-synthetic", Disclosure::Sha256 => "sha256" }),
-        "resources": resources.into_iter().map(|resource| resource.dump).collect::<Vec<_>>(),
-        "unattributed": unattributed,
-        "status": { "kind": disclosure.disclose(DisclosureKind::FixedLiteral, if !failures.is_empty() { "failed" }
-            else if deferred.is_empty() { "ok" } else { "partial" }), "deferred": deferred.iter().map(|site| json!({"file": disclosure.disclose(DisclosureKind::RelativePath, &site.file), "span": site.span})).collect::<Vec<_>>() },
-    });
+    let dump = object([
+        ("format", disclosure.fixed("carina-identity-probe-v2")),
+        (
+            "redaction",
+            disclosure.fixed(match disclosure {
+                Disclosure::Raw(_) => "raw-synthetic",
+                Disclosure::Sha256 => "sha256",
+            }),
+        ),
+        (
+            "resources",
+            array(resources.into_iter().map(|resource| resource.dump)),
+        ),
+        ("unattributed", array(unattributed)),
+        (
+            "status",
+            object([
+                (
+                    "kind",
+                    disclosure.fixed(if !failures.is_empty() {
+                        "failed"
+                    } else if deferred.is_empty() {
+                        "ok"
+                    } else {
+                        "partial"
+                    }),
+                ),
+                (
+                    "deferred",
+                    array(deferred.iter().map(|site| {
+                        object([
+                            ("file", site.file.clone()),
+                            (
+                                "span",
+                                object([
+                                    ("start", site.span.start.into()),
+                                    ("end", site.span.end.into()),
+                                ]),
+                            ),
+                        ])
+                    })),
+                ),
+            ]),
+        ),
+    ]);
     let dump = format!("{}\n", serde_json::to_string_pretty(&dump)?);
     let mut seen = HashSet::new();
     failures.retain(|message| seen.insert(message.clone()));
@@ -697,8 +951,8 @@ fn collapse_observations<'a>(
 
 #[derive(Clone)]
 enum SecretPathPart {
-    Attribute(String),
-    MapKey(String),
+    Attribute(Disclosed),
+    MapKey(Disclosed),
     Index(usize),
 }
 #[derive(Clone)]
@@ -709,37 +963,32 @@ impl SecretPath {
         child.0.push(part);
         child
     }
-    fn render(&self, disclosure: Disclosure) -> Json {
+    fn render(&self, disclosure: Disclosure) -> Disclosed {
         match disclosure {
-            Disclosure::Raw => {
-                let mut path = String::new();
+            Disclosure::Raw(raw) => {
+                let mut parts = Vec::new();
                 for part in &self.0 {
                     match part {
                         SecretPathPart::Attribute(name) | SecretPathPart::MapKey(name) => {
-                            if !path.is_empty() {
-                                path.push('.');
+                            if !parts.is_empty() {
+                                parts.push(disclosure.fixed("."));
                             }
-                            path.push_str(name);
+                            parts.push(name.clone());
                         }
-                        SecretPathPart::Index(index) => {
-                            use std::fmt::Write;
-                            write!(path, "[{index}]").expect("String");
-                        }
+                        SecretPathPart::Index(index) => parts.extend([
+                            disclosure.fixed("["),
+                            (*index).into(),
+                            disclosure.fixed("]"),
+                        ]),
                     }
                 }
-                json!(path)
+                raw.concat(parts)
             }
-            Disclosure::Sha256 => json!(
-                self.0
-                    .iter()
-                    .map(|part| match part {
-                        SecretPathPart::Attribute(name) => json!({"attribute": disclosure.disclose(DisclosureKind::AttributeName, name)}),
-                        SecretPathPart::MapKey(key) =>
-                            json!({"map_key": disclosure.disclose(DisclosureKind::Fingerprint, key)}),
-                        SecretPathPart::Index(index) => json!({"index": index}),
-                    })
-                    .collect::<Vec<_>>()
-            ),
+            Disclosure::Sha256 => array(self.0.iter().map(|part| match part {
+                SecretPathPart::Attribute(name) => object([("attribute", name.clone())]),
+                SecretPathPart::MapKey(key) => object([("map_key", key.clone())]),
+                SecretPathPart::Index(index) => object([("index", (*index).into())]),
+            })),
         }
     }
 }
@@ -748,40 +997,105 @@ fn observe_secrets(
     value: &Value,
     path: &SecretPath,
     effective: Option<carina_core::schema::EffectiveType<'_>>,
-    out: &mut Vec<Json>,
+    out: &mut Vec<Disclosed>,
     paths: &SourcePaths,
     disclosure: Disclosure,
 ) -> Result<(), ProbeError> {
     match value {
         Value::Deferred(DeferredValue::Secret(payload)) => {
-            let known = value.knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation()).ok().and_then(|proof| proof.into_classification().into_known().ok()).is_some();
-            let (available, inputs) = if known { identity_recording::record(|| payload.hash(None).is_ok()) } else { (false, Vec::new()) };
-            let producer = disclosure.disclose(DisclosureKind::FixedLiteral, "secret-payload-hash");
-            if available {
-                if inputs.is_empty() { return Err(ProbeError::incomplete("missing secret material recording")); }
-                out.push(json!({ "path": path.render(disclosure), "producer": producer, "status": "available", "inputs": collapse_observations(&inputs).into_iter().map(|input| render_input(input, paths, disclosure)).collect::<Vec<_>>() }));
+            let known = value
+                .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
+                .ok()
+                .and_then(|proof| proof.into_classification().into_known().ok())
+                .is_some();
+            let mut fields = vec![
+                ("path", path.render(disclosure)),
+                ("producer", disclosure.fixed("secret-payload-hash")),
+            ];
+            if !known {
+                fields.extend([
+                    ("status", disclosure.fixed("unavailable")),
+                    ("reason", disclosure.fixed("secret is not known offline")),
+                ]);
             } else {
-                out.push(json!({ "path": path.render(disclosure), "producer": producer, "status": "unavailable", "reason": "secret is not known offline" }));
+                let (result, inputs) = identity_recording::record(|| payload.hash(None));
+                match result {
+                    Ok(_) => {
+                        if inputs.is_empty() {
+                            return Err(ProbeError::incomplete(
+                                "missing secret material recording",
+                            ));
+                        }
+                        fields.extend([
+                            ("status", disclosure.fixed("available")),
+                            (
+                                "inputs",
+                                array(
+                                    collapse_observations(&inputs)
+                                        .into_iter()
+                                        .map(|input| render_input(input, paths, disclosure)),
+                                ),
+                            ),
+                        ]);
+                    }
+                    Err(_) => fields.extend([
+                        ("status", disclosure.fixed("hash-error")),
+                        (
+                            "reason",
+                            disclosure.fixed("production hashing failed for a known secret"),
+                        ),
+                    ]),
+                }
             }
+            out.push(object(fields));
         }
         Value::Concrete(ConcreteValue::List(items)) => {
             for (index, item) in items.iter().enumerate() {
-                observe_secrets(item, &path.child(SecretPathPart::Index(index)), effective.as_ref().and_then(|ty| ty.list_element()), out, paths, disclosure)?;
+                observe_secrets(
+                    item,
+                    &path.child(SecretPathPart::Index(index)),
+                    effective.as_ref().and_then(|ty| ty.list_element()),
+                    out,
+                    paths,
+                    disclosure,
+                )?;
             }
         }
         Value::Concrete(ConcreteValue::Map(entries)) => {
             for (key, item) in entries {
-                let field = effective.as_ref().filter(|ty| matches!(ty.shape(), carina_core::schema::Shape::Struct { name: _ })).and_then(|ty| {
-                    ty.field_candidates_with_budget(&mut carina_core::schema::ShapeWalkBudget::new(64)).into_iter().find(|field| field.name() == key)
-                });
+                let field = effective
+                    .as_ref()
+                    .filter(|ty| {
+                        matches!(ty.shape(), carina_core::schema::Shape::Struct { name: _ })
+                    })
+                    .and_then(|ty| {
+                        ty.field_candidates_with_budget(
+                            &mut carina_core::schema::ShapeWalkBudget::new(64),
+                        )
+                        .into_iter()
+                        .find(|field| field.name() == key)
+                    });
                 let (part, child_type) = match field {
-                    Some(field) => (SecretPathPart::Attribute(field.name().to_owned()), Some(field.value_type())),
-                    None => (SecretPathPart::MapKey(key.clone()), effective.as_ref().and_then(|ty| ty.map_value())),
+                    Some(field) => (
+                        SecretPathPart::Attribute(disclosure.field(&field)),
+                        Some(field.value_type()),
+                    ),
+                    None => (
+                        SecretPathPart::MapKey(disclosure.opaque(key)),
+                        effective.as_ref().and_then(|ty| ty.map_value()),
+                    ),
                 };
                 observe_secrets(item, &path.child(part), child_type, out, paths, disclosure)?;
             }
         }
-        _ if carina_core::value::contains_secret(value) => out.push(json!({ "path": path.render(disclosure), "status": "unavailable", "reason": "secret remains inside a deferred expression" })),
+        _ if carina_core::value::contains_secret(value) => out.push(object([
+            ("path", path.render(disclosure)),
+            ("status", disclosure.fixed("unavailable")),
+            (
+                "reason",
+                disclosure.fixed("secret remains inside a deferred expression"),
+            ),
+        ])),
         _ => {}
     }
     Ok(())
@@ -880,85 +1194,99 @@ fn load_artifacts(
     Ok(factories)
 }
 
-struct SourcePaths {
-    root: carina_core::paths::PersistedPath,
-}
 impl SourcePaths {
-    fn new(directory: &Path) -> Result<Self, ProbeError> {
-        Ok(Self {
-            root: carina_core::paths::PersistedPath::new(directory)?,
-        })
-    }
     fn declaration(
         &self,
         location: Option<&carina_core::parser::DeclarationLocation>,
+        disclosure: Disclosure,
     ) -> Result<String, ProbeError> {
         let location = location
             .ok_or_else(|| ProbeError::incomplete("resource has no declaration location"))?;
         Ok(format!(
             "{}:{}",
-            self.relative(location.file().path()),
+            disclosure.path(&self.relative(location.file().path())),
             location.span().start_byte()
         ))
-    }
-    fn relative(&self, path: &Path) -> String {
-        carina_core::paths::PersistedPath::new(path)
-            .expect("parser source locator")
-            .lexical_relative_to(&self.root)
-            .expect("source and root share an anchor")
-            .to_string()
     }
     fn module_context(
         &self,
         call: &carina_core::parser::ModuleCallId,
         disclosure: Disclosure,
-    ) -> Json {
-        let file = self.relative(call.source_file());
+    ) -> Disclosed {
         match disclosure {
-            Disclosure::Raw => {
-                let mut context = format!("module:<root>/{file}:{}", call.call_span().start_byte());
-                if let carina_core::parser::CallExpansion::Expanded(expansion) = call.expansion() {
-                    context.push(':');
-                    context.push_str(expansion.as_str());
-                }
-                disclosure.disclose(DisclosureKind::RelativePath, &context)
-            }
-            Disclosure::Sha256 => json!({
-                "kind": disclosure.disclose(DisclosureKind::FixedLiteral, "module"), "file": disclosure.disclose(DisclosureKind::RelativePath, &file), "start_byte": call.call_span().start_byte(),
-                "expansion": match call.expansion() {
-                    carina_core::parser::CallExpansion::Direct => Json::Null,
-                    carina_core::parser::CallExpansion::Expanded(expansion) => disclosure.disclose(DisclosureKind::Fingerprint, expansion.as_str()),
-                },
-            }),
-        }
-    }
-    fn context(&self, context: &InputContext, disclosure: Disclosure) -> Json {
-        match context {
-            InputContext::Resource(Some(location)) => disclosure.disclose(
-                DisclosureKind::RelativePath,
-                &format!(
-                    "resource:<root>/{}:{}",
-                    self.relative(location.file().path()),
-                    location.span().start_byte()
+            Disclosure::Raw(raw) => self.raw_module_context(call, raw),
+            Disclosure::Sha256 => object([
+                ("kind", disclosure.fixed("module")),
+                ("file", disclosure.path(&self.relative(call.source_file()))),
+                ("start_byte", call.call_span().start_byte().into()),
+                (
+                    "expansion",
+                    match call.expansion() {
+                        carina_core::parser::CallExpansion::Direct => None,
+                        carina_core::parser::CallExpansion::Expanded(expansion) => {
+                            Some(disclosure.opaque(expansion.as_str()))
+                        }
+                    }
+                    .into(),
                 ),
-            ),
-            InputContext::Resource(None) => {
-                disclosure.disclose(DisclosureKind::FixedLiteral, "resource:unavailable")
-            }
-            InputContext::Module(call) => self.module_context(call, disclosure),
-            InputContext::PayloadHash => {
-                disclosure.disclose(DisclosureKind::FixedLiteral, "secret-payload-hash")
-            }
+            ]),
         }
     }
-    fn contexts(&self, input: &HashInput, disclosure: Disclosure) -> Vec<Json> {
-        match &input.owner {
+    fn raw_module_context(&self, call: &carina_core::parser::ModuleCallId, raw: Raw) -> Disclosed {
+        let mode = Disclosure::Raw(raw);
+        let mut parts = vec![
+            mode.fixed("module:<root>/"),
+            mode.path(&self.relative(call.source_file())),
+            mode.fixed(":"),
+            call.call_span().start_byte().into(),
+        ];
+        if let carina_core::parser::CallExpansion::Expanded(expansion) = call.expansion() {
+            parts.extend([mode.fixed(":"), raw.text(expansion.as_str())]);
+        }
+        raw.concat(parts)
+    }
+    fn context(&self, context: &InputContext, disclosure: Disclosure) -> Disclosed {
+        match context {
+            InputContext::Resource(Some(location)) => {
+                let file = disclosure.path(&self.relative(location.file().path()));
+                let byte = location.span().start_byte();
+                match disclosure {
+                    Disclosure::Raw(raw) => raw.concat([
+                        disclosure.fixed("resource:<root>/"),
+                        file,
+                        disclosure.fixed(":"),
+                        byte.into(),
+                    ]),
+                    Disclosure::Sha256 => object([
+                        ("kind", disclosure.fixed("resource")),
+                        ("file", file),
+                        ("start_byte", byte.into()),
+                    ]),
+                }
+            }
+            InputContext::Resource(None) => disclosure.fixed("resource:unavailable"),
+            InputContext::Module(call) => self.module_context(call, disclosure),
+            InputContext::PayloadHash => disclosure.fixed("secret-payload-hash"),
+        }
+    }
+    fn contexts(&self, input: &HashInput, disclosure: Disclosure) -> Disclosed {
+        array(match &input.owner {
             InputOwner::Resource(key) => {
                 let (file, ordinal) = key.source();
-                vec![disclosure.disclose(
-                    DisclosureKind::RelativePath,
-                    &format!("resource:<root>/{}#{ordinal}", self.relative(file)),
-                )]
+                let file = disclosure.path(&self.relative(file));
+                vec![match disclosure {
+                    Disclosure::Raw(raw) => raw.concat([
+                        disclosure.fixed("resource:<root>/"),
+                        file,
+                        disclosure.fixed("#"),
+                        ordinal.into(),
+                    ]),
+                    Disclosure::Sha256 => object([
+                        ("kind", disclosure.fixed("resource")),
+                        ("file", file),
+                        ("ordinal", ordinal.into()),
+                    ]),
+                }]
             }
             InputOwner::Module(key) => key
                 .calls()
@@ -969,92 +1297,106 @@ impl SourcePaths {
                 .iter()
                 .map(|context| self.context(context, disclosure))
                 .collect(),
-        }
+        })
     }
-    fn loop_provenance(&self, provenance: &LoopProvenance, disclosure: Disclosure) -> Json {
+    fn loop_provenance(&self, provenance: &LoopProvenance, disclosure: Disclosure) -> Disclosed {
         let (direct, modules) = provenance.recording_parts();
-        let mut out = serde_json::Map::new();
+        let mut fields = Vec::new();
         if let Some(origin) = direct {
-            out.insert("direct".into(), self.loop_origin(origin, disclosure));
+            fields.push(("direct", self.loop_origin(origin, disclosure)));
         }
-        let modules: Vec<_> = modules.map(|(origin, prefix)| json!({
-            "origin": self.loop_origin(origin, disclosure),
-            "current_prefix": disclosure.disclose(DisclosureKind::Fingerprint, prefix.as_str()),
-        })).collect();
+        let modules: Vec<_> = modules
+            .map(|(origin, prefix)| {
+                object([
+                    ("origin", self.loop_origin(origin, disclosure)),
+                    ("current_prefix", disclosure.opaque(prefix.as_str())),
+                ])
+            })
+            .collect();
         if !modules.is_empty() {
-            out.insert("module_prefixes".into(), json!(modules));
+            fields.push(("module_prefixes", array(modules)));
         }
-        Json::Object(out)
+        object(fields)
     }
-    fn loop_origin(&self, origin: &LoopElementOrigin, disclosure: Disclosure) -> Json {
+    fn loop_origin(&self, origin: &LoopElementOrigin, disclosure: Disclosure) -> Disclosed {
         let (source, legacy, parent) = origin.recording_parts();
         let (source_kind, identity) = source.recording_parts();
         let kind = match origin.kind() {
-            LoopOriginKind::For { element } => json!({
-                "kind": disclosure.disclose(DisclosureKind::FixedLiteral, "for"),
-                "element": match element {
-                    ForLoopElement::Index(index) => json!({"kind": disclosure.disclose(DisclosureKind::FixedLiteral, "index"), "value": index}),
-                    ForLoopElement::Key(key) => json!({"kind": disclosure.disclose(DisclosureKind::FixedLiteral, "key"), "value": disclosure.disclose(DisclosureKind::Fingerprint, key)}),
-                },
-            }),
-            LoopOriginKind::If => {
-                json!({"kind": disclosure.disclose(DisclosureKind::FixedLiteral, "if")})
-            }
+            LoopOriginKind::For { element } => object([
+                ("kind", disclosure.fixed("for")),
+                (
+                    "element",
+                    match element {
+                        ForLoopElement::Index(index) => object([
+                            ("kind", disclosure.fixed("index")),
+                            ("value", (*index).into()),
+                        ]),
+                        ForLoopElement::Key(key) => object([
+                            ("kind", disclosure.fixed("key")),
+                            ("value", disclosure.opaque(key)),
+                        ]),
+                    },
+                ),
+            ]),
+            LoopOriginKind::If => object([("kind", disclosure.fixed("if"))]),
         };
-        let file = Path::new(source.file());
-        let file = if file.is_absolute() {
-            file.to_path_buf()
-        } else {
-            self.root.to_path_buf().join(file)
-        };
-        let mut out = json!({
-            "kind": kind,
-            "source": {
-                "display_file": disclosure.disclose(DisclosureKind::RelativePath, &self.relative(&file)),
-                "line": source.line(), "column": source.column(),
-                "kind": disclosure.disclose(DisclosureKind::FixedLiteral, match source_kind { LoopKind::For => "for", LoopKind::If => "if" }),
-                "system_identity": disclosure.disclose(DisclosureKind::Fingerprint, identity.as_str()),
-            },
-            "legacy": disclosure.disclose(DisclosureKind::Fingerprint, legacy),
-        });
+        let mut out = object([
+            ("kind", kind),
+            (
+                "source",
+                object([
+                    (
+                        "display_file",
+                        disclosure.path(&self.source_file(source.file())),
+                    ),
+                    ("line", source.line().into()),
+                    ("column", source.column().into()),
+                    (
+                        "kind",
+                        disclosure.fixed(match source_kind {
+                            LoopKind::For => "for",
+                            LoopKind::If => "if",
+                        }),
+                    ),
+                    ("system_identity", disclosure.opaque(identity.as_str())),
+                ]),
+            ),
+            ("legacy", disclosure.opaque(legacy)),
+        ]);
         if let Some(parent) = parent {
-            out["current_parent"] =
-                disclosure.disclose(DisclosureKind::Fingerprint, parent.as_str());
+            out.insert("current_parent", disclosure.opaque(parent.as_str()));
         }
         out
     }
 }
 
-fn bytes(value: &[u8], disclosure: Disclosure) -> Json {
-    match disclosure {
-        Disclosure::Raw => json!({ "hex": hex(value) }),
-        Disclosure::Sha256 => {
-            serde_json::to_value(identity_recording::fingerprint(value)).expect("fingerprint JSON")
-        }
-    }
-}
-fn render_input(input: &HashInput, paths: &SourcePaths, disclosure: Disclosure) -> Json {
-    json!({
-        "boundary": disclosure.disclose(DisclosureKind::FixedLiteral, input.boundary),
-        "context": paths.contexts(input, disclosure),
-        "writes": input.writes.iter().map(|write| {
-            let mut value = bytes(&write.bytes, disclosure);
-            value.as_object_mut().expect("byte object").insert("operation".to_owned(), disclosure.disclose(DisclosureKind::FixedLiteral, write.operation));
-            value
-        }).collect::<Vec<_>>(),
-        "finishes": input.finishes.iter().map(|finish| json!({
-            "operation": disclosure.disclose(DisclosureKind::FixedLiteral, finish.operation), "after_writes": finish.after_writes, "output": bytes(&finish.output, disclosure),
-        })).collect::<Vec<_>>(),
-        "feature_count": input.feature_count,
-    })
-}
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut hex = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(hex, "{byte:02x}").expect("write String");
-    }
-    hex
+fn render_input(input: &HashInput, paths: &SourcePaths, disclosure: Disclosure) -> Disclosed {
+    object([
+        ("boundary", disclosure.fixed(input.boundary)),
+        ("context", paths.contexts(input, disclosure)),
+        (
+            "writes",
+            array(input.writes.iter().map(|write| {
+                let mut value = bytes(&write.bytes, disclosure);
+                value.insert("operation", disclosure.fixed(write.operation));
+                value
+            })),
+        ),
+        (
+            "finishes",
+            array(input.finishes.iter().map(|finish| {
+                object([
+                    ("operation", disclosure.fixed(finish.operation)),
+                    ("after_writes", finish.after_writes.into()),
+                    ("output", bytes(&finish.output, disclosure)),
+                ])
+            })),
+        ),
+        (
+            "feature_count",
+            input.feature_count.map(Disclosed::from).into(),
+        ),
+    ])
 }
 
 /// Batch entry point for real directories. It has no raw-byte mode parameter.
