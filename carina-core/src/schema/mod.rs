@@ -10562,6 +10562,7 @@ impl ValidatedResourceSchema {
         self.as_schema()
             .validate_admission_report(
                 attributes,
+                attributes.iter(),
                 is_string_literal,
                 &value_validation::AttributeAdmission {
                     known: &|_, selected, proof| {
@@ -15566,7 +15567,7 @@ pub(crate) fn levenshtein_distance(a: &str, b: &str) -> usize {
 }
 
 /// Suggest the most similar field name, if one is close enough.
-/// Equal distances retain candidate order: canonical fields, then schema-ordered aliases.
+/// Equal distances choose the lexically smallest name, independent of candidate order.
 pub fn suggest_similar_name(unknown: &str, known: &[&str]) -> Option<String> {
     let max_distance = match unknown.len() {
         0..=2 => 1,
@@ -15576,11 +15577,10 @@ pub fn suggest_similar_name(unknown: &str, known: &[&str]) -> Option<String> {
 
     known
         .iter()
-        .enumerate()
-        .map(|(rank, name)| (*name, levenshtein_distance(unknown, name), rank))
-        .filter(|(_, dist, _)| *dist <= max_distance)
-        .min_by_key(|(_, dist, rank)| (*dist, *rank))
-        .map(|(name, _, _)| name.to_string())
+        .map(|name| (*name, levenshtein_distance(unknown, name)))
+        .filter(|(_, dist)| *dist <= max_distance)
+        .min_by_key(|(name, dist)| (*dist, *name))
+        .map(|(name, _)| name.to_string())
 }
 
 /// Validate a single IPv6 group (1-4 hex digits)
@@ -16412,13 +16412,15 @@ impl PatternResourceSchema<Compiled> {
     }
 
     pub(crate) fn validate_admission_report<
-        'v,
+        'a,
+        'v: 'a,
         P: PlaceholderKind,
         B: BindingAddress,
         T: StructuralPending<'v, P, B>,
     >(
         &self,
-        attributes: &indexmap::IndexMap<String, Classification<'v, P, B, T>>,
+        attributes: &'a indexmap::IndexMap<String, Classification<'v, P, B, T>>,
+        entries: impl IntoIterator<Item = (&'a String, &'a Classification<'v, P, B, T>)>,
         is_string_literal: &dyn Fn(&str) -> bool,
         admission: &value_validation::AttributeAdmission<'_, 'v, P, B, T>,
     ) -> ResourceValueValidation {
@@ -16434,7 +16436,7 @@ impl PatternResourceSchema<Compiled> {
         }
 
         let values = self.validate_value_entries(
-            attributes,
+            entries,
             is_string_literal,
             ValueEntryValidation::FullInput,
             None,
@@ -16506,7 +16508,7 @@ impl PatternResourceSchema<Compiled> {
         >,
     ) -> ResourceValueValidation {
         let mut report = self.validate_value_entries(
-            attributes,
+            attributes.iter(),
             is_string_literal,
             ValueEntryValidation::KnownWritableOnly,
             selected,
@@ -16536,13 +16538,14 @@ impl PatternResourceSchema<Compiled> {
     }
 
     fn validate_value_entries<
-        'v,
+        'a,
+        'v: 'a,
         P: PlaceholderKind,
         B: BindingAddress,
-        T: StructuralPending<'v, P, B>,
+        T: StructuralPending<'v, P, B> + 'a,
     >(
         &self,
-        attributes: &indexmap::IndexMap<String, Classification<'v, P, B, T>>,
+        entries: impl IntoIterator<Item = (&'a String, &'a Classification<'v, P, B, T>)>,
         is_string_literal: &dyn Fn(&str) -> bool,
         mode: ValueEntryValidation,
         selected: Option<&HashSet<String>>,
@@ -16560,7 +16563,7 @@ impl PatternResourceSchema<Compiled> {
         }
 
         // Type check each attribute and reject unknown ones
-        for (name, value) in attributes {
+        for (name, value) in entries {
             if selected.is_some_and(|selected| !selected.contains(name)) {
                 continue;
             }

@@ -11928,3 +11928,50 @@ let child = consumer_module { record = "record-id" }
         "unexpected diagnostic: {error}",
     );
 }
+
+#[test]
+fn module_if_audit_checks_functions_in_sibling_declaration_order() {
+    use crate::parser::{DeferredIfCondition, DeferredValueIf};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/diagnostic_order/functions");
+    let path = crate::paths::ResolvedPath::new(&root).unwrap();
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = crate::config_loader::parse_directory(&path, &config).unwrap();
+    crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        let mut expanded = crate::module_resolver::resolve_modules_with_providerless_config(
+            parsed,
+            &path,
+            session,
+            &crate::schema::SchemaRegistry::new(),
+        )
+        .unwrap();
+        let authored_condition = DeferredIfCondition::new(
+            Value::Concrete(ConcreteValue::Bool(true)),
+            root.join("a_functions.crn"),
+            1,
+        );
+        let conditional = ExpandedValue::Deferred(ExpandedDeferredValue::ModuleIf(Box::new(
+            DeferredValueIf::new(
+                DeferredIfCondition::new_with_source_expression(
+                    ExpandedValue::Concrete(ExpandedConcreteValue::Bool(true)),
+                    root.join("a_functions.crn"),
+                    1,
+                    authored_condition.source_expression,
+                ),
+                ExpandedValue::Concrete(ExpandedConcreteValue::String("yes".into())),
+                ExpandedValue::Concrete(ExpandedConcreteValue::String("no".into())),
+            ),
+        )));
+        expanded.user_functions["zebra"].body.value = conditional.clone();
+        expanded.user_functions["mango"].params[0].default = Some(conditional);
+        let error = crate::module_resolver::ensure_expanded_root_graph(&expanded).unwrap_err();
+        assert!(
+            matches!(error, ModuleError::UnexpandedModuleTemplate { context } if context == "function body")
+        );
+        expanded.user_functions.move_index(0, 1);
+        let error = crate::module_resolver::ensure_expanded_root_graph(&expanded).unwrap_err();
+        assert!(
+            matches!(error, ModuleError::UnexpandedModuleTemplate { context } if context == "function parameter default")
+        );
+    });
+}

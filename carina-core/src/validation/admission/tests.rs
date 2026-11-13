@@ -3187,6 +3187,7 @@ fn round7_hook_error_without_attribute_has_one_diagnostic_owner() {
             .as_schema()
             .validate_admission_report(
                 &attributes,
+                attributes.iter(),
                 &|_| false,
                 &AttributeAdmission {
                     known: &|_, _, proof| {

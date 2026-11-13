@@ -3,6 +3,56 @@ use std::process::Command;
 
 const SHARDS: usize = 4;
 
+fn check_suggestion_fixture(name: &str) {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("carina-core/tests/fixtures/diagnostic_order")
+        .join(name);
+    for _ in 0..8 {
+        let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+            .arg("validate")
+            .arg(&directory)
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("Did you mean `bat`?"), "{stderr}");
+    }
+}
+
+#[test]
+fn undefined_identifier_suggestion_ties_are_stable() {
+    check_suggestion_fixture("suggestion_identifier");
+}
+
+#[test]
+fn upstream_export_suggestion_ties_are_stable() {
+    check_suggestion_fixture("suggestion_upstream");
+}
+
+#[test]
+fn duplicate_sibling_functions_are_rejected() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("carina-core/tests/fixtures/diagnostic_order/functions/duplicates");
+    let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+        .arg("validate")
+        .arg(directory)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["errors"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        result["errors"][0]["message"],
+        "duplicate function 'zebra': declared in a_functions.crn and z_functions.crn"
+    );
+}
+
 fn check_shard(index: usize) {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let script = repo.join("scripts/validate-parity.py");
@@ -49,14 +99,12 @@ fn check_shard(index: usize) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    // A stable process-setup failure must not masquerade as a validation sweep.
-    let first: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(evidence.join("0000-json-repeat-01.stdout")).unwrap(),
-    )
-    .expect("validate --json must reach the structured validation result");
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(evidence.join("summary.json")).unwrap()).unwrap();
+    // Every shard must exercise validation, excluding stable provider/setup failures.
     assert!(
-        first["resources"].is_array() && first["status"].is_string(),
-        "{first}"
+        summary["validation_directories"].as_u64().unwrap() > 0,
+        "shard {index}/{SHARDS} reached no validation: {summary}"
     );
     eprintln!(
         "shard {index}/{SHARDS}; evidence: {}; {}",
@@ -68,22 +116,38 @@ fn check_shard(index: usize) {
     );
 }
 
-#[test]
-fn validate_diagnostic_order_shard_0() {
-    check_shard(0);
+macro_rules! diagnostic_order_shards {
+    ($($name:ident: $index:literal),+ $(,)?) => {
+        const _: () = {
+            let indices = [$($index),+];
+            assert!(indices.len() == SHARDS);
+            let mut index = 0;
+            while index < SHARDS {
+                assert!(indices[index] == index);
+                index += 1;
+            }
+        };
+        $(#[test] fn $name() { check_shard($index); })+
+    };
+}
+
+diagnostic_order_shards! {
+    validate_diagnostic_order_shard_0: 0,
+    validate_diagnostic_order_shard_1: 1,
+    validate_diagnostic_order_shard_2: 2,
+    validate_diagnostic_order_shard_3: 3,
 }
 
 #[test]
-fn validate_diagnostic_order_shard_1() {
-    check_shard(1);
-}
-
-#[test]
-fn validate_diagnostic_order_shard_2() {
-    check_shard(2);
-}
-
-#[test]
-fn validate_diagnostic_order_shard_3() {
-    check_shard(3);
+fn validation_sweep_coverage_accounting() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/test-validate-parity.py");
+    let output = Command::new("python3").arg(script).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

@@ -1,0 +1,2 @@
+let cat = mock.test.resource { name = "a" }
+let bat = mock.test.resource { name = "b" }

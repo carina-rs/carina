@@ -113,7 +113,7 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
     /// Interned user-function definitions used by deferred call nodes.
     /// Invalidated together with `user_function_scope` whenever the mutable
     /// parser table changes.
-    resolved_user_functions: RefCell<IndexMap<String, Arc<UserFunction>>>,
+    resolved_user_functions: RefCell<HashMap<String, Arc<UserFunction>>>,
     /// Function names injected from sibling files for this directory parse.
     /// A local definition may replace its seed once; a second local
     /// definition remains a duplicate.
@@ -459,7 +459,7 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
             resource_bindings: HashMap::new(),
             imported_modules: HashMap::new(),
             user_functions: Arc::new(IndexMap::new()),
-            resolved_user_functions: RefCell::new(IndexMap::new()),
+            resolved_user_functions: RefCell::new(HashMap::new()),
             seeded_user_functions: HashSet::new(),
             evaluating_functions: Vec::new(),
             config,

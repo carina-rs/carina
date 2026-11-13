@@ -3208,3 +3208,29 @@ mod location_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod diagnostic_order_tests {
+    #[test]
+    fn retained_missing_annotation_reports_the_first_declared_function() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/diagnostic_order/functions/references");
+        let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let mut parsed = crate::config_loader::parse_directory(
+            &crate::paths::ResolvedPath::new(root).unwrap(),
+            &config,
+        )
+        .unwrap()
+        .into_parsed();
+        for function in parsed.user_functions.values_mut() {
+            function.type_annotations.clear();
+        }
+        let error = crate::parser::AnalysisTree::try_from_file(&parsed)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "missing parser syntax provenance for function return type 'zebra' annotation"
+        );
+    }
+}

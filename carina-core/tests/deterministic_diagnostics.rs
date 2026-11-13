@@ -120,6 +120,172 @@ fn function_annotation_findings_keep_sibling_file_order() {
     });
 }
 
+const FUNCTION_LOCATIONS: [(&str, usize); 4] = [
+    ("a_functions.crn", 1),
+    ("a_functions.crn", 2),
+    ("z_functions.crn", 1),
+    ("z_functions.crn", 2),
+];
+
+fn finding_location(location: &carina_core::parser::DeclarationLocation) -> (String, usize) {
+    (
+        location
+            .file()
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned(),
+        location.span().start_line(),
+    )
+}
+
+#[test]
+fn function_arithmetic_findings_keep_sibling_declaration_order() {
+    let parsed = directory("functions/arithmetic");
+    let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let schemas = schemas();
+    let loaded = load_buffer_configuration(&parsed, &schemas, &config);
+    let bindings = BindingIndex::from_parsed(loaded.judged().file(), &schemas, &config);
+    let findings =
+        carina_core::validation::check_file_integer_arithmetic_values(loaded.judged(), &bindings);
+    assert_eq!(findings.len(), 4, "{findings:?}");
+    assert_eq!(
+        findings
+            .iter()
+            .map(|finding| finding_location(finding.location()))
+            .collect::<Vec<_>>(),
+        FUNCTION_LOCATIONS.map(|(file, line)| (file.to_owned(), line))
+    );
+    for finding in findings {
+        assert!(
+            finding
+                .detail()
+                .to_string()
+                .contains("left operand must be Int, got Float"),
+            "{finding}"
+        );
+    }
+}
+
+#[test]
+fn function_reference_and_call_findings_keep_sibling_declaration_order() {
+    let parsed = directory("functions/references");
+    let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let schemas = schemas();
+    let loaded = load_buffer_configuration(&parsed, &schemas, &config);
+    let bindings = BindingIndex::from_parsed(loaded.judged().file(), &schemas, &config);
+    let errors =
+        carina_core::validation::validate_user_function_ref_types_with_bindings(&parsed, &bindings)
+            .unwrap_err();
+    let errors = errors.lines().collect::<Vec<_>>();
+    assert_eq!(errors.len(), 4, "{errors:#?}");
+    for (error, function) in errors.iter().zip(["zebra", "sink", "alpha", "sink"]) {
+        assert!(error.contains(&format!("function '{function}'")), "{error}");
+        assert!(
+            error.contains("expected Int") && error.contains("got String"),
+            "{error}"
+        );
+    }
+    let tree = AnalysisTree::try_from_file(loaded.judged().file()).unwrap();
+    let findings = carina_core::validation::user_function_reference_diagnostics(&tree, &bindings);
+    assert_eq!(
+        findings
+            .iter()
+            .map(|finding| finding_location(finding.location()))
+            .collect::<Vec<_>>(),
+        FUNCTION_LOCATIONS.map(|(file, line)| (file.to_owned(), line))
+    );
+    assert_eq!(
+        findings
+            .iter()
+            .map(|finding| finding.detail().as_str())
+            .collect::<Vec<_>>(),
+        errors
+    );
+}
+
+#[test]
+fn retained_function_references_keep_sibling_declaration_order() {
+    let parsed = directory("functions/references");
+    let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+    assert_eq!(
+        tree.value_references()
+            .iter()
+            .map(|reference| reference.context())
+            .collect::<Vec<_>>(),
+        [
+            "function zebra",
+            "function mango",
+            "function alpha",
+            "function bravo"
+        ]
+    );
+    assert_eq!(
+        tree.value_references()
+            .iter()
+            .map(|reference| finding_location(reference.reference().location()))
+            .collect::<Vec<_>>(),
+        FUNCTION_LOCATIONS.map(|(file, line)| (file.to_owned(), line))
+    );
+}
+
+#[test]
+fn retained_function_annotations_keep_sibling_declaration_order() {
+    let parsed = directory("functions/references");
+    let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+    assert_eq!(
+        tree.type_annotations()
+            .iter()
+            .map(|annotation| annotation.detail().to_string())
+            .collect::<Vec<_>>(),
+        [
+            "function return type 'zebra'",
+            "function return type 'mango'",
+            "function return type 'alpha'",
+            "function return type 'bravo'",
+            "function parameter 'sink' parameter 'value'",
+            "function return type 'sink'",
+        ]
+    );
+}
+
+#[test]
+fn duplicate_sibling_functions_keep_the_existing_last_definition_and_rejection() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/diagnostic_order/functions/duplicates");
+    let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let parsed = parse_directory(&ResolvedPath::new(&root).unwrap(), &config).unwrap();
+    assert_eq!(
+        parsed
+            .parsed()
+            .user_functions
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["zebra", "mango", "alpha"]
+    );
+    assert_eq!(
+        parsed.parsed().variables["result"],
+        Value::Concrete(ConcreteValue::String("last".into()))
+    );
+    let loaded = carina_core::config_loader::load_configuration_for_bootstrap(
+        &ResolvedPath::new(&root).unwrap(),
+        &config,
+        &schemas(),
+    )
+    .unwrap();
+    let duplicates = loaded.duplicate_declarations;
+    assert_eq!(
+        duplicates
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["duplicate function 'zebra': declared in a_functions.crn and z_functions.crn"]
+    );
+}
+
 #[test]
 fn classifications_keep_authored_attribute_order() {
     let parsed = directory("unknown_attributes");
@@ -182,7 +348,7 @@ fn admission_uses_owning_resource_order_even_for_reversed_classifications() {
 }
 
 #[test]
-fn block_alias_suggestion_ties_keep_schema_candidate_order() {
+fn block_alias_suggestion_ties_choose_lexical_minimum() {
     let schema = ResourceSchema::new("Aliases")
         .attribute(
             AttributeSchema::optional("first_group", AttributeType::list(AttributeType::string()))
@@ -211,13 +377,65 @@ fn block_alias_suggestion_ties_keep_schema_candidate_order() {
             .collect::<Vec<_>>();
         assert_eq!(
             suggest_similar_name("hat", &candidates).as_deref(),
-            Some("cat")
+            Some("bat")
         );
     }
     assert_eq!(
         suggest_similar_name("hat", &["bat", "cat"]).as_deref(),
         Some("bat")
     );
+}
+
+#[test]
+fn suggestion_ties_choose_lexical_minimum_for_every_candidate_order() {
+    for candidates in [["cat", "bat"], ["bat", "cat"]] {
+        assert_eq!(
+            suggest_similar_name("hat", &candidates).as_deref(),
+            Some("bat")
+        );
+    }
+}
+
+#[test]
+fn plan_admission_validates_supplied_proofs_absent_from_the_resource() {
+    use carina_core::resource::knowledge::PlanResolved;
+    use carina_core::validation::admission::{attributes::admit_plan_attributes, kind};
+    let resource: carina_core::resource::Resource =
+        carina_core::resource::Resource::with_provider("mock", "Sink", "sink", None);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(AttributeSchema::optional("extra", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let value = Value::Concrete(ConcreteValue::Int(1));
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let context = KnowledgeContext::plan(&bindings);
+    let proofs = [(
+        "extra".to_owned(),
+        PlanResolved::try_from(value.knowledge(&context).unwrap()).unwrap(),
+    )]
+    .into_iter()
+    .collect();
+    let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    with_session_for_test(&config, |session| {
+        let report = admit_plan_attributes::<kind::ResourceAttribute>(
+            schemas.get_for(&resource).unwrap(),
+            &carina_core::parser::TopLevelResourceRef::Resource(&resource),
+            &proofs,
+            &Default::default(),
+            session,
+        );
+        assert_eq!(
+            report
+                .diagnostic_errors()
+                .map(|(_, path, _)| path.unwrap().0)
+                .collect::<Vec<_>>(),
+            ["extra"]
+        );
+    });
 }
 
 #[test]
@@ -405,7 +623,7 @@ fn projected_attributes_take_resource_order_without_authored_authority() {
 }
 
 #[test]
-fn plan_admission_orders_reversed_proofs_by_resource_attributes() {
+fn plan_admission_keeps_supplied_proof_order() {
     use carina_core::resource::knowledge::PlanResolved;
     use carina_core::validation::admission::{attributes::admit_plan_attributes, kind};
     let mut resource: carina_core::resource::Resource =
@@ -444,7 +662,7 @@ fn plan_admission_orders_reversed_proofs_by_resource_attributes() {
                 .diagnostic_errors()
                 .map(|(error, path, _)| path.unwrap_or_else(|| panic!("missing path: {error:?}")).0)
                 .collect::<Vec<_>>(),
-            UNKNOWN
+            UNKNOWN.into_iter().rev().collect::<Vec<_>>()
         );
     });
 }

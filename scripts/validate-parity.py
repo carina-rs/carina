@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import time
 
@@ -34,6 +35,22 @@ def configuration_directories(root):
     if missing:
         raise ValueError(f"Missing tracked configuration inputs in {root}: {missing}")
     return sorted({(root / name).parent for name in paths if name})
+
+
+def validation_output(status, stdout, stderr):
+    try:
+        result = json.loads(stdout)
+    except (ValueError, UnicodeError):
+        result = None
+    messages = [stderr.decode(errors="replace")]
+    if isinstance(result, dict):
+        messages.extend(error.get("message", "") for error in result.get("errors", [])
+                        if isinstance(error, dict))
+    provider_missing = any(re.search(r"\bprovider\b[^\n]*\bnot installed\b", message, re.IGNORECASE)
+                           for message in messages)
+    structured = (isinstance(result, dict) and isinstance(result.get("resources"), list)
+                  and isinstance(result.get("status"), str))
+    return status in (0, 1) and structured and not provider_missing, provider_missing
 
 
 def main():
@@ -149,10 +166,13 @@ def main():
     results = []
     differences = []
     failures = []
+    validated_directories = set()
+    provider_not_installed = set()
     for index, directory in enumerate(directories):
         for json_output in (False, True):
             outputs = []
             case_failed = False
+            validation_runs = []
             for label, binary in binaries:
                 command = [str(binary), "validate", str(directory)]
                 if json_output:
@@ -175,6 +195,11 @@ def main():
                 (args.evidence / f"{stem}.stdout").write_bytes(stdout)
                 (args.evidence / f"{stem}.stderr").write_bytes(stderr)
                 (args.evidence / f"{stem}.status").write_text(f"{status}\n")
+                if json_output:
+                    reached_validation, provider_missing = validation_output(status, stdout, stderr)
+                    validation_runs.append(reached_validation)
+                    if provider_missing:
+                        provider_not_installed.add(str(directory))
                 outputs.append((status, stdout, stderr) if args.binary else (
                     status, normalize(stdout.decode()), normalize(stderr.decode())))
                 if failure:
@@ -186,6 +211,8 @@ def main():
                       "statuses": [o[0] for o in outputs], "differing_repetitions": [i + 1 for i in varying],
                       "identical": not varying and not case_failed}
             results.append(record)
+            if json_output and all(validation_runs):
+                validated_directories.add(str(directory))
             if not record["identical"]:
                 differences.append(record)
                 for repetition in varying:
@@ -199,7 +226,12 @@ def main():
                                                        tofile=f"{binaries[repetition][0]}.{stream}"))
                     (args.evidence / f"{index:04}-{'json' if json_output else 'text'}-{binaries[repetition][0]}.diff").write_text("".join(diff))
             print(f"{index + 1}/{len(directories)} {'json' if json_output else 'text'} {'PASS' if record['identical'] else 'DIFF'} {directory}", flush=True)
+    if args.binary and not validated_directories:
+        failures.append({"failure": "No directory reached validation in this shard"})
     summary = {"directories": len(directories), "total_directories": len(all_directories),
+               "validation_directories": len(validated_directories),
+               "setup_failure_directories": len(directories) - len(validated_directories),
+               "provider_not_installed_directories": len(provider_not_installed),
                "shard": {"index": shard_index, "count": shard_count},
                "comparisons": (len(binaries) - 1) * len(results),
                "invocations": len(binaries) * len(results), "repeat": args.repeat,

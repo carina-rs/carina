@@ -11059,6 +11059,8 @@ fn schema_check_provider_configs(
     AppError,
 > {
     let mut effective = providers.to_vec();
+    let mut overrides = overrides.iter().collect::<Vec<_>>();
+    overrides.sort_unstable_by_key(|(name, _)| *name);
     for (name, path) in overrides {
         let Some(config) = effective
             .iter_mut()
