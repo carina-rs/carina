@@ -220,8 +220,8 @@ pub fn cli_messages(shape: &str, known: bool) -> Vec<String> {
         _ => " (from r.key)",
     };
     let mut messages = Vec::new();
-    // Preserve ordinary union-trial findings for unknown values. Known values
-    // pass the ordinary value check; both phases reject the authored reference.
+    // origin/main (e0dd9dd71) already adds this unknown-only CLI union finding
+    // for rejected plain String sources (carina#4397); known CLI values and LSP keep one finding.
     if !known {
         let container = match shape {
             "union_list" | "recursive_union" => Some("List item at index 0"),

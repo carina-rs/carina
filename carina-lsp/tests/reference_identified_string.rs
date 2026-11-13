@@ -97,3 +97,124 @@ fn issue_4384_reference_identityless_same_identity_and_reference_sinks_have_no_d
         }
     }
 }
+
+async fn assert_reference_completions(
+    target: carina_core::schema::AttributeType,
+    module: Option<&str>,
+    expected: bool,
+) {
+    let schemas = fixture::schemas(target);
+    let directory = fixture::directory(
+        "",
+        &format!(
+            "{}let up = upstream_state {{ source = './upstream' }}\n",
+            fixture::UNKNOWN_SOURCE
+        ),
+    );
+    std::fs::create_dir(directory.path().join("upstream")).unwrap();
+    std::fs::write(
+        directory.path().join("upstream/providers.crn"),
+        "provider mock {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("upstream/exports.crn"),
+        "exports { key = r.key }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("upstream/sources.crn"),
+        fixture::UNKNOWN_SOURCE,
+    )
+    .unwrap();
+    let (main, line) = if let Some(ty) = module {
+        std::fs::create_dir(directory.path().join("child")).unwrap();
+        std::fs::write(
+            directory.path().join("child/main.crn"),
+            format!("arguments {{ value: {ty} }}\n"),
+        )
+        .unwrap();
+        (
+            "let template = use { source = './child' }\nlet call = template {\n  value = \n}\n",
+            2,
+        )
+    } else {
+        ("mock.test.recovery_probe {\n  value = \n}\n", 1)
+    };
+    std::fs::write(directory.path().join("main.crn"), main).unwrap();
+    let mut client = support::TestClient::with_schemas(directory.path(), schemas).await;
+    let uri = tower_lsp::lsp_types::Url::from_file_path(directory.path().join("main.crn")).unwrap();
+    client.open_document(uri.as_str(), main).await;
+    client.wait_for_diagnostics(uri.as_str()).await;
+    let response = client._request_completion(uri.as_str(), line, 10).await;
+    let items = response["result"].as_array().expect("completion result");
+    let labels: Vec<_> = items
+        .iter()
+        .filter_map(|item| item["label"].as_str())
+        .collect();
+    // Unannotated upstream exports are not source-typed at validate yet: carina#4377.
+    for label in ["r.key", "up.key"] {
+        assert_eq!(
+            labels.contains(&label),
+            expected,
+            "{module:?}: {label}: {labels:#?}"
+        );
+    }
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn issue_4384_resource_completion_filters_reference_and_upstream_identity() {
+    for (target, expected) in [
+        (
+            fixture::identified_string(carina_core::schema::TypeIdentity::from_dotted(
+                "mock.RecoveryProbe",
+            )),
+            false,
+        ),
+        (fixture::identified_string(fixture::key_identity()), true),
+    ] {
+        assert_reference_completions(target, None, expected).await;
+    }
+}
+
+#[tokio::test]
+async fn issue_4384_typed_completion_keeps_same_identity_and_plain_string_controls() {
+    for (ty, expected) in [
+        ("mock.RecoveryProbe", false),
+        ("mock.keys.Key.Reference", true),
+        ("String", true),
+    ] {
+        assert_reference_completions(
+            fixture::identified_string(carina_core::schema::TypeIdentity::from_dotted(
+                "mock.RecoveryProbe",
+            )),
+            Some(ty),
+            expected,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn issue_4384_plain_string_field_completion_keeps_reference_candidate() {
+    use carina_core::schema::{AttributeType, StructField};
+    let target = AttributeType::struct_(
+        "Record",
+        vec![StructField::required("field", AttributeType::string()).build()],
+    );
+    let main = "mock.test.recovery_probe {\n  value = {\n    field = \n  }\n}\n";
+    let directory = fixture::directory(main, fixture::UNKNOWN_SOURCE);
+    let mut client =
+        support::TestClient::with_schemas(directory.path(), fixture::schemas(target)).await;
+    let uri = tower_lsp::lsp_types::Url::from_file_path(directory.path().join("main.crn")).unwrap();
+    client.open_document(uri.as_str(), main).await;
+    client.wait_for_diagnostics(uri.as_str()).await;
+    let response = client._request_completion(uri.as_str(), 2, 12).await;
+    let items = response["result"].as_array().expect("completion result");
+    assert!(
+        items.iter().any(|item| item["label"] == "r.key"),
+        "{response:#?}"
+    );
+    client.shutdown().await;
+}

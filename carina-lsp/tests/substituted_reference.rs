@@ -92,12 +92,11 @@ fn substituted_reference_diagnostics_match_unknown_source_wording_severity_and_r
             write("");
             let unknown = findings();
             assert_eq!(unknown.len(), 1, "{source_type}: {unknown:#?}");
-            if let Some(diagnostic) = unknown.first() {
-                assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
-                assert_eq!(diagnostic.range.start.line, if sibling { 1 } else { 2 });
-                assert_eq!(diagnostic.range.start.character, 2);
-                assert!(!diagnostic.message.contains(" as "));
-            }
+            let diagnostic = &unknown[0];
+            assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+            assert_eq!(diagnostic.range.start.line, if sibling { 1 } else { 2 });
+            assert_eq!(diagnostic.range.start.character, 2);
+            assert!(!diagnostic.message.contains(" as "));
             write("name = 'abc'");
             assert_eq!(findings(), unknown, "{source_type}, sibling={sibling}");
             for name in ["sources.crn", "providers.crn", "backend.crn"] {

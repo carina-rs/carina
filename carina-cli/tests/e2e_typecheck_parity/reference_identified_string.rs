@@ -3,6 +3,16 @@ use super::*;
 #[path = "../../../carina-core/tests/support/reference_identified_string.rs"]
 mod fixture;
 
+fn reference_warning(message: &str) -> tower_lsp::lsp_types::Diagnostic {
+    tower_lsp::lsp_types::Diagnostic {
+        range: Range::new(Position::new(1, 2), Position::new(1, 7)),
+        severity: Some(DiagnosticSeverity::WARNING),
+        source: Some("carina".into()),
+        message: message.into(),
+        ..Default::default()
+    }
+}
+
 fn assert_shape(wanted: &str) {
     let (shape, ty, value) = fixture::shapes()
         .into_iter()
@@ -237,5 +247,393 @@ fn issue_4384_reference_identity_admission_at_annotated_boundaries() {
                 );
             }
         }
+    }
+}
+fn assert_upstream_reference_export(annotated: bool) {
+    for (target, accepted) in [
+        (
+            fixture::identified_string(carina_core::schema::TypeIdentity::from_dotted(
+                "mock.RecoveryProbe",
+            )),
+            false,
+        ),
+        (fixture::identified_string(fixture::key_identity()), true),
+        (AttributeType::string(), true),
+    ] {
+        let schemas = fixture::schemas_with_target(target.clone(), target);
+        let loaded = carina_core::provider::loaded_provider_snapshot_from_factories(
+            Arc::new(factories_for(&schemas)),
+            SchemaRegistry::new(),
+            carina_core::EnvironmentSnapshot::empty(),
+        );
+        let engine = engine_with_schemas(schemas.clone());
+        let main = fixture::consumer("up.key");
+        let directory =
+            fixture::directory(&main, "let up = upstream_state { source = './upstream' }\n");
+        std::fs::create_dir(directory.path().join("upstream")).unwrap();
+        for (file, text) in [
+            ("main.crn", ""),
+            ("providers.crn", "provider mock {}\n"),
+            ("backend.crn", "backend local { path = 'state.json' }\n"),
+            (
+                "exports.crn",
+                if annotated {
+                    "exports { key: mock.keys.Key.Reference = r.key }\n"
+                } else {
+                    "exports { key = r.key }\n"
+                },
+            ),
+        ] {
+            std::fs::write(directory.path().join("upstream").join(file), text).unwrap();
+        }
+        for source in [fixture::UNKNOWN_SOURCE, fixture::KNOWN_SOURCE] {
+            std::fs::write(directory.path().join("upstream/sources.crn"), source).unwrap();
+            if !annotated {
+                let base = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
+                let exports = carina_core::validation::deferred_types::with_session_for_test(
+                    loaded.provider_context(),
+                    |session| {
+                        carina_core::upstream_exports::discover_upstream_exports(
+                            &base,
+                            &[carina_core::parser::UpstreamState {
+                                binding: carina_core::resource::RelativeBindingName::new("up"),
+                                source: "./upstream".into(),
+                            }],
+                            session,
+                            Some(&schemas),
+                        )
+                    },
+                );
+                let carina_core::upstream_exports::UpstreamExportType::Static(export_type) =
+                    &exports[&carina_core::resource::RelativeBindingName::new("up")]["key"]
+                        .static_type
+                else {
+                    panic!("the upstream export must have an inferred type");
+                };
+                let export_type = export_type.known().unwrap();
+                let carina_core::parser::TypeExpr::SchemaType { owned } = export_type else {
+                    panic!("the reference export must retain its schema projection");
+                };
+                use carina_core::parser::CustomTypeResolver;
+                let projection = loaded
+                    .provider_context()
+                    .custom_types
+                    .projection_declaration(owned)
+                    .unwrap();
+                assert!(matches!(
+                    projection.shape_ref_free(),
+                    Ok(carina_core::schema::Shape::Reference { .. })
+                ));
+                // origin/main also lifts the Reference read projection to an identified String here.
+                let export_type = carina_core::validation::lift_type_expr(export_type).unwrap();
+                assert!(matches!(
+                    export_type.shape_ref_free(),
+                    Ok(carina_core::schema::Shape::String { .. })
+                ));
+            }
+            let cli = cli_diagnostics(factories_for(&schemas), &directory);
+            let lsp = lsp_diagnostics(&engine, &directory, "main.crn");
+            // Unannotated upstream exports are not source-typed at validate yet: carina#4377.
+            if accepted || !annotated {
+                assert_eq!(cli, Vec::<String>::new());
+                assert_eq!(lsp, []);
+            } else {
+                assert_eq!(
+                    cli,
+                    [
+                        "mock.test.recovery_probe.<pending>: cannot assign mock.keys.Key.Reference to 'value': expected mock.RecoveryProbe, got mock.keys.Key.Reference (from up.key)"
+                    ]
+                );
+                assert_eq!(
+                    lsp,
+                    [reference_warning(
+                        "Type mismatch: expected mock.RecoveryProbe, got mock.keys.Key.Reference (from up.key)"
+                    )]
+                );
+            }
+            for file in [
+                "sources.crn",
+                "providers.crn",
+                "backend.crn",
+                "upstream/main.crn",
+                "upstream/sources.crn",
+                "upstream/exports.crn",
+                "upstream/providers.crn",
+                "upstream/backend.crn",
+            ] {
+                assert_eq!(
+                    lsp_diagnostics(&engine, &directory, file),
+                    [],
+                    "{file}: {source}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn issue_4384_annotated_upstream_reference_export_checks_string_sink_identity() {
+    assert_upstream_reference_export(true);
+}
+
+#[test]
+fn issue_4384_inferred_upstream_reference_export_keeps_4377_behavior() {
+    assert_upstream_reference_export(false);
+}
+
+#[test]
+fn issue_4384_plain_string_union_keeps_main_known_unknown_findings() {
+    // The unknown-only duplicate finding predates #4384 and is tracked as carina#4397.
+    for (shape, ty, expression) in fixture::shapes() {
+        if !matches!(
+            shape,
+            "union_list" | "union_map" | "union_struct" | "recursive_union"
+        ) {
+            continue;
+        }
+        let mut schemas = fixture::schemas(ty);
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("Source")
+                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+                .validate()
+                .unwrap(),
+        );
+        let engine = engine_with_schemas(schemas.clone());
+        let main = fixture::consumer(&expression.replace("r.key", "a.name"));
+        let directory = fixture::directory(&main, "");
+        for (known, source) in [
+            (false, "let a = mock.Source {}\n"),
+            (true, "let a = mock.Source { name = 'abc' }\n"),
+        ] {
+            std::fs::write(directory.path().join("sources.crn"), source).unwrap();
+            let cli = cli_diagnostics(factories_for(&schemas), &directory);
+            let lsp = lsp_diagnostics(&engine, &directory, "main.crn");
+            assert_eq!(cli.len(), if known { 1 } else { 2 }, "{shape}: {cli:#?}");
+            assert_eq!(lsp.len(), 1, "{shape}: {lsp:#?}");
+            let expected_cli: Vec<_> = fixture::cli_messages(shape, known)
+                .iter()
+                .map(|message| {
+                    message
+                        .replace("mock.keys.Key.Reference", "String")
+                        .replace("r.key", "a.name")
+                })
+                .collect();
+            assert_eq!(cli, expected_cli, "{shape}: {source}{main}");
+            assert_eq!(
+                lsp,
+                [reference_warning(
+                    &fixture::lsp_message(shape)
+                        .replace("mock.keys.Key.Reference", "String")
+                        .replace("r.key", "a.name")
+                )],
+                "{shape}: {source}{main}"
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReferenceFlow {
+    Conditional,
+    Coalesce,
+    For,
+}
+
+fn assert_reference_result(flow: ReferenceFlow) {
+    let schemas = fixture::schemas(fixture::identified_string(
+        carina_core::schema::TypeIdentity::from_dotted("mock.RecoveryProbe"),
+    ));
+    let engine = engine_with_schemas(schemas.clone());
+    let directory = fixture::directory("", "");
+    for (known, source) in [
+        (false, fixture::UNKNOWN_SOURCE),
+        (true, fixture::KNOWN_SOURCE),
+    ] {
+        std::fs::write(directory.path().join("sources.crn"), source).unwrap();
+        std::fs::write(
+            directory.path().join("main.crn"),
+            fixture::consumer("r.key"),
+        )
+        .unwrap();
+        let direct_cli = cli_diagnostics(factories_for(&schemas), &directory);
+        let direct_lsp = lsp_diagnostics(&engine, &directory, "main.crn");
+        assert_eq!(direct_cli.len(), 1);
+        assert_eq!(direct_lsp.len(), 1);
+        let (main, expected_cli, expected_lsp) = match flow {
+            ReferenceFlow::Conditional => (
+                fixture::consumer("if true { r.key } else { 'fallback' }"),
+                direct_cli,
+                direct_lsp,
+            ),
+            ReferenceFlow::Coalesce => (
+                fixture::consumer("r.key ?? r.key"),
+                vec![direct_cli[0].clone(); if known { 1 } else { 2 }],
+                vec![reference_warning(
+                    "Type mismatch: expected mock.RecoveryProbe, got mock.keys.Key.Reference",
+                )],
+            ),
+            ReferenceFlow::For => {
+                let message = "Type mismatch: expected mock.RecoveryProbe, got mock.keys.Key.Reference (from r.key)";
+                (
+                    format!("for key in [r.key] {{\n{}\n}}\n", fixture::consumer("key")),
+                    vec![format!(
+                        "{} at line 3\n{message}",
+                        directory.path().join("main.crn").display()
+                    )],
+                    vec![tower_lsp::lsp_types::Diagnostic {
+                        range: Range::new(Position::new(2, 10), Position::new(2, 13)),
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        source: Some("carina".into()),
+                        message: message.into(),
+                        ..Default::default()
+                    }],
+                )
+            }
+        };
+        std::fs::write(directory.path().join("main.crn"), &main).unwrap();
+        assert_eq!(
+            cli_diagnostics(factories_for(&schemas), &directory),
+            expected_cli,
+            "{source}{main}"
+        );
+        assert_eq!(
+            lsp_diagnostics(&engine, &directory, "main.crn"),
+            expected_lsp,
+            "{source}{main}"
+        );
+        for file in ["sources.crn", "providers.crn", "backend.crn"] {
+            assert_eq!(
+                lsp_diagnostics(&engine, &directory, file),
+                [],
+                "{file}: {source}{main}"
+            );
+        }
+    }
+}
+
+#[test]
+fn issue_4384_conditional_reference_result_matches_direct_verdict() {
+    assert_reference_result(ReferenceFlow::Conditional);
+}
+
+#[test]
+fn issue_4384_coalesced_reference_result_matches_direct_verdict() {
+    assert_reference_result(ReferenceFlow::Coalesce);
+}
+
+#[test]
+fn issue_4384_for_reference_binding_matches_direct_verdict() {
+    assert_reference_result(ReferenceFlow::For);
+}
+
+fn assert_reference_builtin(target: AttributeType, expression: &str, builtin: &str) {
+    let schemas = fixture::schemas(target);
+    let engine = engine_with_schemas(schemas.clone());
+    let main = fixture::consumer(expression);
+    let directory = fixture::directory(&main, "");
+    for source in [fixture::UNKNOWN_SOURCE, fixture::KNOWN_SOURCE] {
+        std::fs::write(directory.path().join("sources.crn"), source).unwrap();
+        assert_eq!(
+            cli_diagnostics(factories_for(&schemas), &directory),
+            Vec::<String>::new(),
+            "{source}{main}"
+        );
+        assert_eq!(
+            lsp_diagnostics(&engine, &directory, "main.crn"),
+            [tower_lsp::lsp_types::Diagnostic {
+                range: Range::new(
+                    Position::new(1, 10),
+                    Position::new(1, 10 + builtin.len() as u32)
+                ),
+                severity: Some(DiagnosticSeverity::INFORMATION),
+                source: Some("carina".into()),
+                message: format!(
+                    "Consider using pipe form for '{builtin}': data |> {builtin}(...)"
+                ),
+                ..Default::default()
+            }],
+            "{source}{main}"
+        );
+        for file in ["sources.crn", "providers.crn", "backend.crn"] {
+            assert_eq!(
+                lsp_diagnostics(&engine, &directory, file),
+                [],
+                "{file}: {source}{main}"
+            );
+        }
+    }
+}
+
+#[test]
+fn issue_4384_join_accepts_reference_inputs() {
+    assert_reference_builtin(
+        fixture::identified_string(carina_core::schema::TypeIdentity::from_dotted(
+            "mock.RecoveryProbe",
+        )),
+        "join('', [r.key])",
+        "join",
+    );
+}
+
+#[test]
+fn issue_4384_concat_accepts_reference_inputs() {
+    assert_reference_builtin(
+        AttributeType::list(AttributeType::string()),
+        "concat([r.key], [])",
+        "concat",
+    );
+}
+
+#[test]
+fn issue_4384_literal_alias_keeps_value_admission() {
+    let schemas = fixture::schemas(fixture::identified_string(
+        carina_core::schema::TypeIdentity::from_dotted("mock.RecoveryProbe"),
+    ));
+    let engine = engine_with_schemas(schemas.clone());
+    let expression = "alias";
+    let directory = fixture::directory(
+        &fixture::consumer(expression),
+        "let literal = 'ab'\nlet alias = literal\n",
+    );
+    assert_eq!(
+        cli_diagnostics(factories_for(&schemas), &directory),
+        Vec::<String>::new()
+    );
+    assert_eq!(lsp_diagnostics(&engine, &directory, "main.crn"), []);
+    for file in ["sources.crn", "providers.crn", "backend.crn"] {
+        assert_eq!(lsp_diagnostics(&engine, &directory, file), []);
+    }
+}
+
+#[test]
+fn issue_4384_module_output_keeps_non_schema_value_admission() {
+    let schemas = fixture::schemas(fixture::identified_string(
+        carina_core::schema::TypeIdentity::from_dotted("mock.RecoveryProbe"),
+    ));
+    let engine = engine_with_schemas(schemas.clone());
+    let directory = fixture::directory(
+        "",
+        "let child = use { source = './child' }\nlet module = child {}\n",
+    );
+    std::fs::create_dir(directory.path().join("child")).unwrap();
+    std::fs::write(
+        directory.path().join("child/main.crn"),
+        "attributes { output: String = 'ab' }\n",
+    )
+    .unwrap();
+    let expression = "module.output";
+    let main = fixture::consumer(expression);
+    std::fs::write(directory.path().join("main.crn"), &main).unwrap();
+    let cli = cli_diagnostics(factories_for(&schemas), &directory);
+    let lsp = lsp_diagnostics(&engine, &directory, "main.crn");
+    // Non-schema sources keep their existing value admission after substitution.
+    let expected = (
+            vec!["mock.test.recovery_probe.<pending>: cannot assign String to 'value': expected mock.RecoveryProbe, got String (from module.output)".to_owned()],
+            vec![reference_warning("Type mismatch: expected mock.RecoveryProbe, got String (from module.output)")],
+    );
+    assert_eq!((cli, lsp), expected);
+    for file in ["sources.crn", "providers.crn", "backend.crn"] {
+        assert_eq!(lsp_diagnostics(&engine, &directory, file), []);
     }
 }

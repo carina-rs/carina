@@ -205,7 +205,7 @@ fn secret_substituted_reference_masks_its_origin_like_unknown_source() {
 }
 
 #[test]
-fn issue_4384_reference_to_identified_string_is_rejected_by_validate() {
+fn issue_4384_anonymous_reference_sink_reports_pending_address() {
     let main = "mock.test.recovery_probe { value = r.key }\n";
     let dir = fixture("let r = mock.test.reference { name = 'r' }\n", main);
     for source in [
