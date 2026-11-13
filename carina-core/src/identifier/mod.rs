@@ -3054,6 +3054,8 @@ impl StateRowIdentityValues {
             .map(|path| path.attribute_name())
             .collect::<BTreeSet<_>>();
         let mut unknown_override_origins = BTreeSet::new();
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: per-attribute overrides feed ordered identity maps and origin sets
         for (attribute, override_) in name_overrides {
             if !identity_attributes.contains(attribute.as_str()) {
                 continue;
@@ -3729,7 +3731,7 @@ enum UnresolvedReason {
 /// [`StateCreateOnlyValues`] type so unresolved desired values cannot enter the
 /// state side of a comparison.
 pub struct DesiredCreateOnlyValues {
-    values: HashMap<String, DesiredCreateOnlyValue>,
+    values: BTreeMap<String, DesiredCreateOnlyValue>,
 }
 
 fn desired_comparable_values<'attribute, S, D, E>(
@@ -3743,8 +3745,8 @@ fn desired_comparable_values<'attribute, S, D, E>(
     attributes: impl IntoIterator<Item = &'attribute str>,
     resolve_value: impl Fn(&Value) -> Result<Value, E>,
     prefer_prefixes: bool,
-) -> Result<HashMap<String, DesiredCreateOnlyValue>, E> {
-    let mut values = HashMap::new();
+) -> Result<BTreeMap<String, DesiredCreateOnlyValue>, E> {
+    let mut values = BTreeMap::new();
     for attribute in attributes {
         if prefer_prefixes && let Some(prefix) = resource.prefixes.get(attribute) {
             values.insert(
@@ -3783,7 +3785,7 @@ fn desired_comparable_values<'attribute, S, D, E>(
 }
 
 fn resolved_subset_match(
-    desired_values: &HashMap<String, DesiredCreateOnlyValue>,
+    desired_values: &BTreeMap<String, DesiredCreateOnlyValue>,
     state_values: &HashMap<String, ResolvedCreateOnlyValue<crate::resource::SnapshotLeaf>>,
     schema: &ResourceSchema,
     context: &ObservationComparison<'_>,

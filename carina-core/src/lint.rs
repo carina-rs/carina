@@ -1254,6 +1254,8 @@ mod tests {
             );
         }
 
+        #[allow(clippy::iter_over_hash_type)]
+        // commutative: grammar coverage assertions are independent per rule
         for name in assignment_rule_names {
             let rule = *rules_by_name
                 .get(&name)

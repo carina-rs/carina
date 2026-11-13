@@ -1086,6 +1086,8 @@ fn type_completion_includes_basic_types() {
     );
 
     // Built-in custom types should always appear (no provider needed)
+    #[allow(clippy::iter_over_hash_type)]
+    // commutative: completion membership assertions are independent per builtin
     for identity in carina_core::schema::builtin_type_registry().keys() {
         let builtin_custom = &identity.kind;
         assert!(

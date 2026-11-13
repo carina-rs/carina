@@ -322,6 +322,8 @@ impl<E> CanonicalResourcePair<E> {
     ) {
         let resources = &mut self.parsed.resources; // allow: direct — plan-time reconciliation
         for (resource, fallbacks) in resources.iter_mut().zip(&self.prefix_fallbacks) {
+            #[allow(clippy::iter_over_hash_type)]
+            // keyed rebuild: captured existing keys are restored in place before normalization
             for (attribute, value) in fallbacks {
                 resource.set_attr(attribute.clone(), value.clone());
             }
@@ -549,6 +551,8 @@ impl OverrideAwareResources {
             let Some(name_overrides) = state.name_overrides_for(&resource.id) else {
                 continue;
             };
+            #[allow(clippy::iter_over_hash_type)]
+            // order reaches output; migration tracked in #4414
             for (attribute, override_) in name_overrides {
                 let snapshot_value = snapshot_resource
                     .attributes

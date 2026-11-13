@@ -872,6 +872,8 @@ fn install_prior_managed_transform_states(
             target.apply_transformed_state(state);
         }
     }
+    #[allow(clippy::iter_over_hash_type)]
+    // keyed rebuild: transformed attributes and metadata transfer by exact resource ID
     for (id, current) in current_states {
         if let Some(state) = managed_states.remove(id)
             && let Some(target) = current.state_bearing_mut()

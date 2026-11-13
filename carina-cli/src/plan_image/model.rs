@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use carina_core::effect::Effect;
 use carina_core::executor::{
@@ -219,7 +219,7 @@ pub(crate) fn build_model(input: PlanImageInput<'_>) -> GraphModel {
     // directives. Attribute values are never cloned into this analysis view.
     let original_effect_count = plan.effects().len();
     let mut synthetic_effects = Vec::new();
-    let mut synthetic_nodes = HashMap::new();
+    let mut synthetic_nodes = BTreeMap::new();
     for (resource_idx, resource) in input.desired_resources.iter().enumerate() {
         if changed_resource_ids.contains(&resource.id) {
             continue;
@@ -997,6 +997,8 @@ fn adjacency<'a>(
     for (from, to) in edges {
         adjacency.entry(from.clone()).or_default().push(to.clone());
     }
+    #[allow(clippy::iter_over_hash_type)]
+    // keyed rebuild: adjacency lists are independently sorted and deduplicated
     for next in adjacency.values_mut() {
         next.sort_by_key(GraphNodeId::stable_key);
         next.dedup();
@@ -1055,6 +1057,8 @@ fn attach_blast_radius(
     for source in sources {
         let mut descendants = reachable([source.id.clone()], logical_adjacency);
         descendants.remove(&source.id);
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: descendants receive the same source before source lists are sorted and deduplicated
         for descendant in descendants {
             affected.entry(descendant).or_default().push(source.clone());
         }

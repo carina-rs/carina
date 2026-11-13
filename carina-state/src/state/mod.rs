@@ -66,7 +66,7 @@ fn recorded_write_only_keys(
     attributes: &PersistedAttributes,
     orphan_recorded: &[String],
 ) -> HashSet<String> {
-    let mut keys = schema_write_only_keys(schema);
+    let mut keys: HashSet<_> = schema_write_only_keys(schema).into_iter().collect();
     keys.extend(orphan_recorded.iter().cloned());
     keys.retain(|key| attributes.contains_key(key));
     keys
@@ -91,7 +91,7 @@ impl SelectedStateAttributes {
         schema: Option<&ResourceSchema>,
         additionally_recorded: &[String],
     ) -> HashSet<String> {
-        let mut keys = schema_write_only_keys(schema);
+        let mut keys: HashSet<_> = schema_write_only_keys(schema).into_iter().collect();
         keys.extend(additionally_recorded.iter().cloned());
         keys
     }
@@ -103,6 +103,7 @@ impl SelectedStateAttributes {
     ) -> Result<Self, SerializationError> {
         let write_only_keys = Self::write_only_keys(schema, additionally_recorded);
         let mut encoded = HashMap::new();
+        #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
         for (key, value) in attributes {
             if write_only_keys.contains(key) {
                 continue;
@@ -1449,6 +1450,8 @@ impl StateFile {
                     });
             }
         }
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: candidates are independently sorted and deduplicated in stable row order
         for candidates in state_candidates.values_mut() {
             candidates.sort_by(|left, right| left.id.cmp(&right.id));
             candidates.dedup_by(|left, right| left.id == right.id);
@@ -1513,6 +1516,8 @@ impl StateFile {
             }
 
             let mut deposed_dependencies = HashMap::new();
+            #[allow(clippy::iter_over_hash_type)]
+            // order reaches output; migration tracked in #4414
             for (key, names) in &legacy.deposed_dependencies {
                 let (known, unknown) = classify_legacy_names(
                     input.graph,
@@ -1985,6 +1990,8 @@ impl StateFile {
         else {
             return;
         };
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: distinct missing write-only keys preserve existing-value precedence
         for key in recorded_write_only_keys(Some(schema.as_schema()), attributes, &[]) {
             if let std::collections::hash_map::Entry::Vacant(entry) =
                 current.attributes.entry(key.clone())

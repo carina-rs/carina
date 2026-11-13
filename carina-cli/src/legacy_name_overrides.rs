@@ -21,6 +21,8 @@ pub(crate) fn write_legacy_override_warnings<W: Write>(
         let Some(overrides) = state.name_overrides_for(resource_id) else {
             continue;
         };
+        #[allow(clippy::iter_over_hash_type)]
+        // sorted immediately after: complete warning tuples are sorted before writing
         for (attribute, override_) in overrides {
             if override_.original_value.is_none() {
                 warnings.push((

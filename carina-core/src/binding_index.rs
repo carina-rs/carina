@@ -1835,6 +1835,8 @@ impl BindingNameSet {
                 .entry(fn_name.clone())
                 .or_insert(BindingNameKind::UserFunction);
         }
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: structural names have fixed declaration-kind precedence
         for structural in &parsed.structural_bindings {
             by_name
                 .entry(structural.to_string())
@@ -2152,6 +2154,8 @@ impl SecretPreservingAttributes {
             .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
             .collect::<HashMap<_, _>>();
         let mut attributes = resolved_shapes.clone();
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: distinct provider keys override desired values explicitly
         for (key, value) in &provider_values {
             let protected = resolved_shapes.get(key).map_or_else(
                 || value.clone(),
@@ -2694,6 +2698,8 @@ impl ResolvedBindings {
                     crate::resource::Current::Absent(_absent) => {}
                     crate::resource::Current::Present(present) => {
                         completeness = BindingCompleteness::Complete;
+                        #[allow(clippy::iter_over_hash_type)]
+                        // keyed rebuild: distinct missing state keys preserve desired-value precedence
                         for (k, v) in &present.state().attributes {
                             if changed_attributes.contains(k) && !definitive_attributes.contains(k)
                             {
@@ -2717,6 +2723,8 @@ impl ResolvedBindings {
                     crate::resource::Current::CreateInFlight(_pending) => {}
                     crate::resource::Current::CreateOutcomeUnknown(_unknown) => {}
                     crate::resource::Current::MissingIdentifier(unidentified) => {
+                        #[allow(clippy::iter_over_hash_type)]
+                        // keyed rebuild: distinct missing state keys preserve desired-value precedence
                         for (k, v) in &unidentified.state().attributes {
                             merged.entry(k.clone()).or_insert_with(|| v.clone());
                         }
@@ -2737,6 +2745,8 @@ impl ResolvedBindings {
             );
         }
 
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: distinct remote bindings have fixed upstream precedence
         for (remote_binding, remote_attrs) in remote_bindings {
             by_name.insert(
                 remote_binding.clone(),
@@ -2955,6 +2965,8 @@ impl ResolvedBindings {
                     // but its missing outputs are still definitive absence.
                     completeness = BindingCompleteness::Complete;
                     if state.exists {
+                        #[allow(clippy::iter_over_hash_type)]
+                        // keyed rebuild: distinct read keys have fixed state-over-declaration precedence
                         for (k, v) in &state.attributes {
                             merged.insert(k.clone(), v.clone());
                         }
@@ -3048,6 +3060,8 @@ impl ResolvedBindings {
                     let desired = resource.resolved_attributes();
                     binding.definitive_attributes = desired.keys().cloned().collect();
                     binding.removed_sensitive_attributes.clear();
+                    #[allow(clippy::iter_over_hash_type)]
+                    // keyed rebuild: distinct changed keys update independent attributes and memberships
                     for attribute in changed_attributes {
                         if let Some(value) = desired.get(attribute) {
                             binding
@@ -3124,6 +3138,8 @@ impl ResolvedBindings {
             return;
         };
         let mut merged = resource_attrs.values().clone();
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: distinct applied-state keys have explicit value and secret-shape precedence
         for (k, v) in &state.attributes {
             let v = crate::resource::state_value_snapshot(v);
             let value = resource_attrs.values().get(k).map_or_else(
@@ -3201,6 +3217,8 @@ impl ResolvedBindings {
         &mut self,
         remote_bindings: &crate::upstream_exports::AdmittedRemoteBindings,
     ) {
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: distinct remote bindings retain upstream provenance
         for (binding, exports) in remote_bindings {
             self.set_values_with_completeness(
                 binding,

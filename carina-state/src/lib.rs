@@ -51,6 +51,8 @@
 //! backend.release_lock(&lock).await?;
 //! ```
 
+#![deny(clippy::iter_over_hash_type)]
+
 #[cfg(test)]
 fn fixture_applied_identifier(
     identifier: impl Into<String>,

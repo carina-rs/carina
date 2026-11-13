@@ -1,3 +1,5 @@
+#![deny(clippy::iter_over_hash_type)]
+
 pub mod commands;
 pub mod cursor;
 pub mod display;

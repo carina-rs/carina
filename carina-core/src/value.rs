@@ -4464,6 +4464,7 @@ pub fn verify_historical_state_secrets(
     let mut state = saved.clone();
     let mut drifted_attributes = BTreeSet::new();
     let mut drift_errors = Vec::new();
+    #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
     for (key, saved_value) in &saved.attributes {
         if !contains_redacted_secret(saved_value) {
             continue;
@@ -4735,6 +4736,7 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
         let resource_id = create_ids.get(metadata.create_idx).and_then(Option::as_ref);
         let historical = resource_id.and_then(|id| historical.get(id));
         let guide = resource_id.and_then(|id| planned_resources.get(id));
+        #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
         for (key, value) in &mut metadata.previous_attributes {
             *value = if let Some(shape) = historical.and_then(|state| state.attributes.get(key)) {
                 redact_using_redacted_shape(value, shape)?
@@ -4948,6 +4950,7 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states<
         verified: &crate::resource::SnapshotState,
     ) -> Result<crate::resource::SnapshotState, SecretRehydrationSiteError> {
         let mut out = saved.clone();
+        #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
         for (key, value) in &mut out.attributes {
             if !contains_redacted_secret(value) {
                 continue;
@@ -5071,6 +5074,7 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states<
                 )
             })?;
         let (redacted, verified) = state_evidence(resource_id)?;
+        #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
         for (key, value) in &mut metadata.previous_attributes {
             if !contains_redacted_secret(value) {
                 continue;
@@ -7186,6 +7190,8 @@ pub fn canonicalize_states_with_schemas(
     states: &mut std::collections::HashMap<crate::resource::ResourceId, crate::resource::Current>,
     registry: &crate::schema::SchemaRegistry,
 ) {
+    #[allow(clippy::iter_over_hash_type)]
+    // keyed rebuild: infallible schema canonicalization operates independently per state
     for current in states.values_mut() {
         let state = match current {
             crate::resource::Current::Absent(state) => state.state(),

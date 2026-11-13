@@ -624,6 +624,8 @@ impl PreparationNodes {
         effects: &[Effect<S>],
         deps: &mut HashMap<usize, HashSet<usize>>,
     ) {
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: each replacement template removes its own absorbed prerequisites
         for (&template, absorbed) in &self.replacement_templates {
             // Only the template's own expanded teardown slots can form the
             // template <-> absorbed-delete cycle. Preserve anonymous identity

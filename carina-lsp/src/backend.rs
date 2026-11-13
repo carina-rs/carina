@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -60,7 +60,7 @@ struct ProviderState {
 impl ProviderState {
     fn new(
         factories: Vec<Box<dyn ProviderFactory>>,
-        mut provider_errors: HashMap<String, String>,
+        mut provider_errors: BTreeMap<String, String>,
         configs: Vec<(PathBuf, workspace::DiscoveredProviderConfig)>,
         prober: Option<ProviderInstallProber>,
         install_fingerprint: Vec<(String, ProviderInstallFingerprint)>,
@@ -120,7 +120,8 @@ impl ProviderState {
                     .or_insert_with(|| format!("Provider '{provider}' schemas are unavailable"));
             }
         }
-        let mut diagnostic_engine = diagnostic_engine.with_provider_errors(provider_errors);
+        let mut diagnostic_engine =
+            diagnostic_engine.with_provider_errors(provider_errors.into_iter().collect());
         if let Some((directory, _)) = configs.first() {
             diagnostic_engine = diagnostic_engine.with_directory_providers(
                 PathIdentity::new(directory),
@@ -211,7 +212,7 @@ impl ProviderStates {
             import_map: HashMap::new(),
             empty: ProviderState::new(
                 vec![],
-                HashMap::new(),
+                BTreeMap::new(),
                 vec![],
                 None,
                 vec![],
@@ -261,7 +262,7 @@ impl ProviderStates {
 /// TOCTOU artifact or a file://-vs-`.carina/` mismatch.
 pub type FactoryBuildResult = (
     Vec<Box<dyn ProviderFactory>>,
-    HashMap<String, String>, // provider name -> error reason
+    BTreeMap<String, String>, // provider name -> error reason
     Vec<(String, ProviderInstallFingerprint)>, // install fingerprint
 );
 
@@ -758,7 +759,9 @@ async fn load_schemas_impl(
     };
 
     let environment = providers.read().await.environment.clone();
-    let mut dir_providers = HashMap::new();
+    let mut dir_providers = BTreeMap::new();
+    #[allow(clippy::iter_over_hash_type)]
+    // commutative: canonical groups select the minimum display path from unique discovery keys
     for (dir, configs) in workspace::discover_providers_by_dir(&workspace_root, &environment) {
         let entry = dir_providers
             .entry(PathIdentity::new(&dir))
@@ -1010,7 +1013,7 @@ mod tests {
         let config = workspace::DiscoveredProviderConfig::from_parser(config);
         ProviderState::new(
             vec![Box::new(BlockSchemaFactory { block_name })],
-            HashMap::new(),
+            BTreeMap::new(),
             vec![(PathBuf::new(), config)],
             None,
             vec![],
@@ -1030,7 +1033,7 @@ mod tests {
             .collect();
         ProviderState::new(
             vec![],
-            HashMap::new(),
+            BTreeMap::new(),
             configs,
             None,
             vec![(
@@ -1087,7 +1090,7 @@ mock.test.Thing {
             .collect();
         let state = ProviderState::new(
             vec![],
-            HashMap::new(),
+            BTreeMap::new(),
             configs,
             None,
             vec![(
@@ -1158,7 +1161,7 @@ mock.test.Thing {
             .collect();
         let state = ProviderState::new(
             vec![],
-            HashMap::new(),
+            BTreeMap::new(),
             configs,
             None,
             vec![(
@@ -1408,7 +1411,7 @@ let duplicate = mock.test.resource {
             .collect();
         let state = ProviderState::new(
             vec![],
-            HashMap::new(),
+            BTreeMap::new(),
             configs,
             None,
             vec![(
@@ -1469,7 +1472,7 @@ let duplicate = mock.test.resource {
             .collect();
         let state = ProviderState::new(
             vec![],
-            HashMap::from([(
+            BTreeMap::from([(
                 "mock".to_string(),
                 "provider artifact is missing".to_string(),
             )]),
@@ -1788,7 +1791,7 @@ mod reload_skip_tests {
             move |configs| {
                 assert_eq!(configs.len(), 1);
                 builds.fetch_add(1, Ordering::SeqCst);
-                (vec![], HashMap::new(), vec![])
+                (vec![], BTreeMap::new(), vec![])
             }
         });
         let (service, socket) = tower_lsp::LspService::new(|client| {

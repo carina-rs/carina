@@ -6980,6 +6980,8 @@ impl<E, B: BindingAddress>
             .expressions
             .extend(deferred_for_phase.expressions);
         self.deferred_module_ifs.extend(deferred_module_ifs);
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: distinct leaf keys have fixed incoming-over-existing precedence
         for (leaf, call_sites) in expansion_trace.leaf_to_call_sites {
             self.expansion_trace.record(leaf, call_sites);
         }

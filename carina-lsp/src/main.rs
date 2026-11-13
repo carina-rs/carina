@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+#![deny(clippy::iter_over_hash_type)]
+
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use carina_core::EnvironmentSnapshot;
@@ -87,7 +89,7 @@ fn build_factories(
     grants: &carina_provider_resolver::TrustedLocalGrants,
 ) -> FactoryBuildResult {
     let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
-    let mut errors: HashMap<String, String> = HashMap::new();
+    let mut errors: BTreeMap<String, String> = BTreeMap::new();
     let mut fingerprint: Vec<(String, carina_lsp::backend::ProviderInstallFingerprint)> =
         Vec::with_capacity(providers.len());
 

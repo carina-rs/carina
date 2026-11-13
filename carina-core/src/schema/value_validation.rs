@@ -129,6 +129,8 @@ impl WalkCoverage {
         self.nodes.extend(other.nodes);
         self.unavailable.extend(other.unavailable);
         self.work += other.work;
+        #[allow(clippy::iter_over_hash_type)]
+        // commutative: per-key generations use maxima, set unions, and independent sums
         for (identity, generation) in other.generations {
             self.bump(identity, generation);
         }

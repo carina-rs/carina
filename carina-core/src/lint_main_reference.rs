@@ -78,6 +78,8 @@ pub fn find_list_literal_attrs(source: &str, attr_names: &HashSet<String>) -> Ve
 
     for (line_idx, line) in source.lines().enumerate() {
         let trimmed = line.trim_start();
+        #[allow(clippy::iter_over_hash_type)]
+        // commutative: oracle equality uses the same input-set traversal on both sides
         for attr_name in attr_names {
             if !trimmed.starts_with(attr_name.as_str()) {
                 continue;

@@ -2624,7 +2624,7 @@ let orphan = mock.test.resource {
         carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
             &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            &std::collections::HashMap::new(),
+            &indexmap::IndexMap::new(),
         );
     assert!(
         directory_parse.is_err(),
@@ -16651,7 +16651,7 @@ fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
         carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
             &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            &std::collections::HashMap::new(),
+            &indexmap::IndexMap::new(),
         )
         .expect("directory fixture must parse");
     let (_, parsed_source) = merged_result

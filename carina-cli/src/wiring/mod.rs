@@ -3718,6 +3718,8 @@ fn prefix_state_info(
                     });
             }
         }
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: distinct persisted keys fill missing entries with refreshed-value precedence
         for (name, value) in persisted_values {
             attribute_values
                 .entry(name)
@@ -4955,6 +4957,8 @@ pub fn normalize_state_with_ctx(
         &router,
         &mut provider_states,
     ));
+    #[allow(clippy::iter_over_hash_type)]
+    // keyed rebuild: transformed states transfer by exact resource ID
     for (id, current) in managed_current {
         if let Some(state) = provider_states.remove(id)
             && let Some(target) = current.state_bearing_mut()
@@ -5665,6 +5669,8 @@ impl AddressedState {
     fn refresh_destroy_metadata_from_state(&mut self, state_file: &StateFile) {
         let source_by_target =
             ProjectedStateRead::from_pairs(Some(state_file), &self.moved_pairs).source_by_target;
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: move-projected dependency metadata is updated independently per resource
         for (desired, current) in &mut self.managed_current {
             let source = source_by_target
                 .get(desired)
@@ -8356,6 +8362,8 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
             sorted_resources.iter().map(|resource| &resource.id),
         );
     let mut move_plan: Plan = Plan::default();
+    #[allow(clippy::iter_over_hash_type)]
+    // keyed rebuild: test move pairs map each distinct target to itself
     for target in moved_targets {
         let target = ResolvedResourceId::new(target.clone());
         move_plan.add(Effect::Move {

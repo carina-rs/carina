@@ -1,3 +1,5 @@
+#![deny(clippy::iter_over_hash_type)]
+
 pub mod backend;
 pub mod code_action;
 pub mod completion;

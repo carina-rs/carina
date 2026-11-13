@@ -1,8 +1,10 @@
 //! The single fallible transition from authored dependency operands to
 //! complete scheduler addresses.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Deref;
+
+use indexmap::IndexMap;
 
 use crate::eval_value::UnexpandedResourceHandle;
 use crate::parser::{
@@ -1159,7 +1161,7 @@ pub fn loop_group_bindings<B: BindingAddress>(binding: &B) -> Vec<B> {
 
 fn resolve_pending_output(
     key: &AbsoluteBindingAddress,
-    pending: &HashMap<
+    pending: &IndexMap<
         AbsoluteBindingAddress,
         UnexpandedCompositionAttribute<AbsoluteBindingAddress>,
     >,
@@ -1224,7 +1226,7 @@ fn resolve_pending_output(
 
 fn resolve_composition_dependencies(
     binding: &AbsoluteBindingAddress,
-    raw: &HashMap<AbsoluteBindingAddress, HashSet<AbsoluteBindingAddress>>,
+    raw: &IndexMap<AbsoluteBindingAddress, BTreeSet<AbsoluteBindingAddress>>,
     targets: &ExpandedTargets,
     outputs: &HashMap<AbsoluteBindingAddress, ResolvedHandleTarget>,
     upstream_bindings: &HashSet<AbsoluteBindingAddress>,
@@ -1626,7 +1628,7 @@ pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
                 attribute,
             ))
         })
-        .collect::<Result<HashMap<_, _>, ExpandedGraphResolutionError>>()?;
+        .collect::<Result<IndexMap<_, _>, ExpandedGraphResolutionError>>()?;
     let mut handle_outputs = HashMap::new();
     for key in pending.keys() {
         resolve_pending_output(
@@ -1686,11 +1688,13 @@ pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
             composition.binding.as_ref().map(|binding| {
                 (
                     binding.clone(),
-                    crate::deps::get_composition_dependencies(composition),
+                    crate::deps::get_composition_dependencies(composition)
+                        .into_iter()
+                        .collect::<BTreeSet<_>>(),
                 )
             })
         })
-        .collect::<HashMap<_, _>>();
+        .collect::<IndexMap<_, _>>();
     let mut composition_dependencies = HashMap::new();
     for binding in raw_composition_dependencies.keys() {
         resolve_composition_dependencies(

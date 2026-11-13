@@ -1107,6 +1107,7 @@ fn collect_resource_inputs<D>(
             )?;
         }
     }
+    #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
     for (id, current) in current {
         if let Some(schema) = registry.get(
             &id.provider,
@@ -1147,6 +1148,7 @@ fn collect_resource_inputs<D>(
         .chain(current.keys())
         .chain(saved.resource_ids())
         .collect::<HashSet<_>>();
+    #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
     for id in resources {
         if let Some(schema) = registry.get(
             &id.provider,

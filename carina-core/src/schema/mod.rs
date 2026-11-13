@@ -12044,7 +12044,7 @@ fn validate_tags_key_value(attributes: &HashMap<String, Value>) -> Result<(), Ve
 /// provider-value protection one definition of the schema-owned key set.
 pub fn schema_write_only_keys<R: PatternForm>(
     schema: Option<&PatternResourceSchema<R>>,
-) -> HashSet<String> {
+) -> BTreeSet<String> {
     schema
         .into_iter()
         .flat_map(|schema| schema.attributes.iter())
@@ -14909,6 +14909,8 @@ fn builtin_identified_declarations()
         OnceLock::new();
     DECLARATIONS.get_or_init(|| {
         let mut declarations = HashMap::new();
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: fixed consistent builtin declarations have no competing definitions
         for builtin in builtin_type_registry().values() {
             visit_identified_declarations(builtin, (), &mut |declaration, ()| {
                 declarations.insert(declaration.identity().clone(), declaration);
@@ -14974,6 +14976,8 @@ pub fn builtin_validator_registry()
         OnceLock::new();
     REGISTRY.get_or_init(|| {
         let mut validators = HashMap::new();
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: builtin validators have unique scalar identities
         for attr_type in builtin_type_registry().values() {
             let (kind, binding) = match &attr_type.kind {
                 AttrTypeKind::UnloadedSchemaType(_) => {
@@ -15765,8 +15769,8 @@ impl std::ops::Deref for OwnerBoundResourceSchema<'_> {
 /// See `notes/specs/2026-05-02-resource-vs-data-source-design.md` (Decision 1-2).
 #[derive(Debug, Clone, Default)]
 pub struct SchemaRegistry {
-    managed: HashMap<(SchemaTypeOwner, String), ValidatedResourceSchema>,
-    data_sources: HashMap<(SchemaTypeOwner, String), ValidatedResourceSchema>,
+    managed: BTreeMap<(SchemaTypeOwner, String), ValidatedResourceSchema>,
+    data_sources: BTreeMap<(SchemaTypeOwner, String), ValidatedResourceSchema>,
     reference_forms: BTreeMap<String, ReferenceForms>,
     witness_backed_reference_forms: HashSet<String>,
     assignability_closures: BTreeMap<SchemaTypeOwner, AssignabilityClosure>,

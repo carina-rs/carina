@@ -946,7 +946,7 @@ pub fn find_duplicate_declarations_in_analysis(
 }
 
 /// In-memory source snapshots keyed by the edited file path.
-pub type SourceOverrides = HashMap<PathBuf, String>;
+pub type SourceOverrides = IndexMap<PathBuf, String>;
 
 /// The complete, sorted listing of one directory, including unsaved buffers.
 /// Paths remain OS paths throughout discovery; filename encoding never decides
@@ -1062,7 +1062,7 @@ pub(crate) fn read_source_with_overrides(
 
 fn filename_source_overrides(
     dir: &ResolvedPath,
-    overrides: &HashMap<String, String>,
+    overrides: &IndexMap<String, String>,
 ) -> SourceOverrides {
     overrides
         .iter()
@@ -1445,7 +1445,7 @@ pub fn parse_directory(
     dir: &ResolvedPath,
     config: &ProviderContext,
 ) -> Result<ParsedRootDirectory, String> {
-    parse_directory_with_overrides(dir, config, &HashMap::new())
+    parse_directory_with_overrides(dir, config, &IndexMap::new())
 }
 
 /// Inspect declarations for completion/discovery without demanding their values.
@@ -1457,7 +1457,7 @@ pub fn parse_directory_for_bootstrap(
     parse_directory_with_overrides_impl(
         dir,
         config,
-        &HashMap::new(),
+        &IndexMap::new(),
         ResolutionContext::issue(ResolutionPhase::Bootstrap),
         &SchemaRegistry::new(),
     )
@@ -1469,7 +1469,7 @@ pub fn parse_directory_for_bootstrap(
 pub fn parse_directory_for_metadata(
     dir: &ResolvedPath,
     config: &ProviderContext,
-    overrides: &HashMap<String, String>,
+    overrides: &IndexMap<String, String>,
     schemas: &SchemaRegistry,
 ) -> Result<ParsedRootDirectory, String> {
     parse_directory_for_metadata_report(dir, config, overrides, schemas)
@@ -1480,7 +1480,7 @@ pub fn parse_directory_for_metadata(
 pub fn parse_directory_for_metadata_report(
     dir: &ResolvedPath,
     config: &ProviderContext,
-    overrides: &HashMap<String, String>,
+    overrides: &IndexMap<String, String>,
     schemas: &SchemaRegistry,
 ) -> Result<ParsedRootDirectory, DirectoryParseFailure> {
     parse_directory_for_metadata_with_source_overrides_report(
@@ -1517,7 +1517,7 @@ pub fn parse_directory_for_metadata_with_source_overrides_report(
 pub fn parse_directory_with_overrides(
     dir: &ResolvedPath,
     config: &ProviderContext,
-    overrides: &HashMap<String, String>,
+    overrides: &IndexMap<String, String>,
 ) -> Result<ParsedRootDirectory, String> {
     parse_directory_with_overrides_impl(
         dir,
@@ -1716,7 +1716,7 @@ impl DirectoryParseResult {
 pub fn parse_directory_with_overrides_and_diagnostics(
     dir: &ResolvedPath,
     config: &ProviderContext,
-    overrides: &HashMap<String, String>,
+    overrides: &IndexMap<String, String>,
 ) -> Result<DirectoryParseResult, DirectoryParseFailure> {
     parse_directory_with_overrides_impl(
         dir,
@@ -1730,7 +1730,7 @@ pub fn parse_directory_with_overrides_and_diagnostics(
 pub fn parse_directory_with_overrides_and_diagnostics_with_schemas(
     dir: &ResolvedPath,
     config: &ProviderContext,
-    overrides: &HashMap<String, String>,
+    overrides: &IndexMap<String, String>,
     schemas: &SchemaRegistry,
 ) -> Result<DirectoryParseResult, DirectoryParseFailure> {
     parse_directory_with_source_overrides_and_diagnostics_with_schemas(
@@ -2520,7 +2520,7 @@ mod tests {
         let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
 
         let parsed =
-            parse_directory_with_overrides_and_diagnostics(&root, &context, &HashMap::new())
+            parse_directory_with_overrides_and_diagnostics(&root, &context, &IndexMap::new())
                 .unwrap();
 
         assert!(parsed.semantic_file(&main_path).is_some());
@@ -4092,7 +4092,7 @@ awscc.ec2.SecurityGroup {
         let directory = parse_directory_with_overrides_and_diagnostics(
             &crate::paths::ResolvedPath::new(temp.path()).unwrap(),
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-            &HashMap::new(),
+            &IndexMap::new(),
         )
         .expect("directory parse");
         let semantic = directory.semantic_file(&main_path).expect("semantic file");

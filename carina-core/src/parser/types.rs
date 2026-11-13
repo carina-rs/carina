@@ -565,6 +565,8 @@ mod tests {
 
     #[test]
     fn identity_conversion_preserves_builtins_and_provider_nominals() {
+        #[allow(clippy::iter_over_hash_type)]
+        // commutative: builtin type-conversion assertions are independent per identity
         for identity in crate::schema::builtin_type_registry().keys() {
             assert!(
                 matches!(
@@ -753,6 +755,8 @@ mod tests {
     #[test]
     fn parse_type_expr_str_accepts_every_builtin_validator_when_custom_types_are_loaded() {
         let ctx = loaded_context(Default::default());
+        #[allow(clippy::iter_over_hash_type)]
+        // commutative: builtin registration assertions are independent per identity
         for identity in crate::schema::builtin_type_registry().keys() {
             assert!(identity.provider.is_none() && identity.segments.is_empty());
             let name = &identity.kind;

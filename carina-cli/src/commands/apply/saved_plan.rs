@@ -664,6 +664,8 @@ impl SchemaCheckedPendingPlanFile {
                 already_refreshed.insert(id.clone());
             }
         }
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: distinct required IDs fill absent managed-current entries
         for id in required_managed {
             managed
                 .entry((*id).clone())

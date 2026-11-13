@@ -3026,6 +3026,8 @@ impl ProviderAttributeBindings {
             }
         }
         resolved.install_upstream(remote);
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: distinct remote names are copied after the fixed local-binding pass
         for (binding, attributes) in remote {
             parser.insert(binding.clone(), (**attributes).clone());
         }
