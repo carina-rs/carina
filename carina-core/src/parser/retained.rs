@@ -13,7 +13,11 @@ use crate::resource::{
 };
 use indexmap::IndexMap;
 use pest::iterators::{Pair, Pairs};
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+};
 
 #[cfg(test)]
 mod tests;
@@ -337,20 +341,13 @@ impl RequireScope {
     }
 }
 
-/// Parser-minted declaration identity and its immutable authored obligation.
-/// The exact value that suppresses ordinary value inference evaluates the
-/// condition; a public File.requires edit cannot remove that obligation.
-#[derive(Debug, Clone)]
+/// Parser-minted declaration identity and its scope evidence. The same node
+/// that suppresses child inference must reject a Directory declaration;
+/// a public File.requires edit cannot remove that obligation.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RetainedRequireCondition {
     id: NodeId,
     scope: RequireScope,
-    declaration: super::RequireBlock<ParserPlaceholder, RelativeBindingName>,
-}
-
-impl PartialEq for RetainedRequireCondition {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.scope == other.scope
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -985,21 +982,6 @@ pub(crate) fn admit_require_scope<E, D, B: BindingAddress>(
     expressions.set_require_scope(scope);
 }
 
-pub(crate) fn has_retained_requires<E, D, B: BindingAddress>(
-    file: &super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
-) -> bool {
-    fn contains<P: ValueKind, B: BindingAddress>(root: &ExprValue<P, B>) -> bool {
-        matches!(root.authored.kind, ExprKind::RequireCondition(_))
-            || root.authored.children.iter().any(contains)
-    }
-    file.parser_binding_metadata
-        .syntax()
-        .expressions()
-        .roots
-        .iter()
-        .any(contains)
-}
-
 pub(crate) fn judge_configuration<
     E: super::ExportParamLike<ParserPlaceholder, B>,
     D,
@@ -1141,11 +1123,10 @@ impl Expressions {
         for root in &mut self.roots {
             retain_require_nodes(root, &mut memo, &mut |id, current| {
                 declarations
-                    .get(&id)
-                    .map(|declaration| RetainedRequireCondition {
+                    .contains(&id)
+                    .then(|| RetainedRequireCondition {
                         id,
                         scope: scope.clone(),
-                        declaration: declaration.clone(),
                     })
                     .or(current)
             });
@@ -1302,9 +1283,7 @@ impl ParseNodeKey {
 pub(in crate::parser) struct CapturedNodes {
     inventory: bool,
     nodes: HashMap<ParseNodeKey, ExprValue>,
-    requires: std::sync::RwLock<
-        HashMap<NodeId, super::RequireBlock<ParserPlaceholder, RelativeBindingName>>,
-    >,
+    requires: std::sync::RwLock<HashSet<NodeId>>,
     resource_declarations: HashMap<NodeId, SlotDeclarationId>,
     values: std::sync::RwLock<HashMap<NodeId, Value<ParserPlaceholder, RelativeBindingName>>>,
     conditions: ConditionRecorder,
@@ -1315,15 +1294,11 @@ impl std::fmt::Debug for CapturedNodes {
     }
 }
 impl CapturedNodes {
-    pub(in crate::parser) fn retain_require(
-        &self,
-        id: NodeId,
-        declaration: super::RequireBlock<ParserPlaceholder, RelativeBindingName>,
-    ) {
+    pub(in crate::parser) fn retain_require(&self, id: NodeId) {
         self.requires
             .write()
             .expect("retained require declarations")
-            .insert(id, declaration);
+            .insert(id);
     }
 
     fn condition_snapshot(&self) -> ConditionSnapshot {
@@ -4091,15 +4066,12 @@ mod judgement {
             let outer_scope = self.scope;
             self.scope = scope;
             self.visiting.push(id);
-            let directory_require = match &root.kind {
+            let directory_require = matches!(
+                &root.kind,
                 ExprKind::RequireCondition(require)
-                    if matches!(require.scope, RequireScope::Directory(_)) =>
-                {
-                    Some(require.clone())
-                }
-                _ => None,
-            };
-            let mut children = if directory_require.is_some() {
+                    if matches!(require.scope, RequireScope::Directory(_))
+            );
+            let mut children = if directory_require {
                 Vec::new()
             } else {
                 root.children
@@ -4140,15 +4112,15 @@ mod judgement {
                     owner: FailureOwner::Boundary,
                 };
             }
-            let mut result = if let Some(require) = directory_require {
-                if let Some(diagnostic) =
-                    crate::module_resolver::evaluate_directory_require(&require.declaration)
-                {
-                    self.push_finding(
-                        root.location.authored.clone(),
-                        InferenceError::DirectoryConstraint(Box::new(diagnostic)),
-                    );
-                }
+            let mut result = if directory_require {
+                // A rejected declaration owns the sole diagnostic for its
+                // condition. Do not infer or evaluate any of its children.
+                self.push_finding(
+                    root.location.authored.clone(),
+                    InferenceError::DirectoryConstraint(Box::new(
+                        crate::module_resolver::DirectoryConstraintDiagnostic,
+                    )),
+                );
                 declaration()
             } else {
                 self.infer(expression, &children)

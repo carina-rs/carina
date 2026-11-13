@@ -1936,7 +1936,7 @@ mod tests {
             assert_eq!(finding.location().span().end_column(), 14);
             assert_eq!(
                 finding.detail().to_string(),
-                "require failed: upstream guard"
+                "`require` is only allowed inside a module"
             );
             if physical {
                 let (_, errors) = super::resolve_upstream_export_report_inner(

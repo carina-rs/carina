@@ -1,4 +1,4 @@
-//! Root requirements use the same directory resolver as module requirements.
+//! Root requirements are rejected at the shared directory admission boundary.
 
 use std::fs;
 use std::path::PathBuf;
@@ -49,7 +49,6 @@ impl Directory {
             project,
             home,
         };
-        directory.guard("true");
         success(&directory.run(&["init", "."]));
         directory.guard(condition);
         directory
@@ -61,6 +60,10 @@ impl Directory {
             format!("// sibling guard\nrequire {condition}, 'root guard'\n"),
         )
         .unwrap();
+    }
+
+    fn clear_guard(&self) {
+        fs::remove_file(self.project.join("guards.crn")).unwrap();
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -82,11 +85,14 @@ impl Directory {
             .unwrap()
     }
 
-    fn assert_validate_diagnostic(&self, condition: &str, message: &str) {
+    fn assert_validate_diagnostic(&self, condition: &str) {
+        let message = ROOT_REQUIRE_ERROR;
         let human = self.run(&["validate", "."]);
         rejected(&human, message);
         let text = output_text(&human);
-        assert!(text.contains("guards.crn"), "{text}");
+        assert!(text.contains("guards.crn at line 2"), "{text}");
+        assert_eq!(text.matches(message).count(), 1, "{text}");
+        assert!(!text.contains("root guard"), "{text}");
         let output = self.run(&["validate", "--json", "."]);
         assert!(!output.status.success(), "{}", output_text(&output));
         let report: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -127,6 +133,7 @@ impl Directory {
                     .filter(|d| d.message == message)
                     .collect();
                 assert_eq!(matching.len(), 1, "{diagnostics:?}");
+                assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
                 assert_eq!(
                     matching[0].range,
                     Range::new(
@@ -276,10 +283,7 @@ fn round5_module_guard_error_chain_renders_once() {
     assert!(finding.location().file().path().ends_with("guards.crn"));
     assert_eq!(finding.location().span().start_column(), 9);
     assert_eq!(finding.location().span().end_column(), 14);
-    assert_eq!(
-        finding.detail().to_string(),
-        "require failed: upstream guard"
-    );
+    assert_eq!(finding.detail().to_string(), ROOT_REQUIRE_ERROR);
     assert_eq!(
         carina_cli::error::format_error_with_source_chain(error.as_ref()),
         error.to_string()
@@ -310,6 +314,7 @@ fn round5_upstream_report_error_chain_renders_once() {
 
 fn assert_round4_empty_template(blocks: &str) {
     let directory = Directory::new("true");
+    directory.clear_guard();
     fs::create_dir(directory.project.join("empty")).unwrap();
     fs::write(directory.project.join("empty/arguments.crn"), blocks).unwrap();
     fs::write(
@@ -361,6 +366,7 @@ fn round1_validate_standalone_module_directory_keeps_template_scope() {
 
 fn assert_round1_upstream_guard(condition: &str) {
     let directory = Directory::new("true");
+    directory.clear_guard();
     let upstream = directory.project.join("upstream");
     fs::create_dir(&upstream).unwrap();
     fs::write(
@@ -382,6 +388,7 @@ fn assert_round1_upstream_guard(condition: &str) {
     let output = directory.run(&["validate", "--json", "."]);
     assert!(!output.status.success());
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["errors"].as_array().unwrap().len(), 1, "{report}");
     let error = report["errors"]
         .as_array()
         .unwrap()
@@ -389,9 +396,9 @@ fn assert_round1_upstream_guard(condition: &str) {
         .find(|e| {
             e["message"]
                 .as_str()
-                .is_some_and(|m| m.contains("require failed: upstream guard"))
+                .is_some_and(|m| m.contains(ROOT_REQUIRE_ERROR))
         })
-        .unwrap();
+        .unwrap_or_else(|| panic!("{report}"));
     let file = error["location"]["file"]
         .as_str()
         .expect("upstream require must retain its authored file");
@@ -409,13 +416,18 @@ fn assert_round1_upstream_guard(condition: &str) {
 }
 
 #[test]
-fn round1_upstream_false_require_keeps_location() {
+fn root_require_upstream_false_keeps_location() {
     assert_round1_upstream_guard("false");
 }
 
 #[test]
-fn round1_upstream_unknown_require_keeps_location() {
+fn root_require_upstream_unknown_keeps_location() {
     assert_round1_upstream_guard("missing == 1");
+}
+
+#[test]
+fn root_require_upstream_true_keeps_location() {
+    assert_round1_upstream_guard("true");
 }
 
 #[test]
@@ -426,11 +438,8 @@ fn round1_zero_module_calls_and_data_source_only_guards() {
     ] {
         let directory = Directory::new("false");
         fs::write(directory.project.join("main.crn"), main).unwrap();
-        rejected(
-            &directory.run(&["validate", "."]),
-            "require failed: root guard",
-        );
-        rejected(&directory.run(&["plan", "."]), "require failed: root guard");
+        rejected(&directory.run(&["validate", "."]), ROOT_REQUIRE_ERROR);
+        rejected(&directory.run(&["plan", "."]), ROOT_REQUIRE_ERROR);
     }
 }
 
@@ -439,6 +448,7 @@ fn round1_saved_plan_secret_verification_matches_module_policy() {
     for has_secret in [false, true] {
         for root_guard in [false, true] {
             let directory = Directory::new("true");
+            directory.clear_guard();
             let comment = if has_secret {
                 "comment = secret('ROUND1_SECRET_VALUE')"
             } else {
@@ -450,7 +460,7 @@ fn round1_saved_plan_secret_verification_matches_module_policy() {
             success(&directory.run(&["plan", "--out", "saved.plan", "."]));
             let message = if root_guard {
                 directory.guard("false");
-                "require failed: root guard"
+                ROOT_REQUIRE_ERROR
             } else {
                 fs::write(
                     directory.project.join("checked/guards.crn"),
@@ -483,76 +493,68 @@ fn rejected(output: &Output, message: &str) {
     assert!(!text.contains("Declare it with 'let'"), "{text}");
 }
 
-#[test]
-fn root_require_false_validate_cli_lsp_parity() {
-    Directory::new("1 == 2").assert_validate_diagnostic("1 == 2", "require failed: root guard");
-}
+const ROOT_REQUIRE_ERROR: &str = "`require` is only allowed inside a module";
 
-#[test]
-fn root_require_false_plan() {
-    rejected(
-        &Directory::new("1 == 2").run(&["plan", "."]),
-        "require failed: root guard",
-    );
-}
-
-#[test]
-fn root_require_false_plan_out_does_not_write() {
-    let directory = Directory::new("1 == 2");
+fn assert_root_rejected_on_every_path(condition: &str) {
+    let directory = Directory::new(condition);
+    directory.assert_validate_diagnostic(condition);
+    rejected(&directory.run(&["plan", "."]), ROOT_REQUIRE_ERROR);
     rejected(
         &directory.run(&["plan", "--out", "saved.plan", "."]),
-        "require failed: root guard",
+        ROOT_REQUIRE_ERROR,
     );
     assert!(!directory.project.join("saved.plan").exists());
-}
-
-#[test]
-fn root_require_false_live_apply_preserves_state() {
-    let directory = Directory::new("1 == 2");
     rejected(
         &directory.run(&["apply", "--auto-approve", "."]),
-        "require failed: root guard",
+        ROOT_REQUIRE_ERROR,
     );
-    assert!(!directory.project.join("carina.state.json").exists());
-    assert!(!directory.home.join("mock-state.json").exists());
-    directory.guard("1 == 1");
-    success(&directory.run(&["apply", "--auto-approve", "."]));
     let paths = [
         directory.project.join("carina.state.json"),
         directory.home.join("mock-state.json"),
     ];
+    assert!(paths.iter().all(|path| !path.exists()));
+    directory.clear_guard();
+    success(&directory.run(&["apply", "--auto-approve", "."]));
     let before = paths.each_ref().map(|path| fs::read(path).unwrap());
-    directory.guard("1 == 2");
+    directory.guard(condition);
     rejected(
         &directory.run(&["apply", "--auto-approve", "."]),
-        "require failed: root guard",
+        ROOT_REQUIRE_ERROR,
     );
     assert_eq!(before, paths.each_ref().map(|path| fs::read(path).unwrap()));
 }
 
 #[test]
-fn root_require_true_paths_and_saved_plan_contract() {
-    let directory = Directory::new("false");
+fn root_require_true_commands() {
+    assert_root_rejected_on_every_path("true");
+}
+
+#[test]
+fn root_require_false_commands() {
+    assert_root_rejected_on_every_path("false");
+}
+
+#[test]
+fn root_require_let_commands() {
+    assert_root_rejected_on_every_path("n == 2");
+}
+
+#[test]
+fn root_require_saved_plan_contract() {
+    let directory = Directory::new("true");
     rejected(
         &directory.run(&["plan", "--out", "saved.plan", "."]),
-        "require failed: root guard",
+        ROOT_REQUIRE_ERROR,
     );
     assert!(!directory.project.join("saved.plan").exists());
-    directory.guard("true");
-    for args in [
-        &["validate", "."][..],
-        &["validate", "--json", "."],
-        &["plan", "."],
-        &["plan", "--out", "saved.plan", "."],
-    ] {
-        success(&directory.run(args));
-    }
+    directory.clear_guard();
+    success(&directory.run(&["plan", "--out", "saved.plan", "."]));
     let plan_path = directory.project.join("saved.plan");
     let plan: Value = serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
     assert_eq!(plan["version"], 45);
     assert!(!plan.to_string().contains("root guard"));
-    // This secret-free plan reloads backend syntax without rechecking guards.
-    directory.guard("false");
+    // A secret-free saved plan reloads backend syntax without full validation.
+    directory.guard("true");
     let mut old = plan.clone();
     old["version"] = json!(44);
     fs::write(
@@ -566,87 +568,63 @@ fn root_require_true_paths_and_saved_plan_contract() {
     );
     assert!(!directory.project.join("carina.state.json").exists());
     success(&directory.run(&["apply", "--auto-approve", "saved.plan"]));
-    directory.guard("true");
-    success(&directory.run(&["apply", "--auto-approve", "."]));
 }
-
-macro_rules! unknown_name {
-    ($test:ident, $condition:expr, $name:expr) => {
-        #[test]
-        fn $test() {
-            Directory::new($condition).assert_validate_diagnostic($condition, &format!("require failed: root guard; error evaluating constraint: unknown variable '{}' in constraint expression", $name));
-        }
-    };
-}
-unknown_name!(root_require_unknown_let, "n == 2", "n");
-unknown_name!(root_require_unknown_resource, "r.identifier != null", "r");
-unknown_name!(root_require_unknown_undeclared, "missing == 2", "missing");
-unknown_name!(root_require_unknown_index, "n[0] == 2", "n");
-unknown_name!(root_require_unknown_map_key, "r['key'] == 2", "r");
-unknown_name!(
-    root_require_unknown_even_when_short_circuited,
-    "true || missing == 2",
-    "missing"
-);
-
-macro_rules! expression {
-    ($test:ident, $condition:expr) => {
-        #[test]
-        fn $test() {
-            let directory = Directory::new($condition);
-            success(&directory.run(&["validate", "."]));
-            directory.guard(&format!("!({})", $condition));
-            rejected(
-                &directory.run(&["validate", "."]),
-                "require failed: root guard",
-            );
-        }
-    };
-}
-expression!(
-    root_require_expr_boolean,
-    "true && !false || env('unused') == 1"
-);
-expression!(
-    root_require_expr_integer,
-    "-2 < 1 && 2 <= 2 && 3 >= 2 && 3 > 2 && 2 != 1 && 1 == 1"
-);
-expression!(root_require_expr_float, "1.5 < 2 && -2.5 != 1.5");
-expression!(root_require_expr_duration, "1min == 60s && 2h > 1h");
-expression!(root_require_expr_string, "'a' == \"a\" && 'a' != 'b'");
-expression!(
-    root_require_expr_arithmetic,
-    "(2 + 3) * 4 - 6 / 2 == 17 && 7 % 3 == 1"
-);
-expression!(root_require_expr_null, "null == null && 'value' != null");
-expression!(root_require_expr_len, "len('abc') == 3");
-expression!(root_require_expr_length, "length(\"a\\nb\") == 4");
-expression!(
-    root_require_expr_unicode_length_is_bytes,
-    "length('あ') == 3"
-);
 
 #[test]
-fn root_require_rejects_general_builtins_and_user_functions() {
-    for function in ["env", "coalesce", "custom"] {
-        let condition = format!("{function}('unused') == 1");
-        let directory = Directory::new(&condition);
-        fs::write(
-            directory.project.join("functions.crn"),
-            "fn custom(value: String): Int { 1 }\n",
-        )
-        .unwrap();
-        directory.assert_validate_diagnostic(&condition, &format!("require failed: root guard; error evaluating constraint: unknown function '{function}' in constraint expression"));
+fn root_require_does_not_infer_or_evaluate_condition() {
+    for condition in [
+        "r.identifier != null",
+        "missing == 2",
+        "n[0] == 2",
+        "r['PRIVATE_ROOT_REQUIRE_MAP_KEY'] == 2",
+        "true || missing == 2",
+        "env('PRIVATE_ROOT_REQUIRE_MAP_KEY') == 1",
+        "coalesce('unused') == 1",
+        "custom('unused') == 1",
+        "null",
+        "1",
+        "length(null) == 0",
+        "len(1) == 1",
+        "length() == 0",
+        "1.5 + 1 == 2",
+        "1 / 0 == 2",
+        "true && 1",
+    ] {
+        let directory = Directory::new(condition);
+        directory.assert_validate_diagnostic(condition);
+        for args in [&["plan", "."][..], &["apply", "--auto-approve", "."]] {
+            let output = directory.run(args);
+            rejected(&output, ROOT_REQUIRE_ERROR);
+            assert!(!output_text(&output).contains("PRIVATE_ROOT_REQUIRE_MAP_KEY"));
+            assert!(!output_text(&output).contains("root guard"));
+        }
     }
+}
+
+#[test]
+fn root_require_one_error_per_statement() {
+    let directory = Directory::new("true");
+    fs::write(
+        directory.project.join("guards.crn"),
+        "require true, 'PRIVATE_MESSAGE'\nrequire missing == 2, 'PRIVATE_MESSAGE'\nrequire 1 / 0 == 0, 'PRIVATE_MESSAGE'\n",
+    ).unwrap();
+    let output = directory.run(&["validate", "--json", "."]);
+    assert!(!output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let errors = report["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 3, "{report}");
+    for (index, error) in errors.iter().enumerate() {
+        assert_eq!(error["message"], ROOT_REQUIRE_ERROR);
+        assert_eq!(error["location"]["file"], "guards.crn");
+        assert_eq!(error["location"]["range"]["start"]["line"], index + 1);
+    }
+    assert!(!output_text(&output).contains("PRIVATE_MESSAGE"));
 }
 
 #[test]
 fn root_require_index_builtin_does_not_expose_map_key() {
     let directory = Directory::new("false");
-    rejected(
-        &directory.run(&["validate", "."]),
-        "require failed: root guard",
-    );
+    rejected(&directory.run(&["validate", "."]), ROOT_REQUIRE_ERROR);
     directory.guard("r[env('CARINA_ROOT_REQUIRE_KEY')] != null");
     for args in [
         &["validate", "."][..],
@@ -664,42 +642,12 @@ fn root_require_index_builtin_does_not_expose_map_key() {
 }
 
 #[test]
-fn root_require_evaluation_errors_are_decided_during_validate() {
-    for (condition, detail) in [
-        (
-            "null",
-            "constraint expression must return a boolean, got null",
-        ),
-        ("1", "constraint expression must return a boolean, got int"),
-        (
-            "length(null) == 0",
-            "length() argument must be a string, list, or map, got null",
-        ),
-        (
-            "len(1) == 1",
-            "len() argument must be a string, list, or map, got int",
-        ),
-        ("length() == 0", "length() expects 1 argument, got 0"),
-        ("1.5 + 1 == 2", "left operand of + must be int, got float"),
-    ] {
-        let directory = Directory::new(condition);
-        rejected(&directory.run(&["validate", "."]), detail);
-    }
-    for condition in ["[1] == [1]", "{ key = 1 } == null", "'abc'[0] == 'a'"] {
-        let directory = Directory::new(condition);
-        let output = directory.run(&["validate", "."]);
-        assert!(!output.status.success(), "{}", output_text(&output));
-    }
-}
-
-#[test]
 fn root_require_module_control_is_unchanged() {
     let directory = Directory::new("false");
-    rejected(
-        &directory.run(&["validate", "."]),
-        "require failed: root guard",
-    );
-    directory.guard("true");
+    rejected(&directory.run(&["validate", "."]), ROOT_REQUIRE_ERROR);
+    directory.clear_guard();
+    success(&directory.run(&["validate", "."]));
+    success(&directory.run(&["validate", "--json", "."]));
     fs::write(
         directory.project.join("checked/guards.crn"),
         "require n == 3, 'module guard'\n",
@@ -757,4 +705,21 @@ fn root_require_module_control_is_unchanged() {
             })
         );
     }
+}
+
+#[test]
+fn root_require_attributes_only_directory_is_template() {
+    let directory = Directory::new("true");
+    fs::write(
+        directory.project.join("checked/arguments.crn"),
+        "attributes { value: Int = 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.project.join("checked/guards.crn"),
+        "require false, 'template guard'\n",
+    )
+    .unwrap();
+    success(&directory.run(&["validate", "checked"]));
+    success(&directory.run(&["validate", "--json", "checked"]));
 }

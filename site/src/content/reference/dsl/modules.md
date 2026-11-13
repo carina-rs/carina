@@ -157,11 +157,12 @@ reference every argument declared by the module. An undeclared name is an
 error during validation, even when one of the declared argument values is
 still unresolved.
 
-In a configuration directory with no `arguments` or `attributes` blocks, a
-`require` condition has no arguments in scope. It may use constants and
-supported constraint functions, but cannot reference directory `let` bindings
-or resources. Root requirements are always checked during validation. See
-[Require Statement](/reference/dsl/syntax/#require-statement).
+`require` is argument validation for modules. A `require` in a root
+configuration (a directory with no `arguments` or `attributes` block) is a
+validation error, even if its condition is true. The condition is neither
+evaluated nor checked for expression errors. This also applies to a root
+configuration loaded through `upstream_state`; the error retains the upstream
+file and position. See [Require Statement](/reference/dsl/syntax/#require-statement).
 
 When validated directly, a directory containing either module declaration
 block keeps its `require` conditions unevaluated as a template, including
@@ -184,12 +185,13 @@ Pending constraints remain attached to the module call and are checked again
 at later resolution boundaries. This matters when an update or replacement
 publishes a value that differs from the value available during planning.
 
-Saving a plan requires successful validation of root requirements. Saved-plan
-apply reloads current source to check backend drift. Plans that need secret
-verification also validate the current configuration, so both directory and
-module requirements must still pass. Plans without secrets apply the saved
-snapshot without rechecking the current source's requirements. Pending module
-constraints in that snapshot are still checked when their inputs resolve.
+Saving a plan validates the configuration and rejects any `require` outside
+a module. Saved-plan apply reloads current source to check backend drift.
+Plans that need secret verification also validate the current configuration,
+so it must still be valid and module constraints must pass. Plans without
+secrets apply the saved snapshot without rechecking the current source's
+constraints. Pending module constraints in that snapshot are still checked
+when their inputs resolve.
 Plans with an unsupported format version must be regenerated.
 
 Resource schema value constraints follow the same value-time rule. Carina

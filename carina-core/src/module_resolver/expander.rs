@@ -2587,11 +2587,8 @@ fn resolve_module_binding_uses<P: TypeResolutionPolicy>(
 
 type ArgumentSubstitutionPosition = crate::value_walk::RewritePosition;
 
-/// Only an instantiated module supplies argument substitutions. The outer
-/// directory enters the same collection, binding, and evaluation operation
-/// with no arguments, regardless of any lets or structural bindings it owns.
+/// Only a module call with bound arguments can enter constraint evaluation.
 pub(super) enum ConstraintScope<'a> {
-    Directory(&'a [crate::parser::RequireBlock<ParserPlaceholder, RelativeBindingName>]),
     ModuleCall {
         module: &'a ParsedFile,
         arguments: ArgumentSubstitutions<'a>,
@@ -2606,23 +2603,13 @@ pub(super) fn evaluate_constraint_scope(
     Vec<crate::parser::Located<EvaluatedModuleConstraint<ParserPlaceholder>>>,
     ArgumentSubstitutionError,
 > {
-    let empty_values = HashMap::new();
-    let (parameters, requires, arguments, argument_values, resolved_bindings) = match scope {
-        ConstraintScope::Directory(requires) => (&[][..], requires, None, &empty_values, None),
-        ConstraintScope::ModuleCall {
-            module,
-            arguments,
-            argument_values,
-            resolved_bindings,
-        } => (
-            module.arguments.as_slice(),
-            module.requires.as_slice(),
-            Some(arguments),
-            argument_values,
-            resolved_bindings,
-        ),
-    };
-    let declarations = collect_constraint_declarations(parameters, requires);
+    let ConstraintScope::ModuleCall {
+        module,
+        arguments,
+        argument_values,
+        resolved_bindings,
+    } = scope;
+    let declarations = collect_constraint_declarations(&module.arguments, &module.requires);
     let constraints = declarations
         .iter()
         .map(|declaration| {
@@ -2648,55 +2635,36 @@ pub(super) fn evaluate_constraint_scope(
 }
 
 impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
-    pub(super) fn evaluate_directory_constraints<E>(
+    pub(super) fn check_directory_requires<E>(
         &self,
         parsed: &crate::parser::File<E>,
     ) -> Result<(), ModuleError> {
         use crate::parser::retained::RequireScope;
-        let failures = match crate::parser::retained::require_scope(parsed) {
+        match crate::parser::retained::require_scope(parsed) {
+            RequireScope::Directory(_) | RequireScope::UnvalidatedDirectory(_) => {}
             RequireScope::Unknown
             | RequireScope::ModuleTemplate { .. }
-            | RequireScope::ModuleCall => {
-                return Ok(());
-            }
-            RequireScope::Directory(_) | RequireScope::UnvalidatedDirectory(_) => {
-                if crate::parser::retained::has_retained_requires(parsed) {
-                    parsed
-                        .expression_report()
-                        .findings()
-                        .iter()
-                        .filter_map(|finding| {
-                            if let crate::static_type::InferenceError::DirectoryConstraint(
-                                diagnostic,
-                            ) = finding.detail()
-                            {
-                                Some(crate::parser::Located::new(
-                                    finding.location().clone(),
-                                    (**diagnostic).clone(),
-                                ))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
+            | RequireScope::ModuleCall => return Ok(()),
+        }
+        // Only retained RequireCondition nodes with a Directory witness can
+        // produce these findings. Public AST lists cannot grant or erase them.
+        let failures = parsed
+            .expression_report()
+            .findings()
+            .iter()
+            .filter_map(|finding| {
+                if let crate::static_type::InferenceError::DirectoryConstraint(diagnostic) =
+                    finding.detail()
+                {
+                    Some(crate::parser::Located::new(
+                        finding.location().clone(),
+                        (**diagnostic).clone(),
+                    ))
                 } else {
-                    parsed
-                        .requires
-                        .iter()
-                        .filter_map(|require| {
-                            crate::module_resolver::evaluate_directory_require(require).map(
-                                |diagnostic| {
-                                    crate::parser::Located::new(
-                                        require.condition_location().clone(),
-                                        diagnostic,
-                                    )
-                                },
-                            )
-                        })
-                        .collect()
+                    None
                 }
-            }
-        };
+            })
+            .collect::<Vec<_>>();
         if self.records_constraint_reports() {
             self.record_directory_constraint_report(failures);
             Ok(())
@@ -2714,7 +2682,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
 
 fn bind_constraint_expression(
     expression: &crate::parser::ValidateExpr<ParserPlaceholder, RelativeBindingName>,
-    arguments: Option<ArgumentSubstitutions<'_>>,
+    arguments: ArgumentSubstitutions<'_>,
     resolved_bindings: Option<&crate::binding_index::ResolvedBindings<ParserPlaceholder>>,
     line: usize,
     source_file: &std::path::Path,
@@ -2731,9 +2699,6 @@ fn bind_constraint_expression(
         ValidateExpr<ParserPlaceholder, AbsoluteBindingAddress>,
         ArgumentSubstitutionError,
     > {
-        let Some(arguments) = arguments else {
-            unreachable!("directory scope has no argument substitutions");
-        };
         let Some(resolved_argument) = arguments.arguments.get(argument) else {
             return Err(ArgumentSubstitutionError::Evaluation {
                 source_file: Some(source_file.to_path_buf()),
@@ -2779,14 +2744,12 @@ fn bind_constraint_expression(
     };
 
     Ok(match expression {
-        ValidateExpr::Var(argument) => {
-            match arguments.is_some_and(|arguments| arguments.arguments.contains_key(argument)) {
-                true => return bind_value(argument, ArgumentSubstitutionPosition::Value, &[]),
-                false => ValidateExpr::Var(argument.clone()),
-            }
-        }
+        ValidateExpr::Var(argument) => match arguments.arguments.contains_key(argument) {
+            true => return bind_value(argument, ArgumentSubstitutionPosition::Value, &[]),
+            false => ValidateExpr::Var(argument.clone()),
+        },
         ValidateExpr::Access { argument, path } => {
-            match arguments.is_some_and(|arguments| arguments.arguments.contains_key(argument)) {
+            match arguments.arguments.contains_key(argument) {
                 true => {
                     return bind_value(argument, ArgumentSubstitutionPosition::AccessBase, path);
                 }

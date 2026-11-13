@@ -75,7 +75,7 @@ The following statements are valid at the top level of a `.crn` file:
 | `for` | Iterate to create multiple resources |
 | `if` | Conditionally create resources |
 | `fn` | Define a reusable function |
-| `require` | Assert a condition with an error message |
+| `require` | Validate module arguments with an error message |
 | `arguments` | Declare module input parameters |
 | `attributes` | Define module output values (for callers who bind the module with `let`) |
 | `exports` | Define values published to upstream-state consumers |
@@ -428,8 +428,8 @@ See [Expressions](/reference/dsl/expressions/) for details on function definitio
 
 ## Require Statement
 
-Assert conditions that must be true, with a custom error message if they fail.
-Inside a module, a condition can reference its declared arguments:
+Use `require` inside a module to validate its arguments, with a custom error
+message if the condition is false:
 
 ```crn
 arguments {
@@ -441,18 +441,18 @@ require length(subnets) > 0, 'At least one subnet must be specified'
 require cidr_block != '', 'CIDR block cannot be empty'
 ```
 
-In a configuration directory with no `arguments` or `attributes` blocks,
-`require` has no arguments in scope.
-Its condition must use literals, operators, and supported constraint functions
-(`len` and `length`). Root conditions cannot reference `let` bindings,
-resources, data sources, or module calls, including those in sibling files.
-Every root condition is decided during validation; a false condition prevents
-planning, saving a plan, and live apply. The CLI and language server report it
-at the condition's own file and position.
+A `require` outside a module is a validation error:
+`` `require` is only allowed inside a module ``. In a root configuration
+(directory with no `arguments` or `attributes` block), every `require` is
+rejected, whether its condition is true or false. Its condition is neither
+evaluated nor checked for expression errors. Validation, planning, saving a
+plan, live apply, and the language server report the same error at the
+condition's authored file and position, including declarations in sibling files.
 
-```crn
-require length('production') > 0, 'Environment label cannot be empty'
-```
+Root scope is established only after all sibling `.crn` files have been read
+and parsed. If a sibling cannot be read or parsed and no module declaration
+block is known, the scope remains unknown and no `require` verdict is issued.
+Ordinary expression checks still run in that case and for isolated editor buffers.
 
 A directory containing either module declaration block is treated as an
 uninstantiated template when validated directly, even if the block is empty.

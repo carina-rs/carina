@@ -45,7 +45,10 @@ fn assert_round4_buffer_membership(buffer_text: &str, disk_text: &str, expected_
                 1,
                 "a different on-disk template must not suppress the buffer guard"
             );
-            assert_eq!(findings[0].detail().to_string(), "require failed: guard");
+            assert_eq!(
+                findings[0].detail().to_string(),
+                "`require` is only allowed inside a module"
+            );
         }
     }
 }
@@ -270,11 +273,14 @@ fn round2_recovery_uses_sibling_declaration_evidence() {
     let complete = load();
     let findings = complete.judged().report().findings();
     assert_eq!(findings.len(), 1);
-    assert_eq!(findings[0].detail().to_string(), "require failed: guard");
+    assert_eq!(
+        findings[0].detail().to_string(),
+        "`require` is only allowed inside a module"
+    );
 }
 
 #[test]
-fn round1_retained_require_cannot_lose_its_evaluation_obligation() {
+fn root_require_retained_rejection_cannot_be_erased() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(
         directory.path().join("guards.crn"),
@@ -299,7 +305,7 @@ fn round1_retained_require_cannot_lose_its_evaluation_obligation() {
     );
     assert_eq!(
         findings[0].detail().to_string(),
-        "require failed: retained guard"
+        "`require` is only allowed inside a module"
     );
     assert!(findings[0].location().file().path().ends_with("guards.crn"));
 }
@@ -307,17 +313,20 @@ fn round1_retained_require_cannot_lose_its_evaluation_obligation() {
 #[test]
 fn round1_strict_require_error_retains_location_and_typed_cause() {
     use std::error::Error;
-    let parsed = crate::parser::parse_file(
-        "require false, 'chain guard'\n",
-        std::path::Path::new("upstream/guards.crn"),
-        &config(),
+    let directory = tempfile::tempdir().unwrap();
+    let upstream_dir = directory.path().join("upstream");
+    std::fs::create_dir(&upstream_dir).unwrap();
+    std::fs::write(
+        upstream_dir.join("guards.crn"),
+        "require true, 'chain guard'\n",
     )
     .unwrap();
-    let require = &parsed.requires[0];
-    let diagnostic = crate::module_resolver::evaluate_directory_require(require).unwrap();
-    let error = crate::module_resolver::ModuleError::DirectoryConstraint(Box::new(
-        crate::parser::Located::new(require.condition_location().clone(), diagnostic),
-    ));
+    let context = config();
+    let path = crate::paths::ResolvedPath::new(upstream_dir).unwrap();
+    let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
+    let error = crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        crate::module_resolver::resolve_modules_providerless(parsed, &path, session).unwrap_err()
+    });
     assert!(error.to_string().contains("upstream/guards.crn:1:9"));
     let located = error
         .directory_constraint()
@@ -329,7 +338,10 @@ fn round1_strict_require_error_retains_location_and_typed_cause() {
             .path()
             .ends_with("upstream/guards.crn")
     );
-    assert_eq!(located.detail().to_string(), "require failed: chain guard");
+    assert_eq!(
+        located.detail().to_string(),
+        "`require` is only allowed inside a module"
+    );
     assert!(error.source().is_none());
     let upstream = crate::upstream_exports::UpstreamExportSourceError::Module {
         base: std::path::PathBuf::from("upstream"),

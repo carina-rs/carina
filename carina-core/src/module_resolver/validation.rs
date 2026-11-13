@@ -12,71 +12,16 @@ use crate::parser::{
 use crate::resolver::ResolutionError;
 use crate::resource::{
     AbsoluteBindingAddress, AccessMissPolicy, BindingAddress, ConcreteValue, DeferredValue,
-    LiveComposition, ModuleConstraintId, NoPlaceholder, ParserPlaceholder, PendingModuleConstraint,
-    PlaceholderKind, RelativeBindingName, ResourceId, Value, apply_value_path_segment,
+    LiveComposition, ModuleConstraintId, NoPlaceholder, PendingModuleConstraint, PlaceholderKind,
+    ResourceId, Value, apply_value_path_segment,
 };
 
 use super::ModuleError;
 
-/// A directory has no arguments or composition identity. Only module calls
-/// carry the labels and parser identity needed for module diagnostics.
-#[derive(Clone, Copy)]
-pub enum ConstraintScopeOwner<'a> {
-    Directory,
-    ModuleCall {
-        module: &'a str,
-        instance: &'a str,
-        binding: Option<&'a str>,
-        call_id: Option<&'a ModuleCallId>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DirectoryConstraintDiagnostic {
-    message: String,
-    detail: Option<String>,
-}
-
-impl std::error::Error for DirectoryConstraintDiagnostic {}
-
-/// Evaluate a directory declaration through the same collector and condition
-/// evaluator as module declarations, with the only possible root binding:
-/// an empty argument environment. No value or builtin can defer in this scope.
-pub(crate) fn evaluate_directory_require(
-    declaration: &RequireBlock<ParserPlaceholder, RelativeBindingName>,
-) -> Option<DirectoryConstraintDiagnostic> {
-    let evaluated = super::expander::evaluate_constraint_scope(
-        super::expander::ConstraintScope::Directory(std::slice::from_ref(declaration)),
-    )
-    .expect("authored directory constraints contain no bound arguments")
-    .pop()
-    .expect("one require declaration");
-    assert!(
-        !matches!(
-            evaluated.detail().evaluation(),
-            ConstraintEvaluation::Pending
-        ),
-        "a directory require cannot be pending"
-    );
-    match evaluated
-        .detail()
-        .diagnostic(ConstraintScopeOwner::Directory)
-    {
-        Some(ConstraintDiagnostic::Directory(diagnostic)) => Some(diagnostic),
-        None => None,
-        Some(ConstraintDiagnostic::ModuleCall(_)) => unreachable!("directory owner"),
-    }
-}
-
-impl fmt::Display for DirectoryConstraintDiagnostic {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "require failed: {}", self.message)?;
-        if let Some(detail) = &self.detail {
-            write!(f, "; {detail}")?;
-        }
-        Ok(())
-    }
-}
+/// A rejected root declaration retains no condition or user message in its error.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("`require` is only allowed inside a module")]
+pub struct DirectoryConstraintDiagnostic;
 
 /// Scope ownership is retained through rendering; a directory failure cannot
 /// be mistaken for an anonymous module call.
@@ -387,18 +332,6 @@ impl<P: PlaceholderKind, B: BindingAddress> EvaluatedModuleConstraint<P, B> {
         binding: Option<&str>,
         call_id: Option<&ModuleCallId>,
     ) -> Option<ModuleConstraintDiagnostic> {
-        match self.diagnostic(ConstraintScopeOwner::ModuleCall {
-            module,
-            instance,
-            binding,
-            call_id,
-        })? {
-            ConstraintDiagnostic::ModuleCall(diagnostic) => Some(*diagnostic),
-            ConstraintDiagnostic::Directory(_) => unreachable!("module-call owner"),
-        }
-    }
-
-    pub fn diagnostic(&self, owner: ConstraintScopeOwner<'_>) -> Option<ConstraintDiagnostic> {
         let (message, actuals, detail) = match &self.evaluation {
             ConstraintEvaluation::Violated(violation) => {
                 (violation.message.clone(), violation.actuals.clone(), None)
@@ -410,33 +343,20 @@ impl<P: PlaceholderKind, B: BindingAddress> EvaluatedModuleConstraint<P, B> {
             ),
             ConstraintEvaluation::Satisfied | ConstraintEvaluation::Pending => return None,
         };
-        let ConstraintScopeOwner::ModuleCall {
-            module,
-            instance,
-            binding,
-            call_id,
-        } = owner
-        else {
-            return Some(ConstraintDiagnostic::Directory(
-                DirectoryConstraintDiagnostic { message, detail },
-            ));
-        };
-        Some(ConstraintDiagnostic::ModuleCall(Box::new(
-            ModuleConstraintDiagnostic {
-                module: module.to_string(),
-                instance: instance.to_string(),
-                origin: call_id
-                    .cloned()
-                    .map(ConstraintOrigin::LiveCall)
-                    .unwrap_or(ConstraintOrigin::Saved),
-                call: ModuleConstraintCall::from_binding(binding),
-                kind: self.kind.clone(),
-                arguments: self.arguments.clone(),
-                message,
-                actuals,
-                detail,
-            },
-        )))
+        Some(ModuleConstraintDiagnostic {
+            module: module.to_string(),
+            instance: instance.to_string(),
+            origin: call_id
+                .cloned()
+                .map(ConstraintOrigin::LiveCall)
+                .unwrap_or(ConstraintOrigin::Saved),
+            call: ModuleConstraintCall::from_binding(binding),
+            kind: self.kind.clone(),
+            arguments: self.arguments.clone(),
+            message,
+            actuals,
+            detail,
+        })
     }
 }
 

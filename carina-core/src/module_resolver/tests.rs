@@ -223,8 +223,17 @@ fn resolve_modules(
     .map_err(|error| *error)
 }
 
+// An irrefutable pattern makes adding a directory evaluator scope fail to compile.
 #[test]
-fn root_require_directory_and_module_share_scope_evaluation() {
+fn root_require_evaluator_scope_is_module_call_only() {
+    fn module_call_only(scope: super::expander::ConstraintScope<'_>) {
+        let super::expander::ConstraintScope::ModuleCall { .. } = scope;
+    }
+    let _ = module_call_only;
+}
+
+#[test]
+fn root_require_directory_rejected_and_module_evaluated() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("checked")).unwrap();
     fs::write(
@@ -245,21 +254,16 @@ fn root_require_directory_and_module_share_scope_evaluation() {
     .unwrap();
     let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
-    for (condition, expected) in [
-        ("false", "require failed: root guard"),
-        ("n == 2", "unknown variable 'n' in constraint expression"),
-        (
-            "r.identifier != null",
-            "unknown variable 'r' in constraint expression",
-        ),
-        (
-            "missing == 2",
-            "unknown variable 'missing' in constraint expression",
-        ),
-        (
-            "env('unused') == 1",
-            "unknown function 'env' in constraint expression",
-        ),
+    for condition in [
+        "true",
+        "false",
+        "n == 2",
+        "r.identifier != null",
+        "missing == 2",
+        "env('unused') == 1",
+        "1.5 + 1 == 2",
+        "true && 1",
+        "1 / 0 == 0",
     ] {
         fs::write(
             directory.path().join("guards.crn"),
@@ -277,14 +281,13 @@ fn root_require_directory_and_module_share_scope_evaluation() {
             assert!(diagnostic.location().file().path().ends_with("guards.crn"));
             assert_eq!(diagnostic.location().span().start_line(), 1);
             assert_eq!(diagnostic.location().span().start_column(), 9);
-            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(
+                diagnostic.detail().to_string(),
+                "`require` is only allowed inside a module"
+            );
         });
     }
-    fs::write(
-        directory.path().join("guards.crn"),
-        "require true, 'root guard'\n",
-    )
-    .unwrap();
+    fs::remove_file(directory.path().join("guards.crn")).unwrap();
     fs::write(
         directory.path().join("checked/guards.crn"),
         "require n == 3, 'module guard'\n",

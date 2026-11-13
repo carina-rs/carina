@@ -478,6 +478,5 @@ arguments {
 require value != null, 'Value must not be null'
 ```
 
-A root-level `require` has no arguments in scope. For example,
-`require 'configured' != null, 'Value must not be null'` is valid at the root;
-a reference to a `let` binding or resource is an unknown-name error.
+`require` belongs inside a module. At the root of a configuration, any
+`require` is a validation error, even if its condition uses only literals.

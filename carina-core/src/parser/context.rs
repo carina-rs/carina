@@ -298,15 +298,8 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         self.authored_nodes = nodes;
     }
 
-    pub(super) fn retain_require(
-        &self,
-        id: super::retained::NodeId,
-        declaration: super::RequireBlock<
-            crate::resource::ParserPlaceholder,
-            crate::resource::RelativeBindingName,
-        >,
-    ) {
-        self.authored_nodes.retain_require(id, declaration);
+    pub(super) fn retain_require(&self, id: super::retained::NodeId) {
+        self.authored_nodes.retain_require(id);
     }
 
     pub(super) fn evaluate_retained_expression(

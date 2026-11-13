@@ -2522,7 +2522,7 @@ fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
         crate::binding_index::ResolvedBindings::for_root_validation(parsed, root);
     let mut expanded_calls = Vec::with_capacity(module_calls.len());
     let mut errors = Vec::new();
-    if let Err(error) = resolver.evaluate_directory_constraints(parsed) {
+    if let Err(error) = resolver.check_directory_requires(parsed) {
         errors.push(error);
     }
     for call in &module_calls {
@@ -2559,7 +2559,7 @@ fn resolve_modules_with_resolver<E, P: TypeResolutionPolicy>(
     ref_check: &RefCheckWitness,
     root: &RootScope,
 ) -> Result<Vec<crate::parser::RootBindingResolvedParsedFile>, ModuleError> {
-    resolver.evaluate_directory_constraints(parsed)?;
+    resolver.check_directory_requires(parsed)?;
     let module_calls = &parsed.module_calls;
     let signatures = resolver.resolved_module_signatures();
     let binding_index = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(

@@ -247,6 +247,6 @@ pub(in crate::parser) fn parse_require_statement(
         crate::parser::ConstraintStringPosition::RequireMessage,
     )?;
     let declaration = RequireBlock::new_in_source(condition, error_message, source_span, location);
-    ctx.retain_require(condition_id, declaration.clone());
+    ctx.retain_require(condition_id);
     Ok(declaration)
 }

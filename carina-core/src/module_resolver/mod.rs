@@ -23,7 +23,7 @@
 //! points: `config_loader::LoadedConfig` for a loaded configuration root and
 //! `config_loader::DirectoryParseResult` for a directory parsed by editor
 //! diagnostics. Module directories validated standalone enter through the
-//! ordinary `resolve_modules*` APIs and intentionally behave as roots.
+//! ordinary `resolve_modules*` APIs and retain their uninstantiated template scope.
 
 mod deferred_if;
 mod error;
@@ -32,7 +32,6 @@ pub(crate) mod loader;
 mod resolver;
 mod signature;
 mod validation;
-pub(crate) use validation::evaluate_directory_require;
 
 pub use error::{ModuleError, ModuleErrorCallSource, ModuleErrorDiagnostic};
 pub use expander::{instance_prefix_for_call, reconcile_anonymous_module_instances};
@@ -60,11 +59,11 @@ pub use signature::{
     load_resolved_module_signatures_with_overrides,
 };
 pub use validation::{
-    ConstraintDiagnostic, ConstraintEvaluation, ConstraintOrigin, ConstraintScopeOwner,
-    DirectoryConstraintDiagnostic, EvaluatedModuleConstraint, ModuleConstraintCall,
-    ModuleConstraintDiagnostic, ModuleConstraintFailure, ModuleConstraintKind,
-    ModuleConstraintResolutionError, ModuleConstraintViolation, ModuleConstraints,
-    evaluate_constraint, evaluate_live_pending_constraints, evaluate_module_constraints,
+    ConstraintDiagnostic, ConstraintEvaluation, ConstraintOrigin, DirectoryConstraintDiagnostic,
+    EvaluatedModuleConstraint, ModuleConstraintCall, ModuleConstraintDiagnostic,
+    ModuleConstraintFailure, ModuleConstraintKind, ModuleConstraintResolutionError,
+    ModuleConstraintViolation, ModuleConstraints, evaluate_constraint,
+    evaluate_live_pending_constraints, evaluate_module_constraints,
     evaluate_saved_pending_constraints, referenced_constraint_arguments,
 };
 

@@ -93,7 +93,8 @@ fn assert_round1_buffer_guard(condition: &str, broken_sibling: bool) {
     assert!(
         diagnostics
             .iter()
-            .all(|d| !d.message.contains("require failed:")),
+            .all(|d| !d.message.contains("require failed:")
+                && d.message != "`require` is only allowed inside a module"),
         "incomplete declarations cannot establish directory ownership: {diagnostics:?}"
     );
     if condition == "false" {
@@ -189,20 +190,17 @@ fn root_require_directory_diagnostics_follow_authored_sibling() {
     .unwrap();
     let main = "let n = 2\nlet r = mock.test.resource { name = 'root' }\nlet checked = use { source = './checked' }\nlet control = checked { n = 2 }\n";
     std::fs::write(directory.path().join("main.crn"), main).unwrap();
-    for (condition, message) in [
-        ("1 == 2", "require failed: root guard"),
-        (
-            "n == 2",
-            "require failed: root guard; error evaluating constraint: unknown variable 'n' in constraint expression",
-        ),
-        (
-            "r.identifier != null",
-            "require failed: root guard; error evaluating constraint: unknown variable 'r' in constraint expression",
-        ),
-        (
-            "missing == 2",
-            "require failed: root guard; error evaluating constraint: unknown variable 'missing' in constraint expression",
-        ),
+    let message = "`require` is only allowed inside a module";
+    for condition in [
+        "true",
+        "false",
+        "n == 2",
+        "r.identifier != null",
+        "missing == 2",
+        "1.5 + 1 == 2",
+        "1 / 0 == 0",
+        "true && 1",
+        "custom('PRIVATE_CONDITION') == 1",
     ] {
         let guard = format!("// sibling guard\nrequire {condition}, 'root guard'\n");
         std::fs::write(directory.path().join("guards.crn"), &guard).unwrap();
@@ -224,6 +222,7 @@ fn root_require_directory_diagnostics_follow_authored_sibling() {
             .filter(|diagnostic| diagnostic.message == message)
             .collect();
         assert_eq!(matching.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(matching[0].severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(
             matching[0].range,
@@ -233,4 +232,28 @@ fn root_require_directory_diagnostics_follow_authored_sibling() {
             )
         );
     }
+}
+
+#[test]
+fn root_require_unreadable_sibling_keeps_unknown_scope() {
+    let engine = test_engine();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("guards.crn");
+    let source = "require true, 'PRIVATE_MESSAGE'\n";
+    std::fs::write(&path, source).unwrap();
+    let broken = directory.path().join("broken.crn");
+    std::fs::write(&broken, [0xff]).unwrap();
+    let document = create_document_at(source, path.clone());
+    assert!(engine.analyze(&document, Some(&path)).is_empty());
+    std::fs::remove_file(broken).unwrap();
+    let diagnostics = engine.analyze(&document, Some(&path));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "`require` is only allowed inside a module"
+    );
+    assert_eq!(
+        diagnostics[0].range,
+        Range::new(Position::new(0, 8), Position::new(0, 12))
+    );
 }
