@@ -393,6 +393,68 @@ pub struct RootDirectoryParse<E = crate::parser::ParsedExportParam> {
 pub type ParsedRootDirectory = RootDirectoryParse<crate::parser::ParsedExportParam>;
 pub type InferredRootDirectory = RootDirectoryParse<crate::parser::InferredExportParam>;
 
+/// Negative scope evidence minted only after directory discovery and a
+/// successful declaration parse of every source in that snapshot. A caller
+/// cannot obtain it from an isolated buffer or a caller-supplied source batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompleteDirectoryDeclarations(());
+
+fn mark_complete_directory_files(
+    files: &mut [(PathBuf, DirectoryResolvedFile)],
+    config: &ProviderContext,
+) {
+    let scope = CompleteDirectoryInventories {
+        inventories: files
+            .iter()
+            .map(|(_, file)| file.parsed.parser_binding_metadata.syntax())
+            .collect(),
+    }
+    .require_scope();
+    for (_, file) in files {
+        crate::parser::retained::set_require_scope(&mut file.parsed, scope.clone());
+        crate::parser::retained::judge_configuration(
+            &mut file.parsed,
+            &SchemaRegistry::new(),
+            config,
+        );
+    }
+}
+
+/// Constructible only after every member of one sealed source snapshot has
+/// yielded a complete syntax inventory. Both semantic loading and recovery
+/// use this single issuer; recovery need not evaluate sibling values.
+struct CompleteDirectoryInventories<'a> {
+    inventories: Vec<&'a parser::SyntaxInventory>,
+}
+
+impl CompleteDirectoryInventories<'_> {
+    fn require_scope(self) -> crate::parser::retained::RequireScope {
+        use crate::parser::retained::RequireScope;
+        match require_scope_from_inventories(self.inventories) {
+            RequireScope::Unknown => {
+                RequireScope::UnvalidatedDirectory(CompleteDirectoryDeclarations(()))
+            }
+            scope => scope,
+        }
+    }
+}
+
+fn require_scope_from_inventories<'a>(
+    inventories: impl IntoIterator<Item = &'a parser::SyntaxInventory>,
+) -> crate::parser::retained::RequireScope {
+    let mut blocks = parser::ModuleDeclarationBlocks::Absent;
+    let mut arguments = BTreeSet::new();
+    for inventory in inventories {
+        blocks = blocks.union(inventory.module_declaration_blocks());
+        for declaration in inventory.declarations() {
+            if declaration.detail().kind() == DeclarationKind::Argument {
+                arguments.insert(declaration.detail().name().to_owned());
+            }
+        }
+    }
+    crate::parser::retained::RequireScope::for_declarations(arguments.into_iter(), blocks)
+}
+
 impl<E> RootDirectoryParse<E> {
     fn with_resolution(parsed: File<E>, resolution: ResolutionContext) -> Self {
         let mut root = Self { parsed, resolution };
@@ -422,6 +484,8 @@ impl<E> RootDirectoryParse<E> {
     }
 
     #[cfg(any(test, feature = "test-utils"))]
+    /// Wrap test data without granting directory declaration completeness.
+    /// Directory-scoped guard tests must use a real directory loader.
     pub fn from_parsed_for_test(mut parsed: File<E>) -> Self
     where
         E: crate::parser::ExportParamLike,
@@ -620,6 +684,152 @@ where
     }
 }
 
+/// A parser-minted buffer whose identity, contents and AST cannot be replaced
+/// independently. Clones retain the same parser node identities.
+#[derive(Clone)]
+pub struct ParsedSourceBuffer {
+    file: parser::SourceFileId,
+    text: std::sync::Arc<str>,
+    parsed: std::sync::Arc<ParsedFile>,
+}
+
+impl ParsedSourceBuffer {
+    pub fn parse(
+        text: &str,
+        file: &Path,
+        config: &ProviderContext,
+    ) -> Result<Self, parser::ParseError> {
+        let parsed = parser::parse_file(text, file, config)?;
+        Ok(Self {
+            file: parser::SourceFileId::new(file.to_path_buf()),
+            text: text.into(),
+            parsed: std::sync::Arc::new(parsed),
+        })
+    }
+
+    pub fn parsed(&self) -> &ParsedFile {
+        &self.parsed
+    }
+}
+
+struct SnapshotSource {
+    file: ResolvedPath,
+    text: Option<std::sync::Arc<str>>,
+}
+
+struct SnapshotBufferMember {
+    index: usize,
+    buffer: ParsedSourceBuffer,
+}
+
+/// A discovered directory snapshot sealed with one parsed buffer member.
+/// The member's parser-owned contents override disk and conflicting snapshots;
+/// there is no constructor accepting an unrelated File or mutable source list.
+pub struct DirectoryBufferSnapshot {
+    sources: Vec<SnapshotSource>,
+    member: SnapshotBufferMember,
+}
+
+impl DirectoryBufferSnapshot {
+    pub fn capture(
+        directory: &ResolvedPath,
+        buffer: ParsedSourceBuffer,
+        overrides: &SourceOverrides,
+    ) -> Result<Self, DirectoryParseFailure> {
+        let pinned = ResolvedPath::new(buffer.file.path()).map_err(|error| {
+            DirectoryParseFailure::new(DirectoryParseFailureKind::Discovery(error))
+        })?;
+        if pinned
+            .parent()
+            .is_none_or(|parent| parent.identity() != directory.identity())
+        {
+            return Err(DirectoryParseFailure::new(
+                DirectoryParseFailureKind::Discovery(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "buffer source is not a member of this directory",
+                )),
+            ));
+        }
+        let mut overrides = overrides.clone();
+        overrides.retain(|path, _| {
+            !ResolvedPath::new(path).is_ok_and(|path| path.identity() == pinned.identity())
+        });
+        overrides.insert(buffer.file.path().to_path_buf(), buffer.text.to_string());
+        let files = DirectoryFiles::discover(directory, &overrides).map_err(|error| {
+            DirectoryParseFailure::new(DirectoryParseFailureKind::Discovery(error))
+        })?;
+        let index = files
+            .paths
+            .iter()
+            .position(|file| file.identity() == pinned.identity())
+            .ok_or_else(|| {
+                DirectoryParseFailure::new(DirectoryParseFailureKind::Discovery(
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "buffer source was not discovered in the directory",
+                    ),
+                ))
+            })?;
+        let sources = files
+            .paths
+            .into_iter()
+            .map(|file| {
+                let text = if file.identity() == pinned.identity() {
+                    Some(buffer.text.clone())
+                } else {
+                    read_source_with_overrides(&file, &overrides)
+                        .ok()
+                        .map(std::sync::Arc::from)
+                };
+                SnapshotSource { file, text }
+            })
+            .collect();
+        Ok(Self {
+            sources,
+            member: SnapshotBufferMember { index, buffer },
+        })
+    }
+
+    fn require_scope(&self) -> crate::parser::retained::RequireScope {
+        let inventories = self
+            .sources
+            .iter()
+            .map(|source| {
+                source.text.as_ref().and_then(|text| {
+                    parser::parse_syntax_inventory(text, &source.file.source_label()).ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        if inventories.iter().all(Option::is_some) {
+            CompleteDirectoryInventories {
+                inventories: inventories.iter().filter_map(Option::as_ref).collect(),
+            }
+            .require_scope()
+        } else {
+            require_scope_from_inventories(inventories.iter().filter_map(Option::as_ref))
+        }
+    }
+}
+
+/// Judge the buffer parsed from the exact member text of this sealed snapshot.
+/// Incomplete syntax knowledge retains ordinary expression checks without a
+/// require verdict. A known module block proves template scope; only complete
+/// absence of module blocks admits directory evaluation.
+pub fn load_buffer_configuration_in_directory<'a>(
+    snapshot: DirectoryBufferSnapshot,
+    schemas: &'a SchemaRegistry,
+    config: &ProviderContext,
+) -> BufferConfiguration<'a> {
+    let scope = snapshot.require_scope();
+    let member = &snapshot.sources[snapshot.member.index];
+    debug_assert!(member.text.as_deref() == Some(snapshot.member.buffer.text.as_ref()));
+    let mut parsed = snapshot.member.buffer.parsed().clone();
+    crate::parser::retained::set_require_scope(&mut parsed, scope);
+    BufferConfiguration {
+        judged: crate::parser::retained::JudgedFile::new(parsed, schemas, config),
+    }
+}
+
 impl LoadedConfig {
     /// Cross root binding resolution without expanding module calls.
     pub fn into_root_expanded(self) -> crate::parser::RootBindingResolvedInferredFile {
@@ -738,6 +948,103 @@ pub fn find_duplicate_declarations_in_analysis(
 /// In-memory source snapshots keyed by the edited file path.
 pub type SourceOverrides = HashMap<PathBuf, String>;
 
+/// The complete, sorted listing of one directory, including unsaved buffers.
+/// Paths remain OS paths throughout discovery; filename encoding never decides
+/// whether a source participates. Discovery errors cannot become partial lists.
+pub(crate) struct DirectoryFiles {
+    paths: Vec<ResolvedPath>,
+}
+
+impl DirectoryFiles {
+    pub(crate) fn discover(
+        directory: &ResolvedPath,
+        overrides: &SourceOverrides,
+    ) -> std::io::Result<Self> {
+        let mut paths = directory.crn_files()?;
+        for path in overrides.keys() {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            if ResolvedPath::new(parent)?.identity() != directory.identity() {
+                continue;
+            }
+            let name = path.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "source override must name a file",
+                )
+            })?;
+            let path = directory.join(name)?;
+            if !paths
+                .iter()
+                .any(|existing| existing.identity() == path.identity())
+            {
+                paths.push(path);
+            }
+        }
+        paths.sort_by_key(ResolvedPath::source_label);
+        Ok(Self { paths })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    pub(crate) fn into_paths(self) -> Vec<ResolvedPath> {
+        self.paths
+    }
+
+    fn read_all(
+        self,
+        overrides: &SourceOverrides,
+    ) -> Result<DirectoryInputs, DirectorySourceReadFailure> {
+        self.paths
+            .into_iter()
+            .map(|file| {
+                read_source_with_overrides(&file, overrides)
+                    .map(|source| (file.clone(), source))
+                    .map_err(|error| DirectorySourceReadFailure {
+                        file: file.source_label(),
+                        error,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|sources| DirectoryInputs { sources })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to read {}: {error}", .file.display())]
+struct DirectorySourceReadFailure {
+    file: PathBuf,
+    // Display includes the complete I/O diagnostic. DirectoryParseFailure
+    // exposes the typed error without repeating it through Error::source.
+    error: std::io::Error,
+}
+
+/// Only an unfiltered discovery followed by successful reads can construct
+/// these inputs. Successful parsing of all of them can mint completeness.
+struct DirectoryInputs {
+    sources: Vec<(ResolvedPath, String)>,
+}
+
+impl DirectoryInputs {
+    fn parse(
+        &self,
+        config: &ProviderContext,
+    ) -> Result<Vec<(PathBuf, DirectoryResolvedFile)>, LocatedParseError> {
+        let inputs = self
+            .sources
+            .iter()
+            .map(|(file, source)| (file.source_label(), source.clone()))
+            .collect::<Vec<_>>();
+        let mut parsed = parse_directory_files_located(&inputs, config)?;
+        mark_complete_directory_files(&mut parsed, config);
+        Ok(parsed)
+    }
+}
+
 /// Read the editor snapshot even when a module/upstream reaches it by an alias.
 pub(crate) fn read_source_with_overrides(
     path: &ResolvedPath,
@@ -753,19 +1060,13 @@ pub(crate) fn read_source_with_overrides(
     path.read_to_string()
 }
 
-pub(crate) fn directory_source_overrides(
+fn filename_source_overrides(
     dir: &ResolvedPath,
-    overrides: &SourceOverrides,
-) -> HashMap<String, String> {
+    overrides: &HashMap<String, String>,
+) -> SourceOverrides {
     overrides
         .iter()
-        .filter_map(|(path, text)| {
-            let parent = ResolvedPath::new(path.parent()?).ok()?;
-            if parent.identity() != dir.identity() {
-                return None;
-            }
-            Some((path.file_name()?.to_str()?.to_owned(), text.clone()))
-        })
+        .map(|(name, text)| (dir.source_label().join(name), text.clone()))
         .collect()
 }
 
@@ -984,12 +1285,13 @@ fn load_configuration_in_context(
         ))
     } else if resolved.is_dir() {
         // Directory mode
-        let files = resolved.crn_files().map_err(|error| {
-            ConfigurationLoadFailure::file(
-                format!("Failed to read directory {}: {error}", resolved.display()),
-                path,
-            )
-        })?;
+        let files =
+            DirectoryFiles::discover(&resolved, &SourceOverrides::new()).map_err(|error| {
+                ConfigurationLoadFailure::file(
+                    format!("Failed to read directory {}: {error}", resolved.display()),
+                    path,
+                )
+            })?;
         if files.is_empty() {
             return Err(ConfigurationLoadFailure::file(
                 format!("No .crn files found in {}", path.display()),
@@ -1002,17 +1304,10 @@ fn load_configuration_in_context(
         // union from sibling `.crn`s. Without this, e.g. an
         // `arguments {}` in `main.crn` would be invisible to `${env}`
         // interpolations in sibling `role.crn` (#2815, #2817).
-        let mut file_inputs: Vec<(PathBuf, String)> = Vec::with_capacity(files.len());
-        for file in &files {
-            let content = file.read_to_string().map_err(|e| {
-                ConfigurationLoadFailure::file(
-                    format!("Failed to read {}: {}", file.display(), e),
-                    &file.source_label(),
-                )
-            })?;
-            file_inputs.push((file.source_label(), content));
-        }
-        let parsed_files = match parse_directory_files_located(&file_inputs, config) {
+        let inputs = files.read_all(&SourceOverrides::new()).map_err(|failure| {
+            ConfigurationLoadFailure::file(failure.to_string(), &failure.file)
+        })?;
+        let parsed_files = match inputs.parse(config) {
             Ok(v) => v,
             Err(located) => {
                 return Err(ConfigurationLoadFailure::located(located, path));
@@ -1027,7 +1322,7 @@ fn load_configuration_in_context(
         let mut parse_errors: Vec<ConfigurationLoadFailure> = Vec::new();
         let mut backend_file: Option<ResolvedPath> = None;
 
-        for ((file, resolved), io_file) in parsed_files.into_iter().zip(files) {
+        for ((file, resolved), (io_file, _)) in parsed_files.into_iter().zip(inputs.sources) {
             let mut parsed = resolved.into_inner();
             let mut unresolved = parsed.clone();
             if let Err(e) = parser::resolve_resource_refs_with_backend_failure(
@@ -1188,6 +1483,21 @@ pub fn parse_directory_for_metadata_report(
     overrides: &HashMap<String, String>,
     schemas: &SchemaRegistry,
 ) -> Result<ParsedRootDirectory, DirectoryParseFailure> {
+    parse_directory_for_metadata_with_source_overrides_report(
+        dir,
+        config,
+        &filename_source_overrides(dir, overrides),
+        schemas,
+    )
+}
+
+/// Metadata discovery with OS-path editor snapshots, including non-UTF-8 names.
+pub fn parse_directory_for_metadata_with_source_overrides_report(
+    dir: &ResolvedPath,
+    config: &ProviderContext,
+    overrides: &SourceOverrides,
+    schemas: &SchemaRegistry,
+) -> Result<ParsedRootDirectory, DirectoryParseFailure> {
     parse_directory_with_overrides_impl(
         dir,
         config,
@@ -1212,7 +1522,7 @@ pub fn parse_directory_with_overrides(
     parse_directory_with_overrides_impl(
         dir,
         config,
-        overrides,
+        &filename_source_overrides(dir, overrides),
         strict_resolution_context(),
         &SchemaRegistry::new(),
     )
@@ -1273,6 +1583,10 @@ enum DirectoryParseFailureKind {
     #[error("{0}")]
     Message(String),
     #[error(transparent)]
+    Discovery(std::io::Error),
+    #[error(transparent)]
+    SourceRead(DirectorySourceReadFailure),
+    #[error(transparent)]
     Element(Box<parser::Located<parser::ParseError>>),
     #[error("{location}: {error}")]
     Parse {
@@ -1328,7 +1642,18 @@ impl DirectoryParseFailure {
         match &self.kind {
             DirectoryParseFailureKind::Parse { source_file, .. } => source_file.as_deref(),
             DirectoryParseFailureKind::Element(finding) => Some(finding.location().file().path()),
-            DirectoryParseFailureKind::Message(_) => None,
+            DirectoryParseFailureKind::SourceRead(failure) => Some(failure.file.as_path()),
+            DirectoryParseFailureKind::Message(_) | DirectoryParseFailureKind::Discovery(_) => None,
+        }
+    }
+
+    /// Original discovery or source-read failure, retained independently of
+    /// the complete terminal diagnostic rendered by Display.
+    pub fn io_error(&self) -> Option<&std::io::Error> {
+        match &self.kind {
+            DirectoryParseFailureKind::Discovery(error) => Some(error),
+            DirectoryParseFailureKind::SourceRead(failure) => Some(&failure.error),
+            _ => None,
         }
     }
 
@@ -1347,7 +1672,9 @@ impl DirectoryParseFailure {
         match &self.kind {
             DirectoryParseFailureKind::Parse { error, .. } => Some(error.as_ref()),
             DirectoryParseFailureKind::Element(finding) => Some(finding.detail()),
-            DirectoryParseFailureKind::Message(_) => None,
+            DirectoryParseFailureKind::Message(_)
+            | DirectoryParseFailureKind::Discovery(_)
+            | DirectoryParseFailureKind::SourceRead(_) => None,
         }
     }
 
@@ -1394,7 +1721,7 @@ pub fn parse_directory_with_overrides_and_diagnostics(
     parse_directory_with_overrides_impl(
         dir,
         config,
-        overrides,
+        &filename_source_overrides(dir, overrides),
         diagnostics_resolution_context(),
         &SchemaRegistry::new(),
     )
@@ -1404,6 +1731,21 @@ pub fn parse_directory_with_overrides_and_diagnostics_with_schemas(
     dir: &ResolvedPath,
     config: &ProviderContext,
     overrides: &HashMap<String, String>,
+    schemas: &SchemaRegistry,
+) -> Result<DirectoryParseResult, DirectoryParseFailure> {
+    parse_directory_with_source_overrides_and_diagnostics_with_schemas(
+        dir,
+        config,
+        &filename_source_overrides(dir, overrides),
+        schemas,
+    )
+}
+
+/// Directory analysis retaining OS-path override identities without encoding loss.
+pub fn parse_directory_with_source_overrides_and_diagnostics_with_schemas(
+    dir: &ResolvedPath,
+    config: &ProviderContext,
+    overrides: &SourceOverrides,
     schemas: &SchemaRegistry,
 ) -> Result<DirectoryParseResult, DirectoryParseFailure> {
     parse_directory_with_overrides_impl(
@@ -1418,37 +1760,16 @@ pub fn parse_directory_with_overrides_and_diagnostics_with_schemas(
 fn parse_directory_with_overrides_impl(
     dir: &ResolvedPath,
     config: &ProviderContext,
-    overrides: &HashMap<String, String>,
+    overrides: &SourceOverrides,
     resolution: ResolutionContext,
     schemas: &SchemaRegistry,
 ) -> Result<DirectoryParseResult, DirectoryParseFailure> {
     let resolved = dir.clone();
     let dir_label = resolved.source_label();
     let dir = dir_label.as_path();
-    let files = resolved
-        .crn_files()
-        .map_err(|error| DirectoryParseFailure::message(error.to_string()))?;
-    let mut paths: Vec<(ResolvedPath, String)> = files
-        .into_iter()
-        .filter_map(|p| {
-            p.display()
-                .file_name()
-                .and_then(|n| n.to_str().map(|s| (p.clone(), s.to_string())))
-        })
-        .collect();
-    // Also include overrides whose filename isn't on disk yet (e.g. a new
-    // buffer the user hasn't saved). Keep the list de-duplicated by name.
-    for name in overrides.keys() {
-        if !paths.iter().any(|(_, n)| n == name) {
-            paths.push((
-                resolved
-                    .join(name)
-                    .map_err(|error| DirectoryParseFailure::message(error.to_string()))?,
-                name.clone(),
-            ));
-        }
-    }
-    if paths.is_empty() {
+    let files = DirectoryFiles::discover(&resolved, overrides)
+        .map_err(|error| DirectoryParseFailure::new(DirectoryParseFailureKind::Discovery(error)))?;
+    if files.is_empty() {
         return Err(DirectoryParseFailure::message(format!(
             "No .crn files found in {}",
             dir.display()
@@ -1457,18 +1778,10 @@ fn parse_directory_with_overrides_impl(
 
     // Resolve every file's source text (disk or override) up front so
     // the directory-aware parse helper sees the right inputs. #2817.
-    let mut file_inputs: Vec<(PathBuf, String)> = Vec::with_capacity(paths.len());
-    for (file, name) in &paths {
-        let content = match overrides.get(name) {
-            Some(buffer) => buffer.clone(),
-            None => file.read_to_string().map_err(|e| {
-                DirectoryParseFailure::message(format!("Failed to read {}: {}", file.display(), e))
-            })?,
-        };
-        file_inputs.push((file.source_label(), content));
-    }
-
-    let parsed_files = match parse_directory_files_located(&file_inputs, config) {
+    let inputs = files.read_all(overrides).map_err(|error| {
+        DirectoryParseFailure::new(DirectoryParseFailureKind::SourceRead(error))
+    })?;
+    let parsed_files = match inputs.parse(config) {
         Ok(v) => v,
         Err(located) => {
             let location = located
@@ -1561,11 +1874,7 @@ fn parse_directory_with_overrides_impl(
         parsed: RootDirectoryParse::with_resolution(merged, resolution),
         authored_bindings,
         duplicate_declarations,
-        source_files: paths
-            .into_iter()
-            .zip(file_inputs)
-            .map(|((file, _), (_, source))| (file, source))
-            .collect(),
+        source_files: inputs.sources,
         sole_backend_file,
         semantic_files,
     })
@@ -1952,7 +2261,23 @@ pub(crate) fn parse_directory_files_located_from_root(
         .iter_names()
         .map(str::to_string)
         .collect::<BTreeSet<_>>();
+    let require_scope = crate::parser::retained::RequireScope::for_declarations(
+        merged
+            .arguments
+            .iter()
+            .map(|argument| argument.name.clone()),
+        merged
+            .parser_binding_metadata
+            .syntax()
+            .module_declaration_blocks(),
+    );
     for (_, file) in &mut out {
+        crate::parser::retained::set_require_scope(&mut file.parsed, require_scope.clone());
+        crate::parser::retained::judge_configuration(
+            &mut file.parsed,
+            &SchemaRegistry::new(),
+            config,
+        );
         file.parsed.set_loop_binding_scope(binding_scope.clone());
     }
     Ok(out)
@@ -2167,7 +2492,8 @@ fn collect_resolved_crn_files_recursive(
 
 /// Sorted, pinned `.crn` children of one directory.
 pub fn find_crn_files_in_dir(dir: &ResolvedPath) -> Result<Vec<ResolvedPath>, String> {
-    dir.crn_files()
+    DirectoryFiles::discover(dir, &SourceOverrides::new())
+        .map(DirectoryFiles::into_paths)
         .map_err(|error| format!("Failed to read directory {}: {error}", dir.display()))
 }
 

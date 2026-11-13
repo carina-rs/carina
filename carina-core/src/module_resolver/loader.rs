@@ -68,7 +68,8 @@ pub fn load_module_with_diagnostics_and_schemas(
 /// ordering) must not depend on filesystem iteration order, which varies
 /// across ext4/APFS/tmpfs.
 pub(super) fn sorted_crn_paths_in(dir_path: &ResolvedPath) -> std::io::Result<Vec<ResolvedPath>> {
-    dir_path.crn_files()
+    crate::config_loader::DirectoryFiles::discover(dir_path, &Default::default())
+        .map(crate::config_loader::DirectoryFiles::into_paths)
 }
 
 /// Load all `.crn` files from a directory and merge them into a single `ParsedFile`.
@@ -120,18 +121,8 @@ pub(super) fn source_paths_with_overrides(
     dir: &ResolvedPath,
     overrides: &crate::config_loader::SourceOverrides,
 ) -> std::io::Result<Vec<ResolvedPath>> {
-    let mut paths = sorted_crn_paths_in(dir)?;
-    for name in crate::config_loader::directory_source_overrides(dir, overrides).keys() {
-        let path = dir.join(name)?;
-        if !paths
-            .iter()
-            .any(|existing| existing.identity() == path.identity())
-        {
-            paths.push(path);
-        }
-    }
-    paths.sort_by_key(ResolvedPath::source_label);
-    Ok(paths)
+    crate::config_loader::DirectoryFiles::discover(dir, overrides)
+        .map(crate::config_loader::DirectoryFiles::into_paths)
 }
 
 fn load_directory_module_with_diagnostics_and_config(

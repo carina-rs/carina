@@ -144,6 +144,8 @@ pub enum NotInferableReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InferenceError {
+    #[error(transparent)]
+    DirectoryConstraint(Box<crate::module_resolver::DirectoryConstraintDiagnostic>),
     #[error("{}", crate::resource::INSIDE_SECRET_MESSAGE)]
     InsideSecret {},
     #[error("Type mismatch: {types} (from {})", crate::schema::SECRET_VALUE_MASK)]
