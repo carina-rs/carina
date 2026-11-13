@@ -11964,47 +11964,73 @@ fn r1_root_require_template_apis_need_declaration_evidence() {
     });
 }
 
-fn assert_r1_require_admission(reset_report: bool) {
+#[test]
+fn r2_root_require_has_only_the_expression_report_carrier() {
     let directory = tempfile::tempdir().unwrap();
-    fs::write(directory.path().join("guards.crn"), "require true, 'x'\n").unwrap();
-    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    fs::write(
+        directory.path().join("guards.crn"),
+        "require true, 'private'\n",
+    )
+    .unwrap();
+    let context = LoadedProviderContext::empty_for_test();
     let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
     let schemas = crate::schema::SchemaRegistry::new();
-    let parsed = crate::config_loader::parse_directory(&base, &context).unwrap();
-    let resolution = parsed.module_resolution_context();
-    let mut parsed = parsed.into_parsed();
-    let crate::parser::retained::RequireScope::UnvalidatedDirectory(evidence) =
-        crate::parser::retained::require_scope(&parsed)
-    else {
-        panic!("expected an unadmitted complete directory");
-    };
-    if reset_report {
-        crate::parser::retained::set_require_scope(
-            &mut parsed,
-            crate::parser::retained::RequireScope::Directory(evidence),
-        );
-    }
-    assert!(parsed.expression_report().findings().is_empty());
     crate::validation::deferred_types::with_session_for_test(&context, |session| {
-        let resolver =
-            ModuleResolver::with_config_and_schemas(&base, session, &schemas, resolution);
-        let judged = crate::parser::retained::JudgedFile::new(parsed, &schemas, &context);
-        let error = resolver
-            .check_require_placement(&judged)
-            .expect_err("an unadmitted or unjudged directory must not pass the placement check");
-        assert_eq!(
-            error.require_outside_module().unwrap().detail().to_string(),
-            "`require` is only allowed inside a module"
-        );
+        for providerless in [false, true] {
+            let parsed = crate::config_loader::parse_directory(&base, &context).unwrap();
+            let admitted = parsed.admit(&schemas, session);
+            let result = if providerless {
+                super::resolve_modules_with_providerless_diagnostics(admitted, &base, &[])
+            } else {
+                super::resolve_modules_with_diagnostics(admitted, &base, &[])
+            };
+            let super::ModuleResolutionDiagnosticResult::Expanded { graph } = result else {
+                panic!("a root rejection belongs only to the retained expression report");
+            };
+            let findings = graph.expression_report().findings();
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert!(matches!(
+                findings[0].detail(),
+                crate::static_type::InferenceError::RequireOutsideModule(_)
+            ));
+            assert_eq!(findings[0].location().span().start_column(), 1);
+        }
     });
 }
 
 #[test]
-fn r1_root_require_unadmitted_directory_cannot_pass() {
-    assert_r1_require_admission(false);
-}
-
-#[test]
-fn r1_root_require_unjudged_directory_cannot_pass() {
-    assert_r1_require_admission(true);
+fn r2_root_require_public_strict_resolvers_keep_admission_verdict() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("guards.crn"),
+        "require true, 'private'\n",
+    )
+    .unwrap();
+    let context = LoadedProviderContext::empty_for_test();
+    let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let schemas = crate::schema::SchemaRegistry::new();
+    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        for providerless in [false, true] {
+            let parsed = crate::config_loader::parse_directory(&base, &context).unwrap();
+            let admitted = parsed.admit(&schemas, session);
+            let result = if providerless {
+                super::resolve_modules_with_providerless_config(admitted, &base)
+            } else {
+                super::resolve_modules_with_config(admitted, &base)
+            };
+            let error =
+                result.expect_err("public resolution must preserve the root require verdict");
+            let finding = error.require_outside_module().unwrap();
+            assert_eq!(
+                finding.detail().to_string(),
+                "`require` is only allowed inside a module"
+            );
+            assert_eq!(
+                finding.location().file().path(),
+                directory.path().join("guards.crn")
+            );
+            assert_eq!(finding.location().span().start_line(), 1);
+            assert_eq!(finding.location().span().start_column(), 1);
+        }
+    });
 }

@@ -8691,9 +8691,6 @@ impl ModuleCallFinding {
                         .argument_value_location(&error.identity.argument)
                         .unwrap_or_else(|| call.declaration_location()),
                     ModuleCallFindingMessage::Constraint(
-                        crate::module_resolver::ConstraintDiagnostic::RequireOutsideModule(_),
-                    ) => unreachable!("directory findings have authored anchors"),
-                    ModuleCallFindingMessage::Constraint(
                         crate::module_resolver::ConstraintDiagnostic::ModuleCall(diagnostic),
                     ) => match &diagnostic.kind {
                         crate::module_resolver::ModuleConstraintKind::ArgumentValidation {
@@ -9791,30 +9788,7 @@ impl ModuleCallChecker<'_> {
         compositions: &[crate::resource::LiveComposition<P>],
     ) {
         for report in reports {
-            let report = match report {
-                crate::module_resolver::ConstraintScopeReport::RequireOutsideModule(failures) => {
-                    for failure in failures {
-                        let anchor = ModuleCallFindingAnchor::new(failure.location().clone());
-                        let owner = ModuleCallFindingOwnerSource::Authored(anchor.clone());
-                        self.push_finding(ModuleCallFinding {
-                            kind: ModuleCallFindingKind::Constraint,
-                            owners: vec![ModuleCallFindingOwner {
-                                root: owner.clone(),
-                                immediate: owner,
-                            }],
-                            anchor,
-                            message: ModuleCallFindingMessage::Constraint(
-                                crate::module_resolver::ConstraintDiagnostic::RequireOutsideModule(
-                                    failure.detail().clone(),
-                                ),
-                            ),
-                            identity: None,
-                        });
-                    }
-                    continue;
-                }
-                crate::module_resolver::ConstraintScopeReport::ModuleCall(report) => report,
-            };
+            let crate::module_resolver::ConstraintScopeReport::ModuleCall(report) = report;
             for outcome in &report.outcomes {
                 let crate::module_resolver::ResolvedModuleConstraintStatus::Failed {
                     diagnostic,

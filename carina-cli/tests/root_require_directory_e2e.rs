@@ -431,7 +431,12 @@ fn root_require_upstream_true_keeps_location() {
 }
 
 #[test]
-fn round1_zero_module_calls_and_data_source_only_guards() {
+fn r2_root_require_upstream_function_call_reports_placement_first() {
+    assert_round1_upstream_guard("custom('x') == 1");
+}
+
+#[test]
+fn root_require_rejected_without_module_calls_and_with_data_sources() {
     for main in [
         "let r = mock.test.resource { name = 'root' }\n",
         "let r = read mock.test.resource { name = 'root' }\n",
@@ -486,6 +491,43 @@ fn round1_saved_plan_secret_verification_matches_module_policy() {
     }
 }
 
+#[test]
+fn r2_root_require_saved_plan_secret_failure_exposes_the_cause() {
+    let directory = Directory::new("true");
+    directory.clear_guard();
+    fs::write(
+        directory.project.join("main.crn"),
+        "let r = mock.test.resource { name = 'root' comment = secret('ROUND2_PRIVATE_VALUE') }\n",
+    )
+    .unwrap();
+    success(&directory.run(&["plan", "--out", "saved.plan", "."]));
+    let plan = directory.project.join("saved.plan");
+    let saved = fs::read(&plan).unwrap();
+    let state_paths = [
+        directory.project.join("carina.state.json"),
+        directory.home.join("mock-state.json"),
+    ];
+    let before = state_paths.each_ref().map(|path| fs::read(path).ok());
+    directory.guard("true");
+    let output = directory.run(&["apply", "--auto-approve", "saved.plan"]);
+    rejected(&output, ROOT_REQUIRE_ERROR);
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+    assert_eq!(
+        stderr,
+        format!(
+            "Error: Saved-plan secret verification failed because the current configuration could not be evaluated (for example, an environment variable or decryption key may be unavailable); re-run `carina plan --out saved.plan {project}` after restoring the required inputs: {project}/guards.crn at line 2\nError: {ROOT_REQUIRE_ERROR}\n",
+            project = directory.project.display(),
+        )
+    );
+    assert_eq!(stderr.matches(ROOT_REQUIRE_ERROR).count(), 1);
+    assert!(!output_text(&output).contains("ROUND2_PRIVATE_VALUE"));
+    assert_eq!(saved, fs::read(plan).unwrap());
+    assert_eq!(
+        before,
+        state_paths.each_ref().map(|path| fs::read(path).ok())
+    );
+}
+
 fn rejected(output: &Output, message: &str) {
     let text = output_text(output);
     assert!(!output.status.success(), "unexpected success: {text}");
@@ -537,6 +579,36 @@ fn root_require_false_commands() {
 #[test]
 fn root_require_let_commands() {
     assert_root_rejected_on_every_path("n == 2");
+}
+
+fn assert_r2_state_command_rejects_root_require(args: &[&str]) {
+    let directory = Directory::new("true");
+    directory.clear_guard();
+    success(&directory.run(&["apply", "--auto-approve", "."]));
+    let paths = [
+        directory.project.join("carina.state.json"),
+        directory.home.join("mock-state.json"),
+    ];
+    let before = paths.each_ref().map(|path| fs::read(path).unwrap());
+    directory.guard("true");
+    let output = directory.run(args);
+    rejected(&output, ROOT_REQUIRE_ERROR);
+    let text = output_text(&output);
+    assert_eq!(text.matches(ROOT_REQUIRE_ERROR).count(), 1, "{text}");
+    assert!(text.contains("guards.crn"), "{text}");
+    assert!(text.contains("2:1") || text.contains("line 2"), "{text}");
+    assert!(!text.contains("root guard"), "{text}");
+    assert_eq!(before, paths.each_ref().map(|path| fs::read(path).unwrap()));
+}
+
+#[test]
+fn r2_root_require_blocks_destroy_without_state_changes() {
+    assert_r2_state_command_rejects_root_require(&["destroy", "--auto-approve", "."]);
+}
+
+#[test]
+fn r2_root_require_blocks_state_refresh_without_state_changes() {
+    assert_r2_state_command_rejects_root_require(&["state", "refresh", "."]);
 }
 
 #[test]

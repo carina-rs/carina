@@ -21,9 +21,7 @@ use crate::schema::SchemaRegistry;
 
 use super::error::{ModuleError, ModuleErrorCallSource};
 use super::expander::instance_prefix_for_call;
-use super::validation::{
-    ConstraintOrigin, ModuleConstraintDiagnostic, RequireOutsideModuleDiagnostic,
-};
+use super::validation::{ConstraintOrigin, ModuleConstraintDiagnostic};
 
 type ModuleResolvedValue = crate::resource::Value<ParserPlaceholder, AbsoluteBindingAddress>;
 type JudgedModuleFile<'a, E> = crate::parser::retained::JudgedFile<'a, E, ParsedDeferredForPhase>;
@@ -112,7 +110,6 @@ where
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstraintScopeReport {
-    RequireOutsideModule(Vec<crate::parser::Located<RequireOutsideModuleDiagnostic>>),
     ModuleCall(ModuleCallConstraintReport),
 }
 
@@ -1139,15 +1136,6 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         }
     }
 
-    pub(super) fn record_require_outside_module_report(
-        &self,
-        failures: Vec<crate::parser::Located<RequireOutsideModuleDiagnostic>>,
-    ) {
-        if let Some(reports) = self.constraint_reports.borrow_mut().as_mut() {
-            reports.push(ConstraintScopeReport::RequireOutsideModule(failures));
-        }
-    }
-
     pub(super) fn records_constraint_reports(&self) -> bool {
         self.constraint_reports.borrow().is_some()
     }
@@ -1157,7 +1145,9 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     /// This is intentionally the only constructor for `RefCheckWitness`.
     /// Resource/provider validation may be skipped by a command, but the
     /// BindingIndex reference relation at module and function boundaries may
-    /// not be skipped.
+    /// not be skipped. Imports supply module signatures used to normalize
+    /// attribute handles, so the admitted file is consumed and re-judged here
+    /// before reference checking and require placement checking.
     fn judge_reference_types<
         E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
     >(

@@ -23,18 +23,15 @@ use super::ModuleError;
 #[error("`require` is only allowed inside a module")]
 pub struct RequireOutsideModuleDiagnostic;
 
-/// Require placement errors and evaluated module-call failures retain their
-/// distinct ownership through rendering.
+/// Evaluated module-call failures retain their ownership through rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstraintDiagnostic {
-    RequireOutsideModule(RequireOutsideModuleDiagnostic),
     ModuleCall(Box<ModuleConstraintDiagnostic>),
 }
 
 impl fmt::Display for ConstraintDiagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::RequireOutsideModule(diagnostic) => diagnostic.fmt(f),
             Self::ModuleCall(diagnostic) => diagnostic.fmt(f),
         }
     }

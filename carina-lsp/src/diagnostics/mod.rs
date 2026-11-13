@@ -311,16 +311,6 @@ fn render_module_call_findings(
 ) -> Vec<Diagnostic> {
     findings
         .iter()
-        // Require-placement rejections publish through retained expression
-        // reports. This renderer owns evaluated module-call outcomes.
-        .filter(|finding| {
-            !matches!(
-                finding.message(),
-                carina_core::validation::ModuleCallFindingMessage::Constraint(
-                    carina_core::module_resolver::ConstraintDiagnostic::RequireOutsideModule(_)
-                )
-            )
-        })
         .flat_map(|finding| finding.diagnostics())
         .filter_map(|finding| {
             let mut diagnostic = render_merged(

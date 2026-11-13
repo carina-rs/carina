@@ -1919,12 +1919,12 @@ mod tests {
                 &overrides,
             )
             .unwrap();
-            assert_eq!(errors.len(), 1, "upstream guard was omitted");
+            assert_eq!(errors.len(), 1, "upstream require rejection was omitted");
             let (_, error) = errors[0].detail().module_failure().unwrap();
             let crate::module_resolver::ModuleError::RequireOutsideModule(finding) =
                 error.root_cause()
             else {
-                panic!("expected a located directory constraint: {error}");
+                panic!("expected a located require-outside-module rejection: {error}");
             };
             assert_eq!(finding.location().file().path(), guard);
             assert_eq!(finding.location().span().start_line(), 1);

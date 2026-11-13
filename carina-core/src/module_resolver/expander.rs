@@ -2637,8 +2637,12 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         &self,
         judged: &crate::parser::retained::JudgedFile<'_, E, crate::parser::ParsedDeferredForPhase>,
     ) -> Result<(), ModuleError> {
-        // JudgedFile can only be constructed by admission plus judgement and
-        // exposes no mutable file access. Every root require has its verdict.
+        // Reference normalization re-judges the file before this check. The
+        // retained report owns every root require verdict; diagnostic callers
+        // publish it directly, while strict callers need a resolver error.
+        if self.records_constraint_reports() {
+            return Ok(());
+        }
         let failures = judged
             .report()
             .findings()
@@ -2656,20 +2660,13 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 }
             })
             .collect::<Vec<_>>();
-        if self.records_constraint_reports() {
-            if !failures.is_empty() {
-                self.record_require_outside_module_report(failures);
-            }
-            Ok(())
-        } else {
-            ModuleError::from_errors(
-                failures
-                    .into_iter()
-                    .map(|failure| ModuleError::RequireOutsideModule(Box::new(failure)))
-                    .collect(),
-            )
-            .map_or(Ok(()), Err)
-        }
+        ModuleError::from_errors(
+            failures
+                .into_iter()
+                .map(|failure| ModuleError::RequireOutsideModule(Box::new(failure)))
+                .collect(),
+        )
+        .map_or(Ok(()), Err)
     }
 }
 

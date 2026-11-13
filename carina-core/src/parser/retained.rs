@@ -894,8 +894,9 @@ impl<B: BindingAddress> Expressions<B> {
 /// A schema-judged configuration owns its file and report and borrows the
 /// caller's schema registry. Parsing alone cannot construct this type.
 /// Consumers borrow this bundle so the file and schemas stay paired.
-/// Admission and judgement are inseparable: every Directory require has a
-/// placement verdict, and callers cannot reset the report through this type.
+/// Admission and judgement are inseparable for the wrapped snapshot: every
+/// Directory require has a placement verdict. Reference normalization consumes
+/// this snapshot and re-judges the result before checking require placement.
 #[derive(Debug, Clone)]
 pub struct JudgedFile<'a, E, D, B: BindingAddress = RelativeBindingName> {
     file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
@@ -943,14 +944,14 @@ impl<E, D, B: BindingAddress> super::File<E, ParserPlaceholder, ParserPlaceholde
     }
 }
 
-pub(crate) fn set_require_scope<E, D, B: BindingAddress>(
+pub(crate) fn set_directory_require_scope<E, D, B: BindingAddress>(
     file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
-    scope: RequireScope,
+    scope: crate::config_loader::DirectoryRequireScope,
 ) {
     file.parser_binding_metadata
         .syntax
         .expressions_mut()
-        .set_require_scope(scope);
+        .set_require_scope(scope.into_scope());
 }
 
 #[cfg(test)]
@@ -971,20 +972,12 @@ pub(crate) fn require_scope<E, D, B: BindingAddress>(
 fn admit_require_scope<E, D, B: BindingAddress>(
     file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
 ) {
-    let module_blocks = file
-        .parser_binding_metadata
-        .syntax()
-        .module_declaration_blocks();
     let expressions = file.parser_binding_metadata.syntax.expressions_mut();
-    let scope = match expressions.require_scope.as_ref() {
-        Some(RequireScope::UnvalidatedDirectory(evidence)) => RequireScope::Directory(*evidence),
-        Some(_) => return,
-        None => RequireScope::for_declarations(
-            file.arguments.iter().map(|argument| argument.name.clone()),
-            module_blocks,
-        ),
+    let Some(RequireScope::UnvalidatedDirectory(evidence)) = expressions.require_scope.as_ref()
+    else {
+        return;
     };
-    expressions.set_require_scope(scope);
+    expressions.set_require_scope(RequireScope::Directory(*evidence));
 }
 
 pub(crate) fn judge_configuration<
@@ -3823,6 +3816,9 @@ mod judgement {
     }
 
     fn first_error(findings: &[Located<InferenceError>]) -> Option<super::super::ParseError> {
+        // Ordinary expression failures become ParseError. Require placement
+        // stays typed: diagnostic callers publish this report, while strict
+        // resolvers translate its placement verdicts into ModuleError.
         findings
             .iter()
             .find(|finding| !matches!(finding.detail(), InferenceError::RequireOutsideModule(_)))

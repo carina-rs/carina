@@ -394,7 +394,9 @@ pub type ParsedRootDirectory = RootDirectoryParse<crate::parser::ParsedExportPar
 pub type InferredRootDirectory = RootDirectoryParse<crate::parser::InferredExportParam>;
 
 /// A loader-owned directory after require admission and expression judgement.
-/// Only [`RootDirectoryParse::admit`] can construct this immutable resolver input.
+/// Only [`RootDirectoryParse::admit`] constructs this input. Resolution consumes
+/// it to normalize references using imported signatures, then re-judges the
+/// resulting file before checking require placement.
 #[derive(Clone)]
 pub struct AdmittedRootDirectory<'a, E = crate::parser::ParsedExportParam> {
     judged: crate::parser::retained::JudgedFile<'a, E, crate::parser::ParsedDeferredForPhase>,
@@ -440,6 +442,17 @@ impl<E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder>> Root
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CompleteDirectoryDeclarations(());
 
+/// Scope derived from loader-owned declaration inventories. Only this module
+/// can construct it; the retained layer accepts no arbitrary scope override.
+#[derive(Clone)]
+pub(crate) struct DirectoryRequireScope(crate::parser::retained::RequireScope);
+
+impl DirectoryRequireScope {
+    pub(crate) fn into_scope(self) -> crate::parser::retained::RequireScope {
+        self.0
+    }
+}
+
 fn mark_complete_directory_files(
     files: &mut [(PathBuf, DirectoryResolvedFile)],
     config: &ProviderContext,
@@ -452,7 +465,7 @@ fn mark_complete_directory_files(
     }
     .require_scope();
     for (_, file) in files {
-        crate::parser::retained::set_require_scope(&mut file.parsed, scope.clone());
+        crate::parser::retained::set_directory_require_scope(&mut file.parsed, scope.clone());
         crate::parser::retained::judge_configuration(
             &mut file.parsed,
             &SchemaRegistry::new(),
@@ -469,20 +482,22 @@ struct CompleteDirectoryInventories<'a> {
 }
 
 impl CompleteDirectoryInventories<'_> {
-    fn require_scope(self) -> crate::parser::retained::RequireScope {
+    fn require_scope(self) -> DirectoryRequireScope {
         use crate::parser::retained::RequireScope;
-        match require_scope_from_inventories(self.inventories) {
-            RequireScope::Unknown => {
-                RequireScope::UnvalidatedDirectory(CompleteDirectoryDeclarations(()))
-            }
-            scope => scope,
-        }
+        DirectoryRequireScope(
+            match require_scope_from_inventories(self.inventories).into_scope() {
+                RequireScope::Unknown => {
+                    RequireScope::UnvalidatedDirectory(CompleteDirectoryDeclarations(()))
+                }
+                scope => scope,
+            },
+        )
     }
 }
 
 fn require_scope_from_inventories<'a>(
     inventories: impl IntoIterator<Item = &'a parser::SyntaxInventory>,
-) -> crate::parser::retained::RequireScope {
+) -> DirectoryRequireScope {
     let mut blocks = parser::ModuleDeclarationBlocks::Absent;
     let mut arguments = BTreeSet::new();
     for inventory in inventories {
@@ -493,7 +508,10 @@ fn require_scope_from_inventories<'a>(
             }
         }
     }
-    crate::parser::retained::RequireScope::for_declarations(arguments.into_iter(), blocks)
+    DirectoryRequireScope(crate::parser::retained::RequireScope::for_declarations(
+        arguments.into_iter(),
+        blocks,
+    ))
 }
 
 impl<E> RootDirectoryParse<E> {
@@ -831,7 +849,7 @@ impl DirectoryBufferSnapshot {
         })
     }
 
-    fn require_scope(&self) -> crate::parser::retained::RequireScope {
+    fn require_scope(&self) -> DirectoryRequireScope {
         let inventories = self
             .sources
             .iter()
@@ -865,7 +883,7 @@ pub fn load_buffer_configuration_in_directory<'a>(
     let member = &snapshot.sources[snapshot.member.index];
     debug_assert!(member.text.as_deref() == Some(snapshot.member.buffer.text.as_ref()));
     let mut parsed = snapshot.member.buffer.parsed().clone();
-    crate::parser::retained::set_require_scope(&mut parsed, scope);
+    crate::parser::retained::set_directory_require_scope(&mut parsed, scope);
     BufferConfiguration {
         judged: crate::parser::retained::JudgedFile::new(parsed, schemas, config),
     }
@@ -2302,18 +2320,22 @@ pub(crate) fn parse_directory_files_located_from_root(
         .iter_names()
         .map(str::to_string)
         .collect::<BTreeSet<_>>();
-    let require_scope = crate::parser::retained::RequireScope::for_declarations(
-        merged
-            .arguments
-            .iter()
-            .map(|argument| argument.name.clone()),
-        merged
-            .parser_binding_metadata
-            .syntax()
-            .module_declaration_blocks(),
-    );
+    let require_scope =
+        DirectoryRequireScope(crate::parser::retained::RequireScope::for_declarations(
+            merged
+                .arguments
+                .iter()
+                .map(|argument| argument.name.clone()),
+            merged
+                .parser_binding_metadata
+                .syntax()
+                .module_declaration_blocks(),
+        ));
     for (_, file) in &mut out {
-        crate::parser::retained::set_require_scope(&mut file.parsed, require_scope.clone());
+        crate::parser::retained::set_directory_require_scope(
+            &mut file.parsed,
+            require_scope.clone(),
+        );
         crate::parser::retained::judge_configuration(
             &mut file.parsed,
             &SchemaRegistry::new(),
