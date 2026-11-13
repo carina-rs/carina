@@ -1278,8 +1278,8 @@ fn validate_known_provider_values(
 }
 
 #[cfg(test)]
-#[path = "provider_ready/configuration_step0_tests.rs"]
-mod configuration_step0_tests;
+#[path = "provider_ready/compact_list_configuration_tests.rs"]
+mod compact_list_configuration_tests;
 
 #[cfg(test)]
 mod provider_config_tests {
@@ -1716,23 +1716,21 @@ mod provider_config_tests {
         fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
             crate::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                {
-                    crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
-                        "region".to_string(),
-                        PatternAttributeType::enum_(
-                            crate::schema::TypeIdentity::new(
-                                Some("test"),
-                                Vec::<String>::new(),
-                                "Region",
-                            ),
-                            Some(vec!["ap-northeast-1".to_string()]),
-                            vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
-                            None,
-                            None,
+                crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "region".to_string(),
+                    PatternAttributeType::enum_(
+                        crate::schema::TypeIdentity::new(
+                            Some("test"),
+                            Vec::<String>::new(),
+                            "Region",
                         ),
-                    )]))
-                    .expect("test provider config schema must be valid")
-                },
+                        Some(vec!["ap-northeast-1".to_string()]),
+                        vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
+                        None,
+                        None,
+                    ),
+                )]))
+                .expect("test provider config schema must be valid"),
                 Default::default(),
                 Vec::new(),
             )
@@ -3988,22 +3986,20 @@ mod provider_config_tests {
         fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
             crate::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                {
-                    crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
-                        "endpoint".to_string(),
-                        PatternAttributeType::refined_string(
-                            Some(TypeIdentity::new(
-                                Some("shared"),
-                                Vec::<String>::new(),
-                                "Endpoint",
-                            )),
-                            None,
-                            None,
-                            None,
-                        ),
-                    )]))
-                    .expect("test provider config schema must be valid")
-                },
+                crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "endpoint".to_string(),
+                    PatternAttributeType::refined_string(
+                        Some(TypeIdentity::new(
+                            Some("shared"),
+                            Vec::<String>::new(),
+                            "Endpoint",
+                        )),
+                        None,
+                        None,
+                        None,
+                    ),
+                )]))
+                .expect("test provider config schema must be valid"),
                 Default::default(),
                 Vec::new(),
             )
@@ -4114,21 +4110,19 @@ mod provider_config_tests {
         fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
             crate::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                {
-                    crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
-                        "region".to_string(),
-                        PatternAttributeType::refined_string(
-                            None,
-                            Some(crate::schema::PatternSpec::new(
-                                r"^good-[a-z]+$".to_string(),
-                                crate::schema::PatternMatch::Full,
-                            )),
-                            None,
-                            None,
-                        ),
-                    )]))
-                    .expect("test provider config schema must be valid")
-                },
+                crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "region".to_string(),
+                    PatternAttributeType::refined_string(
+                        None,
+                        Some(crate::schema::PatternSpec::new(
+                            r"^good-[a-z]+$".to_string(),
+                            crate::schema::PatternMatch::Full,
+                        )),
+                        None,
+                        None,
+                    ),
+                )]))
+                .expect("test provider config schema must be valid"),
                 Default::default(),
                 Vec::new(),
             )
@@ -4236,13 +4230,11 @@ mod provider_config_tests {
             fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
                 crate::schema::ValidatedProviderSchemaWitness::new(
                     self.schemas(),
-                    {
-                        ValidatedConfigSchema::validate(BTreeMap::from([(
-                            "region".to_string(),
-                            PatternAttributeType::string(),
-                        )]))
-                        .expect("test provider config schema must be valid")
-                    },
+                    ValidatedConfigSchema::validate(BTreeMap::from([(
+                        "region".to_string(),
+                        PatternAttributeType::string(),
+                    )]))
+                    .expect("test provider config schema must be valid"),
                     Default::default(),
                     Vec::new(),
                 )

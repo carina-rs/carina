@@ -9,11 +9,11 @@ use carina_core::schema::SchemaRegistry;
 
 mod basic;
 mod configuration_admission;
+mod configuration_builtin_diagnostics;
 mod enum_continuation;
 mod extended;
 mod located;
 mod root_requires;
-mod round3_configuration_parity;
 mod seam_review;
 mod seam_round2;
 mod seam_round8;
@@ -109,31 +109,29 @@ impl ProviderFactory for RegionConfigFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            {
-                carina_core::schema::ValidatedConfigSchema::validate(
-                    std::collections::BTreeMap::from([
-                        (
-                            "region".to_string(),
-                            carina_core::schema::AttributeType::enum_(
-                                carina_core::schema::TypeIdentity::new(
-                                    Some("aws"),
-                                    Vec::<String>::new(),
-                                    "Region",
-                                ),
-                                Some(vec!["ap-northeast-1".to_string()]),
-                                vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
-                                None,
-                                None,
+            carina_core::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from(
+                [
+                    (
+                        "region".to_string(),
+                        carina_core::schema::AttributeType::enum_(
+                            carina_core::schema::TypeIdentity::new(
+                                Some("aws"),
+                                Vec::<String>::new(),
+                                "Region",
                             ),
+                            Some(vec!["ap-northeast-1".to_string()]),
+                            vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
+                            None,
+                            None,
                         ),
-                        (
-                            "profile".to_string(),
-                            carina_core::schema::AttributeType::string(),
-                        ),
-                    ]),
-                )
-                .expect("test provider config schema must be valid")
-            },
+                    ),
+                    (
+                        "profile".to_string(),
+                        carina_core::schema::AttributeType::string(),
+                    ),
+                ],
+            ))
+            .expect("test provider config schema must be valid"),
             Default::default(),
             Vec::new(),
         )
@@ -261,15 +259,13 @@ impl ProviderFactory for SuspendedValidationFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            {
-                carina_core::schema::ValidatedConfigSchema::validate(
-                    std::collections::BTreeMap::from([(
-                        "region".to_string(),
-                        carina_core::schema::AttributeType::string(),
-                    )]),
-                )
-                .expect("test provider config schema must be valid")
-            },
+            carina_core::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from(
+                [(
+                    "region".to_string(),
+                    carina_core::schema::AttributeType::string(),
+                )],
+            ))
+            .expect("test provider config schema must be valid"),
             Default::default(),
             Vec::new(),
         )

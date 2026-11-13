@@ -4149,10 +4149,10 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     /// Anonymous String/Int/Float refinements occur only in provider schema slots;
     /// annotations, module/export boundaries and function signatures use identified
     /// refinements or unconstrained scalars. Resolved resource/data-source inputs
-    /// pass through `admit_apply_resource`/`admit_apply_data_source`; provider config
-    /// uses `validate_provider_config_attributes` on resolved values. These checks
-    /// validate the full destination declaration before dispatch, preserving
-    /// #2218's safety without static containment. Function parameters/returns also
+    /// pass through `admit_apply_resource`/`admit_apply_data_source`; provider/backend
+    /// configuration enters `admit()` through `validation/admission/configuration/`.
+    /// These checks validate the full destination declaration before dispatch,
+    /// preserving #2218's safety without static containment. Function parameters/returns also
     /// have runtime constraint checks; backend schemas have no anonymous refinements.
     ///
     /// Preserve the #4362 invariant: adding constraints to a source never reduces

@@ -94,7 +94,7 @@ fn backend_local_native_address_pin_preserves_non_utf8_bytes() {
 
 #[cfg(unix)]
 #[test]
-fn review_r1_native_file_origin_is_explicit_and_not_admitted_settings() {
+fn native_file_origin_is_explicit_and_not_admitted_settings() {
     use std::os::unix::ffi::OsStringExt;
     let root = tempfile::tempdir().unwrap();
     let path = root
@@ -124,7 +124,7 @@ fn locate_error_retains_terminal_io_cause() {
 }
 
 #[test]
-fn review_r1_configured_locate_error_matches_main_text() {
+fn configured_locate_error_includes_file_context() {
     let root = tempfile::tempdir().unwrap();
     let raw = parser::BackendConfig::<NoPlaceholder> {
         backend_type: "local".into(),

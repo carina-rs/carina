@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use crate::test_utils::configuration::{ConfigFactory as Factory, provider_directory as directory};
 
 #[test]
-fn review_r1_analysis_and_complete_configuration_have_distinct_types() {
+fn analysis_and_complete_configuration_have_distinct_types() {
     let factory = Factory::new(ValidatedConfigSchema::default());
     let attrs = ConfigurationAttributes::new();
     let analyzed = analysis(&factory, "owner", &attrs).unwrap();
@@ -360,7 +360,7 @@ fn provider_config_directory_checks_full_destination_after_resolution() {
 }
 
 #[test]
-fn review_r2_analysis_declared_field_cannot_silently_drop_pending() {
+fn analysis_declared_field_cannot_silently_drop_pending() {
     let factory = Factory::new(
         ValidatedConfigSchema::validate(BTreeMap::from([(
             "value".into(),
@@ -426,7 +426,7 @@ fn classification_errors() -> Vec<(KnowledgeError<AbsoluteBindingAddress>, &'sta
 }
 
 #[test]
-fn round4_provider_classification_keeps_main_category_and_text() {
+fn provider_classification_preserves_knowledge_category_and_text() {
     for (error, expected) in classification_errors() {
         let diagnostic = attribute_error("owner", &"value".into(), error.into());
         let ProviderConfigPreparationError::InvalidAttribute { error, .. } = diagnostic else {
@@ -444,7 +444,7 @@ fn round4_provider_classification_keeps_main_category_and_text() {
 }
 
 #[test]
-fn round4_saved_historical_provider_stops_before_configuration_admission() {
+fn saved_historical_provider_stops_before_configuration_admission() {
     use crate::parser::{ProviderConfig, ResolvedProviderConfigs, SavedProviderConfigs};
     use crate::resource::{ConcreteValue, DeferredValue, SnapshotLeaf, Value};
     let token: Value = Value::Deferred(DeferredValue::Secret(

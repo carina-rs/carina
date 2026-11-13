@@ -371,13 +371,11 @@ impl ProviderFactory for EchoFactory {
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            {
-                ValidatedConfigSchema::validate(BTreeMap::from([(
-                    "password".into(),
-                    AttributeType::string(),
-                )]))
-                .unwrap()
-            },
+            ValidatedConfigSchema::validate(BTreeMap::from([(
+                "password".into(),
+                AttributeType::string(),
+            )]))
+            .unwrap(),
             Default::default(),
             Vec::new(),
         )

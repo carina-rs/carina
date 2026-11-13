@@ -142,7 +142,7 @@ fn validate_module_backend_reports_only_the_structural_error() {
 }
 
 #[test]
-fn review_r1_deferred_backend_directory_text_and_status_match_main() {
+fn deferred_backend_directory_text_and_status_match_snapshot() {
     for case in ["resource_reference", "sibling_reference", "sibling_literal"] {
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/backend_deferred_config")
@@ -177,7 +177,7 @@ fn review_r1_deferred_backend_directory_text_and_status_match_main() {
 }
 
 #[test]
-fn review_r2_backend_builtin_failure_text_and_json_match_main() {
+fn backend_builtin_failure_text_and_json_match_snapshot() {
     for case in ["direct", "sibling"] {
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/backend_builtin_failure")
@@ -217,7 +217,7 @@ fn review_r2_backend_builtin_failure_text_and_json_match_main() {
 }
 
 #[test]
-fn round4_recursive_configuration_text_and_json_match_main() {
+fn recursive_configuration_text_and_json_match_snapshot() {
     for case in ["backend_cycle", "provider_cycle"] {
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/configuration_classification")

@@ -983,7 +983,7 @@ mod backend_drift_gate {
 
 #[cfg(unix)]
 #[test]
-fn review_r2_saved_implicit_backend_without_loadable_source_keeps_main_locate_text() {
+fn saved_implicit_backend_without_loadable_source_uses_address_wording() {
     let root = TempDir::new().unwrap();
     let project = root.path();
     fs::write(project.join("providers.crn"), "provider mock {}\n").unwrap();

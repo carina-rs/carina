@@ -18761,7 +18761,7 @@ fn round13_schema_admission_rejects_members_inside_enum_bases() {
 }
 
 #[test]
-fn round4_configuration_located_findings_cover_legacy_errors_without_primary() {
+fn configuration_located_findings_cover_legacy_errors_without_primary() {
     struct Reject;
     impl ValidatedCustomTypeLookup for Reject {
         fn validate(&self, value: LocallyValidatedCustomType<'_>) -> Result<(), TypeError> {

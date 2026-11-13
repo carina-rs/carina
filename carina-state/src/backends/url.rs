@@ -201,7 +201,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn review_r1_offline_locate_error_matches_main_text() {
+    async fn offline_locate_error_includes_file_context() {
         let path = "invalid\0state.json";
         let io = carina_core::paths::ResolvedPath::new(path).unwrap_err();
         let file = LocalStateFile::parse(path).unwrap();
@@ -213,7 +213,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_r1_url_locate_error_matches_main_text() {
+    async fn url_locate_error_uses_address_wording() {
         let path = "invalid\0state.json";
         let io = carina_core::paths::ResolvedPath::new(path).unwrap_err();
         let url = StateUrl::parse(path).unwrap();
@@ -498,7 +498,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod review_r2_source_tests {
+mod terminal_locate_source_tests {
     use super::*;
 
     #[tokio::test]
@@ -526,5 +526,123 @@ mod review_r2_source_tests {
                     .to_string()
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod native_file_non_utf8_tests {
+    use super::*;
+    use crate::backend_config::LocalBackendLocation;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::path::Path;
+
+    fn native_path() -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join(OsString::from_vec(b"state-\xff.json".to_vec()));
+        assert!(path.to_str().is_none());
+        (directory, path)
+    }
+
+    fn create_file_if_supported(path: &Path) -> bool {
+        match std::fs::File::create(path) {
+            Ok(_) => true,
+            Err(error) => {
+                // A UTF-8 sibling must work; directory/permission failures are
+                // test failures, while APFS can reject only the native name.
+                std::fs::File::create(path.with_file_name("utf8-probe.json"))
+                    .expect("test directory must support file creation");
+                eprintln!(
+                    "SKIP non-UTF-8 state round-trip: filesystem refused the native filename: {error}"
+                );
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn native_file_non_utf8_locations_preserve_exact_bytes_without_file_creation() {
+        let (_directory, path) = native_path();
+        // UTF-8 parsers cannot express these paths. Build the native carriers
+        // inside their defining module, then use the production pinning seams.
+        let url = StateUrl::File { path: path.clone() };
+        let file = LocalStateFile { path: path.clone() };
+        let StateUrl::File { path: address } = &url else {
+            panic!("expected a native file address")
+        };
+        assert_eq!(address.as_os_str().as_bytes(), path.as_os_str().as_bytes());
+        assert_eq!(
+            file.path.as_os_str().as_bytes(),
+            path.as_os_str().as_bytes()
+        );
+        for location in [
+            LocalBackendLocation::for_address(address).unwrap(),
+            LocalBackendLocation::for_file(&file.path).unwrap(),
+        ] {
+            assert!(matches!(location, LocalBackendLocation::NativeFile(_)));
+            assert_eq!(
+                location.path().source_label().as_os_str().as_bytes(),
+                path.as_os_str().as_bytes()
+            );
+            assert_eq!(
+                location
+                    .path()
+                    .persisted_path()
+                    .to_path_buf()
+                    .as_os_str()
+                    .as_bytes(),
+                path.as_os_str().as_bytes()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_file_non_utf8_state_url_round_trip() {
+        let (_directory, path) = native_path();
+        let url = StateUrl::File { path: path.clone() };
+        if !create_file_if_supported(&path) {
+            return;
+        }
+        let backend = crate::backends::create_explicit_backend(&url)
+            .await
+            .unwrap();
+        let mut state = StateFile::new();
+        state.increment_serial();
+        backend.write_state(&state).await.unwrap();
+
+        let loaded = load_state_from_url(&url).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(loaded).unwrap(),
+            serde_json::to_value(state).unwrap()
+        );
+        assert!(path.is_file(), "state must exist at the exact native path");
+        assert!(!Path::new(path.to_string_lossy().as_ref()).exists());
+    }
+
+    #[tokio::test]
+    async fn native_file_non_utf8_offline_file_round_trip() {
+        let (_directory, path) = native_path();
+        let file = LocalStateFile { path: path.clone() };
+        if !create_file_if_supported(&path) {
+            return;
+        }
+        // The public offline entry is read-only; seed state through the same
+        // native constructor it uses, without the test-only backend shortcut.
+        let location = LocalBackendLocation::for_file(&file.path).unwrap();
+        let backend = crate::backends::LocalBackend::from_location(location).unwrap();
+        let mut state = StateFile::new();
+        state.increment_serial();
+        backend.write_state(&state).await.unwrap();
+
+        let loaded = load_local_state_file(&file).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(loaded).unwrap(),
+            serde_json::to_value(state).unwrap()
+        );
+        assert!(path.is_file(), "state must exist at the exact native path");
+        assert!(!Path::new(path.to_string_lossy().as_ref()).exists());
     }
 }

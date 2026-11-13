@@ -46,9 +46,14 @@ impl Deref for CanonicalProviderConfigAttributes {
 /// # }
 /// ```
 /// ```
-/// use carina_core::provider::ProviderReadyConfig;
-/// use carina_core::validation::admission::{configuration::AdmittedConfiguration, kind::ProviderConfigAttribute};
-/// fn ready(complete: AdmittedConfiguration<ProviderConfigAttribute>) -> ProviderReadyConfig { complete.into() }
+/// use carina_core::parser::ProviderConfiguration;
+/// use carina_core::provider::{ProviderFactory, ProviderPlan, ProviderReadyConfig};
+/// use carina_core::validation::admission::configuration::provider::construction;
+/// fn ready(factory: &dyn ProviderFactory, config: &dyn ProviderConfiguration) {
+///     let plan = ProviderPlan::state_only();
+///     let construction = construction(factory, config, &plan).unwrap();
+///     let _: &ProviderReadyConfig = construction.session().configuration();
+/// }
 /// ```
 #[derive(Debug, Clone)]
 pub struct AnalyzedConfiguration {
@@ -124,6 +129,12 @@ impl ProviderReadyConfig {
             inner: Arc::new(ReadyConfiguration { admitted, region }),
         }
     }
+    fn from_admitted(admitted: AdmittedConfiguration<kind::ProviderConfigAttribute>) -> Self {
+        let region = admitted
+            .field("region")
+            .and_then(|_| crate::utils::region_from_attrs(admitted.attributes()));
+        Self::new(admitted, region)
+    }
     pub fn attributes(&self) -> &ConfigurationAttributes<Value> {
         self.inner.admitted.attributes()
     }
@@ -135,15 +146,6 @@ impl ProviderReadyConfig {
     }
     pub fn instance(&self) -> &ProviderInstanceKey {
         self.inner.admitted.instance()
-    }
-}
-
-impl From<AdmittedConfiguration<kind::ProviderConfigAttribute>> for ProviderReadyConfig {
-    fn from(admitted: AdmittedConfiguration<kind::ProviderConfigAttribute>) -> Self {
-        let region = admitted
-            .field("region")
-            .and_then(|_| crate::utils::region_from_attrs(admitted.attributes()));
-        Self::new(admitted, region)
     }
 }
 
@@ -250,20 +252,10 @@ fn attribute_error(
     attribute: &crate::parser::AttributeKey,
     error: ConfigurationErrors,
 ) -> ProviderConfigPreparationError {
-    let errors: Vec<_> = error
-        .errors
-        .into_iter()
-        .map(|error| match error {
-            TypeError::ResourceValidationFailed { message, .. } => {
-                TypeError::ValidationFailed { message }
-            }
-            error => error,
-        })
-        .collect();
     ProviderConfigPreparationError::InvalidAttribute {
         provider: provider.to_owned(),
         attribute: attribute.clone(),
-        error: errors.into(),
+        error: error.errors.into(),
     }
 }
 
@@ -397,14 +389,13 @@ fn ready(
     attributes: &ConfigurationAttributes<Value>,
     schema: &ValidatedConfigSchema,
 ) -> Result<ProviderReadyConfig, ProviderConfigPreparationError> {
-    Ok(admitted(
+    Ok(ProviderReadyConfig::from_admitted(admitted(
         factory,
         instance.provider(),
         instance.provider_instance(),
         attributes,
         schema,
-    )?
-    .into())
+    )?))
 }
 
 #[cfg(any(test, feature = "test-utils"))]

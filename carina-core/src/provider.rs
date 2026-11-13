@@ -11070,18 +11070,16 @@ mod tests {
         fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
             crate::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                {
-                    ValidatedConfigSchema::validate(BTreeMap::from([(
-                        "endpoint".to_string(),
-                        PatternAttributeType::refined_string(
-                            Some(TypeIdentity::new(Some("test"), ["config"], "Endpoint")),
-                            None,
-                            None,
-                            None,
-                        ),
-                    )]))
-                    .expect("config-only custom type must validate")
-                },
+                ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "endpoint".to_string(),
+                    PatternAttributeType::refined_string(
+                        Some(TypeIdentity::new(Some("test"), ["config"], "Endpoint")),
+                        None,
+                        None,
+                        None,
+                    ),
+                )]))
+                .expect("config-only custom type must validate"),
                 Default::default(),
                 Vec::new(),
             )

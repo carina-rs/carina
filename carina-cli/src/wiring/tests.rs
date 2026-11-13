@@ -4479,21 +4479,19 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            {
-                carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
-                    "role_arn".to_string(),
-                    PatternAttributeType::refined_string(
-                        None,
-                        Some(carina_core::schema::PatternSpec::new(
-                            r"^arn:aws:iam::[0-9]{12}:role/.+$".to_string(),
-                            carina_core::schema::PatternMatch::Full,
-                        )),
-                        None,
-                        None,
-                    ),
-                )]))
-                .expect("test provider config schema must be valid")
-            },
+            carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
+                "role_arn".to_string(),
+                PatternAttributeType::refined_string(
+                    None,
+                    Some(carina_core::schema::PatternSpec::new(
+                        r"^arn:aws:iam::[0-9]{12}:role/.+$".to_string(),
+                        carina_core::schema::PatternMatch::Full,
+                    )),
+                    None,
+                    None,
+                ),
+            )]))
+            .expect("test provider config schema must be valid"),
             Default::default(),
             Vec::new(),
         )
@@ -11362,23 +11360,21 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            {
-                carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
-                    "region".to_string(),
-                    PatternAttributeType::enum_(
-                        carina_core::schema::TypeIdentity::new(
-                            Some("aws"),
-                            Vec::<String>::new(),
-                            "Region",
-                        ),
-                        Some(vec!["ap-northeast-1".to_string()]),
-                        vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
-                        None,
-                        None,
+            carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
+                "region".to_string(),
+                PatternAttributeType::enum_(
+                    carina_core::schema::TypeIdentity::new(
+                        Some("aws"),
+                        Vec::<String>::new(),
+                        "Region",
                     ),
-                )]))
-                .expect("test provider config schema must be valid")
-            },
+                    Some(vec!["ap-northeast-1".to_string()]),
+                    vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
+                    None,
+                    None,
+                ),
+            )]))
+            .expect("test provider config schema must be valid"),
             Default::default(),
             Vec::new(),
         )

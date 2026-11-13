@@ -1,6 +1,6 @@
 use super::*;
 
-fn assert_main_lsp(case: &str) {
+fn assert_builtin_diagnostics(case: &str) {
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/configuration_error_parity")
         .join(case);
@@ -26,22 +26,22 @@ fn assert_main_lsp(case: &str) {
     assert_eq!(serde_json::json!(errors), expected["errors"], "{case}");
 }
 #[test]
-fn round3_provider_builtin_matches_main_lsp() {
-    assert_main_lsp("provider");
+fn provider_builtin_failure_matches_diagnostic_snapshot() {
+    assert_builtin_diagnostics("provider");
 }
 #[test]
-fn round3_let_builtin_matches_main_lsp() {
-    assert_main_lsp("let");
+fn let_builtin_failure_matches_diagnostic_snapshot() {
+    assert_builtin_diagnostics("let");
 }
 #[test]
-fn round3_resource_builtin_matches_main_lsp() {
-    assert_main_lsp("resource");
+fn resource_builtin_failure_matches_diagnostic_snapshot() {
+    assert_builtin_diagnostics("resource");
 }
 #[test]
-fn round3_backend_builtin_matches_main_lsp() {
-    assert_main_lsp("backend");
+fn backend_builtin_failure_matches_diagnostic_snapshot() {
+    assert_builtin_diagnostics("backend");
 }
 #[test]
-fn round3_backend_builtin_and_let_match_main_lsp() {
-    assert_main_lsp("backend_and_let");
+fn backend_builtin_and_let_failures_match_diagnostic_snapshot() {
+    assert_builtin_diagnostics("backend_and_let");
 }

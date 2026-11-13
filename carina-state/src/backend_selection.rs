@@ -757,7 +757,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod default_admission_cleanup_tests {
+mod implicit_local_admission_tests {
     use super::*;
     #[tokio::test]
     async fn implicit_local_is_admitted_when_selected_and_retains_its_migration_pin() {
@@ -784,7 +784,7 @@ mod default_admission_cleanup_tests {
 }
 
 #[cfg(test)]
-mod review_r1_selection_tests {
+mod configured_backend_selection_tests {
     use super::*;
     fn raw(path: &str) -> ParserBackendConfig {
         ParserBackendConfig {
@@ -801,7 +801,7 @@ mod review_r1_selection_tests {
         }
     }
     #[test]
-    fn review_r1_project_capabilities_hold_only_configured_backends() {
+    fn project_capabilities_hold_only_configured_backends() {
         fn accepts_configured(_: &ConfiguredBackend) {}
         let root = tempfile::tempdir().unwrap();
         let base = ResolvedPath::new(root.path()).unwrap();
@@ -821,7 +821,7 @@ mod review_r1_selection_tests {
         assert!(matches!(explicit.url, StateUrl::File { .. }));
     }
     #[tokio::test]
-    async fn review_r1_resolved_read_origin_is_implicit_declared_or_locked() {
+    async fn resolved_read_origin_is_implicit_declared_or_locked() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("main.crn"), "let unused = 'fixture'\n").unwrap();
         let base = ResolvedPath::new(root.path()).unwrap();
@@ -855,7 +855,7 @@ mod review_r1_selection_tests {
         assert_eq!(settings.path(), Some("old.json"));
     }
     #[tokio::test]
-    async fn review_r1_migration_locate_error_matches_main_text() {
+    async fn migration_locate_error_uses_address_wording() {
         let root = tempfile::tempdir().unwrap();
         let base = ResolvedPath::new(root.path()).unwrap();
         let settings = BackendConfig::try_from(&raw("bad\0state")).unwrap();
@@ -873,7 +873,7 @@ mod review_r1_selection_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn review_r1_implicit_locate_error_matches_main_text() {
+    async fn implicit_locate_error_uses_address_wording() {
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();
@@ -888,10 +888,10 @@ mod review_r1_selection_tests {
 }
 
 #[cfg(test)]
-mod round3_migration_origin_tests {
+mod migration_settings_tests {
     use super::*;
     #[tokio::test]
-    async fn round3_migration_consumes_settings_without_labeling_an_origin() {
+    async fn migration_uses_admitted_implicit_local_path() {
         let root = tempfile::tempdir().unwrap();
         let base = ResolvedPath::new(root.path()).unwrap();
         let config = BackendConfig::Local(BackendConfig::implicit_local());

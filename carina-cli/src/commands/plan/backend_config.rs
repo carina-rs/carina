@@ -81,7 +81,7 @@ impl<'de> serde::Deserialize<'de> for SavedBackendConfig {
 }
 
 #[cfg(test)]
-mod review_r1_tests {
+mod read_origin_serialization_tests {
     use super::*;
     use carina_core::paths::ResolvedPath;
     fn raw(path: &str) -> ExpandedBackendConfig {
@@ -99,7 +99,7 @@ mod review_r1_tests {
         }
     }
     #[tokio::test]
-    async fn review_r1_saved_backend_bytes_follow_read_origin() {
+    async fn saved_backend_bytes_follow_read_origin() {
         let root = tempfile::tempdir().unwrap();
         let base = ResolvedPath::new(root.path()).unwrap();
         let declared = raw("new.json");
@@ -134,10 +134,10 @@ mod review_r1_tests {
 }
 
 #[cfg(test)]
-mod round3_exact_saved_backend_tests {
+mod implicit_backend_serialization_tests {
     use super::*;
     #[test]
-    fn round3_saved_backend_implicit_has_no_candidate() {
+    fn saved_backend_implicit_has_no_candidate() {
         let saved = SavedBackendConfig::default();
         assert!(matches!(
             saved.selection_source(),
@@ -148,10 +148,10 @@ mod round3_exact_saved_backend_tests {
 }
 
 #[cfg(test)]
-mod round4_saved_backend_tests {
+mod saved_backend_serde_tests {
     use super::*;
     #[test]
-    fn round4_saved_backend_serde_preserves_private_origin_payload() {
+    fn saved_backend_serde_preserves_private_origin_payload() {
         let recorded = ExpandedBackendConfig {
             backend_type: "local".into(),
             attributes: [(

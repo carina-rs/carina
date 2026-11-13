@@ -7658,8 +7658,9 @@ async fn wasm_pattern_modes_preserve_matching_and_reason() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn review_r1_measure_undeclared_provider_keys() {
-    let path = wasm_path().expect("mock WASM fixture is required for measurement");
+async fn undeclared_provider_config_keys_reach_native_and_wasm_factories() {
+    let path = wasm_path()
+        .expect("mock WASM fixture must be built for opaque configuration passthrough tests");
     let (factory, _cache) = load_factory(&path).await;
     let attrs = indexmap::IndexMap::from([
         (

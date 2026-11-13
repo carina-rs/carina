@@ -9702,19 +9702,17 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
         fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
             crate::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                {
-                    crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
-                        "region".to_string(),
-                        PatternAttributeType::enum_(
-                            crate::schema::enum_identity("Region", Some("aws")),
-                            Some(vec!["ap-northeast-1".to_string()]),
-                            vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
-                            None,
-                            None,
-                        ),
-                    )]))
-                    .expect("test provider config schema must be valid")
-                },
+                crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "region".to_string(),
+                    PatternAttributeType::enum_(
+                        crate::schema::enum_identity("Region", Some("aws")),
+                        Some(vec!["ap-northeast-1".to_string()]),
+                        vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
+                        None,
+                        None,
+                    ),
+                )]))
+                .expect("test provider config schema must be valid"),
                 Default::default(),
                 Vec::new(),
             )

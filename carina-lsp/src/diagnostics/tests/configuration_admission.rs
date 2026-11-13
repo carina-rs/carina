@@ -59,7 +59,7 @@ fn provider_config_directory_compact_callback_parity() {
 }
 
 #[test]
-fn review_r1_deferred_backend_directory_diagnostics_match_main() {
+fn deferred_backend_directory_diagnostics_match_validation() {
     let factory = carina_provider_mock::ConfiguredBuiltinMock::new(
         Default::default(),
         carina_provider_mock::MockScope::memory(),

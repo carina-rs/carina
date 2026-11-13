@@ -27,7 +27,7 @@ fn classification_errors() -> Vec<(KnowledgeError<AbsoluteBindingAddress>, &'sta
 }
 
 #[test]
-fn round4_backend_classification_keeps_main_category_and_text() {
+fn backend_classification_preserves_knowledge_category_and_text() {
     for (error, expected) in classification_errors() {
         let diagnostic = attribute_error(BackendKind::S3, &"bucket".into(), error.into());
         assert_eq!(

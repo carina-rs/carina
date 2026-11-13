@@ -2850,20 +2850,20 @@ mod terminal_locate_rendering_tests {
 }
 
 #[cfg(test)]
-mod round3_terminal_backend_error_tests {
+mod backend_locate_chain_tests {
     use super::*;
 
     fn locate() -> BackendError {
-        carina_state::LocalStateLocateError::from(std::io::Error::other("round3 locate cause"))
+        carina_state::LocalStateLocateError::from(std::io::Error::other("native locate cause"))
             .into()
     }
 
     #[test]
-    fn round3_locate_is_terminal_with_main_display() {
+    fn backend_locate_is_terminal_with_file_context() {
         let error = locate();
         assert_eq!(
             error.to_string(),
-            "I/O error: Failed to locate state file: round3 locate cause"
+            "I/O error: Failed to locate state file: native locate cause"
         );
         assert!(std::error::Error::source(&error).is_none());
         let BackendError::LocateLocal(locate) = error else {
@@ -2874,12 +2874,12 @@ mod round3_terminal_backend_error_tests {
     }
 
     #[test]
-    fn round3_generic_backend_chain_renders_locate_cause_once() {
+    fn generic_backend_chain_renders_locate_cause_once() {
         let error =
             StateBucketSeedError::new("bucket".into(), "aws.s3.Bucket.bucket".into(), locate());
         let rendered = format_error_with_source_chain(&error);
         assert_eq!(
-            rendered.matches("round3 locate cause").count(),
+            rendered.matches("native locate cause").count(),
             1,
             "{rendered}"
         );

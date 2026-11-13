@@ -178,7 +178,7 @@ impl From<AdmissionErrors> for ConfigurationErrors {
         let findings = error
             .take_findings()
             .expect("configuration admission retains its findings");
-        let errors = match findings.local_error() {
+        let errors: Vec<_> = match findings.local_error() {
             Some(error) => vec![error.clone()],
             None => findings
                 .into_located()
@@ -186,7 +186,17 @@ impl From<AdmissionErrors> for ConfigurationErrors {
                 .map(|(_, error)| error)
                 .collect(),
         };
-        Self { errors }
+        Self {
+            errors: errors
+                .into_iter()
+                .map(|error| match error {
+                    TypeError::ResourceValidationFailed { message, .. } => {
+                        TypeError::ValidationFailed { message }
+                    }
+                    error => error,
+                })
+                .collect(),
+        }
     }
 }
 
