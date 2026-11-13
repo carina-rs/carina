@@ -504,9 +504,6 @@ pub(crate) fn validate_root_backend<E: carina_core::parser::ExportParamLike>(
         E,
     >,
 ) -> Vec<AppError> {
-    if tree.is_module_definition() {
-        return Vec::new();
-    }
     let Some(Err(findings)) = tree.admit_backend() else {
         return Vec::new();
     };

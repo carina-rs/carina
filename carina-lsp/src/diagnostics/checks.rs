@@ -665,12 +665,6 @@ impl DiagnosticRun<'_> {
         let (Some(merged), Some(tree)) = (merged, tree) else {
             return Vec::new();
         };
-        // CLI validation reports only the structural backend-in-module error
-        // for a module-definition directory. Keep editor diagnostics at the
-        // same layer instead of adding backend-schema errors.
-        if tree.is_module_definition() {
-            return Vec::new();
-        }
         // A duplicate backend has no single semantic owner. The parser
         // inventory still supplies every declaration for placement checks.
         if merged.directory.sole_backend_file.is_none() {

@@ -1,6 +1,25 @@
 use super::*;
 
 #[test]
+fn backend_admission_skips_module_definitions() {
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    for declaration in [
+        "arguments { name: String }",
+        "attributes { name: String = 'example' }",
+    ] {
+        let parsed = parser::parse_file(
+            &format!("{declaration}\nbackend local {{ path = 1 typo = true }}\n"),
+            std::path::Path::new("main.crn"),
+            &context,
+        )
+        .unwrap();
+        let tree = parser::AnalysisTree::try_from_file(&parsed).unwrap();
+        assert!(tree.is_module_definition(), "{declaration}");
+        assert!(tree.admit_backend().is_none(), "{declaration}");
+    }
+}
+
+#[test]
 fn backend_admission_is_owned_by_its_analysis_tree() {
     let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let absent = parser::parse_file(

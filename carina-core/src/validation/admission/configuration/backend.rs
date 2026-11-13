@@ -102,8 +102,7 @@ pub struct UnsupportedBackendError {
     backend_type: String,
 }
 
-/// Backend failures located by their sole core-owned diagnostic conversion.
-/// An independently admitted error cannot be paired with an arbitrary tree.
+/// Backend failures built only by [`parser::AnalysisTree::admit_backend`].
 #[derive(Debug)]
 pub enum LocatedBackendError {
     Attribute(parser::Located<BackendAttributeError>),
@@ -138,11 +137,14 @@ impl<P: PlaceholderKind, T: ValueKind, D, B: BindingAddress, E>
 where
     D: parser::DeferredForPhaseTraversal<P, T, B>,
 {
-    /// Admit and locate this tree's own backend declaration, if present.
+    /// Admit and locate this tree's backend, if present in a root configuration.
     pub fn admit_backend(
         &self,
     ) -> Option<Result<AdmittedConfiguration<kind::BackendAttribute>, Vec<LocatedBackendError>>>
     {
+        if self.is_module_definition() {
+            return None;
+        }
         let backend = self.file().backend.as_ref()?;
         Some(admit(backend).map_err(|error| {
             error
