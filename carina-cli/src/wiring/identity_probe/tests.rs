@@ -1,6 +1,10 @@
 use super::*;
 use carina_core::identity_recording::{HashFinish, HashWrite, InputOwner};
 
+fn raw() -> Disclosure {
+    Disclosure::from_mode(RedactionMode::RawSynthetic(Vec::new())).1
+}
+
 fn complete_dump(
     prepared: PreparedProbe,
     inputs: Vec<HashInput>,
@@ -27,12 +31,12 @@ fn resources() -> Vec<PreparedResource> {
         .map(|(ordinal, (resource, address))| PreparedResource {
             dump: object([
                 ("ordinal", ordinal.into()),
-                ("address", Disclosure::raw().opaque(address)),
+                ("address", raw().opaque(address)),
                 ("secret_material", array([])),
                 (
                     "declaration",
                     object([
-                        ("file", Disclosure::raw().fixed("fixture.crn")),
+                        ("file", raw().fixed("fixture.crn")),
                         ("start_byte", (ordinal * 32).into()),
                     ]),
                 ),
@@ -80,7 +84,7 @@ fn reordered_inputs_follow_system_ids_and_keep_distinct_call_order() {
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
-        Disclosure::raw(),
+        raw(),
     )
     .unwrap();
     let dump: Json = serde_json::from_str(&dump).unwrap();
@@ -104,7 +108,7 @@ fn missing_or_off_thread_identity_recording_is_incomplete() {
         },
         Vec::new(),
         &SourcePaths::new(Path::new(".")).unwrap(),
-        Disclosure::raw(),
+        raw(),
     )
     .unwrap_err();
     match error {
@@ -131,11 +135,11 @@ fn foreign_inputs_are_reported_and_make_the_probe_incomplete() {
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
-        Disclosure::raw(),
+        raw(),
     )
     .unwrap();
     assert_eq!(document.missing, ["unattributed hash inputs"]);
-    let dump: Json = serde_json::from_str(&document.dump).unwrap();
+    let dump: Json = serde_json::to_value(&document.dump).unwrap();
     assert_eq!(dump["unattributed"].as_array().unwrap().len(), 1);
     assert_eq!(dump["unattributed"][0]["input"]["writes"][0]["hex"], "07");
     let error = document.complete(None).unwrap_err();
@@ -161,7 +165,7 @@ fn observed_simhash_result_cannot_hide_missing_feature_inputs() {
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
-        Disclosure::raw(),
+        raw(),
     )
     .unwrap_err();
     match error {
@@ -194,7 +198,7 @@ fn loop_association_does_not_depend_on_digest_or_identity_format() {
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
-        Disclosure::raw(),
+        raw(),
     )
     .unwrap();
     let dump: Json = serde_json::from_str(&dump).unwrap();
@@ -224,7 +228,7 @@ fn missing_anonymous_module_prefix_recording_is_incomplete() {
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
-        Disclosure::raw(),
+        raw(),
     )
     .unwrap_err();
     match error {
@@ -266,19 +270,37 @@ fn directory_walk_collects_failures_and_writes_every_success() {
         match name {
             "bad-first" => Ok(ProbeDocument {
                 deferred: Vec::new(),
-                dump: "{\"partial-canary\":true}\n".into(),
+                dump: object([("partial-canary", 1_usize.into())]),
                 missing: vec!["missing fixture observation".into()],
             }),
             "bad-last" => Err(ProbeError::incomplete("fixture failure")),
             "deferred" => Ok(ProbeDocument {
-                deferred: vec![DeferredSite { file: Disclosure::raw().fixed("main.crn"), span: 10..20 }],
-                dump: "{\"status\":{\"kind\":\"partial\",\"deferred\":[{\"file\":\"main.crn\",\"span\":{\"start\":10,\"end\":20}}]}}\n".into(),
+                deferred: vec![DeferredSite {
+                    file: raw().fixed("main.crn"),
+                    span: 10..20,
+                }],
+                dump: object([(
+                    "status",
+                    object([
+                        ("kind", raw().fixed("partial")),
+                        (
+                            "deferred",
+                            array([object([
+                                ("file", raw().fixed("main.crn")),
+                                (
+                                    "span",
+                                    object([("start", 10_usize.into()), ("end", 20_usize.into())]),
+                                ),
+                            ])]),
+                        ),
+                    ]),
+                )]),
                 missing: Vec::new(),
             }),
             "empty" => panic!("empty directory must be skipped before probing"),
             _ => Ok(ProbeDocument {
                 deferred: Vec::new(),
-                dump: "{\"redaction\":\"sha256\"}\n".into(),
+                dump: object([("redaction", raw().fixed("sha256"))]),
                 missing: Vec::new(),
             }),
         }
@@ -287,7 +309,7 @@ fn directory_walk_collects_failures_and_writes_every_success() {
     match &error {
         ProbeError::DirectoryFailures(failures) => {
             assert_eq!(failures.failures().count(), 2);
-            assert!(failures.report().results().iter().any(|result| matches!(&result.status, DirectoryStatus::Partial { deferred } if deferred == &[DeferredSite { file: Disclosure::raw().fixed("main.crn"), span: 10..20 }])));
+            assert!(failures.report().results().iter().any(|result| matches!(&result.status, DirectoryStatus::Partial { deferred } if deferred == &[DeferredSite { file: raw().fixed("main.crn"), span: 10..20 }])));
             assert!(
                 failures
                     .report()
@@ -327,7 +349,7 @@ fn directory_walk_collects_failures_and_writes_every_success() {
     );
     assert_eq!(
         std::fs::read_to_string(output.join("aws/management/bad-first/identity.json")).unwrap(),
-        "{\"partial-canary\":true}\n"
+        "{\n  \"partial-canary\": 1\n}\n"
     );
     for relative in [
         "aws/management/good/identity.json",
@@ -336,7 +358,7 @@ fn directory_walk_collects_failures_and_writes_every_success() {
         let path = output.join(relative);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "{\"redaction\":\"sha256\"}\n"
+            "{\n  \"redaction\": \"sha256\"\n}\n"
         );
         #[cfg(unix)]
         {
@@ -378,7 +400,7 @@ fn round_two_consecutive_repeats_collapse_per_owner_without_reordering_distinct_
         },
         inputs,
         &SourcePaths::new(Path::new(".")).unwrap(),
-        Disclosure::raw(),
+        raw(),
     )
     .unwrap();
     let document: Json = serde_json::from_str(&dump).unwrap();
@@ -418,7 +440,7 @@ fn round_two_unattributed_contexts_outside_root_are_relative() {
         },
         inputs,
         &SourcePaths::new(&root).unwrap(),
-        Disclosure::raw(),
+        raw(),
     )
     .unwrap();
     assert!(
@@ -584,7 +606,7 @@ fn complete_addresses_are_fingerprinted_without_a_recorder() {
             serde_json::to_value(identity_recording::fingerprint(address.as_bytes())).unwrap()
         );
         assert_eq!(
-            serde_json::to_value(Disclosure::raw().opaque(address)).unwrap(),
+            serde_json::to_value(raw().opaque(address)).unwrap(),
             json!(address)
         );
     }
@@ -668,10 +690,18 @@ fn missing_loop_inputs_do_not_disclose_the_identity_in_errors_or_statuses() {
 #[test]
 fn typed_dump_nodes_disclose_only_static_schema_or_source_path_text() {
     let paths = SourcePaths::new(Path::new(".")).unwrap();
-    let outside = paths.relative(
+    let parsed = carina_core::parser::parse_file(
+        "probe.Checked {}\n",
         &std::env::current_dir()
             .unwrap()
             .join("../PRIVATE_PATH_CANARY/main.crn"),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let outside = paths.relative(
+        identity_recording::resource_location(&parsed.resources[0])
+            .unwrap()
+            .file(),
     );
     let mut registry = carina_core::schema::SchemaRegistry::new();
     registry.insert(
@@ -708,7 +738,7 @@ fn typed_dump_nodes_disclose_only_static_schema_or_source_path_text() {
             "undeclared",
             Disclosure::Sha256.attribute(schema.schema(), "PRIVATE_ATTRIBUTE_CANARY"),
         ),
-        ("container", array([true.into(), 7_usize.into()])),
+        ("container", array([0_usize.into(), 7_usize.into()])),
     ]);
     let text = serde_json::to_string(&document).unwrap();
     assert!(!text.contains("PRIVATE_PATH_CANARY"));

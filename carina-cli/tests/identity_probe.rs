@@ -14,7 +14,7 @@
 //! and schema-backed names stay readable; other strings are fingerprinted.
 //! Consecutive
 //! identical computations collapse.
-//! The whole v2 snapshot includes unattributed observations with stated reasons.
+//! The whole v3 snapshot includes unattributed observations with stated reasons.
 //! Use the same checkout path for main and candidate: preparatory loop inputs
 //! include absolute root bytes. RawSynthetic accepts any directory; keep raw
 //! runs limited to generated fixtures. The paired pipeline's own stderr warnings
@@ -345,51 +345,83 @@ fn offline_identity_probe_uses_only_the_supplied_environment() {
 #[test]
 #[ignore = "explicit infra and artifacts required; writes only SHA-256 and lengths, never raw identity or secret bytes"]
 fn real_directory_identity_probe() {
-    if std::env::var_os("CARINA_IDENTITY_PROBE_WORKER").is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "real_directory_identity_probe",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env("CARINA_IDENTITY_PROBE_WORKER", "1")
-            .output()
-            .unwrap();
-        println!("captured pipeline stderr bytes: {}", output.stderr.len());
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-        assert!(
-            output.status.success(),
-            "identity probe worker exited {}",
-            output.status
-        );
-        return;
-    }
-    let required = |name| PathBuf::from(std::env::var_os(name).expect(name));
-    let root = required("CARINA_IDENTITY_PROBE_ROOT");
-    let artifacts = required("CARINA_IDENTITY_PROBE_PROVIDERS");
-    let output = required("CARINA_IDENTITY_PROBE_OUTPUT");
-    // This ignored test is the executable boundary for a local probe run.
-    #[expect(clippy::disallowed_methods)]
-    let environment = EnvironmentSnapshot::capture_process();
-    let children = |directory: &Path| {
-        let mut paths: Vec<_> = fs::read_dir(directory)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| path.is_dir())
-            .collect();
-        paths.sort();
-        paths
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "offline_identity_probe_worker",
+            "--ignored",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    println!("captured pipeline stderr bytes: {}", output.stderr.len());
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "identity probe worker exited {}",
+        output.status
+    );
+}
+
+fn worker_failed_before_probing(class: &'static str) -> ! {
+    println!("worker failed before probing: {class}");
+    panic!("identity probe worker failed before reporting");
+}
+
+#[test]
+#[ignore = "internal worker; invoke real_directory_identity_probe to capture stderr"]
+fn offline_identity_probe_worker() {
+    let prepared = std::panic::catch_unwind(|| {
+        let required = |name: &'static str, missing: &'static str| {
+            std::env::var_os(name).map(PathBuf::from).ok_or(missing)
+        };
+        let root = required(
+            "CARINA_IDENTITY_PROBE_ROOT",
+            "missing CARINA_IDENTITY_PROBE_ROOT",
+        )?;
+        let artifacts = required(
+            "CARINA_IDENTITY_PROBE_PROVIDERS",
+            "missing CARINA_IDENTITY_PROBE_PROVIDERS",
+        )?;
+        let output = required(
+            "CARINA_IDENTITY_PROBE_OUTPUT",
+            "missing CARINA_IDENTITY_PROBE_OUTPUT",
+        )?;
+        // This ignored test is the executable boundary for a local probe run.
+        #[expect(clippy::disallowed_methods)]
+        let environment = EnvironmentSnapshot::capture_process();
+        let children = |directory: &Path| {
+            let mut paths: Vec<_> = fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.is_dir())
+                .collect();
+            paths.sort();
+            paths
+        };
+        let mut directories = children(&root.join("aws/management"));
+        for registry in children(&root.join("envs/registry")) {
+            directories.extend(children(&registry));
+        }
+        let result = probe_real_directories(&root, &directories, &artifacts, &output, &environment);
+        Ok::<_, &'static str>((root, result))
+    });
+    let (root, result) = match prepared {
+        Ok(Ok(result)) => result,
+        Ok(Err(class)) => worker_failed_before_probing(class),
+        Err(_) => worker_failed_before_probing("panic"),
     };
-    let mut directories = children(&root.join("aws/management"));
-    for registry in children(&root.join("envs/registry")) {
-        directories.extend(children(&registry));
-    }
-    let result = probe_real_directories(&root, &directories, &artifacts, &output, &environment);
     let report = match &result {
         Ok(report) => report,
         Err(ProbeError::DirectoryFailures(failures)) => failures.report(),
-        Err(error) => panic!("{error}"),
+        Err(error) => worker_failed_before_probing(match error {
+            ProbeError::Application(_) => "Application",
+            ProbeError::Io(_) => "Io",
+            ProbeError::Json(_) => "Json",
+            ProbeError::Incomplete(_) => "Incomplete",
+            ProbeError::NoConfiguration => "NoConfiguration",
+            ProbeError::DirectoryFailures(_) => "DirectoryFailures",
+        }),
     };
     for result in report.results() {
         let directory = result
@@ -587,10 +619,10 @@ fn offline_identity_ordered_observations_snapshot() {
     assert_eq!(
         first,
         probe(&fixture(), synthetic()).unwrap(),
-        "the entire v2 dump must be deterministic"
+        "the entire v3 dump must be deterministic"
     );
     let observations: serde_json::Value = serde_json::from_str(&first).unwrap();
-    assert_eq!(observations["format"], "carina-identity-probe-v2");
+    assert_eq!(observations["format"], "carina-identity-probe-v3");
     assert_eq!(observations["redaction"], "raw-synthetic");
     let unattributed = observations["unattributed"].as_array().unwrap();
     assert!(
@@ -917,4 +949,48 @@ fn undeclared_authored_attribute_names_are_fingerprinted() {
     assert!(!real.contains("unchecked_secret_key_CANARY"));
     let raw = probe(temporary.path(), synthetic()).unwrap();
     assert!(raw.contains("unchecked_secret_key_CANARY"));
+}
+
+#[test]
+fn real_probe_worker_reports_fixed_setup_failures_and_ignores_inherited_marker() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir_all(root.join("aws/management")).unwrap();
+    fs::create_dir_all(root.join("envs/registry")).unwrap();
+    let output = temporary.path().join("PRIVATE_SETUP_PATH_CANARY");
+    fs::create_dir(&output).unwrap();
+    fs::write(output.join("stale"), "fixture").unwrap();
+    for (configured, expected) in [
+        (
+            false,
+            "worker failed before probing: missing CARINA_IDENTITY_PROBE_ROOT",
+        ),
+        (true, "worker failed before probing: Incomplete"),
+    ] {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "real_directory_identity_probe",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("CARINA_IDENTITY_PROBE_WORKER", "1")
+            .env_remove("CARINA_IDENTITY_PROBE_ROOT")
+            .env_remove("CARINA_IDENTITY_PROBE_PROVIDERS")
+            .env_remove("CARINA_IDENTITY_PROBE_OUTPUT");
+        if configured {
+            command
+                .env("CARINA_IDENTITY_PROBE_ROOT", &root)
+                .env("CARINA_IDENTITY_PROBE_PROVIDERS", temporary.path())
+                .env("CARINA_IDENTITY_PROBE_OUTPUT", &output);
+        }
+        let result = command.output().unwrap();
+        assert!(!result.status.success());
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(stdout.contains("captured pipeline stderr bytes:"));
+        assert!(stdout.contains(expected), "missing fixed failure class");
+        assert!(!stdout.contains("PRIVATE_SETUP_PATH_CANARY"));
+        assert!(!String::from_utf8_lossy(&result.stderr).contains("PRIVATE_SETUP_PATH_CANARY"));
+    }
 }

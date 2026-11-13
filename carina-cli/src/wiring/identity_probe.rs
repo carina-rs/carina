@@ -6,9 +6,12 @@
 //! written under 0600; never attach them to PRs or CI artifacts. Publish only
 //! the comparison verdict. RawSynthetic accepts any directory with supplied
 //! factories; use it only for generated fixtures, never private configurations.
-//! Dump nodes accept only Disclosed values, numbers/bools, and their containers.
+//! Dump nodes accept only Disclosed values, integers, and their containers.
 //! Plaintext comes only from static literals, in-root source paths, or registered
 //! schema/type/attribute names. Unchecked authored names are fingerprinted.
+//! Provider and resource type names are the schema's names.
+//! Block-alias attribute names are shown canonically.
+//! Prefix entries are ordered by authored name.
 //! Outside-root paths disclose only the fixed marker and a path fingerprint.
 //! Exact consecutive computations per owner (including SimHash features)
 //! collapse; distinct computations retain their order without pinning pass counts.
@@ -56,6 +59,10 @@ use std::path::{Path, PathBuf};
 mod disclosure {
     //! The only constructors for dump strings and containers. No arbitrary JSON enters.
 
+    use super::{OfflineProviders, RedactionMode};
+    use carina_core::identity_recording::ResourceKey;
+    use carina_core::parser::{ModuleCallId, SourceFileId};
+    use carina_core::resource::LoopSource;
     use carina_core::schema::{EffectiveField, OwnerBoundResourceSchema, ValidatedResourceSchema};
     use serde::Serialize;
     use serde_json::Value as Json;
@@ -89,11 +96,6 @@ mod disclosure {
     impl From<usize> for Disclosed {
         fn from(value: usize) -> Self {
             Self(Json::from(value))
-        }
-    }
-    impl From<bool> for Disclosed {
-        fn from(value: bool) -> Self {
-            Self(Json::Bool(value))
         }
     }
     impl From<Option<Disclosed>> for Disclosed {
@@ -144,7 +146,16 @@ mod disclosure {
                 root: carina_core::paths::PersistedPath::new(directory)?,
             })
         }
-        pub(super) fn relative(&self, path: &Path) -> RelativeSourcePath {
+        pub(super) fn relative(&self, file: &SourceFileId) -> RelativeSourcePath {
+            self.relative_path(file.path())
+        }
+        pub(super) fn module(&self, call: &ModuleCallId) -> RelativeSourcePath {
+            self.relative(call.source_file_id())
+        }
+        pub(super) fn resource(&self, key: &ResourceKey) -> RelativeSourcePath {
+            self.relative_path(key.source().0)
+        }
+        fn relative_path(&self, path: &Path) -> RelativeSourcePath {
             RelativeSourcePath(
                 carina_core::paths::PersistedPath::new(path)
                     .expect("parser source locator")
@@ -153,14 +164,14 @@ mod disclosure {
                     .to_string(),
             )
         }
-        pub(super) fn source_file(&self, file: &str) -> RelativeSourcePath {
-            let path = Path::new(file);
+        pub(super) fn source_file(&self, source: &LoopSource) -> RelativeSourcePath {
+            let path = Path::new(source.file());
             let path: PathBuf = if path.is_absolute() {
                 path.to_path_buf()
             } else {
                 self.root.to_path_buf().join(path)
             };
-            self.relative(&path)
+            self.relative_path(&path)
         }
     }
 
@@ -171,8 +182,13 @@ mod disclosure {
         Fingerprint(&'a str),
     }
     impl Disclosure {
-        pub(super) fn raw() -> Self {
-            Self::Raw(Raw(()))
+        pub(super) fn from_mode(mode: RedactionMode) -> (OfflineProviders, Self) {
+            match mode {
+                RedactionMode::RawSynthetic(factories) => {
+                    (OfflineProviders::Factories(factories), Self::Raw(Raw(())))
+                }
+                RedactionMode::Sha256(providers) => (providers, Self::Sha256),
+            }
         }
         fn disclose(self, kind: DisclosureKind<'_>) -> Disclosed {
             match kind {
@@ -410,7 +426,7 @@ pub struct ProbeOutcome {
 }
 
 struct ProbeDocument {
-    dump: String,
+    dump: Disclosed,
     missing: Vec<String>,
     deferred: Vec<DeferredSite>,
 }
@@ -418,7 +434,7 @@ impl ProbeDocument {
     fn complete(self, dump_path: Option<PathBuf>) -> Result<ProbeOutcome, ProbeError> {
         if self.missing.is_empty() {
             Ok(ProbeOutcome {
-                dump: self.dump,
+                dump: format!("{}\n", serde_json::to_string_pretty(&self.dump)?),
                 deferred: self.deferred,
             })
         } else {
@@ -461,12 +477,7 @@ fn capture_directory(
     environment: &carina_core::EnvironmentSnapshot,
     mode: RedactionMode,
 ) -> Result<ProbeDocument, ProbeError> {
-    let (providers, disclosure) = match mode {
-        RedactionMode::RawSynthetic(factories) => {
-            (OfflineProviders::Factories(factories), Disclosure::raw())
-        }
-        RedactionMode::Sha256(providers) => (providers, Disclosure::Sha256),
-    };
+    let (providers, disclosure) = Disclosure::from_mode(mode);
     let executor = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -549,7 +560,7 @@ fn prepare(
                 .recording_iterable_location()
                 .ok_or_else(|| ProbeError::incomplete("deferred site has no parser span"))?;
             Ok(DeferredSite {
-                file: disclosure.path(&paths.relative(location.file().path())),
+                file: disclosure.path(&paths.relative(location.file())),
                 span: location.span().start_byte()..location.span().end_byte(),
             })
         })
@@ -602,7 +613,7 @@ fn prepare(
                         ("instance", disclosure.opaque(&call.instance)),
                         (
                             "declaration",
-                            disclosure.path(&paths.relative(location.file().path())),
+                            disclosure.path(&paths.relative(location.file())),
                         ),
                         ("start_byte", location.span().start_byte().into()),
                     ]));
@@ -679,10 +690,7 @@ fn prepare(
                     (
                         "declaration",
                         object([
-                            (
-                                "file",
-                                disclosure.path(&paths.relative(location.file().path())),
-                            ),
+                            ("file", disclosure.path(&paths.relative(location.file()))),
                             ("start_byte", span.start_byte().into()),
                             ("end_byte", span.end_byte().into()),
                             ("line", span.start_line().into()),
@@ -868,7 +876,7 @@ fn finish_dump(
         ]));
     }
     let dump = object([
-        ("format", disclosure.fixed("carina-identity-probe-v2")),
+        ("format", disclosure.fixed("carina-identity-probe-v3")),
         (
             "redaction",
             disclosure.fixed(match disclosure {
@@ -912,7 +920,6 @@ fn finish_dump(
             ]),
         ),
     ]);
-    let dump = format!("{}\n", serde_json::to_string_pretty(&dump)?);
     let mut seen = HashSet::new();
     failures.retain(|message| seen.insert(message.clone()));
     Ok(ProbeDocument {
@@ -1204,7 +1211,7 @@ impl SourcePaths {
             .ok_or_else(|| ProbeError::incomplete("resource has no declaration location"))?;
         Ok(format!(
             "{}:{}",
-            disclosure.path(&self.relative(location.file().path())),
+            disclosure.path(&self.relative(location.file())),
             location.span().start_byte()
         ))
     }
@@ -1217,7 +1224,7 @@ impl SourcePaths {
             Disclosure::Raw(raw) => self.raw_module_context(call, raw),
             Disclosure::Sha256 => object([
                 ("kind", disclosure.fixed("module")),
-                ("file", disclosure.path(&self.relative(call.source_file()))),
+                ("file", disclosure.path(&self.module(call))),
                 ("start_byte", call.call_span().start_byte().into()),
                 (
                     "expansion",
@@ -1236,7 +1243,7 @@ impl SourcePaths {
         let mode = Disclosure::Raw(raw);
         let mut parts = vec![
             mode.fixed("module:<root>/"),
-            mode.path(&self.relative(call.source_file())),
+            mode.path(&self.module(call)),
             mode.fixed(":"),
             call.call_span().start_byte().into(),
         ];
@@ -1248,7 +1255,7 @@ impl SourcePaths {
     fn context(&self, context: &InputContext, disclosure: Disclosure) -> Disclosed {
         match context {
             InputContext::Resource(Some(location)) => {
-                let file = disclosure.path(&self.relative(location.file().path()));
+                let file = disclosure.path(&self.relative(location.file()));
                 let byte = location.span().start_byte();
                 match disclosure {
                     Disclosure::Raw(raw) => raw.concat([
@@ -1272,8 +1279,8 @@ impl SourcePaths {
     fn contexts(&self, input: &HashInput, disclosure: Disclosure) -> Disclosed {
         array(match &input.owner {
             InputOwner::Resource(key) => {
-                let (file, ordinal) = key.source();
-                let file = disclosure.path(&self.relative(file));
+                let (_, ordinal) = key.source();
+                let file = disclosure.path(&self.resource(key));
                 vec![match disclosure {
                     Disclosure::Raw(raw) => raw.concat([
                         disclosure.fixed("resource:<root>/"),
@@ -1345,10 +1352,7 @@ impl SourcePaths {
             (
                 "source",
                 object([
-                    (
-                        "display_file",
-                        disclosure.path(&self.source_file(source.file())),
-                    ),
+                    ("display_file", disclosure.path(&self.source_file(source))),
                     ("line", source.line().into()),
                     ("column", source.column().into()),
                     (
@@ -1464,7 +1468,7 @@ fn write_directory_dumps(
             let destination = output.join(relative);
             std::fs::create_dir_all(&destination)?;
             let dump_path = destination.join("identity.json");
-            write_private_dump(&dump_path, document.dump.as_bytes())?;
+            write_private_dump(&dump_path, &document.dump)?;
             let ProbeOutcome { deferred, .. } = document.complete(Some(dump_path))?;
             Ok(if deferred.is_empty() {
                 DirectoryStatus::Ok
@@ -1493,7 +1497,7 @@ fn write_directory_dumps(
     }
 }
 
-fn write_private_dump(path: &Path, bytes: &[u8]) -> Result<(), ProbeError> {
+fn write_private_dump(path: &Path, dump: &Disclosed) -> Result<(), ProbeError> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -1508,6 +1512,7 @@ fn write_private_dump(path: &Path, bytes: &[u8]) -> Result<(), ProbeError> {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    file.write_all(bytes)?;
+    serde_json::to_writer_pretty(&mut file, dump)?;
+    file.write_all(b"\n")?;
     Ok(())
 }

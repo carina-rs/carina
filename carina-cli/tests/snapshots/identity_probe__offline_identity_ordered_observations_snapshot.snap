@@ -3,7 +3,7 @@ source: carina-cli/tests/identity_probe.rs
 expression: first
 ---
 {
-  "format": "carina-identity-probe-v2",
+  "format": "carina-identity-probe-v3",
   "redaction": "raw-synthetic",
   "resources": [
     {
