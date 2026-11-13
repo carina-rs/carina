@@ -589,7 +589,7 @@ fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType 
 
 fn module_arguments(
     values: impl IntoIterator<Item = (String, Value)>,
-) -> HashMap<String, ModuleArgument> {
+) -> indexmap::IndexMap<String, ModuleArgument> {
     values
         .into_iter()
         .map(|(name, value)| (name, ModuleArgument::new(value)))
@@ -839,7 +839,7 @@ fn empty_parsed() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: Vec::new(),
-        user_functions: HashMap::new(),
+        user_functions: indexmap::IndexMap::new(),
         upstream_states: Vec::new(),
         wait_bindings: Vec::new(),
         requires: Vec::new(),

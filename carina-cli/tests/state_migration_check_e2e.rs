@@ -102,6 +102,41 @@ fn migration_check_current_state_still_validates_provider_schema_flags() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("expected KIND=PATH"));
 }
 
+#[test]
+fn migration_check_multiple_bad_schema_overrides_choose_the_first_argument() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = write_current_state(temp.path());
+    let mut legacy: serde_json::Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+    legacy["version"] = serde_json::json!(20);
+    fs::write(&state, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    for _ in 0..8 {
+        let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+            .current_dir(temp.path())
+            .args(["state", "migrate", "--check"])
+            .arg(temp.path())
+            .arg("--state-url")
+            .arg(&state)
+            .arg("--provider-schema")
+            .arg(format!(
+                "zulu={}",
+                temp.path().join("missing-zulu.wasm").display()
+            ))
+            .arg("--provider-schema")
+            .arg(format!(
+                "alpha={}",
+                temp.path().join("missing-alpha.wasm").display()
+            ))
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("undeclared default provider 'zulu'"),
+            "{stderr}"
+        );
+    }
+}
+
 fn wasm_mock_path() -> Option<PathBuf> {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?;
     ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]

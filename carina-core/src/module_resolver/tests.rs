@@ -350,7 +350,7 @@ fn reconcile_anonymous_module_instances(
 
 fn module_arguments(
     values: impl IntoIterator<Item = (String, Value<ParserPlaceholder>)>,
-) -> HashMap<String, ModuleArgument<ParserPlaceholder>> {
+) -> indexmap::IndexMap<String, ModuleArgument<ParserPlaceholder>> {
     values
         .into_iter()
         .map(|(name, value)| (name, ModuleArgument::new(value)))
@@ -2647,7 +2647,7 @@ fn create_test_module() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: HashMap::new(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -2874,7 +2874,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: HashMap::new(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -2910,7 +2910,7 @@ fn test_expand_anonymous_resource_in_named_module_keeps_identity_absent() {
             let call = ModuleCall::test(
                 "policy_module".to_string(),
                 Some("bootstrap".to_string()),
-                HashMap::new(),
+                indexmap::IndexMap::new(),
             );
 
             let expanded = resolver
@@ -2956,7 +2956,8 @@ fn anonymous_module_resource_instantiated_twice_has_distinct_pending_ids() {
                 );
                 resolver
             };
-            let call = ModuleCall::test("policy_module".to_string(), None, HashMap::new());
+            let call =
+                ModuleCall::test("policy_module".to_string(), None, indexmap::IndexMap::new());
 
             let first = resolver
                 .expand_module_call(&call, "first")
@@ -3096,7 +3097,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: HashMap::new(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -3133,7 +3134,7 @@ fn test_expand_module_call_preserves_provider_instance_on_id() {
             let call = ModuleCall::test(
                 "registry".to_string(),
                 Some("acme".to_string()),
-                HashMap::new(),
+                indexmap::IndexMap::new(),
             );
 
             let expanded = resolver
@@ -3310,7 +3311,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: HashMap::new(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -3480,7 +3481,7 @@ fn create_module_with_attributes() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: HashMap::new(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -3514,7 +3515,7 @@ fn test_expand_module_call_creates_composition() {
             let call = ModuleCall::test(
                 "web_tier".to_string(),
                 Some("web".to_string()),
-                HashMap::new(),
+                indexmap::IndexMap::new(),
             );
 
             let expanded = resolver.expand_module_call(&call, "web").unwrap();
@@ -3584,7 +3585,7 @@ fn test_expand_module_call_populates_compositions_slice() {
             let call = ModuleCall::test(
                 "web_tier".to_string(),
                 Some("web".to_string()),
-                HashMap::new(),
+                indexmap::IndexMap::new(),
             );
 
             let expanded = resolver.expand_module_call(&call, "web").unwrap();
@@ -3631,7 +3632,7 @@ fn test_expand_module_call_populates_expansion_trace_single_level() {
             let call = ModuleCall::test(
                 "web_tier".to_string(),
                 Some("web".to_string()),
-                HashMap::new(),
+                indexmap::IndexMap::new(),
             );
 
             let expanded = resolver.expand_module_call(&call, "web").unwrap();
@@ -3689,7 +3690,7 @@ fn test_expand_module_call_records_use_source_path_on_call_site() {
             let call = ModuleCall::test(
                 "web_tier".to_string(),
                 Some("web".to_string()),
-                HashMap::new(),
+                indexmap::IndexMap::new(),
             );
 
             let expanded = resolver.expand_module_call(&call, "web").unwrap();
@@ -3733,7 +3734,7 @@ fn test_expand_module_call_call_site_source_path_none_when_unmapped() {
             let call = ModuleCall::test(
                 "web_tier".to_string(),
                 Some("web".to_string()),
-                HashMap::new(),
+                indexmap::IndexMap::new(),
             );
 
             let expanded = resolver.expand_module_call(&call, "web").unwrap();
@@ -3849,7 +3850,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: HashMap::new(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -3965,7 +3966,7 @@ fn test_expand_module_call_without_binding_still_records_boundary_composition() 
             };
 
             // Module call without binding_name
-            let call = ModuleCall::test("web_tier".to_string(), None, HashMap::new());
+            let call = ModuleCall::test("web_tier".to_string(), None, indexmap::IndexMap::new());
 
             let expanded = resolver.expand_module_call(&call, "web_tier").unwrap();
             assert_eq!(expanded.compositions.len(), 1);
@@ -4111,7 +4112,7 @@ fn test_named_module_call_uses_binding_name() {
     let call = ModuleCall::test(
         "github".to_string(),
         Some("prod".to_string()),
-        HashMap::new(),
+        indexmap::IndexMap::new(),
     );
     assert_eq!(instance_prefix_for_call(&call), "prod");
 }
@@ -4188,7 +4189,7 @@ fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
                 resolver.insert_module_for_test("m".to_string(), module);
                 resolver
             };
-            let call = ModuleCall::test("m".to_string(), None, HashMap::new());
+            let call = ModuleCall::test("m".to_string(), None, indexmap::IndexMap::new());
             let mut resources = Vec::new();
             for instance in ["first", "second"] {
                 resources.extend(
@@ -4827,7 +4828,7 @@ fn test_missing_required_argument() {
             let call = ModuleCall::test(
                 "test_module".to_string(),
                 Some("my_instance".to_string()),
-                HashMap::new(), // Missing vpc_id
+                indexmap::IndexMap::new(), // Missing vpc_id
             );
 
             let result = resolver.expand_module_call(&call, "my_instance");
@@ -5095,7 +5096,7 @@ fn test_module_composition_dot_path_refs() {
             let call = ModuleCall::test(
                 "web_tier".to_string(),
                 Some("web".to_string()),
-                HashMap::new(),
+                indexmap::IndexMap::new(),
             );
 
             let expanded = resolver.expand_module_call(&call, "web").unwrap();
@@ -5348,7 +5349,7 @@ fn create_module_with_interpolation() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: HashMap::new(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -6105,7 +6106,7 @@ fn create_module_with_port_validation() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: HashMap::new(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -6304,7 +6305,7 @@ let root = outer { outer_port = producer.port }
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: HashMap::new(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -6389,7 +6390,7 @@ fn test_argument_validation_passes_with_default_value() {
             let call = ModuleCall::test(
                 "web_server".to_string(),
                 Some("web".to_string()),
-                HashMap::new(), // Uses default 8080
+                indexmap::IndexMap::new(), // Uses default 8080
             );
 
             let result = resolver.expand_module_call(&call, "web");
@@ -6539,7 +6540,7 @@ fn test_argument_validation_no_message_uses_default() {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: HashMap::new(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -6618,7 +6619,7 @@ fn test_argument_validation_len_with_list() {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: HashMap::new(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -6714,7 +6715,7 @@ fn test_require_block_passes() {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: HashMap::new(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![RequireBlock::dummy(
@@ -6806,7 +6807,7 @@ fn test_require_block_fails_with_not_expr() {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: HashMap::new(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![RequireBlock::dummy(
@@ -6891,7 +6892,7 @@ fn test_require_block_len_function() {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: HashMap::new(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![RequireBlock::dummy(
@@ -6999,7 +7000,7 @@ fn test_require_block_multiple_constraints() {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: HashMap::new(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![RequireBlock::dummy(
@@ -9093,7 +9094,7 @@ fn create_module_with_environment_union() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
-        user_functions: HashMap::new(),
+        user_functions: IndexMap::new(),
         upstream_states: vec![],
         wait_bindings: vec![],
         requires: vec![],
@@ -11927,4 +11928,51 @@ let child = consumer_module { record = "record-id" }
         ),
         "unexpected diagnostic: {error}",
     );
+}
+
+#[test]
+fn module_if_audit_checks_functions_in_sibling_declaration_order() {
+    use crate::parser::{DeferredIfCondition, DeferredValueIf};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/diagnostic_order/functions");
+    let path = crate::paths::ResolvedPath::new(&root).unwrap();
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = crate::config_loader::parse_directory(&path, &config).unwrap();
+    crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        let mut expanded = crate::module_resolver::resolve_modules_with_providerless_config(
+            parsed,
+            &path,
+            session,
+            &crate::schema::SchemaRegistry::new(),
+        )
+        .unwrap();
+        let authored_condition = DeferredIfCondition::new(
+            Value::Concrete(ConcreteValue::Bool(true)),
+            root.join("a_functions.crn"),
+            1,
+        );
+        let conditional = ExpandedValue::Deferred(ExpandedDeferredValue::ModuleIf(Box::new(
+            DeferredValueIf::new(
+                DeferredIfCondition::new_with_source_expression(
+                    ExpandedValue::Concrete(ExpandedConcreteValue::Bool(true)),
+                    root.join("a_functions.crn"),
+                    1,
+                    authored_condition.source_expression,
+                ),
+                ExpandedValue::Concrete(ExpandedConcreteValue::String("yes".into())),
+                ExpandedValue::Concrete(ExpandedConcreteValue::String("no".into())),
+            ),
+        )));
+        expanded.user_functions["zebra"].body.value = conditional.clone();
+        expanded.user_functions["mango"].params[0].default = Some(conditional);
+        let error = crate::module_resolver::ensure_expanded_root_graph(&expanded).unwrap_err();
+        assert!(
+            matches!(error, ModuleError::UnexpandedModuleTemplate { context } if context == "function body")
+        );
+        expanded.user_functions.move_index(0, 1);
+        let error = crate::module_resolver::ensure_expanded_root_graph(&expanded).unwrap_err();
+        assert!(
+            matches!(error, ModuleError::UnexpandedModuleTemplate { context } if context == "function parameter default")
+        );
+    });
 }

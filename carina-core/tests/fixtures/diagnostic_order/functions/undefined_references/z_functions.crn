@@ -1,0 +1,2 @@
+fn alpha(): String { missing_alpha.name }
+fn bravo(): String { missing_bravo.name }

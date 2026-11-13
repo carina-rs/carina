@@ -1,0 +1,6 @@
+let zulu = mock.test.resource { name = "meta-zulu" }
+let alpha = mock.test.resource { name = "meta-alpha" }
+let quartz = mock.test.resource { name = "meta-quartz" }
+let bravo = mock.test.resource { name = "meta-bravo" }
+let mango = mock.test.resource { name = "meta-mango" }
+let delta = mock.test.resource { name = "meta-delta" }
