@@ -2373,13 +2373,13 @@ where
                     .attributes
                     .iter()
                     .rev()
-                    .find(|attribute| attribute.detail() == key)
+                    .find(|attribute| &attribute.key == key)
                     .ok_or_else(|| {
                         AnalysisTreeError::new(AnalysisTreeErrorKind::MissingSyntaxProvenance {
                             element: format!("provider {} attribute {key}", provider.name),
                         })
                     })?;
-                locations.insert(key.clone(), location.location().clone());
+                locations.insert(key.clone(), location.value_location.clone());
             }
             provider_attribute_locations.push(locations);
         }
@@ -2655,8 +2655,26 @@ where
             .attributes
             .iter()
             .rev()
-            .find(|attribute| name.equivalent(attribute.detail()))
-            .map_or(declaration.location(), |attribute| attribute.location())
+            .find(|attribute| name.equivalent(&attribute.key))
+            .map_or(declaration.location(), |attribute| {
+                &attribute.value_location
+            })
+    }
+
+    pub fn provider_attribute_key_location<
+        Q: indexmap::Equivalent<super::AttributeKey> + ?Sized,
+    >(
+        &self,
+        index: usize,
+        name: &Q,
+    ) -> &DeclarationLocation {
+        let declaration = self.provider_declaration(index);
+        declaration
+            .attributes
+            .iter()
+            .rev()
+            .find(|key| name.equivalent(&key.key))
+            .map_or(declaration.location(), |key| &key.key_location)
     }
 
     fn provider_declaration(&self, index: usize) -> &Located<super::elements::ProviderDeclaration> {

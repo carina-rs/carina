@@ -259,6 +259,157 @@ fn attribute_error(
     }
 }
 
+/// All undeclared keys in one configuration, with their parser-owned identities.
+#[derive(Debug)]
+pub struct UnknownProviderConfigAttributes {
+    provider: String,
+    errors: Vec<(crate::parser::AttributeKey, TypeError)>,
+}
+
+impl UnknownProviderConfigAttributes {
+    pub(crate) fn into_diagnostics(self) -> Vec<ProviderConfigPreparationError> {
+        self.errors
+            .into_iter()
+            .map(
+                |(attribute, error)| ProviderConfigPreparationError::InvalidAttribute {
+                    provider: self.provider.clone(),
+                    attribute,
+                    error: vec![error].into(),
+                },
+            )
+            .collect()
+    }
+
+    pub(crate) fn diagnostics(
+        &self,
+    ) -> impl Iterator<Item = crate::executor::provider_ready::ProviderConfigDiagnostic<'_>> {
+        self.errors.iter().map(|(attribute, error)| {
+            crate::executor::provider_ready::ProviderConfigDiagnostic::Attribute {
+                provider: &self.provider,
+                attribute,
+                error,
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for UnknownProviderConfigAttributes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, diagnostic) in self.diagnostics().enumerate() {
+            if index > 0 {
+                f.write_str("\n")?;
+            }
+            std::fmt::Display::fmt(&diagnostic, f)?;
+        }
+        Ok(())
+    }
+}
+
+fn unknown_attribute_report<'a>(
+    provider: &str,
+    keys: impl IntoIterator<Item = &'a crate::parser::AttributeKey>,
+    schema: &ValidatedConfigSchema,
+) -> Option<ProviderConfigPreparationError> {
+    let known: Vec<_> = schema.parts().keys().map(String::as_str).collect();
+    let errors: Vec<_> = keys
+        .into_iter()
+        .map(|key| {
+            (
+                key.clone(),
+                TypeError::unknown_attribute(&key.to_string(), &known, &[]),
+            )
+        })
+        .collect();
+    (!errors.is_empty()).then(|| {
+        ProviderConfigPreparationError::UnknownAttributes(UnknownProviderConfigAttributes {
+            provider: provider.to_owned(),
+            errors,
+        })
+    })
+}
+
+struct ResolvedProviderField<'a, P: crate::resource::ValueKind, B: BindingAddress> {
+    key: crate::parser::AttributeKey,
+    value: Value<P, B>,
+    declared: DeclaredConfigurationField<'a, kind::ProviderConfigAttribute>,
+}
+
+fn resolve_fields<'a, P: crate::resource::ValueKind, B: BindingAddress>(
+    provider: &str,
+    declaration: &'a ConfigurationDeclaration,
+    instance: &ProviderInstanceKey,
+    revision: CatalogRevision,
+    attributes: &ConfigurationAttributes<Value<P, B>>,
+) -> Result<Vec<ResolvedProviderField<'a, P, B>>, ProviderConfigPreparationError> {
+    let mut fields = Vec::with_capacity(attributes.len());
+    let mut unknown = Vec::new();
+    for (key, value) in attributes {
+        match declaration.field(
+            key,
+            InstanceIdentity::Provider(instance.clone()),
+            revision.clone(),
+        ) {
+            Some(declared) => fields.push(ResolvedProviderField {
+                key: key.clone(),
+                value: value.clone(),
+                declared,
+            }),
+            None => unknown.push(key),
+        }
+    }
+    if let Some(error) = unknown_attribute_report(provider, unknown, &declaration.schema) {
+        return Err(error);
+    }
+    Ok(fields)
+}
+
+/// Check persisted declarations before secret rehydration. This grants no
+/// construction authority; complete values still enter `construction()`.
+pub fn validate_keys<P: crate::resource::ValueKind, B: BindingAddress>(
+    configs: &[crate::parser::ProviderConfig<P, B>],
+    factories: &[&dyn ProviderFactory],
+) -> Result<(), ProviderConfigPreparationError> {
+    let errors = configs
+        .iter()
+        .filter_map(|config| {
+            let factory = factories
+                .iter()
+                .find(|factory| factory.name() == config.name)?;
+            let declaration = ConfigurationDeclaration::provider(
+                factory.name(),
+                factory.schema_witness().config().clone(),
+            );
+            let catalog = ProviderContext::new(crate::EnvironmentSnapshot::new([]));
+            resolve_fields(
+                &config.name,
+                &declaration,
+                &ProviderInstanceKey::new(&config.name, config.binding.clone()),
+                CatalogRevision(CatalogSnapshot::Provider(catalog.custom_types.clone())),
+                &config.attributes,
+            )
+            .err()
+        })
+        .collect();
+    ProviderConfigPreparationError::collect(errors)
+}
+
+/// Analyze each declared instance through the same configuration owner.
+pub fn analyze_configs(
+    configs: &[crate::parser::ProviderConfig<crate::resource::ParserPlaceholder>],
+    factories: &[&dyn ProviderFactory],
+) -> Result<(), ProviderConfigPreparationError> {
+    let errors = configs
+        .iter()
+        .filter_map(|config| {
+            let factory = factories
+                .iter()
+                .find(|factory| factory.name() == config.name)?;
+            validate_parser_provider_config(*factory, &config.name, &config.attributes).err()
+        })
+        .collect();
+    ProviderConfigPreparationError::collect(errors)
+}
+
 fn prepare_fields<M: PreparationPhase, P: PlaceholderKind, B: BindingAddress>(
     factory: &dyn ProviderFactory,
     provider_name: &str,
@@ -267,48 +418,47 @@ fn prepare_fields<M: PreparationPhase, P: PlaceholderKind, B: BindingAddress>(
     schema: &ValidatedConfigSchema,
 ) -> Result<M::Output, ProviderConfigPreparationError> {
     let declaration = ConfigurationDeclaration::provider(factory.name(), schema.clone());
-    let canonical = crate::value::canonicalize_provider_config_attributes_with_types(
-        provider_name,
-        attributes,
-        schema.parts(),
-    )
-    .map_err(|error| {
-        let (provider, attribute, error) = error.into_parts();
-        ProviderConfigPreparationError::InvalidAttribute {
-            provider,
-            attribute,
-            error: vec![error].into(),
-        }
-    })?;
-    let inputs = ProviderValidationInputs::collect(provider_name, canonical.values());
-    let lookup = crate::parser::custom_type_lookup_for_factory(factory, &inputs);
     let catalog = ProviderContext::new(crate::EnvironmentSnapshot::new([]));
     let instance = ProviderInstanceKey::new(provider_name, binding.map(str::to_owned));
+    let mut fields = resolve_fields(
+        provider_name,
+        &declaration,
+        &instance,
+        CatalogRevision(CatalogSnapshot::Provider(catalog.custom_types.clone())),
+        attributes,
+    )?;
+    for field in &mut fields {
+        field.value = crate::value::canonicalize_provider_config_with_type_and_ancestry(
+            provider_name,
+            field.value.clone(),
+            field.declared.attr_type,
+            crate::schema::empty_defs_for_schema_walks(),
+            FieldAncestry::WRITABLE,
+        )
+        .map_err(|error| ProviderConfigPreparationError::InvalidAttribute {
+            provider: provider_name.to_owned(),
+            attribute: field.key.clone(),
+            error: vec![error].into(),
+        })?;
+    }
+    let inputs =
+        ProviderValidationInputs::collect(provider_name, fields.iter().map(|field| &field.value));
+    let lookup = crate::parser::custom_type_lookup_for_factory(factory, &inputs);
     let checked = crate::validation::deferred_types::TypeCheckSession::run(&catalog, |session| {
         let mut aggregate = ConfigurationBuilder::new(Arc::clone(&declaration), instance.clone());
-        for (key, value) in &canonical {
-            let destination = declaration.destination::<kind::ProviderConfigAttribute>(
-                key,
-                InstanceIdentity::Provider(instance.clone()),
-                CatalogRevision(CatalogSnapshot::Provider(
-                    session.catalog().custom_types.clone(),
-                )),
-            );
+        for entry in &fields {
+            let key = &entry.key;
+            let value = &entry.value;
+            let destination = &entry.declared.destination;
             if let Some(known) = value
                 .to_expanded()
                 .and_then(Value::try_into_address_free_absolute)
             {
-                if let Some(destination) = destination {
-                    M::declared(&destination, key, &known, session, &lookup, &mut aggregate)
-                        .map_err(|error| attribute_error(provider_name, key, error))?;
-                } else {
-                    aggregate.passthrough(key.clone(), known);
-                }
+                M::declared(destination, key, &known, session, &lookup, &mut aggregate)
+                    .map_err(|error| attribute_error(provider_name, key, error))?;
             } else {
-                if let Some(destination) = destination {
-                    field(&destination, value, session, &lookup)
-                        .map_err(|error| attribute_error(provider_name, key, error))?;
-                }
+                field(destination, value, session, &lookup)
+                    .map_err(|error| attribute_error(provider_name, key, error))?;
                 M::unresolved(value).map_err(|error| attribute_error(provider_name, key, error))?;
             }
         }
@@ -517,9 +667,10 @@ pub(crate) fn test_configuration(
     config: Option<&ProviderReadyConfig>,
 ) -> ProviderReadyConfig {
     let empty = ConfigurationAttributes::new();
-    let factory =
-        crate::test_utils::configuration::ConfigFactory::new(ValidatedConfigSchema::default())
-            .named(provider);
+    let schema = config.map_or_else(ValidatedConfigSchema::default, |config| {
+        config.inner.admitted.declaration_schema().clone()
+    });
+    let factory = crate::test_utils::configuration::ConfigFactory::new(schema).named(provider);
     let canonical = admitted(
         &factory,
         provider,

@@ -7069,16 +7069,6 @@ impl ProviderConfigCanonicalizationError {
     pub fn error(&self) -> &crate::schema::TypeError {
         &self.error
     }
-
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        String,
-        crate::parser::AttributeKey,
-        crate::schema::TypeError,
-    ) {
-        (self.provider, self.attribute, *self.error)
-    }
 }
 
 /// Canonicalize one provider configuration attribute map using its

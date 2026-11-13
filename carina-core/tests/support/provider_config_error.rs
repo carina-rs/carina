@@ -1,7 +1,5 @@
 use carina_core::provider::*;
-use carina_core::schema::{
-    ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
-};
+use carina_core::schema::{ValidatedProviderSchemaWitness, ValidatedResourceSchema};
 
 pub struct NativeConfigErrorFactory(pub ProviderError);
 
@@ -26,7 +24,20 @@ impl ProviderFactory for NativeConfigErrorFactory {
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            ValidatedConfigSchema::default(),
+            carina_core::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from(
+                [
+                    ("token".into(), carina_core::schema::AttributeType::string()),
+                    (
+                        "__mock_validate_config_cause__".into(),
+                        carina_core::schema::AttributeType::string(),
+                    ),
+                    (
+                        "__mock_validate_config_captured_cause__".into(),
+                        carina_core::schema::AttributeType::string(),
+                    ),
+                ],
+            ))
+            .unwrap(),
             Default::default(),
             Vec::new(),
         )

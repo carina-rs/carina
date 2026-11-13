@@ -721,7 +721,10 @@ A struct type represents a nested object with typed fields.
   `admit_apply_data_source`. Provider/backend configuration enters `admit()` through
   `validation/admission/configuration/`, including compact-list callbacks.
   Complete admissions own the canonical payload and placements; analysis cannot
-  authorize construction. Opaque provider keys retain factory validation.
+  authorize construction. Undeclared keys are rejected before value checks or
+  factory validation, using resource unknown-attribute suggestions. The payload
+  contains exactly its placed fields. The native mock has no configuration
+  fields; WASM mock controls belong to its own declaration.
   Provider construction binds admitted configuration to its factory and instance.
   Core owns the S3/local declarations; state extracts settings only from
   `AdmittedConfiguration<BackendAttribute>`. Native file addresses retain their

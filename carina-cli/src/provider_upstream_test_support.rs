@@ -55,7 +55,13 @@ impl ProviderFactory for ProviderConfigCaptureFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            Default::default(),
+            carina_core::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from(
+                [(
+                    "role_arn".into(),
+                    carina_core::schema::AttributeType::string(),
+                )],
+            ))
+            .unwrap(),
             Default::default(),
             Vec::new(),
         )

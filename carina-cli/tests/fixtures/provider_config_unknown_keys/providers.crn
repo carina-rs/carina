@@ -1,0 +1,7 @@
+provider mock {
+  regoin = 'ap-northeast-1'
+  validate_delay_milis = 5
+}
+let second = provider mock {
+  another_typo = pending.name
+}
