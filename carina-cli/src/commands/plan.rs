@@ -3952,6 +3952,10 @@ pub(crate) struct ReloadedPlanFile<
 }
 
 impl UnresolvedReloadedPlanFile {
+    pub(crate) fn provider_configs(&self) -> &SavedProviderConfigs {
+        &self.contents.provider_configs
+    }
+
     pub(crate) fn legacy_dependency_classification(
         &self,
     ) -> Option<&LegacyDependencyClassification> {
@@ -9604,7 +9608,7 @@ mod run_plan_out_tests {
         fs::write(
             dir.join("main.crn"),
             r#"
-                provider mock { target = bucket.name }
+                provider mock { reference_table = bucket.name }
                 let bucket = mock.test.resource { name_prefix = "pref-" }
             "#,
         )
@@ -9656,7 +9660,7 @@ mod run_plan_out_tests {
         assert_eq!(
             saved.provider_configs.as_provider_configs()[0]
                 .attributes
-                .get("target"),
+                .get("reference_table"),
             Some(&Value::Concrete(ConcreteValue::String(
                 "pref-existing".into()
             )))

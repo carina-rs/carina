@@ -8,6 +8,66 @@ use std::sync::atomic::Ordering;
 use crate::test_utils::configuration::{ConfigFactory as Factory, provider_directory as directory};
 
 #[test]
+fn undeclared_configuration_keys_reject_before_values_or_factory_validation() {
+    let root = crate::test_utils::configuration::ConfigurationDirectory::new(&[
+        (
+            "providers.crn",
+            "let east = provider owner { zzz = producer.id regoin = 'ap-northeast-1' aaa = 'private-value' }",
+        ),
+        (
+            "main.crn",
+            "let producer = mock.test.resource { name = 'producer' }",
+        ),
+    ]);
+    let parsed = crate::config_loader::parse_directory(
+        &crate::paths::ResolvedPath::new(root.path()).unwrap(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let attrs = &parsed.parsed().providers[0].attributes;
+    let schema = ValidatedConfigSchema::validate(BTreeMap::from([(
+        "region".into(),
+        AttributeType::string(),
+    )]))
+    .unwrap();
+    let factory = Factory::new(schema.clone());
+    let analysis = analyze(&factory, "owner", attrs)
+        .expect_err("analysis must reject every undeclared field, even a pending one");
+    assert!(analysis.diagnostics().iter().all(|diagnostic| matches!(
+        diagnostic.schema_error(),
+        Some(TypeError::UnknownAttribute { .. })
+    )));
+    let analysis = analysis.to_string();
+    let complete = admitted(&factory, "owner", Some("east"), attrs, &schema)
+        .expect_err("construction must reject undeclared fields before inspecting their values")
+        .to_string();
+    assert_eq!(complete, analysis);
+    let unknowns: Vec<_> = analysis.lines().collect();
+    assert_eq!(unknowns.len(), 3, "{analysis}");
+    for (diagnostic, name) in unknowns.iter().zip(["aaa", "regoin", "zzz"]) {
+        assert!(
+            diagnostic.contains(&format!("Unknown attribute '{name}'")),
+            "{analysis}"
+        );
+    }
+    assert!(analysis.contains("did you mean 'region'?"), "{analysis}");
+    assert!(!analysis.contains("private-value"));
+    assert!(factory.seen.lock().unwrap().is_empty());
+    assert_eq!(factory.custom_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn undeclared_configuration_keys_reject_with_an_empty_declaration() {
+    let factory = Factory::new(ValidatedConfigSchema::default());
+    let configs = directory("provider owner { typo = 'value' }", "let sibling = 'value'");
+    let config = configs.iter().next().unwrap();
+    assert!(analysis(&factory, "owner", config.attributes()).is_err());
+    assert!(provider::construction(&factory, config, &ProviderPlan::state_only()).is_err());
+    assert!(factory.seen.lock().unwrap().is_empty());
+    assert_eq!(factory.initialized.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn analysis_and_complete_configuration_have_distinct_types() {
     let factory = Factory::new(ValidatedConfigSchema::default());
     let attrs = ConfigurationAttributes::new();
@@ -47,27 +107,38 @@ fn operational_provider_configuration_never_omits_unresolved_fields() {
         let factory = Factory::new(schema.clone());
         let error = admitted(&factory, "owner", None, attributes, &schema)
             .expect_err("operational admission must not drop an unresolved value");
-        let ProviderConfigPreparationError::InvalidAttribute { error, .. } = error else {
-            panic!("typed attribute error")
-        };
-        assert!(matches!(error.errors()[0], TypeError::Knowledge { .. }));
         assert!(factory.seen.lock().unwrap().is_empty());
-        assert!(analyze(&factory, "owner", attributes).unwrap().is_empty());
+        if declared {
+            let ProviderConfigPreparationError::InvalidAttribute { error, .. } = error else {
+                panic!("typed attribute error")
+            };
+            assert!(matches!(error.errors()[0], TypeError::Knowledge { .. }));
+            assert!(analyze(&factory, "owner", attributes).unwrap().is_empty());
+        } else {
+            assert!(matches!(
+                error,
+                ProviderConfigPreparationError::UnknownAttributes(_)
+            ));
+            assert!(analyze(&factory, "owner", attributes).is_err());
+        }
     }
 }
 
 #[test]
 fn provider_config_admission_owns_exact_canonical_payload() {
-    let schema = ValidatedConfigSchema::validate(BTreeMap::from([(
-        "region".into(),
-        AttributeType::enum_(
-            TypeIdentity::new(Some("owner"), Vec::<String>::new(), "Region"),
-            None,
-            vec![],
-            None,
-            Some(DslTransform::HyphenToUnderscore),
+    let schema = ValidatedConfigSchema::validate(BTreeMap::from([
+        (
+            "region".into(),
+            AttributeType::enum_(
+                TypeIdentity::new(Some("owner"), Vec::<String>::new(), "Region"),
+                None,
+                vec![],
+                None,
+                Some(DslTransform::HyphenToUnderscore),
+            ),
         ),
-    )]))
+        ("extension".into(), AttributeType::string()),
+    ]))
     .unwrap();
     let factory = Factory::new(schema);
     let configs = directory(
@@ -85,8 +156,11 @@ fn provider_config_admission_owns_exact_canonical_payload() {
         ready.attributes()["extension"],
         Value::Concrete(ConcreteValue::String("kept".into()))
     );
-    assert_eq!(ready.inner.admitted.placements().len(), 1);
-    assert_eq!(ready.inner.admitted.opaque_passthrough().len(), 1);
+    assert_eq!(ready.inner.admitted.placements().len(), 2);
+    assert_eq!(
+        ready.inner.admitted.placements().len(),
+        ready.attributes().len()
+    );
     crate::test_utils::provider_text::block_on(ProviderBoundary::initialize(&construction))
         .unwrap();
     assert_eq!(factory.initialized.load(Ordering::SeqCst), 1);
@@ -177,7 +251,7 @@ fn provider_config_receipt_rejects_other_declaration_instance_revision() {
 }
 
 #[test]
-fn provider_config_directory_preserves_opaque_keys_and_optional_fields() {
+fn provider_config_directory_rejects_undeclared_keys_and_preserves_optional_fields() {
     let factory = Factory::new(
         ValidatedConfigSchema::validate(BTreeMap::from([(
             "optional".into(),
@@ -189,13 +263,29 @@ fn provider_config_directory_preserves_opaque_keys_and_optional_fields() {
         "provider owner { extension = Input }\n",
         "let Input = 'opaque'\n",
     );
+    let error = provider::construction(
+        &factory,
+        configs.iter().next().unwrap(),
+        &ProviderPlan::state_only(),
+    )
+    .err()
+    .expect("an undeclared extension cannot initialize a provider");
+    assert!(error.to_string().contains("Unknown attribute 'extension'"));
+    assert!(factory.seen.lock().unwrap().is_empty());
+    let configs = directory("provider owner {}", "let sibling = 'value'");
     let construction = provider::construction(
         &factory,
         configs.iter().next().unwrap(),
         &ProviderPlan::state_only(),
     )
     .unwrap();
-    assert_eq!(construction.session().configuration().attributes().len(), 1);
+    assert!(
+        construction
+            .session()
+            .configuration()
+            .attributes()
+            .is_empty()
+    );
     assert!(
         !construction
             .session()
@@ -335,7 +425,7 @@ fn provider_config_directory_checks_full_destination_after_resolution() {
                 .unwrap(),
             );
             let configs = directory(
-                "provider owner { value = Input extension = 'opaque' }",
+                "provider owner { value = Input }",
                 &format!("let Input = {source}\n"),
             );
             let result = provider::construction(
@@ -479,5 +569,43 @@ fn saved_historical_provider_stops_before_configuration_admission() {
     assert_eq!(
         error.to_string(),
         "secret value unavailable at provider mock"
+    );
+}
+
+#[test]
+fn provider_config_declared_fields_preserve_saved_and_protocol_wire_bytes() {
+    let schema = ValidatedConfigSchema::validate(BTreeMap::from([
+        ("first".into(), AttributeType::string()),
+        ("second".into(), AttributeType::bool()),
+        ("token".into(), AttributeType::string()),
+    ]))
+    .unwrap();
+    let factory = Factory::new(schema);
+    let configs = directory(
+        "provider owner { second = true first = 'value' token = 'test-token' }",
+        "let sibling = 'value'",
+    );
+    let ready = provider::prepare(&factory, configs.iter().next().unwrap()).unwrap();
+    let wire: Vec<_> = ready
+        .wire_attributes()
+        .transport_iter()
+        .map(|(key, value)| (key, value.value(), value.is_secret()))
+        .collect();
+    let saved = crate::parser::SavedProviderConfigs::from(&configs)
+        .redact_secrets()
+        .unwrap();
+    let actual = serde_json::json!({
+        "wire": serde_json::to_string(&wire).unwrap(),
+        "saved_provider_configs": serde_json::to_string(&saved).unwrap(),
+    });
+    let main: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/configuration_wire.json")).unwrap();
+    assert_eq!(
+        actual, main,
+        "valid configuration wire bytes must match main 55d8904e4"
+    );
+    assert_eq!(
+        ready.inner.admitted.placements().len(),
+        ready.attributes().len()
     );
 }

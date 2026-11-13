@@ -2654,6 +2654,22 @@ where
             .map_or(declaration.location(), |attribute| attribute.location())
     }
 
+    pub fn provider_attribute_key_location<
+        Q: indexmap::Equivalent<super::AttributeKey> + ?Sized,
+    >(
+        &self,
+        index: usize,
+        name: &Q,
+    ) -> &DeclarationLocation {
+        let declaration = self.provider_declaration(index);
+        declaration
+            .keys
+            .iter()
+            .rev()
+            .find(|key| name.equivalent(key.detail()))
+            .map_or(declaration.location(), |key| key.location())
+    }
+
     fn provider_declaration(&self, index: usize) -> &Located<super::elements::ProviderDeclaration> {
         let provider = &self.providers[index];
         let occurrence = self.providers[..index]

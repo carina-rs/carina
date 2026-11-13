@@ -2940,6 +2940,25 @@ impl WiringContext {
         self.loaded_providers.factories()
     }
 
+    /// Construction and configuration admission also include the host-owned
+    /// native factory, without registering it as a plugin custom-type source.
+    pub fn configuration_factories(&self) -> Vec<&dyn ProviderFactory> {
+        self.factories()
+            .iter()
+            .map(Box::as_ref)
+            .chain(
+                self.builtin_mock()
+                    .map(|factory| factory as &dyn ProviderFactory),
+            )
+            .collect()
+    }
+
+    fn configuration_factory(&self, name: &str) -> Option<&dyn ProviderFactory> {
+        self.configuration_factories()
+            .into_iter()
+            .find(|factory| factory.name() == name)
+    }
+
     pub fn factories_arc(&self) -> Arc<Vec<Box<dyn ProviderFactory>>> {
         self.loaded_providers.factories_arc()
     }
@@ -4917,7 +4936,7 @@ pub fn normalize_state_with_ctx(
         .build()
         .expect("failed to build tokio runtime for normalize_state");
     let mut router = ProviderRouter::new();
-    for factory in ctx.factories() {
+    for factory in ctx.configuration_factories() {
         let implicit = provider_configs.provider_or_implicit(factory.name());
         let mut configs = provider_configs
             .iter()
@@ -4928,9 +4947,7 @@ pub fn normalize_state_with_ctx(
         }
         for resolved_config in configs {
             let construction = rt
-                .block_on(async {
-                    prepare_provider_construction(factory.as_ref(), resolved_config, plan)
-                })
+                .block_on(async { prepare_provider_construction(factory, resolved_config, plan) })
                 .map_err(HostError::from)?;
             router.add_initialized_normalizer(rt.block_on(
                 provider_mod::ProviderBoundary::initialize_normalizer(&construction),
@@ -4969,11 +4986,15 @@ pub fn validate_provider_region_with_ctx<E>(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
 ) -> Vec<AppError> {
-    validation::validate_provider_config_report(parsed, ctx.factories())
-        .err()
-        .map(|error| AppError::ProviderConfiguration(Box::new(error)))
-        .into_iter()
-        .collect()
+    carina_core::validation::admission::configuration::provider::analyze_configs(
+        &parsed.providers,
+        &ctx.configuration_factories(),
+    )
+    .err()
+    .into_iter()
+    .flat_map(|error| error.into_diagnostics())
+    .map(|error| AppError::ProviderConfiguration(Box::new(error)))
+    .collect()
 }
 
 /// Preserve source-local module-output diagnostics when module expansion
@@ -5387,43 +5408,27 @@ async fn instantiate_provider_into_router(
 ) -> Result<(), AppError> {
     let color_mode = ctx.runtime().color_mode();
     let binding = provider_config.binding();
-    if let Some(factory) = provider_mod::find_factory(ctx.factories(), provider_config.name()) {
+    if let Some(factory) = ctx.configuration_factory(provider_config.name()) {
         let construction = prepare_provider_construction(factory, provider_config, plan)?;
         let config = construction.session().configuration();
         let displayed_source = provider_config.source().or(inherited_source);
         let provider = provider_mod::ProviderBoundary::initialize(&construction)
             .await
             .map_err(|e| e.for_provider(provider_config.name().to_string()))?;
-        progress_sink.line(
+        let announcement = if ctx.builtin_mock().is_some()
+            && factory.name() == BUILTIN_PROVIDER_NAME
+        {
+            "Using mock provider".to_owned()
+        } else {
             format_provider_using_line(factory.name(), config.region(), binding, displayed_source)
-                .cyan(color_mode),
-        );
+        };
+        progress_sink.line(announcement.cyan(color_mode));
         router.add_provider_instance(
             provider_mod::ProviderInstanceKey::new(
                 provider_config.name(),
                 binding.map(str::to_owned),
             ),
             provider,
-        );
-    } else if let Some(builtin_mock) = ctx.builtin_mock()
-        && provider_config.name() == BUILTIN_PROVIDER_NAME
-    {
-        progress_sink.line("Using mock provider".cyan(color_mode));
-        router.add_provider_instance(
-            provider_mod::ProviderInstanceKey::new(
-                provider_config.name(),
-                binding.map(str::to_owned),
-            ),
-            // Built-in mock consumes admitted empty configuration.
-            provider_mod::ProviderBoundary::initialize(&empty_construction(
-                builtin_mock,
-                &provider_mod::ProviderInstanceKey::new(
-                    provider_config.name(),
-                    binding.map(str::to_owned),
-                ),
-                plan,
-            )?)
-            .await?,
         );
     } else if let Some(message) = missing_provider_message(provider_config, inherited_source) {
         eprintln!("{}", message.red(color_mode));
@@ -5547,7 +5552,7 @@ pub(crate) async fn create_normalizers_from_configs_with_ctx(
     let mut router = NormalizerRouter::new();
 
     for config in configs.iter() {
-        if let Some(factory) = provider_mod::find_factory(ctx.factories(), config.name()) {
+        if let Some(factory) = ctx.configuration_factory(config.name()) {
             let construction = prepare_provider_construction(factory, config, plan)?;
             router.add_initialized_normalizer(
                 provider_mod::ProviderBoundary::initialize_normalizer(&construction).await?,

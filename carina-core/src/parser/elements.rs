@@ -917,6 +917,7 @@ pub(crate) struct ProviderDeclaration {
     pub(crate) name: String,
     pub(crate) binding: Option<String>,
     pub(crate) attributes: Vec<Located<super::AttributeKey>>,
+    pub(crate) keys: Vec<Located<super::AttributeKey>>,
 }
 
 fn provider_declaration(
@@ -928,12 +929,15 @@ fn provider_declaration(
     let mut parts = pair.into_inner();
     let name = parts.next().expect("provider name");
     let mut attributes = Vec::new();
+    let mut keys = Vec::new();
     for attribute in parts.filter(|pair| pair.as_rule() == Rule::attribute) {
         let mut parts = attribute.into_inner();
-        let key = super::AttributeKey::authored_in_file(
-            parts.next().expect("provider attribute key"),
-            file,
-        );
+        let key_pair = parts.next().expect("provider attribute key");
+        let key = super::AttributeKey::authored_in_file(key_pair.clone(), file);
+        keys.push(Located::new(
+            DeclarationLocation::from_pair(&key_pair, file, source),
+            key.clone(),
+        ));
         let value = parts.next().expect("provider attribute value");
         attributes.push(Located::new(
             DeclarationLocation::from_pair(&value, file, source),
@@ -946,6 +950,7 @@ fn provider_declaration(
             name: name.as_str().to_string(),
             binding,
             attributes,
+            keys,
         },
     )
 }

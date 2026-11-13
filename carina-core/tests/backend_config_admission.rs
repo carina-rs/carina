@@ -22,6 +22,22 @@ fn directory(
 }
 
 #[test]
+fn undeclared_configuration_keys_in_backends_are_already_rejected() {
+    let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    for source in [
+        "backend local { zzz = 'ignored' aaa = 'ignored' }",
+        "backend s3 { bucket = 'state' key = 'state.json' zzz = 'ignored' aaa = 'ignored' }",
+    ] {
+        let error = directory(source, "let sibling = 'value'", &context).unwrap_err();
+        let text = error.to_string();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines[0].contains("Unknown attribute 'aaa'"), "{text}");
+        assert!(lines[1].contains("Unknown attribute 'zzz'"), "{text}");
+    }
+}
+
+#[test]
 fn backend_config_directory_admits_before_concrete_extraction() {
     let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
     let admitted = directory(

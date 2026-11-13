@@ -9493,7 +9493,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn initialization_values_fail_at_shared_wire_preparation_before_instance_creation() {
+    async fn undeclared_configuration_fails_before_wire_preparation_and_instance_creation() {
         let factory = rebuildable_state_test_factory()
             .await
             .expect("mock WASM fixture is required");
@@ -9507,23 +9507,13 @@ pub(super) mod tests {
             )]),
         )
         .unwrap_err();
-        let carina_core::executor::ProviderConfigPreparationError::Wire(wire) = &error else {
-            panic!("expected shared wire rejection: {error:?}")
-        };
         assert!(matches!(
-            wire.conversion_error(),
-            carina_core::protocol_convert::ProtocolConvertError::DurationOutOfRange
+            &error,
+            carina_core::executor::ProviderConfigPreparationError::UnknownAttributes(_)
         ));
-        assert_eq!(wire.attribute(), "extra");
-        assert_eq!(
-            wire.target(),
-            &carina_core::provider::ProviderWireTarget::Configuration {
-                provider: "mock".into()
-            }
-        );
         assert_eq!(
             error.to_string(),
-            "provider mock configuration: attribute `extra` cannot cross the provider wire: duration in seconds does not fit the provider protocol integer domain"
+            "provider mock: extra: Unknown attribute 'extra'"
         );
         assert!(std::error::Error::source(&error).is_none());
         assert!(factory.shared_instances.lock().await.is_empty());

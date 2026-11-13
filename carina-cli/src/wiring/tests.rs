@@ -4286,11 +4286,7 @@ async fn provider_progress_uses_schema_region() {
     let configs = validated_provider_configs(vec![
         ProviderConfig {
             name: "test".to_string(),
-            attributes: (IndexMap::<String, _>::from([(
-                "region".to_string(),
-                Value::Concrete(ConcreteValue::String("us-west-2".into())),
-            )]))
-            .into(),
+            attributes: Default::default(),
             default_tags: Default::default(),
             source: None,
             version: None,
@@ -5430,7 +5426,13 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                Default::default(),
+                carina_core::schema::ValidatedConfigSchema::validate(
+                    std::collections::BTreeMap::from([(
+                        "region".into(),
+                        carina_core::schema::AttributeType::string(),
+                    )]),
+                )
+                .unwrap(),
                 Default::default(),
                 Vec::new(),
             )
@@ -5558,7 +5560,13 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                Default::default(),
+                carina_core::schema::ValidatedConfigSchema::validate(
+                    std::collections::BTreeMap::from([(
+                        "region".into(),
+                        carina_core::schema::AttributeType::string(),
+                    )]),
+                )
+                .unwrap(),
                 Default::default(),
                 Vec::new(),
             )
@@ -16206,7 +16214,7 @@ fn retry_policy_inherits_transient_causes_and_respects_explicit_overrides() {
 }
 
 #[tokio::test]
-async fn provider_config_directory_builtin_keeps_ignored_opaque_values() {
+async fn provider_config_directory_builtin_rejects_undeclared_values() {
     for declaration in ["provider mock", "let east = provider mock"] {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -16254,19 +16262,15 @@ async fn provider_config_directory_builtin_keeps_ignored_opaque_values() {
         .unwrap()
         .into_complete()
         .unwrap();
-        let router = get_provider_with_ctx(
+        let error = get_provider_with_ctx(
             &load.context,
             &resolved,
             ProgressSink::Human,
             &carina_core::provider::ProviderPlan::state_only(),
         )
         .await
-        .unwrap();
-        assert!(!router.is_empty());
-        if declaration.starts_with("let ") {
-            assert!(router.provider_scopes().contains_key(
-                &provider_mod::ProviderInstanceKey::new("mock", Some("east".into()))
-            ));
-        }
+        .err()
+        .expect("undeclared keys must fail before wire conversion");
+        assert!(error.to_string().contains("Unknown attribute 'opaque'"));
     }
 }

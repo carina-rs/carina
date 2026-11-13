@@ -7,6 +7,60 @@ use std::sync::atomic::Ordering;
 use carina_core::test_utils::configuration::{ConfigFactory, ConfigurationDirectory};
 
 #[test]
+fn undeclared_provider_configuration_keys_match_validate_and_point_to_each_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../carina-cli/tests/fixtures/provider_config_unknown_keys");
+    for name in ["main.crn", "providers.crn", "backend.crn"] {
+        std::fs::copy(source_directory.join(name), directory.path().join(name)).unwrap();
+    }
+    let expected: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(source_directory.join("expected.json")).unwrap())
+            .unwrap();
+    let path = directory.path().join("providers.crn");
+    let source = std::fs::read_to_string(&path).unwrap();
+    let factory = carina_provider_mock::ConfiguredBuiltinMock::new(
+        Default::default(),
+        carina_provider_mock::MockScope::memory(),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas
+        .insert_provider_witness("mock", &factory.schema_witness())
+        .unwrap();
+    let host_engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()])
+        .with_configuration_factory(Box::new(factory.clone()));
+    let loaded_engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(factory)]),
+        vec!["mock".into()],
+    );
+    for engine in [host_engine, loaded_engine] {
+        let errors: Vec<_> = engine
+            .analyze(&create_document_at(&source, path.clone()), Some(&path))
+            .into_iter()
+            .filter(|error| error.severity == Some(DiagnosticSeverity::ERROR))
+            .collect();
+        assert_eq!(errors.len(), 3, "{errors:#?}");
+        for (message, key) in expected["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(expected["keys"].as_array().unwrap())
+        {
+            let diagnostic = errors
+                .iter()
+                .find(|error| error.message == message.as_str().unwrap())
+                .expect("CLI and LSP must expose the same owner diagnostic");
+            let line = key["line"].as_u64().unwrap() as u32;
+            let length = key["name"].as_str().unwrap().encode_utf16().count() as u32;
+            assert_eq!(
+                diagnostic.range,
+                Range::new(Position::new(line, 2), Position::new(line, 2 + length))
+            );
+        }
+    }
+}
+
+#[test]
 fn provider_config_directory_compact_callback_parity() {
     for (value, rejected) in [("bad", true), ("good", false)] {
         let source = "provider owner { endpoints = [Endpoint] }\n";

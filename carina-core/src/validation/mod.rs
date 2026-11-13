@@ -8125,17 +8125,10 @@ pub fn validate_provider_config_report<E>(
     parsed: &crate::parser::File<E>,
     factories: &[Box<dyn ProviderFactory>],
 ) -> Result<(), crate::executor::provider_ready::ProviderConfigPreparationError> {
-    for provider in &parsed.providers {
-        let Some(factory) = factories.iter().find(|f| f.name() == provider.name) else {
-            continue;
-        };
-        crate::executor::provider_ready::validate_parser_provider_config(
-            factory.as_ref(),
-            &provider.name,
-            &provider.attributes,
-        )?;
-    }
-    Ok(())
+    crate::validation::admission::configuration::provider::analyze_configs(
+        &parsed.providers,
+        &factories.iter().map(Box::as_ref).collect::<Vec<_>>(),
+    )
 }
 
 /// Stable semantic category used for source-aware deduplication.

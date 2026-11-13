@@ -9582,7 +9582,28 @@ impl crate::provider::ProviderFactory for RecordingFactory {
     fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
         crate::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            Default::default(),
+            crate::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from([
+                ("region".into(), crate::schema::AttributeType::string()),
+                (
+                    "assume_role".into(),
+                    crate::schema::AttributeType::struct_(
+                        "AssumeRole",
+                        vec![
+                            crate::schema::StructField::required(
+                                "role_arn",
+                                crate::schema::AttributeType::string(),
+                            )
+                            .build(),
+                            crate::schema::StructField::optional(
+                                "session_name",
+                                crate::schema::AttributeType::string(),
+                            )
+                            .build(),
+                        ],
+                    ),
+                ),
+            ]))
+            .unwrap(),
             Default::default(),
             Vec::new(),
         )

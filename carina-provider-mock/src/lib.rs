@@ -696,11 +696,39 @@ pub fn generated_attribute(
     }
 }
 
+/// Control settings shared by native and component mock declarations.
+pub fn control_config_attributes() -> std::collections::BTreeMap<String, AttributeType> {
+    std::collections::BTreeMap::from([
+        (
+            "__mock_reference_scope_region__".into(),
+            AttributeType::string(),
+        ),
+        (
+            "__mock_validate_config_cause__".into(),
+            AttributeType::string(),
+        ),
+        (
+            "__mock_validate_config_captured_cause__".into(),
+            AttributeType::string(),
+        ),
+        ("__mock_initialize_cause__".into(), AttributeType::string()),
+        (
+            "__mock_validate_config_trap__".into(),
+            AttributeType::bool(),
+        ),
+        ("validate_config_trap".into(), AttributeType::bool()),
+        ("__mock_initialize_error__".into(), AttributeType::bool()),
+        ("validate_delay_millis".into(), AttributeType::int()),
+        ("reference_table".into(), AttributeType::string()),
+    ])
+}
+
 /// Aggregate schema witness exposed by Carina's built-in mock provider.
 pub fn builtin_schema_witness() -> ValidatedProviderSchemaWitness {
     ValidatedProviderSchemaWitness::new(
         builtin_schemas(),
-        ValidatedConfigSchema::default(),
+        ValidatedConfigSchema::validate(control_config_attributes())
+            .expect("mock control configuration must be valid"),
         Default::default(),
         Vec::new(),
     )
@@ -2087,6 +2115,43 @@ mod tests {
     use crate::provider_text_fixtures::*;
     use carina_core::resource::NoPlaceholder;
     use std::time::Duration;
+
+    #[test]
+    fn mock_configuration_control_types_are_declared() {
+        let witness = builtin_schema_witness();
+        for (key, value) in [
+            (
+                "__mock_reference_scope_region__",
+                ConcreteValue::String("region".into()),
+            ),
+            (
+                "__mock_validate_config_cause__",
+                ConcreteValue::String("cause".into()),
+            ),
+            (
+                "__mock_validate_config_captured_cause__",
+                ConcreteValue::String("cause".into()),
+            ),
+            (
+                "__mock_initialize_cause__",
+                ConcreteValue::String("cause".into()),
+            ),
+            ("__mock_validate_config_trap__", ConcreteValue::Bool(true)),
+            ("validate_config_trap", ConcreteValue::Bool(true)),
+            ("__mock_initialize_error__", ConcreteValue::Bool(true)),
+            ("validate_delay_millis", ConcreteValue::Int(1)),
+            ("reference_table", ConcreteValue::String("table".into())),
+        ] {
+            let ty = witness.config().rootless_type(key).expect(key);
+            let value: Value = Value::Concrete(value);
+            ty.validate(&value).unwrap();
+            let wrong: Value = Value::Concrete(ConcreteValue::Map(Default::default()));
+            assert!(
+                ty.validate(&wrong).is_err(),
+                "{key} must have its actual scalar type"
+            );
+        }
+    }
 
     #[test]
     fn builtin_schemas_are_all_valid() {

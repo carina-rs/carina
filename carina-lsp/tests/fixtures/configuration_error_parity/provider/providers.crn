@@ -1,1 +1,1 @@
-provider mock { x = cidr_subnet('bad', 8, 1) }
+provider mock { validate_delay_millis = cidr_subnet('bad', 8, 1) }

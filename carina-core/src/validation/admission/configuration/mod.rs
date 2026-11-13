@@ -1,8 +1,8 @@
 //! Declaration-owned admission for configuration payloads.
 //!
-//! The payload retains its declared field placements and explicitly named
-//! opaque factory-owned passthrough. There is no constructor accepting a
-//! checked marker and a replacement map.
+//! Every payload entry is derived from its declared field placement. There is
+//! no constructor accepting unchecked entries or a checked marker plus a
+//! replacement map.
 
 use std::marker::PhantomData;
 use std::sync::Arc;

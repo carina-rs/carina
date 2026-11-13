@@ -1072,7 +1072,7 @@ fn saved_plan_rehydrates_provider_config_secret_with_independent_digest() {
     let scenario = Scenario::new_with_env(
         r#"backend local { path = "carina.state.json" }
 provider mock {
-  token = secret(env("SAVED_PLAN_PROVIDER_TOKEN_3861"))
+  reference_table = secret(env("SAVED_PLAN_PROVIDER_TOKEN_3861"))
 }
 
 mock.test.resource {
@@ -1086,7 +1086,7 @@ mock.test.resource {
     assert_success("carina plan --out", &scenario.plan_with_env(ENV));
     assert_plan_is_redacted(&scenario, &["SHARED_POSITION_SECRET_3861"]);
     let plan = read_json(&scenario.project.join("plan.json"));
-    let provider_hash = provider_attribute_placeholder_hash(&plan, "token");
+    let provider_hash = provider_attribute_placeholder_hash(&plan, "reference_table");
     let resource_hash = plan_comment_placeholder_hash(&plan, "provider-secret");
     assert_ne!(
         provider_hash, resource_hash,
@@ -1111,7 +1111,7 @@ fn saved_plan_rejects_changed_provider_config_secret_before_provider_call() {
     let scenario = Scenario::new_with_env(
         r#"backend local { path = "carina.state.json" }
 provider mock {
-  token = secret(env("SAVED_PLAN_PROVIDER_ONLY_3861"))
+  reference_table = secret(env("SAVED_PLAN_PROVIDER_ONLY_3861"))
 }
 
 mock.test.resource {
