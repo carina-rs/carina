@@ -1364,6 +1364,32 @@ pub enum AppError {
     #[error(transparent)]
     ResolvedMove(#[from] carina_core::effect::ResolvedMoveMismatch),
 
+    /// A backend schema failure at its authored attribute.
+    #[error("{0}")]
+    BackendAttribute(
+        Box<
+            carina_core::parser::Located<
+                carina_core::validation::admission::configuration::backend::BackendAttributeError,
+            >,
+        >,
+    ),
+
+    /// One backend failure when analysis cannot provide an authored location.
+    #[error("{0}")]
+    UnlocatedBackend(
+        Box<carina_core::validation::admission::configuration::backend::UnlocatedBackendError>,
+    ),
+
+    /// An unsupported backend at its authored block.
+    #[error("{0}")]
+    UnsupportedBackend(
+        Box<
+            carina_core::parser::Located<
+                carina_core::validation::admission::configuration::backend::UnsupportedBackendError,
+            >,
+        >,
+    ),
+
     /// State backend errors (lock contention, I/O, serialization, etc.)
     #[error(transparent)]
     Backend(#[from] BackendError),

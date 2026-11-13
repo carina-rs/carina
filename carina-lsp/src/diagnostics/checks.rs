@@ -2,7 +2,7 @@
 
 use carina_core::parser::ExportParamLike;
 use carina_core::validation::admission::configuration::backend::{
-    self as backend_admission, BackendAttributeError, BackendConfigError,
+    BackendAttributeError, LocatedBackendError,
 };
 use std::collections::HashSet;
 
@@ -665,72 +665,49 @@ impl DiagnosticRun<'_> {
         let (Some(merged), Some(tree)) = (merged, tree) else {
             return Vec::new();
         };
-        // CLI validation reports only the structural backend-in-module error
-        // for a module-definition directory. Keep editor diagnostics at the
-        // same layer instead of adding backend-schema errors.
-        if carina_core::validation::is_module_definition(&merged.directory.parsed) {
-            return Vec::new();
-        }
         // A duplicate backend has no single semantic owner. The parser
         // inventory still supplies every declaration for placement checks.
         if merged.directory.sole_backend_file.is_none() {
             return Vec::new();
         }
-        let Some(backend) = merged.directory.parsed.backend.as_ref() else {
-            return Vec::new();
-        };
-        let Err(error) = backend_admission::admit(backend) else {
+        let Some(Err(findings)) = tree.admit_backend() else {
             return Vec::new();
         };
 
-        let attribute_diagnostic = |error: &BackendAttributeError| {
-            // Directory resolution deliberately retains user-function calls
-            // that failed evaluation so other editor checks can continue.
-            // Suppress only those calls, including nested ones. A deferred
-            // builtin with unresolved arguments is still a genuine value-type
-            // mismatch and must remain visible, matching CLI validation.
-            if backend
-                .attributes
-                .get(error.attribute())
-                .is_some_and(|value| {
-                    contains_matching_function_call(value, &|name| {
-                        merged.directory.parsed.user_functions.contains_key(name)
+        let attribute_diagnostic =
+            |finding: carina_core::parser::Located<BackendAttributeError>| {
+                let error = finding.detail();
+                // Directory resolution deliberately retains user-function calls
+                // that failed evaluation so other editor checks can continue.
+                // Suppress only those calls, including nested ones. A deferred
+                // builtin with unresolved arguments is still a genuine value-type
+                // mismatch and must remain visible, matching CLI validation.
+                if tree
+                    .backend_attribute_value(error.attribute())
+                    .is_some_and(|value| {
+                        contains_matching_function_call(value, &|name| {
+                            merged.directory.parsed.user_functions.contains_key(name)
+                        })
                     })
-                })
-            {
-                return None;
-            }
+                {
+                    return None;
+                }
 
-            let finding = carina_core::parser::Located::new(
-                tree.backend_attribute_location(error.attribute()).clone(),
-                error,
-            );
-            render_merged(doc, &finding, DiagnosticSeverity::ERROR, error.to_string())
-        };
+                render_merged(doc, &finding, DiagnosticSeverity::ERROR, error.to_string())
+            };
 
-        match error {
-            BackendConfigError::Invalid(errors) => errors
-                .errors()
-                .iter()
-                .filter_map(attribute_diagnostic)
-                .collect(),
-            unsupported @ BackendConfigError::UnsupportedBackend(_) => {
-                let finding = carina_core::parser::Located::new(
-                    tree.backend_location()
-                        .expect("backend declaration provenance")
-                        .clone(),
-                    unsupported,
-                );
-                render_merged(
+        findings
+            .into_iter()
+            .filter_map(|finding| match finding {
+                LocatedBackendError::Attribute(finding) => attribute_diagnostic(finding),
+                LocatedBackendError::Unsupported(finding) => render_merged(
                     doc,
                     &finding,
                     DiagnosticSeverity::ERROR,
                     finding.detail().to_string(),
-                )
-                .into_iter()
-                .collect()
-            }
-        }
+                ),
+            })
+            .collect()
     }
 
     /// Check expanded values while retaining the authored provider locations.
