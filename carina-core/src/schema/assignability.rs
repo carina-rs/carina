@@ -1,5 +1,8 @@
 //! Boundary assignability when provider declarations may not be loaded.
 
+#[cfg(test)]
+mod reference_identified_string_tests;
+
 use super::{AttrTypeKind, PatternForm, TypeIdentity, TypeInSchema, resolve_refs_on_path};
 use crate::binding_index::{
     BindingIndex, DeclaredValueAssignment, RefTypeAssignabilityError, RefTypeMismatch,
@@ -621,12 +624,48 @@ fn scalar_value_obligation<'result, C: AssignmentCheck>(
     }
 }
 
+/// One nominal scalar rule for declaration compatibility and reference admission.
+/// Reference sources carry their identity and length here without changing the
+/// wire-scalar rules for identity-less String or Reference destinations.
+fn scalar_identity_assignment<'source, 'sink, R: PatternForm, C: AssignmentCheck>(
+    source_identity: &TypeIdentity,
+    source_constraints: Option<NominalScalarConstraints>,
+    sink: AssignmentSink<'sink, R>,
+    target_identity: IdentityLeaf<'sink>,
+    check: C,
+    sink_refs: &mut Vec<&'sink str>,
+) -> C::Result<'source>
+where
+    'sink: 'source,
+{
+    let same_identity = target_identity.identity() == Some(source_identity);
+    let identity_fits = source_constraints
+        .zip(identity_scalar_constraints(sink.ty, sink_refs))
+        .is_some_and(|(source, target)| source.contained_by(target));
+    let disjoint = sink.attr.has_empty_scalar_intersection()
+        || source_constraints
+            .zip(scalar_value_constraints(sink.ty, sink_refs))
+            .is_some_and(|(source, target)| source.provably_disjoint(target.bounds));
+    C::Result::all([
+        sink.identity_assignment(source_identity, target_identity)
+            .into(),
+        if disjoint || ((!same_identity || check.requires_identity_containment()) && !identity_fits)
+        {
+            TypeAssignability::Mismatch.into()
+        } else {
+            check
+                .destination_obligation(true, same_identity)
+                .expect("identified scalars retain their destination value check")
+        },
+    ])
+}
+
 /// Convert kind evidence while retaining the reference-mode value obligation.
 /// Identified reads carry identity bounds; anonymous reads carry both layers.
 fn known_assignment_result<'source, 'sink, R: PatternForm, C: AssignmentCheck>(
     source: TypeInSchema<'source, R>,
     sink: AssignmentSink<'sink, R>,
-    verdict: super::KnownAssignment,
+    verdict: super::KnownAssignment<'source, 'sink>,
     check: C,
     source_refs: &mut Vec<&'source str>,
     sink_refs: &mut Vec<&'sink str>,
@@ -637,6 +676,18 @@ where
     match verdict {
         super::KnownAssignment::Assignable => TypeAssignability::Assignable.into(),
         super::KnownAssignment::Mismatch => TypeAssignability::Mismatch.into(),
+        super::KnownAssignment::IdentityAdmission {
+            source_identity,
+            source_length,
+            target_binding,
+        } => scalar_identity_assignment(
+            source_identity,
+            Some(NominalScalarConstraints::String(source_length)),
+            sink,
+            IdentityLeaf::Scalar(target_binding),
+            check,
+            sink_refs,
+        ),
         super::KnownAssignment::DeferToSinkValue => {
             let source_bounds = if identity_leaf(&source.attr.kind).is_some() {
                 identity_scalar_constraints(source, source_refs)
@@ -1023,25 +1074,14 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 sink_refs.truncate(target.restore_len);
                 return result;
             }
-            let identity_fits = source_constraints
-                .zip(target_constraints)
-                .is_some_and(|(source, target)| source.contained_by(target));
-            let disjoint = target.attr.has_empty_scalar_intersection()
-                || source_constraints
-                    .zip(scalar_value_constraints(right.ty, sink_refs))
-                    .is_some_and(|(source, target)| source.provably_disjoint(target.bounds));
-            let result = C::Result::all([
-                right
-                    .identity_assignment(source_identity, target_identity)
-                    .into(),
-                if disjoint
-                    || ((!same_identity || check.requires_identity_containment()) && !identity_fits)
-                {
-                    Mismatch.into()
-                } else {
-                    obligation
-                },
-            ]);
+            let result = scalar_identity_assignment(
+                source_identity,
+                source_constraints,
+                right,
+                target_identity,
+                check,
+                sink_refs,
+            );
             source_refs.truncate(source.restore_len);
             sink_refs.truncate(target.restore_len);
             return result;
@@ -2585,10 +2625,10 @@ mod tests {
             let sink = TypeInSchema::schemaless(&target)
                 .with_authority(&catalog, SinkAuthority::Owner(&owner));
             for source in [&overlap, &disjoint] {
-                assert_eq!(
+                assert!(matches!(
                     TypeInSchema::schemaless(source).is_assignable_to_known(sink),
                     super::super::KnownAssignment::DeferToSinkValue
-                );
+                ));
             }
             assert_anonymous_scalar_assignment(&overlap, &target, Expect::NeedsLocal);
             assert_anonymous_scalar_assignment(&disjoint, &target, Expect::Mismatch);

@@ -68,19 +68,25 @@ fn substituted_reference_validate_matches_unknown_source_verdicts_and_messages()
     let (control, text) = run(dir.path(), &["validate", "."]);
     assert!(!control.status.success(), "{text}");
     let control_errors = errors(&text);
-    assert_eq!(control_errors.len(), 1, "{text}");
-    for (unknown_source, known_source, reference, accepted) in [
+    assert_eq!(
+        control_errors,
+        [
+            "mock.test.recovery_probe.sink: cannot assign String to 'value': expected mock.RecoveryProbe, got String (from a.computed)"
+        ],
+        "{text}"
+    );
+    for (unknown_source, known_source, reference, expected_message) in [
         (
             "let a = mock.test.estimated_input {}",
             "let a = mock.test.estimated_input { name = 'abc' }",
             "a.name",
-            false,
+            "mock.test.recovery_probe.sink: cannot assign String to 'value': expected mock.RecoveryProbe, got String (from a.name)",
         ),
         (
             "let r = mock.test.reference { name = 'r' }",
             "let r = mock.test.reference { name = 'r' key = 'k' }",
             "r.key",
-            true,
+            "mock.test.recovery_probe.sink: cannot assign mock.keys.Key.Reference to 'value': expected mock.RecoveryProbe, got mock.keys.Key.Reference (from r.key)",
         ),
     ] {
         for sibling in [false, true] {
@@ -104,19 +110,12 @@ fn substituted_reference_validate_matches_unknown_source_verdicts_and_messages()
             };
             write(unknown_source);
             let (unknown, text) = run(dir.path(), &["validate", "."]);
-            assert_eq!(
-                unknown.status.success(),
-                accepted,
+            assert!(
+                !unknown.status.success(),
                 "{reference}, sibling={sibling}: {text}"
             );
             let unknown_errors = errors(&text);
-            if !accepted {
-                let expected: Vec<_> = control_errors
-                    .iter()
-                    .map(|message| message.replace("a.computed", reference))
-                    .collect();
-                assert_eq!(unknown_errors, expected);
-            }
+            assert_eq!(unknown_errors, [expected_message]);
             write(known_source);
             let (output, text) = run(dir.path(), &["validate", "."]);
             assert_eq!(
@@ -202,5 +201,28 @@ fn secret_substituted_reference_masks_its_origin_like_unknown_source() {
                 "{text}",
             );
         }
+    }
+}
+
+#[test]
+fn issue_4384_anonymous_reference_sink_reports_pending_address() {
+    let main = "mock.test.recovery_probe { value = r.key }\n";
+    let dir = fixture("let r = mock.test.reference { name = 'r' }\n", main);
+    for source in [
+        "let r = mock.test.reference { name = 'r' }\n",
+        "let r = mock.test.reference { name = 'r' key = 'k' }\n",
+    ] {
+        std::fs::write(dir.path().join("sources.crn"), source).unwrap();
+        let (output, text) = run(dir.path(), &["validate", "."]);
+        assert!(!output.status.success(), "{source}{main}\n{text}");
+        assert_eq!(
+            text.lines()
+                .filter_map(|line| line.strip_prefix("Error: "))
+                .collect::<Vec<_>>(),
+            [
+                "mock.test.recovery_probe.<pending>: cannot assign mock.keys.Key.Reference to 'value': expected mock.RecoveryProbe, got mock.keys.Key.Reference (from r.key)"
+            ],
+            "{text}"
+        );
     }
 }

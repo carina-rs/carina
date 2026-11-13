@@ -4116,6 +4116,9 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     ///    also reject. Enum identities are checked before base recursion;
     ///    identity-less scalar bases follow rule 8a's overlap-or-defer rule,
     ///    with enum values checked at the resolved destination.
+    ///    Reference sources into identified String sinks use this identity
+    ///    admission too; identity-less String and Reference sinks retain their
+    ///    wire-scalar compatibility.
     /// 8. Compatible scalar pairs are String→String, Int→Int, Float→Float,
     ///    and Int→Float:
     ///    - 8a. Identity-less pairs use overlap-or-defer (carina#4362).
@@ -4237,14 +4240,18 @@ impl std::fmt::Display for MismatchTypeNames {
 }
 
 /// A scalar kind comparison cannot discard the destination value obligation.
-#[derive(Debug, PartialEq, Eq)]
-enum KnownAssignment {
+enum KnownAssignment<'source, 'sink> {
     Assignable,
     Mismatch,
     DeferToSinkValue,
+    IdentityAdmission {
+        source_identity: &'source TypeIdentity,
+        source_length: Option<(Option<u64>, Option<u64>)>,
+        target_binding: &'sink RefinementBinding,
+    },
 }
 
-impl KnownAssignment {
+impl KnownAssignment<'_, '_> {
     fn from_bool(assignable: bool) -> Self {
         if assignable {
             Self::Assignable
@@ -4382,7 +4389,10 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
 
     /// Scalar structural rules. Nominal and recursive decisions are made by
     /// `assignment_on_paths`, which always carries the sink's authority.
-    fn is_assignable_to_known(self, sink: AssignmentSink<'_, R>) -> KnownAssignment {
+    fn is_assignable_to_known<'sink>(
+        self,
+        sink: AssignmentSink<'sink, R>,
+    ) -> KnownAssignment<'source, 'sink> {
         use AttrTypeKind::*;
         match (&self.attr.kind, &sink.attr.kind) {
             // Scalar destinations without identity share one resolved-value
@@ -4433,9 +4443,9 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     range: _,
                 },
             ) if target.identity().is_none() => KnownAssignment::DeferToSinkValue,
-            // A resolver identity selects comparison behavior, not a different
-            // wire scalar. Reference inputs accept string outputs; constraints
-            // are checked on the materialized value before planning.
+            // Reference slots deliberately accept any string-based source (reference
+            // inputs accept string outputs; constraints are checked on the materialized
+            // value), and #4384 changed only Reference -> identified String admission.
             (
                 String {
                     identity_layer: _,
@@ -4454,15 +4464,24 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             ) => KnownAssignment::Assignable,
             (
                 Reference {
-                    identity: _,
+                    identity,
                     pattern: _,
-                    length: _,
+                    length,
                 },
                 String {
-                    identity_layer: _,
+                    identity_layer: StringIdentityLayer { binding, .. },
                     member_layer: _,
                 },
-            ) => KnownAssignment::Assignable,
+            ) => match binding {
+                RefinementBinding::MetadataOnly(None) => KnownAssignment::Assignable,
+                RefinementBinding::MetadataOnly(Some(_))
+                | RefinementBinding::Annotation(_)
+                | RefinementBinding::Validator { .. } => KnownAssignment::IdentityAdmission {
+                    source_identity: identity,
+                    source_length: *length,
+                    target_binding: binding,
+                },
+            },
 
             (
                 ResourceHandle {

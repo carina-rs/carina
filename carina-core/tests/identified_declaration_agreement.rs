@@ -106,3 +106,60 @@ fn enum_reference_mixing_defers_reference_form_checks_to_aggregate_admission() {
         }) if rejected == identity
     ));
 }
+
+#[test]
+fn issue_4384_mixed_string_reference_declarations_of_one_identity_stay_assignable() {
+    use carina_core::schema::{SchemaKind, SchemaRegistry};
+
+    let identity = TypeIdentity::from_dotted("mock.keys.Key.Reference");
+    let pattern = Some(PatternSpec::new("[a-z]+", PatternMatch::Full));
+    let length = Some((Some(1), Some(8)));
+    let resource = ResourceSchema::new("Mixed")
+        .attribute(
+            AttributeSchema::optional(
+                "reference",
+                AttributeType::reference(identity.clone(), pattern.clone(), length),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::optional(
+                "string",
+                AttributeType::refined_string(Some(identity), pattern, length, None),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![resource],
+        Default::default(),
+        Default::default(),
+        vec![],
+    )
+    .unwrap();
+    let mut registry = SchemaRegistry::new();
+    registry.insert_provider_witness("mock", &witness).unwrap();
+    let loaded = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Default::default(),
+        registry,
+        carina_core::EnvironmentSnapshot::empty(),
+    );
+    let schema = loaded
+        .schema_registry()
+        .get("mock", "Mixed", SchemaKind::Resource)
+        .unwrap();
+    let attributes = schema.as_schema().attributes();
+    for (source, sink) in [("reference", "string"), ("string", "reference")] {
+        assert!(
+            schema
+                .as_schema()
+                .type_in_schema(attributes[source].attr_type())
+                .is_assignable_to(schema.assignment_sink(
+                    attributes[sink].attr_type(),
+                    &loaded.provider_context().custom_types
+                )),
+            "{source} -> {sink}"
+        );
+    }
+}

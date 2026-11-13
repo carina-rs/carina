@@ -103,7 +103,7 @@ fn substituted_reference_known_and_unknown_have_identical_cli_lsp_findings() {
                 };
                 write("");
                 let unknown = findings(&fixture, &schemas);
-                let count = usize::from(sink == "Sink" && matches!(source, "Source" | "Other"));
+                let count = usize::from(sink == "Sink" && source != "Identity");
                 assert_eq!(unknown.0.len(), count, "{source} -> {sink}: {unknown:#?}");
                 assert_eq!(unknown.1.len(), count, "{source} -> {sink}: {unknown:#?}");
                 write("name = 'abc'");
