@@ -156,10 +156,10 @@ trait PreparationPhase {
         session: &dyn ProviderTypeCheckContext,
         lookup: &dyn ValidatedCustomTypeLookup,
         aggregate: &mut ConfigurationBuilder<kind::ProviderConfigAttribute>,
-    ) -> Result<(), AdmissionErrors>;
+    ) -> Result<(), ConfigurationErrors>;
     fn unresolved<P: PlaceholderKind, B: BindingAddress>(
         value: &Value<P, B>,
-    ) -> Result<(), AdmissionErrors>;
+    ) -> Result<(), ConfigurationErrors>;
     fn finish(
         aggregate: ConfigurationBuilder<kind::ProviderConfigAttribute>,
     ) -> Result<Self::Output, crate::provider::ProviderWireError>;
@@ -176,7 +176,7 @@ impl PreparationPhase for Analysis {
         session: &dyn ProviderTypeCheckContext,
         lookup: &dyn ValidatedCustomTypeLookup,
         aggregate: &mut ConfigurationBuilder<kind::ProviderConfigAttribute>,
-    ) -> Result<(), AdmissionErrors> {
+    ) -> Result<(), ConfigurationErrors> {
         match field(destination, value, session, lookup)? {
             Admission::Ready(placed) => {
                 aggregate.place(key.clone(), placed);
@@ -192,7 +192,7 @@ impl PreparationPhase for Analysis {
     }
     fn unresolved<P: PlaceholderKind, B: BindingAddress>(
         _: &Value<P, B>,
-    ) -> Result<(), AdmissionErrors> {
+    ) -> Result<(), ConfigurationErrors> {
         Ok(())
     }
     fn finish(
@@ -217,7 +217,7 @@ impl PreparationPhase for Complete {
         session: &dyn ProviderTypeCheckContext,
         lookup: &dyn ValidatedCustomTypeLookup,
         aggregate: &mut ConfigurationBuilder<kind::ProviderConfigAttribute>,
-    ) -> Result<(), AdmissionErrors> {
+    ) -> Result<(), ConfigurationErrors> {
         aggregate.place(
             key.clone(),
             complete_field(destination, value, session, lookup)?,
@@ -226,7 +226,7 @@ impl PreparationPhase for Complete {
     }
     fn unresolved<P: PlaceholderKind, B: BindingAddress>(
         value: &Value<P, B>,
-    ) -> Result<(), AdmissionErrors> {
+    ) -> Result<(), ConfigurationErrors> {
         let proof = value.knowledge(&KnowledgeContext::validation())?;
         Err(KnowledgeError::<B>::UnresolvedAtBoundary {
             sites: proof.sites().collect(),
@@ -248,30 +248,18 @@ impl PreparationPhase for Complete {
 fn attribute_error(
     provider: &str,
     attribute: &crate::parser::AttributeKey,
-    error: AdmissionErrors,
+    error: ConfigurationErrors,
 ) -> ProviderConfigPreparationError {
-    let errors = match error.into_resolution_error() {
-        ResolutionError::AdmissionConstraints(findings) => findings
-            .findings()
-            .iter()
-            .map(|finding| match finding.error.clone() {
-                TypeError::ResourceValidationFailed { message, .. } => {
-                    TypeError::ValidationFailed { message }
-                }
-                error => error,
-            })
-            .collect(),
-        ResolutionError::Knowledge(error) => vec![TypeError::Knowledge {
-            error,
-            attribute: None,
-        }],
-        error => vec![TypeError::Reference {
-            error: Box::new(crate::resource::SecretDiagnosticError::Public(
-                super::super::AdmissionReferenceError::Resolution(Box::new(error)),
-            )),
-            attribute: None,
-        }],
-    };
+    let errors: Vec<_> = error
+        .errors
+        .into_iter()
+        .map(|error| match error {
+            TypeError::ResourceValidationFailed { message, .. } => {
+                TypeError::ValidationFailed { message }
+            }
+            error => error,
+        })
+        .collect();
     ProviderConfigPreparationError::InvalidAttribute {
         provider: provider.to_owned(),
         attribute: attribute.clone(),

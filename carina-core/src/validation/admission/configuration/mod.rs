@@ -160,17 +160,47 @@ pub(super) fn admit_field<K: DestinationKind, P: PlaceholderKind, B: BindingAddr
     }
 }
 
+/// Configuration classification failures keep their schema error category.
+/// Admission failures retain the findings minted by this configuration owner.
+#[derive(Debug)]
+struct ConfigurationErrors {
+    errors: Vec<TypeError>,
+}
+impl<B: BindingAddress> From<KnowledgeError<B>> for ConfigurationErrors {
+    fn from(error: KnowledgeError<B>) -> Self {
+        Self {
+            errors: vec![TypeError::from(error)],
+        }
+    }
+}
+impl From<AdmissionErrors> for ConfigurationErrors {
+    fn from(mut error: AdmissionErrors) -> Self {
+        let findings = error
+            .take_findings()
+            .expect("configuration admission retains its findings");
+        let errors = match findings.local_error() {
+            Some(error) => vec![error.clone()],
+            None => findings
+                .into_located()
+                .into_iter()
+                .map(|(_, error)| error)
+                .collect(),
+        };
+        Self { errors }
+    }
+}
+
 fn field<K: ConfigurationKind, P: PlaceholderKind, B: BindingAddress>(
     destination: &Destination<K>,
     value: &Value<P, B>,
     session: &dyn ProviderTypeCheckContext,
     lookup: &dyn ValidatedCustomTypeLookup,
-) -> Result<Admission<K, P, B>, AdmissionErrors> {
+) -> Result<Admission<K, P, B>, ConfigurationErrors> {
     let proof = value
         .knowledge(&KnowledgeContext::validation())?
         .into_classification();
     let (candidate, context) = Candidate::configuration(value, session, lookup, proof);
-    admit(destination, candidate, &context)
+    admit(destination, candidate, &context).map_err(Into::into)
 }
 
 fn complete_field<K: ConfigurationKind, P: PlaceholderKind, B: BindingAddress>(
@@ -178,10 +208,18 @@ fn complete_field<K: ConfigurationKind, P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     session: &dyn ProviderTypeCheckContext,
     lookup: &dyn ValidatedCustomTypeLookup,
-) -> Result<PlacedValue<K, P, B>, AdmissionErrors> {
-    let known = Candidate::known_at_apply(
-        value.knowledge(&KnowledgeContext::apply(&ResolvedBindings::default()))?,
-    )?;
+) -> Result<PlacedValue<K, P, B>, ConfigurationErrors> {
+    let proof = value.knowledge(&KnowledgeContext::apply(&ResolvedBindings::default()))?;
+    let sites = proof.sites().collect();
+    let known = KnownValue::from_apply(proof).map_err(|error| match error {
+        KnowledgeError::InvalidStage { operation: _ } => {
+            KnowledgeError::UnresolvedAtBoundary { sites }
+        }
+        error @ (KnowledgeError::Unavailable { .. }
+        | KnowledgeError::Cycle { .. }
+        | KnowledgeError::UnavailableHistoricalSecret(_)
+        | KnowledgeError::UnresolvedAtBoundary { .. }) => error,
+    })?;
     let (candidate, context) = Candidate::configuration(
         value,
         session,

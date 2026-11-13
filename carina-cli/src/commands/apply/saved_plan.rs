@@ -1436,7 +1436,7 @@ mod tests {
             state_lineage: None,
             state_serial: None,
             provider_configs: saved_provider_configs(provider_configs),
-            backend_config: crate::commands::plan::SavedBackendConfig::implicit_local(),
+            backend_config: crate::commands::plan::SavedBackendConfig::default(),
             plan: carina_core::plan::SnapshotPlan::default(),
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
@@ -2064,7 +2064,7 @@ mod tests {
             state_serial: None,
             provider_configs: serde_json::from_value(serde_json::json!([]))
                 .expect("empty saved provider configs"),
-            backend_config: crate::commands::plan::SavedBackendConfig::implicit_local(),
+            backend_config: crate::commands::plan::SavedBackendConfig::default(),
             plan: plan.clone().to_snapshot(),
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),

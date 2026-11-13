@@ -18759,3 +18759,51 @@ fn round13_schema_admission_rejects_members_inside_enum_bases() {
         );
     }
 }
+
+#[test]
+fn round4_configuration_located_findings_cover_legacy_errors_without_primary() {
+    struct Reject;
+    impl ValidatedCustomTypeLookup for Reject {
+        fn validate(&self, value: LocallyValidatedCustomType<'_>) -> Result<(), TypeError> {
+            Err(TypeError::ValidationFailed {
+                message: format!("rejected {}", value.canonical().as_str()).into(),
+            })
+        }
+    }
+    let schema = ValidatedConfigSchema::validate(BTreeMap::from([(
+        "value".into(),
+        crate::schema::AttributeType::list(crate::schema::AttributeType::refined_string(
+            Some(TypeIdentity::bare("Custom")),
+            None,
+            None,
+            None,
+        )),
+    )]))
+    .unwrap();
+    let value: Value = Value::Concrete(ConcreteValue::StringList(vec![
+        "first".into(),
+        "second".into(),
+    ]));
+    let proof = value
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .unwrap()
+        .into_classification();
+    let findings = value_validation::validate_final_provider_value(
+        &schema.parts()["value"],
+        &proof,
+        &BTreeMap::new(),
+        FieldAncestry::WRITABLE,
+        &Reject,
+    );
+    assert!(findings.local_error().is_none());
+    let legacy = findings.clone().into_errors();
+    assert_eq!(legacy.len(), 2);
+    assert_eq!(
+        findings
+            .into_located()
+            .into_iter()
+            .map(|(_, error)| error)
+            .collect::<Vec<_>>(),
+        legacy
+    );
+}

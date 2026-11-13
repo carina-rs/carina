@@ -135,12 +135,6 @@ impl std::error::Error for BackendConfigErrors {}
 /// One schema failure associated with a backend attribute.
 #[derive(Debug, Error)]
 pub enum BackendAttributeError {
-    #[error("Invalid attribute '{attribute}' for backend type '{backend_type}': {error}")]
-    Admission {
-        backend_type: String,
-        attribute: crate::parser::AttributeKey,
-        error: Box<ResolutionError>,
-    },
     #[error("Unknown attribute '{attribute}' for backend type '{backend_type}'")]
     UnknownAttribute {
         backend_type: String,
@@ -162,8 +156,7 @@ pub enum BackendAttributeError {
 impl BackendAttributeError {
     pub fn attribute(&self) -> &crate::parser::AttributeKey {
         match self {
-            Self::Admission { attribute, .. }
-            | Self::UnknownAttribute { attribute, .. }
+            Self::UnknownAttribute { attribute, .. }
             | Self::MissingRequiredAttribute { attribute, .. }
             | Self::InvalidAttribute { attribute, .. } => attribute,
         }
@@ -173,7 +166,7 @@ impl BackendAttributeError {
         match self {
             Self::UnknownAttribute { .. } => 0,
             Self::MissingRequiredAttribute { .. } => 1,
-            Self::InvalidAttribute { .. } | Self::Admission { .. } => 2,
+            Self::InvalidAttribute { .. } => 2,
         }
     }
 }
@@ -189,21 +182,18 @@ impl ValidatedCustomTypeLookup for BuiltinLookup {
 fn attribute_error(
     kind: BackendKind,
     key: &AttributeKey,
-    error: AdmissionErrors,
+    error: ConfigurationErrors,
 ) -> BackendAttributeError {
-    match error.into_resolution_error() {
-        ResolutionError::AdmissionConstraints(findings) => {
-            BackendAttributeError::InvalidAttribute {
-                backend_type: kind.name().into(),
-                attribute: key.clone(),
-                error: Box::new(findings.findings()[0].error.clone()),
-            }
-        }
-        error => BackendAttributeError::Admission {
-            backend_type: kind.name().into(),
-            attribute: key.clone(),
-            error: Box::new(error),
-        },
+    BackendAttributeError::InvalidAttribute {
+        backend_type: kind.name().into(),
+        attribute: key.clone(),
+        error: Box::new(
+            error
+                .errors
+                .into_iter()
+                .next()
+                .expect("a failed backend field has a diagnostic"),
+        ),
     }
 }
 

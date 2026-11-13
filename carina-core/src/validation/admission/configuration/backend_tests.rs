@@ -1,26 +1,43 @@
 use super::*;
 
+fn classification_errors() -> Vec<(KnowledgeError<AbsoluteBindingAddress>, &'static str)> {
+    vec![
+        (
+            KnowledgeError::Cycle {
+                operation: "user function",
+            },
+            "Validation failed: cycle while resolving user function",
+        ),
+        (
+            KnowledgeError::InvalidStage {
+                operation: "fixture classification",
+            },
+            "Validation failed: fixture classification is not valid at this resolution boundary",
+        ),
+        (
+            KnowledgeError::UnavailableHistoricalSecret(
+                serde_json::from_str::<crate::resource::UnavailableSecretError>(
+                    r#"{"path":"saved.plan.provider.token"}"#,
+                )
+                .unwrap(),
+            ),
+            "Validation failed: secret value unavailable at saved.plan.provider.token",
+        ),
+    ]
+}
+
 #[test]
-fn backend_admission_failure_retains_its_typed_cause_once() {
-    let original = ResolutionError::from(KnowledgeError::<AbsoluteBindingAddress>::InvalidStage {
-        operation: "backend fixture",
-    });
-    let diagnostic = attribute_error(BackendKind::Local, &"path".into(), original.clone().into());
-    let BackendAttributeError::Admission { error, .. } = &diagnostic else {
-        panic!("original non-constraint cause must survive")
-    };
-    assert_eq!(error.as_ref(), &original);
-    assert_eq!(
-        diagnostic
-            .to_string()
-            .matches(&original.to_string())
-            .count(),
-        1
-    );
-    assert!(
-        std::error::Error::source(&diagnostic).is_none(),
-        "terminal diagnostics render their cause without exposing it twice"
-    );
+fn round4_backend_classification_keeps_main_category_and_text() {
+    for (error, expected) in classification_errors() {
+        let diagnostic = attribute_error(BackendKind::S3, &"bucket".into(), error.into());
+        assert_eq!(
+            diagnostic.to_string(),
+            format!("Invalid attribute 'bucket' for backend type 's3': {expected}")
+        );
+        assert!(
+            matches!(diagnostic, BackendAttributeError::InvalidAttribute { error, .. } if matches!(*error, TypeError::Knowledge { attribute: None, .. }))
+        );
+    }
 }
 
 #[test]

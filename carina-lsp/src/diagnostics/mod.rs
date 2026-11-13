@@ -951,8 +951,7 @@ impl DiagnosticRun<'_> {
         // sibling call that binds a structural handle and then uses the
         // parameter bare). Resolution retains the parser-owned expression
         // location through the merged pass.
-        let strict_analysis = merged_analysis.as_ref().or(current_analysis.as_ref());
-        if let Some(tree) = strict_analysis
+        if let Some(tree) = merged_analysis.as_ref()
             && let Err(error) = carina_core::parser::resolve_resource_refs_from_analysis(
                 tree,
                 self.provider_context,
@@ -963,10 +962,26 @@ impl DiagnosticRun<'_> {
         // Every catalog runs the same declaration producers. An incomplete
         // catalog records deferrals; a loaded owner produces strict diagnostics.
         {
-            let custom_type_findings = type_resolution
-                .as_ref()
-                .map(|report| report.diagnostics().to_vec())
-                .unwrap_or_default();
+            let custom_type_findings = match merged {
+                Some(_) => type_resolution
+                    .as_ref()
+                    .map(|report| report.diagnostics().to_vec())
+                    .unwrap_or_default(),
+                None => {
+                    if let Some(tree) = current_analysis.as_ref()
+                        && let Err(error) = carina_core::parser::resolve_resource_refs_from_analysis(
+                            tree,
+                            self.provider_context,
+                        )
+                    {
+                        diagnostics.extend(render_analysis_resolution_error(doc, &error));
+                    }
+                    type_resolution
+                        .as_ref()
+                        .map(|report| report.diagnostics().to_vec())
+                        .unwrap_or_default()
+                }
+            };
             for finding in custom_type_findings {
                 if let Some(diagnostic) = render_merged(
                     doc,

@@ -1,0 +1,1 @@
+backend s3 { bucket = recurse('bucket') key = 'state.json' }

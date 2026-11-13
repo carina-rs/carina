@@ -392,9 +392,92 @@ fn review_r2_analysis_declared_field_cannot_silently_drop_pending() {
             Analysis::declared(&destination, &key, &value, session, &lookup, &mut aggregate)
                 .expect_err("a declared-field result must not silently omit Pending");
         assert!(matches!(
-            error.into_resolution_error(),
-            ResolutionError::Knowledge(_)
+            error.errors.as_slice(),
+            [TypeError::Knowledge { .. }]
         ));
     });
     pending.publish(&mut Vec::new());
+}
+
+fn classification_errors() -> Vec<(KnowledgeError<AbsoluteBindingAddress>, &'static str)> {
+    vec![
+        (
+            KnowledgeError::Cycle {
+                operation: "user function",
+            },
+            "Validation failed: cycle while resolving user function",
+        ),
+        (
+            KnowledgeError::InvalidStage {
+                operation: "fixture classification",
+            },
+            "Validation failed: fixture classification is not valid at this resolution boundary",
+        ),
+        (
+            KnowledgeError::UnavailableHistoricalSecret(
+                serde_json::from_str::<crate::resource::UnavailableSecretError>(
+                    r#"{"path":"saved.plan.provider.token"}"#,
+                )
+                .unwrap(),
+            ),
+            "Validation failed: secret value unavailable at saved.plan.provider.token",
+        ),
+    ]
+}
+
+#[test]
+fn round4_provider_classification_keeps_main_category_and_text() {
+    for (error, expected) in classification_errors() {
+        let diagnostic = attribute_error("owner", &"value".into(), error.into());
+        let ProviderConfigPreparationError::InvalidAttribute { error, .. } = diagnostic else {
+            panic!("attribute error")
+        };
+        assert_eq!(error.errors()[0].to_string(), expected);
+        assert!(matches!(
+            error.errors()[0],
+            TypeError::Knowledge {
+                attribute: None,
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
+fn round4_saved_historical_provider_stops_before_configuration_admission() {
+    use crate::parser::{ProviderConfig, ResolvedProviderConfigs, SavedProviderConfigs};
+    use crate::resource::{ConcreteValue, DeferredValue, SnapshotLeaf, Value};
+    let token: Value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "fixture-secret".into(),
+        )))
+        .into(),
+    ));
+    let config = ProviderConfig::<SnapshotLeaf, crate::resource::AbsoluteBindingAddress> {
+        name: "mock".into(),
+        binding: None,
+        attributes: [(
+            "token".to_owned(),
+            crate::value::redact_state_snapshot_value(&token.to_snapshot()).unwrap(),
+        )]
+        .into_iter()
+        .collect(),
+        default_tags: Default::default(),
+        unresolved_attributes: Default::default(),
+        source: None,
+        version: None,
+        revision: None,
+    };
+    let saved: SavedProviderConfigs =
+        serde_json::from_value(serde_json::to_value(vec![config]).unwrap()).unwrap();
+    let saved = saved.redact_secrets().unwrap();
+    let error = ResolvedProviderConfigs::try_from(saved).unwrap_err();
+    assert!(matches!(
+        error,
+        crate::parser::ProviderConfigInvariantError::UnavailableSecret(_)
+    ));
+    assert_eq!(
+        error.to_string(),
+        "secret value unavailable at provider mock"
+    );
 }

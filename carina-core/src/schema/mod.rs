@@ -15644,21 +15644,6 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 /// let _ = no_lookup();
 /// ```
 ///
-/// A rootless config type likewise cannot accept an arbitrary lookup:
-///
-/// ```compile_fail,E0599
-/// use std::collections::BTreeMap;
-/// use carina_core::resource::{ConcreteValue, Value};
-/// use carina_core::schema::{AttributeType, ValidatedConfigSchema};
-///
-/// let config = ValidatedConfigSchema::validate(BTreeMap::from([
-///     ("name".to_string(), AttributeType::string()),
-/// ])).unwrap();
-/// let rootless = config.rootless_type("name").unwrap();
-/// let value = Value::Concrete(ConcreteValue::String("ok".into()));
-/// let _ = rootless.validate_with_lookup(&value, &|_, _| Ok(()));
-/// ```
-///
 /// Resource attributes must enter admission with boundary evidence; an
 /// owner-bound schema cannot decide their validity by itself.
 ///

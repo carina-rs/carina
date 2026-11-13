@@ -1,0 +1,1 @@
+let subject = mock.test.resource { name = 'test' }

@@ -2250,7 +2250,7 @@ mod tests {
         let app_err: AppError = backend_err.into();
         assert!(matches!(
             app_err,
-            AppError::Backend(ref report) if matches!(report, BackendError::Configuration(_))
+            AppError::Backend(BackendError::Configuration(_))
         ));
         assert!(app_err.to_string().contains("missing bucket"));
     }
@@ -2535,7 +2535,7 @@ mod tests {
         let app_err: AppError = locked.into();
         assert!(matches!(
             app_err,
-            AppError::Backend(ref report) if matches!(report, BackendError::Locked { .. })
+            AppError::Backend(BackendError::Locked { .. })
         ));
     }
 
@@ -2828,20 +2828,20 @@ mod tests {
 }
 
 #[cfg(test)]
-mod review_r2_backend_diagnostic_tests {
+mod terminal_locate_rendering_tests {
     use super::*;
 
     #[test]
-    fn review_r2_backend_locate_diagnostic_renders_inspectable_cause_once() {
+    fn terminal_locate_rendering_keeps_inspectable_cause_once() {
         let backend = BackendError::from(carina_state::LocalStateLocateError::from(
             std::io::Error::other("typed locate cause"),
         ));
         assert!(std::error::Error::source(&backend).is_none());
         let error = AppError::from(backend);
-        let AppError::Backend(diagnostic) = &error else {
-            panic!("typed backend diagnostic")
+        let AppError::Backend(locate) = &error else {
+            panic!("terminal locate error")
         };
-        assert!(std::error::Error::source(diagnostic).is_none());
+        assert!(std::error::Error::source(locate).is_none());
         assert_eq!(
             format_error_with_source_chain(&error),
             "I/O error: Failed to locate state file: typed locate cause",

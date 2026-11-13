@@ -490,7 +490,7 @@ mod provider_scope_evidence_tests {
             state_lineage: None,
             state_serial: None,
             provider_configs,
-            backend_config: SavedBackendConfig::implicit_local(),
+            backend_config: SavedBackendConfig::default(),
             plan: SnapshotPlan::default(),
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
@@ -4681,7 +4681,7 @@ mod managed_current_serde_tests {
             state_serial: None,
             provider_configs: serde_json::from_value(serde_json::json!([]))
                 .expect("empty saved provider configs"),
-            backend_config: SavedBackendConfig::implicit_local(),
+            backend_config: SavedBackendConfig::default(),
             plan: (carina_core::plan::Plan::new()).to_snapshot(),
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
@@ -9545,7 +9545,7 @@ mod run_plan_out_tests {
             &carina_core::paths::ResolvedPath::new(&path).unwrap(),
             &parsed,
             &provider_configs,
-            SavedBackendConfig::implicit_local(),
+            SavedBackendConfig::default(),
             &Some(state_file),
             &ctx,
             &ValidatedConfig::from_factories_for_test(
@@ -9956,7 +9956,7 @@ mod run_plan_out_tests {
             &carina_core::paths::ResolvedPath::new(&path).unwrap(),
             &parsed,
             &provider_configs,
-            SavedBackendConfig::implicit_local(),
+            SavedBackendConfig::default(),
             &None,
             &ctx,
             &ValidatedConfig::from_factories_for_test(
@@ -10063,7 +10063,7 @@ mod run_plan_out_tests {
             &carina_core::paths::ResolvedPath::new(&path).unwrap(),
             &parsed,
             &provider_configs,
-            SavedBackendConfig::implicit_local(),
+            SavedBackendConfig::default(),
             &None,
             &ctx,
             &ValidatedConfig::from_factories_for_test(
@@ -10142,7 +10142,7 @@ mod run_plan_out_tests {
             &carina_core::paths::ResolvedPath::new(&path).unwrap(),
             &parsed,
             &provider_configs,
-            SavedBackendConfig::implicit_local(),
+            SavedBackendConfig::default(),
             &None,
             &ctx,
             &ValidatedConfig::from_factories_for_test(
@@ -10223,7 +10223,7 @@ mod run_plan_out_tests {
             &carina_core::paths::ResolvedPath::new(&path).unwrap(),
             &parsed,
             &provider_configs,
-            SavedBackendConfig::implicit_local(),
+            SavedBackendConfig::default(),
             &None,
             &ctx,
             &wiring,

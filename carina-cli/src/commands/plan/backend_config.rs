@@ -1,14 +1,13 @@
 use carina_core::parser::ExpandedBackendConfig;
 
-/// Decoded saved-plan candidate, never backend construction authority.
-/// Implicit selection has no candidate; a recorded candidate crosses state
-/// configuration admission before use.
-/// Selection consumes `selection_source()` so wire omission retains its origin.
+/// Decoded saved-plan selection, never backend construction authority.
+/// Execution enters through `selection_source()`; wire serialization retains
+/// the optional candidate without exposing its stored payload directly.
 ///
 /// ```compile_fail
 /// use carina_cli::commands::plan::SavedBackendConfig;
 /// fn bypass(config: &SavedBackendConfig) {
-///     let _ = config.candidate(); // forbidden: only serialization can access the bare candidate
+///     let _ = &config.source; // forbidden: the stored payload is private
 /// }
 /// ```
 /// ```
@@ -16,50 +15,68 @@ use carina_core::parser::ExpandedBackendConfig;
 /// # fn bypass(config: &SavedBackendConfig) {
 /// # }
 /// ```
-#[derive(Debug, Clone)]
-pub enum SavedBackendConfig {
+#[derive(Debug, Clone, Default)]
+pub struct SavedBackendConfig {
+    source: SavedBackendSource,
+}
+#[derive(Debug, Clone, Default)]
+enum SavedBackendSource {
+    #[default]
     Implicit,
     Recorded(ExpandedBackendConfig),
 }
 impl SavedBackendConfig {
-    pub fn implicit_local() -> Self {
-        Self::Implicit
-    }
-    pub fn from_read_backend(backend: &carina_state::ResolvedReadBackend) -> Self {
-        match backend.origin() {
-            carina_state::ReadBackendOrigin::Implicit => Self::Implicit,
-            carina_state::ReadBackendOrigin::Declared | carina_state::ReadBackendOrigin::Locked => {
-                Self::Recorded(backend.selected_config().to_parser_config())
-            }
+    pub(super) fn from_read_backend(backend: &carina_state::ResolvedReadBackend) -> Self {
+        Self {
+            source: match backend.origin() {
+                carina_state::ReadBackendOrigin::Implicit => SavedBackendSource::Implicit,
+                carina_state::ReadBackendOrigin::Declared
+                | carina_state::ReadBackendOrigin::Locked => {
+                    SavedBackendSource::Recorded(backend.selected_config().to_parser_config())
+                }
+            },
         }
     }
     pub fn selection_source(&self) -> carina_state::BackendConfigurationSource<'_> {
-        match self {
-            Self::Implicit => carina_state::BackendConfigurationSource::Implicit,
-            Self::Recorded(candidate) => {
+        match &self.source {
+            SavedBackendSource::Implicit => carina_state::BackendConfigurationSource::Implicit,
+            SavedBackendSource::Recorded(candidate) => {
                 carina_state::BackendConfigurationSource::Declared(candidate)
             }
         }
     }
     pub(super) fn candidate(&self) -> Option<&ExpandedBackendConfig> {
-        match self {
-            Self::Implicit => None,
-            Self::Recorded(candidate) => Some(candidate),
+        match &self.source {
+            SavedBackendSource::Implicit => None,
+            SavedBackendSource::Recorded(candidate) => Some(candidate),
         }
     }
     pub(super) fn into_wire(self) -> Option<ExpandedBackendConfig> {
-        match self {
-            Self::Implicit => None,
-            Self::Recorded(candidate) => Some(candidate),
+        match self.source {
+            SavedBackendSource::Implicit => None,
+            SavedBackendSource::Recorded(candidate) => Some(candidate),
         }
     }
 }
 impl From<Option<ExpandedBackendConfig>> for SavedBackendConfig {
     fn from(candidate: Option<ExpandedBackendConfig>) -> Self {
-        match candidate {
-            Some(candidate) => Self::Recorded(candidate),
-            None => Self::Implicit,
+        Self {
+            source: match candidate {
+                Some(candidate) => SavedBackendSource::Recorded(candidate),
+                None => SavedBackendSource::Implicit,
+            },
         }
+    }
+}
+impl serde::Serialize for SavedBackendConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&self.candidate(), serializer)
+    }
+}
+impl<'de> serde::Deserialize<'de> for SavedBackendConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        <Option<ExpandedBackendConfig> as serde::Deserialize>::deserialize(deserializer)
+            .map(Self::from)
     }
 }
 
@@ -121,11 +138,38 @@ mod round3_exact_saved_backend_tests {
     use super::*;
     #[test]
     fn round3_saved_backend_implicit_has_no_candidate() {
-        let saved = SavedBackendConfig::Implicit;
+        let saved = SavedBackendConfig::default();
         assert!(matches!(
             saved.selection_source(),
             carina_state::BackendConfigurationSource::Implicit
         ));
         assert_eq!(serde_json::to_string(&saved.into_wire()).unwrap(), "null");
+    }
+}
+
+#[cfg(test)]
+mod round4_saved_backend_tests {
+    use super::*;
+    #[test]
+    fn round4_saved_backend_serde_preserves_private_origin_payload() {
+        let recorded = ExpandedBackendConfig {
+            backend_type: "local".into(),
+            attributes: [(
+                "path".to_owned(),
+                carina_core::resource::Value::Concrete(
+                    carina_core::resource::ConcreteValue::String("state.json".into()),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+            attribute_spans: Default::default(),
+        };
+        for wire in [
+            serde_json::Value::Null,
+            serde_json::to_value(recorded).unwrap(),
+        ] {
+            let saved: SavedBackendConfig = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&saved).unwrap(), wire);
+        }
     }
 }
