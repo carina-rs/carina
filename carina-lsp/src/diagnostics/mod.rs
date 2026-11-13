@@ -741,7 +741,15 @@ impl DiagnosticRun<'_> {
     ) -> Vec<Diagnostic> {
         let mut conversion_validation: carina_core::validation::ConversionValidation<
             OrdinaryDiagnostic,
-        > = Default::default();
+        > = match doc.parsed_buffer() {
+            Some(source) => {
+                carina_core::validation::ConversionValidation::for_editor_source(source)
+            }
+            None => carina_core::validation::ConversionValidation::for_parse_failure(
+                doc.parse_error()
+                    .expect("a document without a parse carries its parse failure"),
+            ),
+        };
         let ordinary =
             self.collect_diagnostics_in(doc, current_file_path, &mut conversion_validation);
         conversion_validation.extend(ordinary.into_iter().map(OrdinaryDiagnostic::visible));

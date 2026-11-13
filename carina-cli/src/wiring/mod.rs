@@ -5067,7 +5067,7 @@ pub(crate) fn validate_module_attribute_refs_after_expansion_failure(
 ) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {
-        let mut parsed = module.loaded().parsed.clone();
+        let mut parsed = module.loaded().parsed().clone();
         let findings = match validation::resolve_file_type_exprs(&mut parsed, config) {
             Ok(findings) => findings,
             Err(error) => {
@@ -5109,10 +5109,11 @@ pub(crate) fn validate_module_internal_ref_types(
     errors: &mut validation::ConversionValidation<AppError>,
 ) {
     for module in module_walk.iter() {
-        let mut parsed = module.loaded().parsed.clone();
+        let mut template = module.loaded().preflight();
+        let parsed = template.parsed();
         let prefix = module.diagnostic_label().to_string();
         let configuration = carina_core::config_loader::load_buffer_configuration(
-            &parsed,
+            parsed,
             ctx.schemas(),
             config.catalog(),
         );
@@ -5127,7 +5128,7 @@ pub(crate) fn validate_module_internal_ref_types(
         // Module expansion retains the established diagnostic for malformed
         // declarations. This pass only needs successful resolution so valid
         // dotted argument types can act as sources before expansion.
-        let findings = match validation::resolve_file_type_exprs(&mut parsed, config) {
+        let findings = match template.resolve_type_exprs(config) {
             Ok(findings) => findings,
             Err(error) => {
                 errors.push(AppError::AnalysisInvariant(error));
@@ -5142,26 +5143,23 @@ pub(crate) fn validate_module_internal_ref_types(
             continue;
         }
 
+        let parsed = template.parsed();
         let imported = module_resolver::load_resolved_module_signatures(
-            &parsed,
+            parsed,
             module.module_path(),
             config.catalog(),
         );
         let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
-            &parsed, ctx.schemas(), None, &imported, config,
+            parsed, ctx.schemas(), None, &imported, config,
         );
-        let configuration = carina_core::config_loader::load_buffer_configuration(
-            &parsed,
-            ctx.schemas(),
-            config.catalog(),
-        );
+        let configuration = template.judge(ctx.schemas(), config.catalog());
         let mut sink = ValidationReportSink {
             errors: Vec::new(),
             warnings: Vec::new(),
         };
         if let Err(error) = validation::resource_reference_preflight_findings_in(
             errors,
-            configuration.judged(),
+            &configuration,
             &bindings,
             &mut sink,
             validation::FindingSubject::Module(prefix.clone()),
@@ -5202,7 +5200,7 @@ pub(crate) fn validate_module_internal_ref_types(
 pub(crate) fn validate_no_provider_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {
-        if let Err(message) = validation::validate_no_provider_in_module(&module.loaded().parsed) {
+        if let Err(message) = validation::validate_no_provider_in_module(module.loaded().parsed()) {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
                 module.diagnostic_label()
@@ -5221,7 +5219,7 @@ pub(crate) fn validate_no_state_blocks_in_modules(module_walk: &ModuleWalk) -> V
     let mut errors = Vec::new();
     for module in module_walk.iter() {
         if let Err(message) =
-            validation::validate_no_state_blocks_in_module(&module.loaded().parsed)
+            validation::validate_no_state_blocks_in_module(module.loaded().parsed())
         {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
@@ -5239,7 +5237,7 @@ pub(crate) fn validate_no_state_blocks_in_modules(module_walk: &ModuleWalk) -> V
 pub(crate) fn validate_no_backend_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {
-        if let Err(message) = validation::validate_no_backend_in_module(&module.loaded().parsed) {
+        if let Err(message) = validation::validate_no_backend_in_module(module.loaded().parsed()) {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
                 module.diagnostic_label()
@@ -5257,7 +5255,7 @@ pub(crate) fn validate_no_upstream_states_in_modules(module_walk: &ModuleWalk) -
     let mut errors = Vec::new();
     for module in module_walk.iter() {
         if let Err(message) =
-            validation::validate_no_upstream_states_in_module(&module.loaded().parsed)
+            validation::validate_no_upstream_states_in_module(module.loaded().parsed())
         {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
@@ -5275,7 +5273,7 @@ pub(crate) fn validate_no_upstream_states_in_modules(module_walk: &ModuleWalk) -
 pub(crate) fn validate_no_exports_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {
-        if let Err(message) = validation::validate_no_exports_in_module(&module.loaded().parsed) {
+        if let Err(message) = validation::validate_no_exports_in_module(module.loaded().parsed()) {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
                 module.diagnostic_label()

@@ -5748,7 +5748,7 @@ pub fn resource_reference_findings<
     bindings: &BindingIndex<'_, B>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
 ) -> Result<PresentedFindings, crate::parser::AnalysisTreeError> {
-    let mut run = ConversionValidation::default();
+    let mut run = ConversionValidation::new(judged.report());
     resource_reference_findings_in(
         &mut run,
         judged,
@@ -5784,21 +5784,29 @@ pub fn resource_reference_findings_in<
     Ok(())
 }
 
-/// Ordinary module preflight uses its own parse, never an expansion inventory.
-pub fn resource_reference_preflight_findings_in<
-    E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
-    B: BindingAddress,
-    F: ValidationClientError,
-    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
->(
+/// Ordinary module preflight accepts only loader-produced module evidence.
+/// A root judgement cannot obtain a suppress-only template claim.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::{ParsedFile, ProviderContext}, schema::SchemaRegistry,
+///     validation::{ConversionValidation, FindingSubject, resource_reference_preflight_findings_in}};
+/// let parsed = ParsedFile::default();
+/// let schemas = SchemaRegistry::new();
+/// let catalog = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+/// let root = carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+/// let bindings = carina_core::binding_index::BindingIndex::from_parsed(root.parsed(), &schemas, &catalog);
+/// let mut run = ConversionValidation::<std::convert::Infallible>::new(root.judged().report());
+/// resource_reference_preflight_findings_in(&mut run, root.judged(), &bindings, &mut Vec::new(), FindingSubject::Root);
+/// ```
+pub fn resource_reference_preflight_findings_in<F: ValidationClientError>(
     run: &mut ConversionValidation<F>,
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
-    bindings: &BindingIndex<'_, B>,
+    template: &crate::module_resolver::ModuleTemplatePreflight<'_>,
+    bindings: &BindingIndex<'_>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
     subject: FindingSubject,
 ) -> Result<(), crate::parser::AnalysisTreeError> {
     let report = resource_admission_report(
-        judged,
+        template.judged(),
         bindings,
         diagnostics,
         run,
@@ -5819,7 +5827,7 @@ pub fn resource_admission_findings<
     known_providers: &HashSet<String>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
 ) -> Result<PresentedFindings, crate::parser::AnalysisTreeError> {
-    let mut run = ConversionValidation::default();
+    let mut run = ConversionValidation::new(judged.report());
     resource_admission_findings_in(
         &mut run,
         judged,

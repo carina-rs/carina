@@ -5065,7 +5065,12 @@ mod judgement {
                     false,
                 );
                 failure.report_at(FailureOwner::BindingIndex);
-                return JudgedExpr::build(failure.data, conversion::flow::JudgementEdges::Leaf);
+                return JudgedExpr::build(
+                    failure.data,
+                    conversion::flow::JudgementEdges::MissingReference(
+                        conversion::flow::MissingReferenceEdge::BindingCycle,
+                    ),
+                );
             }
             let outer_placement_owner = self.placement_owner.clone();
             self.placement_owner = match &root.kind {
@@ -5225,6 +5230,9 @@ mod judgement {
                 ExprKind::Parameter(_) => E::NonCrossed(N::FunctionParameter),
                 ExprKind::Binding(binding) if self.parameter_type(binding).is_some() => {
                     E::NonCrossed(N::ModuleArgument)
+                }
+                ExprKind::Binding(_) if reference.is_none() => {
+                    E::MissingReference(conversion::flow::MissingReferenceEdge::UndefinedBinding)
                 }
                 ExprKind::Reference { binding, .. } if reference.is_none() => {
                     let cut = match self.bindings.get(binding.as_str()) {

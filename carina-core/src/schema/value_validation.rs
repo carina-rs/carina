@@ -10,9 +10,11 @@ use crate::resource::knowledge::{KnownView, ShapeView};
 use crate::validation::admission::assignment_seam_error as seam_error;
 
 mod references;
+mod syntax_children;
 use references::{
     OrdinaryCheck, ReferenceMemo, ReferencePolicy, SupplementalData, SupplementalFindings,
 };
+use syntax_children::{ChildStep, DeclineSink};
 
 #[cfg(test)]
 mod cursor_allocations {
@@ -833,6 +835,7 @@ pub(crate) struct PolicyPosition<'a, 'w, B: BindingAddress, M: WalkMode> {
 }
 pub(crate) trait WalkMode: Clone + Default {
     type Channel: FindingsChannel + 'static;
+    type Declines: Default;
     type Policy<'a, P: ValueKind + 'a, B: BindingAddress>: Copy;
     type Claim<'a, B: BindingAddress>: ClaimState<'a, B, Channel = Self::Channel>;
     fn shorten<'a: 'b, 'b, P: ValueKind + 'a, B: BindingAddress>(
@@ -841,6 +844,14 @@ pub(crate) trait WalkMode: Clone + Default {
     fn reject_transport<B: BindingAddress>(
         cursor: &AuthoredCursor<'_, B>,
         path: &LeafPath,
+    ) -> AssignmentFindings<Self::Channel>;
+    fn decline_child<P: ValueKind, B: BindingAddress>(
+        policy: Self::Policy<'_, P, B>,
+        memo: &mut Self::Declines,
+        child: &AuthoredUse<'_, B>,
+        reason: &crate::parser::retained::conversion::DeclineReason,
+        path: &LeafPath,
+        secret: bool,
     ) -> AssignmentFindings<Self::Channel>;
     fn judge_position<'s, 'c, 'd, 'v, P: PlaceholderKind, B: BindingAddress>(
         callbacks: &WalkCallbacks<'c, P, B, Self>,
@@ -877,6 +888,7 @@ pub(crate) trait WalkMode: Clone + Default {
 }
 impl WalkMode for NoAuthored {
     type Channel = NoConversions;
+    type Declines = ();
     type Policy<'a, P: ValueKind + 'a, B: BindingAddress> = ();
     type Claim<'a, B: BindingAddress> = NoClaim;
     fn shorten<'a: 'b, 'b, P: ValueKind + 'a, B: BindingAddress>(_: ()) {}
@@ -892,6 +904,19 @@ impl WalkMode for NoAuthored {
                 )),
             )],
             ..Default::default()
+        }
+    }
+    fn decline_child<P: ValueKind, B: BindingAddress>(
+        _policy: (),
+        _memo: &mut (),
+        child: &AuthoredUse<'_, B>,
+        _reason: &crate::parser::retained::conversion::DeclineReason,
+        path: &LeafPath,
+        _secret: bool,
+    ) -> AssignmentFindings<NoConversions> {
+        match child.node().judgement().no_conversion() {
+            Some(_proof) => Default::default(),
+            None => Self::reject_transport(&AuthoredCursor::authored(child.clone()), path),
         }
     }
     fn apply_policy<'a, P: PlaceholderKind, B: BindingAddress>(
@@ -912,6 +937,7 @@ impl WalkMode for NoAuthored {
 }
 impl WalkMode for WithAuthored {
     type Channel = crate::ConversionChannel;
+    type Declines = crate::parser::retained::conversion::DeclinedConversions;
     type Policy<'a, P: ValueKind + 'a, B: BindingAddress> = AuthoredChecks<'a, P, B>;
     type Claim<'a, B: BindingAddress> = Claim<'a, B>;
     fn shorten<'a: 'b, 'b, P: ValueKind + 'a, B: BindingAddress>(
@@ -936,6 +962,27 @@ impl WalkMode for WithAuthored {
                 findings
             },
         )
+    }
+    fn decline_child<P: ValueKind, B: BindingAddress>(
+        policy: AuthoredChecks<'_, P, B>,
+        memo: &mut Self::Declines,
+        child: &AuthoredUse<'_, B>,
+        reason: &crate::parser::retained::conversion::DeclineReason,
+        path: &LeafPath,
+        secret: bool,
+    ) -> AssignmentFindings {
+        match policy {
+            AuthoredChecks::Validation(_) => AssignmentFindings {
+                conversions: memo.reject(child.node().judgement(), reason, secret),
+                ..Default::default()
+            },
+            // The sealed module preflight never admits values or publishes
+            // verdicts for its separate parse. Its instance supplies the check.
+            AuthoredChecks::Preflight(_) => Default::default(),
+            AuthoredChecks::Projected(_) => {
+                Self::reject_transport(&AuthoredCursor::authored(child.clone()), path)
+            }
+        }
     }
     fn apply_policy<'a, P: PlaceholderKind, B: BindingAddress>(
         callbacks: &WalkCallbacks<'_, P, B, Self>,
@@ -2771,6 +2818,7 @@ fn visit_syntax<'w, 's: 'w, P: PlaceholderKind, B: BindingAddress, M: WalkMode>(
         coverage: &mut WalkCoverage,
         findings: &mut AssignmentProbe<M::Channel>,
         visited: &mut SyntaxVisits,
+        declines: &mut M::Declines,
     ) -> Result<(), TypeError> {
         let mut references = Vec::new();
         let resolved = resolve_refs_on_path(attr, defs, &mut references)
@@ -2812,6 +2860,7 @@ fn visit_syntax<'w, 's: 'w, P: PlaceholderKind, B: BindingAddress, M: WalkMode>(
                     coverage,
                     findings,
                     visited,
+                    declines,
                 );
             }
             let policy_position = (visit.claim.is_claimed()
@@ -2881,6 +2930,7 @@ fn visit_syntax<'w, 's: 'w, P: PlaceholderKind, B: BindingAddress, M: WalkMode>(
                         visit.clone(),
                         &mut reached,
                         &mut probe,
+                        &mut Default::default(),
                         &mut Default::default(),
                     )?;
                     let rank = (
@@ -2956,45 +3006,55 @@ fn visit_syntax<'w, 's: 'w, P: PlaceholderKind, B: BindingAddress, M: WalkMode>(
                     | AuthoredNavigation::Secret(_)
                     | AuthoredNavigation::Alternatives { .. }
             );
-            let mut child = |attr: &'w CompiledAttributeType,
-                             child: AuthoredUse<'s, B>,
-                             path: FieldPath,
-                             ancestry| {
-                let nested = if same_position {
-                    visit.clone()
-                } else {
-                    SyntaxVisitState::<B, M> {
-                        claim: Default::default(),
-                        ..visit.clone()
-                    }
-                };
-                descend(
-                    attr,
-                    defs,
-                    &path,
-                    ancestry,
-                    child,
-                    callbacks.clone(),
-                    nested,
-                    coverage,
-                    findings,
-                    visited,
-                )
+            let mut child = |step: ChildStep<'w, 's, B>,
+                             findings: &mut AssignmentProbe<M::Channel>,
+                             declines: &mut M::Declines| {
+                step.visit(|child| {
+                    let nested = if same_position {
+                        visit.clone()
+                    } else {
+                        SyntaxVisitState::<B, M> {
+                            claim: Default::default(),
+                            ..visit.clone()
+                        }
+                    };
+                    descend(
+                        child.declaration,
+                        defs,
+                        &child.path,
+                        child.ancestry,
+                        child.cursor,
+                        callbacks.clone(),
+                        nested,
+                        coverage,
+                        findings,
+                        visited,
+                        declines,
+                    )
+                })
             };
             match navigation {
-                AuthoredNavigation::Forward { child: next, .. } => {
-                    child(attr, next, path.clone(), ancestry)
-                }
-                AuthoredNavigation::Secret(next) => {
-                    child(attr, next, path.clone(), ancestry.inside_secret())
-                }
+                AuthoredNavigation::Forward { child: next, .. } => child(
+                    ChildStep::descend(attr, next, path.clone(), ancestry),
+                    findings,
+                    declines,
+                ),
+                AuthoredNavigation::Secret(next) => child(
+                    ChildStep::descend(attr, next, path.clone(), ancestry.inside_secret()),
+                    findings,
+                    declines,
+                ),
                 AuthoredNavigation::Alternatives { first, .. } => {
                     for index in 0..cursor.child_count() - first {
                         child(
-                            attr,
-                            cursor.alternative(index).map_err(seam_error)?,
-                            path.clone(),
-                            ancestry,
+                            ChildStep::descend(
+                                attr,
+                                cursor.alternative(index).map_err(seam_error)?,
+                                path.clone(),
+                                ancestry,
+                            ),
+                            findings,
+                            declines,
                         )?;
                     }
                     Ok(())
@@ -3018,88 +3078,36 @@ fn visit_syntax<'w, 's: 'w, P: PlaceholderKind, B: BindingAddress, M: WalkMode>(
                         | AttrTypeKind::Struct { .. } => attr,
                     };
                     for index in 0..cursor.child_count() {
-                        let route = ChildRoute::ListItem(index);
-                        let CursorKind::Authored(next) = route
-                            .step(&AuthoredCursor::authored(cursor.clone()))
-                            .map_err(seam_error)?
-                            .kind
-                        else {
-                            unreachable!("authored list child")
-                        };
-                        child(element, next, route.path(path), ancestry)?;
+                        let step = ChildStep::list(element, &cursor, index, path, ancestry)?;
+                        child(step, findings, declines)?;
                     }
                     Ok(())
                 }
                 AuthoredNavigation::Map => {
                     for key in cursor.map_keys() {
-                        let (declaration, route, ancestry) = match &attr.kind {
-                            AttrTypeKind::Map { value, .. } => (
-                                value.as_ref(),
-                                ChildRoute::MapValue(std::borrow::Cow::Borrowed(key)),
-                                ancestry,
-                            ),
-                            AttrTypeKind::Struct { fields, .. } => {
-                                let Some(field) = struct_field_for_key(
-                                    fields,
-                                    key.transport_identity(),
-                                    ancestry,
-                                ) else {
-                                    continue;
-                                };
-                                if validate_struct_field_assignment(
-                                    field,
-                                    &key.to_string(),
-                                    ancestry,
-                                )
-                                .is_some()
-                                {
-                                    continue;
-                                }
-                                (
-                                    &field.field_type,
-                                    ChildRoute::StructField {
-                                        key: std::borrow::Cow::Borrowed(key),
-                                        alias: ancestry.block_name(field),
-                                    },
-                                    ancestry.descend(field),
-                                )
-                            }
-                            AttrTypeKind::UnloadedSchemaType(_)
-                            | AttrTypeKind::Reference { .. }
-                            | AttrTypeKind::String { .. }
-                            | AttrTypeKind::ResourceHandle { .. }
-                            | AttrTypeKind::StringLiteralSet { .. }
-                            | AttrTypeKind::Int { .. }
-                            | AttrTypeKind::Float { .. }
-                            | AttrTypeKind::Bool
-                            | AttrTypeKind::Duration
-                            | AttrTypeKind::Enum { .. }
-                            | AttrTypeKind::Union(_)
-                            | AttrTypeKind::Ref(_)
-                            | AttrTypeKind::List { .. } => (
-                                attr,
-                                ChildRoute::MapValue(std::borrow::Cow::Borrowed(key)),
-                                ancestry,
-                            ),
-                        };
-                        let CursorKind::Authored(next) = route
-                            .step(&AuthoredCursor::authored(cursor.clone()))
-                            .map_err(seam_error)?
-                            .kind
-                        else {
-                            unreachable!("authored map child")
-                        };
-                        child(declaration, next, route.path(path), ancestry)?;
+                        let step = ChildStep::map(
+                            attr,
+                            &cursor,
+                            key,
+                            path,
+                            ancestry,
+                            DeclineSink::new(&callbacks, declines, &mut findings.authored),
+                        )?;
+                        child(step, findings, declines)?;
                     }
                     Ok(())
                 }
                 AuthoredNavigation::Parts => {
                     for index in 0..cursor.child_count() {
                         child(
-                            attr,
-                            cursor.part(index).map_err(seam_error)?,
-                            path.clone(),
-                            ancestry,
+                            ChildStep::descend(
+                                attr,
+                                cursor.part(index).map_err(seam_error)?,
+                                path.clone(),
+                                ancestry,
+                            ),
+                            findings,
+                            declines,
                         )?;
                     }
                     Ok(())
@@ -3127,6 +3135,7 @@ fn visit_syntax<'w, 's: 'w, P: PlaceholderKind, B: BindingAddress, M: WalkMode>(
         },
         &mut completed,
         &mut findings,
+        &mut Default::default(),
         &mut Default::default(),
     )?;
     coverage.extend(completed);

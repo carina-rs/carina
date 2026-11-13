@@ -94,7 +94,7 @@ fn visit_module(
         return;
     };
     let child_paths: Vec<_> = loaded
-        .parsed
+        .parsed()
         .uses
         .iter()
         .filter_map(|import| {

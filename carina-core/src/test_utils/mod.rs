@@ -607,3 +607,10 @@ pub fn ordinary_sink_result_for_test<T, E>(
         }
     }
 }
+
+/// Start an isolated collector for fixtures that do not own a parsed document.
+/// Production clients start from a directory, Judge report, or parse failure.
+pub fn conversion_validation<E: crate::validation::ValidationClientError>()
+-> crate::validation::ConversionValidation<E> {
+    crate::validation::ConversionValidation::for_test()
+}

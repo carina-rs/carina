@@ -313,7 +313,7 @@ impl<'a> CstBuilder<'a> {
             | Rule::multiplicative_op
             | Rule::as_keyword
             | Rule::conversion_type_path => {
-                Some(CstChild::Token(Token::new(pair.as_str().to_string(), span)))
+                Some(CstChild::Token(Token::from_rule(pair.as_str().to_string(), span, pair.as_rule())))
             }
             Rule::dot => Some(CstChild::Token(Token::new(".".to_string(), span))),
 

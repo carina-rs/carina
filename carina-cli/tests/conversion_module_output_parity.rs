@@ -50,6 +50,21 @@ impl ProviderFactory for ConversionFactory {
             )
         };
         vec![
+            ResourceSchema::new("SecretSink")
+                .attribute(
+                    AttributeSchema::optional(
+                        "attr",
+                        AttributeType::refined_string(
+                            Some(TypeIdentity::from_dotted("mock.SecretName")),
+                            Some(PatternSpec::new("ok", PatternMatch::Full)),
+                            None,
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
             ResourceSchema::new("Sink")
                 .attribute(AttributeSchema::optional("attr", name()).build())
                 .attribute(
@@ -1197,5 +1212,70 @@ fn r5c_configuration_boundaries_reject_once_in_cli_and_lsp() {
                 assert_eq!(cli.json["status"], "ok");
             }
         }
+    }
+}
+
+#[test]
+fn r6_secret_conversion_causes_are_masked_in_cli_json_and_lsp() {
+    const PLAINTEXT: &str = "PLAINTEXT-bad value";
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    let loaded = loaded_provider_snapshot_from_factories(
+        Arc::new(factories()),
+        SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
+    );
+    let engine =
+        carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+    let path = directory.path().join("main.crn");
+    for alias in [false, true] {
+        let source = if alias {
+            format!(
+                "let s = secret('{PLAINTEXT}')\nmock.SecretSink {{ attr = s as mock.SecretName }}\n"
+            )
+        } else {
+            format!("mock.SecretSink {{ attr = secret('{PLAINTEXT}') as mock.SecretName }}\n")
+        };
+        std::fs::write(&path, &source).unwrap();
+        let cli = carina_cli::commands::validate::validate_diagnostics_with_factories(
+            &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+            carina_cli::wiring::LoadedProviderFactory::for_test(factories()),
+            HashMap::new(),
+        );
+        assert_eq!(
+            cli.json["errors"].as_array().unwrap().len(),
+            1,
+            "{:?}",
+            cli.json
+        );
+        assert_eq!(cli.json["errors"][0]["code"], "conversion_destination");
+        let output = format!("{} {:?}", cli.json, cli.errors);
+        assert!(
+            !output.contains(PLAINTEXT),
+            "secret leaked in CLI output: {output}"
+        );
+        let document = carina_lsp::document::Document::new_with_path(
+            source,
+            path.clone(),
+            Arc::new(carina_core::parser::ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        let lsp = engine.analyze(&document, Some(&path));
+        assert_eq!(
+            lsp.iter()
+                .filter(|d| d.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "conversion_destination".into()
+                    )))
+                .count(),
+            1,
+            "{lsp:?}"
+        );
+        let output = format!("{} {lsp:?}", serde_json::to_string(&lsp).unwrap());
+        assert!(
+            !output.contains(PLAINTEXT),
+            "secret leaked in LSP output: {output}"
+        );
     }
 }

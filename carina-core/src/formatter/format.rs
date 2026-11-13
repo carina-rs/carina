@@ -382,6 +382,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn r6_conversion_type_named_as_is_not_an_operator() {
+        let config = FormatConfig::default();
+        let source = "let value = ('ok' as as)\n";
+        let formatted = format(source, &config).unwrap();
+        assert_eq!(formatted, source);
+        assert_eq!(format(&formatted, &config).unwrap(), source);
+    }
+
+    #[test]
     fn test_format_provider_block() {
         let input = "provider aws {\nregion=aws.Region.ap_northeast_1\n}";
         let config = FormatConfig::default();

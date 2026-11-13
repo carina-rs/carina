@@ -2134,10 +2134,9 @@ fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &Schema
             schemas,
             &covered_findings,
         )
-        .into_validation(&mut carina_core::validation::ConversionValidation::<
+        .into_validation(&mut carina_core::test_utils::conversion_validation::<
             std::convert::Infallible,
-        >::default())
-        {
+        >()) {
             carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
                 assert!(
                     !graph.compositions.is_empty(),

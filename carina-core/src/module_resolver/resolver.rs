@@ -733,9 +733,9 @@ mod diagnostic_status_tests {
                 &schemas,
                 &[],
             )
-            .into_validation(&mut crate::validation::ConversionValidation::<
+            .into_validation(&mut crate::test_utils::conversion_validation::<
                 std::convert::Infallible,
-            >::default())
+            >())
         });
 
         match result {

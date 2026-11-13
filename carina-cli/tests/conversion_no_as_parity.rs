@@ -2,6 +2,8 @@ use std::process::Command;
 
 #[path = "support/conversion_totality.rs"]
 mod round5_fixtures;
+#[path = "support/conversion_twins.rs"]
+mod twins;
 
 #[test]
 fn conversion_no_as_directories_match_main_validate_json() {
@@ -36,7 +38,7 @@ fn conversion_no_as_directories_match_main_validate_json() {
 fn round5_generated_no_as_transport_twins_keep_mains_ordinary_result() {
     use round5_fixtures::*;
     let directory = tempfile::tempdir().unwrap();
-    let count = emit_twins(directory.path());
+    let count = twins::emit_twins(directory.path());
     eprintln!("{count} no-as twins: {}", directory.path().display());
     let mut checked = 0;
     for position in POSITIONS {

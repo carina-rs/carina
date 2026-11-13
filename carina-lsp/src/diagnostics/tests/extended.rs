@@ -8782,9 +8782,9 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
                         &[],
                     )
                     .into_validation(
-                        &mut carina_core::validation::ConversionValidation::<
+                        &mut carina_core::test_utils::conversion_validation::<
                             std::convert::Infallible,
-                        >::default(),
+                        >(),
                     )
                 },
             )
@@ -8801,9 +8801,9 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
                         &[],
                     )
                     .into_validation(
-                        &mut carina_core::validation::ConversionValidation::<
+                        &mut carina_core::test_utils::conversion_validation::<
                             std::convert::Infallible,
-                        >::default(),
+                        >(),
                     )
                 },
             )

@@ -324,6 +324,12 @@ where
 }
 
 /// One owner for placement and sink findings in a document set.
+/// Start with parser evidence; an empty throwaway owner is not a production API.
+///
+/// ```compile_fail,E0599
+/// use carina_core::validation::ConversionValidation;
+/// let ignored = ConversionValidation::<std::convert::Infallible>::default();
+/// ```
 pub struct ConversionValidation<E: ValidationClientError = std::convert::Infallible> {
     conversions: crate::ConversionFindings,
     coverage: crate::schema::value_validation::WalkCoverage,
@@ -335,8 +341,8 @@ pub struct ConversionValidation<E: ValidationClientError = std::convert::Infalli
     >,
 }
 
-impl<E: ValidationClientError> Default for ConversionValidation<E> {
-    fn default() -> Self {
+impl<E: ValidationClientError> ConversionValidation<E> {
+    fn empty() -> Self {
         Self {
             conversions: Default::default(),
             coverage: Default::default(),
@@ -573,8 +579,40 @@ impl<E: ValidationClientError> ConversionValidation<E> {
         }
     }
 
+    /// Start a document run from parser-owned file evidence.
+    pub fn for_file<X, D, B: BindingAddress>(
+        file: &crate::parser::File<
+            X,
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            D,
+            B,
+        >,
+    ) -> Self {
+        Self::new(file.expression_report())
+    }
+
+    /// Start the editor's document-set run. The driver selects the authoritative
+    /// directory or buffer report before collecting placements; the initial
+    /// buffer must not register a second parse's NodeIds ahead of that choice.
+    pub fn for_editor_source(_source: &crate::config_loader::ParsedSourceBuffer) -> Self {
+        Self::empty()
+    }
+
+    /// Start an editor run whose source failed parsing and produced no judgement.
+    /// Ordinary parse diagnostics still flow through this run's consuming exit.
+    pub fn for_parse_failure(_failure: &crate::parser::ParseError) -> Self {
+        Self::empty()
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn for_test() -> Self {
+        Self::empty()
+    }
+
+    /// Start a run from a Judge report, collecting its placement findings.
     pub fn new<B: BindingAddress>(report: &ExpressionReport<B>) -> Self {
-        let mut run = Self::default();
+        let mut run = Self::empty();
         run.include(report);
         run
     }

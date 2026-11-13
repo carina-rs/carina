@@ -9,6 +9,62 @@ use crate::schema::{AttrTypeKind, CompiledAttributeType, LeafPath, RefinedScalar
 use crate::validation::admission::DestinationKind;
 use diagnostic::{ConversionError, ConversionErrorKind as Kind, DeclarationBounds};
 
+/// Reasons a syntax child has no assignable declaration. This decision does
+/// not inspect its value, in either pending or discarded visits.
+pub(crate) enum DeclineReason {
+    UndeclaredField { field: String },
+    FieldAssignment { field: String, error: TypeError },
+}
+impl DeclineReason {
+    fn message(&self) -> String {
+        use crate::provider_text::DiagnosticText;
+        match self {
+            Self::UndeclaredField { field } => format!(
+                "conversion cannot be checked: field '{}' is not declared by the destination",
+                DiagnosticText::new(field),
+            ),
+            Self::FieldAssignment { field, error } => format!(
+                "conversion cannot be checked: destination field '{}' cannot be assigned: {error}",
+                DiagnosticText::new(field),
+            ),
+        }
+    }
+}
+
+/// A syntax probe expands each contributing judgement DAG only once. This
+/// memo has no syntax/value correspondence or completion responsibility.
+pub(crate) struct DeclinedConversions {
+    findings: flow::PlacementFindings,
+}
+impl Default for DeclinedConversions {
+    fn default() -> Self {
+        Self {
+            findings: flow::PlacementFindings::new(Default::default()),
+        }
+    }
+}
+impl DeclinedConversions {
+    pub(crate) fn reject(
+        &mut self,
+        child: &JudgedExpr,
+        reason: &DeclineReason,
+        secret: bool,
+    ) -> crate::ConversionChannel {
+        match child.conversion_evidence() {
+            ConversionEvidence::Free(_proof) => Default::default(),
+            ConversionEvidence::Carried(_) => {
+                child.conversion_sources().reject(
+                    Kind::Destination,
+                    &reason.message(),
+                    secret || child.diagnostic_is_secret(),
+                    &mut self.findings,
+                );
+                self.findings.take_findings()
+            }
+        }
+    }
+}
+
 /// Parse-stage judgement stored on the authored Convert itself.
 #[derive(Clone)]
 pub(crate) struct ConversionParsing {

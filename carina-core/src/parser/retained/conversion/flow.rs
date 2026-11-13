@@ -137,6 +137,9 @@ impl PlacementFindings {
     pub(in crate::parser::retained) fn into_findings(self) -> crate::ConversionChannel {
         self.findings
     }
+    pub(in crate::parser::retained) fn take_findings(&mut self) -> crate::ConversionChannel {
+        std::mem::take(&mut self.findings)
+    }
     pub(in crate::parser::retained) fn append_rejection(&mut self, rejection: ConversionRejection) {
         self.findings.append(rejection.into_channel());
     }
@@ -203,6 +206,12 @@ impl ConversionSources {
     }
 }
 
+/// A reference that has no source judgement cannot transport a converted value.
+pub(in crate::parser::retained) enum MissingReferenceEdge {
+    UndefinedBinding,
+    BindingCycle,
+}
+
 /// Every judgement constructor supplies one of these explicit edge decisions.
 /// There is no missing/default conversion flag.
 pub(in crate::parser::retained) enum JudgementEdges<'a> {
@@ -214,11 +223,17 @@ pub(in crate::parser::retained) enum JudgementEdges<'a> {
     Selected(&'a JudgedExpr),
     Convert(&'a ConversionSite),
     NonCrossed(NonCrossedEdge),
+    MissingReference(MissingReferenceEdge),
 }
 impl JudgementEdges<'_> {
     pub(in crate::parser::retained) fn sources(self) -> ConversionSources {
         match self {
             Self::Leaf => ConversionSources::empty(),
+            Self::MissingReference(reason) => match reason {
+                MissingReferenceEdge::UndefinedBinding | MissingReferenceEdge::BindingCycle => {
+                    ConversionSources::empty()
+                }
+            },
             Self::Follow {
                 inherited,
                 children,

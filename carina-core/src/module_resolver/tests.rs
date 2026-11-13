@@ -83,9 +83,9 @@ fn assert_round4_empty_template(blocks: &str) {
         let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
         assert!(matches!(
             super::resolve_modules_with_diagnostics(&parsed, &path, session, &schemas, &[])
-                .into_validation(&mut crate::validation::ConversionValidation::<
+                .into_validation(&mut crate::test_utils::conversion_validation::<
                     std::convert::Infallible,
-                >::default()),
+                >()),
             super::ModuleResolutionDiagnosticResult::Expanded { .. }
         ));
         assert!(matches!(
@@ -96,9 +96,9 @@ fn assert_round4_empty_template(blocks: &str) {
                 &schemas,
                 &[]
             )
-            .into_validation(&mut crate::validation::ConversionValidation::<
+            .into_validation(&mut crate::test_utils::conversion_validation::<
                 std::convert::Infallible,
-            >::default()),
+            >()),
             super::ModuleResolutionDiagnosticResult::Expanded { .. }
         ));
     });
@@ -191,16 +191,16 @@ fn round1_direct_template_scope_in_all_resolver_entry_points() {
                 &schemas,
                 &[]
             )
-            .into_validation(&mut crate::validation::ConversionValidation::<
+            .into_validation(&mut crate::test_utils::conversion_validation::<
                 std::convert::Infallible,
-            >::default()),
+            >()),
             super::ModuleResolutionDiagnosticResult::Expanded { .. }
         ));
         assert!(matches!(
             super::resolve_modules_with_diagnostics(&parsed, &path, session, &schemas, &[])
-                .into_validation(&mut crate::validation::ConversionValidation::<
+                .into_validation(&mut crate::test_utils::conversion_validation::<
                     std::convert::Infallible,
-                >::default()),
+                >()),
             super::ModuleResolutionDiagnosticResult::Expanded { .. }
         ));
     });
@@ -1420,9 +1420,9 @@ let forwarded = inner { flag = flag }
                 &crate::schema::SchemaRegistry::new(),
                 &[],
             )
-            .into_validation(&mut crate::validation::ConversionValidation::<
+            .into_validation(&mut crate::test_utils::conversion_validation::<
                 std::convert::Infallible,
-            >::default())
+            >())
         },
     );
 

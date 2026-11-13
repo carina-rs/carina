@@ -692,6 +692,237 @@ fn round5_unresolved_or_reshaped_containers_require_conversion_descent() {
     }
 }
 
+fn r7_struct_destination() -> AttributeType {
+    AttributeType::struct_(
+        "B",
+        vec![crate::schema::StructField::required("b", named()).build()],
+    )
+}
+fn r7_union_destination() -> AttributeType {
+    AttributeType::union(vec![
+        AttributeType::struct_(
+            "A",
+            vec![crate::schema::StructField::required("a", AttributeType::string()).build()],
+        ),
+        r7_struct_destination(),
+    ])
+}
+
+fn r7_pending_syntax(
+    expression: &str,
+    destination: AttributeType,
+) -> crate::validation::PresentedFindings {
+    let catalog = super::tests::catalog();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(AttributeSchema::optional("target", destination).build())
+            .validate()
+            .unwrap(),
+    );
+    let parsed = crate::parser::parse_file(
+        &format!("mock.Sink {{ target = {expression} }}"),
+        Path::new("pending-union.crn"),
+        &catalog,
+    )
+    .unwrap()
+    .resolve_root_for_test();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let judged = configuration.judged();
+    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let resource = tree.resources().next().unwrap();
+    let values = std::collections::HashMap::from([(
+        "target".into(),
+        crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(
+            crate::resource::ApplyTimeUnknown::PendingReRead(
+                crate::resource::PendingReRead::not_found(),
+            ),
+        )),
+    )]);
+    let inputs = crate::validation::admission::attributes::ResourceAttributeInputs::from_resolved(
+        resource,
+        &values,
+        judged.report(),
+    )
+    .unwrap();
+    let classified = inputs.classify(
+        &crate::resource::knowledge::KnowledgeContext::validation(),
+        |_, _| {},
+    );
+    assert!(matches!(
+        classified["target"],
+        crate::resource::knowledge::Classification::Pending(_)
+    ));
+    let bindings =
+        crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+    let mut run: crate::validation::ConversionValidation =
+        crate::validation::ConversionValidation::new(judged.report());
+    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+        let findings = run.admit_resource(
+            crate::validation::admission::attributes::ResourceAdmissionRequest {
+                resource,
+                parsed: judged.file(),
+                schema: resource.schema(&schemas).unwrap(),
+                attributes: &classified,
+                quoted: resource.quoted_string_attrs(),
+                inputs: &inputs,
+                bindings: &bindings,
+                session,
+                schemas: &schemas,
+            },
+        );
+        assert_eq!(findings.errors().count(), 0, "{findings:?}");
+    });
+    run.complete().into_presented()
+}
+
+#[test]
+fn r6_pending_union_cannot_choose_a_member_that_skips_the_conversion() {
+    let presented = r7_pending_syntax("{ b = 'ok' as mock.Other }", r7_union_destination());
+    let conversions = conversion_errors(&presented);
+    assert_eq!(conversions.len(), 1, "{presented:?}");
+    assert_eq!(conversions[0].kind(), ConversionErrorKind::Destination);
+    assert!(
+        !conversions[0].diagnostic_message().contains("not declared"),
+        "{presented:?}"
+    );
+}
+
+#[test]
+fn r7_pending_union_accepts_the_member_that_judges_the_conversion() {
+    let presented = r7_pending_syntax("{ b = 'ok' as mock.Name }", r7_union_destination());
+    assert!(presented.is_empty(), "{presented:?}");
+}
+
+#[test]
+fn r7_pending_struct_decline_names_the_undeclared_field() {
+    let presented = r7_pending_syntax("{ unknown = 'ok' as mock.Name }", r7_struct_destination());
+    let conversions = conversion_errors(&presented);
+    assert_eq!(conversions.len(), 1, "{presented:?}");
+    let message = conversions[0].diagnostic_message();
+    assert!(
+        message.contains("field 'unknown'") && message.contains("not declared by the destination"),
+        "{message}"
+    );
+    assert_eq!(
+        conversions[0].location().span().start_column(),
+        "mock.Sink { target = { unknown = ".len() + 1
+    );
+}
+
+#[test]
+fn r7_pending_struct_decline_names_the_failed_assignment() {
+    let destination = AttributeType::struct_(
+        "Locked",
+        vec![crate::schema::StructField::provider_populated("b", named()).build()],
+    );
+    let presented = r7_pending_syntax("{ b = 'ok' as mock.Name }", destination);
+    let conversions = conversion_errors(&presented);
+    assert_eq!(conversions.len(), 1, "{presented:?}");
+    let message = conversions[0].diagnostic_message();
+    let ordinary = crate::schema::TypeError::ReadOnlyAttribute { name: "b".into() }.to_string();
+    assert!(
+        message.contains("cannot be assigned") && message.contains(&ordinary),
+        "{message}"
+    );
+}
+
+#[test]
+fn r7_declined_child_rejects_each_carried_convert_site() {
+    let presented = r7_pending_syntax(
+        "{ unknown = ['ok' as mock.Name, 'fine' as mock.Name] }",
+        r7_struct_destination(),
+    );
+    let conversions = conversion_errors(&presented);
+    assert_eq!(conversions.len(), 2, "{presented:?}");
+    assert!(
+        conversions
+            .iter()
+            .all(|error| error.diagnostic_message().contains("field 'unknown'")),
+        "{presented:?}"
+    );
+}
+
+#[test]
+fn r7_no_as_pending_struct_declines_keep_mains_validation() {
+    let presented = r7_pending_syntax("{ unknown = 'ok' }", r7_struct_destination());
+    assert!(presented.is_empty(), "{presented:?}");
+    let destination = AttributeType::struct_(
+        "Locked",
+        vec![crate::schema::StructField::provider_populated("b", named()).build()],
+    );
+    let presented = r7_pending_syntax("{ b = 'ok' }", destination);
+    assert!(presented.is_empty(), "{presented:?}");
+}
+
+#[test]
+fn r7_discarded_struct_decline_names_the_reason_and_preserves_the_no_as_twin() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(AttributeSchema::optional("target", r7_struct_destination()).build())
+            .validate()
+            .unwrap(),
+    );
+    for (field, destination) in [
+        ("unknown", r7_struct_destination()),
+        (
+            "b",
+            AttributeType::struct_(
+                "Locked",
+                vec![crate::schema::StructField::provider_populated("b", named()).build()],
+            ),
+        ),
+    ] {
+        let mut schemas = schemas.clone();
+        // The locked case has a separate writable selected arm field.
+        let destination = if field == "b" {
+            AttributeType::struct_(
+                "Mixed",
+                vec![
+                    crate::schema::StructField::provider_populated("b", named()).build(),
+                    crate::schema::StructField::optional("selected", named()).build(),
+                ],
+            )
+        } else {
+            destination
+        };
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("Sink")
+                .attribute(AttributeSchema::optional("target", destination).build())
+                .validate()
+                .unwrap(),
+        );
+        let selected = if field == "b" { "selected" } else { "b" };
+        let source = format!(
+            "let cond = false\nmock.Sink {{ target = if cond {{ {{ {field} = 'ok' as mock.Name }} }} else {{ {{ {selected} = 'ok' as mock.Name }} }} }}"
+        );
+        let error = check(&source, &schemas).unwrap_err();
+        let crate::validation::ResourceRefTypeValidationError::Validation(presented) = error else {
+            panic!("typed findings required");
+        };
+        let conversions = conversion_errors(&presented);
+        assert_eq!(conversions.len(), 1, "{source}: {presented:?}");
+        let reason = if field == "b" {
+            "cannot be assigned"
+        } else {
+            "not declared by the destination"
+        };
+        assert!(
+            conversions[0].diagnostic_message().contains(reason),
+            "{presented:?}"
+        );
+        assert!(
+            check(&source.replace(" as mock.Name", ""), &schemas).is_ok(),
+            "no-as discarded fields retain main's behaviour"
+        );
+    }
+}
+
 #[test]
 fn r5b_pending_transport_requires_a_shape_compatible_destination() {
     use crate::validation::admission::attributes::ResourceAttributeInputs;
@@ -1309,4 +1540,81 @@ fn r5b_discarded_containers_keep_kind_only_judgements_without_a_live_child_desti
             }
         }
     }
+}
+
+#[test]
+fn r6_secret_conversion_masks_typed_cause_debug() {
+    use std::error::Error;
+    const PLAINTEXT: &str = "PLAINTEXT-bad value";
+    for source in [
+        format!("mock.Sink {{ target = secret('{PLAINTEXT}') as mock.Name }}"),
+        format!("let s = secret('{PLAINTEXT}')\nmock.Sink {{ target = s as mock.Name }}"),
+    ] {
+        let error = check(&source, &schema()).unwrap_err();
+        let conversion = conversion_error(&error).unwrap();
+        assert_eq!(conversion.kind(), ConversionErrorKind::Destination);
+        assert!(!format!("{error:?}").contains(PLAINTEXT));
+        assert!(!format!("{conversion:?}").contains(PLAINTEXT));
+        assert!(
+            conversion.source().is_some(),
+            "the masked cause stays typed"
+        );
+        let mut cause: Option<&(dyn Error + 'static)> = Some(conversion);
+        while let Some(error) = cause {
+            assert!(!format!("{error} {error:?}").contains(PLAINTEXT));
+            cause = error.source();
+        }
+    }
+}
+
+#[test]
+fn r7_no_as_opaque_pairing_keeps_main_validation_then_plan_field_error() {
+    use crate::resource::{
+        ConcreteValue, Value,
+        knowledge::{KnowledgeContext, PlanResolved},
+    };
+    let destination = AttributeType::struct_(
+        "B",
+        vec![crate::schema::StructField::optional("b", named()).build()],
+    );
+    let presented = r7_pending_syntax("{ unknown = 'ok' }", destination.clone());
+    assert!(presented.is_empty(), "{presented:?}");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(AttributeSchema::optional("target", destination).build())
+            .validate()
+            .unwrap(),
+    );
+    let value: Value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+        "unknown".into(),
+        Value::Concrete(ConcreteValue::String("ok".into())),
+    )])));
+    let resolved = crate::binding_index::ResolvedBindings::default();
+    let proof =
+        PlanResolved::try_from(value.knowledge(&KnowledgeContext::plan(&resolved)).unwrap())
+            .unwrap();
+    let attributes = std::collections::HashMap::from([("target".into(), proof)]);
+    let id = crate::resource::ResourceId::pending_with_provider("mock", "Sink", None);
+    let catalog = super::tests::catalog();
+    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+        let findings = crate::validation::admission::attributes::admit_plan_attributes::<
+            crate::validation::admission::kind::ResourceAttribute,
+        >(
+            schemas
+                .get("mock", "Sink", crate::schema::SchemaKind::Resource)
+                .unwrap(),
+            &id,
+            &attributes,
+            &Default::default(),
+            session,
+        );
+        let errors = findings.errors().collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{findings:?}");
+        assert!(
+            matches!(errors[0], crate::schema::TypeError::UnknownStructField { field, .. } if field == "unknown"),
+            "{findings:?}"
+        );
+    });
 }

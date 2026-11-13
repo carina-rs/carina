@@ -834,7 +834,7 @@ fn validate_and_resolve_configuration(
     );
     extend_binding_use_errors(errors, &binding_use_report);
     for module in module_walk.iter() {
-        let module_parsed = &module.loaded().parsed;
+        let module_parsed = module.loaded().parsed();
         let module_signatures = module_resolver::load_resolved_module_signatures(
             module_parsed,
             module.module_path(),

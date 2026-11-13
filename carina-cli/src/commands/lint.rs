@@ -336,8 +336,7 @@ fn lint_result(
                 .collect::<Vec<_>>();
             let mut conversion_validation = carina_core::validation::ConversionValidation::<
                 std::convert::Infallible,
-            >::default();
-            conversion_validation.include_file(&parsed);
+            >::for_file(&parsed);
             if type_findings.is_empty()
                 && let Err(error) = carina_core::validation::validate_attribute_params_with_context(
                     &parsed.attribute_params,
@@ -365,7 +364,7 @@ fn lint_result(
             for module in module_walk.iter() {
                 type_findings.extend(
                     carina_core::validation::resolve_file_type_exprs(
-                        &mut module.loaded().parsed.clone(),
+                        &mut module.loaded().parsed().clone(),
                         catalog,
                     )?
                     .into_iter()

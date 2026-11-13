@@ -943,3 +943,67 @@ fn r5b_typed_sink_rejects_a_carried_expression_without_a_placement_parent() {
         crate::validation::PresentedFinding::Conversion(_)
     ));
 }
+
+#[test]
+fn r6_undefined_binding_has_only_its_ordinary_finding() {
+    let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = super::super::parse_file(
+        "for n in missing { mock.Sink { target = n } }",
+        Path::new("undefined.crn"),
+        &catalog,
+    )
+    .unwrap();
+    let schemas = crate::schema::SchemaRegistry::new();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let report = configuration.judged().report();
+    // Iterable scope errors belong to main's merged identifier pass, not the
+    // Judge's boundary diagnostics. The unresolved edge must add no echo.
+    let ordinary = super::super::check_identifier_scope(&parsed);
+    assert_eq!(ordinary.len(), 1, "{ordinary:?}");
+    assert!(
+        matches!(&ordinary[0], super::super::ParseError::UndefinedDeferredIterable { name, .. } if name == "missing"),
+        "{ordinary:?}"
+    );
+    assert!(report.findings().is_empty(), "{:?}", report.findings());
+    assert!(
+        report
+            .nodes
+            .values()
+            .all(|judgement| !judgement.contains_any_conversion())
+    );
+    let presented = ConversionValidation::<std::convert::Infallible>::new(report)
+        .complete()
+        .into_presented();
+    assert!(presented.is_empty(), "{presented:?}");
+}
+
+#[test]
+fn r7_declines_expand_shared_conversion_provenance_once_per_probe() {
+    for count in [24, 48] {
+        let catalog = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let source = format!(
+            "let values = [{}]",
+            std::iter::repeat_n("'ok' as unloaded.Name", count)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let parsed =
+            super::super::parse_file(&source, Path::new("decline-work.crn"), &catalog).unwrap();
+        let expression = parsed
+            .expression_report()
+            .binding(&RelativeBindingName::new("values"))
+            .unwrap();
+        let reason = conversion::DeclineReason::UndeclaredField {
+            field: "unknown".into(),
+        };
+        let mut declines = conversion::DeclinedConversions::default();
+        let produced = (0..count)
+            .map(|_| declines.reject(expression, &reason, false).findings().len())
+            .sum::<usize>();
+        assert_eq!(
+            produced, count,
+            "each Convert is produced once even when many declined children carry the same DAG"
+        );
+    }
+}

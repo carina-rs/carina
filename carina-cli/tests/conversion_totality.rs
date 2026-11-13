@@ -201,9 +201,6 @@ fn round5_generated_transport_roles_validate_and_lsp() {
             .collect(),
         "every transport role needs a matrix fixture"
     );
-    let twins = std::path::Path::new("/Volumes/CargoTargets/issue4260-b1-logs/round5-no-as-twins");
-    let count = emit_twins(twins);
-    eprintln!("no-as twins ({count}): {}", twins.display());
     let mut cells = 0;
     for position in POSITIONS {
         for known in [true, false] {

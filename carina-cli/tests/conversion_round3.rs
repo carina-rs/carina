@@ -72,32 +72,31 @@ fn round3_no_as_module_loop_plan_uses_the_resolver_root_and_identities() {
                 )
             })
             .publish(&mut Vec::new());
-        let mut graph = match result
-            .into_validation(&mut carina_core::validation::ConversionValidation::<
+        let mut graph =
+            match result.into_validation(&mut carina_core::test_utils::conversion_validation::<
                 std::convert::Infallible,
-            >::default())
-        {
-            module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => graph,
-            module_resolver::ModuleResolutionDiagnosticResult::ConstraintFailed {
-                findings,
-                errors,
-            } => panic!(
-                "main control constraints: {findings:?}; residuals: {}",
-                errors
-                    .iter()
-                    .map(|e| e.display_relative_to(directory.path()))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ),
-            module_resolver::ModuleResolutionDiagnosticResult::Unowned { errors } => panic!(
-                "main control errors: {}",
-                errors
-                    .iter()
-                    .map(|e| e.display_relative_to(directory.path()))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ),
-        };
+            >()) {
+                module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => graph,
+                module_resolver::ModuleResolutionDiagnosticResult::ConstraintFailed {
+                    findings,
+                    errors,
+                } => panic!(
+                    "main control constraints: {findings:?}; residuals: {}",
+                    errors
+                        .iter()
+                        .map(|e| e.display_relative_to(directory.path()))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+                module_resolver::ModuleResolutionDiagnosticResult::Unowned { errors } => panic!(
+                    "main control errors: {}",
+                    errors
+                        .iter()
+                        .map(|e| e.display_relative_to(directory.path()))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            };
         let factories: Vec<Box<dyn carina_core::provider::ProviderFactory>> =
             vec![Box::new(carina_provider_mock::ConfiguredBuiltinMock::new(
                 Default::default(),

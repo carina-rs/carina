@@ -958,7 +958,7 @@ impl DiagnosticRun<'_> {
                         base_path,
                         &exports,
                         &overrides,
-                        &mut carina_core::validation::ConversionValidation::default(),
+                        &mut carina_core::test_utils::conversion_validation(),
                     ),
                     Err(error) => result.analysis_errors.push(error),
                 }
