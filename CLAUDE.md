@@ -717,8 +717,8 @@ A struct type represents a nested object with typed fields.
   Complete admissions own the canonical payload and placements; analysis cannot
   authorize construction. Undeclared keys are rejected before value checks or
   factory validation, using resource unknown-attribute suggestions. The payload
-  contains exactly its placed fields. The native mock records its declared
-  `configuration_label`; WASM mock controls belong to its own declaration.
+  contains exactly its placed fields. The native mock has no configuration
+  fields; WASM mock controls belong to its own declaration.
   Provider construction binds admitted configuration to its factory and instance.
   Core owns the S3/local declarations; state extracts settings only from
   `AdmittedConfiguration<BackendAttribute>`. Native file addresses retain their

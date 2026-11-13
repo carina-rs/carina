@@ -167,6 +167,20 @@ async fn configuration_duration_overflow_fails_before_native_and_wasm_hooks() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn false_configuration_trap_flags_reach_guest_validation_without_trapping() {
+    let path = wasm_path().expect("mock WASM fixture must be built");
+    let (factory, _cache) = load_factory(&path).await;
+    for key in ["__mock_validate_config_trap__", "validate_config_trap"] {
+        let config = resolved_provider_config(
+            "mock",
+            indexmap::IndexMap::from([(key.into(), Value::Concrete(ConcreteValue::Bool(false)))]),
+        );
+        carina_core::executor::prepare_provider_ready_config(&factory, &config)
+            .expect("false must not request a guest validation trap");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn provider_config_declared_types_have_native_and_wasm_parity() {
     let wasm = wasm_path().expect("the mock WASM fixture must be built");
     let (factory, _cache) = load_factory(&wasm).await;
@@ -7707,33 +7721,26 @@ async fn undeclared_provider_config_keys_reject_before_native_and_wasm_factories
             )),
         ),
     ]);
-    let native_attributes = indexmap::IndexMap::from([(
-        "configuration_label".into(),
-        Value::Concrete(ConcreteValue::String("label".into())),
-    )]);
     for (factory, mut attrs, declared_key) in [
         (
             &factory as &dyn ProviderFactory,
             wasm_attributes,
-            "__mock_reference_scope_region__",
+            Some("__mock_reference_scope_region__"),
         ),
         (
             &native as &dyn ProviderFactory,
-            native_attributes,
-            "configuration_label",
+            indexmap::IndexMap::new(),
+            None,
         ),
     ] {
         attrs.insert(
             "undeclared_probe".into(),
             Value::Concrete(ConcreteValue::String("not printed".into())),
         );
-        assert!(
-            factory
-                .schema_witness()
-                .config()
-                .parts()
-                .contains_key(declared_key)
-        );
+        match declared_key {
+            Some(key) => assert!(factory.schema_witness().config().parts().contains_key(key)),
+            None => assert!(factory.schema_witness().config().parts().is_empty()),
+        }
         assert!(
             !factory
                 .schema_witness()

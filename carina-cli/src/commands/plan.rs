@@ -9608,7 +9608,7 @@ mod run_plan_out_tests {
         fs::write(
             dir.join("main.crn"),
             r#"
-                provider mock { configuration_label = bucket.name }
+                provider mock { source = 'file://in-process-test.wasm' target = bucket.name }
                 let bucket = mock.test.resource { name_prefix = "pref-" }
             "#,
         )
@@ -9639,7 +9639,7 @@ mod run_plan_out_tests {
         .unwrap();
 
         let plan_path = dir.join("plan.json");
-        run_plan(
+        run_plan_using(
             &runtime,
             dir,
             Some(&plan_path),
@@ -9652,6 +9652,15 @@ mod run_plan_out_tests {
             false,
             false,
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            |runtime, providers, _| {
+                Ok(crate::wiring::ProviderLoad::for_test_with_provider_phase(
+                    runtime,
+                    crate::wiring::LoadedProviderFactory::for_test(vec![Box::new(
+                        crate::test_support::ConfigurableMockFactory::with_string_setting("target"),
+                    )]),
+                    providers,
+                ))
+            },
         )
         .await
         .expect("plan should resolve provider attributes after name reconciliation");
@@ -9660,7 +9669,7 @@ mod run_plan_out_tests {
         assert_eq!(
             saved.provider_configs.as_provider_configs()[0]
                 .attributes
-                .get("configuration_label"),
+                .get("target"),
             Some(&Value::Concrete(ConcreteValue::String(
                 "pref-existing".into()
             )))

@@ -38,12 +38,16 @@ fn provider_config_unknown_keys_are_errors_in_directory_validate_text_and_json()
 }
 
 #[test]
-fn builtin_mock_rejects_wasm_only_configuration_controls() {
+fn builtin_mock_rejects_unread_configuration_keys() {
     let directory = tempfile::tempdir().unwrap();
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/builtin_mock_unknown_controls");
     std::fs::copy(fixture.join("main.crn"), directory.path().join("main.crn")).unwrap();
-    for (key, value) in [("validate_config_trap", "true"), ("reference_table", "'x'")] {
+    for (key, value) in [
+        ("validate_config_trap", "true"),
+        ("reference_table", "'x'"),
+        ("configuration_label", "'x'"),
+    ] {
         std::fs::write(
             directory.path().join("providers.crn"),
             format!("provider mock {{ {key} = {value} }}\n"),

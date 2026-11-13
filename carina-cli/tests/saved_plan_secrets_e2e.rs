@@ -100,18 +100,36 @@ impl Scenario {
     }
 
     fn new_with_env(main: &str, env: &[(&str, &str)]) -> Self {
+        Self::new_with_provider(main, env, None)
+    }
+
+    fn new_with_wasm_provider(main: &str, env: &[(&str, &str)]) -> Self {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let wasm = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
+            .into_iter()
+            .map(|name| workspace.join("target/wasm32-wasip2/debug").join(name))
+            .find(|path| path.is_file())
+            .expect("the mock WASM fixture must be built");
+        Self::new_with_provider(main, env, Some(&wasm))
+    }
+
+    fn new_with_provider(main: &str, env: &[(&str, &str)], wasm: Option<&Path>) -> Self {
         let temp = tempfile::tempdir().expect("tempdir");
         let project = temp.path().to_path_buf();
         fs::write(project.join("main.crn"), main).expect("write main.crn");
+        if let Some(wasm) = wasm {
+            fs::copy(wasm, project.join("provider.wasm")).unwrap();
+        }
         let scenario = Self {
             mock_state: project.join("mock-provider-state.json"),
             project,
             _temp: temp,
         };
-        assert_success(
-            "carina init",
-            &scenario.carina_with_env(&["init", "."], env),
-        );
+        let mut args = vec!["init", "."];
+        if wasm.is_some() {
+            args.extend(["--accept-egress", "file://provider.wasm"]);
+        }
+        assert_success("carina init", &scenario.carina_with_env(&args, env));
         scenario
     }
 
@@ -1067,15 +1085,16 @@ mock.test.resource {
 fn saved_plan_rehydrates_provider_config_secret_with_independent_digest() {
     const ENV: &[(&str, &str)] = &[(
         "SAVED_PLAN_PROVIDER_TOKEN_3861",
-        "SHARED_POSITION_SECRET_3861",
+        r#"{"fixture":{"Ok":{"Resolved":"SHARED_POSITION_SECRET_3861"}}}"#,
     )];
-    let scenario = Scenario::new_with_env(
+    let scenario = Scenario::new_with_wasm_provider(
         r#"backend local { path = "carina.state.json" }
 provider mock {
-  configuration_label = secret(env("SAVED_PLAN_PROVIDER_TOKEN_3861"))
+  source = "file://provider.wasm"
+  reference_table = secret(env("SAVED_PLAN_PROVIDER_TOKEN_3861"))
 }
 
-mock.test.resource {
+mock.test.creation_constrained {
   name    = "provider-secret"
   comment = secret(env("SAVED_PLAN_PROVIDER_TOKEN_3861"))
 }
@@ -1086,7 +1105,8 @@ mock.test.resource {
     assert_success("carina plan --out", &scenario.plan_with_env(ENV));
     assert_plan_is_redacted(&scenario, &["SHARED_POSITION_SECRET_3861"]);
     let plan = read_json(&scenario.project.join("plan.json"));
-    let provider_hash = provider_attribute_placeholder_hash(&plan, "configuration_label");
+    assert_eq!(plan["provider_artifacts"]["mock"]["kind"], "wasm");
+    let provider_hash = provider_attribute_placeholder_hash(&plan, "reference_table");
     let resource_hash = plan_comment_placeholder_hash(&plan, "provider-secret");
     assert_ne!(
         provider_hash, resource_hash,
@@ -1097,24 +1117,34 @@ mock.test.resource {
         "carina apply saved plan",
         &scenario.apply_plan_with_env(ENV),
     );
+    let state = scenario.state_json();
     assert_eq!(
-        provider_resource_by_name(&scenario.provider_json(), "provider-secret")["comment"],
-        "SHARED_POSITION_SECRET_3861",
+        state_resource_by_name(&state, "provider-secret")["attributes"]["comment"]
+            [PERSISTED_SECRET_KEY]
+            .as_str(),
+        Some(resource_hash),
+        "successful guest initialization parsed the rehydrated table and state kept the resource digest",
     );
 }
 
 #[test]
 fn saved_plan_rejects_changed_provider_config_secret_before_provider_call() {
-    const ORIGINAL: &[(&str, &str)] =
-        &[("SAVED_PLAN_PROVIDER_ONLY_3861", "ORIGINAL_PROVIDER_3861")];
-    const CHANGED: &[(&str, &str)] = &[("SAVED_PLAN_PROVIDER_ONLY_3861", "CHANGED_PROVIDER_3861")];
-    let scenario = Scenario::new_with_env(
+    const ORIGINAL: &[(&str, &str)] = &[(
+        "SAVED_PLAN_PROVIDER_ONLY_3861",
+        r#"{"fixture":{"Ok":{"Resolved":"ORIGINAL_PROVIDER_3861"}}}"#,
+    )];
+    const CHANGED: &[(&str, &str)] = &[(
+        "SAVED_PLAN_PROVIDER_ONLY_3861",
+        r#"{"fixture":{"Ok":{"Resolved":"CHANGED_PROVIDER_3861"}}}"#,
+    )];
+    let scenario = Scenario::new_with_wasm_provider(
         r#"backend local { path = "carina.state.json" }
 provider mock {
-  configuration_label = secret(env("SAVED_PLAN_PROVIDER_ONLY_3861"))
+  source = "file://provider.wasm"
+  reference_table = secret(env("SAVED_PLAN_PROVIDER_ONLY_3861"))
 }
 
-mock.test.resource {
+mock.test.creation_constrained {
   name = "provider-only-secret"
 }
 "#,
@@ -1135,9 +1165,13 @@ mock.test.resource {
         rendered.contains("secret changed since the plan") && rendered.contains("carina plan"),
         "changed provider secret must produce replan guidance:\n{rendered}",
     );
+    assert_eq!(
+        read_json(&scenario.project.join("plan.json"))["provider_artifacts"]["mock"]["kind"],
+        "wasm"
+    );
     assert!(
-        !scenario.mock_state.exists(),
-        "provider must not be called before provider-config secret verification",
+        !rendered.contains("ORIGINAL_PROVIDER_3861") && !rendered.contains("CHANGED_PROVIDER_3861"),
+        "{rendered}"
     );
     assert_eq!(
         fs::read(scenario.project.join("carina.state.json")).ok(),

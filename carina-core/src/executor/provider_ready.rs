@@ -963,10 +963,13 @@ impl ProviderConfigPreparationError {
     }
 
     pub(crate) fn collect(mut errors: Vec<Self>) -> Result<(), Self> {
-        match errors.len() {
-            0 => Ok(()),
-            1 => Err(errors.pop().expect("one configuration error")),
-            _ => Err(Self::Multiple(ProviderConfigPreparationErrors { errors })),
+        match errors.pop() {
+            None => Ok(()),
+            Some(error) if errors.is_empty() => Err(error),
+            Some(error) => {
+                errors.push(error);
+                Err(Self::Multiple(ProviderConfigPreparationErrors { errors }))
+            }
         }
     }
 

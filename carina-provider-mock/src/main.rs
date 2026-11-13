@@ -1009,7 +1009,11 @@ impl CarinaProvider for MockProcessProvider {
             )
             .with_status(403));
         }
-        if attrs.contains_key("__mock_validate_config_trap__") || attrs.contains_key(CONFIG_TRAP) {
+        if matches!(
+            attrs.get("__mock_validate_config_trap__"),
+            Some(Value::Bool(true))
+        ) || matches!(attrs.get(CONFIG_TRAP), Some(Value::Bool(true)))
+        {
             panic!("intentional mock validate_config trap");
         }
         if let Some(Value::Int(delay_millis)) = attrs.get("validate_delay_millis")
@@ -2202,8 +2206,21 @@ mod configuration_tests {
     use carina_core::resource::{ConcreteValue, Value as CoreValue};
 
     #[test]
+    fn false_configuration_trap_flags_do_not_trap() {
+        for key in ["__mock_validate_config_trap__", "validate_config_trap"] {
+            MockProcessProvider::default()
+                .validate_config(&BTreeMap::from([(key.into(), Value::Bool(false))]))
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn wasm_configuration_controls_have_the_types_the_guest_reads() {
         let schema = MockProcessProvider::default().provider_config_attribute_types();
+        // unique_values is the deliberate schema-only host uniqueness fixture;
+        // every other setting below is consumed by the guest.
+        assert!(schema.parts().contains_key("unique_values"));
+        assert_eq!(schema.parts().len(), 10);
         for (key, value) in [
             (
                 "__mock_reference_scope_region__",
