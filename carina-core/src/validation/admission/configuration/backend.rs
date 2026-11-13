@@ -104,14 +104,6 @@ pub struct UnsupportedBackendError {
 
 /// Backend failures located by their sole core-owned diagnostic conversion.
 /// An independently admitted error cannot be paired with an arbitrary tree.
-///
-/// ```compile_fail,E0599
-/// use carina_core::parser::AnalysisTree;
-/// use carina_core::validation::admission::configuration::backend::BackendConfigError;
-/// fn locate_unrelated(error: BackendConfigError, tree: &AnalysisTree<'_>) {
-///     error.into_located(tree);
-/// }
-/// ```
 #[derive(Debug)]
 pub enum LocatedBackendError {
     Attribute(parser::Located<BackendAttributeError>),

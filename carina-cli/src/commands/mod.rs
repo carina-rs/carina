@@ -684,10 +684,30 @@ fn validate_and_resolve_configuration(
                 .map(|error| AppError::Parse(Box::new(error))),
         );
     }
-    // Export inference refreshes retained judgements before the shared authored
-    // analysis snapshot. Keep its diagnostics in their original reporting order.
-    let mut export_inference_errors = Vec::new();
     if !skip_resource_validation {
+        match carina_core::parser::AnalysisTree::try_from_file(parsed.parsed()) {
+            Ok(tree) => errors.extend(
+                carina_core::parser::check_provider_instance_routing(&tree)
+                    .into_iter()
+                    .map(|diagnostic| AppError::ProviderRouting(Box::new(diagnostic))),
+            ),
+            Err(error) => {
+                errors.push(AppError::AnalysisInvariant(error));
+                return Err(non_empty_validation_failure(errors));
+            }
+        }
+    }
+
+    if !skip_resource_validation {
+        errors.extend(duplicate_declaration_errors(
+            duplicate_declarations,
+            &module_walk,
+        ));
+    }
+
+    if !skip_resource_validation {
+        #[cfg(test)]
+        tests::EXPORT_INFERENCE_RETRIES.set(tests::EXPORT_INFERENCE_RETRIES.get() + 1);
         let schema_checked_exports = match parsed.retry_unchecked_export_inference(
             ctx.loaded_provider_schemas(),
             enriched_context.catalog(),
@@ -698,34 +718,15 @@ fn validate_and_resolve_configuration(
                 return Err(non_empty_validation_failure(errors));
             }
         };
-        export_inference_errors.extend(
+        errors.extend(
             carina_core::validation::inference::attached_inference_failures(schema_checked_exports)
                 .map(|failure| AppError::Validation(failure.to_string())),
         );
     }
 
+    // Export inference refreshes retained judgements. Share a post-retry tree
+    // between backend admission and the remaining analysis consumers.
     let analysis = parsed.analysis();
-    if !skip_resource_validation {
-        let analysis = match &analysis {
-            Ok(analysis) => analysis,
-            Err(error) => {
-                errors.push(AppError::AnalysisInvariant(error.clone()));
-                return Err(non_empty_validation_failure(errors));
-            }
-        };
-        errors.extend(
-            carina_core::parser::check_provider_instance_routing(analysis.tree())
-                .into_iter()
-                .map(|diagnostic| AppError::ProviderRouting(Box::new(diagnostic))),
-        );
-    }
-    if !skip_resource_validation {
-        errors.extend(duplicate_declaration_errors(
-            duplicate_declarations,
-            &module_walk,
-        ));
-    }
-    errors.extend(export_inference_errors);
 
     // A backend in a module-definition directory is the structural error: the
     // backend is misplaced, so do not also classify the module's arguments as
@@ -744,8 +745,8 @@ fn validate_and_resolve_configuration(
     let analysis = match analysis {
         Ok(analysis) => analysis,
         Err(error) => {
-            errors.push(AppError::AnalysisInvariant(error));
             errors.extend(validate_unlocated_root_backend(parsed.parsed()));
+            errors.push(AppError::AnalysisInvariant(error));
             return Err(non_empty_validation_failure(errors));
         }
     };
@@ -1389,6 +1390,10 @@ mod tests {
     use indexmap::IndexMap;
     use std::collections::HashMap;
 
+    thread_local! {
+        pub(super) static EXPORT_INFERENCE_RETRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     type ValidateAndResolveErrors =
         fn(
             &crate::wiring::ValidationPipelineAccess,
@@ -1641,16 +1646,22 @@ mod tests {
 
     #[test]
     fn normal_validation_stops_when_analysis_fails() {
+        EXPORT_INFERENCE_RETRIES.set(0);
         let errors = validation_with_missing_resource_provenance(
             "backend local { path = 1 typo = true }",
             false,
         );
+        assert!(matches!(
+            errors.as_slice(),
+            [AppError::AnalysisInvariant(_)]
+        ));
         assert_eq!(
-            errors.len(),
-            1,
-            "normal validation must return early: {errors:#?}"
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["missing declaration provenance for Resource mock.test.resource.<pending>"],
         );
-        assert!(matches!(errors[0], AppError::AnalysisInvariant(_)));
+        // Retrying currently returns the same invariant, so also ensure the
+        // broken input never reaches export judgement in the first place.
+        assert_eq!(EXPORT_INFERENCE_RETRIES.get(), 0);
     }
 
     #[test]
@@ -1679,15 +1690,18 @@ mod tests {
                 expected.len() + 1,
                 "one separate error per backend failure: {errors:#?}"
             );
-            let backend_errors: Vec<_> = errors
+            let backend_errors: Vec<_> = errors[..expected.len()]
                 .iter()
-                .filter(|error| !matches!(error, AppError::AnalysisInvariant(_)))
                 .map(|error| {
                     assert!(matches!(error, AppError::UnlocatedBackend(_)), "{error:?}");
                     crate::error::format_error_with_source_chain(error)
                 })
                 .collect();
             assert_eq!(backend_errors, expected, "{backend}");
+            assert!(matches!(
+                errors.last(),
+                Some(AppError::AnalysisInvariant(_))
+            ));
         }
     }
 
