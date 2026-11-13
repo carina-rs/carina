@@ -1551,11 +1551,11 @@ fn typed_function_result(type_expr: TypeExpr) -> Value {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let mut function = parsed.user_functions.remove("result").unwrap();
+    let mut function = parsed.user_functions.shift_remove("result").unwrap();
     function.return_type = Some(type_expr);
     Value::Deferred(crate::resource::DeferredValue::ResolvedFunctionCall {
         function: Arc::new(function),
-        functions: Arc::new(HashMap::new()),
+        functions: Arc::new(indexmap::IndexMap::new()),
         args: Vec::new(),
         source_line: 1.into(),
     })

@@ -16312,3 +16312,20 @@ async fn builtin_normalization_uses_only_its_dedicated_factory() {
     .await
     .expect("native normalization admits the dedicated factory's empty configuration");
 }
+
+#[test]
+fn schema_override_errors_choose_the_first_argument() {
+    for _ in 0..64 {
+        let overrides = [
+            ("zulu".to_owned(), PathBuf::from("missing-zulu.wasm")),
+            ("alpha".to_owned(), PathBuf::from("missing-alpha.wasm")),
+        ]
+        .into_iter()
+        .collect();
+        let error = schema_check_provider_configs(&[], &overrides).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "provider schema override names undeclared default provider 'zulu'"
+        );
+    }
+}

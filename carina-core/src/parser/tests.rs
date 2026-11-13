@@ -1405,7 +1405,7 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
     file.module_calls.push(ModuleCall::test(
         "example_module",
         Some("component".to_string()),
-        HashMap::from([("input".to_string(), ModuleArgument::new(empty()))]),
+        indexmap::IndexMap::from([("input".to_string(), ModuleArgument::new(empty()))]),
     ));
     file.arguments.push(ArgumentParameter {
         name: "input".to_string(),

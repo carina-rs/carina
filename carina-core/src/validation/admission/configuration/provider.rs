@@ -311,16 +311,15 @@ fn unknown_attribute_report<'a>(
     schema: &ValidatedConfigSchema,
 ) -> Option<ProviderConfigPreparationError> {
     let known: Vec<_> = schema.parts().keys().map(String::as_str).collect();
-    let mut errors: Vec<_> = keys
+    let errors: Vec<_> = keys
         .into_iter()
         .map(|key| {
             (
                 key.clone(),
-                TypeError::unknown_attribute(&key.to_string(), &known),
+                TypeError::unknown_attribute(&key.to_string(), &known, &[]),
             )
         })
         .collect();
-    errors.sort_by(|(left, _), (right, _)| left.cmp(right));
     (!errors.is_empty()).then(|| {
         ProviderConfigPreparationError::UnknownAttributes(UnknownProviderConfigAttributes {
             provider: provider.to_owned(),

@@ -6558,7 +6558,7 @@ mod tests {
             registry
                 .get("awscc", "awscc.ec2.Vpc", CoreSchemaKind::Resource)
                 .expect("decoded fixture must be owner-bound"),
-            &HashMap::<String, carina_core::resource::knowledge::Classification<'_>>::new(),
+            &indexmap::IndexMap::<String, carina_core::resource::knowledge::Classification<'_>>::new(),
             &|_| false,
             &resolver,
         )

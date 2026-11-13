@@ -44,7 +44,7 @@ fn undeclared_configuration_keys_reject_before_values_or_factory_validation() {
     assert_eq!(complete, analysis);
     let unknowns: Vec<_> = analysis.lines().collect();
     assert_eq!(unknowns.len(), 3, "{analysis}");
-    for (diagnostic, name) in unknowns.iter().zip(["aaa", "regoin", "zzz"]) {
+    for (diagnostic, name) in unknowns.iter().zip(["zzz", "regoin", "aaa"]) {
         assert!(
             diagnostic.contains(&format!("Unknown attribute '{name}'")),
             "{analysis}"
@@ -54,6 +54,39 @@ fn undeclared_configuration_keys_reject_before_values_or_factory_validation() {
     assert!(!analysis.contains("private-value"));
     assert!(factory.seen.lock().unwrap().is_empty());
     assert_eq!(factory.custom_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn provider_configuration_suggestions_share_resource_tie_breaking() {
+    let configs = directory("provider owner { hat = 'value' }", "let sibling = 'value'");
+    let attributes = configs.iter().next().unwrap().attributes();
+    for primary in [["cat", "bat"], ["bat", "cat"]] {
+        let expected = TypeError::unknown_attribute("hat", &primary, &[]);
+        assert_eq!(
+            expected.to_string(),
+            "Unknown attribute 'hat', did you mean 'bat'?"
+        );
+        let schema = ValidatedConfigSchema::validate(
+            primary
+                .into_iter()
+                .map(|name| (name.into(), AttributeType::string()))
+                .collect(),
+        )
+        .unwrap();
+        let factory = Factory::new(schema.clone());
+        for error in [
+            analyze(&factory, "owner", attributes).unwrap_err(),
+            admitted(&factory, "owner", None, attributes, &schema).unwrap_err(),
+        ] {
+            let diagnostics = error.diagnostics();
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(
+                diagnostics[0].schema_error().unwrap().to_string(),
+                expected.to_string()
+            );
+        }
+        assert!(factory.seen.lock().unwrap().is_empty());
+    }
 }
 
 #[test]

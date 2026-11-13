@@ -543,6 +543,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dotted_custom_type_suggestion_ties_are_independent_of_registration_order() {
+        for names in [["Cat", "Bat"], ["Bat", "Cat"]] {
+            let known = names
+                .into_iter()
+                .map(|name| {
+                    crate::parser::OwnedTypeIdentity::provider(
+                        "mock",
+                        TypeIdentity::new(Some("mock"), ["test"], name),
+                        crate::schema::RefinedScalarKind::String,
+                    )
+                })
+                .collect();
+            let context = loaded_context(known);
+            assert_eq!(
+                suggest_registered_dotted_custom_type("mock.test.Hat", &context).as_deref(),
+                Some("mock.test.Bat")
+            );
+        }
+    }
+
+    #[test]
     fn identity_conversion_preserves_builtins_and_provider_nominals() {
         for identity in crate::schema::builtin_type_registry().keys() {
             assert!(
