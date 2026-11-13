@@ -21,7 +21,9 @@ use crate::schema::SchemaRegistry;
 
 use super::error::{ModuleError, ModuleErrorCallSource};
 use super::expander::instance_prefix_for_call;
-use super::validation::{ConstraintOrigin, ModuleConstraintDiagnostic};
+use super::validation::{
+    ConstraintOrigin, DirectoryConstraintDiagnostic, ModuleConstraintDiagnostic,
+};
 
 type ModuleResolvedValue = crate::resource::Value<ParserPlaceholder, AbsoluteBindingAddress>;
 
@@ -107,7 +109,13 @@ where
     graph
 }
 
-pub type ModuleCallConstraintReports = Vec<ModuleCallConstraintReport>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstraintScopeReport {
+    Directory(Vec<crate::parser::Located<DirectoryConstraintDiagnostic>>),
+    ModuleCall(ModuleCallConstraintReport),
+}
+
+pub type ModuleCallConstraintReports = Vec<ConstraintScopeReport>;
 
 /// Diagnostic module-resolution outcome.
 ///
@@ -247,11 +255,15 @@ impl ResidualModuleResolutionError {
     }
 
     pub fn is_constraint(&self) -> bool {
-        matches!(self.0.root_cause(), ModuleError::Constraint(_diagnostic))
+        matches!(
+            self.0.root_cause(),
+            ModuleError::Constraint(_) | ModuleError::DirectoryConstraint(_)
+        )
     }
 
     pub fn diagnostic(&self) -> Option<ResidualModuleResolutionDiagnostic<'_>> {
         match self.0.root_cause() {
+            ModuleError::DirectoryConstraint(_) => None,
             ModuleError::AnalysisInvariant(_) => None,
             ModuleError::WithProviderTypeWarnings { .. } => {
                 unreachable!("root_cause removes diagnostic wrappers")
@@ -536,7 +548,7 @@ impl ResidualModuleResolutionError {
             ModuleError::BackendInModule => false,
             ModuleError::UpstreamStateInModule => false,
             ModuleError::ExportsInModule => false,
-            ModuleError::Constraint(_) => false,
+            ModuleError::Constraint(_) | ModuleError::DirectoryConstraint(_) => false,
             ModuleError::NotADirectory { path: _ } => false,
         }
     }
@@ -642,6 +654,7 @@ fn without_covered_reference_type_members(
         | ModuleError::UpstreamStateInModule
         | ModuleError::ExportsInModule
         | ModuleError::Constraint(_)
+        | ModuleError::DirectoryConstraint(_)
         | ModuleError::NotADirectory { path: _ }) => Some(error),
     }
 }
@@ -1123,7 +1136,16 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
 
     pub(super) fn record_constraint_report(&self, report: ModuleCallConstraintReport) {
         if let Some(reports) = self.constraint_reports.borrow_mut().as_mut() {
-            reports.push(report);
+            reports.push(ConstraintScopeReport::ModuleCall(report));
+        }
+    }
+
+    pub(super) fn record_directory_constraint_report(
+        &self,
+        failures: Vec<crate::parser::Located<DirectoryConstraintDiagnostic>>,
+    ) {
+        if let Some(reports) = self.constraint_reports.borrow_mut().as_mut() {
+            reports.push(ConstraintScopeReport::Directory(failures));
         }
     }
 
@@ -1694,6 +1716,8 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
         parsed: &'parsed mut crate::parser::File<E>,
         mut resolver: ModuleResolver<'cfg, StrictTypeResolution>,
     ) -> Result<Self, ModuleError> {
+        crate::parser::retained::admit_require_scope(parsed);
+        crate::parser::retained::judge_configuration(parsed, resolver.schemas, resolver.config());
         StrictTypeResolution::resolve_file_type_exprs(parsed, resolver.session)?;
         if let Some(error) = parsed.expression_report().first_error() {
             return Err(ModuleError::Parse(error));
@@ -1756,6 +1780,8 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
             base_dir, config, schemas, resolution,
         );
         resolver.source_overrides = overrides.clone();
+        crate::parser::retained::admit_require_scope(parsed);
+        crate::parser::retained::judge_configuration(parsed, resolver.schemas, resolver.config());
         resolver.process_imports(&parsed.uses, &parsed.module_calls)?;
         let root_witness = resolver.validate_reference_types(parsed)?;
         Ok(Self {
@@ -1778,6 +1804,8 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
                 base_dir, config, schemas, resolution,
             );
         resolver.source_overrides = overrides.clone();
+        crate::parser::retained::admit_require_scope(parsed);
+        crate::parser::retained::judge_configuration(parsed, resolver.schemas, resolver.config());
         resolver.process_imports(&parsed.uses, &parsed.module_calls)?;
         let root_witness = resolver.validate_reference_types(parsed)?;
         Ok(Self {
@@ -1963,6 +1991,16 @@ pub fn resolve_module_template_with_config<E: ResolveExportBindingPhase<ParserPl
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let resolution = parsed.module_resolution_context();
     let mut parsed = parsed.into_parsed();
+    let scope = crate::parser::retained::RequireScope::ModuleTemplate {
+        arguments: parsed
+            .arguments
+            .iter()
+            .map(|argument| argument.name.clone())
+            .collect::<Vec<_>>()
+            .into(),
+    };
+    crate::parser::retained::set_require_scope(&mut parsed, scope);
+    crate::parser::retained::judge_configuration(&mut parsed, schemas, config.catalog());
     let expanded =
         RefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas, resolution)?
             .expand()?;
@@ -1981,6 +2019,16 @@ pub fn resolve_module_template_with_providerless_config<
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let resolution = parsed.module_resolution_context();
     let mut parsed = parsed.into_parsed();
+    let scope = crate::parser::retained::RequireScope::ModuleTemplate {
+        arguments: parsed
+            .arguments
+            .iter()
+            .map(|argument| argument.name.clone())
+            .collect::<Vec<_>>()
+            .into(),
+    };
+    crate::parser::retained::set_require_scope(&mut parsed, scope);
+    crate::parser::retained::judge_configuration(&mut parsed, schemas, config.catalog());
     let warnings = parsed
         .warnings
         .iter()
@@ -2125,6 +2173,8 @@ fn resolve_modules_with_diagnostics_and_resolver<
     covered_findings: &[crate::validation::ModuleCallFinding],
 ) -> ModuleResolutionDiagnosticResult<E::Absolute> {
     let mut graph = parsed.clone();
+    crate::parser::retained::admit_require_scope(&mut graph);
+    crate::parser::retained::judge_configuration(&mut graph, resolver.schemas, resolver.config());
     let root = root_expansion_scope();
     let mut errors = resolver.process_imports_collecting(&graph.uses, &graph.module_calls);
     let mut contributions = Vec::new();
@@ -2472,6 +2522,9 @@ fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
         crate::binding_index::ResolvedBindings::for_root_validation(parsed, root);
     let mut expanded_calls = Vec::with_capacity(module_calls.len());
     let mut errors = Vec::new();
+    if let Err(error) = resolver.evaluate_directory_constraints(parsed) {
+        errors.push(error);
+    }
     for call in &module_calls {
         let import_failed = parsed
             .uses
@@ -2506,6 +2559,7 @@ fn resolve_modules_with_resolver<E, P: TypeResolutionPolicy>(
     ref_check: &RefCheckWitness,
     root: &RootScope,
 ) -> Result<Vec<crate::parser::RootBindingResolvedParsedFile>, ModuleError> {
+    resolver.evaluate_directory_constraints(parsed)?;
     let module_calls = &parsed.module_calls;
     let signatures = resolver.resolved_module_signatures();
     let binding_index = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(

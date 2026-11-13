@@ -4,7 +4,7 @@ use carina_core::parser::ExportParamLike;
 use carina_core::validation::admission::configuration::backend::{
     self as backend_admission, BackendAttributeError, BackendConfigError,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
@@ -853,14 +853,14 @@ impl DiagnosticRun<'_> {
     pub(super) fn parse_merged_with_buffer(
         &self,
         doc: &Document,
-        current_file_name: Option<&str>,
+        _current_file_name: Option<&str>,
         base_path: &carina_core::paths::ResolvedPath,
     ) -> Result<MergedParseResult, carina_core::config_loader::DirectoryParseFailure> {
-        let mut overrides: HashMap<String, String> = HashMap::new();
-        if let Some(name) = current_file_name {
-            overrides.insert(name.to_string(), doc.text());
-        }
-        let result = carina_core::config_loader::parse_directory_with_overrides_and_diagnostics_with_schemas(
+        let overrides = carina_core::config_loader::SourceOverrides::from([(
+            doc.source_file().to_path_buf(),
+            doc.text(),
+        )]);
+        let result = carina_core::config_loader::parse_directory_with_source_overrides_and_diagnostics_with_schemas(
             base_path,
             self.provider_context.catalog(),
             &overrides,
@@ -1068,20 +1068,21 @@ impl DiagnosticRun<'_> {
     pub(super) fn finalize_provider_diagnostic(
         &self,
         doc: &Document,
-        current_file_name: Option<&str>,
+        _current_file_name: Option<&str>,
         base_path: &carina_core::paths::ResolvedPath,
     ) -> Option<carina_core::parser::AnalysisResolutionError> {
-        let mut overrides: HashMap<String, String> = HashMap::new();
-        if let Some(name) = current_file_name {
-            overrides.insert(name.to_string(), doc.text());
-        }
-        let merged = carina_core::config_loader::parse_directory_for_metadata(
-            base_path,
-            self.provider_context.catalog(),
-            &overrides,
-            &self.schemas,
-        )
-        .ok()?;
+        let overrides = carina_core::config_loader::SourceOverrides::from([(
+            doc.source_file().to_path_buf(),
+            doc.text(),
+        )]);
+        let merged =
+            carina_core::config_loader::parse_directory_for_metadata_with_source_overrides_report(
+                base_path,
+                self.provider_context.catalog(),
+                &overrides,
+                &self.schemas,
+            )
+            .ok()?;
         let module_resolution =
             carina_core::module_resolver::resolve_modules_with_diagnostics_and_overrides(
                 &merged,

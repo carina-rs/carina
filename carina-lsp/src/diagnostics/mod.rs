@@ -311,6 +311,17 @@ fn render_module_call_findings(
 ) -> Vec<Diagnostic> {
     findings
         .iter()
+        // Directory declarations publish through their retained expression
+        // report on both directory and buffer-only paths. This renderer owns
+        // the module-call carrier of constraint outcomes.
+        .filter(|finding| {
+            !matches!(
+                finding.message(),
+                carina_core::validation::ModuleCallFindingMessage::Constraint(
+                    carina_core::module_resolver::ConstraintDiagnostic::Directory(_)
+                )
+            )
+        })
         .flat_map(|finding| finding.diagnostics())
         .filter_map(|finding| {
             let mut diagnostic = render_merged(
@@ -1158,11 +1169,31 @@ impl DiagnosticRun<'_> {
                 }
             }
             let pre_expansion_input = merged.unwrap_or(parsed);
-            let pre_expansion_configuration = carina_core::config_loader::load_buffer_configuration(
-                pre_expansion_input,
-                &self.schemas,
-                self.provider_context.catalog(),
-            );
+            let recovery_snapshot = if let (None, Some(base), Some(buffer)) =
+                (merged, base_path, doc.parsed_buffer())
+            {
+                carina_core::config_loader::DirectoryBufferSnapshot::capture(
+                    base,
+                    buffer.clone(),
+                    &overrides,
+                )
+                .ok()
+            } else {
+                None
+            };
+            let pre_expansion_configuration = if let Some(snapshot) = recovery_snapshot {
+                carina_core::config_loader::load_buffer_configuration_in_directory(
+                    snapshot,
+                    &self.schemas,
+                    self.provider_context.catalog(),
+                )
+            } else {
+                carina_core::config_loader::load_buffer_configuration(
+                    pre_expansion_input,
+                    &self.schemas,
+                    self.provider_context.catalog(),
+                )
+            };
             let expression_report = pre_expansion_configuration.judged().report();
             for finding in expression_report.findings() {
                 if let Some(diagnostic) = render_merged(

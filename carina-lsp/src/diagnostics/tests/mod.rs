@@ -12,6 +12,7 @@ mod configuration_admission;
 mod enum_continuation;
 mod extended;
 mod located;
+mod root_requires;
 mod seam_review;
 mod seam_round2;
 mod seam_round8;
