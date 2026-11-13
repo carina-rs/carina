@@ -4,7 +4,11 @@
 //! CARINA_IDENTITY_PROBE_PROVIDERS (offline artifacts), and
 //! CARINA_IDENTITY_PROBE_OUTPUT (one dump per directory). Real-directory runs
 //! write SHA-256 plus byte length for identity and secret bytes, never raw bytes.
-//! Files are private (0600 on Unix). No provider runtime is initialized.
+//! Files are private (0600 on Unix). The output root must be fresh and empty.
+//! Schema-only installed artifacts are read; provider runtimes, network, AWS and
+//! state backends are never used. Source identifiers stay readable; loop/map and
+//! expansion keys are fingerprints. Consecutive identical observations collapse.
+//! The whole v2 snapshot includes named producers and unattributed observations.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -94,6 +98,10 @@ impl ProviderFactory for ProbeFactory {
                     .build(),
             ),
             ResourceSchema::new("Mutable").attribute(string("name")),
+            ResourceSchema::new("SecretMap").attribute(
+                AttributeSchema::optional("values", AttributeType::map(AttributeType::string()))
+                    .build(),
+            ),
             ResourceSchema::new("Secrets")
                 .attribute(string("literal"))
                 .attribute(string("known"))
@@ -120,7 +128,7 @@ fn synthetic() -> OfflineProviders {
 }
 
 fn fixture() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/identity_probe")
+    PathBuf::from("tests/fixtures/identity_probe")
 }
 
 fn probe(
@@ -131,13 +139,7 @@ fn probe(
         OfflineProviders::Factories(factories) => RedactionMode::RawSynthetic(factories),
         providers @ OfflineProviders::ArtifactDirectory(_) => RedactionMode::Sha256(providers),
     };
-    probe_directory(directory, &EnvironmentSnapshot::empty(), mode).map(legacy_dump)
-}
-
-#[test]
-fn offline_identity_inputs_snapshot() {
-    let dump = probe(&fixture(), synthetic()).expect("complete offline probe");
-    insta::assert_snapshot!(dump);
+    probe_directory(directory, &EnvironmentSnapshot::empty(), mode)
 }
 
 #[test]
@@ -164,13 +166,28 @@ fn copy_fixture(destination: &Path) {
 }
 
 #[test]
-fn temporary_root_paths_do_not_change_the_dump() {
+fn temporary_root_paths_preserve_resource_results_and_normalize_all_contexts() {
     let copied = tempfile::tempdir().unwrap();
     copy_fixture(copied.path());
-    assert_eq!(
-        probe(&fixture(), synthetic()).unwrap(),
-        probe(copied.path(), synthetic()).unwrap(),
-    );
+    let original: serde_json::Value =
+        serde_json::from_str(&probe(&fixture(), synthetic()).unwrap()).unwrap();
+    let relocated: serde_json::Value =
+        serde_json::from_str(&probe(copied.path(), synthetic()).unwrap()).unwrap();
+    assert_eq!(original["resources"], relocated["resources"]);
+    assert_eq!(original["secret_producers"], relocated["secret_producers"]);
+    // Unretained preparatory loop hashes genuinely include the source-root
+    // bytes. Preserve that evidence, while normalizing every context label.
+    let contexts = |document: &serde_json::Value| {
+        document["unattributed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["input"]["context"].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(contexts(&original), contexts(&relocated));
+    assert_no_absolute_paths(&original);
+    assert_no_absolute_paths(&relocated);
     assert!(
         !copied
             .path()
@@ -195,6 +212,11 @@ fn offline_identity_probe_rejects_incomplete_expansion() {
 #[test]
 fn offline_identity_probe_rejects_empty_directories_and_missing_schemas() {
     let empty = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        probe(empty.path(), synthetic()),
+        Err(ProbeError::NoConfiguration)
+    ));
+    fs::write(empty.path().join("providers.crn"), "provider probe {}\n").unwrap();
     expect_incomplete(
         probe(empty.path(), synthetic()),
         "zero resources enumerated",
@@ -280,8 +302,30 @@ fn real_directory_identity_probe() {
     // This ignored test is the executable boundary for a local probe run.
     #[expect(clippy::disallowed_methods)]
     let environment = EnvironmentSnapshot::capture_process();
-    probe_real_directories(&root, &artifacts, &output, &environment)
-        .unwrap_or_else(|error| panic!("{error}"));
+    let result = probe_real_directories(&root, &artifacts, &output, &environment);
+    let report = match &result {
+        Ok(report) => report,
+        Err(ProbeError::DirectoryFailures(failures)) => failures.report(),
+        Err(error) => panic!("{error}"),
+    };
+    for result in report.results() {
+        let directory = result
+            .directory
+            .strip_prefix(&root)
+            .unwrap_or(&result.directory);
+        match &result.status {
+            carina_cli::identity_probe::DirectoryStatus::Ok => {
+                println!("{}: ok", directory.display())
+            }
+            carina_cli::identity_probe::DirectoryStatus::Skipped => {
+                println!("{}: skipped (no .crn files)", directory.display())
+            }
+            carina_cli::identity_probe::DirectoryStatus::Failed(error) => {
+                println!("{}: failed ({error})", directory.display())
+            }
+        }
+    }
+    result.unwrap_or_else(|error| panic!("{error}"));
 }
 
 #[test]
@@ -332,6 +376,7 @@ fn module_outside_the_root_has_relative_declarations_and_contexts() {
     let dump = probe(&project, synthetic()).unwrap();
     assert!(!dump.contains(&temporary.path().display().to_string()));
     assert!(dump.contains("../external/main.crn"));
+    assert_no_absolute_paths(&serde_json::from_str(&dump).unwrap());
 }
 
 #[test]
@@ -482,57 +527,6 @@ fn empty_simhash_records_its_empty_input_and_result() {
     assert_eq!(inputs[0]["output"]["hex"], "0000000000000000");
 }
 
-// Retain the original byte/address golden without editing its expectation.
-// This projection discards only v2 additions and restores v1 presentation;
-// the separate v2 golden below pins actual call order, duplicates and finishes.
-fn legacy_dump(dump: String) -> String {
-    use serde_json::{Value, json};
-    fn input(input: &mut Value, ordinal: usize) {
-        let boundary = input["boundary"].as_str().unwrap().to_owned();
-        let object = input.as_object_mut().unwrap();
-        object.remove("finishes");
-        object.remove("feature_count");
-        let output = object["output"].get("hex").cloned().unwrap_or(Value::Null);
-        object.insert(
-            "output".to_owned(),
-            if matches!(boundary.as_str(), "create-only" | "simhash-feature") {
-                Value::Null
-            } else {
-                output
-            },
-        );
-        if object["context"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|context| context.as_str().unwrap().starts_with("resource:"))
-        {
-            object.insert("context".to_owned(), json!([format!("resource:{ordinal}")]));
-        }
-    }
-    let mut dump: Value = serde_json::from_str(&dump).unwrap();
-    dump["format"] = json!("carina-identity-probe-v1");
-    dump.as_object_mut().unwrap().remove("redaction");
-    dump.as_object_mut().unwrap().remove("unattributed");
-    for resource in dump["resources"].as_array_mut().unwrap() {
-        let ordinal = resource["ordinal"].as_u64().unwrap() as usize;
-        let inputs = resource["hash_inputs"].as_array_mut().unwrap();
-        inputs.retain(|input| input["boundary"] != "simhash");
-        for recorded in inputs.iter_mut() {
-            input(recorded, ordinal);
-        }
-        inputs.sort_by_key(Value::to_string);
-        for secret in resource["secret_material"].as_array_mut().unwrap() {
-            if let Some(inputs) = secret.get_mut("inputs").and_then(Value::as_array_mut) {
-                for recorded in inputs {
-                    input(recorded, ordinal);
-                }
-            }
-        }
-    }
-    format!("{}\n", serde_json::to_string_pretty(&dump).unwrap())
-}
-
 #[test]
 fn offline_identity_ordered_observations_snapshot() {
     let raw = || {
@@ -558,13 +552,188 @@ fn offline_identity_ordered_observations_snapshot() {
     );
     assert!(unattributed.iter().all(|input| input["reason"]
         == "preparatory loop template identity not retained by the expanded graph"));
-    let dump = serde_json::to_string_pretty(&observations["resources"]).unwrap();
-    insta::assert_snapshot!(dump);
+    assert_no_absolute_paths(&observations);
+    insta::assert_snapshot!(first);
 }
 
 fn expect_incomplete(result: Result<String, ProbeError>, expected: &str) {
     match result {
-        Err(ProbeError::Incomplete(message)) => assert_eq!(message, expected),
+        Err(ProbeError::Incomplete(details)) => {
+            assert_eq!(details.missing.first().map(String::as_str), Some(expected));
+            assert!(details.dump_path.is_none());
+        }
         result => panic!("expected Incomplete({expected:?}), got {result:?}"),
+    }
+}
+
+fn assert_no_plaintext_or_hex(dump: &str, private: &str) {
+    assert!(
+        !dump.contains(private),
+        "private key leaked in real-mode metadata"
+    );
+    let encoded: String = private
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert!(
+        !dump.contains(&encoded),
+        "hex private key leaked in real-mode metadata"
+    );
+}
+
+#[test]
+fn round_two_fingerprint_mode_hides_environment_map_loop_keys() {
+    for private in [
+        "environmentLoopKeyCanary",
+        "environment-loop-key-CANARY.with space",
+    ] {
+        let temporary = tempfile::tempdir().unwrap();
+        copy_fixture(temporary.path());
+        let environment =
+            EnvironmentSnapshot::new([("PROBE_PRIVATE_KEY".to_owned(), private.into())]);
+        // Map keys are literals in this branch's grammar. Evaluate env() through
+        // the production parser, then use that value to construct the fixture map.
+        let config = carina_core::parser::ProviderContext::new(environment.clone());
+        let mut parsed = carina_core::parser::parse_file(
+            "let key = env('PROBE_PRIVATE_KEY')\n",
+            Path::new("environment.crn"),
+            &config,
+        )
+        .unwrap();
+        carina_core::parser::resolve_resource_refs(&mut parsed, &config).unwrap();
+        let carina_core::resource::Value::Concrete(carina_core::resource::ConcreteValue::String(
+            key,
+        )) = &parsed.variables["key"]
+        else {
+            panic!("env must produce a string");
+        };
+        assert!(key.is_diagnostic_sensitive());
+        let key = serde_json::to_string(key).unwrap();
+        fs::write(
+            temporary.path().join("map-loops.crn"),
+            format!(
+                r#"
+let environment_key = env('PROBE_PRIVATE_KEY')
+let keyed = {{ {key} = 'map-loop-name' }}
+for key, name in keyed {{ probe.Declared {{ name = "${{name}}-anonymous" }} }}
+let named = for key, name in keyed {{ probe.Declared {{ name = "${{name}}-anonymous" }} }}
+for key, name in keyed {{ child {{ name = "${{name}}-module" }} }}
+"#
+            ),
+        )
+        .unwrap();
+        let dump = probe_directory(
+            temporary.path(),
+            &environment,
+            RedactionMode::Sha256(synthetic()),
+        )
+        .unwrap();
+        assert_no_plaintext_or_hex(&dump, private);
+        let OfflineProviders::Factories(factories) = synthetic() else {
+            unreachable!()
+        };
+        let raw = probe_directory(
+            temporary.path(),
+            &environment,
+            RedactionMode::RawSynthetic(factories),
+        )
+        .unwrap();
+        assert!(
+            raw.contains(private),
+            "fixture must exercise the key-bearing metadata"
+        );
+        let document: serde_json::Value = serde_json::from_str(&dump).unwrap();
+        assert!(
+            document["resources"].as_array().unwrap().len() == 20,
+            "loop resources must be expanded"
+        );
+        assert!(dump.contains("map-loops.crn"));
+        assert!(dump.contains("Declared"));
+        assert!(
+            document["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|resource| resource["resource_id"]["identity"][0]["literal"] == "named"),
+            "source binding identifiers stay readable"
+        );
+    }
+}
+
+#[test]
+fn round_two_fingerprint_mode_hides_secret_path_map_keys() {
+    let temporary = tempfile::tempdir().unwrap();
+    copy_fixture(temporary.path());
+    fs::write(
+        temporary.path().join("secret-map.crn"),
+        r#"
+let secret_map = probe.SecretMap {
+    values = { "private-secret-map-key-CANARY" = secret('map-secret-value') }
+}
+"#,
+    )
+    .unwrap();
+    let private = "private-secret-map-key-CANARY";
+    let environment = EnvironmentSnapshot::new([("PROBE_PRIVATE_KEY".to_owned(), private.into())]);
+    let dump = probe_directory(
+        temporary.path(),
+        &environment,
+        RedactionMode::Sha256(synthetic()),
+    )
+    .unwrap();
+    assert_no_plaintext_or_hex(&dump, private);
+    assert!(
+        dump.contains("values"),
+        "schema-declared attributes stay readable"
+    );
+}
+
+fn assert_no_absolute_paths(value: &serde_json::Value) {
+    match value {
+        serde_json::Value::String(value) => {
+            assert!(
+                !Path::new(value).is_absolute(),
+                "absolute path in the document"
+            );
+            assert!(!value.contains(":/"), "absolute path in a context label");
+            assert!(
+                !value.contains("/Volumes/CargoTargets/"),
+                "absolute scratch path in the document"
+            );
+            assert!(
+                !value.contains("/Users/"),
+                "absolute workspace path in the document"
+            );
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                assert_no_absolute_paths(value);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                assert_no_absolute_paths(&serde_json::json!(key));
+                assert_no_absolute_paths(value);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+#[test]
+fn incomplete_expansion_keeps_completed_resource_inputs_attributed() {
+    let copied = tempfile::tempdir().unwrap();
+    copy_fixture(copied.path());
+    fs::write(
+        copied.path().join("deferred.crn"),
+        "for name in unknown_b.names { probe.Declared { name = name } }\n",
+    )
+    .unwrap();
+    match probe(copied.path(), synthetic()) {
+        Err(ProbeError::Incomplete(details)) => {
+            assert_eq!(details.missing, ["deferred expansion remains"])
+        }
+        other => panic!("expected only the deferred-expansion failure, got {other:?}"),
     }
 }

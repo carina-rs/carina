@@ -903,11 +903,14 @@ pub(crate) fn region_from_attrs(
 /// `moved` / `removed` string can stay double-quoted without escape
 /// juggling. See #1903.
 pub fn map_key_address(binding: &str, key: &str) -> String {
-    if is_identifier_safe(key) {
+    let address = if is_identifier_safe(key) {
         format!("{}.{}", binding, key)
     } else {
         format!("{}['{}']", binding, key)
-    }
+    };
+    #[cfg(feature = "test-utils")]
+    crate::identity_recording::address_key(&address, binding, key);
+    address
 }
 
 /// Canonicalize the trailing map-key segment of a resource address so

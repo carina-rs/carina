@@ -181,7 +181,7 @@ fn identity_addresses_and_secret_hashes_are_identical_with_an_idle_or_active_rec
 #[test]
 fn nested_recorders_and_unwinding_restore_the_previous_scope() {
     let (_, outer) = record(|| {
-        let _context = context(|| "outer".to_owned());
+        let _context = secret_producer_context(SecretProducer::PayloadHash);
         secret_material(b"before");
         let (_, inner) = record(|| secret_material(b"inner"));
         assert_eq!(inner.len(), 1);
@@ -191,7 +191,12 @@ fn nested_recorders_and_unwinding_restore_the_previous_scope() {
         secret_material(b"after");
     });
     assert_eq!(outer.len(), 2);
-    assert!(outer.iter().all(|input| input.context == ["outer"]));
+    assert!(
+        outer
+            .iter()
+            .all(|input| input.context
+                == [InputContext::SecretProducer(SecretProducer::PayloadHash)])
+    );
     assert!(ACTIVE.with(|active| active.borrow().is_none()));
 }
 
@@ -203,12 +208,15 @@ fn eight_in_process_threads_do_not_share_recordings() {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 let (_, inputs) = record(|| {
-                    let _context = context(|| format!("thread:{index}"));
+                    let _context = secret_producer_context(SecretProducer::PayloadHash);
                     barrier.wait();
                     secret_material(&[index]);
                 });
                 assert_eq!(inputs.len(), 1);
-                assert_eq!(inputs[0].context, [format!("thread:{index}")]);
+                assert_eq!(
+                    inputs[0].context,
+                    [InputContext::SecretProducer(SecretProducer::PayloadHash)]
+                );
                 assert_eq!(inputs[0].writes[0].bytes, [index]);
             })
         })
@@ -392,4 +400,71 @@ fn fingerprints_pin_sha256_and_byte_length() {
         fingerprint.sha256,
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
+}
+
+#[test]
+fn probe_secret_observations_use_production_payload_and_snapshot_hashes() {
+    let payload: SecretPayload<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    > = Box::new(Value::Concrete(ConcreteValue::String(
+        "producer-canary".into(),
+    )))
+    .into();
+    let (_, production) = record(|| payload.hash(None).unwrap());
+    let (_, observed) = record(|| observe_secret(&payload).unwrap());
+    assert_eq!(observed, production);
+    assert_eq!(
+        observed[0].owner,
+        InputOwner::SecretProducer(SecretProducer::PayloadHash)
+    );
+    let (_, snapshot) = record(|| observe_snapshot_secret(&payload).unwrap());
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(
+        snapshot[0].owner,
+        InputOwner::SecretProducer(SecretProducer::SnapshotHash)
+    );
+    assert_eq!(snapshot[0].writes, production[0].writes);
+}
+
+#[test]
+fn module_source_recording_is_an_additive_provided_method() {
+    struct ExternalModuleSource;
+    impl crate::resource::AnonymousIdentityModuleSource for ExternalModuleSource {
+        fn anonymous_outer_instance_identity(&self) -> Option<crate::resource::ResourceIdentity> {
+            None
+        }
+        fn anonymous_scope(&self) -> Option<(String, String)> {
+            None
+        }
+        fn anonymous_authored_locations(
+            &self,
+        ) -> Vec<(std::path::PathBuf, crate::parser::SourceSpan)> {
+            Vec::new()
+        }
+    }
+    use crate::resource::AnonymousIdentityModuleSource;
+    assert!(ExternalModuleSource.recording_module_calls().is_none());
+}
+
+#[test]
+fn address_key_observations_preserve_the_production_address_and_source_binding_names() {
+    let (_, _) = record(|| {
+        let safe = crate::utils::map_key_address("named", "safe_private_key");
+        let unsafe_key = crate::utils::map_key_address(&safe, "private-key.with space");
+        assert_eq!(safe, "named.safe_private_key");
+        assert_eq!(
+            unsafe_key,
+            "named.safe_private_key['private-key.with space']"
+        );
+        assert_eq!(
+            address_parts(&format!("module.{unsafe_key}.child")),
+            [
+                AddressPart::Literal("module.named".into()),
+                AddressPart::MapKey("safe_private_key".into()),
+                AddressPart::MapKey("private-key.with space".into()),
+                AddressPart::Literal(".child".into()),
+            ]
+        );
+    });
 }

@@ -293,6 +293,10 @@ impl<P: super::PlaceholderKind> SecretPayload<P, super::AbsoluteBindingAddress> 
         &self,
         previous: Option<&super::RedactedSecretHash>,
     ) -> Result<super::RedactedSecretHash, crate::value::SerializationError> {
+        #[cfg(feature = "test-utils")]
+        let _recording = crate::identity_recording::secret_producer_context(
+            crate::identity_recording::SecretProducer::PayloadHash,
+        );
         self.try_inspect(|value| {
             crate::value::canonical_secret_hash_material(value)
                 .map(|material| super::RedactedSecretHash::reuse_or_generate(&material, previous))
@@ -304,6 +308,10 @@ impl<P: super::PlaceholderKind> SecretPayload<P, super::AbsoluteBindingAddress> 
         &self,
         hash: &super::RedactedSecretHash,
     ) -> Result<bool, crate::value::SerializationError> {
+        #[cfg(feature = "test-utils")]
+        let _recording = crate::identity_recording::secret_producer_context(
+            crate::identity_recording::SecretProducer::PayloadVerification,
+        );
         self.try_inspect(|value| {
             crate::value::canonical_secret_hash_material(value)
                 .map(|material| hash.verify(material))

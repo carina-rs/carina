@@ -8982,7 +8982,9 @@ pub enum ProviderModuleSource {}
 #[doc(hidden)]
 pub trait AnonymousIdentityModuleSource {
     #[cfg(feature = "test-utils")]
-    fn recording_module_calls(&self) -> Option<Vec<crate::parser::ModuleCallId>>;
+    fn recording_module_calls(&self) -> Option<Vec<crate::parser::ModuleCallId>> {
+        None
+    }
 
     fn anonymous_outer_instance_identity(&self) -> Option<ResourceIdentity>;
 

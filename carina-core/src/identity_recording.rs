@@ -52,7 +52,7 @@ impl ModuleKey {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum InputOwner {
     Resource(ResourceKey),
     Module(ModuleKey),
@@ -62,10 +62,49 @@ pub enum InputOwner {
         identity: ResourceIdentity,
         parent: Option<ResourceIdentity>,
     },
+    SecretProducer(SecretProducer),
     Unattributed,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// The production operation that owns secret material outside a resource pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SecretProducer {
+    PayloadHash,
+    PayloadVerification,
+    SnapshotHash,
+}
+impl SecretProducer {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::PayloadHash => "secret-payload-hash",
+            Self::PayloadVerification => "secret-payload-verification",
+            Self::SnapshotHash => "snapshot-secret-hash",
+        }
+    }
+}
+
+/// Structured labels retain source identity until the facade renders paths and
+/// fingerprints expansion keys. They never require parsing a display string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InputContext {
+    Resource(Option<DeclarationLocation>),
+    Module(ModuleCallId),
+    SecretProducer(SecretProducer),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AddressPart {
+    Literal(String),
+    MapKey(String),
+}
+
+struct AddressKey {
+    address: String,
+    parent: String,
+    key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HashWrite {
     pub operation: &'static str,
     /// Typed integer calls use little endian; usize/isize use 64 bits. The
@@ -73,19 +112,18 @@ pub struct HashWrite {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HashFinish {
     pub operation: &'static str,
     pub after_writes: usize,
     pub output: Vec<u8>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HashInput {
     pub boundary: &'static str,
-    #[serde(skip)]
     pub owner: InputOwner,
-    pub context: Vec<String>,
+    pub context: Vec<InputContext>,
     pub writes: Vec<HashWrite>,
     pub output: Option<Vec<u8>>,
     pub finishes: Vec<HashFinish>,
@@ -94,10 +132,11 @@ pub struct HashInput {
 
 #[derive(Default)]
 struct Frame {
-    context: Vec<String>,
+    context: Vec<InputContext>,
     owner: Option<InputOwner>,
     modules: Vec<ModuleCallId>,
     inputs: Vec<HashInput>,
+    address_keys: Vec<AddressKey>,
 }
 
 thread_local! {
@@ -126,21 +165,17 @@ pub fn record<R>(run: impl FnOnce() -> R) -> (R, Vec<HashInput>) {
 }
 
 enum Restore {
-    Context,
     Owner(Option<InputOwner>),
     Module,
 }
 
 /// Guards own an Rc, so cannot be moved to another thread.
-pub struct ContextGuard(Option<(Rc<RefCell<Frame>>, Restore)>);
+pub(crate) struct ContextGuard(Option<(Rc<RefCell<Frame>>, Restore)>);
 impl Drop for ContextGuard {
     fn drop(&mut self) {
         if let Some((frame, restore)) = self.0.take() {
             let mut frame = frame.borrow_mut();
             match restore {
-                Restore::Context => {
-                    frame.context.pop();
-                }
                 Restore::Owner(owner) => {
                     frame.owner = owner;
                     frame.context.pop();
@@ -153,16 +188,7 @@ impl Drop for ContextGuard {
     }
 }
 
-pub fn context(label: impl FnOnce() -> String) -> ContextGuard {
-    let frame = ACTIVE.with(|active| active.borrow().clone());
-    ContextGuard(frame.map(|frame| {
-        let label = label();
-        frame.borrow_mut().context.push(label);
-        (frame, Restore::Context)
-    }))
-}
-
-fn owner_context(make: impl FnOnce(&Frame) -> (InputOwner, String)) -> ContextGuard {
+fn owner_context(make: impl FnOnce(&Frame) -> (InputOwner, InputContext)) -> ContextGuard {
     let frame = ACTIVE.with(|active| active.borrow().clone());
     ContextGuard(frame.map(|frame| {
         let (owner, label) = make(&frame.borrow());
@@ -187,16 +213,7 @@ pub(crate) fn resource_context<
         let owner = resource_key(resource)
             .map(InputOwner::Resource)
             .unwrap_or(InputOwner::Unattributed);
-        let label = resource_location(resource).map_or_else(
-            || "resource:unavailable".to_owned(),
-            |location| {
-                format!(
-                    "resource:{}:{}",
-                    location.file().path().display(),
-                    location.span().start_byte()
-                )
-            },
-        );
+        let label = InputContext::Resource(resource_location(resource).cloned());
         (owner, label)
     })
 }
@@ -205,7 +222,10 @@ pub(crate) fn module_context(id: &ModuleCallId) -> ContextGuard {
     owner_context(|frame| {
         let mut path = frame.modules.clone();
         path.push(id.clone());
-        (InputOwner::Module(ModuleKey(path)), module_context_key(id))
+        (
+            InputOwner::Module(ModuleKey(path)),
+            InputContext::Module(id.clone()),
+        )
     })
 }
 
@@ -384,7 +404,82 @@ pub fn fingerprint(bytes: &[u8]) -> Fingerprint {
 pub fn observe_secret<P: crate::resource::PlaceholderKind>(
     payload: &crate::resource::SecretPayload<P, crate::resource::AbsoluteBindingAddress>,
 ) -> Result<(), crate::value::SerializationError> {
-    payload.try_inspect(|value| crate::value::canonical_secret_hash_material(value).map(|_| ()))
+    payload.hash(None).map(|_| ())
+}
+
+/// Exercise the production snapshot binding adapter and material producer.
+pub fn observe_snapshot_secret<
+    P: crate::resource::PlaceholderKind + serde::de::DeserializeOwned,
+>(
+    payload: &crate::resource::SecretPayload<P, crate::resource::AbsoluteBindingAddress>,
+) -> Result<(), crate::value_walk::WalkError> {
+    crate::value_walk::observe_snapshot_secret(payload)
+}
+
+pub(crate) fn secret_producer_context(producer: SecretProducer) -> ContextGuard {
+    owner_context(|frame| {
+        let owner = frame
+            .owner
+            .clone()
+            .unwrap_or(InputOwner::SecretProducer(producer));
+        (owner, InputContext::SecretProducer(producer))
+    })
+}
+
+/// Capture the actual address builder's association, including identifier-safe
+/// map keys rendered with a dot. The facade never guesses keys from spelling.
+pub(crate) fn address_key(address: &str, parent: &str, key: &str) {
+    ACTIVE.with(|active| {
+        if let Some(frame) = active.borrow().as_ref() {
+            frame.borrow_mut().address_keys.push(AddressKey {
+                address: address.to_owned(),
+                parent: parent.to_owned(),
+                key: key.to_owned(),
+            });
+        }
+    });
+}
+
+/// Split only producer-observed map expansions; literal source identifiers
+/// retain their exact spelling. Longer expansions win so nested keys recurse.
+pub fn address_parts(address: &str) -> Vec<AddressPart> {
+    fn split(address: &str, keys: &[AddressKey]) -> Vec<AddressPart> {
+        let candidate = keys
+            .iter()
+            .filter_map(|key| {
+                address
+                    .match_indices(&key.address)
+                    .find(|(start, _)| {
+                        (*start == 0 || address.as_bytes()[start - 1] == b'.')
+                            && (start + key.address.len() == address.len()
+                                || matches!(
+                                    address.as_bytes()[start + key.address.len()],
+                                    b'.' | b'['
+                                ))
+                    })
+                    .map(|(start, _)| (key, start))
+            })
+            .max_by_key(|(key, start)| (key.address.len(), std::cmp::Reverse(*start)));
+        match candidate {
+            Some((key, start)) => {
+                let mut parts = split(&format!("{}{}", &address[..start], key.parent), keys);
+                parts.push(AddressPart::MapKey(key.key.clone()));
+                let suffix = &address[start + key.address.len()..];
+                if !suffix.is_empty() {
+                    parts.extend(split(suffix, keys));
+                }
+                parts
+            }
+            None => vec![AddressPart::Literal(address.to_owned())],
+        }
+    }
+    ACTIVE.with(|active| {
+        let active = active.borrow();
+        match active.as_ref() {
+            Some(frame) => split(address, &frame.borrow().address_keys),
+            None => vec![AddressPart::Literal(address.to_owned())],
+        }
+    })
 }
 
 pub fn resource_location<S, P: ValueKind, B: BindingAddress, D>(
@@ -440,23 +535,6 @@ pub fn loop_system_identities(
         )
         .map(|origin| origin.source().scheduler_identity().clone())
         .collect()
-}
-
-pub fn module_context_key(id: &ModuleCallId) -> String {
-    let location = id.declaration_location();
-    let mut key = format!(
-        "module:{}:{}",
-        location.file().path().display(),
-        location.span().start_byte()
-    );
-    match id.expansion() {
-        crate::parser::CallExpansion::Direct => {}
-        crate::parser::CallExpansion::Expanded(expansion) => {
-            key.push(':');
-            key.push_str(expansion.as_str());
-        }
-    }
-    key
 }
 
 #[cfg(test)]
