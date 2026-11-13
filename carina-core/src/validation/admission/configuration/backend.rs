@@ -116,6 +116,17 @@ impl BackendConfigErrors {
     pub fn errors(&self) -> &[BackendAttributeError] {
         &self.errors
     }
+
+    /// Locate each failure at its authored attribute, preserving diagnostic order.
+    pub fn into_located(
+        self,
+        locate: impl Fn(&AttributeKey) -> parser::DeclarationLocation,
+    ) -> Vec<parser::Located<BackendAttributeError>> {
+        self.errors
+            .into_iter()
+            .map(|error| parser::Located::new(locate(error.attribute()), error))
+            .collect()
+    }
 }
 
 impl fmt::Display for BackendConfigErrors {

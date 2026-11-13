@@ -683,35 +683,33 @@ impl DiagnosticRun<'_> {
             return Vec::new();
         };
 
-        let attribute_diagnostic = |error: &BackendAttributeError| {
-            // Directory resolution deliberately retains user-function calls
-            // that failed evaluation so other editor checks can continue.
-            // Suppress only those calls, including nested ones. A deferred
-            // builtin with unresolved arguments is still a genuine value-type
-            // mismatch and must remain visible, matching CLI validation.
-            if backend
-                .attributes
-                .get(error.attribute())
-                .is_some_and(|value| {
-                    contains_matching_function_call(value, &|name| {
-                        merged.directory.parsed.user_functions.contains_key(name)
+        let attribute_diagnostic =
+            |finding: carina_core::parser::Located<BackendAttributeError>| {
+                let error = finding.detail();
+                // Directory resolution deliberately retains user-function calls
+                // that failed evaluation so other editor checks can continue.
+                // Suppress only those calls, including nested ones. A deferred
+                // builtin with unresolved arguments is still a genuine value-type
+                // mismatch and must remain visible, matching CLI validation.
+                if backend
+                    .attributes
+                    .get(error.attribute())
+                    .is_some_and(|value| {
+                        contains_matching_function_call(value, &|name| {
+                            merged.directory.parsed.user_functions.contains_key(name)
+                        })
                     })
-                })
-            {
-                return None;
-            }
+                {
+                    return None;
+                }
 
-            let finding = carina_core::parser::Located::new(
-                tree.backend_attribute_location(error.attribute()).clone(),
-                error,
-            );
-            render_merged(doc, &finding, DiagnosticSeverity::ERROR, error.to_string())
-        };
+                render_merged(doc, &finding, DiagnosticSeverity::ERROR, error.to_string())
+            };
 
         match error {
             BackendConfigError::Invalid(errors) => errors
-                .errors()
-                .iter()
+                .into_located(|attribute| tree.backend_attribute_location(attribute).clone())
+                .into_iter()
                 .filter_map(attribute_diagnostic)
                 .collect(),
             unsupported @ BackendConfigError::UnsupportedBackend(_) => {

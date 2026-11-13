@@ -7,6 +7,65 @@ use std::sync::atomic::Ordering;
 use carina_core::test_utils::configuration::{ConfigFactory, ConfigurationDirectory};
 
 #[test]
+fn backend_attribute_error_locations_match_cli_directory_fixtures() {
+    let factory = carina_provider_mock::ConfiguredBuiltinMock::new(
+        Default::default(),
+        carina_provider_mock::MockScope::memory(),
+    );
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(factory)]),
+        vec!["mock".into()],
+    );
+    for (case, messages) in [
+        (
+            "multiple",
+            vec![
+                "Invalid attribute 'bucket' for backend type 's3': Type mismatch: expected String, got Int",
+                "Invalid attribute 'key' for backend type 's3': Type mismatch: expected String, got Int",
+            ],
+        ),
+        (
+            "single",
+            vec![
+                "Invalid attribute 'bucket' for backend type 's3': Type mismatch: expected String, got Int",
+            ],
+        ),
+    ] {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../carina-cli/tests/fixtures/backend_error_locations")
+            .join(case);
+        for file in ["backend.crn", "main.crn", "providers.crn"] {
+            let path = directory.join(file);
+            let source = std::fs::read_to_string(&path).unwrap();
+            let errors: Vec<_> = engine
+                .analyze(&create_document_at(&source, path.clone()), Some(&path))
+                .into_iter()
+                .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|diagnostic| (diagnostic.message, diagnostic.range))
+                .collect();
+            let expected: Vec<_> = if file == "backend.crn" {
+                messages
+                    .iter()
+                    .enumerate()
+                    .map(|(index, message)| {
+                        (
+                            message.to_string(),
+                            Range::new(
+                                Position::new(index as u32 + 1, 2),
+                                Position::new(index as u32 + 1, if index == 0 { 8 } else { 5 }),
+                            ),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            assert_eq!(errors, expected, "{case}/{file}");
+        }
+    }
+}
+
+#[test]
 fn provider_config_directory_compact_callback_parity() {
     for (value, rejected) in [("bad", true), ("good", false)] {
         let source = "provider owner { endpoints = [Endpoint] }\n";
@@ -88,7 +147,7 @@ fn deferred_backend_directory_diagnostics_match_validation() {
             .as_str()
             .unwrap()
             .trim()
-            .strip_prefix("Error: ")
+            .strip_prefix("Error: $DIR/backend.crn:2:3: ")
             .unwrap_or("");
         if message.is_empty() {
             assert!(errors.is_empty(), "{case}: {errors:?}");

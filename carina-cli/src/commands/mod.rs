@@ -27,8 +27,6 @@ use carina_core::parser::BackendConfig;
 #[cfg(test)]
 use carina_core::parser::ProviderContext;
 use carina_core::resource::{BindingAddress, PlaceholderKind};
-#[cfg(test)]
-use carina_state::BackendError;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendDrift, BackendLock, BackendSelection,
     MutationBackendSelection, ResolvedReadBackend, VerifiedMutationBackendSelection,
@@ -495,12 +493,34 @@ fn extend_module_resolution_errors(
 }
 
 /// Backend checks depend on authored values, even when provider loading fails.
-pub(crate) fn validate_root_backend<E>(parsed: &carina_core::parser::File<E>) -> Vec<AppError> {
+pub(crate) fn validate_root_backend<E: carina_core::parser::ExportParamLike>(
+    parsed: &carina_core::parser::File<E>,
+) -> Vec<AppError> {
     if !carina_core::validation::is_module_definition(parsed)
         && let Some(backend) = &parsed.backend
         && let Err(error) = StateBackendConfig::try_from(backend)
     {
-        vec![AppError::Backend(error.into())]
+        let tree = match carina_core::parser::AnalysisTree::try_from_file(parsed) {
+            Ok(tree) => tree,
+            Err(error) => return vec![AppError::AnalysisInvariant(error)],
+        };
+        match error {
+            carina_state::BackendConfigError::Invalid(errors) => errors
+                .into_located(|attribute| tree.backend_attribute_location(attribute).clone())
+                .into_iter()
+                .map(|finding| AppError::BackendAttribute(Box::new(finding)))
+                .collect(),
+            unsupported @ carina_state::BackendConfigError::UnsupportedBackend(_) => {
+                vec![AppError::BackendConfiguration(Box::new(
+                    carina_core::parser::Located::new(
+                        tree.backend_location()
+                            .expect("backend declaration provenance")
+                            .clone(),
+                        unsupported,
+                    ),
+                ))]
+            }
+        }
     } else {
         Vec::new()
     }
@@ -1610,18 +1630,30 @@ mod tests {
             &[],
         );
 
-        assert!(errors.iter().any(|error| {
-            matches!(
-                error,
-                AppError::Backend(BackendError::InvalidConfig(
-                    carina_state::BackendConfigError::Invalid(errors)
-                )) if errors.errors().iter().any(|error| matches!(
+        let error = errors
+            .iter()
+            .find(|error| {
+                matches!(
                     error,
-                    carina_state::BackendAttributeError::InvalidAttribute { attribute, .. }
-                        if attribute == "region"
-                ))
-            )
-        }));
+                    AppError::BackendAttribute(finding) if matches!(
+                        finding.detail(),
+                        carina_state::BackendAttributeError::InvalidAttribute { attribute, .. }
+                            if attribute == "region"
+                    )
+                )
+            })
+            .expect("located, typed backend attribute error");
+        assert!(
+            std::error::Error::source(error)
+                .unwrap()
+                .downcast_ref::<carina_state::BackendAttributeError>()
+                .is_some()
+        );
+        assert_eq!(
+            crate::error::format_error_with_source_chain(error),
+            error.to_string(),
+            "the typed source must not repeat the complete located message"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
