@@ -62,23 +62,8 @@ pub enum InputOwner {
         identity: ResourceIdentity,
         parent: Option<ResourceIdentity>,
     },
-    SecretProducer(SecretProducer),
-    Unattributed,
-}
-
-/// The production operation that owns secret material outside a resource pass.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SecretProducer {
     PayloadHash,
-    PayloadVerification,
-}
-impl SecretProducer {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::PayloadHash => "secret-payload-hash",
-            Self::PayloadVerification => "secret-payload-verification",
-        }
-    }
+    Unattributed,
 }
 
 /// Structured labels retain source identity until the facade renders paths and
@@ -87,19 +72,7 @@ impl SecretProducer {
 pub enum InputContext {
     Resource(Option<DeclarationLocation>),
     Module(ModuleCallId),
-    SecretProducer(SecretProducer),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AddressPart {
-    Literal(String),
-    MapKey(String),
-}
-
-struct AddressKey {
-    address: String,
-    parent: String,
-    key: String,
+    PayloadHash,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,7 +96,6 @@ pub struct HashInput {
     pub owner: InputOwner,
     pub context: Vec<InputContext>,
     pub writes: Vec<HashWrite>,
-    pub output: Option<Vec<u8>>,
     pub finishes: Vec<HashFinish>,
     pub feature_count: Option<usize>,
 }
@@ -134,7 +106,6 @@ struct Frame {
     owner: Option<InputOwner>,
     modules: Vec<ModuleCallId>,
     inputs: Vec<HashInput>,
-    address_keys: Vec<AddressKey>,
 }
 
 thread_local! {
@@ -253,7 +224,6 @@ impl Capture {
                     owner: active.owner.clone().unwrap_or(InputOwner::Unattributed),
                     context: active.context.clone(),
                     writes: Vec::new(),
-                    output: None,
                     finishes: Vec::new(),
                     feature_count: None,
                 };
@@ -280,7 +250,6 @@ impl Capture {
             after_writes: input.writes.len(),
             output: bytes.to_vec(),
         });
-        input.output = Some(bytes.to_vec());
     }
     pub(crate) fn loop_result(&self, identity: &ResourceIdentity, parent: Option<&str>) {
         self.frame.borrow_mut().inputs[self.index].owner = InputOwner::Loop {
@@ -399,68 +368,12 @@ pub fn fingerprint(bytes: &[u8]) -> Fingerprint {
     }
 }
 
-pub(crate) fn secret_producer_context(producer: SecretProducer) -> ContextGuard {
+pub(crate) fn payload_hash_context() -> ContextGuard {
     owner_context(|frame| {
-        let owner = frame
-            .owner
-            .clone()
-            .unwrap_or(InputOwner::SecretProducer(producer));
-        (owner, InputContext::SecretProducer(producer))
-    })
-}
-
-/// Capture the actual address builder's association, including identifier-safe
-/// map keys rendered with a dot. The facade never guesses keys from spelling.
-pub(crate) fn address_key(address: &str, parent: &str, key: &str) {
-    ACTIVE.with(|active| {
-        if let Some(frame) = active.borrow().as_ref() {
-            frame.borrow_mut().address_keys.push(AddressKey {
-                address: address.to_owned(),
-                parent: parent.to_owned(),
-                key: key.to_owned(),
-            });
-        }
-    });
-}
-
-/// Split only producer-observed map expansions; literal source identifiers
-/// retain their exact spelling. Longer expansions win so nested keys recurse.
-pub fn address_parts(address: &str) -> Option<Vec<AddressPart>> {
-    fn split(address: &str, keys: &[AddressKey]) -> Vec<AddressPart> {
-        let candidate = keys
-            .iter()
-            .filter_map(|key| {
-                address
-                    .match_indices(&key.address)
-                    .find(|(start, _)| {
-                        (*start == 0 || address.as_bytes()[start - 1] == b'.')
-                            && (start + key.address.len() == address.len()
-                                || matches!(
-                                    address.as_bytes()[start + key.address.len()],
-                                    b'.' | b'['
-                                ))
-                    })
-                    .map(|(start, _)| (key, start))
-            })
-            .max_by_key(|(key, start)| (key.address.len(), std::cmp::Reverse(*start)));
-        match candidate {
-            Some((key, start)) => {
-                let mut parts = split(&format!("{}{}", &address[..start], key.parent), keys);
-                parts.push(AddressPart::MapKey(key.key.clone()));
-                let suffix = &address[start + key.address.len()..];
-                if !suffix.is_empty() {
-                    parts.extend(split(suffix, keys));
-                }
-                parts
-            }
-            None => vec![AddressPart::Literal(address.to_owned())],
-        }
-    }
-    ACTIVE.with(|active| {
-        let active = active.borrow();
-        active
-            .as_ref()
-            .map(|frame| split(address, &frame.borrow().address_keys))
+        (
+            frame.owner.clone().unwrap_or(InputOwner::PayloadHash),
+            InputContext::PayloadHash,
+        )
     })
 }
 
@@ -510,19 +423,6 @@ pub fn loop_system_identities(
     loop_origins(provenance)
         .map(|origin| origin.source().scheduler_identity().clone())
         .collect()
-}
-
-pub fn keyed_for_elements(provenance: &crate::resource::LoopProvenance) -> usize {
-    loop_origins(provenance)
-        .filter(|origin| {
-            matches!(
-                origin.kind(),
-                LoopOriginKind::For {
-                    element: crate::resource::ForLoopElement::Key(_)
-                }
-            )
-        })
-        .count()
 }
 
 #[cfg(test)]

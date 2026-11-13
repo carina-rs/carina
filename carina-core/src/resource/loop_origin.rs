@@ -139,6 +139,11 @@ impl Hash for LoopSource {
 }
 
 impl LoopSource {
+    #[cfg(feature = "test-utils")]
+    pub fn recording_parts(&self) -> (LoopKind, &ResourceIdentity) {
+        (self.kind, &self.system_identity)
+    }
+
     pub(crate) fn authored(
         source_file: &Path,
         span: SourceSpan,
@@ -320,6 +325,15 @@ pub struct LoopElementOrigin {
 }
 
 impl LoopElementOrigin {
+    #[cfg(feature = "test-utils")]
+    pub fn recording_parts(&self) -> (&LoopSource, &str, Option<&ResourceIdentity>) {
+        (
+            &self.source,
+            self.legacy.exact_state_name(),
+            self.current_parent.as_ref(),
+        )
+    }
+
     pub(crate) fn new(kind: LoopOriginKind, source: LoopSource, legacy: LegacyLoopAddress) -> Self {
         Self {
             kind,
@@ -530,6 +544,21 @@ pub struct LoopProvenance {
 }
 
 impl LoopProvenance {
+    #[cfg(feature = "test-utils")]
+    pub fn recording_parts(
+        &self,
+    ) -> (
+        Option<&LoopElementOrigin>,
+        impl Iterator<Item = (&LoopElementOrigin, &ResourceIdentity)>,
+    ) {
+        (
+            self.direct_origin(),
+            self.module_prefixes
+                .iter()
+                .map(|prefix| (prefix.origin(), prefix.current_prefix())),
+        )
+    }
+
     pub(crate) fn direct(origin: LoopElementOrigin) -> Self {
         Self {
             direct: Some(Box::new(origin)),

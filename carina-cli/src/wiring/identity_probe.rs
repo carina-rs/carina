@@ -1,13 +1,14 @@
 //! Offline identity observations for comparing #4400 PR heads.
 //!
-//! Synthetic callers explicitly choose raw bytes or fingerprints. The real
-//! directory entry point only writes SHA-256 and byte lengths, never raw bytes.
-//! User-derived loop/map keys, address key parts, expansion discriminators and
-//! secret-path map keys are fingerprinted too. Source-level resource types,
-//! binding names, schema-declared attribute/field names and relative files stay
-//! readable. Exact consecutive computations per owner (including SimHash
-//! features) collapse; distinct computations retain their original order,
-//! without pinning pass counts.
+//! Synthetic callers explicitly choose raw bytes or fingerprints. Real mode
+//! fingerprints every complete identity/address and other user-derived string
+//! with SHA-256 plus byte length. Plaintext requires an explicit allow-list kind:
+//! FixedLiteral, RelativePath, SchemaOrTypeName, AttributeName, SourceBindingName.
+//! Typed renderers select every field; serialized structures never pass through.
+//! Exact consecutive computations per owner (including SimHash features)
+//! collapse; distinct computations retain their order without pinning pass counts.
+//! The production directory/module pipeline uses skip-resource-validation mode
+//! (`validate_config_pair(.., true, ..)`); this is not a full validation report.
 //! Secret material comes from `SecretPayload::hash(None)`. The production
 //! persistence routes `merge_secrets_into_provider_json_inner -> inner.hash`
 //! and `persist_secret_json -> hash_secret_value -> payload.hash` use the same
@@ -26,9 +27,12 @@
 use super::{LoadedProviderFactory, ProviderLoad, ProviderNoticeSink, WiringContext};
 use crate::error::AppError;
 use carina_core::identity_recording::{
-    self, AddressPart, HashInput, InputContext, InputOwner, ModuleKey, ResourceKey,
+    self, HashInput, InputContext, InputOwner, ModuleKey, ResourceKey,
 };
-use carina_core::resource::{ConcreteValue, DeferredValue, ResourceIdentity, Value};
+use carina_core::resource::{
+    ConcreteValue, DeferredValue, ForLoopElement, LoopElementOrigin, LoopKind, LoopOriginKind,
+    LoopProvenance, ResourceIdentity, Value,
+};
 use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -56,7 +60,34 @@ enum Disclosure {
     Sha256,
 }
 
-#[derive(Debug, thiserror::Error)]
+/// Only these five explicit classifications can disclose plaintext in real mode.
+#[derive(Clone, Copy)]
+pub enum DisclosureKind {
+    FixedLiteral,
+    RelativePath,
+    SchemaOrTypeName,
+    AttributeName,
+    SourceBindingName,
+    Fingerprint,
+}
+impl Disclosure {
+    fn disclose(self, kind: DisclosureKind, value: &str) -> Json {
+        match (self, kind) {
+            (Self::Raw, _)
+            | (
+                Self::Sha256,
+                DisclosureKind::FixedLiteral
+                | DisclosureKind::RelativePath
+                | DisclosureKind::SchemaOrTypeName
+                | DisclosureKind::AttributeName
+                | DisclosureKind::SourceBindingName,
+            ) => json!(value),
+            (Self::Sha256, DisclosureKind::Fingerprint) => bytes(value.as_bytes(), self),
+        }
+    }
+}
+
+#[derive(thiserror::Error)]
 pub enum ProbeError {
     #[error("Application")]
     Application(#[source] Box<AppError>),
@@ -70,6 +101,11 @@ pub enum ProbeError {
     NoConfiguration,
     #[error(transparent)]
     DirectoryFailures(#[from] DirectoryFailures),
+}
+impl std::fmt::Debug for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 impl From<AppError> for ProbeError {
     fn from(error: AppError) -> Self {
@@ -101,7 +137,7 @@ impl ProbeError {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeferredSite {
     pub file: String,
     pub span: std::ops::Range<usize>,
@@ -113,6 +149,16 @@ pub enum DirectoryStatus {
     Skipped,
     Partial { deferred: Vec<DeferredSite> },
     Failed(ProbeError),
+}
+impl std::fmt::Display for DirectoryStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ok => f.write_str("ok"),
+            Self::Skipped => f.write_str("skipped (no .crn files)"),
+            Self::Partial { deferred } => write!(f, "partial ({} deferred sites)", deferred.len()),
+            Self::Failed(error) => write!(f, "failed ({error})"),
+        }
+    }
 }
 #[derive(Debug)]
 pub struct DirectoryResult {
@@ -165,15 +211,24 @@ impl std::error::Error for DirectoryFailures {
     }
 }
 
+#[derive(Debug)]
+pub struct ProbeOutcome {
+    pub dump: String,
+    pub deferred: Vec<DeferredSite>,
+}
+
 struct ProbeDocument {
     dump: String,
     missing: Vec<String>,
     deferred: Vec<DeferredSite>,
 }
 impl ProbeDocument {
-    fn complete(self, dump_path: Option<PathBuf>) -> Result<String, ProbeError> {
+    fn complete(self, dump_path: Option<PathBuf>) -> Result<ProbeOutcome, ProbeError> {
         if self.missing.is_empty() {
-            Ok(self.dump)
+            Ok(ProbeOutcome {
+                dump: self.dump,
+                deferred: self.deferred,
+            })
         } else {
             Err(ProbeError::Incomplete(IncompleteProbe {
                 missing: self.missing,
@@ -204,7 +259,7 @@ pub fn probe_directory(
     directory: &Path,
     environment: &carina_core::EnvironmentSnapshot,
     mode: RedactionMode,
-) -> Result<String, ProbeError> {
+) -> Result<ProbeOutcome, ProbeError> {
     capture_directory(directory, environment, mode)?.complete(None)
 }
 
@@ -346,7 +401,7 @@ fn prepare(
                         required_modules.push(key);
                     }
                     let location = call.id.declaration_location();
-                    instances.push(json!({ "instance": render_address(&call.instance, 0, disclosure)?, "declaration": paths.relative(location.file().path()), "start_byte": location.span().start_byte() }));
+                    instances.push(json!({ "instance": disclosure.disclose(DisclosureKind::Fingerprint, &call.instance), "declaration": disclosure.disclose(DisclosureKind::RelativePath, &paths.relative(location.file().path())), "start_byte": location.span().start_byte() }));
                 }
             }
             let basis = if resource.binding.is_some() {
@@ -394,22 +449,26 @@ fn prepare(
                 .prefixes
                 .iter()
                 .map(|(name, value)| {
-                    let value = match disclosure {
-                        Disclosure::Raw => json!(value),
-                        Disclosure::Sha256 => bytes(value.as_bytes(), disclosure),
-                    };
-                    (name, value)
+                    (
+                        disclosure
+                            .disclose(DisclosureKind::AttributeName, name)
+                            .as_str()
+                            .expect("attribute name")
+                            .to_owned(),
+                        disclosure.disclose(DisclosureKind::Fingerprint, value),
+                    )
                 })
                 .collect();
-            let mut provenance = serde_json::to_value(&resource.loop_provenance)?;
-            paths.loop_provenance(&mut provenance, disclosure)?;
-            let keyed = identity_recording::keyed_for_elements(&resource.loop_provenance);
-            let mut resource_id = serde_json::to_value(&resource.id)?;
-            resource_id["identity"] = render_address(
-                resource.id.identity_str().expect("resolved identity"),
-                keyed,
-                disclosure,
-            )?;
+            let provenance = paths.loop_provenance(&resource.loop_provenance, disclosure);
+            let mut resource_id = json!({
+                "provider": disclosure.disclose(DisclosureKind::SchemaOrTypeName, &resource.id.provider),
+                "resource_type": disclosure.disclose(DisclosureKind::SchemaOrTypeName, &resource.id.resource_type),
+                "identity": disclosure.disclose(DisclosureKind::Fingerprint, resource.id.identity_str().expect("resolved identity")),
+            });
+            if let Some(binding) = &resource.id.provider_instance {
+                resource_id["provider_instance"] =
+                    disclosure.disclose(DisclosureKind::Fingerprint, binding);
+            }
             Ok::<_, ProbeError>(PreparedResource {
                 key,
                 loop_identities: identity_recording::loop_system_identities(
@@ -419,9 +478,9 @@ fn prepare(
                 required_modules,
                 dump: json!({
                     "ordinal": ordinal,
-                    "declaration": { "file": paths.relative(location.file().path()), "start_byte": span.start_byte(), "end_byte": span.end_byte(), "line": span.start_line(), "column": span.start_column() },
+                    "declaration": { "file": disclosure.disclose(DisclosureKind::RelativePath, &paths.relative(location.file().path())), "start_byte": span.start_byte(), "end_byte": span.end_byte(), "line": span.start_line(), "column": span.start_column() },
                     "expansion": { "instances": instances, "loop": provenance },
-                    "identity_basis": basis, "resource_id": resource_id, "address": render_address(&resource.id.to_string(), keyed, disclosure)?,
+                    "identity_basis": disclosure.disclose(DisclosureKind::FixedLiteral, basis), "resource_id": resource_id, "address": disclosure.disclose(DisclosureKind::Fingerprint, &resource.id.to_string()),
                     "resolved_prefixes": prefixes, "secret_material": secrets,
                 }),
             })
@@ -476,7 +535,7 @@ fn finish_dump(
             if !inputs.iter().any(|input| {
                 matches!(&input.owner, InputOwner::Module(recorded) if recorded == module)
                     && input.boundary == "simhash"
-                    && input.output.is_some()
+                    && !input.finishes.is_empty()
             }) {
                 failures.push(format!("missing module prefix hash inputs for {address}"));
             }
@@ -502,7 +561,7 @@ fn finish_dump(
         required_loops.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         for identity in required_loops {
             if !inputs.iter().any(|input| matches!(&input.owner, InputOwner::Loop { identity: recorded, .. } if recorded == identity)) {
-                failures.push(format!("missing loop identity hash inputs for {address}: {identity}"));
+                failures.push(format!("missing loop identity hash inputs for {address}"));
             }
         }
         let mut rendered = Vec::new();
@@ -512,7 +571,7 @@ fn finish_dump(
                 InputOwner::Resource(key) => key == &resource.key,
                 InputOwner::Module(module) => module.owns(&resource.key),
                 InputOwner::Loop { identity, .. } => loops.contains(identity),
-                InputOwner::SecretProducer(_) | InputOwner::Unattributed => false,
+                InputOwner::PayloadHash | InputOwner::Unattributed => false,
             };
             if !owns {
                 continue;
@@ -523,7 +582,7 @@ fn finish_dump(
                     input.boundary,
                     "declared-identity" | "create-only" | "simhash"
                 )
-                && input.output.is_some()
+                && !input.finishes.is_empty()
             {
                 primary = true;
             }
@@ -552,7 +611,7 @@ fn finish_dump(
             .filter(|next| {
                 next.owner == input.owner
                     && next.boundary == "simhash-feature"
-                    && next.output.is_some()
+                    && !next.finishes.is_empty()
             })
             .count();
         if input.feature_count != Some(features) {
@@ -562,25 +621,6 @@ fn finish_dump(
             ));
         }
     }
-    let mut producers: BTreeMap<&str, Vec<&HashInput>> = BTreeMap::new();
-    for (index, input) in inputs.iter().enumerate() {
-        if let InputOwner::SecretProducer(producer) = input.owner {
-            claimed[index] = true;
-            producers.entry(producer.name()).or_default().push(input);
-        }
-    }
-    let producers: BTreeMap<_, _> = producers
-        .into_iter()
-        .map(|(producer, observations)| {
-            (
-                producer,
-                collapse_observations(observations)
-                    .into_iter()
-                    .map(|input| render_input(input, paths, disclosure))
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect();
     let mut unattributed = Vec::new();
     for input in collapse_observations(
         inputs
@@ -599,25 +639,24 @@ fn finish_dump(
             InputOwner::Module(key) if compositions.contains(key) => {
                 Some("composition call has no managed resource descendants")
             }
-            InputOwner::Resource(_)
-            | InputOwner::Module(_)
-            | InputOwner::SecretProducer(_)
-            | InputOwner::Unattributed => None,
+            InputOwner::PayloadHash => {
+                Some("production secret payload hash outside a resource identity pass")
+            }
+            InputOwner::Resource(_) | InputOwner::Module(_) | InputOwner::Unattributed => None,
         };
         if reason.is_none() {
             failures.push("unattributed hash inputs".to_owned());
         }
         unattributed
-            .push(json!({ "reason": reason, "input": render_input(input, paths, disclosure) }));
+            .push(json!({ "reason": reason.map(|reason| disclosure.disclose(DisclosureKind::FixedLiteral, reason)), "input": render_input(input, paths, disclosure) }));
     }
     let dump = json!({
-        "format": "carina-identity-probe-v2",
-        "redaction": match disclosure { Disclosure::Raw => "raw-synthetic", Disclosure::Sha256 => "sha256" },
+        "format": disclosure.disclose(DisclosureKind::FixedLiteral, "carina-identity-probe-v2"),
+        "redaction": disclosure.disclose(DisclosureKind::FixedLiteral, match disclosure { Disclosure::Raw => "raw-synthetic", Disclosure::Sha256 => "sha256" }),
         "resources": resources.into_iter().map(|resource| resource.dump).collect::<Vec<_>>(),
         "unattributed": unattributed,
-        "secret_producers": producers,
-        "status": { "kind": if !failures.is_empty() { "failed" }
-            else if deferred.is_empty() { "ok" } else { "partial" }, "deferred": deferred },
+        "status": { "kind": disclosure.disclose(DisclosureKind::FixedLiteral, if !failures.is_empty() { "failed" }
+            else if deferred.is_empty() { "ok" } else { "partial" }), "deferred": deferred.iter().map(|site| json!({"file": disclosure.disclose(DisclosureKind::RelativePath, &site.file), "span": site.span})).collect::<Vec<_>>() },
     });
     let dump = format!("{}\n", serde_json::to_string_pretty(&dump)?);
     let mut seen = HashSet::new();
@@ -694,9 +733,9 @@ impl SecretPath {
                 self.0
                     .iter()
                     .map(|part| match part {
-                        SecretPathPart::Attribute(name) => json!({"attribute": name}),
+                        SecretPathPart::Attribute(name) => json!({"attribute": disclosure.disclose(DisclosureKind::AttributeName, name)}),
                         SecretPathPart::MapKey(key) =>
-                            json!({"map_key": bytes(key.as_bytes(), disclosure)}),
+                            json!({"map_key": disclosure.disclose(DisclosureKind::Fingerprint, key)}),
                         SecretPathPart::Index(index) => json!({"index": index}),
                     })
                     .collect::<Vec<_>>()
@@ -717,7 +756,7 @@ fn observe_secrets(
         Value::Deferred(DeferredValue::Secret(payload)) => {
             let known = value.knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation()).ok().and_then(|proof| proof.into_classification().into_known().ok()).is_some();
             let (available, inputs) = if known { identity_recording::record(|| payload.hash(None).is_ok()) } else { (false, Vec::new()) };
-            let producer = identity_recording::SecretProducer::PayloadHash.name();
+            let producer = disclosure.disclose(DisclosureKind::FixedLiteral, "secret-payload-hash");
             if available {
                 if inputs.is_empty() { return Err(ProbeError::incomplete("missing secret material recording")); }
                 out.push(json!({ "path": path.render(disclosure), "producer": producer, "status": "available", "inputs": collapse_observations(&inputs).into_iter().map(|input| render_input(input, paths, disclosure)).collect::<Vec<_>>() }));
@@ -746,45 +785,6 @@ fn observe_secrets(
         _ => {}
     }
     Ok(())
-}
-
-fn render_address(
-    address: &str,
-    required_keys: usize,
-    disclosure: Disclosure,
-) -> Result<Json, ProbeError> {
-    match disclosure {
-        Disclosure::Raw => Ok(json!(address)),
-        Disclosure::Sha256 => {
-            let parts = identity_recording::address_parts(address)
-                .ok_or_else(|| ProbeError::incomplete("address recorder is not active"))?;
-            let found = parts
-                .iter()
-                .filter(|part| matches!(part, AddressPart::MapKey(_)))
-                .count();
-            if found < required_keys {
-                return Err(ProbeError::incomplete(format!(
-                    "address map-key observations: expected at least {required_keys}, found {found}"
-                )));
-            }
-            if parts
-                .iter()
-                .all(|part| matches!(part, AddressPart::Literal(_)))
-            {
-                return Ok(json!(address));
-            }
-            Ok(json!(
-                parts
-                    .into_iter()
-                    .map(|part| match part {
-                        AddressPart::Literal(text) => json!({"literal": text}),
-                        AddressPart::MapKey(key) =>
-                            json!({"map_key": bytes(key.as_bytes(), disclosure)}),
-                    })
-                    .collect::<Vec<_>>()
-            ))
-        }
-    }
 }
 
 fn load_artifacts(
@@ -921,87 +921,107 @@ impl SourcePaths {
                     context.push(':');
                     context.push_str(expansion.as_str());
                 }
-                json!(context)
+                disclosure.disclose(DisclosureKind::RelativePath, &context)
             }
             Disclosure::Sha256 => json!({
-                "kind": "module", "file": file, "start_byte": call.call_span().start_byte(),
+                "kind": disclosure.disclose(DisclosureKind::FixedLiteral, "module"), "file": disclosure.disclose(DisclosureKind::RelativePath, &file), "start_byte": call.call_span().start_byte(),
                 "expansion": match call.expansion() {
                     carina_core::parser::CallExpansion::Direct => Json::Null,
-                    carina_core::parser::CallExpansion::Expanded(expansion) => bytes(expansion.as_str().as_bytes(), disclosure),
+                    carina_core::parser::CallExpansion::Expanded(expansion) => disclosure.disclose(DisclosureKind::Fingerprint, expansion.as_str()),
                 },
             }),
         }
     }
     fn context(&self, context: &InputContext, disclosure: Disclosure) -> Json {
         match context {
-            InputContext::Resource(Some(location)) => json!(format!(
-                "resource:<root>/{}:{}",
-                self.relative(location.file().path()),
-                location.span().start_byte()
-            )),
-            InputContext::Resource(None) => json!("resource:unavailable"),
+            InputContext::Resource(Some(location)) => disclosure.disclose(
+                DisclosureKind::RelativePath,
+                &format!(
+                    "resource:<root>/{}:{}",
+                    self.relative(location.file().path()),
+                    location.span().start_byte()
+                ),
+            ),
+            InputContext::Resource(None) => {
+                disclosure.disclose(DisclosureKind::FixedLiteral, "resource:unavailable")
+            }
             InputContext::Module(call) => self.module_context(call, disclosure),
-            InputContext::SecretProducer(producer) => json!(producer.name()),
+            InputContext::PayloadHash => {
+                disclosure.disclose(DisclosureKind::FixedLiteral, "secret-payload-hash")
+            }
         }
     }
     fn contexts(&self, input: &HashInput, disclosure: Disclosure) -> Vec<Json> {
         match &input.owner {
             InputOwner::Resource(key) => {
                 let (file, ordinal) = key.source();
-                vec![json!(format!(
-                    "resource:<root>/{}#{ordinal}",
-                    self.relative(file)
-                ))]
+                vec![disclosure.disclose(
+                    DisclosureKind::RelativePath,
+                    &format!("resource:<root>/{}#{ordinal}", self.relative(file)),
+                )]
             }
             InputOwner::Module(key) => key
                 .calls()
                 .map(|call| self.module_context(call, disclosure))
                 .collect(),
-            InputOwner::Loop { .. } | InputOwner::SecretProducer(_) | InputOwner::Unattributed => {
-                input
-                    .context
-                    .iter()
-                    .map(|context| self.context(context, disclosure))
-                    .collect()
-            }
+            InputOwner::Loop { .. } | InputOwner::PayloadHash | InputOwner::Unattributed => input
+                .context
+                .iter()
+                .map(|context| self.context(context, disclosure))
+                .collect(),
         }
     }
-    fn loop_provenance(&self, value: &mut Json, disclosure: Disclosure) -> Result<(), ProbeError> {
-        match value {
-            Json::Object(fields) => {
-                let map_key = fields.get("kind").and_then(Json::as_str) == Some("key");
-                for (key, value) in fields {
-                    match (key.as_str(), value.as_str()) {
-                        ("display_file", Some(file)) => {
-                            let path = Path::new(file);
-                            let path = if path.is_absolute() {
-                                path.to_path_buf()
-                            } else {
-                                self.root.to_path_buf().join(path)
-                            };
-                            *value = json!(self.relative(&path));
-                        }
-                        ("value", Some(key)) if map_key => {
-                            if matches!(disclosure, Disclosure::Sha256) {
-                                *value = bytes(key.as_bytes(), disclosure);
-                            }
-                        }
-                        (
-                            "legacy" | "current_parent" | "current_prefix" | "system_identity",
-                            Some(address),
-                        ) => *value = render_address(address, 0, disclosure)?,
-                        _ => self.loop_provenance(value, disclosure)?,
-                    }
-                }
-            }
-            Json::Array(values) => {
-                for value in values {
-                    self.loop_provenance(value, disclosure)?;
-                }
-            }
-            Json::Null | Json::Bool(_) | Json::Number(_) | Json::String(_) => {}
+    fn loop_provenance(&self, provenance: &LoopProvenance, disclosure: Disclosure) -> Json {
+        let (direct, modules) = provenance.recording_parts();
+        let mut out = serde_json::Map::new();
+        if let Some(origin) = direct {
+            out.insert("direct".into(), self.loop_origin(origin, disclosure));
         }
-        Ok(())
+        let modules: Vec<_> = modules.map(|(origin, prefix)| json!({
+            "origin": self.loop_origin(origin, disclosure),
+            "current_prefix": disclosure.disclose(DisclosureKind::Fingerprint, prefix.as_str()),
+        })).collect();
+        if !modules.is_empty() {
+            out.insert("module_prefixes".into(), json!(modules));
+        }
+        Json::Object(out)
+    }
+    fn loop_origin(&self, origin: &LoopElementOrigin, disclosure: Disclosure) -> Json {
+        let (source, legacy, parent) = origin.recording_parts();
+        let (source_kind, identity) = source.recording_parts();
+        let kind = match origin.kind() {
+            LoopOriginKind::For { element } => json!({
+                "kind": disclosure.disclose(DisclosureKind::FixedLiteral, "for"),
+                "element": match element {
+                    ForLoopElement::Index(index) => json!({"kind": disclosure.disclose(DisclosureKind::FixedLiteral, "index"), "value": index}),
+                    ForLoopElement::Key(key) => json!({"kind": disclosure.disclose(DisclosureKind::FixedLiteral, "key"), "value": disclosure.disclose(DisclosureKind::Fingerprint, key)}),
+                },
+            }),
+            LoopOriginKind::If => {
+                json!({"kind": disclosure.disclose(DisclosureKind::FixedLiteral, "if")})
+            }
+        };
+        let file = Path::new(source.file());
+        let file = if file.is_absolute() {
+            file.to_path_buf()
+        } else {
+            self.root.to_path_buf().join(file)
+        };
+        let mut out = json!({
+            "kind": kind,
+            "source": {
+                "display_file": disclosure.disclose(DisclosureKind::RelativePath, &self.relative(&file)),
+                "line": source.line(), "column": source.column(),
+                "kind": disclosure.disclose(DisclosureKind::FixedLiteral, match source_kind { LoopKind::For => "for", LoopKind::If => "if" }),
+                "system_identity": disclosure.disclose(DisclosureKind::Fingerprint, identity.as_str()),
+            },
+            "legacy": disclosure.disclose(DisclosureKind::Fingerprint, legacy),
+        });
+        if let Some(parent) = parent {
+            out["current_parent"] =
+                disclosure.disclose(DisclosureKind::Fingerprint, parent.as_str());
+        }
+        out
     }
 }
 
@@ -1015,16 +1035,15 @@ fn bytes(value: &[u8], disclosure: Disclosure) -> Json {
 }
 fn render_input(input: &HashInput, paths: &SourcePaths, disclosure: Disclosure) -> Json {
     json!({
-        "boundary": input.boundary,
+        "boundary": disclosure.disclose(DisclosureKind::FixedLiteral, input.boundary),
         "context": paths.contexts(input, disclosure),
         "writes": input.writes.iter().map(|write| {
             let mut value = bytes(&write.bytes, disclosure);
-            value.as_object_mut().expect("byte object").insert("operation".to_owned(), json!(write.operation));
+            value.as_object_mut().expect("byte object").insert("operation".to_owned(), disclosure.disclose(DisclosureKind::FixedLiteral, write.operation));
             value
         }).collect::<Vec<_>>(),
-        "output": input.output.as_deref().map(|output| bytes(output, disclosure)),
         "finishes": input.finishes.iter().map(|finish| json!({
-            "operation": finish.operation, "after_writes": finish.after_writes, "output": bytes(&finish.output, disclosure),
+            "operation": disclosure.disclose(DisclosureKind::FixedLiteral, finish.operation), "after_writes": finish.after_writes, "output": bytes(&finish.output, disclosure),
         })).collect::<Vec<_>>(),
         "feature_count": input.feature_count,
     })
@@ -1099,13 +1118,12 @@ fn write_directory_dumps(
             let relative = directory.strip_prefix(root).map_err(|_| {
                 ProbeError::incomplete("probe directory is outside the supplied root")
             })?;
-            let mut document = probe(directory)?;
+            let document = probe(directory)?;
             let destination = output.join(relative);
             std::fs::create_dir_all(&destination)?;
             let dump_path = destination.join("identity.json");
             write_private_dump(&dump_path, document.dump.as_bytes())?;
-            let deferred = std::mem::take(&mut document.deferred);
-            document.complete(Some(dump_path))?;
+            let ProbeOutcome { deferred, .. } = document.complete(Some(dump_path))?;
             Ok(if deferred.is_empty() {
                 DirectoryStatus::Ok
             } else {

@@ -7,8 +7,9 @@
 //! Files are private (0600 on Unix). The output root must be fresh and empty.
 //! Schema-only installed artifacts are read; provider runtimes, network, AWS and
 //! state backends are never used. Source identifiers stay readable; loop/map and
-//! expansion keys are fingerprints. Consecutive identical observations collapse.
-//! The whole v2 snapshot includes named producers and unattributed observations.
+//! expansion keys and whole identities/addresses are fingerprints. Consecutive
+//! identical computations collapse.
+//! The whole v2 snapshot includes unattributed observations with stated reasons.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -139,7 +140,7 @@ fn probe(
         OfflineProviders::Factories(factories) => RedactionMode::RawSynthetic(factories),
         providers @ OfflineProviders::ArtifactDirectory(_) => RedactionMode::Sha256(providers),
     };
-    probe_directory(directory, &EnvironmentSnapshot::empty(), mode)
+    probe_directory(directory, &EnvironmentSnapshot::empty(), mode).map(|outcome| outcome.dump)
 }
 
 fn copy_fixture(destination: &Path) {
@@ -167,7 +168,6 @@ fn temporary_root_paths_preserve_resource_results_and_normalize_all_contexts() {
     let relocated: serde_json::Value =
         serde_json::from_str(&probe(copied.path(), synthetic()).unwrap()).unwrap();
     assert_eq!(original["resources"], relocated["resources"]);
-    assert_eq!(original["secret_producers"], relocated["secret_producers"]);
     // Unretained preparatory loop hashes genuinely include the source-root
     // bytes. Preserve that evidence, while normalizing every context label.
     let contexts = |document: &serde_json::Value| {
@@ -203,6 +203,14 @@ fn deferred_loop_body_is_covered_when_the_iterable_becomes_known() {
         "for name in names { probe.Declared { name = name } }\n",
     )
     .unwrap();
+    let outcome = probe_directory(
+        copied.path(),
+        &EnvironmentSnapshot::empty(),
+        RedactionMode::RawSynthetic(vec![Box::new(ProbeFactory)]),
+    )
+    .unwrap();
+    assert_eq!(outcome.deferred.len(), 1);
+    assert_eq!(outcome.deferred[0].file, "deferred.crn");
     let pending: serde_json::Value =
         serde_json::from_str(&probe(copied.path(), synthetic()).unwrap()).unwrap();
     assert_eq!(pending["status"]["kind"], "partial");
@@ -300,7 +308,8 @@ fn offline_identity_probe_uses_only_the_supplied_environment() {
         &environment,
         RedactionMode::RawSynthetic(vec![Box::new(ProbeFactory)]),
     )
-    .unwrap();
+    .unwrap()
+    .dump;
     let dump: serde_json::Value = serde_json::from_str(&dump).unwrap();
     let secrets = dump["resources"]
         .as_array()
@@ -354,24 +363,7 @@ fn real_directory_identity_probe() {
             .directory
             .strip_prefix(&root)
             .unwrap_or(&result.directory);
-        match &result.status {
-            carina_cli::identity_probe::DirectoryStatus::Ok => {
-                println!("{}: ok", directory.display())
-            }
-            carina_cli::identity_probe::DirectoryStatus::Skipped => {
-                println!("{}: skipped (no .crn files)", directory.display())
-            }
-            carina_cli::identity_probe::DirectoryStatus::Partial { deferred } => {
-                println!(
-                    "{}: partial ({} deferred sites)",
-                    directory.display(),
-                    deferred.len()
-                )
-            }
-            carina_cli::identity_probe::DirectoryStatus::Failed(error) => {
-                println!("{}: failed ({error})", directory.display())
-            }
-        }
+        println!("{}: {}", directory.display(), result.status);
     }
     result.unwrap_or_else(|error| panic!("{error}"));
 }
@@ -384,7 +376,8 @@ fn real_mode_fingerprints_all_recorded_bytes_without_secret_literals() {
         &EnvironmentSnapshot::empty(),
         RedactionMode::Sha256(synthetic()),
     )
-    .unwrap();
+    .unwrap()
+    .dump;
     for plaintext in [
         "literal-secret",
         "known-a",
@@ -522,7 +515,8 @@ fn fingerprint_mode_hides_values_resolved_from_environment() {
         &environment,
         RedactionMode::Sha256(synthetic()),
     )
-    .unwrap();
+    .unwrap()
+    .dump;
     assert!(!dump.contains("sensitive-env-value"));
     let encoded: String = b"sensitive-env-value"
         .iter()
@@ -548,7 +542,10 @@ fn empty_simhash_records_its_empty_input_and_result() {
     assert_eq!(inputs[0]["boundary"], "simhash");
     assert_eq!(inputs[0]["feature_count"], 0);
     assert_eq!(inputs[0]["writes"], serde_json::json!([]));
-    assert_eq!(inputs[0]["output"]["hex"], "0000000000000000");
+    assert_eq!(
+        inputs[0]["finishes"][0]["output"]["hex"],
+        "0000000000000000"
+    );
 }
 
 #[test]
@@ -605,73 +602,104 @@ fn round_two_fingerprint_mode_hides_environment_map_loop_keys() {
         "environmentLoopKeyCanary",
         "environment-loop-key-CANARY.with space",
     ] {
-        let temporary = tempfile::tempdir().unwrap();
-        copy_fixture(temporary.path());
-        let environment =
-            EnvironmentSnapshot::new([("PROBE_PRIVATE_KEY".to_owned(), private.into())]);
-        // Map keys are literals in this branch's grammar. Evaluate env() through
-        // the production parser, then use that value to construct the fixture map.
-        let config = carina_core::parser::ProviderContext::new(environment.clone());
-        let mut parsed = carina_core::parser::parse_file(
-            "let key = env('PROBE_PRIVATE_KEY')\n",
-            Path::new("environment.crn"),
-            &config,
-        )
-        .unwrap();
-        carina_core::parser::resolve_resource_refs(&mut parsed, &config).unwrap();
-        let carina_core::resource::Value::Concrete(carina_core::resource::ConcreteValue::String(
-            key,
-        )) = &parsed.variables["key"]
-        else {
-            panic!("env must produce a string");
-        };
-        assert!(key.is_diagnostic_sensitive());
-        let key = serde_json::to_string(key).unwrap();
-        fs::write(
-            temporary.path().join("map-loops.crn"),
-            format!(
+        // Keep identical module arguments in separate configurations: combining
+        // bound and unbound calls would itself produce an identity collision.
+        for (loops, expected_count) in [
+            (
                 r#"
+for key, name in keyed { probe.Declared { name = "${name}-anonymous" } }
+let named = for key, name in keyed { probe.Declared { name = "${name}-anonymous" } }
+for key, name in keyed { child { name = "${name}-module" } }
+"#,
+                20,
+            ),
+            (
+                r#"
+let other_named = for key, name in keyed { probe.Declared { name = "${name}-anonymous" } }
+let module_named = for key, name in keyed { child { name = "${name}-module" } }
+"#,
+                19,
+            ),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            copy_fixture(temporary.path());
+            let environment =
+                EnvironmentSnapshot::new([("PROBE_PRIVATE_KEY".to_owned(), private.into())]);
+            // Map keys are literals in this branch's grammar. Evaluate env() through
+            // the production parser, then use that value to construct the fixture map.
+            let config = carina_core::parser::ProviderContext::new(environment.clone());
+            let mut parsed = carina_core::parser::parse_file(
+                "let key = env('PROBE_PRIVATE_KEY')\n",
+                Path::new("environment.crn"),
+                &config,
+            )
+            .unwrap();
+            carina_core::parser::resolve_resource_refs(&mut parsed, &config).unwrap();
+            let carina_core::resource::Value::Concrete(
+                carina_core::resource::ConcreteValue::String(key),
+            ) = &parsed.variables["key"]
+            else {
+                panic!("env must produce a string");
+            };
+            assert!(key.is_diagnostic_sensitive());
+            let key = serde_json::to_string(key).unwrap();
+            fs::write(
+                temporary.path().join("map-loops.crn"),
+                format!(
+                    r#"
 let environment_key = env('PROBE_PRIVATE_KEY')
 let keyed = {{ {key} = 'map-loop-name' }}
-let other_named = for key, name in keyed {{ probe.Declared {{ name = "${{name}}-anonymous" }} }}
-let named = for key, name in keyed {{ probe.Declared {{ name = "${{name}}-anonymous" }} }}
-let module_named = for key, name in keyed {{ child {{ name = "${{name}}-module" }} }}
+{loops}
 "#
-            ),
-        )
-        .unwrap();
-        let dump = probe_directory(
-            temporary.path(),
-            &environment,
-            RedactionMode::Sha256(synthetic()),
-        )
-        .unwrap();
-        assert_no_plaintext_or_hex(&dump, private);
-        let raw = probe_directory(
-            temporary.path(),
-            &environment,
-            RedactionMode::RawSynthetic(vec![Box::new(ProbeFactory)]),
-        )
-        .unwrap();
-        assert!(
-            raw.contains(private),
-            "fixture must exercise the key-bearing metadata"
-        );
-        let document: serde_json::Value = serde_json::from_str(&dump).unwrap();
-        assert!(
-            document["resources"].as_array().unwrap().len() == 20,
-            "loop resources must be expanded"
-        );
-        assert!(dump.contains("map-loops.crn"));
-        assert!(dump.contains("Declared"));
-        assert!(
-            document["resources"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|resource| resource["resource_id"]["identity"][0]["literal"] == "named"),
-            "source binding identifiers stay readable"
-        );
+                ),
+            )
+            .unwrap();
+            let result = probe_directory(
+                temporary.path(),
+                &environment,
+                RedactionMode::Sha256(synthetic()),
+            );
+            assert_no_plaintext_or_hex(&format!("{result:?}"), private);
+            if let Err(error) = &result {
+                assert_no_plaintext_or_hex(&error.to_string(), private);
+                assert_no_plaintext_or_hex(&format!("{error:?}"), private);
+            }
+            let outcome = result.expect("all bound and unbound keyed loops must succeed");
+            let status = if outcome.deferred.is_empty() {
+                carina_cli::identity_probe::DirectoryStatus::Ok
+            } else {
+                carina_cli::identity_probe::DirectoryStatus::Partial {
+                    deferred: outcome.deferred,
+                }
+            };
+            assert_no_plaintext_or_hex(&status.to_string(), private);
+            assert_no_plaintext_or_hex(&format!("{status:?}"), private);
+            let dump = outcome.dump;
+            assert_no_plaintext_or_hex(&dump, private);
+            let raw = probe_directory(
+                temporary.path(),
+                &environment,
+                RedactionMode::RawSynthetic(vec![Box::new(ProbeFactory)]),
+            )
+            .unwrap()
+            .dump;
+            assert!(
+                raw.contains(private),
+                "fixture must exercise the key-bearing metadata"
+            );
+            let document: serde_json::Value = serde_json::from_str(&dump).unwrap();
+            assert_eq!(
+                document["resources"].as_array().unwrap().len(),
+                expected_count,
+                "every keyed loop body must expand"
+            );
+            assert!(dump.contains("map-loops.crn"));
+            assert!(dump.contains("Declared"));
+            for resource in document["resources"].as_array().unwrap() {
+                assert!(resource["address"]["sha256"].is_string());
+                assert!(resource["resource_id"]["identity"]["sha256"].is_string());
+            }
+        }
     }
 }
 
@@ -695,7 +723,8 @@ let secret_map = probe.SecretMap {
         &environment,
         RedactionMode::Sha256(synthetic()),
     )
-    .unwrap();
+    .unwrap()
+    .dump;
     assert_no_plaintext_or_hex(&dump, private);
     assert!(
         dump.contains("values"),

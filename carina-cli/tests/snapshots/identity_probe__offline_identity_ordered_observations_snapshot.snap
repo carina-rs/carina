@@ -35,9 +35,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "a40a62dbfee881e9bfacd03f94c44e639e5ec930d14ce40fd99ca16ca6a6965a"
-          },
           "writes": [
             {
               "hex": "1c00000000000000",
@@ -141,9 +138,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "a0bf5787ba598ebe738026b0370025dd403ddf9713348982e347064265e92218"
-          },
           "writes": [
             {
               "hex": "1c00000000000000",
@@ -247,9 +241,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "a53573df6ac09f26c51c61afde15de003aba05f2366d0aa6581624b19f22e7ab"
-          },
           "writes": [
             {
               "hex": "1c00000000000000",
@@ -353,9 +344,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "a0bf5787ba598ebe738026b0370025dd403ddf9713348982e347064265e92218"
-          },
           "writes": [
             {
               "hex": "1c00000000000000",
@@ -459,9 +447,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "112116a81f2ffbd9"
-          },
           "writes": [
             {
               "hex": "726567696f6e",
@@ -537,9 +522,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "659eca16e161b70a"
-          },
           "writes": [
             {
               "hex": "726567696f6e",
@@ -615,9 +597,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "3535f8b5a50d58d9"
-          },
           "writes": [
             {
               "hex": "726567696f6e",
@@ -693,9 +672,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "084127908d024140"
-          },
           "writes": []
         },
         {
@@ -713,9 +689,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "0c51a790cd7661c4"
-          },
           "writes": [
             {
               "hex": "6e616d653d537472696e67282273696d686173682d6c69746572616c2229",
@@ -742,9 +715,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "ca6b2fd08f82d773"
-          },
           "writes": [
             {
               "hex": "726567696f6e3d537472696e6728226f66666c696e652d726567696f6e2229",
@@ -796,9 +766,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "da0d611413a4da11d922e94cec87724b20f54ef627246926f6cbd89ab23f7d94"
-          },
           "writes": [
             {
               "hex": "1c00000000000000",
@@ -920,9 +887,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "76f3ece31dac22cc911b48f4f8aa3744d8dff0127b5e2675061eb63757d3dd85"
-          },
           "writes": [
             {
               "hex": "0000000000000008",
@@ -965,9 +929,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "bb65fff5943beb72aa662c6bf4ac64d0b9c5e8ecf6a45c33e1a1d2b7fcfaf00b"
-          },
           "writes": [
             {
               "hex": "1c00000000000000",
@@ -1087,9 +1048,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "76f3ece31dac22cc911b48f4f8aa3744d8dff0127b5e2675061eb63757d3dd85"
-          },
           "writes": [
             {
               "hex": "0000000000000008",
@@ -1132,9 +1090,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "b2001f4a81fcdd6443637b9f20c0c1e154b3ca34f307f82fc8ac83db866ade34"
-          },
           "writes": [
             {
               "hex": "1c00000000000000",
@@ -1241,7 +1196,6 @@ expression: first
               ],
               "feature_count": null,
               "finishes": [],
-              "output": null,
               "writes": [
                 {
                   "hex": "226c69746572616c2d73656372657422",
@@ -1263,7 +1217,6 @@ expression: first
               ],
               "feature_count": null,
               "finishes": [],
-              "output": null,
               "writes": [
                 {
                   "hex": "226b6e6f776e2d6122",
@@ -1391,9 +1344,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "e4c53e45b8687b34a630728fd2589139a5ec4c9271d1280995e2651b39c7e519"
-          },
           "writes": [
             {
               "hex": "1c00000000000000",
@@ -1503,9 +1453,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "45048082a3008320"
-          },
           "writes": []
         },
         {
@@ -1523,9 +1470,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "5724c497f702ebe3"
-          },
           "writes": [
             {
               "hex": "5f6d6f64756c653d6368696c64",
@@ -1552,9 +1496,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "65c59bc2a3258720"
-          },
           "writes": [
             {
               "hex": "6e616d653d537472696e6728226d6f64756c652d616e6f6e796d6f75732229",
@@ -1581,9 +1522,6 @@ expression: first
               }
             }
           ],
-          "output": {
-            "hex": "33f119d0dd3c7b7e484fe9ae52e2cbaed0be46e02a6d738f573f5815739bf33f"
-          },
           "writes": [
             {
               "hex": "1c00000000000000",
@@ -1659,7 +1597,6 @@ expression: first
       "secret_material": []
     }
   ],
-  "secret_producers": {},
   "status": {
     "deferred": [],
     "kind": "ok"
@@ -1679,9 +1616,6 @@ expression: first
             }
           }
         ],
-        "output": {
-          "hex": "dc3e81260dcd9f933464c924c8278ed7f1c89cf8e75e71075e0b1258d2faa551"
-        },
         "writes": [
           {
             "hex": "0000000000000026",

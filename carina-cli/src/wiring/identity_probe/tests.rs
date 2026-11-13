@@ -1,5 +1,5 @@
 use super::*;
-use carina_core::identity_recording::{HashWrite, InputOwner};
+use carina_core::identity_recording::{HashFinish, HashWrite, InputOwner};
 
 fn complete_dump(
     prepared: PreparedProbe,
@@ -7,7 +7,9 @@ fn complete_dump(
     paths: &SourcePaths,
     disclosure: Disclosure,
 ) -> Result<String, ProbeError> {
-    super::finish_dump(prepared, inputs, paths, disclosure)?.complete(None)
+    super::finish_dump(prepared, inputs, paths, disclosure)?
+        .complete(None)
+        .map(|outcome| outcome.dump)
 }
 
 fn resources() -> Vec<PreparedResource> {
@@ -41,8 +43,11 @@ fn input(resource: &PreparedResource, byte: u8) -> HashInput {
             operation: "update",
             bytes: vec![byte],
         }],
-        output: Some(vec![byte]),
-        finishes: Vec::new(),
+        finishes: vec![HashFinish {
+            operation: "finish",
+            after_writes: 1,
+            output: vec![byte],
+        }],
         feature_count: None,
     }
 }
@@ -421,10 +426,7 @@ fn production_secret_hashes_outside_resources_have_a_named_owner() {
     )))
     .into();
     let (_, producer_inputs) = identity_recording::record(|| payload.hash(None).unwrap());
-    assert_eq!(
-        producer_inputs[0].owner,
-        InputOwner::SecretProducer(identity_recording::SecretProducer::PayloadHash)
-    );
+    assert_eq!(producer_inputs[0].owner, InputOwner::PayloadHash);
     let resources = resources();
     let mut inputs = vec![input(&resources[0], 1), input(&resources[1], 2)];
     inputs.extend(producer_inputs);
@@ -439,14 +441,16 @@ fn production_secret_hashes_outside_resources_have_a_named_owner() {
     )
     .unwrap();
     let document: Json = serde_json::from_str(&dump).unwrap();
+    assert!(document.get("secret_producers").is_none());
+    assert_eq!(document["unattributed"].as_array().unwrap().len(), 1);
     assert_eq!(
-        document["secret_producers"]["secret-payload-hash"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
+        document["unattributed"][0]["reason"],
+        "production secret payload hash outside a resource identity pass"
     );
-    assert_eq!(document["unattributed"], json!([]));
+    assert_eq!(
+        document["unattributed"][0]["input"]["context"],
+        json!(["secret-payload-hash"])
+    );
 }
 
 #[test]
@@ -554,18 +558,93 @@ fn application_error_reporting_does_not_quote_authored_values() {
 }
 
 #[test]
-fn keyed_address_rendering_requires_all_expected_map_keys() {
-    let (result, _) =
-        identity_recording::record(|| render_address("named.private_key", 1, Disclosure::Sha256));
-    match result {
-        Err(ProbeError::Incomplete(details)) => assert_eq!(
-            details.missing,
-            ["address map-key observations: expected at least 1, found 0"]
-        ),
-        other => panic!("unrecorded map key must fail closed, got {other:?}"),
+fn complete_addresses_are_fingerprinted_without_a_recorder() {
+    for address in [
+        "named.private_key",
+        "_for0['private.key']",
+        "module.instance.child",
+    ] {
+        assert_eq!(
+            Disclosure::Sha256.disclose(DisclosureKind::Fingerprint, address),
+            serde_json::to_value(identity_recording::fingerprint(address.as_bytes())).unwrap()
+        );
+        assert_eq!(
+            Disclosure::Raw.disclose(DisclosureKind::Fingerprint, address),
+            json!(address)
+        );
     }
-    assert!(matches!(
-        render_address("named", 0, Disclosure::Sha256),
-        Err(ProbeError::Incomplete(_))
-    ));
+}
+
+#[test]
+fn application_debug_and_status_never_quote_authored_values_but_retain_the_source() {
+    use std::error::Error;
+    let error = ProbeError::from(AppError::Validation("ERROR_PRIVATE_CANARY".into()));
+    assert_eq!(format!("{error:?}"), "Application");
+    assert_eq!(error.to_string(), "Application");
+    assert!(
+        error
+            .source()
+            .unwrap()
+            .to_string()
+            .contains("ERROR_PRIVATE_CANARY")
+    );
+    let status = DirectoryStatus::Failed(error);
+    assert!(!format!("{status:?}").contains("ERROR_PRIVATE_CANARY"));
+    assert!(!status.to_string().contains("ERROR_PRIVATE_CANARY"));
+}
+
+#[test]
+fn typed_provenance_string_disclosure_does_not_depend_on_json_field_names() {
+    let parsed = carina_core::parser::parse_file(
+        "let keys = { 'private-provenance-key' = 'one' }\nfor k, v in keys { probe.Declared { name = v } }\n",
+        Path::new("provenance.crn"),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let origin = parsed.resources[0]
+        .loop_provenance
+        .display_origin()
+        .unwrap();
+    let (_, legacy, _) = origin.recording_parts();
+    let value = Disclosure::Sha256.disclose(DisclosureKind::Fingerprint, legacy);
+    let renamed = json!({"future_provenance_identity": value});
+    assert_eq!(
+        renamed["future_provenance_identity"],
+        serde_json::to_value(identity_recording::fingerprint(legacy.as_bytes())).unwrap()
+    );
+    let rendered = SourcePaths::new(Path::new("."))
+        .unwrap()
+        .loop_provenance(&parsed.resources[0].loop_provenance, Disclosure::Sha256);
+    assert_eq!(
+        rendered["direct"]["legacy"],
+        renamed["future_provenance_identity"]
+    );
+    let text = serde_json::to_string(&rendered).unwrap();
+    assert!(!text.contains("private-provenance-key"));
+}
+
+#[test]
+fn missing_loop_inputs_do_not_disclose_the_identity_in_errors_or_statuses() {
+    let mut resources = resources();
+    resources[0]
+        .loop_identities
+        .push(ResourceIdentity::try_from("PRIVATE_LOOP_IDENTITY_CANARY".to_owned()).unwrap());
+    let inputs = vec![input(&resources[0], 1), input(&resources[1], 2)];
+    let error = complete_dump(
+        PreparedProbe {
+            resources,
+            ..PreparedProbe::default()
+        },
+        inputs,
+        &SourcePaths::new(Path::new(".")).unwrap(),
+        Disclosure::Sha256,
+    )
+    .unwrap_err();
+    for message in [error.to_string(), format!("{error:?}")] {
+        assert!(!message.contains("PRIVATE_LOOP_IDENTITY_CANARY"));
+        assert!(message.contains("fixture.crn:0"));
+    }
+    let status = DirectoryStatus::Failed(error);
+    assert!(!status.to_string().contains("PRIVATE_LOOP_IDENTITY_CANARY"));
+    assert!(!format!("{status:?}").contains("PRIVATE_LOOP_IDENTITY_CANARY"));
 }

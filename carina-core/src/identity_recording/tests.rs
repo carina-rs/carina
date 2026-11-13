@@ -92,7 +92,10 @@ fn sha256_forwarding_preserves_updates_and_digest() {
             .collect::<Vec<_>>(),
         chunks
     );
-    assert_eq!(inputs[0].output.as_deref(), Some(digest.as_slice()));
+    assert_eq!(
+        inputs[0].finishes.last().unwrap().output.as_slice(),
+        digest.as_slice()
+    );
 }
 
 #[test]
@@ -181,7 +184,7 @@ fn identity_addresses_and_secret_hashes_are_identical_with_an_idle_or_active_rec
 #[test]
 fn nested_recorders_and_unwinding_restore_the_previous_scope() {
     let (_, outer) = record(|| {
-        let _context = secret_producer_context(SecretProducer::PayloadHash);
+        let _context = payload_hash_context();
         secret_material(b"before");
         let (_, inner) = record(|| secret_material(b"inner"));
         assert_eq!(inner.len(), 1);
@@ -194,8 +197,7 @@ fn nested_recorders_and_unwinding_restore_the_previous_scope() {
     assert!(
         outer
             .iter()
-            .all(|input| input.context
-                == [InputContext::SecretProducer(SecretProducer::PayloadHash)])
+            .all(|input| input.context == [InputContext::PayloadHash])
     );
     assert!(ACTIVE.with(|active| active.borrow().is_none()));
 }
@@ -208,15 +210,12 @@ fn eight_in_process_threads_do_not_share_recordings() {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 let (_, inputs) = record(|| {
-                    let _context = secret_producer_context(SecretProducer::PayloadHash);
+                    let _context = payload_hash_context();
                     barrier.wait();
                     secret_material(&[index]);
                 });
                 assert_eq!(inputs.len(), 1);
-                assert_eq!(
-                    inputs[0].context,
-                    [InputContext::SecretProducer(SecretProducer::PayloadHash)]
-                );
+                assert_eq!(inputs[0].context, [InputContext::PayloadHash]);
                 assert_eq!(inputs[0].writes[0].bytes, [index]);
             })
         })
@@ -246,7 +245,10 @@ fn str_and_string_hashes_and_finish_outputs_match_plain_default_hasher() {
             first
         });
         assert_eq!(actual, expected);
-        assert_eq!(inputs[0].output, Some(expected.to_le_bytes().to_vec()));
+        assert_eq!(
+            inputs[0].finishes.last().unwrap().output,
+            expected.to_le_bytes().to_vec()
+        );
         assert_eq!(inputs[0].finishes.len(), 2);
 
         let (actual, inputs) = record(|| {
@@ -255,7 +257,10 @@ fn str_and_string_hashes_and_finish_outputs_match_plain_default_hasher() {
             hasher.finish()
         });
         assert_eq!(actual, expected);
-        assert_eq!(inputs[0].output, Some(expected.to_le_bytes().to_vec()));
+        assert_eq!(
+            inputs[0].finishes.last().unwrap().output,
+            expected.to_le_bytes().to_vec()
+        );
     }
 }
 
@@ -420,31 +425,4 @@ fn module_source_recording_is_an_additive_provided_method() {
     }
     use crate::resource::AnonymousIdentityModuleSource;
     assert!(ExternalModuleSource.recording_module_calls().is_none());
-}
-
-#[test]
-fn address_key_observations_preserve_the_production_address_and_source_binding_names() {
-    let (_, _) = record(|| {
-        let safe = crate::utils::map_key_address("named", "safe_private_key");
-        let unsafe_key = crate::utils::map_key_address(&safe, "private-key.with space");
-        assert_eq!(safe, "named.safe_private_key");
-        assert_eq!(
-            unsafe_key,
-            "named.safe_private_key['private-key.with space']"
-        );
-        assert_eq!(
-            address_parts(&format!("module.{unsafe_key}.child")).unwrap(),
-            [
-                AddressPart::Literal("module.named".into()),
-                AddressPart::MapKey("safe_private_key".into()),
-                AddressPart::MapKey("private-key.with space".into()),
-                AddressPart::Literal(".child".into()),
-            ]
-        );
-    });
-}
-
-#[test]
-fn address_parts_require_an_active_recorder() {
-    assert!(address_parts("named.private_key").is_none());
 }
