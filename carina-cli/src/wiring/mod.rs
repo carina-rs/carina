@@ -8363,7 +8363,7 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
         );
     let mut move_plan: Plan = Plan::default();
     #[allow(clippy::iter_over_hash_type)]
-    // keyed rebuild: test move pairs map each distinct target to itself
+    // commutative: hash order in the Plan effects Vec is harmless; only ResolvedMovePairs::from_saved_plan consumes it, pairing moves by key
     for target in moved_targets {
         let target = ResolvedResourceId::new(target.clone());
         move_plan.add(Effect::Move {

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 
 use carina_core::resource::{ConcreteValue, EnumValueResolver, Value};
 use carina_core::schema::{
@@ -228,7 +228,7 @@ fn draft_metadata_walks_support_write_only_and_enum_aliases() {
         );
     assert_eq!(
         schema_write_only_keys(Some(&schema)),
-        BTreeSet::from(["password".into()])
+        HashSet::from(["password".into()])
     );
     assert_eq!(
         schema.enum_valid_values_for_attr_alias("modes", "test.Mode.active"),

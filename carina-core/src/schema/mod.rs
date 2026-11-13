@@ -12044,7 +12044,7 @@ fn validate_tags_key_value(attributes: &HashMap<String, Value>) -> Result<(), Ve
 /// provider-value protection one definition of the schema-owned key set.
 pub fn schema_write_only_keys<R: PatternForm>(
     schema: Option<&PatternResourceSchema<R>>,
-) -> BTreeSet<String> {
+) -> HashSet<String> {
     schema
         .into_iter()
         .flat_map(|schema| schema.attributes.iter())

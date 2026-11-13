@@ -761,7 +761,7 @@ async fn load_schemas_impl(
     let environment = providers.read().await.environment.clone();
     let mut dir_providers = BTreeMap::new();
     #[allow(clippy::iter_over_hash_type)]
-    // commutative: canonical groups select the minimum display path from unique discovery keys
+    // keyed rebuild: canonical groups select the minimum display path from unique discovery keys
     for (dir, configs) in workspace::discover_providers_by_dir(&workspace_root, &environment) {
         let entry = dir_providers
             .entry(PathIdentity::new(&dir))

@@ -4806,7 +4806,7 @@ impl ResourceState {
             .keys()
             .cloned()
             .collect::<BTreeSet<_>>();
-        let schema_write_only = schema_write_only_keys(schema);
+        let schema_write_only: BTreeSet<_> = schema_write_only_keys(schema).into_iter().collect();
         let carried_write_only = previous
             .map(|attributes| recorded_write_only_keys(schema, attributes, &[]))
             .unwrap_or_default();
