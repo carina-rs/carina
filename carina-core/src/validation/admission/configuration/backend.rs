@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use super::*;
 use crate::parser::{self, AttributeKey};
-use crate::resource::ConcreteValue;
+use crate::resource::{ConcreteValue, ValueKind};
 use crate::schema::{AttributeType, DslTransform, TypeIdentity};
 
 const AWS_PROVIDER_NAME: &str = "aws";
@@ -89,10 +89,86 @@ struct BackendDeclaration {
 /// Failure to resolve a raw backend block through its declared schema.
 #[derive(Debug, Error)]
 pub enum BackendConfigError {
-    #[error("Unsupported backend type: {0}")]
-    UnsupportedBackend(String),
+    #[error(transparent)]
+    UnsupportedBackend(#[from] UnsupportedBackendError),
     #[error(transparent)]
     Invalid(#[from] BackendConfigErrors),
+}
+
+/// A backend type with no built-in declaration.
+#[derive(Debug, Error)]
+#[error("Unsupported backend type: {backend_type}")]
+pub struct UnsupportedBackendError {
+    backend_type: String,
+}
+
+/// Backend failures built only by [`parser::AnalysisTree::admit_backend`].
+#[derive(Debug)]
+pub enum LocatedBackendError {
+    Attribute(parser::Located<BackendAttributeError>),
+    Unsupported(parser::Located<UnsupportedBackendError>),
+}
+
+/// One typed backend failure when no authored analysis tree is available.
+#[derive(Debug, Error)]
+pub enum UnlocatedBackendError {
+    #[error(transparent)]
+    Attribute(#[from] BackendAttributeError),
+    #[error(transparent)]
+    Unsupported(#[from] UnsupportedBackendError),
+}
+
+impl BackendConfigError {
+    /// Preserve individual failures when analysis cannot provide locations.
+    pub fn into_unlocated(self) -> Vec<UnlocatedBackendError> {
+        match self {
+            Self::Invalid(errors) => errors
+                .errors
+                .into_iter()
+                .map(UnlocatedBackendError::Attribute)
+                .collect(),
+            Self::UnsupportedBackend(error) => vec![UnlocatedBackendError::Unsupported(error)],
+        }
+    }
+}
+
+impl<P: PlaceholderKind, T: ValueKind, D, B: BindingAddress, E>
+    parser::AnalysisTree<'_, P, T, D, B, E>
+where
+    D: parser::DeferredForPhaseTraversal<P, T, B>,
+{
+    /// Admit and locate this tree's backend, if present in a root configuration.
+    pub fn admit_backend(
+        &self,
+    ) -> Option<Result<AdmittedConfiguration<kind::BackendAttribute>, Vec<LocatedBackendError>>>
+    {
+        if self.is_module_definition() {
+            return None;
+        }
+        let backend = self.file().backend.as_ref()?;
+        Some(admit(backend).map_err(|error| {
+            error
+                .into_unlocated()
+                .into_iter()
+                .map(|error| match error {
+                    UnlocatedBackendError::Attribute(error) => {
+                        LocatedBackendError::Attribute(parser::Located::new(
+                            self.backend_attribute_location(error.attribute()).clone(),
+                            error,
+                        ))
+                    }
+                    UnlocatedBackendError::Unsupported(error) => {
+                        LocatedBackendError::Unsupported(parser::Located::new(
+                            self.backend_location()
+                                .expect("backend declaration provenance")
+                                .clone(),
+                            error,
+                        ))
+                    }
+                })
+                .collect()
+        }))
+    }
 }
 
 /// All attribute-level failures from resolving one backend block.
@@ -113,6 +189,8 @@ impl BackendConfigErrors {
     }
 
     /// Attribute failures in deterministic attribute-name order.
+    /// Test-only introspection for structural admission assertions.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn errors(&self) -> &[BackendAttributeError] {
         &self.errors
     }
@@ -278,7 +356,12 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
     let kind = match config.backend_type.as_str() {
         "s3" => BackendKind::S3,
         "local" => BackendKind::Local,
-        other => return Err(BackendConfigError::UnsupportedBackend(other.into())),
+        other => {
+            return Err(UnsupportedBackendError {
+                backend_type: other.into(),
+            }
+            .into());
+        }
     };
     let backend = kind.declaration();
     let declaration = &backend.configuration;

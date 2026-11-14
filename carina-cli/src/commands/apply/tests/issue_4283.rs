@@ -1,6 +1,7 @@
 //! Physical-record regression: parent generations coexist, while child creates
 //! UPSERT the same physical key and old deletes remove that key.
 use super::*;
+use crate::commands::plan::prepare_plan_identity_and_provider_inputs;
 use crate::wiring::{LoadedProviderFactory, RowRequest};
 
 #[derive(Clone, Default)]
