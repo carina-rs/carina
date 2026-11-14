@@ -89,6 +89,117 @@ fn equals_guard() -> InputCondition {
     }
 }
 
+fn secret_rule() -> InputRule {
+    InputRule::value(
+        InputRuleScope::EveryWrite,
+        path("value"),
+        InputRuleCode::new("value.secret").unwrap(),
+        InputPredicate::Secret,
+    )
+    .with_condition(InputCondition::Equals {
+        path: path("type"),
+        literal: InputLiteral::String("secure_string".into()),
+    })
+}
+
+fn secret_schema() -> ResourceSchema {
+    ResourceSchema::new("test.Conditional")
+        .attribute(AttributeSchema::optional("type", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("value", AttributeType::string()).build())
+        .input_rule(secret_rule())
+}
+
+#[test]
+fn secret_predicate_protocol_convert_round_trips_scope_condition_and_kind() {
+    let original = secret_schema().validate().unwrap();
+    let wire = resource_schema_to_protocol(&original).unwrap();
+    let json = serde_json::to_value(&wire).unwrap();
+    assert_eq!(
+        json["input_rules"][0],
+        serde_json::json!({
+            "scope": "every_write",
+            "target": {"kind": "value", "path": "value"},
+            "code": "value.secret",
+            "condition": {"kind": "equals", "value": {
+                "path": "type", "literal": {"kind": "string", "value": "secure_string"}
+            }},
+            "predicate": {"kind": "secret"}
+        })
+    );
+    let decoded = protocol_to_resource_schema(&serde_json::from_value(json).unwrap()).unwrap();
+    assert_eq!(
+        original.as_schema().input_rules(),
+        decoded.as_schema().input_rules()
+    );
+    assert_eq!(
+        decoded.as_schema().input_rules()[0].predicate(),
+        &InputPredicate::Secret
+    );
+}
+
+#[test]
+fn secret_predicate_decoded_wire_record_maps_to_core_and_enforces_the_rule() {
+    // Start with an existing predicate so this tests inbound JSON independently
+    // of the new predicate's outbound conversion.
+    let declaration = InputRule::value(
+        InputRuleScope::EveryWrite,
+        path("value"),
+        InputRuleCode::new("value.secret").unwrap(),
+        InputPredicate::Present,
+    )
+    .with_condition(InputCondition::Equals {
+        path: path("type"),
+        literal: InputLiteral::String("secure_string".into()),
+    });
+    let original = ResourceSchema::new("test.Conditional")
+        .attribute(AttributeSchema::optional("type", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("value", AttributeType::string()).build())
+        .input_rule(declaration)
+        .validate()
+        .unwrap();
+    let mut json = serde_json::to_value(resource_schema_to_protocol(&original).unwrap()).unwrap();
+    json["input_rules"][0]["predicate"] = serde_json::json!({"kind": "secret"});
+    let wire = serde_json::from_value(json);
+    assert!(
+        wire.is_ok(),
+        "the protocol must decode the secret kind: {wire:?}"
+    );
+    let decoded = protocol_to_resource_schema(&wire.unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(resource_schema_to_protocol(&decoded).unwrap()).unwrap()["input_rules"]
+            [0]["predicate"],
+        serde_json::json!({"kind": "secret"})
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", decoded);
+    for secret in [false, true] {
+        let value = if secret {
+            Value::Deferred(carina_core::resource::DeferredValue::Secret(
+                Box::new(string("x")).into(),
+            ))
+        } else {
+            string("x")
+        };
+        let result = check(
+            &schemas,
+            desired(
+                &schemas,
+                [("type", string("secure_string")), ("value", value)],
+            ),
+        );
+        if secret {
+            let checked = result.expect("a decoded Secret rule accepts a Secret");
+            assert!(checked.pending_inputs().is_empty());
+        } else {
+            let failure = result.expect_err("a decoded Secret rule rejects plaintext");
+            assert_eq!(failure.errors().len(), 1);
+            assert!(
+                matches!(&failure.errors()[0].kind, PlanErrorKind::InputRule { code, .. } if code == "value.secret")
+            );
+        }
+    }
+}
+
 #[test]
 fn admission_rejects_guard_path_type_depth_and_duplicates() {
     let cases = [
