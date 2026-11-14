@@ -2645,6 +2645,45 @@ let orphan = mock.test.resource {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn source_override_leaf_failure_preserves_directory_unused_binding_filter() {
+    let schemas = authored_binding_regression_schemas();
+    let engine = custom_engine(schemas);
+    let fixture = tempfile::tempdir().unwrap();
+    let source = "let bucket = mock.test.resource { name = 'bucket' }\n";
+    std::fs::write(
+        fixture.path().join("consumer.crn"),
+        "mock.test.resource { name = bucket.name }\n",
+    )
+    .unwrap();
+    let path = fixture.path().join("main.crn");
+    std::os::unix::fs::symlink("main.crn", &path).unwrap();
+    let base = carina_core::paths::ResolvedPath::new(fixture.path()).unwrap();
+    assert!(base.join("main.crn").is_err());
+    let directory_failure =
+        carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
+            &base,
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &Default::default(),
+        )
+        .err()
+        .expect("the looping document leaf must fail directory discovery");
+    assert!(directory_failure.io_error().is_some());
+
+    let document = create_document_at(source, path.clone());
+    assert_eq!(
+        unused_binding_names(&engine.analyze(&document, None)),
+        vec!["bucket".to_string()],
+        "the control must exercise the unused-binding check"
+    );
+    let diagnostics = engine.analyze(&document, Some(&path));
+    assert!(
+        unused_binding_names(&diagnostics).is_empty(),
+        "failed document resolution must retain directory context for sibling uses: {diagnostics:#?}"
+    );
+}
+
 #[test]
 fn attribute_derived_bindings_required_across_sibling_files_are_not_unused() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};

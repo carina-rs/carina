@@ -723,21 +723,22 @@ impl DiagnosticRun<'_> {
         let pinned_base = current_file_path
             .and_then(|path| path.parent())
             .and_then(|path| carina_core::paths::ResolvedPath::new(path).ok());
+        let base_path = pinned_base.as_ref();
         let current_file_name = current_file_path.map(|path| {
             path.file_name()
                 .expect("a current file path must name a file")
         });
         // Resolve the document through the pinned base once, then share its
         // snapshot across directory, module, upstream and recovery analysis.
-        let overrides = if let Some(base) = pinned_base.as_ref() {
+        let overrides = if let Some(base) = base_path {
             current_file_name
                 .and_then(|file_name| base.join(file_name).ok())
                 .map(|path| carina_core::config_loader::SourceOverrides::single(path, text.clone()))
         } else {
             None
         };
-        let base_path = pinned_base.as_ref().filter(|_| overrides.is_some());
-        let overrides = overrides.unwrap_or_default();
+        // Keep directory checks available when only the document leaf fails.
+        let overrides = overrides.unwrap_or_else(carina_core::config_loader::SourceOverrides::new);
         let current_file_name = current_file_name.map(|name| name.to_string_lossy());
         let current_file_name = current_file_name.as_deref();
 
