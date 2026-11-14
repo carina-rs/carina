@@ -881,6 +881,8 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             AbsoluteBindingAddress,
         > = crate::parser::ParserBindingMetadata::default();
         *expanded_parser_metadata.syntax = instance.parser_binding_metadata.syntax().clone();
+        expanded_parser_metadata.directive_findings =
+            instance.parser_binding_metadata.directive_findings.clone();
         let mut expanded_binding_uses =
             resolve_module_binding_uses::<P>(module, &module_scope_resolver)
                 .map_err(contextualize_access_error)?;

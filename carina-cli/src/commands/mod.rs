@@ -620,6 +620,7 @@ pub(crate) fn validate_and_resolve_report_inner(
     name_resolution: ConfigNameResolution,
 ) -> ConfigurationValidation<ResolvedConfig> {
     let mut warnings = Vec::new();
+    let mut directive_errors = Vec::new();
     let mut authored_inputs = carina_core::input_rules::AuthoredInputs::for_directory_in_session(
         &parsed,
         enriched_context,
@@ -636,7 +637,20 @@ pub(crate) fn validate_and_resolve_report_inner(
         name_resolution,
         &mut authored_inputs,
         &mut warnings,
+        &mut directive_errors,
     );
+    // Directive findings are independent of value/type validation. Merge them only
+    // after that pass so they cannot trigger an early return hiding findings.
+    let result = if directive_errors.is_empty() {
+        result
+    } else {
+        let mut errors = match result {
+            Ok(_) => Vec::new(),
+            Err(errors) => errors.into_vec(),
+        };
+        errors.extend(directive_errors);
+        Err(non_empty_validation_failure(errors))
+    };
     ConfigurationValidation {
         result,
         authored_inputs,
@@ -657,11 +671,12 @@ fn validate_and_resolve_configuration(
     name_resolution: ConfigNameResolution,
     authored_inputs: &mut carina_core::input_rules::AuthoredInputs,
     warnings: &mut Vec<ConfigurationWarning>,
+    directive_errors: &mut Vec<AppError>,
 ) -> Result<ResolvedConfig, NonEmptyValidationErrors> {
     let initial_warning_count = parsed.warnings.len();
     let resolved_base = base_dir.clone();
     let base_dir = &resolved_base;
-    // Binding-use validation is a production-readiness invariant, not a
+    // Binding-use and directive syntax validation are readiness invariants, not a
     // resource-validation preference. Keep the recursive module snapshots
     // available even on destroy/state recovery paths; the later optional
     // policy checks remain gated by `skip_resource_validation`.
@@ -671,6 +686,18 @@ fn validate_and_resolve_configuration(
         &enriched_context.catalog().environment,
         ctx.schemas(),
     );
+    for metadata in std::iter::once(&parsed.parser_binding_metadata).chain(
+        module_walk
+            .iter()
+            .map(|module| &module.loaded().parsed.parser_binding_metadata),
+    ) {
+        directive_errors.extend(
+            carina_core::validation::resource_directive_findings(metadata)
+                .iter()
+                .cloned()
+                .map(|finding| AppError::ResourceDirective(Box::new(finding))),
+        );
+    }
 
     let mut errors: Vec<AppError> = Vec::new();
     if !skip_resource_validation {

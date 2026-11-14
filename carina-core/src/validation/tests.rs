@@ -304,6 +304,74 @@ fn planning_resolution_requires_a_successful_judgement() {
 }
 
 #[test]
+fn resource_resolution_rejects_unknown_directive_keys_in_session() {
+    let schemas = SchemaRegistry::new();
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+    let parsed = crate::parser::parse_and_resolve(
+        "mock.test.resource {\n  directives {\n    prevent_destory = true\n  }\n}\n",
+    )
+    .unwrap()
+    .resolve_root(&RootScope::new());
+    let (file, ()) = parsed.map_deferred_for_phase(|templates| {
+        assert!(templates.is_empty());
+        (Vec::new(), ())
+    });
+    let result = deferred_types::with_session_for_test(&config, |session| {
+        resolve_bare_binding_uses_in_session(file, &schemas, session, &signatures)
+    });
+    let error = result.expect_err("invalid directives cannot produce a ResolvedFile");
+    assert_eq!(
+        error.to_string(),
+        "test.crn:3:5: Unknown directive 'prevent_destory', did you mean 'prevent_destroy'?"
+    );
+}
+
+#[test]
+fn module_directive_findings_reach_root_resource_resolution_once() {
+    for calls in [1, 2] {
+        let directory = tempfile::tempdir().unwrap();
+        let child = directory.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(
+            child.join("main.crn"),
+            "arguments { name: String }\nmock.test.resource {\n  name = name\n  directives {\n    prevent_destory = true\n  }\n}\n",
+        )
+        .unwrap();
+        let mut source = "let child = use { source = './child' }\n".to_string();
+        for index in 0..calls {
+            source.push_str(&format!("child {{ name = 'instance-{index}' }}\n"));
+        }
+        std::fs::write(directory.path().join("main.crn"), source).unwrap();
+        let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let schemas = SchemaRegistry::new();
+        let loaded =
+            crate::config_loader::load_configuration_with_config(&path, &config, &schemas).unwrap();
+        deferred_types::with_session_for_test(&config, |session| {
+            let file = crate::module_resolver::resolve_modules_with_providerless_config(
+                loaded.parsed,
+                &path,
+                session,
+                &schemas,
+            )
+            .unwrap();
+            let findings = resource_directive_findings(&file.parser_binding_metadata);
+            assert_eq!(findings.len(), 1, "{calls} calls: {findings:?}");
+            assert_eq!(findings[0].location().file().path(), child.join("main.crn"));
+            let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+            let error = resolve_bare_binding_uses_in_session(file, &schemas, session, &signatures)
+                .expect_err("called-module findings must reach finish_binding_resolution");
+            assert!(
+                error
+                    .to_string()
+                    .contains("main.crn:5:5: Unknown directive 'prevent_destory'")
+            );
+        });
+    }
+}
+
+#[test]
 fn deferred_directive_consumes_judged_iterable_type() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("main.crn"), "let source = mock.r.Typed { name = 'source' tags = { child = 'not-a-bool' } }\nlet children = for child, flag in source.tags { mock.r.Typed { name = child directives { prevent_destroy = flag } } }\n").unwrap();

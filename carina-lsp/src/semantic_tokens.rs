@@ -1,5 +1,6 @@
 use crate::lex::{self, LexKind, LexedLine, MaskedCode};
 use crate::position;
+use carina_core::resource::ResourceDirective;
 use tower_lsp::lsp_types::{SemanticToken, SemanticTokenType, SemanticTokensLegend};
 
 /// Token types supported by this language server.
@@ -52,7 +53,7 @@ impl SemanticTokensProvider {
             let mut line_tokens = if line.is_heredoc_body() {
                 Vec::new()
             } else {
-                self.tokenize_masked_line(&line.masked_code())
+                self.tokenize_masked_line(&line.masked_code(), Self::assignment_directive(line))
             };
             line_tokens.extend(lexical_tokens(line));
             line_tokens.sort_by_key(|(start, _, _)| *start);
@@ -73,16 +74,33 @@ impl SemanticTokensProvider {
     fn tokenize_line(&self, source: &str) -> Vec<(u32, u32, u32)> {
         let lexed = lex::lex(source);
         let line = &lexed.lines()[0];
-        let mut tokens = self.tokenize_masked_line(&line.masked_code());
+        let mut tokens =
+            self.tokenize_masked_line(&line.masked_code(), Self::assignment_directive(line));
         tokens.extend(lexical_tokens(line));
         tokens.sort_by_key(|(start, _, _)| *start);
         tokens.dedup();
         tokens
     }
 
+    fn assignment_directive(line: &LexedLine) -> Option<ResourceDirective> {
+        let masked = line.masked_code();
+        let eq_byte = masked.as_str().find('=')?;
+        let column = position::byte_offset_to_char_offset(masked.as_str(), eq_byte);
+        let key = position::line_prefix(line.text(), column).trim();
+        // Masking preserves bare keys after comments; the original prefix
+        // supplies quoted keys, whose literal identity the parser validates.
+        let decoded = carina_core::parser::decode_attribute_key(masked.as_str()[..eq_byte].trim())
+            .or_else(|| carina_core::parser::decode_attribute_key(key))?;
+        ResourceDirective::from_name(&decoded)
+    }
+
     /// Tokenize a line whose non-code lexical regions have already been masked.
     /// Positions use UTF-16 code units.
-    fn tokenize_masked_line(&self, masked: &MaskedCode) -> Vec<(u32, u32, u32)> {
+    fn tokenize_masked_line(
+        &self,
+        masked: &MaskedCode,
+        directive: Option<ResourceDirective>,
+    ) -> Vec<(u32, u32, u32)> {
         let line = masked.as_str();
         let mut tokens = Vec::new();
         let trimmed = line.trim_start();
@@ -253,7 +271,7 @@ impl SemanticTokensProvider {
                     3,
                 )); // PROPERTY
             }
-            if prop_name == "ignore_changes" {
+            if directive == Some(ResourceDirective::IgnoreChanges) {
                 let rhs_start = line[..eq_byte_pos].chars().count() + 1;
                 Self::find_ignore_change_path_identifiers(masked, rhs_start, &mut tokens);
             }
@@ -1526,6 +1544,27 @@ mod tests {
                 kinds.contains(&expected),
                 "Expected token_type {expected} in output. Got kinds: {kinds:?}"
             );
+        }
+    }
+
+    #[test]
+    fn quoted_ignore_changes_keys_keep_path_identifier_tokens() {
+        let provider = SemanticTokensProvider::new(&[]);
+        for quote in ["'", "\""] {
+            let line =
+                format!("    {quote}ignore_changes{quote} = [code.image_uri, tags[\"Owner\"]]");
+            let tokens = provider.tokenize_line(&line);
+            for identifier in ["code", "image_uri", "tags"] {
+                let start = line.find(identifier).unwrap() as u32;
+                assert!(
+                    tokens
+                        .iter()
+                        .any(|(token_start, length, kind)| *token_start == start
+                            && *length == identifier.len() as u32
+                            && *kind == 3),
+                    "{quote}: missing {identifier}: {tokens:?}"
+                );
+            }
         }
     }
 
