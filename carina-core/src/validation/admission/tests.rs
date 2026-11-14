@@ -15,6 +15,15 @@ mod seam_round4;
 #[path = "tests/substituted_reference.rs"]
 mod substituted_reference;
 
+#[path = "tests/named_annotations.rs"]
+mod named_annotations;
+
+#[path = "tests/refined_destinations.rs"]
+mod refined_destinations;
+
+#[path = "tests/lsp_discharge.rs"]
+mod lsp_discharge;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct AdmissionWork {
     candidates: usize,

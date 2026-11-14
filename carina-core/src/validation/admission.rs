@@ -124,23 +124,26 @@
 //! Configuration never enters resource assignment or retains discharge work.
 //!
 //! ```
-//! use carina_core::validation::admission::{admit, Candidate, Destination, AdmissionContext, kind::ResourceAttribute};
-//! fn check(destination: &Destination<ResourceAttribute>, candidate: Candidate, context: &AdmissionContext<'_>) {
-//!     let _ = admit(destination, candidate, context);
+//! use carina_core::validation::admission::{AssignmentKind, Destination, kind::ResourceAttribute};
+//! fn assignment<K: AssignmentKind>(_: &Destination<K>) {}
+//! fn check(destination: &Destination<ResourceAttribute>) {
+//!     assignment(destination);
 //! }
 //! ```
 //!
 //! ```compile_fail,E0277
-//! use carina_core::validation::admission::{admit, Candidate, Destination, AdmissionContext, kind::ProviderConfigAttribute};
-//! fn check(destination: &Destination<ProviderConfigAttribute>, candidate: Candidate, context: &AdmissionContext<'_>) {
-//!     let _ = admit(destination, candidate, context);
+//! use carina_core::validation::admission::{AssignmentKind, Destination, kind::ProviderConfigAttribute};
+//! fn assignment<K: AssignmentKind>(_: &Destination<K>) {}
+//! fn check(destination: &Destination<ProviderConfigAttribute>) {
+//!     assignment(destination);
 //! }
 //! ```
 //!
 //! ```compile_fail,E0277
-//! use carina_core::validation::admission::{admit, Candidate, Destination, AdmissionContext, kind::BackendAttribute};
-//! fn check(destination: &Destination<BackendAttribute>, candidate: Candidate, context: &AdmissionContext<'_>) {
-//!     let _ = admit(destination, candidate, context);
+//! use carina_core::validation::admission::{AssignmentKind, Destination, kind::BackendAttribute};
+//! fn assignment<K: AssignmentKind>(_: &Destination<K>) {}
+//! fn check(destination: &Destination<BackendAttribute>) {
+//!     assignment(destination);
 //! }
 //! ```
 //!
@@ -589,7 +592,7 @@ pub struct AdmissionContext<
 }
 
 impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
-    pub fn validation_classified<'a>(
+    fn validation_classified<'a>(
         proof: crate::resource::knowledge::Classification<'a, P, B>,
         bindings: Option<&'a BindingIndex<'a, B>>,
         provider: &'a dyn ProviderTypeCheckContext,
@@ -616,7 +619,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
         )
     }
 
-    pub fn plan<'a>(
+    fn plan<'a>(
         proof: PlanResolved<'a, P, B>,
         provider: &'a dyn ProviderTypeCheckContext,
     ) -> (Self, AdmissionContext<'a, P, B>) {
@@ -632,7 +635,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
         )
     }
 
-    pub fn apply<'a>(
+    fn apply<'a>(
         proof: Knowledge<'a, P, B, Apply>,
         provider: &'a dyn ProviderTypeCheckContext,
     ) -> Result<(Self, AdmissionContext<'a, P, B>), AdmissionErrors> {
@@ -1068,29 +1071,34 @@ impl AdmissionErrors {
 /// assignment applies; a raw value cannot supply reference-origin evidence.
 ///
 /// ```
-/// use carina_core::validation::admission::{admit, Candidate, Destination, AdmissionContext, kind::ResourceAttribute};
-/// fn inspect(value: Candidate, destination: &Destination<ResourceAttribute>, context: &AdmissionContext<'_>) {
-///     let _ = admit(destination, value, context);
+/// use carina_core::{resource::Value, validation::admission::Candidate};
+/// fn inspect(value: Candidate) {
+///     let _: Candidate = value;
 /// }
 /// ```
 /// ```compile_fail,E0308
-/// use carina_core::{resource::Value, validation::admission::{admit, Destination, AdmissionContext, kind::ResourceAttribute}};
-/// fn bypass(value: Value, destination: &Destination<ResourceAttribute>, context: &AdmissionContext<'_>) {
-///     let _ = admit(destination, value, context);
+/// use carina_core::{resource::Value, validation::admission::Candidate};
+/// fn bypass(value: Value) {
+///     let _: Candidate = value;
 /// }
 /// ```
 ///
 /// An arbitrary candidate also cannot mint the evidence required by the
 /// relaxed reference relation.
 ///
-/// ```compile_fail,E0277
-/// use carina_core::validation::admission::{admit, Candidate, ReferenceCandidate, Destination, AdmissionContext, kind::ResourceAttribute};
-/// fn bypass(value: Candidate, destination: &Destination<ResourceAttribute>, context: &AdmissionContext<'_>) {
-///     let _: ReferenceCandidate = value.clone().into();
-///     let _ = admit(destination, value, context);
+/// ```
+/// use carina_core::validation::admission::{Candidate, ReferenceCandidate};
+/// fn inspect(value: ReferenceCandidate) {
+///     let _: ReferenceCandidate = value.into();
 /// }
 /// ```
-pub fn admit<K: AssignmentKind, P: PlaceholderKind, B: BindingAddress>(
+/// ```compile_fail,E0277
+/// use carina_core::validation::admission::{Candidate, ReferenceCandidate};
+/// fn bypass(value: Candidate) {
+///     let _: ReferenceCandidate = value.into();
+/// }
+/// ```
+fn admit<K: AssignmentKind, P: PlaceholderKind, B: BindingAddress>(
     destination: &Destination<K>,
     candidate: Candidate<P, B>,
     context: &AdmissionContext<'_, P, B>,

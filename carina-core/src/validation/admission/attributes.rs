@@ -1060,6 +1060,82 @@ fn typed_resource_attribute_admissions<
 ///     let _ = Candidate::validation_slot(slot, proof, bindings, provider);
 /// }
 /// ```
+///
+/// Raw admission entry and candidate factories belong to admission. These
+/// external-crate examples pin their lack of public visibility; plain private
+/// declarations also exclude sibling modules inside this crate.
+///
+/// ```
+/// use carina_core::validation::admission::Candidate;
+/// ```
+///
+/// ```compile_fail,E0603
+/// use carina_core::validation::admission::admit;
+/// ```
+///
+/// ```
+/// use carina_core::{binding_index::BindingIndex, resource::AbsoluteBindingAddress,
+///     resource::knowledge::Classification, validation::{admission::Candidate,
+///         deferred_types::ProviderTypeCheckContext}};
+/// fn paired<'a>(proof: Classification<'a>,
+///     bindings: Option<&'a BindingIndex<'a, AbsoluteBindingAddress>>,
+///     provider: &'a dyn ProviderTypeCheckContext) {
+///     let _: Option<Candidate> = None;
+///     let _ = (proof, bindings, provider);
+/// }
+/// ```
+///
+/// ```compile_fail,E0624
+/// use carina_core::{binding_index::BindingIndex, resource::AbsoluteBindingAddress,
+///     resource::knowledge::Classification, validation::{admission::Candidate,
+///         deferred_types::ProviderTypeCheckContext}};
+/// fn paired<'a>(proof: Classification<'a>,
+///     bindings: Option<&'a BindingIndex<'a, AbsoluteBindingAddress>>,
+///     provider: &'a dyn ProviderTypeCheckContext) {
+///     let _: Option<Candidate> = None;
+///     let _ = Candidate::validation_classified(proof, bindings, provider);
+/// }
+/// ```
+///
+/// ```
+/// use carina_core::{resource::knowledge::PlanResolved,
+///     validation::{admission::Candidate, deferred_types::ProviderTypeCheckContext}};
+/// fn paired<'a>(proof: PlanResolved<'a>, provider: &'a dyn ProviderTypeCheckContext) {
+///     let _: Option<Candidate> = None;
+///     let _ = (proof, provider);
+/// }
+/// ```
+///
+/// ```compile_fail,E0624
+/// use carina_core::{resource::knowledge::PlanResolved,
+///     validation::{admission::Candidate, deferred_types::ProviderTypeCheckContext}};
+/// fn paired<'a>(proof: PlanResolved<'a>, provider: &'a dyn ProviderTypeCheckContext) {
+///     let _: Option<Candidate> = None;
+///     let _ = Candidate::plan(proof, provider);
+/// }
+/// ```
+///
+/// ```
+/// use carina_core::{resource::{AbsoluteBindingAddress, NoPlaceholder},
+///     resource::knowledge::{Apply, Knowledge},
+///     validation::{admission::Candidate, deferred_types::ProviderTypeCheckContext}};
+/// fn paired<'a>(proof: Knowledge<'a, NoPlaceholder, AbsoluteBindingAddress, Apply>,
+///     provider: &'a dyn ProviderTypeCheckContext) {
+///     let _: Option<Candidate> = None;
+///     let _ = (proof, provider);
+/// }
+/// ```
+///
+/// ```compile_fail,E0624
+/// use carina_core::{resource::{AbsoluteBindingAddress, NoPlaceholder},
+///     resource::knowledge::{Apply, Knowledge},
+///     validation::{admission::Candidate, deferred_types::ProviderTypeCheckContext}};
+/// fn paired<'a>(proof: Knowledge<'a, NoPlaceholder, AbsoluteBindingAddress, Apply>,
+///     provider: &'a dyn ProviderTypeCheckContext) {
+///     let _: Option<Candidate> = None;
+///     let _ = Candidate::apply(proof, provider);
+/// }
+/// ```
 fn resource_attribute_admission_api_pins() {}
 
 #[cfg(test)]
