@@ -716,7 +716,6 @@ fn module_reload_uses_the_unsaved_buffer() {
         .with_run_for_test(|run| {
             run.parse_and_resolve_merged_with_buffer(
                 &document.for_diagnostics().expect("public fixture"),
-                Some("main.crn"),
                 &carina_core::paths::ResolvedPath::new(directory.root.path()).unwrap(),
             )
         })
@@ -1127,7 +1126,6 @@ fn expanded_module_diagnostic_keeps_its_authored_file()
         .with_run_for_test(|run| {
             run.parse_and_resolve_merged_with_buffer(
                 &document.for_diagnostics().expect("public fixture"),
-                Some("main.crn"),
                 &carina_core::paths::ResolvedPath::new(directory.root.path()).unwrap(),
             )
         })
@@ -1189,6 +1187,71 @@ fn deferred_populate_and_routing_in_static_and_deferred_for_bodies_keep_the_owne
             &[("typo", 0)],
         );
     }
+}
+
+#[test]
+fn source_override_never_written_buffer_is_visible_from_sibling() {
+    let directory = Directory::new(&[("sibling.crn", "let observed = fresh\n")]);
+    let path = directory.root.path().join("unsaved.crn");
+    assert!(!path.exists());
+    let source = "let fresh = 'from buffer'\n";
+    let document = create_document_at(source, path.clone());
+    let base = carina_core::paths::ResolvedPath::new(directory.root.path()).unwrap();
+    let merged = test_engine()
+        .with_run_for_test(|run| {
+            run.parse_and_resolve_merged_with_buffer(&document.for_diagnostics().unwrap(), &base)
+        })
+        .unwrap();
+    let sibling = merged
+        .directory
+        .semantic_file(&directory.root.path().join("sibling.crn"))
+        .unwrap();
+    assert_eq!(
+        sibling.variables.get("observed"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "from buffer".into()
+        )))
+    );
+    assert!(
+        merged
+            .directory
+            .source_files
+            .iter()
+            .any(|(file, text)| { file.source_label() == path && text == source })
+    );
+    assert!(!path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn source_override_merged_buffer_reuses_pinned_base() {
+    let directory = Directory::new(&[
+        ("before/sibling.crn", "let observed = fresh\n"),
+        ("after/sibling.crn", "let observed = 'other tree'\n"),
+    ]);
+    let alias = directory.root.path().join("project");
+    std::os::unix::fs::symlink("before", &alias).unwrap();
+    let base = carina_core::paths::ResolvedPath::new(&alias).unwrap();
+    let path = alias.join("unsaved.crn");
+    let document = create_document_at("let fresh = 'pinned buffer'\n", path);
+    std::fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink("after", &alias).unwrap();
+
+    let merged = test_engine()
+        .with_run_for_test(|run| {
+            run.parse_and_resolve_merged_with_buffer(&document.for_diagnostics().unwrap(), &base)
+        })
+        .unwrap();
+    let sibling = merged
+        .directory
+        .semantic_file(&alias.join("sibling.crn"))
+        .unwrap();
+    assert_eq!(
+        sibling.variables.get("observed"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "pinned buffer".into()
+        )))
+    );
 }
 
 #[test]

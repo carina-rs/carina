@@ -851,18 +851,13 @@ impl DiagnosticRun<'_> {
     /// Module analysis follows after sealing and upstream type resolution.
     pub(super) fn parse_merged_with_buffer(
         &self,
-        doc: &Document,
-        _current_file_name: Option<&str>,
         base_path: &carina_core::paths::ResolvedPath,
+        overrides: &carina_core::config_loader::SourceOverrides,
     ) -> Result<MergedParseResult, carina_core::config_loader::DirectoryParseFailure> {
-        let overrides = carina_core::config_loader::SourceOverrides::from([(
-            doc.source_file().to_path_buf(),
-            doc.text(),
-        )]);
         let result = carina_core::config_loader::parse_directory_with_source_overrides_and_diagnostics_with_schemas(
             base_path,
             self.provider_context.catalog(),
-            &overrides,
+            overrides,
             &self.schemas,
         )?;
         Ok(MergedParseResult {
@@ -936,15 +931,20 @@ impl DiagnosticRun<'_> {
     pub(super) fn parse_and_resolve_merged_with_buffer(
         &self,
         doc: &Document,
-        current_file_name: Option<&str>,
         base_path: &carina_core::paths::ResolvedPath,
     ) -> Result<MergedParseResult, carina_core::config_loader::DirectoryParseFailure> {
-        let mut result = self.parse_merged_with_buffer(doc, current_file_name, base_path)?;
-        let directory = std::sync::Arc::clone(&result.directory);
-        let overrides = carina_core::config_loader::SourceOverrides::from([(
-            doc.source_file().to_path_buf(),
+        let file_name = doc
+            .source_file()
+            .file_name()
+            .expect("test document must name a file");
+        let overrides = carina_core::config_loader::SourceOverrides::single(
+            base_path
+                .join(file_name)
+                .expect("resolve test document against pinned base"),
             doc.text(),
-        )]);
+        );
+        let mut result = self.parse_merged_with_buffer(base_path, &overrides)?;
+        let directory = std::sync::Arc::clone(&result.directory);
         match carina_core::parser::AnalysisTree::try_from_file(directory.parsed.parsed()) {
             Ok(tree) => {
                 match self.resolve_diagnostic_upstream_exports(base_path, &tree, &overrides) {
@@ -1066,19 +1066,14 @@ impl DiagnosticRun<'_> {
     /// somewhere (#2717 / #2753).
     pub(super) fn finalize_provider_diagnostic(
         &self,
-        doc: &Document,
-        _current_file_name: Option<&str>,
         base_path: &carina_core::paths::ResolvedPath,
+        overrides: &carina_core::config_loader::SourceOverrides,
     ) -> Option<carina_core::parser::AnalysisResolutionError> {
-        let overrides = carina_core::config_loader::SourceOverrides::from([(
-            doc.source_file().to_path_buf(),
-            doc.text(),
-        )]);
         let merged =
             carina_core::config_loader::parse_directory_for_metadata_with_source_overrides_report(
                 base_path,
                 self.provider_context.catalog(),
-                &overrides,
+                overrides,
                 &self.schemas,
             )
             .ok()?;
@@ -1089,10 +1084,7 @@ impl DiagnosticRun<'_> {
                 self.provider_context,
                 &self.schemas,
                 &[],
-                &carina_core::config_loader::SourceOverrides::from([(
-                    doc.source_file().to_path_buf(),
-                    doc.text(),
-                )]),
+                overrides,
             );
         if let carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } =
             module_resolution
