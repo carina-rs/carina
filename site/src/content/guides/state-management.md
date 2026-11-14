@@ -189,12 +189,16 @@ Carina trims surrounding ASCII whitespace from either credential source.
 A whitespace-only `GITHUB_TOKEN` falls back to `gh`; control characters left
 inside a token cause a credential error without displaying the token.
 For fine-grained tokens, include the state repository in the repository selection.
+The token must be allowed to push directly to the state branch. Rulesets or
+branch protection must not block its direct pushes, including by requiring
+changes through a pull request.
 
-State reads fail closed when Contents access is uncertain. If the state path
+State and lease reads fail closed when Contents access is uncertain. If the path
 returns 404, Carina makes one additional root Contents request at the same
-commit. Only HTTP 200 proves Contents is readable and allows the state to be
-treated as absent. Branch visibility alone is insufficient; denied root
-access produces a Contents read permission error.
+commit. Only HTTP 200 proves Contents is readable and allows the path to be
+treated as absent, including an empty root returning `[]`. Branch visibility
+alone is insufficient; root HTTP 403/404 produces a Contents read permission
+error, while other failures retain their API status.
 
 For read-only access without a configuration directory, use:
 
@@ -257,10 +261,13 @@ between the ownership check and the state PUT. Removal of a recreated lease
 can also fail or race with another client, and does not undo a successor's
 work during that window.
 
-If a mutation times out, Carina returns the deadline error and remembers the
-uncertain write in memory. A mismatched blob acknowledgement also retains this
-uncertainty. The next mutation in the same process resolves it with a Contents
-metadata read (plus the root access check if state is absent): a blob SHA
+If a mutation returns HTTP 500, 502, 503, or 504, Carina attempts to reconcile
+it within the operation deadline, as it does for a lost transport reply. If
+the outcome remains uncertain or a mutation times out, Carina returns the
+error and remembers the uncertain write in memory. A mismatched blob
+acknowledgement also retains this uncertainty. The next mutation in the same
+process resolves it with a Contents metadata read (plus the root access check
+if the path is absent): a blob SHA
 matching the exact sent bytes is currently treated as our write, the prior SHA
 means it did not commit, and a different SHA is a conflict. An acquisition or
 renewal recovered this way recognizes its own lock UUID. Other lost replies

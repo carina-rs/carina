@@ -101,6 +101,10 @@ pub enum GitHubError {
         "GitHub token needs Contents write on repository {target}; check Contents permission and fine-grained token repository selection"
     )]
     ContentsWriteDenied { target: String },
+    #[error(
+        "GitHub repository rule violation at {location}: {message}; the token must be allowed to push directly to the state branch"
+    )]
+    RuleViolation { location: String, message: String },
     #[error("Malformed GitHub response")]
     MalformedResponse,
     #[error("GitHub state path refers to a non-file object")]
@@ -109,8 +113,14 @@ pub enum GitHubError {
     CorruptLease,
     #[error("Unexpected GitHub mutation outcome: {reason}")]
     UnexpectedOutcome { reason: &'static str },
-    #[error("GitHub branch contention persisted after {attempts} attempts")]
-    Contention { attempts: usize },
+    #[error(
+        "GitHub branch contention persisted after {attempts} attempts: {message} (request ID: {request_id:?})"
+    )]
+    Contention {
+        attempts: usize,
+        message: String,
+        request_id: Option<String>,
+    },
     #[error(
         "State write conflict: the state file had been deleted concurrently; the PUT recreated it and the created file has been kept"
     )]
@@ -633,14 +643,17 @@ impl GitHubBackend {
             return Ok(response);
         }
     }
+    fn api_message(response: &GitHubResponse) -> String {
+        redact_response_body(&response.body)
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .take(2048)
+            .collect()
+    }
     fn api_error(response: &GitHubResponse) -> BackendError {
         GitHubError::Api {
             status: response.status,
-            body: redact_response_body(&response.body)
-                .chars()
-                .filter(|ch| !ch.is_control())
-                .take(2048)
-                .collect(),
+            body: Self::api_message(response),
             request_id: request_id(response),
         }
         .into()
@@ -742,8 +755,9 @@ impl GitHubBackend {
         operation: &Operation,
     ) -> BackendResult<()> {
         // Fail closed: Contents 404 can hide a missing Contents read grant.
-        // An existing branch has a non-empty root; a 200 at this exact commit
-        // is positive evidence of read access before treating state as absent.
+        // M5, real GitHub measurement (2026-11-15, #4436): an empty-tree
+        // branch returns 200 with [] at the root and 404 for a missing path.
+        // A 200 at this exact commit proves read access even for an empty root.
         let root = self
             .get(
                 format!("{}/contents", self.repository_route()),
@@ -752,8 +766,11 @@ impl GitHubBackend {
                 operation,
             )
             .await?;
-        if root.status != 200 {
+        if matches!(root.status, 403 | 404) {
             return Err(self.contents_read_error());
+        }
+        if root.status != 200 {
+            return Err(Self::api_error(&root));
         }
         Ok(())
     }
@@ -772,9 +789,7 @@ impl GitHubBackend {
             )
             .await?;
         if response.status == 404 {
-            if matches!(path, ContentsPath::State(_)) {
-                self.verify_contents_readable(commit, operation).await?;
-            }
+            self.verify_contents_readable(commit, operation).await?;
             return Ok(None);
         }
         if response.status == 403 {
@@ -853,15 +868,10 @@ impl GitHubBackend {
     async fn confirm_lease_absence(&self, operation: &Operation) -> BackendResult<bool> {
         let commit = self.branch_snapshot(operation).await?;
         let path = self.settings.path().lock_path();
-        if self
+        Ok(self
             .metadata_at((&path).into(), &commit, operation)
             .await?
-            .is_some()
-        {
-            return Ok(false);
-        }
-        self.verify_contents_readable(&commit, operation).await?;
-        Ok(true)
+            .is_none())
     }
     async fn verify_owner(&self, lock: &LockInfo, operation: &Operation) -> BackendResult<()> {
         if self.lease_is_revoked(lock.id()) {
@@ -1069,7 +1079,20 @@ impl GitHubBackend {
             }
             self.begin_mutation(&mutation, &sent);
             let rate_retries_before = operation.rate_retries.load(Ordering::Relaxed);
-            let response = match self.request(request.clone(), operation).await {
+            // A server failure can arrive after GitHub committed the mutation.
+            // Reconcile it like a lost transport reply, retaining the persisted
+            // intent if the observation fails or exhausts this operation's budget.
+            let response = self
+                .request(request.clone(), operation)
+                .await
+                .and_then(|response| {
+                    if matches!(response.status, 500 | 502 | 503 | 504) {
+                        Err(Self::api_error(&response))
+                    } else {
+                        Ok(response)
+                    }
+                });
+            let response = match response {
                 Ok(response) => response,
                 Err(
                     error @ BackendError::GitHub(
@@ -1085,7 +1108,12 @@ impl GitHubBackend {
                 }
                 Err(
                     error @ BackendError::GitHub(
-                        GitHubError::Transport { .. } | GitHubError::RateLimited { .. },
+                        GitHubError::Transport { .. }
+                        | GitHubError::RateLimited { .. }
+                        | GitHubError::Api {
+                            status: 500 | 502 | 503 | 504,
+                            ..
+                        },
                     ),
                 ) => {
                     if Instant::now() < operation.deadline
@@ -1103,6 +1131,25 @@ impl GitHubBackend {
                     return Err(error);
                 }
             };
+            // M6, real GitHub measurement (2026-11-15, #4436): rules requiring
+            // pull requests reject Contents creates and updates with HTTP 409.
+            // This is a definitive rejection; other 409 bodies keep the recorded
+            // re-read / unchanged-SHA retry rule below.
+            if response.status == 409
+                && serde_json::from_slice::<Value>(&response.body).is_ok_and(|value| {
+                    value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .is_some_and(|message| message.contains("Repository rule violations found"))
+                })
+            {
+                self.reject_mutation(&mutation);
+                return Err(GitHubError::RuleViolation {
+                    location: self.target(),
+                    message: Self::api_message(&response),
+                }
+                .into());
+            }
             // A committed DELETE can lose its reply to a rate limit, then
             // receive 404/409 on the automatic retry. Its next observation is
             // authoritative for release, without deleting a successor lease.
@@ -1156,7 +1203,12 @@ impl GitHubBackend {
                 }
                 self.reject_mutation(&mutation);
                 if attempt == MAX_ATTEMPTS {
-                    return Err(GitHubError::Contention { attempts: attempt }.into());
+                    return Err(GitHubError::Contention {
+                        attempts: attempt,
+                        message: Self::api_message(&response),
+                        request_id: request_id(&response),
+                    }
+                    .into());
                 }
                 let jitter = (uuid::Uuid::new_v4().as_u128() % 25) as u64;
                 let delay = Duration::from_millis(10 * attempt as u64 + jitter);
@@ -1224,21 +1276,14 @@ impl GitHubBackend {
             // Keep lease intent until the operation returns successfully, so a
             // compare timeout cannot strand an acquisition's UUID either.
             let success = self.remember_mutation(&mutation, success);
-            if response.status == 201 {
-                match &mutation {
-                    Mutation::RenewLease { id, .. } => {
-                        // The reply is known: this UUID has lost ownership.
-                        // Cancellation during compare must not turn the known
-                        // recreation into matching-bytes recovery on retry.
-                        *self.pending_lease.lock().expect("lease revision mutex") =
-                            Some(PendingLease::Recreated { id: (*id).into() });
-                    }
-                    Mutation::CreateState { .. }
-                    | Mutation::ReplaceState { .. }
-                    | Mutation::CreateLease { .. }
-                    | Mutation::TakeOverLease { .. }
-                    | Mutation::DeleteLease { .. } => {}
-                }
+            if response.status == 201
+                && let Mutation::RenewLease { id, .. } = &mutation
+            {
+                // The reply is known: this UUID has lost ownership.
+                // Cancellation during compare must not turn the known
+                // recreation into matching-bytes recovery on retry.
+                *self.pending_lease.lock().expect("lease revision mutex") =
+                    Some(PendingLease::Recreated { id: (*id).into() });
             }
             let commit = (|| -> Result<_, GitHubError> {
                 let commit = CommitSha::parse(json_string(&value["commit"], "sha")?)?;
@@ -1255,9 +1300,6 @@ impl GitHubBackend {
             let verification = self.verify_reachable(&commit, operation).await;
             if response.status == 201 {
                 let deletion_error = match &mutation {
-                    Mutation::CreateState { .. }
-                    | Mutation::CreateLease { .. }
-                    | Mutation::TakeOverLease { .. } => None,
                     Mutation::ReplaceState { .. } => {
                         Some(GitHubError::StateDeletedConcurrently.into())
                     }
@@ -1281,15 +1323,24 @@ impl GitHubBackend {
                         }
                         Some(BackendError::LockNotHeld((*id).into()))
                     }
-                    Mutation::DeleteLease { .. } => Some(malformed().into()),
+                    // DeleteLease cannot reach here: DELETE success requires HTTP 200 above.
+                    Mutation::CreateState { .. }
+                    | Mutation::CreateLease { .. }
+                    | Mutation::TakeOverLease { .. }
+                    | Mutation::DeleteLease { .. } => None,
                 };
-                if let Some(error) = deletion_error {
-                    return match verification {
-                        Err(
-                            error @ BackendError::GitHub(GitHubError::UnexpectedOutcome { .. }),
-                        ) => Err(error),
-                        _ => Err(error),
-                    };
+                if let Some(deletion_error) = deletion_error {
+                    // A definitive branch mismatch takes precedence. Failed
+                    // verification otherwise preserves the known 201 outcome.
+                    if let Err(
+                        verification_error @ BackendError::GitHub(GitHubError::UnexpectedOutcome {
+                            ..
+                        }),
+                    ) = verification
+                    {
+                        return Err(verification_error);
+                    }
+                    return Err(deletion_error);
                 }
             }
             verification?;

@@ -21,6 +21,8 @@ struct Store {
     contents_status: Option<u16>,
     root_status: Option<u16>,
     mutation_response: Option<GitHubResponse>,
+    mutation_responses: VecDeque<GitHubResponse>,
+    requires_pull_request: bool,
     files: BTreeMap<String, Vec<u8>>,
     history: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
     parents: BTreeMap<String, Option<String>>,
@@ -672,7 +674,10 @@ impl GitHubTransport for Fake {
             let mut store = self.0.lock().unwrap();
             store.requests.push(request.clone());
             if request.method != Method::Get
-                && let Some(response) = store.mutation_response.take()
+                && let Some(response) = store
+                    .mutation_responses
+                    .pop_front()
+                    .or_else(|| store.mutation_response.take())
             {
                 return Ok(response);
             }
@@ -753,15 +758,13 @@ impl GitHubTransport for Fake {
         }
         if request.path == "/repos/owner/repo/contents" {
             assert_eq!(request.method, Method::Get);
-            assert!(
-                store
-                    .history
-                    .contains_key(request.reference.as_ref().unwrap())
-            );
-            return Ok(reply(
-                store.root_status.unwrap_or(200),
-                json!([{"type":"file", "name":"README.md"}]),
-            ));
+            let files = &store.history[request.reference.as_ref().unwrap()];
+            // M5: even an empty-tree branch has a readable root, returning [].
+            let entries: Vec<_> = files
+                .keys()
+                .map(|path| json!({"type":"file", "name":path}))
+                .collect();
+            return Ok(reply(store.root_status.unwrap_or(200), json!(entries)));
         }
         let path = request
             .path
@@ -812,6 +815,13 @@ impl GitHubTransport for Fake {
         assert_eq!(body["branch"], "states/prod");
         assert!(body.get("committer").is_none());
         assert!(body["message"].as_str().unwrap().starts_with("carina: "));
+        if store.requires_pull_request {
+            // M6: Contents creates and updates both return 409 under this rule.
+            return Ok(reply(
+                409,
+                json!({"message":"Repository rule violations found\n\nChanges must be made through a pull request.\n\n"}),
+            ));
+        }
         if store.contention > 0 {
             store.contention -= 1;
             store.commit();
@@ -1828,23 +1838,31 @@ impl GitHubTransport for RateOnEachRequest {
 }
 #[tokio::test(start_paused = true)]
 async fn github_round1_rate_retry_budget_is_shared_by_the_entire_operation() {
-    let transport = Arc::new(RateOnEachRequest {
-        fake: Fake::default(),
-        calls: std::sync::atomic::AtomicUsize::new(0),
-    });
-    let backend = GitHubBackend::with_transport(settings(), transport.clone());
-    let start = Instant::now();
-    assert!(matches!(
-        backend.acquire_lock("apply").await,
-        Err(BackendError::GitHub(GitHubError::RateLimited { .. }))
-    ));
-    assert_eq!(
-        transport.calls.load(std::sync::atomic::Ordering::Relaxed),
-        // Two additional reconciliation reads use the same exhausted retry
-        // budget; neither is allowed to wait or reset the rate retry count.
-        7
-    );
-    assert_eq!(start.elapsed(), Duration::from_secs(2));
+    for existing in [false, true] {
+        let fake = Fake::default();
+        if existing {
+            let expired = LockInfo::with_timeout("expired", -1);
+            fake.put("state.json.lock", serde_json::to_vec(&expired).unwrap());
+        }
+        let transport = Arc::new(RateOnEachRequest {
+            fake,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let backend = GitHubBackend::with_transport(settings(), transport.clone());
+        let start = Instant::now();
+        assert!(matches!(
+            backend.acquire_lock("apply").await,
+            Err(BackendError::GitHub(GitHubError::RateLimited { .. }))
+        ));
+        assert_eq!(
+            transport.calls.load(std::sync::atomic::Ordering::Relaxed),
+            // An absent lease needs a root proof, which exhausts the shared
+            // retry budget before dispatch. An existing lease reaches the
+            // mutation and two reconciliation reads, with no fresh budget.
+            if existing { 7 } else { 5 }
+        );
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
+    }
 }
 
 struct RateAfterSlowRead {
@@ -2725,7 +2743,7 @@ async fn github_round4_absence_requires_readable_root_at_the_same_commit() {
 #[tokio::test]
 async fn github_round4_hidden_contents_fail_closed_without_a_state_put() {
     for contents_status in [403, 404] {
-        for root_status in [301, 403, 404, 500] {
+        for root_status in [301, 403, 404, 500, 502, 503, 504] {
             for writing in [false, true] {
                 let fake = Fake::default();
                 let backend = fake.backend();
@@ -2739,11 +2757,21 @@ async fn github_round4_hidden_contents_fail_closed_without_a_state_put() {
                 } else {
                     backend.read_state().await.unwrap_err()
                 };
-                assert_located_message(&error, &["token", "Contents read"]);
-                assert!(matches!(
-                    error,
-                    BackendError::GitHub(GitHubError::ContentsReadDenied { .. })
-                ));
+                if contents_status == 403 || matches!(root_status, 403 | 404) {
+                    assert_located_message(&error, &["token", "Contents read"]);
+                    assert!(matches!(
+                        error,
+                        BackendError::GitHub(GitHubError::ContentsReadDenied { .. })
+                    ));
+                } else {
+                    assert!(
+                        matches!(
+                            error,
+                            BackendError::GitHub(GitHubError::Api { status, .. }) if status == root_status
+                        ),
+                        "{error:?}"
+                    );
+                }
                 let store = fake.0.lock().unwrap();
                 assert!(store.requests.iter().all(|r| r.method == Method::Get));
                 assert_eq!(
@@ -2755,6 +2783,373 @@ async fn github_round4_hidden_contents_fail_closed_without_a_state_put() {
                     usize::from(contents_status == 404)
                 );
             }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round5_rules_requiring_pull_requests_fail_without_retrying() {
+    for operation in [
+        "create state",
+        "replace state",
+        "create lease",
+        "delete lease",
+    ] {
+        let fake = Fake::default();
+        let backend = fake.backend();
+        let state = StateFile::new();
+        if operation == "replace state" {
+            backend.write_state(&state).await.unwrap();
+        }
+        backend.read_state().await.unwrap();
+        let lock = if operation == "delete lease" {
+            Some(backend.acquire_lock("apply").await.unwrap())
+        } else {
+            None
+        };
+        let before = fake.0.lock().unwrap().files.clone();
+        {
+            let mut store = fake.0.lock().unwrap();
+            store.requires_pull_request = true;
+            store.requests.clear();
+        }
+        let error = match operation {
+            "create lease" => backend.acquire_lock("apply").await.unwrap_err(),
+            "delete lease" => backend
+                .release_lock(lock.as_ref().unwrap())
+                .await
+                .unwrap_err(),
+            _ => backend.write_state(&state).await.unwrap_err(),
+        };
+        let store = fake.0.lock().unwrap();
+        assert_eq!(store.files, before);
+        assert_eq!(
+            store
+                .requests
+                .iter()
+                .filter(|r| r.method != Method::Get)
+                .count(),
+            1,
+            "{operation}: {error:?}"
+        );
+        assert!(
+            store.requests.last().unwrap().method != Method::Get,
+            "a rule rejection needs no reconciliation read"
+        );
+        assert_located_message(
+            &error,
+            &[
+                "Repository rule violations found",
+                "token must be allowed to push directly to the state branch",
+            ],
+        );
+        assert!(
+            matches!(&error,
+            BackendError::GitHub(GitHubError::RuleViolation { location, message })
+                if location == "owner/repo@states/prod"
+                    && message.contains("Changes must be made through a pull request.")),
+            "{error:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round5_contention_keeps_the_last_sanitized_response_evidence() {
+    // Preserve the recorded 409 rule, including unrecognised 409 messages.
+    for message in ["is at X but expected Y", "another 409 reason"] {
+        let fake = Fake::default();
+        let backend = fake.backend();
+        backend.read_state().await.unwrap();
+        let mut expected_body = String::new();
+        let mut expected_request_id = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let mut response = reply(
+                409,
+                json!({
+                    "message": format!("{message}; attempt {attempt}; https://example.invalid/details?token=body-secret"),
+                    "documentation_url": "https://example.invalid/docs?token=docs-secret",
+                }),
+            );
+            response.headers.insert(
+                "x-github-request-id".into(),
+                format!("request-{attempt} https://example.invalid/id?token=id-secret"),
+            );
+            let BackendError::GitHub(GitHubError::Api {
+                body, request_id, ..
+            }) = GitHubBackend::api_error(&response)
+            else {
+                panic!("API evidence")
+            };
+            expected_body = body;
+            expected_request_id = request_id;
+            fake.0
+                .lock()
+                .unwrap()
+                .mutation_responses
+                .push_back(response);
+        }
+        let error = backend.write_state(&StateFile::new()).await.unwrap_err();
+        assert!(
+            matches!(&error, BackendError::GitHub(GitHubError::Contention {
+            attempts: MAX_ATTEMPTS, message, request_id,
+        }) if message == &expected_body && request_id == &expected_request_id),
+            "{error:?}"
+        );
+        let display = error.to_string();
+        assert!(display.contains(&expected_body), "{display}");
+        assert!(
+            display.contains(expected_request_id.as_ref().unwrap()),
+            "{display}"
+        );
+        for diagnostic in [display, format!("{error:?}")] {
+            for secret in ["body-secret", "docs-secret", "id-secret"] {
+                assert!(!diagnostic.contains(secret), "{diagnostic}");
+            }
+        }
+        let store = fake.0.lock().unwrap();
+        assert_eq!(
+            store
+                .requests
+                .iter()
+                .filter(|r| r.method == Method::Put)
+                .count(),
+            MAX_ATTEMPTS
+        );
+        assert!(store.files.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn github_round5_committed_server_error_preserves_state_intent_for_the_next_save() {
+    for status in [500, 502, 503, 504] {
+        for replacing in [false, true] {
+            let fake = Fake::default();
+            let backend = fake.backend();
+            let mut state = StateFile::new();
+            if replacing {
+                backend.write_state(&state).await.unwrap();
+            }
+            backend.read_state().await.unwrap();
+            {
+                let mut store = fake.0.lock().unwrap();
+                store.after_commit_response = Some(reply(status, json!({"message":"lost reply"})));
+                store.fail_read_after_commit = true;
+            }
+            state.serial = 1;
+            assert!(matches!(backend.write_state(&state).await,
+                Err(BackendError::GitHub(GitHubError::Api { status: actual, .. })) if actual == status));
+            assert_eq!(
+                fake.bytes("state.json").unwrap(),
+                carina_core::utils::pretty_with_newline_bytes(&state).unwrap()
+            );
+            {
+                let mut store = fake.0.lock().unwrap();
+                // End the read outage even if the implementation skipped reconciliation.
+                store.response = None;
+                store.requests.clear();
+            }
+            state.serial = 2;
+            backend.write_state(&state).await.unwrap();
+            assert_eq!(
+                fake.bytes("state.json").unwrap(),
+                carina_core::utils::pretty_with_newline_bytes(&state).unwrap()
+            );
+            assert_eq!(
+                fake.0
+                    .lock()
+                    .unwrap()
+                    .requests
+                    .iter()
+                    .filter(|r| r.method == Method::Put)
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn github_round5_committed_server_error_preserves_our_uuid_for_the_next_acquire() {
+    for status in [500, 502, 503, 504] {
+        let fake = Fake::default();
+        let backend = fake.backend();
+        {
+            let mut store = fake.0.lock().unwrap();
+            store.after_commit_response = Some(reply(status, json!({"message":"lost reply"})));
+            store.fail_read_after_commit = true;
+        }
+        assert!(matches!(backend.acquire_lock("apply").await,
+            Err(BackendError::GitHub(GitHubError::Api { status: actual, .. })) if actual == status));
+        let sent = fake.bytes("state.json.lock").unwrap();
+        {
+            let mut store = fake.0.lock().unwrap();
+            store.response = None;
+            store.requests.clear();
+        }
+        let recovered = backend.acquire_lock("apply").await.unwrap();
+        assert_eq!(serde_json::to_vec(&recovered).unwrap(), sent);
+        assert!(
+            fake.0
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .all(|r| r.method == Method::Get)
+        );
+    }
+}
+
+#[tokio::test]
+async fn github_round5_committed_server_errors_reconcile_put_and_delete_in_the_same_call() {
+    for status in [500, 502, 503, 504] {
+        for deleting in [false, true] {
+            let fake = Fake::default();
+            let backend = fake.backend();
+            let lock = backend.acquire_lock("apply").await.unwrap();
+            backend.read_state().await.unwrap();
+            {
+                let mut store = fake.0.lock().unwrap();
+                store.after_commit_response = Some(reply(status, json!({"message":"lost reply"})));
+                store.requests.clear();
+            }
+            if deleting {
+                backend.release_lock(&lock).await.unwrap();
+                assert!(fake.bytes("state.json.lock").is_none());
+            } else {
+                let state = StateFile::new();
+                backend.write_state(&state).await.unwrap();
+                assert_eq!(
+                    fake.bytes("state.json").unwrap(),
+                    carina_core::utils::pretty_with_newline_bytes(&state).unwrap()
+                );
+            }
+            assert_eq!(
+                fake.0
+                    .lock()
+                    .unwrap()
+                    .requests
+                    .iter()
+                    .filter(|r| r.method != Method::Get)
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn github_round5_committed_delete_server_error_keeps_pending_release_until_readable() {
+    for force in [false, true] {
+        let fake = Fake::default();
+        let backend = fake.backend();
+        let lock = backend.acquire_lock("apply").await.unwrap();
+        {
+            let mut store = fake.0.lock().unwrap();
+            store.after_commit_response = Some(reply(502, json!({"message":"lost reply"})));
+            store.fail_read_after_commit = true;
+        }
+        let result = if force {
+            backend.force_unlock(lock.id()).await
+        } else {
+            backend.release_lock(&lock).await
+        };
+        assert!(matches!(
+            result,
+            Err(BackendError::GitHub(GitHubError::Api { status: 502, .. }))
+        ));
+        {
+            let mut store = fake.0.lock().unwrap();
+            store.response = None;
+            store.requests.clear();
+        }
+        if force {
+            backend.force_unlock(lock.id()).await.unwrap();
+        } else {
+            backend.release_lock(&lock).await.unwrap();
+        }
+        assert!(
+            fake.0
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .all(|r| r.method == Method::Get)
+        );
+        assert!(fake.bytes("state.json.lock").is_none());
+    }
+}
+
+#[tokio::test]
+async fn github_round5_empty_tree_root_proves_absence_before_the_first_write() {
+    for raw in [false, true] {
+        let fake = Fake::default();
+        let commit = CommitSha::parse(&fake.0.lock().unwrap().commit()).unwrap();
+        let response = fake
+            .execute(
+                GitHubRequest::get(
+                    "/repos/owner/repo/contents".into(),
+                    Some(&commit),
+                    JSON_MEDIA_TYPE,
+                ),
+                Instant::now() + OPERATION_BUDGET,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(decode(&response.body).unwrap(), json!([]));
+        fake.0.lock().unwrap().requests.clear();
+        let backend = fake.backend();
+        if raw {
+            assert!(backend.read_state_bytes().await.unwrap().is_none());
+        } else {
+            assert!(backend.read_state().await.unwrap().is_none());
+        }
+        {
+            let store = fake.0.lock().unwrap();
+            assert_eq!(store.requests.len(), 3);
+            assert_eq!(
+                store.requests[1].reference.as_deref(),
+                Some(commit.as_str())
+            );
+            assert_eq!(store.requests[2].reference, store.requests[1].reference);
+        }
+        backend.write_state(&StateFile::new()).await.unwrap();
+        assert!(fake.bytes("state.json").is_some());
+    }
+}
+
+#[tokio::test]
+async fn github_round5_release_cannot_treat_lost_contents_access_as_lease_absence() {
+    for operation in ["release", "cleanup", "force unlock"] {
+        for root_status in [403, 404] {
+            let fake = Fake::default();
+            let backend = fake.backend();
+            let lock = backend.acquire_lock("apply").await.unwrap();
+            let before = fake.bytes("state.json.lock").unwrap();
+            {
+                let mut store = fake.0.lock().unwrap();
+                store.contents_status = Some(404);
+                store.root_status = Some(root_status);
+                store.requests.clear();
+            }
+            let result = match operation {
+                "cleanup" => backend.release_lock_for_cleanup(&lock).await,
+                "force unlock" => backend.force_unlock(lock.id()).await,
+                _ => backend.release_lock(&lock).await,
+            };
+            assert!(
+                matches!(
+                    &result,
+                    Err(BackendError::GitHub(GitHubError::ContentsReadDenied { .. }))
+                ),
+                "{operation}: {result:?}"
+            );
+            assert_located_message(&result.unwrap_err(), &["token", "Contents read"]);
+            assert_eq!(fake.bytes("state.json.lock").unwrap(), before);
+            let store = fake.0.lock().unwrap();
+            assert!(store.requests.iter().all(|r| r.method == Method::Get));
+            assert_eq!(store.requests.len(), 3);
+            assert_eq!(store.requests[1].reference, store.requests[2].reference);
         }
     }
 }
