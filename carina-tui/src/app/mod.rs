@@ -683,7 +683,7 @@ impl App {
 /// This reuses the same dependency-based algorithm from `carina-cli/src/display.rs`:
 /// - Builds forward/reverse dependency maps from `ResourceRef` attributes
 /// - Assigns each resource a single parent (shallowest dependency)
-/// - Sorts siblings by `(resource_type, binding_name)`
+/// - Sorts siblings by `(resource_type, binding_name, effect_index)`
 fn build_tree_structure<S, V: carina_core::resource::PlanValueKind>(
     plan: &Plan<S, V>,
     nodes: &mut [TreeNode],
