@@ -702,7 +702,7 @@ A struct type represents a nested object with typed fields.
   identity/member labels; identified leaves show every identity-conjunction
   pattern. Shared provider docgen
   must render both layers too. This change needs no WIT change.
-  Schema fingerprints use v13 and saved plans use format 45; format 44 plans
+  Schema fingerprints use v13 and saved plans use format 46; format 45 plans
   must fail the version gate before decoding the payload. Saved module
   `pending_constraints` contain `ValidateExpr` values, not retained types.
   Condition strings, `require` messages, and wait RHS strings retain checked
@@ -727,8 +727,11 @@ A struct type represents a nested object with typed fields.
   `NeedsLocal` exists only in the admission-facing reference relation, requiring
   a `ReferenceCandidate`; it cannot convert back into general type compatibility.
   Resource/data-source final inputs use `admit_apply_resource` and
-  `admit_apply_data_source`. Provider/backend configuration enters `admit()` through
-  `validation/admission/configuration/`, including compact-list callbacks.
+  `admit_apply_data_source`. Provider/backend configuration has its own field admission
+  in `validation/admission/configuration/`, including compact-list callbacks.
+  `ConfigurationKind` destinations carry a `ConfigurationContract` with no resource
+  lookup; configuration kinds cannot name `PendingAdmission` and cannot be passed
+  to `admit` or `discharge`.
   Complete admissions own the canonical payload and placements; analysis cannot
   authorize construction. Undeclared keys are rejected before value checks or
   factory validation, using resource unknown-attribute suggestions. The payload
@@ -832,6 +835,17 @@ A struct type represents a nested object with typed fields.
   further WIT change beyond the diagnostics imports. Resource and Struct
   declarations use the same admitted rule type,
   with Struct paths relative to each object instance (including recursive defs).
+  `InputPredicate::Secret` (`kind: "secret"`) applies to scalar String Value targets,
+  including refined Strings and String definition refs; containers, other scalar
+  shapes, and MapKeys targets are rejected. Check failure first, then
+  `NodeRef::scope()`, then knownness: Secret is proven even with a pending
+  payload, known Public is a violation, and a pending Public value and every
+  withheld target remain pending. An absent optional target uses the existing
+  omission proof. Never extract or estimate the plaintext for Secret. The schema
+  input rule is the sole owner. WIT stays 0.3.0, fingerprint encoding stays v13
+  (new predicate tag 15), and saved-plan format stays 45. The record decodes at
+  protocol 28, but providers must not declare it until the next protocol bump:
+  a host predating it rejects the whole schema as an unknown variant.
   The shared input-rule admission gate checks writable canonical paths, typed
   scalar literals, enum identity and canonical membership, predicate compatibility,
   duplicate target/code pairs, and a condition depth limit of 16. The one evaluator

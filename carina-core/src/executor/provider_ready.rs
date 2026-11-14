@@ -78,6 +78,20 @@ mod attribute_admission_tests;
 ///     ready.as_resource().attributes.insert("unchecked".into(), value);
 /// }
 /// ```
+///
+/// Provider configuration has its own concrete admission boundary.
+///
+/// ```
+/// use carina_core::provider::{ProviderReady, ResourceWirePayload};
+/// use carina_core::validation::admission::kind::ResourceAttribute;
+/// fn check<T: ResourceWirePayload>(_: Option<ProviderReady<T, ResourceAttribute>>) {}
+/// ```
+///
+/// ```compile_fail,E0277
+/// use carina_core::provider::{ProviderReady, ResourceWirePayload};
+/// use carina_core::validation::admission::kind::ProviderConfigAttribute;
+/// fn check<T: ResourceWirePayload>(_: Option<ProviderReady<T, ProviderConfigAttribute>>) {}
+/// ```
 #[derive(Debug, Clone)]
 pub struct ProviderReady<T: ResourceWirePayload, K: RechecksResolved = kind::ResourceAttribute> {
     admission: FinalInput<DispatchPayload<WireReady<T>>>,

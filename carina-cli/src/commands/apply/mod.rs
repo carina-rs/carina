@@ -38,7 +38,9 @@ use carina_core::resource::{ConcreteValue, State};
 use carina_core::shutdown::ShutdownToken;
 use carina_core::upstream_exports::AdmittedRemoteBindings;
 use carina_core::value::{RenderedKey, render_value};
-use carina_state::{LockInfo, RowBasis, StateBackend, StateFile};
+use carina_state::{
+    LockInfo, RowBasis, S3AutoCreate, S3Bootstrap, StateBackend, StateFile, StorageReadiness,
+};
 
 #[cfg(test)]
 use carina_core::parser::ProviderConfig;
@@ -301,8 +303,25 @@ async fn prepare_bootstrap_permit(
         })
 }
 
-async fn create_auto_bootstrap_bucket(backend: &dyn StateBackend) -> Result<(), AppError> {
-    backend.create_bucket().await.map_err(AppError::Backend)
+#[derive(Debug)]
+enum S3BucketBootstrap<'a> {
+    Declared(&'a Resource),
+    AutoCreate(S3AutoCreate),
+}
+
+fn select_s3_bucket_bootstrap(
+    bootstrap: S3Bootstrap,
+    bucket_resource: Option<&Resource>,
+) -> Result<S3BucketBootstrap<'_>, AppError> {
+    if let Some(resource) = bucket_resource {
+        Ok(S3BucketBootstrap::Declared(resource))
+    } else {
+        Ok(S3BucketBootstrap::AutoCreate(
+            bootstrap
+                .auto_create()
+                .map_err(|disabled| AppError::Config(disabled.to_string()))?,
+        ))
+    }
 }
 
 async fn create_checked_bootstrap_resource(
@@ -1942,7 +1961,6 @@ async fn run_apply_with_observer_factory(
     observer_factory: &ObserverFactory<'_>,
 ) -> Result<(), AppError> {
     let path = project_argument;
-    let color_mode = runtime.color_mode();
     let loaded = load_configuration_with_config(
         project,
         provider_context,
@@ -1960,7 +1978,7 @@ async fn run_apply_with_observer_factory(
         base_dir,
         &mut crate::commands::human_provider_notices(runtime.color_mode()),
     )?;
-    let mut validated_config = providers.validate_config_pair(
+    let validated_config = providers.validate_config_pair(
         parsed,
         loaded.unresolved_parsed,
         base_dir,
@@ -1985,178 +2003,18 @@ async fn run_apply_with_observer_factory(
         .map_err(AppError::Backend)?
         .into();
 
-    // Handle bootstrap if S3 backend is configured
-    let s3_bootstrap = verified_backend
-        .s3_settings()
-        .map(|settings| (settings.bucket().to_owned(), settings.auto_create()));
-    if let Some((bucket_name, auto_create)) = s3_bootstrap {
-        // Check if bucket exists (bootstrap detection)
-        let bucket_exists = backend.bucket_exists().await.map_err(AppError::Backend)?;
-
-        if !bucket_exists {
-            println!(
-                "{}",
-                "State bucket not found. Running bootstrap..."
-                    .yellow(color_mode)
-                    .bold(color_mode)
-            );
-
-            // Check if there's a bucket resource defined with matching name
-            let backend_resource_type = backend
-                .resource_type()
-                .ok_or("Backend does not specify a resource type")?;
-            if let Some(bucket_resource) = validated_config
-                .resources()
-                .parsed()
-                .find_resource_by_attr(backend_resource_type, "bucket", &bucket_name)
-            {
-                println!("Found state bucket resource in configuration.");
-                println!(
-                    "Creating bucket '{}' before other resources...",
-                    bucket_name.cyan(color_mode)
-                );
-
-                // Create the bucket resource using the factory pattern
-                let backend_provider_name = backend
-                    .provider_name()
-                    .ok_or("Backend does not specify a provider name")?;
-                // This is the only pre-lock path that constructs a provider.
-                // Resolve its attributes here; every other apply path waits
-                // for the post-reconciliation lock-held resolution below.
-                let bootstrap_provider_inputs = load_apply_provider_inputs(
-                    runtime,
-                    validated_config.resources().parsed(),
-                    base_dir,
-                    &validated_config
-                        .context()
-                        .provider_context()
-                        .with_runtime(provider_context),
-                    validated_config.context().schemas(),
-                )
-                .await?;
-                let (bucket_provider, bucket_normalizer) = create_state_bucket_bootstrap_provider(
-                    &validated_config,
-                    bootstrap_provider_inputs.configs(),
-                    backend_provider_name,
-                    validated_config.provider_plan(),
-                )
-                .await?;
-                // Module expansion can place a module-owned state-bucket
-                // resource in `parsed.resources`; `find_resource_by_attr`
-                // does not imply top-level ownership. Gate bootstrap with
-                // the same expanded compositions and resolved config values
-                // that are available before any provider effect runs.
-                create_checked_bootstrap_resource(
-                    color_mode,
-                    &bucket_provider,
-                    &bucket_provider,
-                    bucket_resource.clone(),
-                    BootstrapCreateContext {
-                        provider_context: validated_config.context().provider_context(),
-                        backend: backend.as_ref(),
-                        parsed: validated_config.resources().parsed(),
-                        provider_configs: bootstrap_provider_inputs.configs(),
-                        normalizer: bucket_normalizer.as_ref(),
-                        schemas: validated_config.context().schemas(),
-                    },
-                )
-                .await?;
-                println!(
-                    "  {} Created state bucket: {}",
-                    "✓".green(color_mode),
-                    bucket_name
-                );
-            } else {
-                // Auto-create the bucket if auto_create is enabled
-                if auto_create {
-                    println!(
-                        "Auto-creating state bucket: {}",
-                        bucket_name.cyan(color_mode)
-                    );
-                    create_auto_bootstrap_bucket(backend.as_ref()).await?;
-                    println!("  {} Created state bucket", "✓".green(color_mode));
-
-                    let backend_provider_name = backend
-                        .provider_name()
-                        .ok_or("Backend does not specify a provider name")?;
-
-                    // Append resource definition to backend file
-                    let target_file = backend_file.as_ref().unwrap_or(project);
-
-                    let resource_code = backend
-                        .resource_definition(&bucket_name)
-                        .ok_or("Backend does not support resource definition generation")?;
-
-                    append_bootstrap_resource(target_file, &resource_code)?;
-                    println!(
-                        "  {} Added resource definition to {}",
-                        "✓".green(color_mode),
-                        target_file.display()
-                    );
-
-                    // Re-parse and re-resolve the updated configuration so the
-                    // bucket resource is fully addressed (in particular: its
-                    // anonymous identifier is computed) before we seed state.
-                    // Without this, the seed can't use the resolved name and
-                    // the differ produces phantom Create + Delete entries on
-                    // the next plan (#2533). `skip_resource_validation = true`
-                    // reuses the heavier preflight pipeline only for its
-                    // resolve+anon-id steps; the schema validation already
-                    // ran on the pre-injection configuration.
-                    // Keep the authored pre-injection canonical snapshot for
-                    // resource pairing; replace only the resolved snapshot so
-                    // the lock-held path sees the injected bucket row.
-                    validated_config = reload_apply_configuration_after_bootstrap(
-                        project,
-                        base_dir,
-                        provider_context,
-                        validated_config,
-                        bootstrap_unresolved,
-                    )?;
-                    let parsed = validated_config.resources().parsed();
-
-                    let backend_resource_type = backend
-                        .resource_type()
-                        .ok_or("Backend does not specify a resource type")?;
-                    let bucket_resource_name = parsed
-                        .find_resource_by_attr(backend_resource_type, "bucket", &bucket_name)
-                        .and_then(|r| r.id.identity().cloned())
-                        .ok_or_else(|| {
-                            format!(
-                                "Auto-injected state bucket resource '{}' not found after re-parse",
-                                bucket_name
-                            )
-                        })?;
-                    let initial_state = StateFile::with_managed_state_bucket(
-                        backend_provider_name,
-                        backend_resource_type,
-                        bucket_resource_name,
-                        AppliedIdentifier::new(&bucket_name).map_err(|source| {
-                            AppError::Config(format!(
-                                "State bucket has an invalid provider identifier: {source}"
-                            ))
-                        })?,
-                    )
-                    .map_err(|source| {
-                        AppError::Config(format!("Failed to encode initial state bucket: {source}"))
-                    })?;
-                    backend
-                        .write_state(&initial_state)
-                        .await
-                        .map_err(AppError::Backend)?;
-                    println!(
-                        "  {} Registered state bucket as protected resource",
-                        "✓".green(color_mode)
-                    );
-                } else {
-                    return Err(AppError::Config(format!(
-                        "Backend bucket '{}' not found and auto_create is disabled",
-                        bucket_name
-                    )));
-                }
-            }
-        }
-    }
+    // Must stay before acquire_lock and before operation providers are built.
+    let validated_config = prepare_apply_storage(
+        runtime,
+        project,
+        provider_context,
+        validated_config,
+        bootstrap_unresolved,
+        backend_file.as_ref(),
+        backend.as_ref(),
+    )
+    .await?;
+    let color_mode = runtime.color_mode();
 
     // Acquire lock (unless --lock=false)
     let state_lock = if lock {
@@ -2201,6 +2059,184 @@ async fn run_apply_with_observer_factory(
     }
 
     Ok(())
+}
+
+/// Prepare storage before apply acquires a lock or constructs operation providers.
+async fn prepare_apply_storage(
+    runtime: &crate::runtime::CommandRuntime,
+    project: &ResolvedPath,
+    provider_context: &ProviderContext,
+    mut validated_config: ValidatedConfig,
+    bootstrap_unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
+    backend_file: Option<&ResolvedPath>,
+    backend: &dyn StateBackend,
+) -> Result<ValidatedConfig, AppError> {
+    let color_mode = runtime.color_mode();
+    let base_dir = project;
+    match backend
+        .storage_readiness()
+        .await
+        .map_err(AppError::Backend)?
+    {
+        StorageReadiness::Ready => {}
+        StorageReadiness::Unavailable(unavailable) => {
+            return Err(AppError::Backend(unavailable.into_error()));
+        }
+        StorageReadiness::Provisionable(bootstrap) => {
+            let storage = bootstrap.info().clone();
+            let bucket_name = storage.settings().bucket().to_owned();
+            println!(
+                "{}",
+                "State bucket not found. Running bootstrap..."
+                    .yellow(color_mode)
+                    .bold(color_mode)
+            );
+
+            // Check if there's a bucket resource defined with matching name
+            let backend_resource_type = storage.resource_type();
+            let bucket_resource = validated_config.resources().parsed().find_resource_by_attr(
+                backend_resource_type,
+                "bucket",
+                &bucket_name,
+            );
+            match select_s3_bucket_bootstrap(bootstrap, bucket_resource)? {
+                S3BucketBootstrap::Declared(bucket_resource) => {
+                    println!("Found state bucket resource in configuration.");
+                    println!(
+                        "Creating bucket '{}' before other resources...",
+                        bucket_name.cyan(color_mode)
+                    );
+
+                    // Create the bucket resource using the factory pattern
+                    let backend_provider_name = storage.provider_name();
+                    // This is the only pre-lock path that constructs a provider.
+                    // Resolve its attributes here; every other apply path waits
+                    // for the post-reconciliation lock-held resolution below.
+                    let bootstrap_provider_inputs = load_apply_provider_inputs(
+                        runtime,
+                        validated_config.resources().parsed(),
+                        base_dir,
+                        &validated_config
+                            .context()
+                            .provider_context()
+                            .with_runtime(provider_context),
+                        validated_config.context().schemas(),
+                    )
+                    .await?;
+                    let (bucket_provider, bucket_normalizer) =
+                        create_state_bucket_bootstrap_provider(
+                            &validated_config,
+                            bootstrap_provider_inputs.configs(),
+                            backend_provider_name,
+                            validated_config.provider_plan(),
+                        )
+                        .await?;
+                    // Module expansion can place a module-owned state-bucket
+                    // resource in `parsed.resources`; `find_resource_by_attr`
+                    // does not imply top-level ownership. Gate bootstrap with
+                    // the same expanded compositions and resolved config values
+                    // that are available before any provider effect runs.
+                    create_checked_bootstrap_resource(
+                        color_mode,
+                        &bucket_provider,
+                        &bucket_provider,
+                        bucket_resource.clone(),
+                        BootstrapCreateContext {
+                            provider_context: validated_config.context().provider_context(),
+                            backend,
+                            parsed: validated_config.resources().parsed(),
+                            provider_configs: bootstrap_provider_inputs.configs(),
+                            normalizer: bucket_normalizer.as_ref(),
+                            schemas: validated_config.context().schemas(),
+                        },
+                    )
+                    .await?;
+                    println!(
+                        "  {} Created state bucket: {}",
+                        "✓".green(color_mode),
+                        bucket_name
+                    );
+                }
+                S3BucketBootstrap::AutoCreate(auto_create) => {
+                    println!(
+                        "Auto-creating state bucket: {}",
+                        bucket_name.cyan(color_mode)
+                    );
+                    auto_create.create().await.map_err(AppError::Backend)?;
+                    println!("  {} Created state bucket", "✓".green(color_mode));
+
+                    let backend_provider_name = storage.provider_name();
+
+                    // Append resource definition to backend file
+                    let target_file = backend_file.unwrap_or(project);
+
+                    let resource_code = storage.resource_definition();
+
+                    append_bootstrap_resource(target_file, &resource_code)?;
+                    println!(
+                        "  {} Added resource definition to {}",
+                        "✓".green(color_mode),
+                        target_file.display()
+                    );
+
+                    // Re-parse and re-resolve the updated configuration so the
+                    // bucket resource is fully addressed (in particular: its
+                    // anonymous identifier is computed) before we seed state.
+                    // Without this, the seed can't use the resolved name and
+                    // the differ produces phantom Create + Delete entries on
+                    // the next plan (#2533). `skip_resource_validation = true`
+                    // reuses the heavier preflight pipeline only for its
+                    // resolve+anon-id steps; the schema validation already
+                    // ran on the pre-injection configuration.
+                    // Keep the authored pre-injection canonical snapshot for
+                    // resource pairing; replace only the resolved snapshot so
+                    // the lock-held path sees the injected bucket row.
+                    validated_config = reload_apply_configuration_after_bootstrap(
+                        project,
+                        base_dir,
+                        provider_context,
+                        validated_config,
+                        bootstrap_unresolved,
+                    )?;
+                    let parsed = validated_config.resources().parsed();
+
+                    let backend_resource_type = storage.resource_type();
+                    let bucket_resource_name = parsed
+                        .find_resource_by_attr(backend_resource_type, "bucket", &bucket_name)
+                        .and_then(|r| r.id.identity().cloned())
+                        .ok_or_else(|| {
+                            format!(
+                                "Auto-injected state bucket resource '{}' not found after re-parse",
+                                bucket_name
+                            )
+                        })?;
+                    let initial_state = StateFile::with_managed_state_bucket(
+                        backend_provider_name,
+                        backend_resource_type,
+                        bucket_resource_name,
+                        AppliedIdentifier::new(&bucket_name).map_err(|source| {
+                            AppError::Config(format!(
+                                "State bucket has an invalid provider identifier: {source}"
+                            ))
+                        })?,
+                    )
+                    .map_err(|source| {
+                        AppError::Config(format!("Failed to encode initial state bucket: {source}"))
+                    })?;
+                    backend
+                        .write_state(&initial_state)
+                        .await
+                        .map_err(AppError::Backend)?;
+                    println!(
+                        "  {} Registered state bucket as protected resource",
+                        "✓".green(color_mode)
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(validated_config)
 }
 
 /// Deterministic test rendezvous, following plan's state-drift handshake.

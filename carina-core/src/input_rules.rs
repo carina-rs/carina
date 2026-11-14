@@ -15,6 +15,8 @@ pub use authored::{AuthoredInputUnavailable, AuthoredInputs};
 mod declarations;
 mod estimator;
 mod instances;
+mod predicate;
+use predicate::{PredicateClass, Presence, StringPredicate, StringPredicateKind};
 mod rule_input;
 mod type_context;
 mod union_fits;
@@ -43,11 +45,14 @@ use crate::{
         ValueKind,
     },
     schema::{
-        Compiled, CompiledAttributeType, InputCondition, InputDiagnosticPath, InputLiteral,
-        InputMode, InputPath, InputPredicate, InputRule, InputRuleCode, InputRuleScope,
+        Compiled, CompiledAttributeType, CompiledPattern, InputCondition, InputDiagnosticPath,
+        InputLiteral, InputMode, InputPath, InputRule, InputRuleCode, InputRuleScope,
         InputRuleTarget, InputViolation, SchemaKind, SchemaRegistry, ValidatedResourceSchema,
     },
 };
+
+#[cfg(test)]
+use crate::schema::InputPredicate;
 
 // One transient input phase retains parser and loop substitutions without
 // granting them provider-readiness or changing their knowledge provenance.
@@ -1222,7 +1227,9 @@ fn verdict(applicable: &BoundInputRule<'_, '_>) -> InputVerdict {
         return match path_evidence(applicable, rule.path()) {
             InputRead::Failed(_) => failed_verdict(rule),
             InputRead::Present(value) if value.failed() => failed_verdict(rule),
-            _ => InputVerdict::Undecided,
+            InputRead::Present(_) | InputRead::Absent(_) | InputRead::Withheld(_) => {
+                InputVerdict::Undecided
+            }
         };
     }
     target_verdict(applicable)
@@ -1230,46 +1237,75 @@ fn verdict(applicable: &BoundInputRule<'_, '_>) -> InputVerdict {
 
 fn target_verdict(applicable: &BoundInputRule<'_, '_>) -> InputVerdict {
     let rule = applicable.rule;
-    let truth = match rule.predicate() {
-        InputPredicate::Present => Some(presence(path_evidence(applicable, rule.path()))),
-        InputPredicate::Absent => Some(match presence(path_evidence(applicable, rule.path())) {
-            Truth::True => Truth::False,
-            Truth::False => Truth::True,
-            Truth::Pending => Truth::Pending,
-            Truth::Failed => Truth::Failed,
-        }),
-        InputPredicate::Equals(literal) => Some(scalar_equals(
+    let truth = match predicate::classify(rule.predicate()) {
+        PredicateClass::Presence(Presence::Present) => {
+            presence(path_evidence(applicable, rule.path()))
+        }
+        PredicateClass::Presence(Presence::Absent) => {
+            match presence(path_evidence(applicable, rule.path())) {
+                Truth::True => Truth::False,
+                Truth::False => Truth::True,
+                Truth::Pending => Truth::Pending,
+                Truth::Failed => Truth::Failed,
+            }
+        }
+        PredicateClass::Equals(literal) => scalar_equals(
             applicable,
             rule.path(),
             literal,
             path_evidence(applicable, rule.path()),
-        )),
-        _ => None,
+        ),
+        // Protection and knowledge are node evidence. Never extract or estimate
+        // the plaintext for this predicate, even when its payload is pending.
+        PredicateClass::Secret => match path_evidence(applicable, rule.path()) {
+            InputRead::Present(node) => {
+                if node.failed() {
+                    Truth::Failed
+                } else if node.scope().is_secret() {
+                    Truth::True
+                } else if node.known() {
+                    Truth::False
+                } else {
+                    Truth::Pending
+                }
+            }
+            InputRead::Withheld(_) => Truth::Pending,
+            InputRead::Failed(_) => Truth::Failed,
+            InputRead::Absent(proof) => return absent_target_verdict(applicable, proof),
+        },
+        PredicateClass::String(predicate) => return string_target_verdict(applicable, &predicate),
     };
-    if let Some(truth) = truth {
-        return match truth {
-            Truth::True => InputVerdict::Proven,
-            Truth::False => InputVerdict::Violation(rule_violation(rule)),
-            Truth::Pending => InputVerdict::Undecided,
-            Truth::Failed => failed_verdict(rule),
-        };
+    match truth {
+        Truth::True => InputVerdict::Proven,
+        Truth::False => InputVerdict::Violation(rule_violation(rule)),
+        Truth::Pending => InputVerdict::Undecided,
+        Truth::Failed => failed_verdict(rule),
     }
+}
+
+fn absent_target_verdict(applicable: &BoundInputRule<'_, '_>, proof: AbsenceProof) -> InputVerdict {
+    let optional = input_declaration(applicable, applicable.rule.path(), proof.depth() + 1)
+        .is_some_and(|(_, mode)| mode == InputMode::Optional);
+    if optional {
+        InputVerdict::Proven
+    } else {
+        InputVerdict::Undecided
+    }
+}
+
+fn string_target_verdict(
+    applicable: &BoundInputRule<'_, '_>,
+    predicate: &StringPredicate<'_, CompiledPattern>,
+) -> InputVerdict {
+    let rule = applicable.rule;
     // All owners consume the same evidence before using the same estimator.
     // Withheld inputs cannot acquire proof from an unapplied authored value.
     match path_evidence(applicable, rule.path()) {
-        InputRead::Absent(proof) => {
-            let optional = input_declaration(applicable, rule.path(), proof.depth() + 1)
-                .is_some_and(|(_, mode)| mode == InputMode::Optional);
-            if optional {
-                InputVerdict::Proven
-            } else {
-                InputVerdict::Undecided
-            }
-        }
+        InputRead::Absent(proof) => absent_target_verdict(applicable, proof),
         InputRead::Withheld(value) => {
             if matches!(rule.target(), InputRuleTarget::MapKeys(_)) {
                 value.target().map_or(InputVerdict::Undecided, |node| {
-                    map_keys_verdict(applicable, &node)
+                    map_keys_verdict(applicable, predicate, &node)
                 })
             } else {
                 InputVerdict::Undecided
@@ -1288,8 +1324,11 @@ fn target_verdict(applicable: &BoundInputRule<'_, '_>) -> InputVerdict {
                             api_value: text, ..
                         },
                     ) => {
-                        return evaluate_string(rule, &text)
-                            .map_or_else(InputVerdict::Violation, |()| InputVerdict::Proven);
+                        return if evaluate_string(predicate, &text) {
+                            InputVerdict::Proven
+                        } else {
+                            InputVerdict::Violation(rule_violation(rule))
+                        };
                     }
                     ScalarEvidence::Known(
                         InputLiteral::Bool(_) | InputLiteral::Int(_) | InputLiteral::Float(_),
@@ -1297,18 +1336,28 @@ fn target_verdict(applicable: &BoundInputRule<'_, '_>) -> InputVerdict {
                     | ScalarEvidence::Failed => return failed_verdict(rule),
                     ScalarEvidence::Pending => {}
                 },
-                InputRuleTarget::MapKeys(_) => return map_keys_verdict(applicable, &value),
+                InputRuleTarget::MapKeys(_) => {
+                    return map_keys_verdict(applicable, predicate, &value);
+                }
             }
             value
                 .expression()
                 .map_or(InputVerdict::Undecided, |expression| {
-                    estimator::estimate(applicable, rule_input::EstimatorInput::Value(expression))
+                    estimator::estimate(
+                        applicable,
+                        predicate,
+                        rule_input::EstimatorInput::Value(expression),
+                    )
                 })
         }
     }
 }
 
-fn map_keys_verdict(applicable: &BoundInputRule<'_, '_>, evidence: &NodeRef<'_>) -> InputVerdict {
+fn map_keys_verdict(
+    applicable: &BoundInputRule<'_, '_>,
+    predicate: &StringPredicate<'_, CompiledPattern>,
+    evidence: &NodeRef<'_>,
+) -> InputVerdict {
     let rule = applicable.rule;
     let cursor = evidence.keys();
     let mut pending = false;
@@ -1323,9 +1372,9 @@ fn map_keys_verdict(applicable: &BoundInputRule<'_, '_>, evidence: &NodeRef<'_>)
         let Ok(text) = crate::value::canonicalize_authored_map_key_text(text, key, defs) else {
             return failed_verdict(rule);
         };
-        if let Err(violation) = evaluate_string(rule, &text) {
+        if !evaluate_string(predicate, &text) {
             match membership {
-                Membership::Present => return InputVerdict::Violation(violation),
+                Membership::Present => return InputVerdict::Violation(rule_violation(rule)),
                 Membership::Possible => pending = true,
             }
         }
@@ -1333,9 +1382,11 @@ fn map_keys_verdict(applicable: &BoundInputRule<'_, '_>, evidence: &NodeRef<'_>)
     let remainder = match cursor.remainder {
         rule_input::KeyRemainder::Complete => InputVerdict::Proven,
         rule_input::KeyRemainder::Withheld => InputVerdict::Undecided,
-        rule_input::KeyRemainder::Expression(expression) => {
-            estimator::estimate(applicable, rule_input::EstimatorInput::Keys(expression))
-        }
+        rule_input::KeyRemainder::Expression(expression) => estimator::estimate(
+            applicable,
+            predicate,
+            rule_input::EstimatorInput::Keys(expression),
+        ),
     };
     match remainder {
         InputVerdict::Proven if pending => InputVerdict::Undecided,
@@ -1763,23 +1814,22 @@ pub(crate) fn executor_write_site<'a>(
     )
 }
 
-fn evaluate_string(rule: &InputRule<Compiled>, value: &str) -> Result<(), InputViolation> {
-    let accepted = match rule.predicate() {
-        InputPredicate::Present | InputPredicate::Absent | InputPredicate::Equals(_) => {
-            unreachable!("general predicates are evaluated before string predicates")
-        }
-        InputPredicate::Length { min, max } => {
+fn evaluate_string(predicate: &StringPredicate<'_, CompiledPattern>, value: &str) -> bool {
+    match predicate.kind() {
+        StringPredicateKind::Length { min, max } => {
             let count = u64::try_from(value.chars().count()).expect("string length fits u64");
             min.is_none_or(|min| count >= min) && max.is_none_or(|max| count <= max)
         }
-        InputPredicate::AllowedChars(set) => value.chars().all(|ch| set.contains(ch)),
-        InputPredicate::FirstChar(set) => value.chars().next().is_some_and(|ch| set.contains(ch)),
-        InputPredicate::LastChar(set) => {
+        StringPredicateKind::AllowedChars(set) => value.chars().all(|ch| set.contains(ch)),
+        StringPredicateKind::FirstChar(set) => {
+            value.chars().next().is_some_and(|ch| set.contains(ch))
+        }
+        StringPredicateKind::LastChar(set) => {
             value.chars().next_back().is_some_and(|ch| set.contains(ch))
         }
-        InputPredicate::NoSubstring(token) => !value.contains(token.as_str()),
-        InputPredicate::NoPrefix(token) => !value.starts_with(token.as_str()),
-        InputPredicate::ForbiddenPrefix {
+        StringPredicateKind::NoSubstring(token) => !value.contains(token.as_str()),
+        StringPredicateKind::NoPrefix(token) => !value.starts_with(token.as_str()),
+        StringPredicateKind::ForbiddenPrefix {
             prefix,
             ignore_ascii_case,
         } => !value.get(..prefix.as_str().len()).is_some_and(|head| {
@@ -1789,19 +1839,14 @@ fn evaluate_string(rule: &InputRule<Compiled>, value: &str) -> Result<(), InputV
                 head == prefix.as_str()
             }
         }),
-        InputPredicate::NoSuffix(token) => !value.ends_with(token.as_str()),
-        InputPredicate::NoAdjacent { left, right } => !value
+        StringPredicateKind::NoSuffix(token) => !value.ends_with(token.as_str()),
+        StringPredicateKind::NoAdjacent { left, right } => !value
             .chars()
             .zip(value.chars().skip(1))
             .any(|(a, b)| left.contains(a) && right.contains(b)),
-        InputPredicate::NotIpv4 => !is_ipv4(value),
-        InputPredicate::Matches(pattern) => pattern.is_match(value),
-        InputPredicate::NotMatches(pattern) => !pattern.is_match(value),
-    };
-    if accepted {
-        Ok(())
-    } else {
-        Err(rule_violation(rule))
+        StringPredicateKind::NotIpv4 => !is_ipv4(value),
+        StringPredicateKind::Matches(pattern) => pattern.is_match(value),
+        StringPredicateKind::NotMatches(pattern) => !pattern.is_match(value),
     }
 }
 /// Strict decimal dotted quad: exactly four ASCII octets in 0..=255, without

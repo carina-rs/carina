@@ -325,6 +325,7 @@ fn review_2_saved_apply_reports_new_admission_failure_as_drift() {
 
 #[test]
 fn review_2_saved_apply_allows_known_to_unchecked_admission_change() {
+    let current_version = carina_cli::commands::plan::PlanFile::CURRENT_VERSION;
     let root = tempfile::tempdir().unwrap();
     let (upstream, downstream) = write_fixture(root.path());
     write_exports(&upstream, serde_json::json!({"count": 73, "unused": true}));
@@ -345,7 +346,7 @@ fn review_2_saved_apply_allows_known_to_unchecked_admission_change() {
 
     let saved: serde_json::Value =
         serde_json::from_slice(&fs::read(downstream.join("saved.plan")).unwrap()).unwrap();
-    assert_eq!(saved["version"], serde_json::json!(45));
+    assert_eq!(saved["version"], serde_json::json!(current_version));
     let sources = saved["upstream_sources"].as_array().unwrap();
     assert_eq!(sources.len(), 1);
     assert_eq!(
@@ -356,7 +357,7 @@ fn review_2_saved_apply_allows_known_to_unchecked_admission_change() {
             .map(String::as_str)
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from(["binding", "source"]),
-        "format 45 must not acquire source-type evidence fields",
+        "format {current_version} must not acquire source-type evidence fields",
     );
 }
 

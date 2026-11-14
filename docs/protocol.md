@@ -26,6 +26,47 @@ v0.13.1 speaks protocol **24**, with minimum provider protocol **24**.
 | 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
 
+## Secret input-rule predicate
+
+The predicate's record exists at protocol 28, but providers must not declare it
+until the next protocol version bump; a host that predates the predicate rejects
+such a schema with a decode error.
+
+Input-rule predicates add `{"kind":"secret"}`. A provider can require it on a
+scalar String `value` target, including refined Strings and String definition
+references. List, Map, other scalar shapes, and `map_keys` targets are rejected
+at schema admission. For example:
+
+```json
+{
+  "scope": "every_write",
+  "target": {"kind": "value", "path": "value"},
+  "code": "value.secret",
+  "condition": {
+    "kind": "equals",
+    "value": {
+      "path": "type",
+      "literal": {"kind": "string", "value": "secure_string"}
+    }
+  },
+  "predicate": {"kind": "secret"}
+}
+```
+
+The schema rule owns this requirement. Evaluation checks failure, then
+protection scope, then knownness without inspecting plaintext. A Secret node
+satisfies the predicate even with a pending payload. A known Public node
+violates it; a pending Public value and every withheld target remain pending
+for plan and dispatch rechecks. An absent optional target is proven. Validate
+and LSP diagnostics report known violations and leave pending inputs for plan.
+
+An unknown predicate kind fails schema JSON decoding; the host does not admit
+the schema with that rule omitted.
+
+Schemas still travel as JSON, so WIT is unchanged. Secret uses the next free
+fingerprint predicate tag, 15; existing fingerprints, encoding v13, and saved-plan
+format 45 remain unchanged.
+
 ## Version 28
 
 WIT package `carina:provider@0.3.0` adds required `error-detail.retryability`.
@@ -125,18 +166,22 @@ rule: all alternatives must infer identical `TypeExpr`s. Slot reads differing
 only in member layers therefore compare equal. An explicit compatible annotation
 accepts otherwise mixed declarations; inference does not widen their types.
 
-Schema fingerprint encoding is v13. Saved-plan format 45 supersedes 44 and
-retains quoted validation string literals, checked for interpolation on decode.
+Schema fingerprint encoding is v13. Saved-plan format 46 supersedes 45.
+Replacement `required_by` and `required_children` values are non-empty ordered
+sets of resource or deferred-effect identities. Decoding rejects empty lists.
+The format retains quoted validation string literals, checked for interpolation on decode.
 Saved module `pending_constraints` contain value expressions (`ValidateExpr`), not retained type records. Saved-plan
 replay reloads identity/member constraints from fingerprint-checked provider
-schemas. Format-44 plans must be regenerated; their version gate fails
+schemas. Format-45 and older plans must be regenerated; their version gate fails
 before payload decoding or fingerprint verification.
 
 Every typed destination uses one String/Int identity rule: same identity
 or an allowed structural/provider widening. This includes binding/export
 annotations, map/list element annotations, module arguments, and user-function
 parameters and returns. Destination member constraints remain resolved-value
-obligations; every destination kind supports the existing `NeedsLocal` path.
+obligations; every assignment destination kind supports the existing `NeedsLocal`
+path. Provider and backend configuration validate concrete values at their own
+field boundary and cannot hold a pending obligation.
 Same-identity value admission, including admission with a declared source,
 defers overlapping identity bounds through `NeedsLocal`; provably disjoint bounds
 reject statically. Different-identity widening retains String length / Int range

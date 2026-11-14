@@ -751,6 +751,170 @@ mod tests {
     use crate::resource::Value;
 
     #[test]
+    fn secret_predicate_dispatch_rechecks_pending_values_on_the_protected_tree() {
+        use crate::resource::{
+            ApplyTimeUnknown, ConcreteValue, DeferredValue, PendingReRead, ResolvedResource,
+            Resource,
+        };
+        use crate::schema::{
+            AttributeSchema, AttributeType, InputCondition, InputLiteral, InputPath,
+            InputPredicate, InputRule, InputRuleCode, InputRuleScope, ResourceSchema,
+        };
+        let text = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("SecretInput")
+                .attribute(AttributeSchema::optional("type", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::optional("description", AttributeType::string()).build(),
+                )
+                .attribute(
+                    AttributeSchema::optional("value", AttributeType::string())
+                        .write_only()
+                        .build(),
+                )
+                .input_rule(
+                    InputRule::value(
+                        InputRuleScope::EveryWrite,
+                        InputPath::new("value").unwrap(),
+                        InputRuleCode::new("value.secret").unwrap(),
+                        InputPredicate::Secret,
+                    )
+                    .with_condition(InputCondition::Equals {
+                        path: InputPath::new("type").unwrap(),
+                        literal: InputLiteral::String("secure_string".into()),
+                    }),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let bindings = crate::binding_index::ResolvedBindings::default();
+        let gate = super::super::ModuleConstraintGate::from_live_compositions(&[]);
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let context = ProviderPreparationContext::for_test(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &crate::provider::NoopNormalizer,
+                    &schemas,
+                    type_checks,
+                );
+                for (update, reassert) in [(false, false), (true, false), (true, true)] {
+                    for secret in [false, true] {
+                        let resource =
+                            Resource::with_provider("mock", "SecretInput", "example", None)
+                                .with_attribute("type", text("secure_string"))
+                                .with_attribute("description", text("new"))
+                                .with_attribute(
+                                    "value",
+                                    Value::Deferred(DeferredValue::Unknown(
+                                        ApplyTimeUnknown::PendingReRead(PendingReRead::not_found()),
+                                    )),
+                                );
+                        let from = SnapshotState::existing(
+                            resource.id.clone(),
+                            crate::test_support::snapshot_attributes::<
+                                crate::resource::NoPlaceholder,
+                            >(HashMap::from([
+                                ("type".into(), text("secure_string")),
+                                ("description".into(), text("old")),
+                            ])),
+                        )
+                        .with_identifier("existing");
+                        let desired =
+                            ResolvedResource::resolve_raw_fixture(resource.clone(), &schemas)
+                                .unwrap();
+                        let changed = vec![if reassert {
+                            "description".into()
+                        } else {
+                            "value".into()
+                        }];
+                        let mut plan = Plan::new();
+                        plan.add(if update {
+                            Effect::Update {
+                                from: Box::new(from.clone()),
+                                identifier: AppliedIdentifier::new("existing").unwrap(),
+                                to: desired,
+                                changed_attributes: changed.clone(),
+                            }
+                        } else {
+                            Effect::Create(desired)
+                        });
+                        let checked = FinalizedPlan::new(plan)
+                            .check_inputs(&schemas, &HashMap::new())
+                            .unwrap();
+                        assert_eq!(checked.pending_inputs().len(), 1);
+                        let check = ExecutionInputChecks::new(
+                            checked.execution_input_checks(),
+                            checked.effects(),
+                            &[0],
+                        )
+                        .unwrap()
+                        .take_write(0)
+                        .unwrap();
+                        let value = if secret {
+                            text("DO-NOT-PRINT").into_secret()
+                        } else {
+                            text("DO-NOT-PRINT")
+                        };
+                        let request =
+                            futures::executor::block_on(super::super::prepare_create_request(
+                                resource.with_attribute("value", value),
+                                &context,
+                            ))
+                            .unwrap();
+                        // The wire payload is identical in both cases. The
+                        // rule must read the retained protected source tree.
+                        let attributes = request.resource().as_resource().resolved_attributes();
+                        assert_eq!(attributes.get("value"), Some(&text("DO-NOT-PRINT")));
+                        let writeback = SecretPreservingAttributes::from_provider_values(
+                            &attributes,
+                            &attributes,
+                        );
+                        let result = if update {
+                            check.prepare_update(
+                                from,
+                                &changed,
+                                request.resource().clone(),
+                                writeback,
+                                &context,
+                            ).map(|prepared| {
+                                if reassert {
+                                    assert!(prepared.request().patch().ops.iter().any(|op| matches!(op,
+                                        crate::provider::PatchOp::Reassert { key, .. } if key == "value"
+                                    )));
+                                }
+                            })
+                        } else {
+                            check
+                                .prepare_create(request, writeback, &schemas)
+                                .map(|_| ())
+                        };
+                        if secret {
+                            assert!(
+                                result.is_ok(),
+                                "update={update}, reassert={reassert}: {result:?}"
+                            );
+                        } else {
+                            let error = result
+                                .expect_err("a resolved public value must fail before dispatch");
+                            assert!(
+                                error.to_string().contains("[value.secret]"),
+                                "update={update}, reassert={reassert}: {error}"
+                            );
+                            assert!(error.to_string().contains("must be a secret value"));
+                            assert!(!error.to_string().contains("DO-NOT-PRINT"));
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    #[test]
     fn provider_selected_union_rules_are_enforced_at_create_and_update_dispatch() {
         use crate::schema::{
             AttributeSchema, AttributeType, InputCondition, InputLiteral, InputPath,

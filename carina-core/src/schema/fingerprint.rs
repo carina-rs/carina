@@ -335,6 +335,7 @@ fn encode_input_rules(encoder: &mut CanonicalEncoder, rules: &[InputRule<Compile
             match predicate {
                 InputPredicate::Present => encoder.tag(12),
                 InputPredicate::Absent => encoder.tag(13),
+                InputPredicate::Secret => encoder.tag(15),
                 InputPredicate::Equals(literal) => {
                     encoder.tag(14);
                     encode_input_literal(&mut encoder, literal);
@@ -1155,6 +1156,74 @@ mod conditional_input_rule_tests {
         AttributeSchema, AttributeType, InputCondition, InputLiteral, InputPath, InputPredicate,
         InputRule, InputRuleCode, InputRuleScope, ResourceSchema as DraftSchema, StructField,
     };
+
+    fn secret_fingerprint_fixture(
+        predicate: Option<InputPredicate<crate::schema::PatternSpec>>,
+    ) -> String {
+        let mut schema = DraftSchema::new("test.SecretFingerprint")
+            .attribute(AttributeSchema::optional("value", AttributeType::string()).build());
+        if let Some(predicate) = predicate {
+            schema = schema.input_rule(InputRule::value(
+                InputRuleScope::EveryWrite,
+                InputPath::new("value").unwrap(),
+                InputRuleCode::new("value.secret").unwrap(),
+                predicate,
+            ));
+        }
+        schema
+            .validate()
+            .unwrap()
+            .as_schema()
+            .semantic_fingerprint()
+    }
+
+    #[test]
+    fn secret_predicate_gets_a_distinct_schema_fingerprint() {
+        let secret = secret_fingerprint_fixture(Some(InputPredicate::Secret));
+        for other in [
+            None,
+            Some(InputPredicate::Present),
+            Some(InputPredicate::Absent),
+            Some(InputPredicate::Equals(InputLiteral::String("x".into()))),
+            Some(InputPredicate::NotIpv4),
+        ] {
+            assert_ne!(secret, secret_fingerprint_fixture(other));
+        }
+    }
+
+    #[test]
+    fn existing_input_rule_schema_fingerprints_remain_v13() {
+        assert_eq!(
+            super::ENCODING_VERSION,
+            "carina-resource-schema-semantic-v13"
+        );
+        // Pin the current v13 encoding, including the old predicate tags. A
+        // new Secret tag must not renumber or otherwise rewrite existing ones.
+        for (predicate, expected) in [
+            (
+                None,
+                "b0e4f22fdc9d06fa6e47e1b8e0e13ff7e07f8112b391307297318e950b01ca10",
+            ),
+            (
+                Some(InputPredicate::Present),
+                "483093174bd8f05a8eadf6898b4f04c659c0f4ff4f1e9d7f29efff4d5ebaa5c4",
+            ),
+            (
+                Some(InputPredicate::Absent),
+                "ed8eecef7faff6b1f723608362ae3f64e022ef209845c1f754f67f2205379e5c",
+            ),
+            (
+                Some(InputPredicate::Equals(InputLiteral::String("x".into()))),
+                "dc4752b1461ba8f5064d9bc13a962bf7187126bdbf04f7c6e1b1ca4e9cecca70",
+            ),
+            (
+                Some(InputPredicate::NotIpv4),
+                "d6c20689f375df31d08af48fa0be57c048075c7753f51c91ec34adad3fecc500",
+            ),
+        ] {
+            assert_eq!(secret_fingerprint_fixture(predicate), expected);
+        }
+    }
 
     #[test]
     fn guards_and_nested_rules_change_semantic_fingerprints() {

@@ -32,6 +32,8 @@ use std::time::Duration;
 mod attribute_admission;
 #[path = "tests/cancellation_fixture.rs"]
 mod cancellation_fixture;
+#[path = "tests/storage_readiness.rs"]
+mod storage_readiness;
 
 use cancellation_fixture::ApplyCancellationFixture;
 
@@ -1983,7 +1985,7 @@ async fn saved_configuration_decode_failure_returns_command_error_without_panick
     let runtime = crate::test_support::TestCommandRuntime::new();
     let temp = tempfile::tempdir().unwrap();
     let mut document: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/module_binding_wire_compat/carina.v45.plan.json"
+        "../../../tests/fixtures/module_binding_wire_compat/carina.v46.plan.json"
     ))
     .unwrap();
     document["sorted_resources"] = serde_json::json!("invalid saved configuration");
@@ -7513,10 +7515,7 @@ fn bootstrap_test_backend() -> (tempfile::TempDir, Box<dyn StateBackend>) {
     (temp, backend)
 }
 
-#[derive(Default)]
-struct BootstrapWriteFailureBackend {
-    create_calls: AtomicUsize,
-}
+struct BootstrapWriteFailureBackend;
 
 #[async_trait::async_trait]
 impl StateBackend for BootstrapWriteFailureBackend {
@@ -7570,13 +7569,10 @@ impl StateBackend for BootstrapWriteFailureBackend {
         ))
     }
 
-    async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
-        Ok(true)
-    }
-
-    async fn create_bucket(&self) -> carina_state::BackendResult<()> {
-        self.create_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+    async fn storage_readiness(
+        &self,
+    ) -> carina_state::BackendResult<carina_state::StorageReadiness> {
+        Ok(carina_state::StorageReadiness::Ready)
     }
 }
 
@@ -7837,13 +7833,10 @@ async fn declared_state_bucket_successful_create_seed_write_failure_is_actionabl
         create_calls: AtomicUsize::new(0).into(),
         behavior: BootstrapCreateBehavior::Success,
     };
-    let error = bootstrap_declared_state_bucket(
-        color_mode,
-        &provider,
-        &BootstrapWriteFailureBackend::default(),
-    )
-    .await
-    .expect_err("a successful create followed by a seed write failure must be actionable");
+    let error =
+        bootstrap_declared_state_bucket(color_mode, &provider, &BootstrapWriteFailureBackend)
+            .await
+            .expect_err("a successful create followed by a seed write failure must be actionable");
 
     let AppError::StateBucketSeed(seed) = &error else {
         panic!("seed write failure lost its bootstrap context: {error:?}");
@@ -8403,7 +8396,7 @@ async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
         resource,
         BootstrapCreateContext {
             provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
-            backend: &BootstrapWriteFailureBackend::default(),
+            backend: &BootstrapWriteFailureBackend,
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
@@ -10805,7 +10798,7 @@ mod saved_plan_version_tests {
                 &error,
                 crate::error::AppError::UnsupportedPlanVersion {
                     found: 40,
-                    expected: 45,
+                    expected: 46,
                     ..
                 }
             ),
@@ -10863,7 +10856,7 @@ mod saved_plan_version_tests {
 
     #[test]
     fn replacement_admission_requests_require_current_plan_format() {
-        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 45);
+        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 46);
     }
 
     #[tokio::test]
@@ -10912,6 +10905,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn format_38_saved_plan_is_rejected_before_source_identity_decode() {
+        let current_version = crate::commands::plan::PlanFile::CURRENT_VERSION;
         let (_dir, plan_path, mut json) = replacement_plan_json();
         json["version"] = serde_json::json!(38);
         json.as_object_mut().unwrap().remove("source_identity");
@@ -10919,7 +10913,9 @@ mod saved_plan_version_tests {
             rejected_saved_plan_message(&plan_path, &json, "format 38 must require replanning")
                 .await;
         assert!(
-            message.contains("Unsupported plan file version: 38 (expected 45)"),
+            message.contains(&format!(
+                "Unsupported plan file version: 38 (expected {current_version})"
+            )),
             "{message}"
         );
         assert!(!message.contains("corrupted"), "{message}");
@@ -11035,7 +11031,39 @@ mod saved_plan_version_tests {
                 error,
                 crate::error::AppError::UnsupportedPlanVersion {
                     found: 43,
-                    expected: 45,
+                    expected: 46,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_4418_format_45_fails_gate_before_dependent_payload_decode() {
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let dir = TempDir::new().unwrap();
+        let plan_path = dir.path().join("format-45.json");
+        std::fs::write(&plan_path, br#"{"version":45,"timestamp":"2026-11-14T00:00:00Z","source_path":"infra","plan":{"effects":"invalid old dependent payload"}}"#).unwrap();
+        let error = crate::commands::apply::run_apply_from_plan(
+            &runtime,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(1).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::error::AppError::UnsupportedPlanVersion {
+                    found: 45,
+                    expected: 46,
                     ..
                 }
             ),
@@ -11049,12 +11077,12 @@ mod saved_plan_version_tests {
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            45,
-            "carina#4386 requires format 45 for checked validation strings",
+            46,
+            "carina#4418 requires format 46 for ordered non-empty dependent sets",
         );
-        let previous = 44;
+        let previous = 45;
 
-        for older_version in [previous, 43, 42, 41, 40, 39, 38, 37, 36, 35, 34, 33, 32] {
+        for older_version in [previous, 44, 43, 42, 41, 40, 39, 38, 37, 36, 35, 34, 33, 32] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,
@@ -12385,8 +12413,102 @@ fn saved_plan_reloaded_resolved_data_source_retains_folded_module_dependency() {
 }
 
 #[tokio::test]
+async fn auto_create_backend_bucket_disabled_policy_keeps_configuration_error() {
+    let (backend, requests) = crate::test_support::missing_s3_backend(false).await;
+    let StorageReadiness::Provisionable(bootstrap) = backend.storage_readiness().await.unwrap()
+    else {
+        panic!("fixture bucket must be missing")
+    };
+
+    let error = select_s3_bucket_bootstrap(bootstrap, None).unwrap_err();
+    assert!(matches!(&error, AppError::Config(_)));
+    assert_eq!(
+        error.to_string(),
+        "Backend bucket 'state-bucket' not found and auto_create is disabled"
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect::<Vec<_>>(),
+        ["HEAD"]
+    );
+}
+
+#[tokio::test]
+async fn auto_create_backend_bucket_declared_resource_precedes_disabled_policy() {
+    let resource = Resource::with_provider("aws", "s3.Bucket", "state", None).with_attribute(
+        "bucket",
+        Value::Concrete(ConcreteValue::String("state-bucket".into())),
+    );
+    for auto_create in [false, true] {
+        let (backend, requests) = crate::test_support::missing_s3_backend(auto_create).await;
+        let StorageReadiness::Provisionable(bootstrap) = backend.storage_readiness().await.unwrap()
+        else {
+            panic!("fixture bucket must be missing")
+        };
+        let S3BucketBootstrap::Declared(selected) =
+            select_s3_bucket_bootstrap(bootstrap, Some(&resource)).unwrap()
+        else {
+            panic!("a declared bucket must use the provider regardless of auto-create policy")
+        };
+        assert_eq!(selected.id, resource.id);
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            ["HEAD"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn auto_create_backend_bucket_apply_redacts_env_bucket_like_plan() {
+    let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([(
+        "STATE_BUCKET".into(),
+        "private-bucket-name".into(),
+    )]));
+    let mut parsed = carina_core::parser::parse_file(
+        "backend s3 { bucket = env('STATE_BUCKET') key = 'state.json' auto_create = false }",
+        Path::new("backend.crn"),
+        &context,
+    )
+    .unwrap();
+    carina_core::parser::resolve_resource_refs_with_config(&mut parsed, &context).unwrap();
+    let config = carina_state::BackendConfig::try_from(parsed.backend.as_ref().unwrap()).unwrap();
+    let (backend, requests) =
+        crate::test_support::missing_s3_backend_with_settings(config.as_s3().unwrap()).await;
+    let StorageReadiness::Provisionable(bootstrap) = backend.storage_readiness().await.unwrap()
+    else {
+        panic!("fixture bucket must be missing")
+    };
+
+    let error = select_s3_bucket_bootstrap(bootstrap, None).unwrap_err();
+    assert!(matches!(&error, AppError::Config(_)));
+    // The disabled-policy message is shared with plan, including env() redaction.
+    assert_eq!(
+        error.to_string(),
+        "Backend bucket value from env() not found and auto_create is disabled"
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect::<Vec<_>>(),
+        ["HEAD"]
+    );
+}
+
+#[tokio::test]
 async fn auto_create_backend_bucket_does_not_require_provider_schema() {
-    let backend = BootstrapWriteFailureBackend::default();
+    let (backend, requests) = crate::test_support::missing_s3_backend(true).await;
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "other",
@@ -12401,13 +12523,32 @@ async fn auto_create_backend_bucket_does_not_require_provider_schema() {
             )
             .is_none()
     );
-    create_auto_bootstrap_bucket(&backend).await.unwrap();
-    assert_eq!(backend.create_calls.load(Ordering::SeqCst), 1);
+    let bootstrap = match backend.storage_readiness().await.unwrap() {
+        StorageReadiness::Ready => panic!("fixture bucket must be missing"),
+        StorageReadiness::Provisionable(bootstrap) => bootstrap,
+        StorageReadiness::Unavailable(error) => panic!("S3 storage must be provisionable: {error}"),
+    };
+    let S3BucketBootstrap::AutoCreate(auto_create) =
+        select_s3_bucket_bootstrap(bootstrap, None).unwrap()
+    else {
+        panic!("an undeclared bucket with auto-create enabled must obtain creation authority")
+    };
+    auto_create.create().await.unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect::<Vec<_>>(),
+        ["HEAD", "PUT", "PUT"]
+    );
+    assert!(!requests[1].uri.contains("publicAccessBlock"));
+    assert!(requests[2].uri.contains("publicAccessBlock"));
 }
 
 #[tokio::test]
 async fn auto_create_backend_bucket_is_outside_provider_input_admission() {
-    let backend = BootstrapWriteFailureBackend::default();
+    let (backend, requests) = crate::test_support::missing_s3_backend(true).await;
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
@@ -12424,8 +12565,15 @@ async fn auto_create_backend_bucket_is_outside_provider_input_admission() {
             .validate()
             .unwrap(),
     );
-    create_auto_bootstrap_bucket(&backend).await.unwrap();
-    assert_eq!(backend.create_calls.load(Ordering::SeqCst), 1);
+    let bootstrap = match backend.storage_readiness().await.unwrap() {
+        StorageReadiness::Ready => panic!("fixture bucket must be missing"),
+        StorageReadiness::Provisionable(bootstrap) => bootstrap,
+        StorageReadiness::Unavailable(error) => panic!("S3 storage must be provisionable: {error}"),
+    };
+    bootstrap.auto_create().unwrap().create().await.unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.iter().filter(|r| r.method == "PUT").count(), 2);
+    assert!(requests.iter().any(|r| r.uri.contains("publicAccessBlock")));
 }
 
 #[path = "tests/issue_4283.rs"]

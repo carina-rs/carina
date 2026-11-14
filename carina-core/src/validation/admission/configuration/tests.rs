@@ -269,11 +269,11 @@ fn provider_config_receipt_rejects_other_declaration_instance_revision() {
     ));
     let lookup_inputs = ProviderValidationInputs::for_schema("owner");
     let lookup = crate::parser::custom_type_lookup_for_factory(&factory, &lookup_inputs);
-    let checked = crate::validation::deferred_types::TypeCheckSession::run(&catalog, |session| {
-        let placed = field(&expected, &value, session, &lookup)
-            .unwrap()
-            .ready()
-            .unwrap();
+    let checked = crate::validation::deferred_types::TypeCheckSession::run(&catalog, |_| {
+        let placed = match field(&expected, &value, &lookup).unwrap() {
+            ConfigurationAdmission::Ready(placed) => placed,
+            ConfigurationAdmission::Unresolved(sites) => panic!("known field: {sites:?}"),
+        };
         for (wrong, mismatch) in different {
             let mut slot = TypedSlot::new(wrong);
             assert_eq!(slot.place(placed.clone()), Err(mismatch));
@@ -505,15 +505,14 @@ fn analysis_declared_field_cannot_silently_drop_pending() {
     let inputs = ProviderValidationInputs::for_schema("owner");
     let lookup = crate::parser::custom_type_lookup_for_factory(&factory, &inputs);
     let value = Value::root_resource_ref("producer", "id", vec![]);
-    let pending = crate::validation::deferred_types::TypeCheckSession::run(&catalog, |session| {
+    let pending = crate::validation::deferred_types::TypeCheckSession::run(&catalog, |_| {
         assert!(matches!(
-            field(&destination, &value, session, &lookup).unwrap(),
-            Admission::Pending(_)
+            field(&destination, &value, &lookup).unwrap(),
+            ConfigurationAdmission::Unresolved(_)
         ));
         let mut aggregate = ConfigurationBuilder::new(Arc::clone(&declaration), route.clone());
-        let error =
-            Analysis::declared(&destination, &key, &value, session, &lookup, &mut aggregate)
-                .expect_err("a declared-field result must not silently omit Pending");
+        let error = Analysis::declared(&destination, &key, &value, &lookup, &mut aggregate)
+            .expect_err("a declared-field result must not silently omit unresolved sites");
         assert!(matches!(
             error.errors.as_slice(),
             [TypeError::Knowledge { .. }]

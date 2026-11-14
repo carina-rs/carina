@@ -675,15 +675,8 @@ impl StateBackend for LocalBackend {
         Ok(())
     }
 
-    async fn bucket_exists(&self) -> BackendResult<bool> {
-        // For local backend, we consider the "bucket" to always exist
-        // (it's just the local filesystem)
-        Ok(true)
-    }
-
-    async fn create_bucket(&self) -> BackendResult<()> {
-        // Local backend doesn't need bucket creation
-        Ok(())
+    async fn storage_readiness(&self) -> BackendResult<crate::StorageReadiness> {
+        Ok(crate::StorageReadiness::Ready)
     }
 }
 
@@ -1336,12 +1329,22 @@ mod tests {
         assert!(matches!(result, Err(BackendError::LockNotHeld(_))));
     }
 
-    #[test]
-    fn test_local_backend_provider_metadata() {
-        let backend = LocalBackend::with_path(PathBuf::from("test.state.json"));
-        assert_eq!(backend.provider_name(), None);
-        assert_eq!(backend.resource_type(), None);
-        assert_eq!(backend.resource_definition("test"), None);
+    #[tokio::test]
+    async fn storage_readiness_is_ready_without_creating_local_storage() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("missing").join("test.state.json");
+        let backend = LocalBackend::with_path(state_path.clone());
+
+        match backend.storage_readiness().await.unwrap() {
+            crate::StorageReadiness::Ready => {}
+            crate::StorageReadiness::Provisionable(_) => {
+                panic!("local storage cannot provision S3")
+            }
+            crate::StorageReadiness::Unavailable(error) => {
+                panic!("local storage is ready: {error}")
+            }
+        }
+        assert!(!state_path.parent().unwrap().exists());
     }
 
     /// A retry must yield before starting the next filesystem check.

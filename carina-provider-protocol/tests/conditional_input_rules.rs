@@ -35,6 +35,25 @@ fn conditional_schema_requires_protocol_27() {
 }
 
 #[test]
+fn secret_predicate_wire_record_round_trips_with_its_condition() {
+    let value = json!({
+        "scope": "every_write",
+        "target": {"kind": "value", "path": "value"},
+        "code": "value.secret",
+        "condition": {"kind": "equals", "value": {
+            "path": "type", "literal": {"kind": "string", "value": "secure_string"}
+        }},
+        "predicate": {"kind": "secret"}
+    });
+    let decoded = serde_json::from_value::<InputRule>(value.clone());
+    assert!(
+        decoded.is_ok(),
+        "secret must be a supported wire predicate: {decoded:?}"
+    );
+    assert_eq!(serde_json::to_value(decoded.unwrap()).unwrap(), value);
+}
+
+#[test]
 fn all_literal_kinds_and_general_predicates_round_trip_without_untyped_values() {
     for literal in [
         json!({"kind":"bool","value":false}),

@@ -1,0 +1,6 @@
+provider aws {}
+
+let cert = aws.acm.Certificate { domain_name = 'new.example.com' }
+let records = for opt in cert.domain_validation_options {
+  aws.route53.RecordSet { name = opt.domain_name }
+}

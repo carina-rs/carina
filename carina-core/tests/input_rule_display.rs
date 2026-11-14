@@ -176,6 +176,44 @@ fn string(value: &str) -> Value {
     Value::Concrete(ConcreteValue::String(value.into()))
 }
 
+#[test]
+fn secret_predicate_display_shares_the_pinned_requirement_with_violations() {
+    let requirement = "must be a secret value (for example `secret(...)` or `decrypt(...)`)";
+    for (scope, scope_text) in [
+        (InputRuleScope::CreateOnly, "on create"),
+        (InputRuleScope::EveryWrite, "on every write"),
+    ] {
+        for (condition, suffix) in [
+            (InputCondition::Always, ""),
+            (
+                InputCondition::Present(path("guard")),
+                " when guard is present",
+            ),
+        ] {
+            let declaration = InputRule::value(
+                scope,
+                path("name"),
+                InputRuleCode::new("test.secret").unwrap(),
+                InputPredicate::Secret,
+            )
+            .with_condition(condition);
+            let expected = format!("value at name: {requirement}{suffix} ({scope_text})");
+            assert_eq!(InputRuleDisplay::new(&declaration).to_string(), expected);
+            let admitted = schema(declaration);
+            assert_eq!(
+                InputRuleDisplay::new(&admitted.as_schema().input_rules()[0]).to_string(),
+                expected
+            );
+            let violation = reject(&admitted, Some(string("DO-NOT-PRINT")));
+            assert_eq!(
+                violation.message().to_string(),
+                format!("{requirement}{suffix}")
+            );
+            assert!(!format!("{violation:?} {violation}").contains("DO-NOT-PRINT"));
+        }
+    }
+}
+
 struct Case {
     predicate: InputPredicate<PatternSpec>,
     requirement: &'static str,
