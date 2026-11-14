@@ -5541,7 +5541,7 @@ fn resource_values_report<
             )),
         ),
         crate::config_loader::DirectoryVerdict::ModuleTemplate(_)
-        | crate::config_loader::DirectoryVerdict::Unknown => {}
+        | crate::config_loader::DirectoryVerdict::Unknown(_) => {}
     }
 
     // Classify per kind via the typed `ResourceRef` arms instead of
@@ -7053,21 +7053,13 @@ fn is_string_compatible_type_on_path<'a>(
 pub fn validate_no_module_declarations_in_root<E>(
     parsed: &crate::parser::File<E>,
 ) -> Result<(), ConfigurationPlacementDiagnostic> {
-    for block in parsed
-        .parser_binding_metadata
-        .syntax()
-        .configuration_blocks()
+    match placement_diagnostics_for_inventory(parsed.parser_binding_metadata.syntax())
+        .into_iter()
+        .find(|finding| finding.detail().root_evidence().is_some())
     {
-        if let Some(root) = block.detail().directory_verdict().root()
-            && let Some(message) = root_declaration_message(block.detail().kind())
-        {
-            return Err(ConfigurationPlacementDiagnostic {
-                message,
-                root: Some(root.clone()),
-            });
-        }
+        Some(finding) => Err(finding.into_parts().1),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 fn unknown_type_resolution_error(
@@ -8033,7 +8025,12 @@ fn root_declaration_message(block: crate::parser::ConfigurationBlock) -> Option<
         ConfigurationBlock::Attributes => Some(
             "attributes blocks are only valid inside module definitions, not in root configurations.",
         ),
-        _ => None,
+        ConfigurationBlock::Require
+        | ConfigurationBlock::Provider
+        | ConfigurationBlock::State
+        | ConfigurationBlock::Backend
+        | ConfigurationBlock::UpstreamState
+        | ConfigurationBlock::Exports => None,
     }
 }
 
@@ -8041,13 +8038,20 @@ pub fn configuration_placement_diagnostics<
     P: crate::resource::PlaceholderKind,
     T: crate::resource::PlaceholderKind,
     B: BindingAddress,
+    E: crate::parser::ExportParamLike<P, B>,
     D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
 >(
-    tree: &crate::parser::AnalysisTree<'_, P, T, D, B>,
+    tree: &crate::parser::AnalysisTree<'_, P, T, D, B, E>,
+) -> Vec<crate::parser::Located<ConfigurationPlacementDiagnostic>> {
+    placement_diagnostics_for_inventory(tree.syntax())
+}
+
+fn placement_diagnostics_for_inventory<B: BindingAddress>(
+    syntax: &crate::parser::SyntaxInventory<B>,
 ) -> Vec<crate::parser::Located<ConfigurationPlacementDiagnostic>> {
     use crate::config_loader::DirectoryVerdict;
     use crate::parser::ConfigurationBlock;
-    tree.syntax().configuration_blocks().iter().filter_map(|block| {
+    syntax.configuration_blocks().iter().filter_map(|block| {
         let (message, root) = match block.detail().directory_verdict() {
             DirectoryVerdict::Root(root) => (root_declaration_message(block.detail().kind())?, Some(root.clone())),
             DirectoryVerdict::ModuleTemplate(_) => {
@@ -8060,7 +8064,7 @@ pub fn configuration_placement_diagnostics<
                 };
                 (message, None)
             }
-            DirectoryVerdict::Unknown | DirectoryVerdict::NoEvidence(_) => return None,
+            DirectoryVerdict::Unknown(_) | DirectoryVerdict::NoEvidence(_) => return None,
         };
         Some(crate::parser::Located::new(block.location().clone(), ConfigurationPlacementDiagnostic { message, root }))
     }).collect()
@@ -8080,8 +8084,14 @@ pub fn configuration_placement_diagnostics<
 pub fn validate_no_provider_in_module(
     module: &crate::module_resolver::LoadedModule,
 ) -> Result<(), String> {
-    let parsed = &module.parsed;
-    if !parsed.providers.is_empty() {
+    if module
+        .parsed
+        .parser_binding_metadata
+        .syntax()
+        .configuration_blocks()
+        .iter()
+        .any(|block| block.detail().kind() == crate::parser::ConfigurationBlock::Provider)
+    {
         return Err(
             "provider blocks are not allowed inside modules. Define providers at the root configuration level.".to_string(),
         );
@@ -8096,8 +8106,14 @@ pub fn validate_no_provider_in_module(
 pub fn validate_no_state_blocks_in_module(
     module: &crate::module_resolver::LoadedModule,
 ) -> Result<(), String> {
-    let parsed = &module.parsed;
-    if !parsed.state_blocks.is_empty() {
+    if module
+        .parsed
+        .parser_binding_metadata
+        .syntax()
+        .configuration_blocks()
+        .iter()
+        .any(|block| block.detail().kind() == crate::parser::ConfigurationBlock::State)
+    {
         return Err(
             "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.".to_string(),
         );
@@ -8112,8 +8128,14 @@ pub fn validate_no_state_blocks_in_module(
 pub fn validate_no_backend_in_module(
     module: &crate::module_resolver::LoadedModule,
 ) -> Result<(), String> {
-    let parsed = &module.parsed;
-    if parsed.backend.is_some() {
+    if module
+        .parsed
+        .parser_binding_metadata
+        .syntax()
+        .configuration_blocks()
+        .iter()
+        .any(|block| block.detail().kind() == crate::parser::ConfigurationBlock::Backend)
+    {
         return Err(
             "backend blocks are not allowed inside modules. Define the backend at the root configuration level.".to_string(),
         );
@@ -8128,8 +8150,14 @@ pub fn validate_no_backend_in_module(
 pub fn validate_no_upstream_states_in_module(
     module: &crate::module_resolver::LoadedModule,
 ) -> Result<(), String> {
-    let parsed = &module.parsed;
-    if !parsed.upstream_states.is_empty() {
+    if module
+        .parsed
+        .parser_binding_metadata
+        .syntax()
+        .configuration_blocks()
+        .iter()
+        .any(|block| block.detail().kind() == crate::parser::ConfigurationBlock::UpstreamState)
+    {
         return Err(
             "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.".to_string(),
         );
@@ -8144,8 +8172,14 @@ pub fn validate_no_upstream_states_in_module(
 pub fn validate_no_exports_in_module(
     module: &crate::module_resolver::LoadedModule,
 ) -> Result<(), String> {
-    let parsed = &module.parsed;
-    if !parsed.export_params.is_empty() {
+    if module
+        .parsed
+        .parser_binding_metadata
+        .syntax()
+        .configuration_blocks()
+        .iter()
+        .any(|block| block.detail().kind() == crate::parser::ConfigurationBlock::Exports)
+    {
         return Err(
             "exports blocks are not allowed inside modules. Define exports at the root configuration level.".to_string(),
         );

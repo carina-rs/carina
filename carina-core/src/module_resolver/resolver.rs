@@ -168,6 +168,10 @@ impl ResidualModuleResolutionError {
         self.0.display_relative_to(root)
     }
 
+    pub fn diagnostic_lines_relative_to(&self, root: &Path) -> Vec<super::error::DiagnosticLine> {
+        self.0.diagnostic_lines_relative_to(Some(root))
+    }
+
     pub fn lsp_message_relative_to(&self, root: &Path) -> String {
         self.0.lsp_message_relative_to(root)
     }
@@ -900,6 +904,12 @@ pub(super) struct RefCheckWitness(
     >,
 );
 
+#[derive(Clone, Copy)]
+enum ImportErrorReporting {
+    First,
+    All,
+}
+
 /// Compile-time policy for resolving type annotations in loaded modules.
 pub(crate) trait TypeResolutionPolicy {
     fn resolve_file_type_exprs<
@@ -1006,9 +1016,10 @@ pub(crate) struct ModuleResolver<'cfg, P = StrictTypeResolution> {
     pub(super) session: &'cfg dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     /// Schema authority used by the mandatory pre-expansion reference check.
     pub(super) schemas: &'cfg SchemaRegistry,
-    /// Present only for the editor-facing resolution entry point. Expansion
-    /// records into it at the same seam that evaluates fixed-point arguments.
+    /// Present for diagnostic resolution, including command validation.
+    /// Expansion records outcomes at the bound-argument evaluation seam.
     pub(super) constraint_reports: RefCell<Option<ModuleCallConstraintReports>>,
+    import_error_reporting: ImportErrorReporting,
     /// The type-resolution mode is selected by the resolver's type. This field
     /// is private so callers cannot construct a resolver with a new policy.
     type_resolution: PhantomData<P>,
@@ -1124,6 +1135,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             session,
             schemas,
             constraint_reports: RefCell::new(None),
+            import_error_reporting: ImportErrorReporting::First,
             type_resolution: PhantomData,
         }
     }
@@ -1309,7 +1321,10 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             self.schemas,
             &self.configuration_root,
         )
-        .map_err(super::loader::ModuleLoadError::into_first_error)?;
+        .map_err(|error| match self.import_error_reporting {
+            ImportErrorReporting::First => error.into_first_error(),
+            ImportErrorReporting::All => error.into_error(),
+        })?;
         let merged = &mut module.parsed;
 
         // Preserve authored value trees while this file is a reusable
@@ -2045,11 +2060,49 @@ pub fn resolve_modules_with_diagnostics_and_overrides<
     covered_findings: &[crate::validation::ModuleCallFinding],
     overrides: &crate::config_loader::SourceOverrides,
 ) -> ModuleResolutionDiagnosticResult<E::Absolute> {
+    resolve_modules_with_import_diagnostics(
+        parsed,
+        base_dir,
+        covered_findings,
+        overrides,
+        ImportErrorReporting::First,
+    )
+}
+
+/// Editor import diagnostics retain each prohibition and its own evidence.
+/// Command paths keep their established first import error behavior.
+pub fn resolve_modules_with_all_import_diagnostics_and_overrides<
+    E: ResolveExportBindingPhase<ParserPlaceholder> + Clone,
+>(
+    parsed: AdmittedRootDirectory<'_, E>,
+    base_dir: &ResolvedPath,
+    covered_findings: &[crate::validation::ModuleCallFinding],
+    overrides: &crate::config_loader::SourceOverrides,
+) -> ModuleResolutionDiagnosticResult<E::Absolute> {
+    resolve_modules_with_import_diagnostics(
+        parsed,
+        base_dir,
+        covered_findings,
+        overrides,
+        ImportErrorReporting::All,
+    )
+}
+
+fn resolve_modules_with_import_diagnostics<
+    E: ResolveExportBindingPhase<ParserPlaceholder> + Clone,
+>(
+    parsed: AdmittedRootDirectory<'_, E>,
+    base_dir: &ResolvedPath,
+    covered_findings: &[crate::validation::ModuleCallFinding],
+    overrides: &crate::config_loader::SourceOverrides,
+    import_error_reporting: ImportErrorReporting,
+) -> ModuleResolutionDiagnosticResult<E::Absolute> {
     let (parsed, resolution, config) = parsed.into_parts();
     let schemas = parsed.schemas();
     let mut resolver =
         ModuleResolver::with_constraint_reports(base_dir, config, schemas, resolution);
     resolver.source_overrides = overrides.clone();
+    resolver.import_error_reporting = import_error_reporting;
     resolve_modules_with_diagnostics_and_resolver(parsed, resolver, covered_findings)
 }
 
@@ -2114,6 +2167,7 @@ fn resolve_modules_with_diagnostics_and_resolver<
     let resolution_failed = !errors.is_empty();
     let errors = errors
         .into_iter()
+        .flat_map(ModuleError::into_root_evidence_errors)
         .filter_map(|error| ResidualModuleResolutionError::new(error, covered_findings))
         .collect::<Vec<_>>();
     if !findings.is_empty() {

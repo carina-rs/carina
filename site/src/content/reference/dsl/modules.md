@@ -28,9 +28,9 @@ a template when validated directly or opened in the language server.
 A directory is importable when it has at least one `.crn` file and no provider
 or backend block. Arguments and outputs are optional; entry counts do not
 change importability. Importing an existing directory with no `.crn` files
-reports `No .crn files found`. Imported modules cannot declare state blocks
-(`moved`, `import`, `removed`), `upstream_state`, or `exports`; those declarations
-do not supply root evidence.
+reports `No .crn files found`. Imported modules and directly validated module templates cannot declare state
+blocks (`moved`, `import`, `removed`), `upstream_state`, or `exports`. Empty
+blocks count too. These declarations do not supply root evidence.
 
 A directory with no provider/backend can be applied directly as a root and also
 imported by another root, which would manage its resources twice.
@@ -44,9 +44,8 @@ Each root-placement diagnostic carries the provider/backend evidence from the
 verdict. The CLI includes an indented note naming its file and line; the
 language server attaches that location as related information to the same
 diagnostic. The same evidence accompanies a prohibition when a root directory
-is imported. Direct entry of a directory with neither kind of evidence has no
-evidence location: its explanation states that there is no provider/backend
-block and no arguments/attributes block or require statement.
+is imported. A provider prohibition cites the provider block; a backend
+prohibition cites the backend block, including when both are present.
 
 ## Block Roles at a Glance
 

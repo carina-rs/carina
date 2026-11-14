@@ -1068,8 +1068,8 @@ fn validate_lint_plan_and_module_validation_reject_handle_exports() {
         let output = run(fixture.path(), &["validate", "."]);
         let text = output_text(&output);
         assert!(
-            !output.status.success() && text.contains(expected),
-            "standalone module validation must reject the handle export:\n{text}",
+            !output.status.success() && text.contains("exports blocks are not allowed inside modules. Define exports at the root configuration level."),
+            "standalone module validation must reject the exports block:\n{text}",
         );
     }
 }

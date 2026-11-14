@@ -122,17 +122,22 @@ fn deferred_alias_requirement_is_rejected_before_materialization() {
 fn read_gate_plan(bound: bool, generation: EffectGeneration) -> (Plan, ResolvedResourceId) {
     let parent = ResolvedResourceId::with_provider_identity("mock", "Parent", "parent", None);
     let lookup = ResolvedResourceId::with_provider_identity("mock", "Lookup", "lookup", None);
+    let fixture_source = "let upstream = upstream_state { source = '../upstream' }\nfor value in upstream.values { mock.Child {} }\n";
     let parsed = crate::parser::parse_file(
-        "let upstream = upstream_state { source = '../upstream' }\nfor value in upstream.values { mock.Child {} }\n",
+        fixture_source,
         std::path::Path::new("main.crn"),
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-    ).unwrap();
+    )
+    .unwrap();
     let parsed = crate::validation::deferred_types::with_session_for_test(
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(
-                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
-                    .admit(&crate::schema::SchemaRegistry::new(), session),
+                crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                    parsed,
+                    fixture_source,
+                )
+                .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
             )
             .map_err(Box::new)

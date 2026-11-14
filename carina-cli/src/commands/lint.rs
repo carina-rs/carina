@@ -310,8 +310,8 @@ fn lint_result(
         &carina_core::schema::SchemaRegistry::new(),
     );
     let mut module_boundary_findings = validate_no_provider_in_modules(&module_walk);
-    module_boundary_findings.extend(validate_no_state_blocks_in_modules(&module_walk));
     module_boundary_findings.extend(validate_no_backend_in_modules(&module_walk));
+    module_boundary_findings.extend(validate_no_state_blocks_in_modules(&module_walk));
     module_boundary_findings.extend(validate_no_upstream_states_in_modules(&module_walk));
     module_boundary_findings.extend(validate_no_exports_in_modules(&module_walk));
 
@@ -337,7 +337,9 @@ fn lint_result(
             if let Err(error) =
                 carina_core::validation::validate_no_module_declarations_in_root(parsed.parsed())
             {
-                type_findings.push(error.to_string());
+                type_findings.push(crate::error::lint_error_message(
+                    &AppError::RootDeclaration(Box::new(error)),
+                ));
             }
             if type_findings.is_empty()
                 && let Err(error) = carina_core::validation::validate_attribute_params_with_context(
@@ -424,7 +426,7 @@ fn lint_result(
                     // the finding itself retains the recursive module-path prefix.
                     file: base_dir.source_label(),
                     line: 1,
-                    message: finding.to_string(),
+                    message: crate::error::lint_error_message(&finding),
                 })
                 .collect();
             if let Some(boundary_errors) = export_handle_errors {

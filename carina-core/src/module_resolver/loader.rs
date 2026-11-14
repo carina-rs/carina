@@ -54,6 +54,13 @@ pub enum ModuleLoadError {
 }
 
 impl ModuleLoadError {
+    pub(crate) fn into_error(self) -> ModuleError {
+        match self {
+            Self::Unavailable(error) => error,
+            Self::NotModule { error, imports: _ } => *error,
+        }
+    }
+
     pub fn into_errors(self) -> Vec<ModuleError> {
         let error = match self {
             Self::Unavailable(error) => error,
@@ -166,14 +173,18 @@ pub(crate) fn load_imported_directory(
             })
         })?;
     if parsed_files.is_empty() {
+        let label = dir_path.source_label();
+        let display = ResolvedPath::new(display_root)
+            .ok()
+            .map(|base| crate::paths::DisplayPath::for_diagnostics_from(&label, &base))
+            .unwrap_or_else(|| crate::paths::DisplayPath::for_diagnostics(&label));
+        let display = if matches!(display.to_string().as_str(), "" | ".") {
+            crate::paths::DisplayPath::for_diagnostics(dir_path.persisted_path().to_path_buf())
+        } else {
+            display
+        };
         return Err(ModuleLoadError::rejected(
-            ModuleError::NoConfigurationFiles {
-                path: crate::paths::DisplayPath::for_diagnostics_from(
-                    dir_path.source_label(),
-                    &ResolvedPath::new(display_root)
-                        .map_err(|e| Unavailable(ModuleError::Io(e)))?,
-                ),
-            },
+            ModuleError::NoConfigurationFiles { path: display },
         ));
     }
     let duplicate_declarations =
@@ -201,7 +212,7 @@ pub(crate) fn load_imported_directory(
                         ModuleError::BackendInModule
                     }
                 }
-                .with_root_evidence(root.clone())
+                .with_root_evidence(root.evidence().clone())
             });
             return Err(ModuleLoadError::NotModule {
                 error: Box::new(error),
@@ -213,7 +224,7 @@ pub(crate) fn load_imported_directory(
         // preserving independent diagnostics from an otherwise importable body.
         crate::config_loader::DirectoryVerdict::ModuleTemplate(_)
         | crate::config_loader::DirectoryVerdict::NoEvidence(_) => {}
-        crate::config_loader::DirectoryVerdict::Unknown => {
+        crate::config_loader::DirectoryVerdict::Unknown(_) => {
             unreachable!("a successfully parsed complete directory has an issued verdict")
         }
     }
@@ -225,16 +236,18 @@ pub(crate) fn load_imported_directory(
 impl LoadedModule {
     pub(crate) fn placement_errors(&self) -> Vec<ModuleError> {
         let root = self.parsed.directory_verdict().root();
+        let provider = root
+            .and_then(|root| root.provider_evidence())
+            .map(|evidence| ModuleError::ProviderInModule.with_root_evidence(evidence.clone()));
+        let backend = root
+            .and_then(|root| root.backend_evidence())
+            .map(|evidence| ModuleError::BackendInModule.with_root_evidence(evidence.clone()));
         [
-            crate::validation::validate_no_provider_in_module(self)
-                .err()
-                .map(|_| ModuleError::ProviderInModule),
+            provider,
+            backend,
             crate::validation::validate_no_state_blocks_in_module(self)
                 .err()
                 .map(|_| ModuleError::StateBlockInModule),
-            crate::validation::validate_no_backend_in_module(self)
-                .err()
-                .map(|_| ModuleError::BackendInModule),
             crate::validation::validate_no_upstream_states_in_module(self)
                 .err()
                 .map(|_| ModuleError::UpstreamStateInModule),
@@ -244,12 +257,6 @@ impl LoadedModule {
         ]
         .into_iter()
         .flatten()
-        .map(|error| match (&error, root) {
-            (ModuleError::ProviderInModule | ModuleError::BackendInModule, Some(root)) => {
-                error.with_root_evidence(root.clone())
-            }
-            _ => error,
-        })
         .collect()
     }
 }
@@ -395,7 +402,7 @@ mod tests {
         )
         .unwrap();
 
-        let parsed = load_module_from_directory(
+        let parsed = load_module(
             &crate::paths::ResolvedPath::new(dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
@@ -404,6 +411,132 @@ mod tests {
         assert_eq!(parsed.arguments[0].name, "env");
         assert_eq!(parsed.export_params.len(), 1);
         assert_eq!(parsed.export_params[0].name, "region");
+    }
+
+    #[test]
+    fn imported_root_reports_backend_before_state_and_keeps_each_evidence() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("a-provider.crn"), "provider mock {}\n").unwrap();
+        fs::write(
+            tmp.path().join("b-backend.crn"),
+            "backend local { path = 'state.json' }\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("state.crn"),
+            "removed { from = mock.test.resource 'old' }\n",
+        )
+        .unwrap();
+        let error = load_module_with_diagnostics(
+            &ResolvedPath::new(tmp.path()).unwrap(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .err()
+        .expect("root is not importable");
+        let errors = error.into_errors();
+        assert!(matches!(
+            errors[0].root_cause(),
+            ModuleError::ProviderInModule
+        ));
+        assert!(matches!(
+            errors[1].root_cause(),
+            ModuleError::BackendInModule
+        ));
+        assert!(matches!(
+            errors[2].root_cause(),
+            ModuleError::StateBlockInModule
+        ));
+        assert!(
+            errors[0]
+                .root_evidence()
+                .unwrap()
+                .note()
+                .contains("a-provider.crn:1.")
+        );
+        assert!(
+            errors[1]
+                .root_evidence()
+                .unwrap()
+                .note()
+                .contains("b-backend.crn:1.")
+        );
+        assert_eq!(
+            errors[1].root_evidence().unwrap().related_message(),
+            "This backend block makes the directory a root configuration."
+        );
+        let combined = ModuleError::from_errors(errors).unwrap();
+        assert!(combined.root_evidence().is_some());
+        assert_eq!(
+            combined.lsp_message_relative_to(tmp.path()),
+            "provider blocks are not allowed inside modules. Define providers at the root configuration level.\nbackend blocks are not allowed inside modules. Define the backend at the root configuration level.\nstate blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level."
+        );
+        assert_eq!(
+            combined
+                .diagnostic_lines_relative_to(Some(tmp.path()))
+                .iter()
+                .filter(|line| matches!(line, super::super::error::DiagnosticLine::RootEvidence(_)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn imported_empty_exports_is_prohibited_by_block_presence() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("arguments.crn"), "arguments {}\n").unwrap();
+        fs::write(tmp.path().join("exports.crn"), "exports {}\n").unwrap();
+        let loaded = load_module_with_diagnostics(
+            &ResolvedPath::new(tmp.path()).unwrap(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let errors = loaded.placement_errors();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].to_string(),
+            "exports blocks are not allowed inside modules. Define exports at the root configuration level."
+        );
+    }
+
+    #[test]
+    fn empty_import_diagnostic_names_its_directory_without_display_root() {
+        let tmp = tempdir().unwrap();
+        let empty = tmp.path().join("empty-module");
+        fs::create_dir(&empty).unwrap();
+        let error = load_module_with_diagnostics(
+            &ResolvedPath::new(&empty).unwrap(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(error, ModuleLoadError::NotModule { .. }));
+        assert_eq!(
+            error.to_string(),
+            format!("No .crn files found in {}", empty.display())
+        );
+    }
+
+    #[test]
+    fn empty_import_stays_not_module_when_display_root_is_unavailable() {
+        let tmp = tempdir().unwrap();
+        let empty = tmp.path().join("empty-module");
+        fs::create_dir(&empty).unwrap();
+        let error = load_module_with_diagnostics_and_schemas(
+            &ResolvedPath::new(&empty).unwrap(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            &crate::schema::SchemaRegistry::new(),
+            std::path::Path::new(""),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(error, ModuleLoadError::NotModule { .. }),
+            "{error}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("No .crn files found in {}", empty.display())
+        );
     }
 
     /// Sibling `.crn` files must be merged in sorted filename order so that
@@ -589,14 +722,8 @@ mod importability_tests {
             let actual = match loaded.directory_verdict() {
                 DirectoryVerdict::Root(_) => "root",
                 DirectoryVerdict::ModuleTemplate(_) => "module",
-                DirectoryVerdict::NoEvidence(proof) => {
-                    assert_eq!(
-                        proof.root_note(),
-                        "directory is treated as a root configuration on direct entry because it has no `provider` or `backend` block and no `arguments` block, `attributes` block, or `require` statement."
-                    );
-                    "neutral"
-                }
-                DirectoryVerdict::Unknown => panic!("complete inventory must issue a verdict"),
+                DirectoryVerdict::NoEvidence(_) => "neutral",
+                DirectoryVerdict::Unknown(_) => panic!("complete inventory must issue a verdict"),
             };
             assert_eq!(actual, expected, "{evidence}");
         }

@@ -1910,82 +1910,116 @@ pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static))
     messages.join("\n")
 }
 
-/// Render only typed root-placement evidence as a continuation of its error.
-/// Other multiline diagnostics keep the existing per-line error rendering.
-pub(crate) fn root_placement_notes(error: &AppError) -> Vec<String> {
-    fn module_notes(error: &carina_core::module_resolver::ModuleError, notes: &mut Vec<String>) {
-        for finding in error.individual_errors() {
-            if let Some(evidence) = finding.error.root_evidence() {
-                notes.push(format!("Note: {}", evidence.note()));
-            }
-            if let Some(rejection) = finding.error.require_outside_module() {
-                notes.push(format!(
-                    "Note: {}",
-                    rejection.detail().root_evidence().note()
-                ));
-            }
-        }
+/// Evidence stays typed through human rendering. Ordinary multiline messages
+/// retain their existing per-line error prefixes; only RootEvidence is a note.
+pub use carina_core::module_resolver::DiagnosticLine as HumanErrorLine;
+
+fn prefix_first_message(lines: &mut [HumanErrorLine], prefix: &str) {
+    if let Some(HumanErrorLine::Message(message)) = lines.first_mut() {
+        message.insert_str(0, prefix);
     }
-    let mut notes = Vec::new();
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(current) = source {
-        if let Some(app) = current.downcast_ref::<AppError>() {
-            match app {
-                AppError::SavedPlanSecretVerification(failure) => {
-                    if let SavedPlanSecretVerificationError::EvaluationUnavailable {
-                        error, ..
-                    } = failure.as_ref()
-                    {
-                        notes.extend(root_placement_notes(error));
-                    }
-                }
-                AppError::LintModuleResolution { error, .. } => module_notes(error, &mut notes),
-                AppError::ModuleImport { error, .. } => module_notes(error, &mut notes),
-                AppError::RootPlacementGroup(group) => {
-                    for error in &group.errors {
-                        notes.extend(root_placement_notes(error));
-                    }
-                }
-                AppError::RootDeclaration(finding) => {
-                    if let Some(evidence) = finding.root_evidence() {
-                        notes.push(format!("Note: {}", evidence.note()));
-                    }
-                }
-                AppError::ExpressionType(finding) => {
-                    if let carina_core::static_type::InferenceError::RequireOutsideModule(
-                        rejection,
-                    ) = finding.detail()
-                    {
-                        notes.push(format!("Note: {}", rejection.root_evidence().note()));
-                    }
-                }
-                AppError::ModuleResolution(failure) => {
-                    for finding in failure.individual_errors() {
-                        module_notes(finding.error, &mut notes);
-                    }
-                }
-                AppError::UpstreamResolution(finding) => {
-                    if let Some((_, error)) = finding.detail().module_failure() {
-                        module_notes(error, &mut notes);
-                    }
-                }
-                _ => {}
-            }
-        }
-        if let Some(module) = current.downcast_ref::<carina_core::module_resolver::ModuleError>() {
-            module_notes(module, &mut notes);
-        }
-        source = current.source();
-    }
-    notes
 }
 
-pub fn human_error_lines(error: &AppError) -> Vec<(bool, String)> {
-    let notes = root_placement_notes(error);
-    format_error_with_source_chain(error)
-        .lines()
-        .map(|line| (notes.iter().any(|note| note == line), line.to_string()))
-        .collect()
+pub fn human_error_lines(error: &AppError) -> Vec<HumanErrorLine> {
+    let mut lines = match error {
+        AppError::RootPlacementGroup(group) => {
+            return group.errors.iter().flat_map(human_error_lines).collect();
+        }
+        AppError::RootDeclaration(finding) => {
+            let mut lines = vec![HumanErrorLine::Message(finding.lsp_message())];
+            if let Some(evidence) = finding.root_evidence() {
+                lines.push(HumanErrorLine::RootEvidence(evidence.clone()));
+            }
+            lines
+        }
+        AppError::ExpressionType(finding) => match finding.detail() {
+            carina_core::static_type::InferenceError::RequireOutsideModule(rejection) => vec![
+                HumanErrorLine::Message(format!(
+                    "{} at line {}\n{}",
+                    expression_source_label(finding),
+                    finding.location().span().start_line(),
+                    rejection.lsp_message()
+                )),
+                HumanErrorLine::RootEvidence(rejection.root_evidence().clone()),
+            ],
+            _ => vec![HumanErrorLine::Message(error.to_string())],
+        },
+        AppError::ModuleImport { path, error } => {
+            let mut lines = error.diagnostic_lines_relative_to(None);
+            prefix_first_message(&mut lines, &format!("{path}: "));
+            lines
+        }
+        AppError::LintModuleResolution { error, base } => {
+            let mut lines = error.diagnostic_lines_relative_to(Some(base));
+            prefix_first_message(&mut lines, "Module resolution error: ");
+            lines
+        }
+        AppError::ModuleResolution(failure) => {
+            let mut lines = failure
+                .error
+                .diagnostic_lines_relative_to(&failure.base.source_label());
+            if !failure.error.is_constraint() {
+                prefix_first_message(&mut lines, "Module resolution error: ");
+            }
+            lines
+        }
+        AppError::UpstreamResolution(finding) => {
+            let mut lines = finding.detail().diagnostic_lines();
+            if let Some(HumanErrorLine::Message(message)) = lines.first_mut() {
+                *message =
+                    carina_core::parser::Located::new(finding.location().clone(), message.as_str())
+                        .to_string();
+            }
+            lines
+        }
+        AppError::SavedPlanSecretVerification(failure) => match failure.as_ref() {
+            SavedPlanSecretVerificationError::EvaluationUnavailable { replan, error } => {
+                let mut lines = human_error_lines(error);
+                prefix_first_message(
+                    &mut lines,
+                    &format!(
+                        "Saved-plan secret verification failed because the current configuration could not be evaluated (for example, an environment variable or decryption key may be unavailable); re-run `{replan}` after restoring the required inputs: "
+                    ),
+                );
+                lines
+            }
+            _ => vec![HumanErrorLine::Message(error.to_string())],
+        },
+        _ => vec![HumanErrorLine::Message(error.to_string())],
+    };
+    // Keep source-chain and replan rendering identical for every other error.
+    if !lines
+        .iter()
+        .any(|line| matches!(line, HumanErrorLine::RootEvidence(_)))
+    {
+        return vec![HumanErrorLine::Message(format_error_with_source_chain(
+            error,
+        ))];
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        lines.push(HumanErrorLine::Message(cause.to_string()));
+        source = cause.source();
+    }
+    lines
+}
+
+pub(crate) fn has_root_placement_notes(error: &AppError) -> bool {
+    human_error_lines(error)
+        .iter()
+        .any(|line| matches!(line, HumanErrorLine::RootEvidence(_)))
+}
+
+/// Lint keeps its warning prefix while indenting typed evidence continuations.
+pub(crate) fn lint_error_message(error: &AppError) -> String {
+    human_error_lines(error)
+        .into_iter()
+        .map(|line| match line {
+            HumanErrorLine::Message(message) => message,
+            HumanErrorLine::RootEvidence(evidence) => format!("  Note: {}", evidence.note()),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl From<carina_core::resource::ResolvedResourceError> for AppError {

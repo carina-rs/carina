@@ -199,7 +199,7 @@ fn parser_placeholder_boundary(
         DirectoryVerdict::Root(_) | DirectoryVerdict::NoEvidence(_) => {
             ParserPlaceholderBoundary::ExpandedFile
         }
-        DirectoryVerdict::ModuleTemplate(_) | DirectoryVerdict::Unknown => {
+        DirectoryVerdict::ModuleTemplate(_) | DirectoryVerdict::Unknown(_) => {
             ParserPlaceholderBoundary::ModuleDefinition
         }
     }
@@ -211,13 +211,9 @@ fn attach_root_evidence(
     diagnostic: &mut Diagnostic,
     evidence: &carina_core::config_loader::RootEvidence,
 ) {
-    let (Some(location), Some((start, end))) = (evidence.location(), evidence.utf16_columns())
-    else {
-        return;
-    };
-    let Some(file) = evidence.file_locator() else {
-        return;
-    };
+    let location = evidence.location();
+    let (start, end) = evidence.utf16_columns();
+    let file = evidence.file_locator();
     let Ok(uri) = tower_lsp::lsp_types::Url::from_file_path(file.to_path_buf()) else {
         return;
     };
@@ -1769,7 +1765,7 @@ impl DiagnosticRun<'_> {
                             carina_core::config_loader::DirectoryVerdict::Root(_)
                             | carina_core::config_loader::DirectoryVerdict::NoEvidence(_) => {}
                             carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
-                            | carina_core::config_loader::DirectoryVerdict::Unknown => continue,
+                            | carina_core::config_loader::DirectoryVerdict::Unknown(_) => continue,
                         }
                         (
                             DiagnosticSeverity::ERROR,

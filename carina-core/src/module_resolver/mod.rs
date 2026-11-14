@@ -36,7 +36,7 @@ mod resolver;
 mod signature;
 mod validation;
 
-pub use error::{ModuleError, ModuleErrorCallSource, ModuleErrorDiagnostic};
+pub use error::{DiagnosticLine, ModuleError, ModuleErrorCallSource, ModuleErrorDiagnostic};
 pub use expander::{instance_prefix_for_call, reconcile_anonymous_module_instances};
 pub use loader::{
     LoadedModule, ModuleLoadError, derive_module_name, get_parsed_file, load_directory_module,
@@ -53,7 +53,8 @@ pub use resolver::{
     ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
     ResolvedModuleConstraintStatus, ensure_expanded_root_graph, prepare_root_export_validation,
     resolve_module_template_with_config, resolve_module_template_with_providerless_config,
-    resolve_modules_providerless, resolve_modules_with_config, resolve_modules_with_diagnostics,
+    resolve_modules_providerless, resolve_modules_with_all_import_diagnostics_and_overrides,
+    resolve_modules_with_config, resolve_modules_with_diagnostics,
     resolve_modules_with_diagnostics_and_overrides, resolve_modules_with_providerless_config,
     resolve_modules_with_providerless_diagnostics,
 };

@@ -375,19 +375,18 @@ impl CompletionProvider {
                     &self.schemas,
                 ),
         };
-        let directory = carina_core::config_loader::parse_directory_for_metadata(
+        match carina_core::module_resolver::load_module_with_diagnostics_and_schemas(
             &module_path,
             &provider_context,
-            &std::collections::HashMap::new(),
             &self.schemas,
-        )
-        .ok()?;
-        use carina_core::config_loader::DirectoryVerdict;
-        match directory.parsed().directory_verdict() {
-            DirectoryVerdict::Root(_) | DirectoryVerdict::Unknown => None,
-            DirectoryVerdict::ModuleTemplate(_) | DirectoryVerdict::NoEvidence(_) => {
-                Some(directory.into_parsed())
-            }
+            &module_path.source_label(),
+        ) {
+            Ok(module) => Some(module.parsed),
+            Err(carina_core::module_resolver::ModuleLoadError::Unavailable(_))
+            | Err(carina_core::module_resolver::ModuleLoadError::NotModule {
+                error: _,
+                imports: _,
+            }) => None,
         }
     }
 

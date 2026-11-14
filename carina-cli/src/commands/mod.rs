@@ -266,10 +266,7 @@ pub(crate) fn collapse_errors(errors: Vec<AppError>) -> AppError {
     if errors.len() == 1 {
         return errors.into_iter().next().unwrap();
     }
-    if errors
-        .iter()
-        .any(|error| !crate::error::root_placement_notes(error).is_empty())
-    {
+    if errors.iter().any(crate::error::has_root_placement_notes) {
         return AppError::RootPlacementGroup(Box::new(crate::error::RootPlacementErrors::new(
             errors,
         )));
@@ -503,10 +500,11 @@ fn extend_module_resolution_errors(
 }
 
 /// Backend checks depend on authored values, even when provider loading fails.
-pub(crate) fn validate_root_backend<E>(parsed: &carina_core::parser::File<E>) -> Vec<AppError> {
-    match parsed.directory_verdict() {
-        carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
-        | carina_core::config_loader::DirectoryVerdict::Unknown => return Vec::new(),
+pub(crate) fn validate_root_backend<E>(
+    parsed: &carina_core::config_loader::RootDirectoryParse<E>,
+) -> Vec<AppError> {
+    match parsed.complete_directory_verdict() {
+        carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_) => return Vec::new(),
         carina_core::config_loader::DirectoryVerdict::Root(_)
         | carina_core::config_loader::DirectoryVerdict::NoEvidence(_) => {}
     }
@@ -642,6 +640,7 @@ fn validate_and_resolve_configuration(
     authored_inputs: &mut carina_core::input_rules::AuthoredInputs,
     warnings: &mut Vec<ConfigurationWarning>,
 ) -> Result<ResolvedConfig, NonEmptyValidationErrors> {
+    let directory_verdict = parsed.complete_directory_verdict();
     let initial_warning_count = parsed.warnings.len();
     let resolved_base = base_dir.clone();
     let base_dir = &resolved_base;
@@ -702,16 +701,19 @@ fn validate_and_resolve_configuration(
         );
     }
 
-    if let Err(msg) =
-        carina_core::validation::validate_no_module_declarations_in_root(parsed.parsed())
-    {
-        errors.push(AppError::RootDeclaration(Box::new(msg)));
+    match carina_core::parser::AnalysisTree::try_from_file(parsed.parsed()) {
+        Ok(tree) => errors.extend(
+            carina_core::validation::configuration_placement_diagnostics(&tree)
+                .into_iter()
+                .map(|finding| AppError::RootDeclaration(Box::new(finding.into_parts().1))),
+        ),
+        Err(error) => errors.push(AppError::AnalysisInvariant(error)),
     }
 
     // Validate provider region
     errors.extend(validate_provider_region_with_ctx(ctx, parsed.parsed()));
 
-    errors.extend(validate_root_backend(parsed.parsed()));
+    errors.extend(validate_root_backend(&parsed));
 
     // The catalog retains the schemas available in `ctx`, including explicit
     // unavailable owners when provider loading is skipped.
@@ -855,8 +857,8 @@ fn validate_and_resolve_configuration(
     // backstops while still expanding modules.
     if !skip_resource_validation {
         errors.extend(validate_no_provider_in_modules(&module_walk));
-        errors.extend(validate_no_state_blocks_in_modules(&module_walk));
         errors.extend(validate_no_backend_in_modules(&module_walk));
+        errors.extend(validate_no_state_blocks_in_modules(&module_walk));
         errors.extend(validate_no_upstream_states_in_modules(&module_walk));
         errors.extend(validate_no_exports_in_modules(&module_walk));
     }
@@ -1062,13 +1064,12 @@ fn validate_and_resolve_configuration(
     // This is the sole parser-placeholder boundary. Standalone module
     // definitions intentionally retain typed module-argument slots until a
     // caller expands them; root configurations must be fully expanded.
-    let placeholder_boundary = match parsed.directory_verdict() {
+    let placeholder_boundary = match directory_verdict {
         carina_core::config_loader::DirectoryVerdict::Root(_)
         | carina_core::config_loader::DirectoryVerdict::NoEvidence(_) => {
             carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
         }
-        carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
-        | carina_core::config_loader::DirectoryVerdict::Unknown => {
+        carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_) => {
             carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
         }
     };

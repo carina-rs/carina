@@ -874,8 +874,10 @@ let observed_names = roles.names
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
             |session| {
                 carina_core::module_resolver::resolve_modules_providerless(
-                    carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
-                        .admit(&carina_core::schema::SchemaRegistry::new(), session),
+                    carina_core::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                        parsed, src,
+                    )
+                    .admit(&carina_core::schema::SchemaRegistry::new(), session),
                     &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                 )
                 .expect("cross the deferred-body resolution seam")

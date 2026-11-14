@@ -672,7 +672,9 @@ fn assert_root_declaration_rejected(block: &str, declaration: &str, same_file: b
     assert_eq!(String::from_utf8(lint.stdout).unwrap(), "");
     assert_eq!(
         String::from_utf8(lint.stderr).unwrap(),
-        format!("warning: .:1  {block_error}\n{evidence_note}\nError: Found 1 lint warning(s).\n")
+        format!(
+            "warning: .:1  {block_error}\n  {evidence_note}\nError: Found 1 lint warning(s).\n"
+        )
     );
 
     for command in [
@@ -1587,7 +1589,7 @@ fn imported_root_reports_only_its_provider_prohibition() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
-        format!("warning: .:1  checked: {message}\n{note}\nError: Found 1 lint warning(s).\n")
+        format!("warning: .:1  checked: {message}\n  {note}\nError: Found 1 lint warning(s).\n")
     );
     let output = directory.run(&["validate", "--json", "."]);
     assert_eq!(output.status.code(), Some(1));
@@ -1816,4 +1818,174 @@ fn no_evidence_directory_is_root_for_upstream_and_module_info() {
         "\u{1b}[1mFile:\u{1b}[0m \u{1b}[36mupstream\u{1b}[0m\n\n\u{1b}[1m=== IMPORTS ===\u{1b}[0m\n\n  \u{1b}[2m(none)\u{1b}[0m\n\n\u{1b}[1m=== CREATES ===\u{1b}[0m\n\n  \u{1b}[2m(none)\u{1b}[0m\n\n"
     );
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn direct_module_template_rejects_root_only_declarations() {
+    for evidence in ["arguments {}\n", "require true, 'x'\n"] {
+        for (file, declaration, message) in [
+            (
+                "exports.crn",
+                "exports { value: Int = 1 }\n",
+                "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
+            ),
+            (
+                "exports.crn",
+                "exports {}\n",
+                "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
+            ),
+            (
+                "state.crn",
+                "removed { from = mock.test.resource 'old' }\n",
+                "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
+            ),
+            (
+                "upstream.crn",
+                "let previous = upstream_state { source = '../upstream' }\n",
+                "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
+            ),
+        ] {
+            let directory = Directory::new("true");
+            fs::create_dir(directory.project.join("upstream")).unwrap();
+            fs::write(
+                directory.project.join("upstream/exports.crn"),
+                "exports { value: Int = 1 }\n",
+            )
+            .unwrap();
+            fs::write(directory.project.join("upstream/main.crn"), "// sibling\n").unwrap();
+            configure_importability_target(
+                &directory,
+                &[("declarations.crn", evidence), (file, declaration)],
+            );
+            let human = directory.run(&["validate", "checked"]);
+            assert_eq!(human.status.code(), Some(1), "{}", output_text(&human));
+            assert_eq!(String::from_utf8(human.stdout).unwrap(), "Validating...\n");
+            assert_eq!(
+                String::from_utf8(human.stderr).unwrap(),
+                format!("Error: {message}\n")
+            );
+            let output = directory.run(&["validate", "--json", "checked"]);
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stderr.is_empty());
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["errors"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                report["errors"],
+                json!([{ "message": message, "severity": "error", "code": null, "location": null }])
+            );
+        }
+    }
+}
+
+#[test]
+fn imported_backend_precedes_state_prohibition_on_validating_paths() {
+    let directory = Directory::new("true");
+    directory.clear_root_require();
+    success(&directory.run(&["apply", "--auto-approve", "."]));
+    let state = fs::read(directory.project.join("carina.state.json")).unwrap();
+    let provider_state = fs::read(directory.home.join("mock-state.json")).unwrap();
+    directory.write_root_require("true");
+    configure_importability_target(
+        &directory,
+        &[
+            ("backend.crn", "backend local { path = 'state.json' }\n"),
+            ("state.crn", "removed { from = mock.test.resource 'old' }\n"),
+        ],
+    );
+    let backend = "backend blocks are not allowed inside modules. Define the backend at the root configuration level.";
+    let note = "  Note: directory is a root configuration because of the backend block at checked/backend.crn:1.\n";
+    let state_message = "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.";
+    for args in [
+        &["validate", "."][..],
+        &["destroy", "--auto-approve", "."],
+        &["state", "refresh", "--lock=false", "."],
+    ] {
+        let output = directory.run(args);
+        assert_eq!(output.status.code(), Some(1), "{}", output_text(&output));
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            if args[0] == "validate" {
+                "Validating...\n"
+            } else {
+                ""
+            }
+        );
+        let tail = if args[0] == "validate" {
+            format!("Error: checked: {state_message}\n")
+        } else {
+            String::new()
+        };
+        let prefix = if args[0] == "validate" {
+            "checked: "
+        } else {
+            "Module resolution error: "
+        };
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!("Error: {prefix}{backend}\n{note}{tail}")
+        );
+        assert_eq!(
+            fs::read(directory.project.join("carina.state.json")).unwrap(),
+            state
+        );
+        assert_eq!(
+            fs::read(directory.home.join("mock-state.json")).unwrap(),
+            provider_state
+        );
+    }
+}
+
+#[test]
+fn imported_provider_and_backend_notes_name_their_own_files() {
+    let directory = Directory::new("true");
+    configure_importability_target(
+        &directory,
+        &[
+            ("a-provider.crn", "provider mock {}\n"),
+            ("b-backend.crn", "backend local {}\n"),
+        ],
+    );
+    let provider = "provider blocks are not allowed inside modules. Define providers at the root configuration level.";
+    let backend = "backend blocks are not allowed inside modules. Define the backend at the root configuration level.";
+    let provider_note = "Note: directory is a root configuration because of the provider block at checked/a-provider.crn:1.";
+    let backend_note = "Note: directory is a root configuration because of the backend block at checked/b-backend.crn:1.";
+    let human = directory.run(&["validate", "."]);
+    assert_eq!(human.status.code(), Some(1));
+    assert_eq!(String::from_utf8(human.stdout).unwrap(), "Validating...\n");
+    assert_eq!(
+        String::from_utf8(human.stderr).unwrap(),
+        format!(
+            "Error: checked: {provider}\n  {provider_note}\nError: checked: {backend}\n  {backend_note}\n"
+        )
+    );
+    let output = directory.run(&["validate", "--json", "."]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["errors"],
+        json!([
+            { "message": format!("checked: {provider}\n{provider_note}"), "severity": "error", "code": null, "location": null },
+            { "message": format!("checked: {backend}\n{backend_note}"), "severity": "error", "code": null, "location": null },
+        ])
+    );
+}
+
+#[test]
+fn imported_empty_exports_reports_the_exports_prohibition() {
+    let directory = Directory::new("true");
+    configure_importability_target(
+        &directory,
+        &[
+            ("main.crn", "// sibling\n"),
+            ("exports.crn", "exports {}\n"),
+        ],
+    );
+    let output = directory.run(&["validate", "."]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "Validating...\n");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "Error: checked: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n"
+    );
 }

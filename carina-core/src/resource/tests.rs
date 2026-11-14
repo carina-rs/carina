@@ -3251,9 +3251,10 @@ fn loop_scheduler_identity_uses_the_persisted_stable_hash_contract() {
 
 #[test]
 fn deserialized_unbound_loop_template_still_rejects_read_without_a_source_span() {
+    let fixture_source = "let upstream = upstream_state { source = '../upstream' }\n\
+         for value in upstream.values { mock.test.Leaf { value = value } }\n";
     let parsed = crate::parser::parse(
-        "let upstream = upstream_state { source = '../upstream' }\n\
-         for value in upstream.values { mock.test.Leaf { value = value } }\n",
+        fixture_source,
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("deferred loop parses");
@@ -3261,8 +3262,11 @@ fn deserialized_unbound_loop_template_still_rejects_read_without_a_source_span()
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(
-                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
-                    .admit(&crate::schema::SchemaRegistry::new(), session),
+                crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                    parsed,
+                    fixture_source,
+                )
+                .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
             )
             .expect("deferred fixture crosses the module-resolution seam")

@@ -708,3 +708,93 @@ fn no_evidence_upstream_directory_keeps_its_root_exports() {
     let diagnostics = test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
     assert!(diagnostics.is_empty(), "{diagnostics:#?}");
 }
+
+#[test]
+fn imported_provider_and_backend_each_keep_their_own_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("module");
+    std::fs::create_dir(&module).unwrap();
+    let provider = module.join("a-provider.crn");
+    let backend = module.join("b-backend.crn");
+    std::fs::write(&provider, "provider aws {}\n").unwrap();
+    std::fs::write(&backend, "backend local { path = 'state.json' }\n").unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider aws {}\n").unwrap();
+    let path = directory.path().join("main.crn");
+    let source = "let rejected = use { source = './module' }\nrejected {}\n";
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+        .collect();
+    assert_eq!(errors.len(), 2, "{diagnostics:#?}");
+    for (diagnostic, (message, file, kind, end)) in errors.iter().zip([
+        ("provider blocks are not allowed inside modules. Define providers at the root configuration level.", provider, "provider", 12),
+        ("backend blocks are not allowed inside modules. Define the backend at the root configuration level.", backend, "backend", 7),
+    ]) {
+        assert_eq!(diagnostic.message, message);
+        assert_eq!(diagnostic.range, Range::new(Position::new(1, 0), Position::new(1, 8)));
+        let related = diagnostic.related_information.as_ref().unwrap();
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].message, format!("This {kind} block makes the directory a root configuration."));
+        assert_eq!(related[0].location.uri, tower_lsp::lsp_types::Url::from_file_path(file).unwrap());
+        assert_eq!(related[0].location.range, Range::new(Position::new(0, 0), Position::new(0, end)));
+    }
+}
+
+#[test]
+fn direct_template_root_only_blocks_are_rejected_in_the_authored_sibling() {
+    for evidence in ["arguments {}\n", "require true, 'x'\n"] {
+        for (file, source, message, start, end) in [
+            (
+                "exports.crn",
+                "exports {}\n",
+                "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
+                0,
+                7,
+            ),
+            (
+                "exports.crn",
+                "exports { value: Int = 1 }\n",
+                "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
+                0,
+                7,
+            ),
+            (
+                "state.crn",
+                "removed { from = aws.s3.Bucket 'old' }\n",
+                "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
+                0,
+                7,
+            ),
+            (
+                "upstream.crn",
+                "let previous = upstream_state { source = './upstream' }\n",
+                "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
+                0,
+                3,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("declarations.crn"), evidence).unwrap();
+            std::fs::create_dir(directory.path().join("upstream")).unwrap();
+            std::fs::write(
+                directory.path().join("upstream/exports.crn"),
+                "exports { value: Int = 1 }\n",
+            )
+            .unwrap();
+            std::fs::write(directory.path().join("upstream/main.crn"), "// sibling\n").unwrap();
+            let path = directory.path().join(file);
+            std::fs::write(&path, source).unwrap();
+            let diagnostics =
+                test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+            assert_eq!(diagnostics[0].message, message);
+            assert_eq!(
+                diagnostics[0].range,
+                Range::new(Position::new(0, start), Position::new(0, end))
+            );
+            assert!(diagnostics[0].related_information.is_none());
+        }
+    }
+}

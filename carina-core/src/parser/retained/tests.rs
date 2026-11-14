@@ -124,7 +124,7 @@ fn unsaved_directory_cannot_inherit_disk_template_scope() {
 }
 
 #[test]
-fn test_utils_constructor_cannot_mint_directory_completeness() {
+fn standalone_buffer_cannot_mint_directory_completeness() {
     let directory = tempfile::tempdir().unwrap();
     let source = "require false, 'partial guard'\n";
     let guard = directory.path().join("guards.crn");
@@ -135,10 +135,8 @@ fn test_utils_constructor_cannot_mint_directory_completeness() {
     )
     .unwrap();
     let parsed = crate::parser::parse_file(source, &guard, &config()).unwrap();
-    let root = crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed);
     let schemas = SchemaRegistry::new();
-    let buffer =
-        crate::config_loader::load_buffer_configuration(root.parsed(), &schemas, &config());
+    let buffer = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config());
     assert!(matches!(
         require_scope(buffer.parsed()),
         RequireScope::Unknown
@@ -1319,6 +1317,6 @@ fn merging_another_directory_cannot_adopt_its_verdict() {
     assert!(matches!(require_scope(&target), RequireScope::Unknown));
     assert!(matches!(
         target.directory_verdict(),
-        crate::config_loader::DirectoryVerdict::Unknown
+        crate::config_loader::DirectoryVerdict::Unknown(())
     ));
 }

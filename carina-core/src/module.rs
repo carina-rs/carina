@@ -956,7 +956,7 @@ impl FileSignature {
             DirectoryVerdict::Root(_) | DirectoryVerdict::NoEvidence(_) => {
                 Self::RootConfig(RootConfigSignature::from_parsed_file(parsed, module_name))
             }
-            DirectoryVerdict::Unknown => {
+            DirectoryVerdict::Unknown(_) => {
                 Self::Unknown(RootConfigSignature::from_parsed_file(parsed, module_name))
             }
         }

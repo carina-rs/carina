@@ -1484,11 +1484,12 @@ mod tests {
     }
 
     fn unbound_deferred_template_in(file: &str) -> crate::parser::ExpandedDeferredForExpression {
-        let parsed = crate::parser::parse_file(
-            "let upstream = upstream_state { source = '../upstream' }\n\
+        let fixture_source = "let upstream = upstream_state { source = '../upstream' }\n\
              for value in upstream.accounts {\n\
                mock.test.Child { identity_input = value }\n\
-             }\n",
+             }\n";
+        let parsed = crate::parser::parse_file(
+            fixture_source,
             std::path::Path::new(file),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
@@ -1497,8 +1498,11 @@ mod tests {
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::module_resolver::resolve_modules_providerless(
-                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
-                        .admit(&crate::schema::SchemaRegistry::new(), session),
+                    crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                        parsed,
+                        fixture_source,
+                    )
+                    .admit(&crate::schema::SchemaRegistry::new(), session),
                     &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                 )
                 .map_err(Box::new)

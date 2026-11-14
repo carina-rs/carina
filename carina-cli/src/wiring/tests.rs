@@ -1801,8 +1801,10 @@ query {}
     let parsed =
         carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
             carina_core::module_resolver::resolve_modules_with_providerless_config(
-                carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
-                    .admit(&SchemaRegistry::new(), session),
+                carina_core::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                    parsed, &root_body,
+                )
+                .admit(&SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(&root_dir).unwrap(),
             )
             .expect("anonymous calls must expand")
@@ -1899,8 +1901,10 @@ outer {{}}
     let parsed =
         carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
             carina_core::module_resolver::resolve_modules_with_providerless_config(
-                carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
-                    .admit(&SchemaRegistry::new(), session),
+                carina_core::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                    parsed, &root_body,
+                )
+                .admit(&SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(&root_dir).unwrap(),
             )
             .expect("nested calls must expand")
@@ -1965,14 +1969,24 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
             ]),
         )
     };
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("providers.crn"), "provider zeta { source = 'file:///definitely-missing/zeta.wasm' }\nprovider alpha { source = 'file:///definitely-missing/alpha.wasm' }\n").unwrap();
+    std::fs::write(
+        fixture.path().join("arguments.crn"),
+        "arguments { unrelated: String }\n",
+    )
+    .unwrap();
     let invalid_config = || {
-        crate::test_support::inferred_fixture(
-            "provider zeta { source = 'file:///definitely-missing/zeta.wasm' }\nprovider alpha { source = 'file:///definitely-missing/alpha.wasm' }\narguments { unrelated: String }\n",
+        carina_core::config_loader::load_configuration(
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
+        .unwrap()
+        .parsed
     };
 
     let evaluated_error = match incomplete_load().validate_evaluated_config(
-        carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(invalid_config()),
+        invalid_config(),
         &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         true,
         &[],
@@ -1982,7 +1996,7 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
     };
     let unresolved = carina_core::parser::ParsedFile::default();
     let pair_error = match incomplete_load().validate_config_pair(
-        carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(invalid_config()),
+        invalid_config(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         true,
@@ -1992,7 +2006,10 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
         Err(error) => error,
     };
 
-    let expected = "alpha failed\nzeta failed";
+    let expected = format!(
+        "arguments blocks are only valid inside module definitions, not in root configurations.\nNote: directory is a root configuration because of the provider block at {}/providers.crn:1.\nalpha failed\nzeta failed",
+        fixture.path().display()
+    );
     assert_eq!(evaluated_error.to_string(), expected);
     assert_eq!(pair_error.to_string(), expected);
 }
@@ -2155,15 +2172,29 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
         std::slice::from_ref(&provider),
         HashMap::from([("broken".to_string(), "broken provider failed".to_string())]),
     );
-    let parsed = crate::test_support::inferred_fixture(
-        "provider broken { source = 'file:///definitely-missing/broken.wasm' }\narguments { unrelated: String }\n",
-    );
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(
+        fixture.path().join("providers.crn"),
+        "provider broken { source = 'file:///definitely-missing/broken.wasm' }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.path().join("arguments.crn"),
+        "arguments { unrelated: String }\n",
+    )
+    .unwrap();
+    let parsed = carina_core::config_loader::load_configuration(
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .unwrap()
+    .parsed;
 
     let unresolved = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
         carina_core::parser::ParsedFile::default(),
     );
     let error = match providers.validate_config_pair(
-        carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+        parsed,
         unresolved,
         &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         false,
@@ -2175,7 +2206,10 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
     let message = error.to_string();
 
     assert!(message.contains("broken provider failed"), "{message}");
-    assert_eq!(message, "broken provider failed");
+    assert!(
+        message.contains("arguments blocks are only valid inside module definitions"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -2652,7 +2686,12 @@ fn parse(
     input: &str,
     config: &carina_core::parser::ProviderContext,
 ) -> Result<carina_core::parser::ParsedFile, carina_core::parser::ParseError> {
-    carina_core::parser::parse_file(input, std::path::Path::new("wiring_test.crn"), config)
+    let parsed =
+        carina_core::parser::parse_file(input, std::path::Path::new("wiring_test.crn"), config)?;
+    Ok(
+        carina_core::config_loader::ParsedRootDirectory::from_parsed_source_for_test(parsed, input)
+            .into_parsed(),
+    )
 }
 
 fn pathless_test_type(
@@ -12579,8 +12618,10 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
             |session| {
                 carina_core::module_resolver::resolve_modules_providerless(
-                    carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
-                        .admit(&carina_core::schema::SchemaRegistry::new(), session),
+                    carina_core::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                        parsed, input,
+                    )
+                    .admit(&carina_core::schema::SchemaRegistry::new(), session),
                     &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                 )
                 .map_err(Box::<dyn std::error::Error>::from)

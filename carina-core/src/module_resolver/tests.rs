@@ -121,7 +121,7 @@ fn assert_empty_template(blocks: &str) {
         assert_eq!(
             matches!(
                 configuration.parsed().directory_verdict(),
-                crate::config_loader::DirectoryVerdict::Unknown
+                crate::config_loader::DirectoryVerdict::Unknown(())
             ),
             broken
         );
@@ -448,8 +448,10 @@ impl ModuleResolutionFixture {
             .expect("fixture caller parses");
         crate::validation::deferred_types::with_session_for_test(&config, |session| {
             resolve_upstream_modules_with_providerless_config(
-                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
-                    .admit(&crate::schema::SchemaRegistry::new(), session),
+                crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                    parsed, &caller,
+                )
+                .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(
                     caller_file.parent().expect("caller file has a directory"),
                 )
@@ -1422,7 +1424,10 @@ let forwarded = inner { flag = flag }
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("standalone outer module parses");
-    let parsed = crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed);
+    let parsed = crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+        parsed,
+        outer_source,
+    );
     let result = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
@@ -7428,7 +7433,7 @@ fn test_load_module_directory_merges_sibling_files_with_main() {
     )
     .unwrap();
 
-    let parsed = load_module_from_directory(
+    let parsed = load_module(
         &crate::paths::ResolvedPath::new(&tmp_dir).unwrap(),
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
@@ -9968,14 +9973,15 @@ let resources = for item in itmes {
 
 #[test]
 fn finalize_reports_every_undefined_iterable_for_managed_resource_bodies() {
-    let parsed = crate::parser::parse(
-        r#"let first = for item in frist_items {
+    let fixture_source = r#"let first = for item in frist_items {
   mock.test.resource { name = item }
 }
 let second = for item in secnd_items {
   mock.test.resource { name = item }
 }
-"#,
+"#;
+    let parsed = crate::parser::parse(
+        fixture_source,
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("both undefined iterables remain deferred until finalization");
@@ -9984,8 +9990,11 @@ let second = for item in secnd_items {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             super::resolve_modules_providerless(
-                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
-                    .admit(&crate::schema::SchemaRegistry::new(), session),
+                crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                    parsed,
+                    fixture_source,
+                )
+                .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
             )
             .expect_err("finalization must reject both undefined iterables")
@@ -10818,7 +10827,7 @@ fn directory_module_loader_preserves_parameter_diagnostic_sources() {
     .unwrap();
     std::fs::write(&exports_path, "exports {\n  result: String = 'value'\n}\n").unwrap();
 
-    let parsed = load_module_from_directory(
+    let parsed = load_directory_module(
         &crate::paths::ResolvedPath::new(temp.path()).unwrap(),
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
@@ -12120,7 +12129,7 @@ fn module_require_diagnostic_keeps_direct_constraint_type_and_message() {
 }
 
 #[test]
-fn expanded_unknown_directory_keeps_its_own_verdict() {
+fn expanded_complete_directory_keeps_its_own_verdict() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("child")).unwrap();
     fs::write(
@@ -12129,13 +12138,22 @@ fn expanded_unknown_directory_keeps_its_own_verdict() {
     )
     .unwrap();
     let context = LoadedProviderContext::empty_for_test();
-    let parsed = crate::parser::parse_file(
+    fs::write(
+        directory.path().join("main.crn"),
         "let child = use { source = './child' }\nlet result = child { n = 1 }\n",
+    )
+    .unwrap();
+    let fixture_source = "let child = use { source = './child' }\nlet result = child { n = 1 }\n";
+    let parsed = crate::parser::parse_file(
+        fixture_source,
         &directory.path().join("main.crn"),
         context.as_provider_context(),
     )
     .unwrap();
-    let root = crate::config_loader::RootDirectoryParse::from_parsed_for_test(parsed);
+    let root = crate::config_loader::RootDirectoryParse::from_parsed_source_for_test(
+        parsed,
+        fixture_source,
+    );
     let schemas = crate::schema::SchemaRegistry::new();
     crate::validation::deferred_types::with_session_for_test(&context, |session| {
         let expanded = super::resolve_modules_with_providerless_config(
@@ -12145,7 +12163,7 @@ fn expanded_unknown_directory_keeps_its_own_verdict() {
         .unwrap();
         assert!(matches!(
             expanded.directory_verdict(),
-            crate::config_loader::DirectoryVerdict::Unknown
+            crate::config_loader::DirectoryVerdict::NoEvidence(_)
         ));
     });
 }

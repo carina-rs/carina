@@ -353,7 +353,7 @@ fn module_body_slots_keep_per_instance_authored_roots() {
         ("exports.crn", "exports {}\n"),
         ("child/arguments.crn", "arguments { x: String }\n"),
         ("child/main.crn", "let body = mock.Sink { input = x }\n"),
-        ("child/exports.crn", "exports {}\n"),
+        ("child/exports.crn", "// no root exports in the module\n"),
     ] {
         std::fs::write(directory.path().join(file), source).unwrap();
     }

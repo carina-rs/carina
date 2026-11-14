@@ -819,11 +819,12 @@ fn render_app_error(
         _ => AppErrorRendering {
             stderr: error::human_error_lines(e)
                 .into_iter()
-                .map(|(note, line)| {
-                    if note {
-                        format!("  {line}\n")
-                    } else {
-                        format!("{} {line}\n", "Error:".red(color_mode).bold(color_mode))
+                .map(|line| match line {
+                    error::HumanErrorLine::RootEvidence(evidence) => {
+                        format!("  Note: {}\n", evidence.note())
+                    }
+                    error::HumanErrorLine::Message(message) => {
+                        format_error_lines(color_mode, &message)
                     }
                 })
                 .collect(),

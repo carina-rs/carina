@@ -1054,8 +1054,10 @@ fn format_effect_unbound_deferred_for_uses_the_source_identity() {
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
         |session| {
             carina_core::module_resolver::resolve_modules_providerless(
-                carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
-                    .admit(&carina_core::schema::SchemaRegistry::new(), session),
+                carina_core::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                    parsed, source,
+                )
+                .admit(&carina_core::schema::SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
             )
             .expect("root bindings resolve")

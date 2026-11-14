@@ -574,11 +574,16 @@ impl ValidateReport {
                     if matches!(error, AppError::Interrupted) {
                         continue;
                     }
-                    for (note, line) in crate::error::human_error_lines(error) {
-                        if note {
-                            writeln!(stderr, "  {line}")?;
-                        } else {
-                            writeln!(stderr, "{prefix} {line}")?;
+                    for line in crate::error::human_error_lines(error) {
+                        match line {
+                            crate::error::HumanErrorLine::RootEvidence(evidence) => {
+                                writeln!(stderr, "  Note: {}", evidence.note())?
+                            }
+                            crate::error::HumanErrorLine::Message(message) => {
+                                for line in message.lines() {
+                                    writeln!(stderr, "{prefix} {line}")?;
+                                }
+                            }
                         }
                     }
                 }

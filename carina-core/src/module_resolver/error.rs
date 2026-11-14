@@ -54,6 +54,26 @@ pub struct ModuleErrorDiagnostic<'a> {
     pub call_source: ModuleErrorCallSource<'a>,
 }
 
+/// Presentation preserves evidence as a typed continuation until the caller
+/// chooses a human note or editor related information.
+#[derive(Debug, Clone)]
+pub enum DiagnosticLine {
+    Message(String),
+    RootEvidence(crate::config_loader::RootEvidence),
+}
+
+fn require_outside_module_message(
+    finding: &crate::parser::Located<super::validation::RequireOutsideModuleDiagnostic>,
+    detail: impl std::fmt::Display,
+) -> String {
+    format!(
+        "{}:{}:{}: {detail}",
+        crate::paths::DisplayPath::for_diagnostics(finding.location().file().path()),
+        finding.location().span().start_line(),
+        finding.location().span().start_column()
+    )
+}
+
 /// Module resolution error
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleError {
@@ -85,10 +105,10 @@ pub enum ModuleError {
     },
 
     /// The prohibition and its directory evidence are one semantic diagnostic.
-    #[error("{error}\nNote: {}", root.evidence().note())]
+    #[error("{error}\nNote: {}", root.note())]
     WithRootEvidence {
         error: Box<ModuleError>,
-        root: crate::config_loader::RootDirectoryVerdict,
+        root: crate::config_loader::RootEvidence,
     },
 
     #[error("No .crn files found in {path}")]
@@ -210,7 +230,7 @@ pub enum ModuleError {
     #[error(transparent)]
     Constraint(Box<ModuleConstraintDiagnostic>),
 
-    #[error("{}:{}:{}: {}", crate::paths::DisplayPath::for_diagnostics(.0.location().file().path()), .0.location().span().start_line(), .0.location().span().start_column(), .0.detail())]
+    #[error("{}", require_outside_module_message(.0, .0.detail()))]
     RequireOutsideModule(
         Box<crate::parser::Located<super::validation::RequireOutsideModuleDiagnostic>>,
     ),
@@ -234,43 +254,268 @@ impl From<ParseError> for ModuleError {
 }
 
 impl ModuleError {
-    pub(crate) fn with_root_evidence(
-        self,
-        root: crate::config_loader::RootDirectoryVerdict,
-    ) -> Self {
+    pub(crate) fn with_root_evidence(self, root: crate::config_loader::RootEvidence) -> Self {
         Self::WithRootEvidence {
             error: Box::new(self),
             root,
         }
     }
 
+    /// Decompose only evidence-bearing import rejections. Other resolver
+    /// failures keep their established grouping and source rendering.
+    pub(crate) fn into_root_evidence_errors(self) -> Vec<Self> {
+        if self.root_evidence().is_none() {
+            return vec![self];
+        }
+        match self {
+            Self::Multiple(errors) => errors
+                .into_vec()
+                .into_iter()
+                .flat_map(Self::into_root_evidence_errors)
+                .collect(),
+            Self::OwnedByCalls { calls, error } => error
+                .into_root_evidence_errors()
+                .into_iter()
+                .map(|error| error.with_owning_calls(calls.clone()))
+                .collect(),
+            Self::AtCall { call, error } => error
+                .into_root_evidence_errors()
+                .into_iter()
+                .map(|error| error.with_failing_call(call.clone()))
+                .collect(),
+            // Every other variant is retained, including future diagnostic kinds.
+            error => vec![error],
+        }
+    }
+
     pub fn root_evidence(&self) -> Option<&crate::config_loader::RootEvidence> {
         match self {
-            Self::WithRootEvidence { root, .. } => Some(root.evidence()),
-            Self::OwnedByCalls { error, .. }
-            | Self::AtCall { error, .. }
-            | Self::WithProviderTypeWarnings { error, .. } => error.root_evidence(),
-            _ => None,
+            Self::WithRootEvidence { error: _, root } => Some(root),
+            Self::OwnedByCalls { calls: _, error }
+            | Self::AtCall { call: _, error }
+            | Self::WithProviderTypeWarnings { error, warnings: _ } => error.root_evidence(),
+            Self::Multiple(errors) => errors.iter().find_map(Self::root_evidence),
+            Self::AnalysisInvariant(_)
+            | Self::NoConfigurationFiles { path: _ }
+            | Self::NotFound(_)
+            | Self::CircularImport(_)
+            | Self::MissingArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::InvalidArgumentType {
+                module: _,
+                argument: _,
+                mismatch: _,
+            }
+            | Self::BareStructuralHandleArgument {
+                module: _,
+                argument: _,
+                source_path: _,
+                line: _,
+                message: _,
+            }
+            | Self::ArgumentValueAccess {
+                module: _,
+                source_path: _,
+                line: _,
+                diagnostic: _,
+            }
+            | Self::DroppedConditionalBinding {
+                binding: _,
+                condition: _,
+                source_path: _,
+                line: _,
+            }
+            | Self::UnexpandedModuleTemplate { context: _ }
+            | Self::ReferenceType(_)
+            | Self::Io(_)
+            | Self::Parse(_)
+            | Self::ParseInFile { path: _, error: _ }
+            | Self::TypeResolution(_)
+            | Self::UnknownArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::UnknownModule(_)
+            | Self::ProviderInModule
+            | Self::StateBlockInModule
+            | Self::BackendInModule
+            | Self::UpstreamStateInModule
+            | Self::ExportsInModule
+            | Self::Constraint(_)
+            | Self::RequireOutsideModule(_)
+            | Self::NotADirectory { path: _ } => None,
         }
     }
 
     pub fn lsp_message_relative_to(&self, root: &Path) -> String {
-        // Only the new evidence note moves into relatedInformation. Preserve
-        // every established non-root renderer, including deferred-body owners.
+        // Preserve established renderers for diagnostics without evidence,
+        // including deferred-body call-site ownership.
         if self.root_evidence().is_none() {
             return self.display_relative_to(root);
         }
         match self {
-            Self::WithRootEvidence { error, .. } => error.lsp_message_relative_to(root),
-            Self::OwnedByCalls { error, .. } | Self::AtCall { error, .. } => {
-                error.lsp_message_relative_to(root)
-            }
+            Self::WithRootEvidence { error, root: _ }
+            | Self::OwnedByCalls { calls: _, error }
+            | Self::AtCall { call: _, error } => error.lsp_message_relative_to(root),
+            Self::Multiple(errors) => errors
+                .iter()
+                .map(|error| error.lsp_message_relative_to(root))
+                .collect::<Vec<_>>()
+                .join("\n"),
             Self::WithProviderTypeWarnings { error, warnings } => format!(
                 "{}\n{}",
                 error.lsp_message_relative_to(root),
                 render_provider_type_warnings(warnings),
             ),
-            _ => self.display_relative_to(root),
+            Self::AnalysisInvariant(_)
+            | Self::NoConfigurationFiles { path: _ }
+            | Self::NotFound(_)
+            | Self::CircularImport(_)
+            | Self::MissingArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::InvalidArgumentType {
+                module: _,
+                argument: _,
+                mismatch: _,
+            }
+            | Self::BareStructuralHandleArgument {
+                module: _,
+                argument: _,
+                source_path: _,
+                line: _,
+                message: _,
+            }
+            | Self::ArgumentValueAccess {
+                module: _,
+                source_path: _,
+                line: _,
+                diagnostic: _,
+            }
+            | Self::DroppedConditionalBinding {
+                binding: _,
+                condition: _,
+                source_path: _,
+                line: _,
+            }
+            | Self::UnexpandedModuleTemplate { context: _ }
+            | Self::ReferenceType(_)
+            | Self::Io(_)
+            | Self::Parse(_)
+            | Self::ParseInFile { path: _, error: _ }
+            | Self::TypeResolution(_)
+            | Self::UnknownArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::UnknownModule(_)
+            | Self::ProviderInModule
+            | Self::StateBlockInModule
+            | Self::BackendInModule
+            | Self::UpstreamStateInModule
+            | Self::ExportsInModule
+            | Self::Constraint(_)
+            | Self::RequireOutsideModule(_)
+            | Self::NotADirectory { path: _ } => self.display_relative_to(root),
+        }
+    }
+
+    pub fn diagnostic_lines_relative_to(&self, root: Option<&Path>) -> Vec<DiagnosticLine> {
+        let plain = || {
+            DiagnosticLine::Message(
+                root.map_or_else(|| self.to_string(), |root| self.display_relative_to(root)),
+            )
+        };
+        if !self.individual_errors().iter().any(|finding| {
+            finding.error.root_evidence().is_some()
+                || finding.error.require_outside_module().is_some()
+        }) {
+            return vec![plain()];
+        }
+        match self {
+            Self::WithRootEvidence {
+                error,
+                root: evidence,
+            } => {
+                let mut lines = error.diagnostic_lines_relative_to(root);
+                lines.push(DiagnosticLine::RootEvidence(evidence.clone()));
+                lines
+            }
+            Self::RequireOutsideModule(finding) => {
+                let message =
+                    require_outside_module_message(finding, finding.detail().lsp_message());
+                vec![
+                    DiagnosticLine::Message(message),
+                    DiagnosticLine::RootEvidence(finding.detail().root_evidence().clone()),
+                ]
+            }
+            Self::Multiple(errors) => errors
+                .iter()
+                .flat_map(|error| error.diagnostic_lines_relative_to(root))
+                .collect(),
+            Self::OwnedByCalls { calls: _, error } | Self::AtCall { call: _, error } => {
+                error.diagnostic_lines_relative_to(root)
+            }
+            Self::WithProviderTypeWarnings { error, warnings } => {
+                let mut lines = error.diagnostic_lines_relative_to(root);
+                lines.push(DiagnosticLine::Message(render_provider_type_warnings(
+                    warnings,
+                )));
+                lines
+            }
+            Self::AnalysisInvariant(_)
+            | Self::NoConfigurationFiles { path: _ }
+            | Self::NotFound(_)
+            | Self::CircularImport(_)
+            | Self::MissingArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::InvalidArgumentType {
+                module: _,
+                argument: _,
+                mismatch: _,
+            }
+            | Self::BareStructuralHandleArgument {
+                module: _,
+                argument: _,
+                source_path: _,
+                line: _,
+                message: _,
+            }
+            | Self::ArgumentValueAccess {
+                module: _,
+                source_path: _,
+                line: _,
+                diagnostic: _,
+            }
+            | Self::DroppedConditionalBinding {
+                binding: _,
+                condition: _,
+                source_path: _,
+                line: _,
+            }
+            | Self::UnexpandedModuleTemplate { context: _ }
+            | Self::ReferenceType(_)
+            | Self::Io(_)
+            | Self::Parse(_)
+            | Self::ParseInFile { path: _, error: _ }
+            | Self::TypeResolution(_)
+            | Self::UnknownArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::UnknownModule(_)
+            | Self::ProviderInModule
+            | Self::StateBlockInModule
+            | Self::BackendInModule
+            | Self::UpstreamStateInModule
+            | Self::ExportsInModule
+            | Self::Constraint(_)
+            | Self::NotADirectory { path: _ } => vec![plain()],
         }
     }
 
@@ -537,7 +782,11 @@ impl ModuleError {
             Self::WithRootEvidence {
                 error,
                 root: evidence,
-            } => evidence.format_message(&error.display_relative_to(root)),
+            } => format!(
+                "{}\nNote: {}",
+                error.display_relative_to(root),
+                evidence.note()
+            ),
             Self::WithProviderTypeWarnings { error, warnings } => format!(
                 "{}\n{}",
                 error.display_relative_to(root),

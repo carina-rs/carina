@@ -4136,58 +4136,58 @@ fn imported_placement_fixture(parsed: ParsedFile) -> crate::module_resolver::Loa
     loaded
 }
 
+fn imported_root_block_error(
+    declarations: &str,
+    block_file: &str,
+    block: &str,
+) -> (String, std::path::PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("declarations.crn"), declarations).unwrap();
+    let evidence = directory.path().join(block_file);
+    std::fs::write(&evidence, block).unwrap();
+    let result = crate::module_resolver::load_module_with_diagnostics(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
+    (
+        result
+            .err()
+            .expect("root block must prohibit import")
+            .to_string(),
+        evidence,
+    )
+}
+
 #[test]
 fn provider_in_module_with_arguments_errors() {
-    let mut parsed = empty_parsed();
-    parsed.providers.push(crate::parser::ProviderConfig {
-        name: "awscc".to_string(),
-        attributes: Default::default(),
-        default_tags: Default::default(),
-        source: None,
-        version: None,
-        revision: None,
-        unresolved_attributes: Default::default(),
-        binding: None,
-    });
-    parsed.arguments.push(crate::parser::ArgumentParameter {
-        name: "vpc_cidr".to_string(),
-        static_type: local_type(TypeExpr::String),
-        default: None,
-        description: None,
-        validations: Vec::new(),
-    });
-
-    let result = validate_no_provider_in_module(&imported_placement_fixture(parsed));
-    assert!(result.is_err());
+    let (message, evidence) = imported_root_block_error(
+        "arguments { vpc_cidr: String }\n",
+        "providers.crn",
+        "provider awscc {}\n",
+    );
     assert_eq!(
-        result.unwrap_err(),
-        "provider blocks are not allowed inside modules. Define providers at the root configuration level."
+        message,
+        format!(
+            "provider blocks are not allowed inside modules. Define providers at the root configuration level.\nNote: directory is a root configuration because of the provider block at {}:1.",
+            evidence.display()
+        )
     );
 }
 
 #[test]
 fn provider_in_module_with_attributes_errors() {
-    let mut parsed = empty_parsed();
-    parsed.providers.push(crate::parser::ProviderConfig {
-        name: "awscc".to_string(),
-        attributes: Default::default(),
-        default_tags: Default::default(),
-        source: None,
-        version: None,
-        revision: None,
-        unresolved_attributes: Default::default(),
-        binding: None,
-    });
-    parsed
-        .attribute_params
-        .push(crate::parser::AttributeParameter::dummy(
-            "vpc_id".to_string(),
-            Some(TypeExpr::String),
-            Some(Value::Concrete(ConcreteValue::String("dummy".into()))),
-        ));
-
-    let result = validate_no_provider_in_module(&imported_placement_fixture(parsed));
-    assert!(result.is_err());
+    let (message, evidence) = imported_root_block_error(
+        "attributes { vpc_id: String = 'dummy' }\n",
+        "providers.crn",
+        "provider awscc {}\n",
+    );
+    assert_eq!(
+        message,
+        format!(
+            "provider blocks are not allowed inside modules. Define providers at the root configuration level.\nNote: directory is a root configuration because of the provider block at {}:1.",
+            evidence.display()
+        )
+    );
 }
 
 #[test]
@@ -4297,41 +4297,34 @@ fn module_without_state_blocks_ok() {
 
 #[test]
 fn backend_in_module_with_arguments_errors() {
-    let mut parsed = empty_parsed();
-    parsed.arguments.push(argument_param("name"));
-    parsed.backend = Some(crate::parser::BackendConfig {
-        backend_type: "local".to_string(),
-        attributes: Default::default(),
-        attribute_spans: Default::default(),
-    });
-
-    let result = validate_no_backend_in_module(&imported_placement_fixture(parsed));
-
+    let (message, evidence) = imported_root_block_error(
+        "arguments { name: String }\n",
+        "backend.crn",
+        "backend local {}\n",
+    );
     assert_eq!(
-        result.unwrap_err(),
-        "backend blocks are not allowed inside modules. Define the backend at the root configuration level."
+        message,
+        format!(
+            "backend blocks are not allowed inside modules. Define the backend at the root configuration level.\nNote: directory is a root configuration because of the backend block at {}:1.",
+            evidence.display()
+        )
     );
 }
 
 #[test]
 fn backend_in_module_with_attributes_errors() {
-    let mut parsed = empty_parsed();
-    parsed
-        .attribute_params
-        .push(crate::parser::AttributeParameter::dummy(
-            "resource_id".to_string(),
-            Some(TypeExpr::String),
-            Some(Value::Concrete(ConcreteValue::String("dummy".into()))),
-        ));
-    parsed.backend = Some(crate::parser::BackendConfig {
-        backend_type: "local".to_string(),
-        attributes: Default::default(),
-        attribute_spans: Default::default(),
-    });
-
-    let result = validate_no_backend_in_module(&imported_placement_fixture(parsed));
-
-    assert!(result.is_err());
+    let (message, evidence) = imported_root_block_error(
+        "attributes { resource_id: String = 'dummy' }\n",
+        "backend.crn",
+        "backend local {}\n",
+    );
+    assert_eq!(
+        message,
+        format!(
+            "backend blocks are not allowed inside modules. Define the backend at the root configuration level.\nNote: directory is a root configuration because of the backend block at {}:1.",
+            evidence.display()
+        )
+    );
 }
 
 #[test]
@@ -4465,13 +4458,7 @@ fn arguments_with_backend_errors() {
         format!(
             "arguments blocks are only valid inside module definitions, not in root configurations.\nNote: directory is a root configuration because of the backend block at {}:2.",
             crate::paths::DisplayPath::for_diagnostics(
-                error
-                    .root_evidence()
-                    .unwrap()
-                    .location()
-                    .unwrap()
-                    .file()
-                    .path()
+                error.root_evidence().unwrap().location().file().path()
             )
         )
     );
@@ -4486,13 +4473,7 @@ fn arguments_with_provider_errors() {
         format!(
             "arguments blocks are only valid inside module definitions, not in root configurations.\nNote: directory is a root configuration because of the provider block at {}:2.",
             crate::paths::DisplayPath::for_diagnostics(
-                error
-                    .root_evidence()
-                    .unwrap()
-                    .location()
-                    .unwrap()
-                    .file()
-                    .path()
+                error.root_evidence().unwrap().location().file().path()
             )
         )
     );
@@ -4514,13 +4495,7 @@ fn authored_arguments_in_root_are_rejected_regardless_of_entries() {
                         "backend"
                     },
                     crate::paths::DisplayPath::for_diagnostics(
-                        error
-                            .root_evidence()
-                            .unwrap()
-                            .location()
-                            .unwrap()
-                            .file()
-                            .path()
+                        error.root_evidence().unwrap().location().file().path()
                     )
                 ),
                 "{root}; {block}"
@@ -4533,7 +4508,9 @@ fn authored_arguments_in_root_are_rejected_regardless_of_entries() {
                     .unwrap()
                     .evidence()
                     .location()
-                    .is_some()
+                    .span()
+                    .start_line()
+                    > 0
             );
         }
     }

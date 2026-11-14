@@ -42,12 +42,19 @@ pub(crate) fn admit_fixture_plan<S: Clone>(
 /// Fixtures that cross analysis boundaries must originate in real syntax.
 #[cfg(test)]
 pub(crate) fn parsed_fixture(source: &str) -> carina_core::parser::ParsedFile {
-    carina_core::parser::parse_file(
+    let parsed = carina_core::parser::parse_file(
         source,
         std::path::Path::new("test.crn"),
         &carina_core::parser::ProviderContext::new(EnvironmentSnapshot::empty()),
     )
-    .expect("parse authored fixture")
+    .expect("parse authored fixture");
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("main.crn"), source).unwrap();
+    carina_core::config_loader::ParsedRootDirectory::from_parsed_in_directory_for_test(
+        parsed,
+        &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+    )
+    .into_parsed()
 }
 
 #[cfg(test)]

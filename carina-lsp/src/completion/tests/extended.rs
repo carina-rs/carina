@@ -5782,3 +5782,46 @@ fn bootstrap_module_argument_completion_ignores_unconsumed_lets() {
         test_provider().complete_for_test(&doc, Position::new(2, 2), Some(directory.path()));
     assert!(items.iter().any(|item| item.label == "name"), "{items:?}");
 }
+
+#[test]
+fn called_module_completion_uses_import_admission_for_empty_and_root_directories() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("module");
+    std::fs::create_dir(&module).unwrap();
+    let text = "let service = use { source = './module' }\nservice {}\n";
+    let provider = test_provider();
+    let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let base = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
+    assert_eq!(
+        provider
+            .find_module_import_path("service", text, Some(&base))
+            .as_deref(),
+        Some("./module")
+    );
+    assert!(
+        carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+            provider
+                .load_called_module("service", text, Some(&base), session)
+                .is_none()
+        }),
+        "empty directories are not importable"
+    );
+    std::fs::write(module.join("arguments.crn"), "arguments { name: String }\n").unwrap();
+    assert!(
+        carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+            provider
+                .load_called_module("service", text, Some(&base), session)
+                .is_some()
+        }),
+        "valid templates remain available"
+    );
+    std::fs::write(module.join("providers.crn"), "provider mock {}\n").unwrap();
+    assert!(
+        carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+            provider
+                .load_called_module("service", text, Some(&base), session)
+                .is_none()
+        }),
+        "root directories are not importable"
+    );
+}

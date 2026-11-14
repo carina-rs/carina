@@ -588,6 +588,26 @@ impl UpstreamResolveFailure {
             _ => None,
         }
     }
+    pub fn diagnostic_lines(&self) -> Vec<crate::module_resolver::DiagnosticLine> {
+        use crate::module_resolver::DiagnosticLine;
+        match &self.cause {
+            UpstreamResolveCause::Module { base: _, error } => {
+                let mut lines = error.diagnostic_lines_relative_to(None);
+                if let Some(DiagnosticLine::Message(message)) = lines.first_mut() {
+                    *message =
+                        std::fmt::from_fn(|formatter| self.legacy.fmt_reason(formatter, message))
+                            .to_string();
+                }
+                lines
+            }
+            UpstreamResolveCause::Message
+            | UpstreamResolveCause::Parse(_)
+            | UpstreamResolveCause::Boundaries(_) => {
+                vec![DiagnosticLine::Message(self.to_string())]
+            }
+        }
+    }
+
     /// Editor projection keeps located root evidence in related information.
     pub fn lsp_message(&self) -> String {
         if let Some((_, error)) = self.module_failure()

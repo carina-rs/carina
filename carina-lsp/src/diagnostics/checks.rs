@@ -673,7 +673,7 @@ impl DiagnosticRun<'_> {
             carina_core::config_loader::DirectoryVerdict::Root(_)
             | carina_core::config_loader::DirectoryVerdict::NoEvidence(_) => {}
             carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
-            | carina_core::config_loader::DirectoryVerdict::Unknown => return Vec::new(),
+            | carina_core::config_loader::DirectoryVerdict::Unknown(_) => return Vec::new(),
         }
         // A duplicate backend has no single semantic owner. The parser
         // inventory still supplies every declaration for placement checks.
@@ -906,7 +906,7 @@ impl DiagnosticRun<'_> {
         // Failures retain the authored parse for source-level checks; only the
         // successful outcome can replace it with the expanded graph.
         let module_resolution =
-            carina_core::module_resolver::resolve_modules_with_diagnostics_and_overrides(
+            carina_core::module_resolver::resolve_modules_with_all_import_diagnostics_and_overrides(
                 result
                     .directory
                     .parsed
@@ -1095,7 +1095,7 @@ impl DiagnosticRun<'_> {
             )
             .ok()?;
         let module_resolution =
-            carina_core::module_resolver::resolve_modules_with_diagnostics_and_overrides(
+            carina_core::module_resolver::resolve_modules_with_all_import_diagnostics_and_overrides(
                 merged.clone().admit(&self.schemas, self.provider_context),
                 base_path,
                 &[],
