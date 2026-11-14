@@ -1985,7 +1985,7 @@ async fn saved_configuration_decode_failure_returns_command_error_without_panick
     let runtime = crate::test_support::TestCommandRuntime::new();
     let temp = tempfile::tempdir().unwrap();
     let mut document: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/module_binding_wire_compat/carina.v45.plan.json"
+        "../../../tests/fixtures/module_binding_wire_compat/carina.v46.plan.json"
     ))
     .unwrap();
     document["sorted_resources"] = serde_json::json!("invalid saved configuration");
@@ -10798,7 +10798,7 @@ mod saved_plan_version_tests {
                 &error,
                 crate::error::AppError::UnsupportedPlanVersion {
                     found: 40,
-                    expected: 45,
+                    expected: 46,
                     ..
                 }
             ),
@@ -10856,7 +10856,7 @@ mod saved_plan_version_tests {
 
     #[test]
     fn replacement_admission_requests_require_current_plan_format() {
-        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 45);
+        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 46);
     }
 
     #[tokio::test]
@@ -10905,6 +10905,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn format_38_saved_plan_is_rejected_before_source_identity_decode() {
+        let current_version = crate::commands::plan::PlanFile::CURRENT_VERSION;
         let (_dir, plan_path, mut json) = replacement_plan_json();
         json["version"] = serde_json::json!(38);
         json.as_object_mut().unwrap().remove("source_identity");
@@ -10912,7 +10913,9 @@ mod saved_plan_version_tests {
             rejected_saved_plan_message(&plan_path, &json, "format 38 must require replanning")
                 .await;
         assert!(
-            message.contains("Unsupported plan file version: 38 (expected 45)"),
+            message.contains(&format!(
+                "Unsupported plan file version: 38 (expected {current_version})"
+            )),
             "{message}"
         );
         assert!(!message.contains("corrupted"), "{message}");
@@ -11028,7 +11031,39 @@ mod saved_plan_version_tests {
                 error,
                 crate::error::AppError::UnsupportedPlanVersion {
                     found: 43,
-                    expected: 45,
+                    expected: 46,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_4418_format_45_fails_gate_before_dependent_payload_decode() {
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let dir = TempDir::new().unwrap();
+        let plan_path = dir.path().join("format-45.json");
+        std::fs::write(&plan_path, br#"{"version":45,"timestamp":"2026-11-14T00:00:00Z","source_path":"infra","plan":{"effects":"invalid old dependent payload"}}"#).unwrap();
+        let error = crate::commands::apply::run_apply_from_plan(
+            &runtime,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(1).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::error::AppError::UnsupportedPlanVersion {
+                    found: 45,
+                    expected: 46,
                     ..
                 }
             ),
@@ -11042,12 +11077,12 @@ mod saved_plan_version_tests {
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            45,
-            "carina#4386 requires format 45 for checked validation strings",
+            46,
+            "carina#4418 requires format 46 for ordered non-empty dependent sets",
         );
-        let previous = 44;
+        let previous = 45;
 
-        for older_version in [previous, 43, 42, 41, 40, 39, 38, 37, 36, 35, 34, 33, 32] {
+        for older_version in [previous, 44, 43, 42, 41, 40, 39, 38, 37, 36, 35, 34, 33, 32] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,

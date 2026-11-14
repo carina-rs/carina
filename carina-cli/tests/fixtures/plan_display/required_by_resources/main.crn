@@ -1,0 +1,10 @@
+provider aws {}
+
+let cert = aws.acm.Certificate { domain_name = 'new.example.com' }
+let zeta = aws.acm.CertificateValidation { certificate_arn = cert.arn }
+let alpha = aws.acm.CertificateValidation { certificate_arn = cert.arn }
+
+exports {
+  alpha_certificate_arn = alpha.certificate_arn
+  zeta_certificate_arn  = zeta.certificate_arn
+}

@@ -130,6 +130,10 @@ plan-postfix-access:
 	$(PLAN_FIXTURE) postfix_access
 plan-resolved-value-constraint-multifile:
 	$(PLAN_FIXTURE) resolved_value_constraint_multifile
+plan-required-by-resources:
+	$(PLAN_FIXTURE) required_by_resources
+plan-required-by-deferred:
+	$(PLAN_FIXTURE) required_by_deferred
 plan-wait-cert:
 	$(PLAN_FIXTURE) wait_cert
 plan-secret-values:
@@ -453,6 +457,7 @@ plan-multi-instance-module:
         plan-list-diff-modified-with-unchanged-nested \
         plan-enum-display plan-string-dot-suffix plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
         plan-default-values plan-explicit plan-default-tags plan-default-tags-update-replace plan-postfix-access \
+        plan-required-by-resources plan-required-by-deferred \
         plan-state-blocks plan-removed-missing-identifier plan-secret-values plan-nested-write-only plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
         plan-moved-let-to-for-bound plan-moved-let-to-for-unbound \
         plan-moved-let-to-for-map plan-moved-let-to-for-unbound-reference \

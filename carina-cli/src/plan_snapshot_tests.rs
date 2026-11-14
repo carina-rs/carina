@@ -3698,3 +3698,35 @@ fn round2_saved_plan_matches_existing_nested_and_tags_snapshots() {
         );
     }
 }
+
+#[test]
+fn issue_4418_plan_snapshot_required_by_resources() {
+    issue_4418_error_snapshot("required_by_resources");
+}
+
+#[test]
+fn issue_4418_plan_snapshot_required_by_deferred() {
+    issue_4418_error_snapshot("required_by_deferred");
+}
+
+fn issue_4418_error_snapshot(fixture: &str) {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let fp = build_plan_from_fixture_name(&runtime, fixture).unwrap();
+    let output = fp
+        .plan
+        .errors()
+        .iter()
+        .map(|error| {
+            error
+                .display_with_project_dir(std::path::Path::new("."))
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !output.is_empty(),
+        "fixture must reject create-first admission"
+    );
+    println!("{fixture}: {output}");
+    insta::assert_snapshot!(fixture, output);
+}

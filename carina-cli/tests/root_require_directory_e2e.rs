@@ -532,6 +532,8 @@ fn root_require_false_live_apply_preserves_state() {
 
 #[test]
 fn root_require_true_paths_and_saved_plan_contract() {
+    let current_version = carina_cli::commands::plan::PlanFile::CURRENT_VERSION;
+    let previous_version = current_version - 1;
     let directory = Directory::new("false");
     rejected(
         &directory.run(&["plan", "--out", "saved.plan", "."]),
@@ -549,12 +551,12 @@ fn root_require_true_paths_and_saved_plan_contract() {
     }
     let plan_path = directory.project.join("saved.plan");
     let plan: Value = serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
-    assert_eq!(plan["version"], 45);
+    assert_eq!(plan["version"], current_version);
     assert!(!plan.to_string().contains("root guard"));
     // This secret-free plan reloads backend syntax without rechecking guards.
     directory.guard("false");
     let mut old = plan.clone();
-    old["version"] = json!(44);
+    old["version"] = json!(previous_version);
     fs::write(
         directory.project.join("old.plan"),
         serde_json::to_vec(&old).unwrap(),
@@ -562,7 +564,7 @@ fn root_require_true_paths_and_saved_plan_contract() {
     .unwrap();
     rejected(
         &directory.run(&["apply", "--auto-approve", "old.plan"]),
-        "Unsupported plan file version: 44 (expected 45)",
+        &format!("Unsupported plan file version: {previous_version} (expected {current_version})"),
     );
     assert!(!directory.project.join("carina.state.json").exists());
     success(&directory.run(&["apply", "--auto-approve", "saved.plan"]));
