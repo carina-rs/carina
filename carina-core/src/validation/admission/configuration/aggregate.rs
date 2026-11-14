@@ -55,6 +55,9 @@ impl AdmittedConfiguration<kind::BackendAttribute> {
     pub fn backend_kind(&self) -> backend::BackendKind {
         self.instance
     }
+    pub fn backend_settings(&self) -> &backend::BackendSettings {
+        &self.payload.settings
+    }
 }
 
 pub(super) struct ConfigurationBuilder<K: ConfigurationKind> {
@@ -116,8 +119,14 @@ impl ConfigurationBuilder<kind::ProviderConfigAttribute> {
 }
 
 impl ConfigurationBuilder<kind::BackendAttribute> {
-    pub(super) fn admit_payload(self) -> AdmittedConfiguration<kind::BackendAttribute> {
-        let payload = self.values();
+    pub(super) fn admit_payload(
+        self,
+        settings: backend::BackendSettings,
+    ) -> AdmittedConfiguration<kind::BackendAttribute> {
+        let payload = backend::BackendPayload {
+            attributes: self.values(),
+            settings,
+        };
         self.finish(payload)
     }
 }

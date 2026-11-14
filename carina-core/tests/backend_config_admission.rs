@@ -213,3 +213,51 @@ fn github_admission_rejects_missing_invalid_secret_and_unresolved_fields() {
         assert!(!format!("{error:?} {error}").contains("never-print-token"));
     }
 }
+
+#[test]
+fn github_round1_admission_carries_typed_settings_from_declared_fields() {
+    use backend::BackendSettings;
+    let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let admitted = directory(
+        "backend github { repository = state_repo branch = state_branch path = state_path }",
+        "let state_repo = 'owner/repo'\nlet state_branch = 'states/prod'\nlet state_path = 'states/prod.json'",
+        &context,
+    ).unwrap();
+    let BackendSettings::GitHub(settings) = admitted.backend_settings() else {
+        panic!("typed GitHub settings")
+    };
+    assert_eq!(settings.repository().as_str(), "owner/repo");
+    assert_eq!(settings.branch().as_str(), "states/prod");
+    assert_eq!(settings.path().as_str(), "states/prod.json");
+    assert_eq!(
+        settings.path().lock_path().as_str(),
+        "states/prod.json.lock"
+    );
+    assert!(matches!(
+        directory("backend local {}", "", &context)
+            .unwrap()
+            .backend_settings(),
+        BackendSettings::Local
+    ));
+    assert!(matches!(
+        directory("backend s3 { bucket = 'b' key = 'k' }", "", &context)
+            .unwrap()
+            .backend_settings(),
+        BackendSettings::S3
+    ));
+}
+
+#[test]
+fn github_round1_state_paths_reject_lease_paths_and_mint_a_distinct_lease_type() {
+    use backend::{GitHubDestinationError, LeasePath, StatePath};
+    let path = StatePath::parse("states/prod.json").unwrap();
+    let lease: LeasePath = path.lock_path();
+    assert_eq!(lease.as_str(), "states/prod.json.lock");
+    assert_eq!(
+        StatePath::parse(lease.as_str()),
+        Err(GitHubDestinationError::LockPath)
+    );
+    for invalid in ["", "/state.json", "a//b", "a/../b", "./state.json"] {
+        assert!(StatePath::parse(invalid).is_err(), "{invalid}");
+    }
+}

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -26,8 +26,13 @@ struct Store {
     replace: Option<Vec<u8>>,
     loser: u16,
     response: Option<GitHubResponse>,
+    responses: VecDeque<GitHubResponse>,
     malformed_success: bool,
     two_winners: bool,
+    corrupt_inline: bool,
+    after_success: Option<Vec<u8>>,
+    after_success_pending: Option<(String, Vec<u8>)>,
+    remove_before_mutation: bool,
     directory: bool,
     delay: Option<Duration>,
 }
@@ -185,6 +190,17 @@ impl GitHubTransport for Fake {
         let (head, delay) = {
             let mut store = self.0.lock().unwrap();
             store.requests.push(request.clone());
+            if request.method == Method::Get
+                && let Some((path, bytes)) = store.after_success_pending.take()
+            {
+                // Our 2xx has returned to the client. Publish the rival's
+                // next revision immediately before serving its read-back.
+                store.files.insert(path, bytes);
+                store.commit();
+            }
+            if let Some(response) = store.responses.pop_front() {
+                return Ok(response);
+            }
             if let Some(response) = store.response.take() {
                 return Ok(response);
             }
@@ -245,19 +261,30 @@ impl GitHubTransport for Fake {
             }
             assert_eq!(request.accept, JSON_MEDIA_TYPE);
             let content = if bytes.len() <= 1_000_000 {
-                STANDARD.encode(bytes)
+                let inline = if store.corrupt_inline {
+                    vec![b'!'; bytes.len()]
+                } else {
+                    bytes.clone()
+                };
+                format!("{}\n", STANDARD.encode(inline))
             } else {
                 String::new()
             };
             return Ok(reply(
                 200,
-                json!({"type": if store.directory {"dir"} else {"file"}, "sha":blob(bytes), "size":bytes.len(), "content":content}),
+                json!({"type": if store.directory {"dir"} else {"file"}, "sha":blob(bytes), "size":bytes.len(), "encoding":if bytes.len() <= 1_000_000 {"base64"} else {"none"}, "content":content}),
             ));
         }
         let body = request.body.as_ref().expect("mutation body");
         assert_eq!(body["branch"], "states/prod");
         assert!(body.get("committer").is_none());
         assert!(body["message"].as_str().unwrap().starts_with("carina: "));
+        if store.remove_before_mutation {
+            store.remove_before_mutation = false;
+            store.files.remove(&path);
+            store.commit();
+            return Ok(conflict(store.loser, "does not match"));
+        }
         if store.contention > 0 {
             store.contention -= 1;
             store.commit();
@@ -289,10 +316,14 @@ impl GitHubTransport for Fake {
             store.files.remove(&path);
             Value::Null
         };
-        let commit = store.commit();
         if store.two_winners {
-            store.files.insert(path, b"another writer".to_vec());
-            store.commit();
+            // A broken acknowledgement: our returned commit itself contains
+            // different bytes, rather than a legitimate later publication.
+            store.files.insert(path.clone(), b"another writer".to_vec());
+        }
+        let commit = store.commit();
+        if let Some(bytes) = store.after_success.take() {
+            store.after_success_pending = Some((path, bytes));
         }
         if store.malformed_success {
             return Ok(reply(200, json!({})));
@@ -801,7 +832,7 @@ async fn github_different_state_paths_share_branch_contention_but_not_lease_owne
 }
 
 #[tokio::test]
-async fn github_cleanup_renews_before_saving_and_releases_within_the_existing_deadline() {
+async fn github_cleanup_checks_lease_before_saving_and_releases_within_the_existing_deadline() {
     let fake = Fake::default();
     let lock = LockInfo::new("apply");
     fake.put("state.json.lock", serde_json::to_vec(&lock).unwrap());
@@ -817,10 +848,9 @@ async fn github_cleanup_renews_before_saving_and_releases_within_the_existing_de
         .iter()
         .filter(|r| r.method != Method::Get)
         .collect();
-    assert_eq!(mutations.len(), 3);
-    assert!(mutations[0].path.ends_with(".lock"));
-    assert!(mutations[1].path.ends_with("state.json"));
-    assert_eq!(mutations[2].method, Method::Delete);
+    assert_eq!(mutations.len(), 2);
+    assert!(mutations[0].path.ends_with("state.json"));
+    assert_eq!(mutations[1].method, Method::Delete);
 }
 
 struct LateMutation {
@@ -955,6 +985,10 @@ async fn github_readiness_confirms_archived_storage_is_unavailable_and_transport
         ) -> Result<GitHubResponse, GitHubError> {
             Err(GitHubError::Transport {
                 kind: "offline failure",
+                source: reqwest::Client::new()
+                    .get("http://[invalid")
+                    .build()
+                    .unwrap_err(),
             })
         }
     }
@@ -982,4 +1016,431 @@ async fn github_cleanup_protocol_fits_the_flush_budget_with_fifty_ms_transport_l
     assert!(start.elapsed() < Duration::from_secs(1));
     backend.release_lock_for_cleanup(&lock).await.unwrap();
     assert!(start.elapsed() < Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn github_round1_acquire_readback_ignores_a_later_client_write() {
+    let fake = Fake::default();
+    let later = LockInfo::new("later client");
+    fake.0.lock().unwrap().after_success = Some(serde_json::to_vec(&later).unwrap());
+    let acquired = fake.backend().acquire_lock("apply").await.unwrap();
+    assert_ne!(acquired.id(), later.id());
+    assert_eq!(
+        LockInfo::from_json_slice(&fake.bytes("state.json.lock").unwrap())
+            .unwrap()
+            .id(),
+        later.id()
+    );
+    assert_pinned_readback(&fake, 1);
+}
+
+#[tokio::test]
+async fn github_round1_release_readback_ignores_a_new_lease() {
+    let fake = Fake::default();
+    let backend = fake.backend();
+    let lock = backend.acquire_lock("apply").await.unwrap();
+    let later = LockInfo::new("later client");
+    {
+        let mut store = fake.0.lock().unwrap();
+        store.requests.clear();
+        store.after_success = Some(serde_json::to_vec(&later).unwrap());
+    }
+    backend.release_lock(&lock).await.unwrap();
+    assert_eq!(
+        LockInfo::from_json_slice(&fake.bytes("state.json.lock").unwrap())
+            .unwrap()
+            .id(),
+        later.id()
+    );
+    assert_pinned_readback(&fake, 1);
+}
+
+#[tokio::test]
+async fn github_round1_state_readback_ignores_a_later_state_write() {
+    let fake = Fake::default();
+    let later = StateFile::new();
+    let later_bytes = serde_json::to_vec(&later).unwrap();
+    fake.0.lock().unwrap().after_success = Some(later_bytes.clone());
+    let backend = fake.backend();
+    backend.write_state(&StateFile::new()).await.unwrap();
+    assert_eq!(fake.bytes("state.json").unwrap(), later_bytes);
+    assert_pinned_readback(&fake, 1);
+    assert!(matches!(
+        backend.write_state(&StateFile::new()).await,
+        Err(BackendError::StateWriteConflict { .. })
+    ));
+}
+
+fn assert_pinned_readback(fake: &Fake, count: usize) {
+    let store = fake.0.lock().unwrap();
+    let mutation = store
+        .requests
+        .iter()
+        .rposition(|r| r.method != Method::Get)
+        .unwrap();
+    let reads = &store.requests[mutation + 1..];
+    assert_eq!(reads.len(), count, "read-back request count");
+    assert_eq!(reads[0].accept, JSON_MEDIA_TYPE);
+    if count == 2 {
+        assert_eq!(reads[1].accept, RAW_MEDIA_TYPE);
+    }
+    for read in reads {
+        assert_eq!(read.method, Method::Get);
+        assert!(read.path.contains("/contents/"));
+        let reference = read.reference.as_ref().expect("pinned ref");
+        assert_eq!(reference.len(), 40);
+        assert_eq!(reference, reads[0].reference.as_ref().unwrap());
+    }
+}
+
+#[tokio::test]
+async fn github_round1_readback_uses_inline_content_and_raw_only_for_large_files() {
+    for size in [1_000_000, 1_000_001] {
+        let fake = Fake::default();
+        let mut state = StateFile::new();
+        state.carina_version.clear();
+        let overhead = carina_core::utils::pretty_with_newline_bytes(&state)
+            .unwrap()
+            .len();
+        state.carina_version = "x".repeat(size - overhead);
+        fake.backend().write_state(&state).await.unwrap();
+        assert_pinned_readback(&fake, if size == 1_000_000 { 1 } else { 2 });
+    }
+    let fake = Fake::default();
+    fake.backend().write_state(&StateFile::new()).await.unwrap();
+    assert_pinned_readback(&fake, 1);
+}
+
+#[tokio::test]
+async fn github_round1_cleanup_save_has_one_lease_check_no_renewal_and_pinned_readback() {
+    let fake = Fake::default();
+    let backend = fake.backend();
+    backend.read_state().await.unwrap();
+    let lock = backend.acquire_lock("apply").await.unwrap();
+    fake.0.lock().unwrap().requests.clear();
+    backend
+        .write_state_locked_for_cleanup(&StateFile::new(), &lock)
+        .await
+        .unwrap();
+    {
+        let store = fake.0.lock().unwrap();
+        assert_eq!(store.requests.len(), 4);
+        assert_eq!(
+            store
+                .requests
+                .iter()
+                .filter(|r| r.method == Method::Put)
+                .count(),
+            1
+        );
+        assert!(store.requests[2].path.ends_with("state.json"));
+    }
+    assert_pinned_readback(&fake, 1);
+    fake.0.lock().unwrap().requests.clear();
+    backend.release_lock_for_cleanup(&lock).await.unwrap();
+    assert_eq!(fake.0.lock().unwrap().requests.len(), 4);
+    assert_pinned_readback(&fake, 1);
+}
+
+#[tokio::test]
+async fn github_round1_expired_takeover_retries_create_when_the_old_lease_disappears() {
+    let fake = Fake::default();
+    let expired = LockInfo::with_timeout("apply", -1);
+    fake.put("state.json.lock", serde_json::to_vec(&expired).unwrap());
+    fake.0.lock().unwrap().remove_before_mutation = true;
+    let lock = fake.backend().acquire_lock("apply").await.unwrap();
+    assert_ne!(lock.id(), expired.id());
+    let store = fake.0.lock().unwrap();
+    let puts: Vec<_> = store
+        .requests
+        .iter()
+        .filter(|r| r.method == Method::Put)
+        .collect();
+    assert_eq!(puts.len(), 2);
+    assert!(puts[0].body.as_ref().unwrap().get("sha").is_some());
+    assert!(puts[1].body.as_ref().unwrap().get("sha").is_none());
+    assert!(!store.requests.iter().any(|r| r.method == Method::Delete));
+}
+
+fn rate_limit(status: u16, header: &str, hint: String) -> GitHubResponse {
+    let mut response = reply(status, json!({"message":"rate limited"}));
+    response.headers.insert(header.into(), hint);
+    if header == "x-ratelimit-reset" {
+        response
+            .headers
+            .insert("x-ratelimit-remaining".into(), "0".into());
+    }
+    response
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round1_rate_limits_retry_short_hints_within_the_deadline() {
+    for (status, header, hint) in [
+        (403, "retry-after", "1".into()),
+        (429, "retry-after", "1".into()),
+        (
+            403,
+            "x-ratelimit-reset",
+            (chrono::Utc::now().timestamp() + 2).to_string(),
+        ),
+    ] {
+        let fake = Fake::default();
+        fake.0.lock().unwrap().response = Some(rate_limit(status, header, hint));
+        let start = Instant::now();
+        fake.backend().storage_readiness().await.unwrap();
+        assert!(start.elapsed() >= Duration::from_secs(1));
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert_eq!(fake.0.lock().unwrap().requests.len(), 3);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round1_rate_limits_allow_at_most_two_retries() {
+    let fake = Fake::default();
+    fake.0.lock().unwrap().responses = (0..3)
+        .map(|_| rate_limit(429, "retry-after", "1".into()))
+        .collect();
+    let start = Instant::now();
+    assert!(matches!(
+        fake.backend().storage_readiness().await,
+        Err(BackendError::GitHub(GitHubError::RateLimited {
+            status: 429,
+            ..
+        }))
+    ));
+    assert_eq!(fake.0.lock().unwrap().requests.len(), 3);
+    assert_eq!(start.elapsed(), Duration::from_secs(2));
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round1_rate_limits_do_not_wait_without_a_fitting_hint() {
+    for response in [
+        rate_limit(429, "retry-after", "30".into()),
+        reply(429, json!({"message":"rate limited"})),
+        reply(403, json!({"message":"secondary rate limit"})),
+    ] {
+        let fake = Fake::default();
+        fake.0.lock().unwrap().response = Some(response);
+        let start = Instant::now();
+        assert!(matches!(
+            fake.backend().storage_readiness().await,
+            Err(BackendError::GitHub(GitHubError::RateLimited { .. }))
+        ));
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_eq!(fake.0.lock().unwrap().requests.len(), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round1_cleanup_never_waits_on_rate_limits() {
+    for operation in 0..3 {
+        let fake = Fake::default();
+        let backend = fake.backend();
+        let lock = LockInfo::new("apply");
+        fake.0.lock().unwrap().response = Some(rate_limit(429, "retry-after", "0".into()));
+        let start = Instant::now();
+        let result = match operation {
+            0 => backend.write_state_for_cleanup(&StateFile::new()).await,
+            1 => {
+                backend
+                    .write_state_locked_for_cleanup(&StateFile::new(), &lock)
+                    .await
+            }
+            _ => backend.release_lock_for_cleanup(&lock).await,
+        };
+        assert!(matches!(
+            result,
+            Err(BackendError::GitHub(GitHubError::RateLimited { .. }))
+        ));
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_eq!(fake.0.lock().unwrap().requests.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn github_round1_readback_rejects_wrong_inline_bytes_even_with_the_expected_sha() {
+    let fake = Fake::default();
+    fake.0.lock().unwrap().corrupt_inline = true;
+    assert!(matches!(
+        fake.backend().write_state(&StateFile::new()).await,
+        Err(BackendError::GitHub(GitHubError::UnexpectedOutcome { .. }))
+    ));
+}
+
+struct RateOnEachRequest {
+    fake: Fake,
+    calls: std::sync::atomic::AtomicUsize,
+}
+#[async_trait]
+impl GitHubTransport for RateOnEachRequest {
+    async fn execute(
+        &self,
+        request: GitHubRequest,
+        deadline: Instant,
+    ) -> Result<GitHubResponse, GitHubError> {
+        if self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(2)
+        {
+            Ok(rate_limit(429, "retry-after", "1".into()))
+        } else {
+            self.fake.execute(request, deadline).await
+        }
+    }
+}
+#[tokio::test(start_paused = true)]
+async fn github_round1_rate_retry_budget_is_shared_by_the_entire_operation() {
+    let transport = Arc::new(RateOnEachRequest {
+        fake: Fake::default(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let backend = GitHubBackend::with_transport(settings(), transport.clone());
+    let start = Instant::now();
+    assert!(matches!(
+        backend.acquire_lock("apply").await,
+        Err(BackendError::GitHub(GitHubError::RateLimited { .. }))
+    ));
+    assert_eq!(
+        transport.calls.load(std::sync::atomic::Ordering::Relaxed),
+        5
+    );
+    assert_eq!(start.elapsed(), Duration::from_secs(2));
+}
+
+struct RateAfterSlowRead {
+    fake: Fake,
+    calls: std::sync::atomic::AtomicUsize,
+}
+#[async_trait]
+impl GitHubTransport for RateAfterSlowRead {
+    async fn execute(
+        &self,
+        request: GitHubRequest,
+        deadline: Instant,
+    ) -> Result<GitHubResponse, GitHubError> {
+        if self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            let response = self.fake.execute(request, deadline).await?;
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            Ok(response)
+        } else {
+            Ok(rate_limit(429, "retry-after", "11".into()))
+        }
+    }
+}
+#[tokio::test(start_paused = true)]
+async fn github_round1_rate_hint_must_fit_the_remaining_operation_deadline() {
+    let transport = Arc::new(RateAfterSlowRead {
+        fake: Fake::default(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let backend = GitHubBackend::with_transport(settings(), transport.clone());
+    let start = Instant::now();
+    assert!(matches!(
+        backend.storage_readiness().await,
+        Err(BackendError::GitHub(GitHubError::RateLimited { .. }))
+    ));
+    assert_eq!(
+        transport.calls.load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+    assert_eq!(start.elapsed(), Duration::from_secs(20));
+}
+
+#[tokio::test]
+async fn github_round1_cleanup_request_counts_cover_cold_and_cached_small_and_large_saves() {
+    for cached in [false, true] {
+        for locked in [false, true] {
+            for large in [false, true] {
+                let fake = Fake::default();
+                let mut previous = StateFile::new();
+                previous.carina_version = "x".repeat(1_000_001);
+                fake.put("state.json", serde_json::to_vec(&previous).unwrap());
+                let backend = fake.backend();
+                if cached {
+                    backend.read_state().await.unwrap();
+                }
+                let lock = if locked {
+                    Some(backend.acquire_lock("apply").await.unwrap())
+                } else {
+                    None
+                };
+                fake.0.lock().unwrap().requests.clear();
+                let mut state = StateFile::new();
+                if large {
+                    state.carina_version = "x".repeat(1_000_001);
+                }
+                if let Some(lock) = &lock {
+                    backend
+                        .write_state_locked_for_cleanup(&state, lock)
+                        .await
+                        .unwrap();
+                } else {
+                    backend.write_state_for_cleanup(&state).await.unwrap();
+                }
+                let expected =
+                    2 + usize::from(locked) * 2 + usize::from(!cached) * 2 + usize::from(large);
+                let store = fake.0.lock().unwrap();
+                assert_eq!(
+                    store.requests.len(),
+                    expected,
+                    "cached={cached}, locked={locked}, large={large}"
+                );
+                assert_eq!(
+                    store
+                        .requests
+                        .iter()
+                        .filter(|r| r.method == Method::Put)
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    store
+                        .requests
+                        .iter()
+                        .filter(|r| r.accept == RAW_MEDIA_TYPE)
+                        .count(),
+                    usize::from(large),
+                    "only read-back needs raw bytes; the old state's SHA needs one metadata GET"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn github_round1_cleanup_never_saves_with_an_expired_or_replaced_lease() {
+    for expired in [false, true] {
+        let fake = Fake::default();
+        let backend = fake.backend();
+        backend.read_state().await.unwrap();
+        let lock = if expired {
+            LockInfo::with_timeout("apply", -1)
+        } else {
+            LockInfo::new("apply")
+        };
+        let replacement = LockInfo::new("replacement");
+        let current = if expired { &lock } else { &replacement };
+        fake.put("state.json.lock", serde_json::to_vec(current).unwrap());
+        fake.0.lock().unwrap().requests.clear();
+        assert!(matches!(
+            backend
+                .write_state_locked_for_cleanup(&StateFile::new(), &lock)
+                .await,
+            Err(BackendError::LockNotHeld(_))
+        ));
+        assert!(
+            fake.0
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .all(|r| r.method == Method::Get)
+        );
+        assert!(fake.bytes("state.json").is_none());
+    }
 }

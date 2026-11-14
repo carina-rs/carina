@@ -13,7 +13,24 @@ const AWS_PROVIDER_NAME: &str = "aws";
 
 #[path = "github.rs"]
 mod github;
-pub use github::{GitBranch, GitHubDestinationError, RepositoryPath, RepositorySlug};
+pub use github::{
+    GitBranch, GitHubBackendSettings, GitHubDestinationError, LeasePath, RepositorySlug, StatePath,
+};
+
+/// Typed settings retained by the sole backend admission owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendSettings {
+    S3,
+    Local,
+    GitHub(GitHubBackendSettings),
+}
+
+/// Canonical attributes and their typed backend-specific interpretation.
+#[derive(Debug, Clone)]
+pub struct BackendPayload {
+    pub(super) attributes: crate::parser::ConfigurationAttributes<Value>,
+    pub(super) settings: BackendSettings,
+}
 
 /// A built-in destination, independent of installed providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,6 +451,7 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
     }
     let catalog = ProviderContext::new(crate::EnvironmentSnapshot::new([]));
     let lookup = BuiltinLookup;
+    let mut github_settings = github::GitHubSettingsBuilder::default();
     let checked = crate::validation::deferred_types::TypeCheckSession::run(&catalog, |_| {
         let mut aggregate = ConfigurationBuilder::new(Arc::clone(declaration), kind);
         for (key, value) in &config.attributes {
@@ -486,14 +504,7 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
                     unreachable!()
                 };
                 let value = value.expose_plaintext();
-                let validated = if key.matches("repository") {
-                    RepositorySlug::parse(value).map(|_| ())
-                } else if key.matches("branch") {
-                    GitBranch::parse(value).map(|_| ())
-                } else {
-                    RepositoryPath::state_path(value).map(|_| ())
-                };
-                if let Err(error) = validated {
+                if let Err(error) = github_settings.place(&destination.contract.attribute, value) {
                     errors.push(BackendAttributeError::InvalidAttribute {
                         backend_type: kind.name().into(),
                         attribute: key.clone(),
@@ -532,7 +543,12 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
     if !errors.is_empty() {
         return Err(BackendConfigErrors::new(errors).into());
     }
-    Ok(aggregate.admit_payload())
+    let settings = match kind {
+        BackendKind::GitHub => BackendSettings::GitHub(github_settings.finish()?),
+        BackendKind::S3 => BackendSettings::S3,
+        BackendKind::Local => BackendSettings::Local,
+    };
+    Ok(aggregate.admit_payload(settings))
 }
 
 #[cfg(test)]

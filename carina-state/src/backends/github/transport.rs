@@ -55,8 +55,9 @@ impl ReqwestTransport {
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|_| GitHubError::Transport {
+            .map_err(|source| GitHubError::Transport {
                 kind: "client construction",
+                source,
             })?;
         Ok(Self {
             client,
@@ -166,7 +167,7 @@ impl GitHubTransport for ReqwestTransport {
 }
 fn transport_error(error: reqwest::Error) -> GitHubError {
     if error.is_timeout() {
-        GitHubError::Deadline
+        GitHubError::TransportDeadline { source: error }
     } else {
         GitHubError::Transport {
             kind: if error.is_connect() {
@@ -174,6 +175,7 @@ fn transport_error(error: reqwest::Error) -> GitHubError {
             } else {
                 "request or response"
             },
+            source: error,
         }
     }
 }
@@ -181,6 +183,43 @@ fn transport_error(error: reqwest::Error) -> GitHubError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_round1_transport_error_keeps_the_reqwest_source() {
+        use std::error::Error;
+        let source = reqwest::Client::new()
+            .get("http://[invalid")
+            .build()
+            .unwrap_err();
+        let error = transport_error(source);
+        assert!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<reqwest::Error>())
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn github_round1_transport_timeout_keeps_the_reqwest_source() {
+        use std::error::Error;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let source = reqwest::Client::new()
+            .get(url)
+            .timeout(std::time::Duration::from_millis(20))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(source.is_timeout());
+        let error = transport_error(source);
+        assert!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<reqwest::Error>())
+                .is_some()
+        );
+    }
 
     #[test]
     fn github_transport_unexpected_status_cannot_expose_credentials() {

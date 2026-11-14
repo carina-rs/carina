@@ -4,7 +4,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum GitHubTokenError {
-    #[error("Set GITHUB_TOKEN or run `gh auth login --hostname github.com`")]
+    #[error(
+        "`gh auth token --hostname github.com` failed or returned no usable token; set GITHUB_TOKEN or run `gh auth login --hostname github.com`"
+    )]
     Unavailable,
     #[error("`gh auth token --hostname github.com` exceeded its deadline")]
     Deadline,

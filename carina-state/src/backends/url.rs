@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use crate::backend::{BackendError, BackendResult, StateBackend};
 use crate::backend_selection::BackendSelection;
 use crate::state::{PublishedExports, StateFile};
-use crate::{GitBranch, RepositoryPath, RepositorySlug};
+use crate::{GitBranch, RepositorySlug, StatePath};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GitHubUrlError {
@@ -139,19 +139,15 @@ pub async fn load_local_state_file(file: &LocalStateFile) -> BackendResult<State
 
 /// A parsed `--state-url` argument.
 ///
-/// Constructable **only** via [`Self::parse`]: each variant is
-/// `#[non_exhaustive]`, so external code cannot fabricate a `StateUrl`
-/// with an unvalidated bucket / key / path. Combined with
-/// `load_state_from_url` taking `&StateUrl` (not `&str`), a raw user
-/// string can never reach the backend layer without going through the
-/// parser's scheme + emptiness checks first.
+/// GitHub addresses can also be assembled from validated component types.
+/// S3 and File remain `#[non_exhaustive]`, requiring [`Self::parse`] to
+/// validate their raw bucket, key, and path strings before loading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StateUrl {
-    #[non_exhaustive]
     GitHub {
         repository: RepositorySlug,
         branch: GitBranch,
-        path: RepositoryPath,
+        path: StatePath,
     },
     /// `s3://bucket/key` — bucket is the URL host, key is the path
     /// (leading `/` stripped). Region / credentials come from the AWS
@@ -239,7 +235,7 @@ impl StateUrl {
             decode_component(owner)?,
             decode_component(repo)?
         ))?;
-        let path = RepositoryPath::state_path(&decode_component(path)?)?;
+        let path = StatePath::parse(&decode_component(path)?)?;
         let mut branch = None;
         for pair in query.ok_or(GitHubUrlError::MissingBranch)?.split('&') {
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));

@@ -9,14 +9,14 @@ use carina_core::resource::{
 use carina_core::validation::admission::{
     configuration::{
         AdmittedConfiguration,
-        backend::{self, BackendKind},
+        backend::{self, BackendSettings},
     },
     kind::BackendAttribute,
 };
 use std::collections::HashMap;
 
 pub use backend::{BackendAttributeError, BackendConfigError, BackendConfigErrors};
-pub use backend::{GitBranch, RepositoryPath, RepositorySlug};
+pub use backend::{GitBranch, GitHubBackendSettings, LeasePath, RepositorySlug, StatePath};
 
 use crate::backend::{LOCAL_BACKEND_TYPE, S3_BACKEND_TYPE};
 
@@ -114,15 +114,17 @@ impl BackendConfig {
                 attributes: [
                     (
                         "repository".to_string(),
-                        Value::Concrete(ConcreteValue::String(settings.repository.as_str().into())),
+                        Value::Concrete(ConcreteValue::String(
+                            settings.repository().as_str().into(),
+                        )),
                     ),
                     (
                         "branch".to_string(),
-                        Value::Concrete(ConcreteValue::String(settings.branch.as_str().into())),
+                        Value::Concrete(ConcreteValue::String(settings.branch().as_str().into())),
                     ),
                     (
                         "path".to_string(),
-                        Value::Concrete(ConcreteValue::String(settings.path.as_str().into())),
+                        Value::Concrete(ConcreteValue::String(settings.path().as_str().into())),
                     ),
                 ]
                 .into_iter()
@@ -178,36 +180,6 @@ impl BackendConfig {
                 }
             }
         }
-    }
-}
-
-/// Credentials are deliberately absent from persistent backend settings.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitHubBackendSettings {
-    repository: RepositorySlug,
-    branch: GitBranch,
-    path: RepositoryPath,
-}
-impl GitHubBackendSettings {
-    pub(crate) fn from_parts(
-        repository: RepositorySlug,
-        branch: GitBranch,
-        path: RepositoryPath,
-    ) -> Self {
-        Self {
-            repository,
-            branch,
-            path,
-        }
-    }
-    pub fn repository(&self) -> &RepositorySlug {
-        &self.repository
-    }
-    pub fn branch(&self) -> &GitBranch {
-        &self.branch
-    }
-    pub fn path(&self) -> &RepositoryPath {
-        &self.path
     }
 }
 
@@ -438,31 +410,9 @@ impl LocalBackendSettings {
 
 impl From<AdmittedConfiguration<BackendAttribute>> for BackendConfig {
     fn from(configuration: AdmittedConfiguration<BackendAttribute>) -> Self {
-        match configuration.backend_kind() {
-            BackendKind::GitHub => Self::GitHub(GitHubBackendSettings {
-                repository: RepositorySlug::parse(
-                    configuration
-                        .string("repository")
-                        .expect("required repository")
-                        .expose_plaintext(),
-                )
-                .expect("admitted repository"),
-                branch: GitBranch::parse(
-                    configuration
-                        .string("branch")
-                        .expect("required branch")
-                        .expose_plaintext(),
-                )
-                .expect("admitted branch"),
-                path: RepositoryPath::state_path(
-                    configuration
-                        .string("path")
-                        .expect("required path")
-                        .expose_plaintext(),
-                )
-                .expect("admitted path"),
-            }),
-            BackendKind::S3 => Self::S3(S3BackendSettings {
+        match configuration.backend_settings() {
+            BackendSettings::GitHub(settings) => Self::GitHub(settings.clone()),
+            BackendSettings::S3 => Self::S3(S3BackendSettings {
                 bucket: configuration
                     .string("bucket")
                     .expect("required backend bucket")
@@ -475,7 +425,7 @@ impl From<AdmittedConfiguration<BackendAttribute>> for BackendConfig {
                 encrypt: configuration.boolean("encrypt"),
                 auto_create: configuration.boolean("auto_create"),
             }),
-            BackendKind::Local => Self::Local(LocalBackendSettings {
+            BackendSettings::Local => Self::Local(LocalBackendSettings {
                 path: configuration.string("path").cloned(),
             }),
         }

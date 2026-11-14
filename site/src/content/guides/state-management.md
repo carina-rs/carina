@@ -177,6 +177,8 @@ them or chooses a default branch. The path must be relative, with no empty or
 `..` segments, and must not end in `.lock`. Carina stores its lease at
 `<path>.lock`. Only `api.github.com` is supported.
 
+Branch names are passed to GitHub as-is. GitHub rejects invalid ref names.
+
 Authentication uses a non-empty `GITHUB_TOKEN`, otherwise
 `gh auth token --hostname github.com`. Grant **Contents read/write** on the
 state repository. Read-only consumers of `upstream_state`, exports, or state
@@ -190,6 +192,8 @@ carina state show --state-url 'github://owner/infra-state/states/prod/carina.sta
 carina export --state-url 'github://owner/infra-state/states/prod/carina.state.json?branch=states%2Fprod'
 ```
 
+The first URL uses the block's `carina-state` branch. The second shows
+percent-encoding for a different branch named `states/prod`.
 The `branch` query parameter is required. Percent-encode `/` in branch names
 as `%2F`. These URLs never acquire a lock or modify state. Offline
 `state migrate --check` accepts only a local copy, not a GitHub URL.

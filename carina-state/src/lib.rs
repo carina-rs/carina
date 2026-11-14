@@ -83,8 +83,8 @@ pub use backend::{
 };
 pub use backend_config::{
     BackendAttributeError, BackendConfig, BackendConfigError, BackendConfigErrors, GitBranch,
-    GitHubBackendSettings, LocalBackendSettings, LocalStateLocateError, RepositoryPath,
-    RepositorySlug, S3BackendSettings,
+    GitHubBackendSettings, LeasePath, LocalBackendSettings, LocalStateLocateError, RepositorySlug,
+    S3BackendSettings, StatePath,
 };
 pub use backend_lock::BackendLock;
 pub use backend_selection::{

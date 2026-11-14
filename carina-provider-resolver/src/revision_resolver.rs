@@ -2512,6 +2512,23 @@ mod tests {
         assert_eq!(token, "test-token-123");
     }
 
+    #[test]
+    fn github_round1_missing_gh_failure_is_informative_without_stderr_or_tokens() {
+        let _env_guard = crate::test_env_guard();
+        let directory = tempfile::tempdir().unwrap();
+        let _token = crate::ScopedEnvVar::set("GITHUB_TOKEN", "");
+        let _path = crate::ScopedEnvVar::set("PATH", directory.path().to_str().unwrap());
+        let error = get_github_token().unwrap_err();
+        assert!(
+            error.contains("gh auth token --hostname github.com"),
+            "{error}"
+        );
+        assert!(
+            error.contains("GITHUB_TOKEN") && error.contains("gh auth login"),
+            "{error}"
+        );
+    }
+
     const TEST_SOURCE: &str = "github.com/carina-rs/carina-provider-aws";
     const TEST_SHA: &str = "abcdef0123456789abcdef0123456789abcdef01";
     const OTHER_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
