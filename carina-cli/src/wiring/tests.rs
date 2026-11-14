@@ -15489,6 +15489,7 @@ exports { team_prefix: String = "x" }"#,
         parsed
             .upstream_states
             .push(carina_core::parser::UpstreamState {
+                caller: None,
                 binding: absolute_binding("net"),
                 source: std::path::PathBuf::from("../network"),
             });

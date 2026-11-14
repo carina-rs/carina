@@ -2466,6 +2466,7 @@ mod tests {
         let resource: Resource =
             Resource::with_provider("awscc", "ec2.Vpc", "main", None).with_binding("x");
         let upstream: UpstreamState = UpstreamState {
+            caller: None,
             binding: "x".into(),
             source: std::path::PathBuf::from("../other"),
         };
@@ -2480,6 +2481,7 @@ mod tests {
     fn bindings_from_parts_collects_pure_upstream_state() {
         use crate::parser::UpstreamState;
         let upstream: UpstreamState = UpstreamState {
+            caller: None,
             binding: "network".into(),
             source: std::path::PathBuf::from("../network"),
         };

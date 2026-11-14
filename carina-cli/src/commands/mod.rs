@@ -1421,7 +1421,7 @@ mod tests {
         );
         BackendConfig {
             backend_type: "s3".to_string(),
-            attributes: (attributes).into(),
+            attributes: (attributes).into_iter().collect(),
             attribute_spans: Default::default(),
         }
     }
@@ -1434,7 +1434,7 @@ mod tests {
         );
         BackendConfig {
             backend_type: "local".to_string(),
-            attributes: (attributes).into(),
+            attributes: (attributes).into_iter().collect(),
             attribute_spans: Default::default(),
         }
     }

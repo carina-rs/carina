@@ -5224,7 +5224,6 @@ async fn saved_plan_provider_validation_preserves_typed_source_and_replan_hint()
             source_dir: tmp.path(),
         },
         &source,
-        &[],
         cancel.clone(),
         &observer_factory,
         NonZeroUsize::new(1).unwrap(),
@@ -7333,7 +7332,7 @@ fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::Expande
     );
     carina_core::parser::BackendConfig {
         backend_type: "s3".to_string(),
-        attributes: (attributes).into(),
+        attributes: (attributes).into_iter().collect(),
         attribute_spans: Default::default(),
     }
 }
@@ -8476,7 +8475,7 @@ fn saved_plan_backend_cross_check_preserves_typed_config_error() {
     let mut planned = s3_backend_config_with_encrypt(false);
     planned.attributes.insert(
         "bucket".to_string(),
-        Value::Concrete(ConcreteValue::Bool(true)),
+        Value::Concrete(ConcreteValue::Bool(true)).into(),
     );
     let current = s3_backend_config_with_encrypt(false);
 

@@ -453,7 +453,8 @@ impl ResidualModuleResolutionError {
                         ),
                     )
                 }
-                ParseError::Syntax(_)
+                ParseError::BackendEvaluation(_)
+                | ParseError::Syntax(_)
                 | ParseError::ProtectedFile(_)
                 | ParseError::Evaluation { .. }
                 | ParseError::UnavailableSecret(_)
@@ -2275,7 +2276,11 @@ where
         }
     }
     if let Some(backend) = &file.backend {
-        for value in backend.attributes.values() {
+        for value in backend
+            .attributes
+            .values()
+            .filter_map(|value| value.evaluated().ok())
+        {
             audit(value, "backend attribute")?;
         }
     }

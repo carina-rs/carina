@@ -3519,7 +3519,11 @@ pub fn check_file_integer_arithmetic_values<
         }
     }
     if let Some(backend) = &parsed.backend {
-        for value in backend.attributes.values() {
+        for value in backend
+            .attributes
+            .values()
+            .filter_map(|value| value.evaluated().ok())
+        {
             check(value, Some(RefSink::TypeExpr(&INT_REF_SINK)));
         }
     }
@@ -4827,7 +4831,11 @@ fn validate_user_function_ref_types_inner<
         }
     }
     if let Some(backend) = &parsed.backend {
-        for value in backend.attributes.values() {
+        for value in backend
+            .attributes
+            .values()
+            .filter_map(|value| value.evaluated().ok())
+        {
             check_function_calls(value, None, None, bindings, unknown_policy, &mut errors);
         }
     }
@@ -9592,7 +9600,10 @@ impl ModuleCallChecker<'_> {
                 &self.source_overrides,
             ) {
                 Ok(module) => Some(module),
-                Err(ModuleLoadError::NotModule { .. }) => None,
+                Err(ModuleLoadError::NotModule {
+                    error: _,
+                    imports: _,
+                }) => None,
                 Err(ModuleLoadError::Unavailable(_)) => {
                     match crate::module_resolver::loader::load_module_with_overrides(
                         &module_dir,
@@ -9605,7 +9616,10 @@ impl ModuleCallChecker<'_> {
                         &self.source_overrides,
                     ) {
                         Ok(module) => Some(module),
-                        Err(ModuleLoadError::NotModule { .. }) => None,
+                        Err(ModuleLoadError::NotModule {
+                            error: _,
+                            imports: _,
+                        }) => None,
                         Err(ModuleLoadError::Unavailable(_)) => None,
                     }
                 }

@@ -305,6 +305,9 @@ fn lint_result(
         &provider_context.environment,
         &carina_core::schema::SchemaRegistry::new(),
     );
+    if let Some(error) = module_walk.fatal_import() {
+        return Err(error);
+    }
     let module_boundary_findings = validate_module_boundaries(&module_walk);
 
     let (providers, provider_factory_error) = ProviderLoad::load_reporting(

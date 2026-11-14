@@ -619,8 +619,20 @@ impl DiagnosticRun<'_> {
         };
         // Backend admission consumes the issued verdict, including cardinality
         // from readable siblings during partial recovery.
+        let mut diagnostics: Vec<_> = tree
+            .backend_evaluation_failures()
+            .filter_map(|error| {
+                let finding = error.element_diagnostic()?;
+                render_merged(
+                    doc,
+                    finding,
+                    DiagnosticSeverity::ERROR,
+                    finding.detail().to_string(),
+                )
+            })
+            .collect();
         let Some(Err(findings)) = tree.admit_backend() else {
-            return Vec::new();
+            return diagnostics;
         };
 
         let attribute_diagnostic =
@@ -629,18 +641,16 @@ impl DiagnosticRun<'_> {
                 render_merged(doc, &finding, DiagnosticSeverity::ERROR, error.to_string())
             };
 
-        findings
-            .into_iter()
-            .filter_map(|finding| match finding {
-                LocatedBackendError::Attribute(finding) => attribute_diagnostic(finding),
-                LocatedBackendError::Unsupported(finding) => render_merged(
-                    doc,
-                    &finding,
-                    DiagnosticSeverity::ERROR,
-                    finding.detail().to_string(),
-                ),
-            })
-            .collect()
+        diagnostics.extend(findings.into_iter().filter_map(|finding| match finding {
+            LocatedBackendError::Attribute(finding) => attribute_diagnostic(finding),
+            LocatedBackendError::Unsupported(finding) => render_merged(
+                doc,
+                &finding,
+                DiagnosticSeverity::ERROR,
+                finding.detail().to_string(),
+            ),
+        }));
+        diagnostics
     }
 
     /// Check expanded values while retaining the authored provider locations.

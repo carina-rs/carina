@@ -353,6 +353,7 @@ impl ResolvedInitialDeletePlan {
             .backend
             .as_ref()
             .and_then(|backend| backend.attributes.get("bucket"))
+            .and_then(|value| value.evaluated().ok())
             .and_then(|value| match value {
                 Value::Concrete(ConcreteValue::String(name)) => Some(name.expose_plaintext()),
                 _ => None,
@@ -1892,7 +1893,8 @@ mod tests {
                     "bucket".into(),
                     Value::Concrete(ConcreteValue::String("".into())),
                 )]))
-                .into(),
+                .into_iter()
+                .collect(),
                 attribute_spans: Default::default(),
             }),
             ..Default::default()
@@ -1976,6 +1978,7 @@ mod tests {
         let absolute = |name| root.resolve(crate::resource::RelativeBindingName::new(name));
         let mut parsed = crate::parser::ExpandedInferredFile::default();
         parsed.upstream_states.push(crate::parser::UpstreamState {
+            caller: None,
             binding: absolute("orgs"),
             source: "../organizations".into(),
         });

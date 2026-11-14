@@ -1650,6 +1650,7 @@ fn state_bucket_delete_error(
             .backend
             .as_ref()
             .and_then(|backend| backend.attributes.get("bucket"))
+            .and_then(|value| value.evaluated().ok())
             .and_then(|value| match value {
                 Value::Concrete(ConcreteValue::String(name)) => {
                     Some(name.expose_plaintext().to_owned())
@@ -3741,7 +3742,8 @@ mod tests {
                 "bucket".into(),
                 Value::Concrete(ConcreteValue::String(name.into())),
             )]))
-            .into(),
+            .into_iter()
+            .collect(),
             attribute_spans: Default::default(),
         });
         parsed

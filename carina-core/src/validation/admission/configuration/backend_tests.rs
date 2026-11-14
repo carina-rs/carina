@@ -1,6 +1,55 @@
 use super::*;
 
 #[test]
+fn round17_retaining_loader_cannot_admit_failed_backend_without_recovery() {
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let directory = crate::test_utils::configuration::ConfigurationDirectory::new(&[
+        (
+            "backend.crn",
+            "backend s3 { bucket = backend_bucket() key = 'state.json' }",
+        ),
+        ("functions.crn", "fn backend_bucket(): String { true }"),
+    ]);
+    let parsed = crate::config_loader::load_configuration_for_metadata(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .unwrap()
+    .parsed;
+    assert!(
+        parsed.admit_backend_unlocated().is_none(),
+        "a retaining loader must carry the failed evaluation itself"
+    );
+    let tree = parser::AnalysisTree::try_from_file(&parsed).unwrap();
+    assert!(tree.admit_backend().is_none());
+    assert!(
+        matches!(tree.backend_attribute_value(&"bucket".into()), Some(parser::BackendAttributeValue::Failed(error)) if matches!(error.as_ref(), parser::ParseError::AtElement(_)))
+    );
+    let cause = match tree.backend_attribute_value(&"bucket".into()).unwrap() {
+        parser::BackendAttributeValue::Failed(cause) => Arc::clone(cause),
+        parser::BackendAttributeValue::Evaluated(_) => panic!("expected retained failure"),
+    };
+    let mut demanded = parsed.clone().into_parsed();
+    let error = parser::resolve_resource_refs_in_context(
+        &mut demanded,
+        &context,
+        None,
+        crate::config_loader::strict_resolution_context(),
+    )
+    .unwrap_err();
+    assert_eq!(error.source_file(), cause.source_file());
+    assert!(
+        matches!(error, parser::ParseError::BackendEvaluation(error) if Arc::ptr_eq(&error, &cause))
+    );
+    assert!(admit(parsed.backend.as_ref().unwrap()).is_err());
+    assert!(
+        serde_json::to_string(parsed.backend.as_ref().unwrap()).is_err(),
+        "a retained failure cannot be persisted as an ordinary value"
+    );
+}
+
+#[test]
 fn backend_admission_uses_the_issued_directory_verdict() {
     let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     for declaration in [
@@ -290,10 +339,10 @@ fn round15_recovery_cannot_admit_failed_backend_values() {
         crate::config_loader::load_buffer_configuration_in_directory(snapshot, &schemas, &context);
     let tree = parser::AnalysisTree::try_from_file(configuration.parsed()).unwrap();
     for key in ["bucket", "key"] {
-        assert_eq!(
-            tree.syntax().backend_value_state(&key.into()),
-            parser::BackendValueState::EvaluationFailed
-        );
+        assert!(matches!(
+            tree.backend_attribute_value(&key.into()),
+            Some(parser::BackendAttributeValue::Failed(_))
+        ));
     }
     assert!(
         tree.admit_backend().is_none(),

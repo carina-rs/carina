@@ -5829,7 +5829,7 @@ pub struct BackendConfig<P: ValueKind = NoPlaceholder, B: BindingAddress = Relat
     /// Backend type (e.g., "s3", "gcs", "local")
     pub backend_type: String,
     /// Backend-specific attributes
-    pub attributes: super::ConfigurationAttributes<Value<P, B>>,
+    pub attributes: super::ConfigurationAttributes<super::BackendAttributeValue<P, B>>,
     /// Parser-authored source spans for attribute keys. Runtime and saved-plan
     /// representations deliberately omit this diagnostic-only metadata.
     #[serde(skip)]
@@ -5842,7 +5842,9 @@ impl<B: BindingAddress> BackendConfig<ParserPlaceholder, B> {
     ) -> Result<BackendConfig<NoPlaceholder, B>, crate::resource::LeftoverPlaceholder> {
         Ok(BackendConfig {
             backend_type: self.backend_type,
-            attributes: self.attributes.into_try_map(Value::into_expanded)?,
+            attributes: self
+                .attributes
+                .into_try_map(super::BackendAttributeValue::into_expanded)?,
             attribute_spans: self.attribute_spans,
         })
     }
@@ -5896,8 +5898,45 @@ impl<P: ValueKind> BackendConfig<P, RelativeBindingName> {
 /// Which specific `.crn` file inside that directory declares the
 /// `upstream_state` does not affect resolution. The upstream's backend and
 /// state file are derived from the upstream configuration itself.
+/// A diagnostic call site persisted with a saved upstream declaration. This
+/// presentation record cannot be used as parser provenance or admission evidence.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UpstreamCallSite {
+    file: PathBuf,
+    line: usize,
+    column: usize,
+}
+impl UpstreamCallSite {
+    pub(in crate::parser) fn from_location(location: &super::DeclarationLocation) -> Self {
+        Self {
+            file: location.file().path().to_path_buf(),
+            line: location.span().start_line(),
+            column: location.span().start_column(),
+        }
+    }
+    pub(crate) fn prefix(&self, root: &crate::paths::ResolvedPath) -> String {
+        let path = if self.file.is_absolute() {
+            crate::paths::PersistedPath::new(&self.file)
+                .ok()
+                .and_then(|file| file.lexical_relative_to(root.persisted_path()))
+                .map(crate::paths::DisplayPath::into_source_path)
+                .unwrap_or_else(|| self.file.clone())
+        } else {
+            self.file.clone()
+        };
+        let label = crate::paths::DisplayPath::for_diagnostics_from(&path, root).to_string();
+        let label = if !std::path::Path::new(&label).is_absolute() && !label.starts_with("..") {
+            format!("./{label}")
+        } else {
+            label
+        };
+        format!("{label}:{}:{}: ", self.line, self.column)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UpstreamState<B: BindingAddress = RelativeBindingName> {
+    pub caller: Option<UpstreamCallSite>,
     /// The binding name (e.g., "orgs")
     pub binding: B,
     /// Source directory (raw, unresolved path)
@@ -7282,8 +7321,13 @@ where
             upstream_states: upstream_states
                 .into_iter()
                 .map(|upstream| {
-                    let UpstreamState { binding, source } = upstream;
+                    let UpstreamState {
+                        binding,
+                        source,
+                        caller,
+                    } = upstream;
                     UpstreamState {
+                        caller,
                         binding: resolve(binding),
                         source,
                     }
@@ -7509,6 +7553,7 @@ where
             let UpstreamState {
                 binding,
                 source: _source,
+                caller: _,
             } = upstream;
             *binding = map(binding);
         }
@@ -8541,6 +8586,9 @@ where
         } = backend;
         let _attribute_spans = attribute_spans;
         for (attribute, value) in attributes {
+            let Ok(value) = value.evaluated() else {
+                continue;
+            };
             value.collect_leftover_placeholders(
                 LeftoverPlaceholderContext::BackendAttribute {
                     backend: backend_type.clone(),
@@ -9690,6 +9738,7 @@ mod substitute_placeholder_tests {
             indexmap::IndexMap::new(),
         ));
         parsed.upstream_states.push(UpstreamState {
+            caller: None,
             binding: "upstream_name".into(),
             source: "upstream".into(),
         });

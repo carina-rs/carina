@@ -138,6 +138,8 @@ pub struct UpstreamSourceIdentity {
     binding: String,
     source: ResolvedPath,
     declared_source: std::path::PathBuf,
+    caller: Option<crate::parser::UpstreamCallSite>,
+    display_root: ResolvedPath,
 }
 
 impl UpstreamSourceIdentity {
@@ -149,6 +151,8 @@ impl UpstreamSourceIdentity {
             binding: upstream.binding.to_string(),
             source: base.join_display(&base.persisted_path().display().join(&upstream.source))?,
             declared_source: upstream.source.clone(),
+            caller: upstream.caller.clone(),
+            display_root: base.clone(),
         })
     }
 
@@ -175,20 +179,18 @@ impl UpstreamSourceIdentity {
         })?;
         // The original loaded verdict is decisive before re-resolution or any
         // backend/value conversion can turn this rejection into unavailability.
-        match loaded.parsed.complete_directory_verdict() {
+        let root_source = match loaded.parsed.complete_directory_verdict() {
             crate::config_loader::DirectoryVerdict::ModuleTemplate(template) => {
                 return Err(UpstreamSourceLoadError::Rejected(Box::new(
-                    UpstreamModuleTemplateRejection::new(
-                        self.binding.clone(),
-                        self.declared_source.clone(),
-                        template,
-                    ),
+                    UpstreamModuleTemplateRejection::for_identity(self, template),
                 )));
             }
             crate::config_loader::DirectoryVerdict::Root(_)
-            | crate::config_loader::DirectoryVerdict::NoEvidence(_) => {}
-        }
-        let surface = resolve_upstream_source_surface(&loaded, self, context, schemas)?;
+            | crate::config_loader::DirectoryVerdict::NoEvidence(_) => {
+                RootUpstreamSource(&loaded, self.source.clone())
+            }
+        };
+        let surface = resolve_upstream_source_surface(root_source, context, schemas)?;
         Ok(ResolvedUpstreamSource {
             identity: self.clone(),
             backend: loaded
@@ -254,6 +256,8 @@ impl ResolvedUpstreamSource {
                 binding: binding.into(),
                 source: ResolvedPath::new(".").expect("fixture directory exists"),
                 declared_source: ".".into(),
+                caller: None,
+                display_root: ResolvedPath::new(".").expect("fixture directory exists"),
             },
             backend: None,
             upstream_states: vec![],
@@ -288,40 +292,31 @@ pub enum UpstreamSourceUnavailable {
     Boundaries(Vec<crate::validation::ExportBoundaryError>),
 }
 
+/// Only an already classified root/neutral source can enter runtime surface discovery.
+struct RootUpstreamSource<'a>(&'a crate::config_loader::LoadedConfig, ResolvedPath);
+struct RootUpstreamParse(crate::config_loader::ParsedRootDirectory);
+
 /// Discover admission authority from an actual loader-owned source snapshot.
 /// Unavailable declarations preserve the unchecked policy without warnings.
 fn resolve_upstream_source_surface(
-    loaded: &crate::config_loader::LoadedConfig,
-    identity: &UpstreamSourceIdentity,
+    source: RootUpstreamSource<'_>,
     context: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: &crate::schema::SchemaRegistry,
 ) -> Result<SourceSurface, UpstreamSourceLoadError> {
-    let entries = match loaded.upstream_export_source(context.catalog(), schemas) {
-        Ok(parsed) => match resolve_upstream_exports_from_parsed(
-            parsed,
-            identity.source(),
+    let entries = match source.0.upstream_export_source(context.catalog(), schemas) {
+        Ok(parsed) => match resolve_upstream_root_exports(
+            RootUpstreamParse(parsed),
+            &source.1,
             context,
             Some(schemas),
             &Default::default(),
         ) {
             Ok(entries) => Ok(entries),
-            Err(UpstreamExportSourceError::Invariant(error)) => return Err(error.into()),
-            Err(UpstreamExportSourceError::ModuleTemplate(template)) => {
-                return Err(UpstreamSourceLoadError::Rejected(Box::new(
-                    UpstreamModuleTemplateRejection::new(
-                        identity.binding.clone(),
-                        identity.declared_source.clone(),
-                        template,
-                    ),
-                )));
-            }
-            Err(UpstreamExportSourceError::Unavailable(reason)) => {
-                Err(UpstreamSourceUnavailable::Configuration(reason))
-            }
-            Err(UpstreamExportSourceError::Module { base, error }) => {
+            Err(RootUpstreamExportError::Invariant(error)) => return Err(error.into()),
+            Err(RootUpstreamExportError::Module { base, error }) => {
                 Err(UpstreamSourceUnavailable::Module { base, error })
             }
-            Err(UpstreamExportSourceError::Boundaries(errors)) => {
+            Err(RootUpstreamExportError::Boundaries(errors)) => {
                 Err(UpstreamSourceUnavailable::Boundaries(errors))
             }
         },
@@ -565,8 +560,12 @@ pub struct UpstreamModuleTemplateRejection {
     binding: String,
     source: std::path::PathBuf,
     template: crate::config_loader::ModuleTemplateDeclarations,
+    caller: Option<crate::parser::UpstreamCallSite>,
+    display_root: Option<ResolvedPath>,
 }
 impl UpstreamModuleTemplateRejection {
+    const REASON: &str = "is a module definition and has no state to read";
+
     fn new(
         binding: String,
         source: std::path::PathBuf,
@@ -576,6 +575,20 @@ impl UpstreamModuleTemplateRejection {
             binding,
             source,
             template,
+            caller: None,
+            display_root: None,
+        }
+    }
+    fn for_identity(
+        identity: &UpstreamSourceIdentity,
+        template: crate::config_loader::ModuleTemplateDeclarations,
+    ) -> Self {
+        Self {
+            binding: identity.binding.clone(),
+            source: identity.declared_source.clone(),
+            template,
+            caller: identity.caller.clone(),
+            display_root: Some(identity.display_root.clone()),
         }
     }
     pub fn binding(&self) -> &str {
@@ -586,39 +599,41 @@ impl UpstreamModuleTemplateRejection {
     }
     fn message(&self) -> String {
         format!(
-            "upstream_state `{}`: source `{}` is a module definition and has no state to read",
+            "upstream_state `{}`: source `{}` {}",
             self.binding,
-            self.source.display()
+            self.source.display(),
+            Self::REASON
         )
+    }
+    fn legacy_reason(&self) -> String {
+        format!("{}\nNote: {}", Self::REASON, self.module_evidence().note())
+    }
+    fn located_message(&self) -> String {
+        let prefix = match (&self.caller, &self.display_root) {
+            (Some(caller), Some(root)) => caller.prefix(root),
+            _ => String::new(),
+        };
+        format!("{prefix}{}", self.message())
     }
     pub fn diagnostic_lines(&self) -> Vec<crate::module_resolver::DiagnosticLine> {
-        vec![
-            crate::module_resolver::DiagnosticLine::Message(self.message()),
-            crate::module_resolver::DiagnosticLine::ModuleEvidence(self.module_evidence().clone()),
-        ]
-    }
-    /// Attach the current caller's parser provenance and use its display root
-    /// for both the prefix and the evidence continuation.
-    pub fn at_call(
-        self,
-        location: &crate::parser::DeclarationLocation,
-        root: &ResolvedPath,
-    ) -> Located<UpstreamResolveFailure> {
-        let template = self.template.displayed_from(root);
-        Located::new(
-            location.displayed_from(root),
-            UpstreamResolveFailure::module_template(self.binding, self.source, template),
-        )
+        use crate::module_resolver::DiagnosticLine;
+        let note = match &self.display_root {
+            Some(root) => DiagnosticLine::ModuleEvidenceRelative {
+                evidence: self.module_evidence().clone(),
+                root: root.clone(),
+            },
+            None => DiagnosticLine::ModuleEvidence(self.module_evidence().clone()),
+        };
+        vec![DiagnosticLine::Message(self.located_message()), note]
     }
 }
 impl std::fmt::Display for UpstreamModuleTemplateRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}\nNote: {}",
-            self.message(),
-            self.module_evidence().note()
-        )
+        let note = match &self.display_root {
+            Some(root) => self.module_evidence().note_relative_to(root),
+            None => self.module_evidence().note(),
+        };
+        write!(f, "{}\nNote: {note}", self.located_message())
     }
 }
 impl std::error::Error for UpstreamModuleTemplateRejection {}
@@ -632,7 +647,7 @@ pub struct UpstreamResolveFailure {
 #[derive(Debug, Clone)]
 enum UpstreamResolveCause {
     Message,
-    ModuleTemplate(crate::config_loader::ModuleTemplateDeclarations),
+    ModuleTemplate(UpstreamModuleTemplateRejection),
     Boundaries(Vec<crate::validation::ExportBoundaryError>),
     Parse(std::sync::Arc<crate::config_loader::DirectoryParseFailure>),
     Module {
@@ -709,28 +724,23 @@ impl UpstreamResolveFailure {
     ) -> Self {
         Self {
             context: UpstreamResolveContext {
-                binding,
-                source,
+                binding: binding.clone(),
+                source: source.clone(),
                 reason: String::new(),
             },
-            cause: UpstreamResolveCause::ModuleTemplate(template),
+            cause: UpstreamResolveCause::ModuleTemplate(UpstreamModuleTemplateRejection::new(
+                binding, source, template,
+            )),
         }
     }
     pub fn module_evidence(&self) -> Option<&crate::config_loader::ModuleEvidence> {
         match &self.cause {
-            UpstreamResolveCause::ModuleTemplate(template) => Some(template.evidence()),
+            UpstreamResolveCause::ModuleTemplate(rejection) => Some(rejection.module_evidence()),
             UpstreamResolveCause::Message
             | UpstreamResolveCause::Boundaries(_)
             | UpstreamResolveCause::Parse(_)
             | UpstreamResolveCause::Module { base: _, error: _ } => None,
         }
-    }
-    fn module_template_message(&self) -> String {
-        format!(
-            "upstream_state `{}`: source `{}` is a module definition and has no state to read",
-            self.context.binding,
-            self.context.source.display()
-        )
     }
     pub fn boundary_errors(&self) -> &[crate::validation::ExportBoundaryError] {
         match &self.cause {
@@ -764,10 +774,7 @@ impl UpstreamResolveFailure {
     pub fn diagnostic_lines(&self) -> Vec<crate::module_resolver::DiagnosticLine> {
         use crate::module_resolver::DiagnosticLine;
         match &self.cause {
-            UpstreamResolveCause::ModuleTemplate(template) => vec![
-                DiagnosticLine::Message(self.module_template_message()),
-                DiagnosticLine::ModuleEvidence(template.evidence().clone()),
-            ],
+            UpstreamResolveCause::ModuleTemplate(rejection) => rejection.diagnostic_lines(),
             UpstreamResolveCause::Module { base: _, error } => {
                 let mut lines = error.diagnostic_lines_relative_to(None);
                 if let Some(DiagnosticLine::Message(message)) = lines.first_mut() {
@@ -787,8 +794,8 @@ impl UpstreamResolveFailure {
 
     /// Editor projection keeps declaration evidence in related information.
     pub fn lsp_message(&self) -> String {
-        if self.module_evidence().is_some() {
-            return self.module_template_message();
+        if let UpstreamResolveCause::ModuleTemplate(rejection) = &self.cause {
+            return rejection.message();
         }
         if let Some((_, error)) = self.module_failure()
             && let Some(rejection) = error.root_cause().require_outside_module()
@@ -809,11 +816,8 @@ impl UpstreamResolveFailure {
             UpstreamResolveCause::Module { error, base: _ } => {
                 self.context.reason = error.to_string()
             }
-            UpstreamResolveCause::ModuleTemplate(template) => {
-                self.context.reason = format!(
-                    "is a module definition and has no state to read\nNote: {}",
-                    template.evidence().note()
-                )
+            UpstreamResolveCause::ModuleTemplate(rejection) => {
+                self.context.reason = rejection.legacy_reason()
             }
             UpstreamResolveCause::Message
             | UpstreamResolveCause::Boundaries(_)
@@ -833,12 +837,7 @@ impl std::fmt::Display for UpstreamResolveFailure {
             UpstreamResolveCause::Module { error, base: _ } => {
                 self.context.fmt_reason(formatter, error.as_ref())
             }
-            UpstreamResolveCause::ModuleTemplate(template) => write!(
-                formatter,
-                "{}\nNote: {}",
-                self.module_template_message(),
-                template.evidence().note()
-            ),
+            UpstreamResolveCause::ModuleTemplate(rejection) => rejection.fmt(formatter),
             UpstreamResolveCause::Message
             | UpstreamResolveCause::Boundaries(_)
             | UpstreamResolveCause::Parse(_) => {
@@ -1181,6 +1180,30 @@ pub enum UpstreamExportSourceError {
     Boundaries(Vec<crate::validation::ExportBoundaryError>),
 }
 
+#[derive(Debug)]
+enum RootUpstreamExportError {
+    Invariant(crate::parser::AnalysisTreeError),
+    Module {
+        base: std::path::PathBuf,
+        error: Box<crate::module_resolver::ModuleError>,
+    },
+    Boundaries(Vec<crate::validation::ExportBoundaryError>),
+}
+impl From<crate::parser::AnalysisTreeError> for RootUpstreamExportError {
+    fn from(error: crate::parser::AnalysisTreeError) -> Self {
+        Self::Invariant(error)
+    }
+}
+impl From<RootUpstreamExportError> for UpstreamExportSourceError {
+    fn from(error: RootUpstreamExportError) -> Self {
+        match error {
+            RootUpstreamExportError::Invariant(error) => Self::Invariant(error),
+            RootUpstreamExportError::Module { base, error } => Self::Module { base, error },
+            RootUpstreamExportError::Boundaries(error) => Self::Boundaries(error),
+        }
+    }
+}
+
 impl UpstreamExportSourceError {
     /// Source directory and typed resolver failure whose complete diagnostic
     /// is already rendered by this error's Display.
@@ -1232,6 +1255,23 @@ pub fn resolve_upstream_exports_from_parsed(
         } // Unknown is uninhabited after the complete source-loading parse;
           // unavailable sources retain their existing parse/load diagnostics.
     }
+    resolve_upstream_root_exports(
+        RootUpstreamParse(parsed),
+        source_abs,
+        config,
+        schemas,
+        overrides,
+    )
+    .map_err(Into::into)
+}
+
+fn resolve_upstream_root_exports(
+    RootUpstreamParse(parsed): RootUpstreamParse,
+    source_abs: &ResolvedPath,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    schemas: Option<&crate::schema::SchemaRegistry>,
+    overrides: &crate::config_loader::SourceOverrides,
+) -> Result<UpstreamExportEntries, RootUpstreamExportError> {
     let provider_context =
         crate::validation::typecheck::TypecheckProviderContext::for_session(config);
     let parsed = parsed.try_update(|parsed| {
@@ -1275,9 +1315,9 @@ pub fn resolve_upstream_exports_from_parsed(
             if let crate::module_resolver::ModuleError::AnalysisInvariant(error) =
                 reason.root_cause()
             {
-                return Err(UpstreamExportSourceError::Invariant(error.clone()));
+                return Err(RootUpstreamExportError::Invariant(error.clone()));
             }
-            return Err(UpstreamExportSourceError::Module {
+            return Err(RootUpstreamExportError::Module {
                 base: source_abs.source_label(),
                 error: Box::new(reason),
             });
@@ -1303,7 +1343,7 @@ pub fn resolve_upstream_exports_from_parsed(
         if let Err(boundary_errors) =
             crate::validation::validate_export_handle_boundaries(inferred.parameters())
         {
-            return Err(UpstreamExportSourceError::Boundaries(boundary_errors));
+            return Err(RootUpstreamExportError::Boundaries(boundary_errors));
         }
     }
     let entries: UpstreamExportEntries = match schemas {
@@ -1313,7 +1353,7 @@ pub fn resolve_upstream_exports_from_parsed(
             if let Err(boundary_errors) =
                 crate::validation::validate_export_handle_boundaries(&inferred.export_params)
             {
-                return Err(UpstreamExportSourceError::Boundaries(boundary_errors));
+                return Err(RootUpstreamExportError::Boundaries(boundary_errors));
             }
             inferred
                 .export_params
@@ -2650,6 +2690,7 @@ mod tests {
 
     fn upstream(binding: &str, source: &str) -> UpstreamState {
         UpstreamState {
+            caller: None,
             binding: binding.into(),
             source: PathBuf::from(source),
         }

@@ -14080,6 +14080,7 @@ async fn deposed_deferred_admission(coexisting: bool, absorbed: bool, bound: boo
     let compiled = if bound {
         let configuration = crate::parser::ExpandedParsedFile {
             upstream_states: vec![crate::parser::UpstreamState {
+                caller: None,
                 binding: absolute_binding("cert"),
                 source: "../cert".into(),
             }],
@@ -14205,6 +14206,7 @@ fn review_4283_deferred_requirements_apply_to_one_concrete_sibling() {
     let first = old(0).id;
     let configuration = crate::parser::ExpandedParsedFile {
         upstream_states: vec![crate::parser::UpstreamState {
+            caller: None,
             binding: absolute_binding("cert"),
             source: std::path::PathBuf::from("../cert"),
         }],

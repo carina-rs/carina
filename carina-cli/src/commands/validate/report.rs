@@ -230,6 +230,9 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
             location: Some(Location::span(error.source_file(), error.source_span())),
             ..Diagnostic::new(error.to_string(), "error")
         },
+        AppError::ModuleImportResolution { error, base: _ } => {
+            return module_error_diagnostics(error.individual_errors());
+        }
         AppError::ModuleResolution(failure) => {
             return module_error_diagnostics(failure.individual_errors());
         }
@@ -343,6 +346,14 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
             ..Diagnostic::new(format_error_with_source_chain(error), "error")
         },
         AppError::AnalysisResolution(error) => match error.as_ref() {
+            carina_core::parser::AnalysisResolutionError::BackendEvaluation(error) => {
+                match error.element_diagnostic() {
+                    Some(finding) => {
+                        Diagnostic::located(error.diagnostic_message(), finding.location())
+                    }
+                    None => Diagnostic::new(error.diagnostic_message(), "error"),
+                }
+            }
             carina_core::parser::AnalysisResolutionError::Diagnostic(finding) => {
                 Diagnostic::located(finding.detail().diagnostic_message(), finding.location())
             }
@@ -590,6 +601,10 @@ impl ValidateReport {
                             crate::error::HumanErrorLine::RootEvidence(evidence) => {
                                 writeln!(stderr, "  Note: {}", evidence.note())?
                             }
+                            crate::error::HumanErrorLine::ModuleEvidenceRelative {
+                                evidence,
+                                root,
+                            } => writeln!(stderr, "  Note: {}", evidence.note_relative_to(&root))?,
                             crate::error::HumanErrorLine::ModuleEvidence(evidence) => {
                                 writeln!(stderr, "  Note: {}", evidence.note())?
                             }

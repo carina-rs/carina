@@ -591,6 +591,7 @@ mod tests {
             upstream_states: ["up", "parent", "upstream", "primary", "fallback"]
                 .into_iter()
                 .map(|binding| crate::parser::UpstreamState {
+                    caller: None,
                     binding: RootScope::new().resolve(binding.into()),
                     source: std::path::PathBuf::from("upstream"),
                 })

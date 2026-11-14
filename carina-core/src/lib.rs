@@ -179,6 +179,7 @@ pub(crate) mod test_support {
         let root = RootScope::new();
         let configuration = ExpandedParsedFile {
             upstream_states: vec![crate::parser::UpstreamState {
+                caller: None,
                 binding: root.resolve("upstream".into()),
                 source: "upstream".into(),
             }],
@@ -232,6 +233,7 @@ pub(crate) mod test_support {
         let configuration = ExpandedParsedFile {
             resources,
             upstream_states: vec![crate::parser::UpstreamState {
+                caller: None,
                 binding: root.resolve("upstream".into()),
                 source: "upstream".into(),
             }],

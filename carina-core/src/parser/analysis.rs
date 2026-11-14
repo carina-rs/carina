@@ -76,36 +76,6 @@ pub struct DeclarationLocation {
 }
 
 impl DeclarationLocation {
-    pub(crate) fn displayed_from(&self, root: &crate::paths::ResolvedPath) -> Self {
-        let label = if self.file.path().is_absolute() {
-            crate::paths::PersistedPath::new(self.file.path())
-                .ok()
-                .and_then(|file| file.lexical_relative_to(root.persisted_path()))
-                .map(crate::paths::DisplayPath::into_source_path)
-                .unwrap_or_else(|| self.file.path().to_path_buf())
-        } else {
-            self.file.path().to_path_buf()
-        };
-        let label = label
-            .strip_prefix(".")
-            .map(Path::to_path_buf)
-            .unwrap_or(label);
-        let label = if label.is_relative() && !label.starts_with("..") {
-            std::path::Path::new(".").join(label)
-        } else {
-            label
-        };
-        Self {
-            file: SourceFileId::new(label),
-            span: self.span,
-        }
-    }
-    pub(crate) fn with_display_file(&self, file: std::path::PathBuf) -> Self {
-        Self {
-            file: SourceFileId::new(file),
-            span: self.span,
-        }
-    }
     pub(in crate::parser) fn literal_string(
         pair: &pest::iterators::Pair<'_, Rule>,
         interpolation: Option<std::ops::Range<usize>>,
@@ -2605,7 +2575,11 @@ where
             }
         }
         if let Some(backend) = &file.backend {
-            for value in backend.attributes.values() {
+            for value in backend
+                .attributes
+                .values()
+                .filter_map(|value| value.evaluated().ok())
+            {
                 add_value(
                     backend_location.expect("validated backend"),
                     value,
@@ -2724,8 +2698,23 @@ where
     pub fn backend_location(&self) -> Option<&'a DeclarationLocation> {
         self.backend_location
     }
-    pub fn backend_attribute_value(&self, name: &super::AttributeKey) -> Option<&'a Value<P, B>> {
+    pub fn backend_attribute_value(
+        &self,
+        name: &super::AttributeKey,
+    ) -> Option<&'a super::BackendAttributeValue<P, B>> {
         self.file.backend.as_ref()?.attributes.get(name)
+    }
+    pub fn backend_evaluation_failures(
+        &self,
+    ) -> impl Iterator<Item = &std::sync::Arc<super::ParseError>> {
+        self.file
+            .backend
+            .iter()
+            .flat_map(|backend| backend.attributes.values())
+            .filter_map(|value| match value {
+                super::BackendAttributeValue::Failed(error) => Some(error),
+                super::BackendAttributeValue::Evaluated(_) => None,
+            })
     }
     pub fn backend_attribute_location<Q: indexmap::Equivalent<super::AttributeKey> + ?Sized>(
         &self,

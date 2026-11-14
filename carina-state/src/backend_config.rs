@@ -138,7 +138,7 @@ impl BackendConfig {
                 }
                 parser::BackendConfig {
                     backend_type: S3_BACKEND_TYPE.to_string(),
-                    attributes: attributes.into(),
+                    attributes: attributes.into_iter().collect(),
                     attribute_spans: Default::default(),
                 }
             }
@@ -649,11 +649,17 @@ mod tests {
 
         let projected = resolved.to_parser_config();
         assert_eq!(
-            projected.attributes.get("encrypt"),
+            projected
+                .attributes
+                .get("encrypt")
+                .and_then(|value| value.evaluated().ok()),
             Some(&Value::Concrete(ConcreteValue::Bool(false)))
         );
         assert_eq!(
-            projected.attributes.get("auto_create"),
+            projected
+                .attributes
+                .get("auto_create")
+                .and_then(|value| value.evaluated().ok()),
             Some(&Value::Concrete(ConcreteValue::Bool(false)))
         );
     }

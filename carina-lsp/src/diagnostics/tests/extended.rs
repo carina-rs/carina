@@ -1647,6 +1647,60 @@ fn backend_schema_uses_resolved_sibling_let_and_function_values() {
 }
 
 #[test]
+fn backend_schema_uses_resolved_sibling_let_and_function_values_with_broken_sibling() {
+    for (sibling, failed) in [
+        ("let b = 'state'\n", false),
+        ("let b = cidr_subnet('bad', 8, 1)\n", true),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let source = "backend s3 {\n  bucket = b\n  key = 'state.json'\n  typo = true\n}\n";
+        std::fs::write(directory.path().join("backend.crn"), source).unwrap();
+        std::fs::write(directory.path().join("values.crn"), sibling).unwrap();
+        std::fs::write(directory.path().join("broken.crn"), "let broken =\n").unwrap();
+        let path = directory.path().join("backend.crn");
+        let context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let root = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
+        let buffer =
+            carina_core::config_loader::ParsedSourceBuffer::parse(source, &path, &context).unwrap();
+        let snapshot = carina_core::config_loader::DirectoryBufferSnapshot::capture(
+            &root,
+            buffer,
+            &Default::default(),
+        )
+        .unwrap();
+        let schemas = SchemaRegistry::new();
+        let configuration = carina_core::config_loader::load_buffer_configuration_in_directory(
+            snapshot, &schemas, &context,
+        );
+        let tree =
+            carina_core::parser::AnalysisTree::try_from_file(configuration.parsed()).unwrap();
+        let value = tree.backend_attribute_value(&"bucket".into()).unwrap();
+        assert_eq!(
+            matches!(value, carina_core::parser::BackendAttributeValue::Failed(_)),
+            failed
+        );
+        if !failed {
+            assert!(
+                matches!(value, carina_core::parser::BackendAttributeValue::Evaluated(Value::Concrete(ConcreteValue::String(value))) if value.expose_plaintext() == "state")
+            );
+        }
+        let diagnostics =
+            test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+        let schema_errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("backend type 's3'"))
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert_eq!(
+            schema_errors,
+            vec!["Unknown attribute 'typo' for backend type 's3'"],
+            "{sibling}: {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
 fn failed_backend_user_function_does_not_emit_a_schema_type_mismatch() {
     let sibling_source = "fn backend_bucket(): String { true }\n";
     let backend_source = "backend s3 {\n  bucket = backend_bucket()\n  key = \"state.json\"\n}\n";
@@ -1661,6 +1715,36 @@ fn failed_backend_user_function_does_not_emit_a_schema_type_mismatch() {
         "diagnostics: {diagnostics:#?}"
     );
     assert_backend_typo_is_diagnosed(sibling_source, backend_source);
+}
+
+#[test]
+fn round17_each_failed_backend_builtin_reports_its_own_evaluation_error() {
+    let source = "backend s3 {\n  bucket = cidr_subnet('bad', 8, 1)\n  key = cidr_subnet('bad', 8, 1)\n  encrypt = 'yes'\n}\n";
+    let diagnostics =
+        backend_directory_diagnostics_with_sibling("let ordinary = 'value'\n", source);
+    let failures: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.starts_with("Invalid expression")
+                && diagnostic.message.contains("invalid CIDR")
+        })
+        .collect();
+    eprintln!(
+        "Round 17 backend diagnostics: {}",
+        serde_json::to_string_pretty(&diagnostics).unwrap()
+    );
+    assert_eq!(failures.len(), 2, "{diagnostics:#?}");
+    assert_eq!(
+        failures
+            .iter()
+            .map(|diagnostic| diagnostic.range.start.line)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert!(diagnostics.iter().all(|diagnostic| {
+        !diagnostic.message.contains("Invalid attribute 'bucket'")
+            && !diagnostic.message.contains("Invalid attribute 'key'")
+    }));
 }
 
 #[test]

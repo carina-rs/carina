@@ -4967,6 +4967,7 @@ let vpc = aws.ec2.Vpc {
         )
         .expect("parse");
         parsed.upstream_states.push(UpstreamState {
+            caller: None,
             binding: RelativeBindingName::new("up"),
             source: "../upstream".into(),
         });
@@ -5024,6 +5025,7 @@ let vpc = aws.ec2.Vpc {
         )
         .expect("parse");
         parsed.upstream_states.push(UpstreamState {
+            caller: None,
             binding: RelativeBindingName::new("up"),
             source: "../upstream".into(),
         });
@@ -5063,6 +5065,7 @@ let vpc = aws.ec2.Vpc {
         )
         .expect("parse");
         parsed.upstream_states.push(UpstreamState {
+            caller: None,
             binding: RelativeBindingName::new("up"),
             source: "../missing".into(),
         });

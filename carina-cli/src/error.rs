@@ -1265,6 +1265,11 @@ pub enum AppError {
         path: carina_core::paths::DisplayPath,
         error: std::sync::Arc<carina_core::module_resolver::ModuleError>,
     },
+    #[error("Module resolution error: {}", error.display_relative_to(&base.source_label()))]
+    ModuleImportResolution {
+        error: std::sync::Arc<carina_core::module_resolver::ModuleError>,
+        base: Box<carina_core::paths::ResolvedPath>,
+    },
     /// Lint aborts expansion with the typed resolver failure and original path presentation.
     #[error("Module resolution error: {}", error.display_relative_to(base))]
     LintModuleResolution {
@@ -2065,6 +2070,11 @@ pub fn human_error_lines(error: &AppError) -> Vec<HumanErrorLine> {
             prefix_first_message(&mut lines, &format!("{path}: "));
             lines
         }
+        AppError::ModuleImportResolution { error, base } => {
+            let mut lines = error.diagnostic_lines_relative_to(Some(&base.source_label()));
+            prefix_first_message(&mut lines, "Module resolution error: ");
+            lines
+        }
         AppError::LintModuleResolution { error, base } => {
             let mut lines = error.diagnostic_lines_relative_to(Some(base));
             prefix_first_message(&mut lines, "Module resolution error: ");
@@ -2304,7 +2314,12 @@ pub fn human_error_lines(error: &AppError) -> Vec<HumanErrorLine> {
     if !lines.iter().any(|line| {
         matches!(
             line,
-            HumanErrorLine::RootEvidence(_) | HumanErrorLine::ModuleEvidence(_)
+            HumanErrorLine::RootEvidence(_)
+                | HumanErrorLine::ModuleEvidence(_)
+                | HumanErrorLine::ModuleEvidenceRelative {
+                    evidence: _,
+                    root: _
+                }
         )
     }) {
         return vec![HumanErrorLine::Message(format_error_with_source_chain(
@@ -2323,7 +2338,12 @@ pub(crate) fn has_directory_evidence_notes(error: &AppError) -> bool {
     human_error_lines(error).iter().any(|line| {
         matches!(
             line,
-            HumanErrorLine::RootEvidence(_) | HumanErrorLine::ModuleEvidence(_)
+            HumanErrorLine::RootEvidence(_)
+                | HumanErrorLine::ModuleEvidence(_)
+                | HumanErrorLine::ModuleEvidenceRelative {
+                    evidence: _,
+                    root: _
+                }
         )
     })
 }
@@ -2336,6 +2356,9 @@ pub(crate) fn lint_error_message(error: &AppError) -> String {
             HumanErrorLine::Message(message) => message,
             HumanErrorLine::RootEvidence(evidence) => format!("  Note: {}", evidence.note()),
             HumanErrorLine::ModuleEvidence(evidence) => format!("  Note: {}", evidence.note()),
+            HumanErrorLine::ModuleEvidenceRelative { evidence, root } => {
+                format!("  Note: {}", evidence.note_relative_to(&root))
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -2400,29 +2423,6 @@ impl From<crate::wiring::PlanPreparationError> for AppError {
             | crate::wiring::PlanPreparationError::Plan(_)) => {
                 Self::PlanPreparation(Box::new(error))
             }
-        }
-    }
-}
-
-impl AppError {
-    pub(crate) fn with_upstream_source_locations<B: carina_core::resource::BindingAddress>(
-        self,
-        locations: &[carina_core::parser::Located<B>],
-        root: &carina_core::paths::ResolvedPath,
-    ) -> Self {
-        match self {
-            Self::UpstreamSourceRejected(rejection) => {
-                match locations
-                    .iter()
-                    .find(|source| source.detail().to_string() == rejection.binding())
-                {
-                    Some(source) => Self::UpstreamResolution(Box::new(
-                        rejection.at_call(source.location(), root),
-                    )),
-                    None => Self::UpstreamSourceRejected(rejection),
-                }
-            }
-            error => error,
         }
     }
 }

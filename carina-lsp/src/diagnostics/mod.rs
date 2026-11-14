@@ -181,6 +181,16 @@ fn render_analysis_resolution_error(
     error: &carina_core::parser::AnalysisResolutionError,
 ) -> Option<Diagnostic> {
     match error {
+        carina_core::parser::AnalysisResolutionError::BackendEvaluation(error) => {
+            error.element_diagnostic().and_then(|finding| {
+                render_merged(
+                    doc,
+                    finding,
+                    DiagnosticSeverity::ERROR,
+                    error.diagnostic_message(),
+                )
+            })
+        }
         carina_core::parser::AnalysisResolutionError::Invariant(error) => {
             render_analysis_invariant(doc, error)
         }

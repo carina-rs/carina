@@ -290,6 +290,7 @@ mod graph_fixtures {
         configuration.upstream_states = ["orgs", "upstream"]
             .into_iter()
             .map(|binding| carina_core::parser::UpstreamState {
+                caller: None,
                 binding: crate::absolute_binding_for_test(binding),
                 source: "upstream".into(),
             })

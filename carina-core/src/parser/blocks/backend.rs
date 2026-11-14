@@ -39,7 +39,7 @@ pub(in crate::parser) fn parse_backend_block(
             .expect("materialized parser expression")
             .clone();
             attribute_spans.insert(key.clone(), key_span);
-            attributes.insert(key, value);
+            attributes.insert(key, value.into());
         }
     }
 
@@ -63,6 +63,7 @@ pub(in crate::parser) fn parse_upstream_state_expr(
     let inner = pair.into_inner();
 
     let mut source: Option<String> = None;
+    let mut caller = None;
     for attr_pair in inner {
         if attr_pair.as_rule() != Rule::attribute {
             continue;
@@ -81,6 +82,9 @@ pub(in crate::parser) fn parse_upstream_state_expr(
         )?;
         match key {
             key if key.matches("source") => {
+                caller = Some(crate::parser::UpstreamCallSite::from_location(
+                    &ctx.declaration_location(&value_pair),
+                ));
                 let value_text =
                     crate::parser::AuthoredExpressionText::redact(value_pair.clone(), None);
                 let invalid_source =
@@ -126,6 +130,7 @@ pub(in crate::parser) fn parse_upstream_state_expr(
     })?;
 
     Ok(UpstreamState {
+        caller,
         binding: crate::resource::RelativeBindingName::new(binding_name),
         source: std::path::PathBuf::from(source),
     })

@@ -289,7 +289,7 @@ mod tests {
     fn resolve(backend_type: &str, attributes: HashMap<String, Value>) -> BackendConfig {
         let raw = carina_core::parser::BackendConfig {
             backend_type: backend_type.to_string(),
-            attributes: (attributes).into(),
+            attributes: (attributes).into_iter().collect(),
             attribute_spans: Default::default(),
         };
         BackendConfig::try_from(&raw).unwrap()

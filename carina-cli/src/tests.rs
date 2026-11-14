@@ -976,7 +976,8 @@ fn plan_file_serde_round_trip() {
                         Value::Concrete(ConcreteValue::String("prod/carina.state".into())),
                     ),
                 ]))
-                .into(),
+                .into_iter()
+                .collect(),
                 attribute_spans: Default::default(),
             })
             .into(),

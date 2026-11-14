@@ -61,6 +61,10 @@ pub enum DiagnosticLine {
     Message(String),
     RootEvidence(crate::config_loader::RootEvidence),
     ModuleEvidence(crate::config_loader::ModuleEvidence),
+    ModuleEvidenceRelative {
+        evidence: crate::config_loader::ModuleEvidence,
+        root: crate::paths::ResolvedPath,
+    },
 }
 
 fn require_outside_module_message(
@@ -1026,6 +1030,7 @@ fn render_provider_type_warnings(warnings: &[crate::parser::ParseWarning]) -> St
 
 fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
     match error {
+        ParseError::BackendEvaluation(error) => parse_error_is_deferred_for_body_rejection(error),
         ParseError::DeferredForBodyUnsupported(_)
         | ParseError::UndefinedDeferredIterable { .. } => true,
         ParseError::Located { path: _, error } => parse_error_is_deferred_for_body_rejection(error),
@@ -1073,6 +1078,7 @@ fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
 
 fn display_parse_error_relative_to(error: &ParseError, root: &Path) -> String {
     match error {
+        ParseError::BackendEvaluation(error) => display_parse_error_relative_to(error, root),
         ParseError::AtElement(finding) => {
             let location = finding.location();
             let span = location.span();

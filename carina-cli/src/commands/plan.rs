@@ -2457,6 +2457,7 @@ impl PlanFile {
                 backend
                     .attributes
                     .values()
+                    .filter_map(|value| value.evaluated().ok())
                     .any(carina_core::value::contains_redacted_secret)
             })
             || plan.contains_redacted_secret_placeholders()
@@ -3867,16 +3868,14 @@ pub struct PlanWaitBinding {
     pub target: carina_core::resource::AbsoluteBindingAddress,
 }
 
-/// Serializable representation of an `upstream_state` declaration's
-/// source directory — needed because `parser::ast::UpstreamState` is
-/// not `Serialize`/`Deserialize` and pulling a `serde` derive into
-/// `carina-core::parser::ast` would have wider blast radius than this
-/// PR wants. Constructed once at plan time and consumed at
-/// apply-from-plan time.
+/// Upstream source and diagnostic call site saved at plan time. Older plans
+/// without a call site remain readable and retain their unlocated diagnostic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamSource {
     pub binding: carina_core::resource::AbsoluteBindingAddress,
     pub source: std::path::PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<carina_core::parser::UpstreamCallSite>,
 }
 
 /// Typed saved-plan snapshot with an explicit ownership tag.
@@ -5604,6 +5603,7 @@ fn build_plan_file_contents<E>(
             .upstream_states
             .iter()
             .map(|us| UpstreamSource {
+                caller: us.caller.clone(),
                 binding: us.binding.clone(),
                 source: us.source.clone(),
             })
@@ -6715,13 +6715,7 @@ pub(crate) async fn load_and_resolve_provider_configs<E>(
                     None,
                 )
                 .await
-                .map_err(AppError::from)
-                .map_err(|error| {
-                    error.with_upstream_source_locations(
-                        parsed.parser_binding_metadata.syntax().upstream_sources(),
-                        base_dir,
-                    )
-                })?;
+                .map_err(AppError::from)?;
                 let configs =
                     ResolvedProviderConfigs::resolve_with_remote(parsed, &remote_bindings, session)
                         .map_err(provider_config_resolution_error)?;
@@ -6759,13 +6753,7 @@ async fn load_and_resolve_plan_preview_provider_configs<E>(
                     None,
                 )
                 .await
-                .map_err(AppError::from)
-                .map_err(|error| {
-                    error.with_upstream_source_locations(
-                        parsed.parser_binding_metadata.syntax().upstream_sources(),
-                        base_dir,
-                    )
-                })?;
+                .map_err(AppError::from)?;
                 let configs = carina_core::parser::PlanPreviewProviderConfigs::resolve_with_remote(
                     parsed,
                     &remote_bindings,
@@ -6869,7 +6857,7 @@ async fn load_provider_referenced_upstream_states<E>(
             provider: required_by.provider,
             attribute: required_by.attribute,
             error: Box::new(
-                (if required_by
+                if required_by
                     .diagnostic_path
                     .as_ref()
                     .is_some_and(carina_core::resource::DiagnosticPath::is_secret)
@@ -6878,11 +6866,7 @@ async fn load_provider_referenced_upstream_states<E>(
                     AppError::Config(carina_core::resource::INSIDE_SECRET_MESSAGE.into())
                 } else {
                     error
-                })
-                .with_upstream_source_locations(
-                    parsed.parser_binding_metadata.syntax().upstream_sources(),
-                    base_dir,
-                ),
+                },
             ),
         })?;
         remote_bindings.extend(loaded);
@@ -7202,6 +7186,7 @@ pub(crate) fn admit_saved_upstream_snapshot(
         };
         let identity = carina_core::upstream_exports::UpstreamSourceIdentity::resolve(
             &carina_core::parser::ExpandedUpstreamState {
+                caller: source.caller.clone(),
                 binding: source.binding.clone(),
                 source: source.source.clone(),
             },
@@ -7455,6 +7440,7 @@ mod load_upstream_states_tests {
             let saved = admit_saved_upstream_snapshot(
                 &runtime,
                 &[UpstreamSource {
+                    caller: None,
                     binding: absolute_binding("orgs"),
                     source: "../upstream".into(),
                 }],
@@ -7604,6 +7590,7 @@ mod load_upstream_states_tests {
         let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         let schemas = carina_core::schema::SchemaRegistry::new();
         let sources = [UpstreamState {
+            caller: None,
             binding: absolute_binding("orgs"),
             source: dir.path().to_path_buf(),
         }];
@@ -7819,6 +7806,7 @@ mod load_upstream_states_tests {
         let runtime = crate::test_support::TestCommandRuntime::new();
         let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         let upstreams = ["orgs", "again"].map(|name| UpstreamState {
+            caller: None,
             binding: absolute_binding(name),
             source: dir.path().to_path_buf(),
         });
@@ -7867,6 +7855,7 @@ mod load_upstream_states_tests {
         );
         let context = wiring.provider_context().with_runtime(&empty);
         let source = [UpstreamState {
+            caller: None,
             binding: absolute_binding("orgs"),
             source: dir.path().to_path_buf(),
         }];
@@ -7914,6 +7903,7 @@ mod load_upstream_states_tests {
         let error = admit_saved_upstream_snapshot(
             &runtime,
             &[UpstreamSource {
+                caller: None,
                 binding: absolute_binding("orgs"),
                 source: "bad\0source".into(),
             }],
@@ -7959,6 +7949,7 @@ mod load_upstream_states_tests {
         let context = wiring.provider_context().with_runtime(&empty);
         let value = |api_value: &str| serde_json::json!({"$enum": {"identity": {"provider": "mock", "segments": ["actions", "OidcSubject"], "kind": "ClaimKey"}, "api_value": api_value}});
         let source = [UpstreamState {
+            caller: None,
             binding: absolute_binding("orgs"),
             source: dir.path().to_path_buf(),
         }];
@@ -8032,6 +8023,7 @@ mod load_upstream_states_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.upstream_states.push(UpstreamState {
+            caller: None,
             binding: absolute_binding("private_upstream"),
             source: PathBuf::from("private_source"),
         });
@@ -8203,10 +8195,12 @@ mod load_upstream_states_tests {
         });
         parsed.upstream_states.extend([
             UpstreamState {
+                caller: None,
                 binding: absolute_binding("mgmt"),
                 source: referenced,
             },
             UpstreamState {
+                caller: None,
                 binding: absolute_binding("unrelated"),
                 source: unrelated,
             },
@@ -8321,6 +8315,7 @@ mod load_upstream_states_tests {
         write_state(dir.path(), &[("account_id", serde_json::json!("123"))]);
 
         let upstream_states = vec![UpstreamState {
+            caller: None,
             binding: absolute_binding("orgs"),
             source: dir.path().to_path_buf(),
         }];
@@ -8513,6 +8508,7 @@ mod load_upstream_states_tests {
         load_upstream_states(
             &crate::test_support::TestCommandRuntime::new(),
             &[UpstreamState {
+                caller: None,
                 binding: absolute_binding("orgs"),
                 source: dir.to_path_buf(),
             }],
@@ -8632,6 +8628,7 @@ mod load_upstream_states_tests {
         )
         .unwrap();
         let upstream_states = vec![UpstreamState {
+            caller: None,
             binding: absolute_binding("orgs"),
             source: dir.path().to_path_buf(),
         }];
@@ -8676,6 +8673,7 @@ mod load_upstream_states_tests {
             .join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
         let template = fs::read_to_string(&state_path).unwrap();
         let upstream_states = vec![UpstreamState {
+            caller: None,
             binding: absolute_binding("orgs"),
             source: dir.path().to_path_buf(),
         }];
@@ -8743,6 +8741,7 @@ mod load_upstream_states_tests {
             .unwrap();
 
         let upstream_states = vec![UpstreamState {
+            caller: None,
             binding: absolute_binding("orgs"),
             source: dir.path().to_path_buf(),
         }];
@@ -8798,6 +8797,7 @@ mod load_upstream_states_tests {
         .unwrap();
 
         let upstream_states = vec![UpstreamState {
+            caller: None,
             binding: absolute_binding("orgs"),
             source: dir.path().to_path_buf(),
         }];
@@ -8837,6 +8837,7 @@ mod load_upstream_states_tests {
         .unwrap();
 
         let upstream_states = vec![UpstreamState {
+            caller: None,
             binding: absolute_binding("b"),
             source: PathBuf::from("../b"),
         }];
@@ -8866,6 +8867,7 @@ mod load_upstream_states_tests {
         fs::create_dir(&real).unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let upstreams = [UpstreamState {
+            caller: None,
             binding: absolute_binding("self"),
             source: link.clone(),
         }];
@@ -8906,6 +8908,7 @@ mod load_upstream_states_tests {
     #[tokio::test]
     async fn load_upstream_states_errors_when_source_missing() {
         let upstream_states = vec![UpstreamState {
+            caller: None,
             binding: absolute_binding("orgs"),
             source: PathBuf::from("/nonexistent/carina/upstream/path"),
         }];
@@ -8940,6 +8943,7 @@ mod load_upstream_states_tests {
         // Intentionally do NOT write carina.state.json.
 
         let upstream_states = vec![UpstreamState {
+            caller: None,
             binding: absolute_binding("orgs"),
             source: dir.path().to_path_buf(),
         }];
@@ -8980,6 +8984,7 @@ mod load_upstream_states_tests {
         .unwrap();
 
         let upstream_states = vec![UpstreamState {
+            caller: None,
             binding: absolute_binding("orgs"),
             source: dir.path().to_path_buf(),
         }];
@@ -9063,6 +9068,7 @@ let internal = upstream_state {{ source = '{}' }}"#,
 
         // A reads B.
         let upstream_states = vec![UpstreamState {
+            caller: None,
             binding: absolute_binding("bootstrap"),
             source: b_dir.clone(),
         }];
@@ -9127,6 +9133,7 @@ let back = upstream_state {{ source = '{}' }}"#,
         // Pretend a "downstream" reads A; the loader must catch the
         // A → B → A cycle.
         let upstream_states = vec![UpstreamState {
+            caller: None,
             binding: absolute_binding("a"),
             source: a_dir.clone(),
         }];

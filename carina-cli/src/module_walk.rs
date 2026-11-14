@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use carina_core::module_resolver::{self, LoadedModule, ModuleError, ModuleLoadError};
+use carina_core::module_resolver::{
+    self, LoadedModule, ModuleError, ModuleLoadError, ModuleRejection,
+};
 use carina_core::paths::{CanonicalPath, DisplayPath, ResolvedPath};
 
 /// One successfully loaded module in the shared depth-first module walk.
@@ -34,6 +36,29 @@ impl LoadedModuleAtPath {
 pub(crate) struct RejectedModuleAtPath {
     pub(crate) label: DisplayPath,
     pub(crate) error: std::sync::Arc<ModuleError>,
+    presentation: ImportPresentation,
+}
+
+enum ImportPresentation {
+    Boundary,
+    Resolution(ResolvedPath),
+}
+
+impl RejectedModuleAtPath {
+    pub(crate) fn diagnostic(&self) -> crate::error::AppError {
+        match &self.presentation {
+            ImportPresentation::Boundary => crate::error::AppError::ModuleImport {
+                path: self.label.clone(),
+                error: self.error.clone(),
+            },
+            ImportPresentation::Resolution(base) => {
+                crate::error::AppError::ModuleImportResolution {
+                    error: self.error.clone(),
+                    base: Box::new(base.clone()),
+                }
+            }
+        }
+    }
 }
 
 /// Modules reachable from a root parse, in depth-first pre-order.
@@ -63,10 +88,19 @@ impl ModuleWalk {
             let Ok(module_path) = base_dir.join(&import.path) else {
                 continue;
             };
+            let owners = parsed
+                .module_calls
+                .iter()
+                .filter(|call| call.module_name == import.alias)
+                .map(|call| call.id().clone())
+                .collect::<Vec<_>>();
             visit_module(
-                &module_path,
-                Path::new(&import.path),
-                &base_dir,
+                ModuleVisit {
+                    module_path: &module_path,
+                    diagnostic_path: Path::new(&import.path),
+                    diagnostic_base: &base_dir,
+                    owners: &owners,
+                },
                 &mut visited,
                 &mut walk,
                 &context,
@@ -74,6 +108,13 @@ impl ModuleWalk {
             );
         }
         walk
+    }
+
+    pub(crate) fn fatal_import(&self) -> Option<crate::error::AppError> {
+        self.rejections
+            .iter()
+            .find(|rejection| matches!(rejection.presentation, ImportPresentation::Resolution(_)))
+            .map(RejectedModuleAtPath::diagnostic)
     }
 
     pub(crate) fn rejections(&self) -> &[RejectedModuleAtPath] {
@@ -85,10 +126,20 @@ impl ModuleWalk {
     }
 }
 
+struct ModuleVisit<'a> {
+    module_path: &'a ResolvedPath,
+    diagnostic_path: &'a Path,
+    diagnostic_base: &'a ResolvedPath,
+    owners: &'a [carina_core::parser::ModuleCallId],
+}
+
 fn visit_module(
-    module_path: &ResolvedPath,
-    diagnostic_path: &Path,
-    diagnostic_base: &ResolvedPath,
+    ModuleVisit {
+        module_path,
+        diagnostic_path,
+        diagnostic_base,
+        owners,
+    }: ModuleVisit<'_>,
     visited: &mut HashSet<CanonicalPath>,
     walk: &mut ModuleWalk,
     context: &carina_core::parser::ProviderContext,
@@ -118,18 +169,32 @@ fn visit_module(
         // modules. The strict resolver still reports these typed failures.
         Err(ModuleLoadError::Unavailable(_)) => return,
         Err(ModuleLoadError::NotModule { error, imports }) => {
-            walk.rejections.extend(
-                ModuleLoadError::NotModule {
-                    error,
-                    imports: Vec::new(),
+            match *error {
+                ModuleRejection::NotADirectory { path } => {
+                    walk.rejections.push(RejectedModuleAtPath {
+                        label: DisplayPath::for_diagnostics_from(diagnostic_path, diagnostic_base),
+                        error: std::sync::Arc::new(ModuleError::OwnedByCalls {
+                            calls: owners.to_vec(),
+                            error: Box::new(ModuleError::NotADirectory { path }),
+                        }),
+                        presentation: ImportPresentation::Resolution(diagnostic_base.clone()),
+                    })
                 }
-                .into_errors()
-                .into_iter()
-                .map(|error| RejectedModuleAtPath {
-                    label: DisplayPath::for_diagnostics_from(diagnostic_path, diagnostic_base),
-                    error: std::sync::Arc::new(error),
-                }),
-            );
+                rejection @ (ModuleRejection::NoConfigurationFiles { path: _ }
+                | ModuleRejection::Root { root: _, body: _ }) => {
+                    walk.rejections
+                        .extend(rejection.into_errors().into_iter().map(|error| {
+                            RejectedModuleAtPath {
+                                label: DisplayPath::for_diagnostics_from(
+                                    diagnostic_path,
+                                    diagnostic_base,
+                                ),
+                                error: std::sync::Arc::new(error),
+                                presentation: ImportPresentation::Boundary,
+                            }
+                        }));
+                }
+            }
             imports
         }
     };
@@ -145,9 +210,12 @@ fn visit_module(
 
     for (child_module_path, child_diagnostic_path) in child_paths {
         visit_module(
-            &child_module_path,
-            &child_diagnostic_path,
-            diagnostic_base,
+            ModuleVisit {
+                module_path: &child_module_path,
+                diagnostic_path: &child_diagnostic_path,
+                diagnostic_base,
+                owners,
+            },
             visited,
             walk,
             context,

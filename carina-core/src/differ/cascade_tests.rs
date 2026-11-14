@@ -1664,6 +1664,7 @@ fn resolve_cascade_targets(
             .map(|resource| resource.as_inner().clone().into_unexpanded_for_test())
             .collect(),
         upstream_states: vec![crate::parser::UpstreamState {
+            caller: None,
             binding: absolute_binding("other"),
             source: "../other".into(),
         }],

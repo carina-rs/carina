@@ -462,7 +462,10 @@ impl HoverProvider {
             match carina_core::module_resolver::load_module(&module_path, doc.provider_context()) {
                 Ok(module) => module,
                 Err(
-                    carina_core::module_resolver::ModuleLoadError::NotModule { .. }
+                    carina_core::module_resolver::ModuleLoadError::NotModule {
+                        error: _,
+                        imports: _,
+                    }
                     | carina_core::module_resolver::ModuleLoadError::Unavailable(_),
                 ) => return None,
             };
@@ -528,7 +531,10 @@ impl HoverProvider {
             match carina_core::module_resolver::load_module(&module_path, doc.provider_context()) {
                 Ok(module) => module,
                 Err(
-                    carina_core::module_resolver::ModuleLoadError::NotModule { .. }
+                    carina_core::module_resolver::ModuleLoadError::NotModule {
+                        error: _,
+                        imports: _,
+                    }
                     | carina_core::module_resolver::ModuleLoadError::Unavailable(_),
                 ) => return None,
             };

@@ -296,6 +296,7 @@ fn assert_upstream_reference_export(annotated: bool) {
                         carina_core::upstream_exports::discover_upstream_exports(
                             &base,
                             &[carina_core::parser::UpstreamState {
+                                caller: None,
                                 binding: carina_core::resource::RelativeBindingName::new("up"),
                                 source: "./upstream".into(),
                             }],

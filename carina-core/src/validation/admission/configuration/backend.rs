@@ -142,11 +142,8 @@ where
         &self,
     ) -> Option<Result<AdmittedConfiguration<kind::BackendAttribute>, Vec<LocatedBackendError>>>
     {
-        let admitted = admit_directory_backend(
-            self.directory_verdict(),
-            self.file().backend.as_ref(),
-            self.syntax(),
-        )?;
+        let admitted =
+            admit_directory_backend(self.directory_verdict(), self.file().backend.as_ref())?;
         Some(admitted.map_err(|error| {
             error
                 .into_unlocated()
@@ -176,7 +173,6 @@ where
 fn admit_directory_backend<U, T, N, P: PlaceholderKind, B: BindingAddress>(
     verdict: &crate::config_loader::DirectoryVerdict<U, T, N>,
     backend: Option<&parser::BackendConfig<P, B>>,
-    syntax: &parser::SyntaxInventory<B>,
 ) -> Option<Result<AdmittedConfiguration<kind::BackendAttribute>, BackendConfigError>> {
     match verdict {
         crate::config_loader::DirectoryVerdict::Root(root) if root.has_sole_backend() => {}
@@ -186,19 +182,20 @@ fn admit_directory_backend<U, T, N, P: PlaceholderKind, B: BindingAddress>(
         | crate::config_loader::DirectoryVerdict::Unknown(_) => return None,
     }
     let backend = backend?;
-    let failed = |key: &AttributeKey| {
-        matches!(
-            syntax.backend_value_state(key),
-            parser::BackendValueState::EvaluationFailed
-        )
-    };
-    let checked = check(backend, failed);
-    // Recovery can report independent errors, but cannot issue a complete
-    // receipt while even one field's evaluation has failed.
-    if backend.attributes.keys().any(failed) && checked.is_ok() {
-        return None;
+    match check(backend) {
+        Ok(builder) => Some(Ok(builder.admit_payload())),
+        Err(BackendConfigError::Invalid(mut errors)) => {
+            errors
+                .errors
+                .retain(|error| !matches!(error, BackendAttributeError::EvaluationFailed { .. }));
+            if errors.errors.is_empty() {
+                None
+            } else {
+                Some(Err(errors.into()))
+            }
+        }
+        Err(error) => Some(Err(error)),
     }
-    Some(checked.map(|builder| builder.admit_payload()))
 }
 
 impl<E> crate::config_loader::RootDirectoryParse<E> {
@@ -207,12 +204,8 @@ impl<E> crate::config_loader::RootDirectoryParse<E> {
         &self,
     ) -> Option<Result<AdmittedConfiguration<kind::BackendAttribute>, Vec<UnlocatedBackendError>>>
     {
-        admit_directory_backend(
-            &self.complete_directory_verdict(),
-            self.backend.as_ref(),
-            self.parser_binding_metadata.syntax(),
-        )
-        .map(|result| result.map_err(BackendConfigError::into_unlocated))
+        admit_directory_backend(&self.complete_directory_verdict(), self.backend.as_ref())
+            .map(|result| result.map_err(BackendConfigError::into_unlocated))
     }
 }
 
@@ -258,6 +251,12 @@ impl std::error::Error for BackendConfigErrors {}
 /// One schema failure associated with a backend attribute.
 #[derive(Debug, Error)]
 pub enum BackendAttributeError {
+    #[error("{error}")]
+    EvaluationFailed {
+        backend_type: String,
+        attribute: crate::parser::AttributeKey,
+        error: Arc<crate::parser::ParseError>,
+    },
     #[error("Unknown attribute '{attribute}' for backend type '{backend_type}'")]
     UnknownAttribute {
         backend_type: String,
@@ -279,7 +278,8 @@ pub enum BackendAttributeError {
 impl BackendAttributeError {
     pub fn attribute(&self) -> &crate::parser::AttributeKey {
         match self {
-            Self::UnknownAttribute { attribute, .. }
+            Self::EvaluationFailed { attribute, .. }
+            | Self::UnknownAttribute { attribute, .. }
             | Self::MissingRequiredAttribute { attribute, .. }
             | Self::InvalidAttribute { attribute, .. } => attribute,
         }
@@ -287,6 +287,7 @@ impl BackendAttributeError {
 
     fn sort_rank(&self) -> u8 {
         match self {
+            Self::EvaluationFailed { .. } => 3,
             Self::UnknownAttribute { .. } => 0,
             Self::MissingRequiredAttribute { .. } => 1,
             Self::InvalidAttribute { .. } => 2,
@@ -398,12 +399,11 @@ impl AdmittedConfiguration<kind::BackendAttribute> {
 pub fn admit<P: PlaceholderKind, B: BindingAddress>(
     config: &parser::BackendConfig<P, B>,
 ) -> Result<AdmittedConfiguration<kind::BackendAttribute>, BackendConfigError> {
-    check(config, |_| false).map(|builder| builder.admit_payload())
+    check(config).map(|builder| builder.admit_payload())
 }
 
 fn check<P: PlaceholderKind, B: BindingAddress>(
     config: &parser::BackendConfig<P, B>,
-    failed: impl Fn(&AttributeKey) -> bool,
 ) -> Result<ConfigurationBuilder<kind::BackendAttribute>, BackendConfigError> {
     let kind = match config.backend_type.as_str() {
         "s3" => BackendKind::S3,
@@ -442,9 +442,17 @@ fn check<P: PlaceholderKind, B: BindingAddress>(
                 });
                 continue;
             };
-            if failed(key) {
-                continue;
-            }
+            let value = match value {
+                parser::BackendAttributeValue::Evaluated(value) => value,
+                parser::BackendAttributeValue::Failed(error) => {
+                    errors.push(BackendAttributeError::EvaluationFailed {
+                        backend_type: kind.name().into(),
+                        attribute: key.clone(),
+                        error: Arc::clone(error),
+                    });
+                    continue;
+                }
+            };
             let ty = destination.contract.attr();
             // The enum's actual namespace is intentional: backend regions do
             // not use provider-block aliases or depend on provider loading.

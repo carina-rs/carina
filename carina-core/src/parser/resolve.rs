@@ -68,6 +68,8 @@ enum DefaultTagResolutionPolicy {
 /// semantic error. A semantic finding always has parser-owned provenance.
 #[derive(Debug, thiserror::Error)]
 pub enum AnalysisResolutionError {
+    #[error("{0}")]
+    BackendEvaluation(std::sync::Arc<ParseError>),
     #[error(transparent)]
     Invariant(#[from] super::AnalysisTreeError),
     #[error(transparent)]
@@ -77,6 +79,9 @@ pub enum AnalysisResolutionError {
 impl AnalysisResolutionError {
     pub(crate) fn from_parse_failure(error: ParseError) -> Self {
         match error {
+            ParseError::BackendEvaluation(error) if error.element_diagnostic().is_some() => {
+                Self::BackendEvaluation(error)
+            }
             ParseError::AtElement(finding) => Self::Diagnostic(finding),
             error => Self::Invariant(super::AnalysisTreeError::new(
                 super::AnalysisTreeErrorKind::MissingSyntaxProvenance {
@@ -1443,14 +1448,26 @@ fn evaluate_backend_attribute(
         key,
         span,
     }: BackendAttributeSource<'_>,
-    value: &Value,
+    value: &super::BackendAttributeValue<ParserPlaceholder, RelativeBindingName>,
     syntax: &super::SyntaxInventory,
     binding_map: &HashMap<String, HashMap<String, Value>>,
     config: &ProviderContext,
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     resolution: ResolutionContext,
-) -> Result<Value, ParseError> {
-    let evaluated = resolve_function_calls_only(value, binding_map, config, session, resolution)
+) -> super::BackendAttributeValue<ParserPlaceholder, RelativeBindingName> {
+    use super::BackendAttributeValue;
+    let value = match value {
+        BackendAttributeValue::Evaluated(value) => value,
+        BackendAttributeValue::Failed(_) => return value.clone(),
+    };
+    let evaluated = (|| {
+        let evaluated = resolve_function_calls_only(
+            value,
+            binding_map,
+            config,
+            session,
+            strict_resolution_context(),
+        )
         .map_err(|error| {
             match syntax
                 .backend_keys()
@@ -1462,45 +1479,45 @@ fn evaluate_backend_attribute(
                 None => error,
             }
         })?;
-    if resolution.backend_is_demanded() && crate::value::contains_secret(&evaluated) {
-        let span = span.ok_or_else(|| ParseError::InternalError {
-            expected: format!("source span for backend attribute '{key}'"),
-            context: "secret-derived backend attribute validation".to_string(),
-        })?;
-        let error = ParseError::SecretDerivedBackendAttribute {
-            backend_type: backend_type.to_owned(),
-            attribute: key.clone(),
-            line: span.start_line(),
-            start_column: span.start_column(),
-            end_column: span.end_column(),
-        };
-        return Err(
-            match syntax
-                .backend_keys()
-                .iter()
-                .rev()
-                .find(|record| record.detail() == key)
-            {
-                Some(record) => error.at(record.location()),
-                None => error,
-            },
-        );
+        if resolution.backend_is_demanded() && crate::value::contains_secret(&evaluated) {
+            let span = span.ok_or_else(|| ParseError::InternalError {
+                expected: format!("source span for backend attribute '{key}'"),
+                context: "secret-derived backend attribute validation".to_string(),
+            })?;
+            let error = ParseError::SecretDerivedBackendAttribute {
+                backend_type: backend_type.to_owned(),
+                attribute: key.clone(),
+                line: span.start_line(),
+                start_column: span.start_column(),
+                end_column: span.end_column(),
+            };
+            return Err(
+                match syntax
+                    .backend_keys()
+                    .iter()
+                    .rev()
+                    .find(|record| record.detail() == key)
+                {
+                    Some(record) => error.at(record.location()),
+                    None => error,
+                },
+            );
+        }
+        Ok(evaluated)
+    })();
+    match evaluated {
+        Ok(value) => BackendAttributeValue::Evaluated(value),
+        Err(error) => BackendAttributeValue::Failed(std::sync::Arc::new(error)),
     }
-    Ok(evaluated)
 }
 
-/// Recover every backend value independently using the same evaluator and
-/// policy as strict loading. A failed value remains authored but cannot be
-/// admitted as an unresolved schema input.
-pub(crate) fn recover_backend_values(
-    target: &mut ParsedFile,
-    source: &ParsedFile,
+/// The buffer parser crosses the same value-evaluation seam as directory
+/// resolution. It has no preceding backend evaluation or recovery pass.
+pub(crate) fn resolve_backend_attribute_values_for_buffer(
+    parsed: &mut ParsedFile,
     config: &ProviderContext,
 ) {
-    let (Some(target_backend), Some(backend)) = (&mut target.backend, &source.backend) else {
-        return;
-    };
-    let bindings = source
+    let bindings = parsed
         .iter_top_level_resources()
         .filter_map(|resource| {
             Some((
@@ -1509,27 +1526,22 @@ pub(crate) fn recover_backend_values(
             ))
         })
         .collect();
-    for (key, value) in &backend.attributes {
-        match evaluate_backend_attribute(
-            BackendAttributeSource {
-                backend_type: &backend.backend_type,
-                key,
-                span: backend.attribute_spans.get(key).copied(),
-            },
-            value,
-            source.parser_binding_metadata.syntax(),
-            &bindings,
-            config,
-            None,
-            strict_resolution_context(),
-        ) {
-            Ok(value) => {
-                target_backend.attributes.insert(key.clone(), value);
-            }
-            Err(_) => target
-                .parser_binding_metadata
-                .syntax
-                .record_backend_evaluation_failure(key.clone()),
+    let syntax = parsed.parser_binding_metadata.syntax();
+    if let Some(backend) = &mut parsed.backend {
+        for (key, value) in &mut backend.attributes {
+            *value = evaluate_backend_attribute(
+                BackendAttributeSource {
+                    backend_type: &backend.backend_type,
+                    key,
+                    span: backend.attribute_spans.get(key).copied(),
+                },
+                value,
+                syntax,
+                &bindings,
+                config,
+                None,
+                diagnostics_resolution_context(),
+            );
         }
     }
 }
@@ -1702,9 +1714,22 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
                 fn_ctx.config,
                 session,
                 crate::config_loader::backend_resolution_context(resolution),
-            )
-            .map_err(RootInputFailure::Backend)?;
-            *value = evaluated;
+            );
+            let backend_resolution = crate::config_loader::backend_resolution_context(resolution);
+            *value = match evaluated {
+                super::BackendAttributeValue::Failed(error)
+                    if !backend_resolution.retains_failed_calls()
+                        && backend_resolution.backend_is_demanded() =>
+                {
+                    // Initial failures keep their original public error variant;
+                    // rechecks share the exact cause already owned by the value.
+                    let error = std::sync::Arc::try_unwrap(error)
+                        .unwrap_or_else(ParseError::BackendEvaluation);
+                    return Err(RootInputFailure::Backend(error));
+                }
+                value @ (super::BackendAttributeValue::Evaluated(_)
+                | super::BackendAttributeValue::Failed(_)) => value,
+            };
         }
     }
 

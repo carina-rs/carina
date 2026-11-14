@@ -569,7 +569,8 @@ mod tests {
                 "path".to_string(),
                 Value::Concrete(ConcreteValue::String(path.to_string().into())),
             )]))
-            .into(),
+            .into_iter()
+            .collect(),
             attribute_spans: Default::default(),
         }
     }
@@ -591,7 +592,8 @@ mod tests {
                     Value::Concrete(ConcreteValue::String("us-east-1".into())),
                 ),
             ]))
-            .into(),
+            .into_iter()
+            .collect(),
             attribute_spans: Default::default(),
         }
     }

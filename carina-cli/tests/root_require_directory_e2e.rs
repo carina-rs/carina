@@ -19,6 +19,63 @@ struct Directory {
     home: PathBuf,
 }
 
+#[test]
+fn round17_single_file_import_keeps_error_severity_and_call_site() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    fs::create_dir_all(project.join("modules")).unwrap();
+    let directory = Directory {
+        _temp: temp,
+        home: project.join("home"),
+        project,
+    };
+    fs::create_dir_all(&directory.home).unwrap();
+    fs::write(
+        directory.project.join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.project.join("main.crn"),
+        "let selected = use { source = './modules/x.crn' }\nselected {}\n",
+    )
+    .unwrap();
+    fs::write(directory.project.join("modules/x.crn"), "arguments {}\n").unwrap();
+    for args in [vec!["validate", "."], vec!["plan", "."], vec!["lint", "."]] {
+        let output = directory.run(&args);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(stderr.starts_with("Error:"), "{args:?}: {stderr}");
+        assert!(
+            stderr.starts_with("Error: Module resolution error: Module path"),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("Single-file modules are not supported"),
+            "{args:?}: {stderr}"
+        );
+        assert_eq!(
+            stderr
+                .matches("Single-file modules are not supported")
+                .count(),
+            1,
+            "{args:?}: {stderr}"
+        );
+    }
+    let output = directory.run(&["validate", "--json", "."]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let errors = report["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{report}");
+    assert_eq!(errors[0]["severity"], "error");
+    assert_eq!(
+        errors[0]["location"],
+        json!({"file": "main.crn", "range": {"start": {"line": 2, "column": 1}, "end": {"line": 2, "column": 9}}}),
+        "{report}"
+    );
+}
+
 impl Directory {
     fn new(condition: &str) -> Self {
         let temp = tempfile::tempdir().unwrap();
@@ -2271,6 +2328,38 @@ fn round12_saved_plan_apply_rejects_current_upstream_template() {
         );
         assert_eq!(before, paths.each_ref().map(|path| fs::read(path).unwrap()));
     }
+}
+
+#[test]
+fn round17_saved_plan_rejection_keeps_caller_when_current_config_cannot_load() {
+    let (directory, upstream) = round12_upstream_provider_fixture();
+    fs::write(
+        upstream.join("declarations.crn"),
+        "exports { value: String = 'published' }\n",
+    )
+    .unwrap();
+    round12_write_upstream_state(&upstream);
+    success(&directory.run(&["plan", "--out", "saved.plan", "."]));
+    fs::write(
+        upstream.join("declarations.crn"),
+        "// authored module\narguments {}\n",
+    )
+    .unwrap();
+    fs::write(upstream.join("carina.state.json"), "invalid state sentinel").unwrap();
+    fs::write(directory.project.join("broken.crn"), "let broken =\n").unwrap();
+    let paths = [
+        directory.project.join("carina.state.json"),
+        directory.home.join("mock-state.json"),
+        upstream.join("carina.state.json"),
+        directory.project.join("saved.plan"),
+    ];
+    let before = paths.each_ref().map(|path| fs::read(path).unwrap());
+    round12_assert_template_rejection(
+        &directory.run(&["apply", "--auto-approve", "saved.plan"]),
+        "arguments block",
+        std::path::Path::new("../mod"),
+    );
+    assert_eq!(before, paths.each_ref().map(|path| fs::read(path).unwrap()));
 }
 
 #[test]

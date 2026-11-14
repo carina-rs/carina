@@ -2469,6 +2469,7 @@ fn resolve_upstream_export_keys(
 ) -> Option<carina_core::upstream_exports::UpstreamExportEntries> {
     let base = base_path?;
     let upstream = carina_core::parser::UpstreamState {
+        caller: None,
         binding: carina_core::resource::RelativeBindingName::new(binding),
         source: std::path::PathBuf::from(source),
     };
@@ -2548,6 +2549,7 @@ fn infer_for_binding_type(
         .or_insert_with(|| {
             let binding = carina_core::resource::RelativeBindingName::new(iterable.binding.clone());
             let upstream = carina_core::parser::UpstreamState {
+                caller: None,
                 binding: binding.clone(),
                 source: std::path::PathBuf::from(source),
             };

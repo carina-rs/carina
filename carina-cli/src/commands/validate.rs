@@ -991,6 +991,7 @@ let observed_names = roles.names
 
     fn upstream(binding: &str, source: &str) -> UpstreamState {
         UpstreamState {
+            caller: None,
             binding: carina_core::resource::RelativeBindingName::new(binding),
             source: std::path::PathBuf::from(source),
         }

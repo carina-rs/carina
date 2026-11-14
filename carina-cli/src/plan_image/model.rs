@@ -1372,6 +1372,7 @@ mod tests {
         let mut configuration = carina_core::parser::ExpandedParsedFile::default();
         configuration.resources = vec![first.clone(), second.clone()];
         configuration.upstream_states = vec![carina_core::parser::UpstreamState {
+            caller: None,
             binding: absolute_binding("future"),
             source: "upstream".into(),
         }];

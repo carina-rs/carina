@@ -5207,10 +5207,7 @@ fn rejected_module_errors(module_walk: &ModuleWalk) -> Vec<AppError> {
     module_walk
         .rejections()
         .iter()
-        .map(|rejection| AppError::ModuleImport {
-            path: rejection.label.clone(),
-            error: rejection.error.clone(),
-        })
+        .map(crate::module_walk::RejectedModuleAtPath::diagnostic)
         .collect()
 }
 

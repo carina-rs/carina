@@ -825,6 +825,9 @@ fn render_app_error(
                     error::HumanErrorLine::RootEvidence(evidence) => {
                         format!("  Note: {}\n", evidence.note())
                     }
+                    error::HumanErrorLine::ModuleEvidenceRelative { evidence, root } => {
+                        format!("  Note: {}\n", evidence.note_relative_to(&root))
+                    }
                     error::HumanErrorLine::ModuleEvidence(evidence) => {
                         format!("  Note: {}\n", evidence.note())
                     }

@@ -108,7 +108,10 @@ pub fn load_resolved_module_signatures_with_overrides<E, B: crate::resource::Bin
             // boundary errors are reported alongside the body diagnostic.
             let loaded = match super::loader::load_module_with_overrides(&path, config, overrides) {
                 Ok(module) => Some(module),
-                Err(super::loader::ModuleLoadError::NotModule { .. }) => None,
+                Err(super::loader::ModuleLoadError::NotModule {
+                    error: _,
+                    imports: _,
+                }) => None,
                 Err(super::loader::ModuleLoadError::Unavailable(_)) => {
                     match super::loader::load_module_with_overrides(
                         &path,
@@ -116,7 +119,10 @@ pub fn load_resolved_module_signatures_with_overrides<E, B: crate::resource::Bin
                         overrides,
                     ) {
                         Ok(module) => Some(module),
-                        Err(super::loader::ModuleLoadError::NotModule { .. }) => None,
+                        Err(super::loader::ModuleLoadError::NotModule {
+                            error: _,
+                            imports: _,
+                        }) => None,
                         Err(super::loader::ModuleLoadError::Unavailable(_)) => None,
                     }
                 }

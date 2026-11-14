@@ -1434,7 +1434,9 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
     });
     file.backend = Some(BackendConfig {
         backend_type: "local".to_string(),
-        attributes: (HashMap::<String, _>::from([("path".to_string(), empty())])).into(),
+        attributes: HashMap::<String, _>::from([("path".to_string(), empty())])
+            .into_iter()
+            .collect(),
         attribute_spans: Default::default(),
     });
     file.variables.insert("greeting".to_string(), empty());
@@ -3617,29 +3619,44 @@ fn parse_backend_block() {
     let backend = result.backend.unwrap();
     assert_eq!(backend.backend_type, "s3");
     assert_eq!(
-        backend.attributes.get("bucket"),
+        backend
+            .attributes
+            .get("bucket")
+            .and_then(|value| value.evaluated().ok()),
         Some(&Value::Concrete(ConcreteValue::String(
             "my-carina-state".into()
         )))
     );
     assert_eq!(
-        backend.attributes.get("key"),
+        backend
+            .attributes
+            .get("key")
+            .and_then(|value| value.evaluated().ok()),
         Some(&Value::Concrete(ConcreteValue::String(
             "infra/prod/carina.crnstate".into()
         )))
     );
     assert_eq!(
-        backend.attributes.get("region"),
+        backend
+            .attributes
+            .get("region")
+            .and_then(|value| value.evaluated().ok()),
         Some(&Value::Concrete(ConcreteValue::enum_identifier(
             "aws.Region.ap_northeast_1".to_string()
         )))
     );
     assert_eq!(
-        backend.attributes.get("encrypt"),
+        backend
+            .attributes
+            .get("encrypt")
+            .and_then(|value| value.evaluated().ok()),
         Some(&Value::Concrete(ConcreteValue::Bool(true)))
     );
     assert_eq!(
-        backend.attributes.get("auto_create"),
+        backend
+            .attributes
+            .get("auto_create")
+            .and_then(|value| value.evaluated().ok()),
         Some(&Value::Concrete(ConcreteValue::Bool(true)))
     );
 
@@ -3723,7 +3740,10 @@ fn parse_backend_block_with_resources() {
     let backend = result.backend.unwrap();
     assert_eq!(backend.backend_type, "s3");
     assert_eq!(
-        backend.attributes.get("bucket"),
+        backend
+            .attributes
+            .get("bucket")
+            .and_then(|value| value.evaluated().ok()),
         Some(&Value::Concrete(ConcreteValue::String("my-state".into())))
     );
 

@@ -297,7 +297,8 @@ mod tests {
                     path.to_string_lossy().into_owned().into(),
                 )),
             )]))
-            .into(),
+            .into_iter()
+            .collect(),
             attribute_spans: Default::default(),
         }
     }
@@ -565,7 +566,7 @@ mod tests {
                         dst_path.to_string_lossy().into_owned().into(),
                     )),
                 );
-                (m).into()
+                (m).into_iter().collect()
             },
             attribute_spans: Default::default(),
         };
@@ -639,7 +640,7 @@ mod tests {
                         dst_path.to_string_lossy().into_owned().into(),
                     )),
                 );
-                (m).into()
+                (m).into_iter().collect()
             },
             attribute_spans: Default::default(),
         };

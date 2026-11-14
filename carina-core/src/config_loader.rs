@@ -571,11 +571,17 @@ impl CompleteDirectoryVerdict {
 pub struct RootDirectoryVerdict(std::sync::Arc<RootDeclarations>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RootDeclaration {
+struct RootDeclaration<K> {
+    _kind: K,
     location: parser::DeclarationLocation,
     file: crate::paths::PersistedPath,
     utf16_columns: (u32, u32),
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderRoot;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BackendRoot;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FirstRootDeclaration {
     Provider,
@@ -588,27 +594,29 @@ enum BackendOwnership {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RootDeclarations {
-    Provider(RootDeclaration),
+    Provider(RootDeclaration<ProviderRoot>),
     Backend {
-        backend: RootDeclaration,
+        backend: RootDeclaration<BackendRoot>,
         ownership: BackendOwnership,
     },
     Both {
         first: FirstRootDeclaration,
-        provider: RootDeclaration,
-        backend: RootDeclaration,
+        provider: RootDeclaration<ProviderRoot>,
+        backend: RootDeclaration<BackendRoot>,
         ownership: BackendOwnership,
     },
 }
-impl RootDeclaration {
-    fn provider(&self) -> RootEvidence {
+impl RootDeclaration<ProviderRoot> {
+    fn evidence(&self) -> RootEvidence {
         RootEvidence::Provider {
             location: self.location.clone(),
             file: self.file.clone(),
             utf16_columns: self.utf16_columns,
         }
     }
-    fn backend(&self) -> RootEvidence {
+}
+impl RootDeclaration<BackendRoot> {
+    fn evidence(&self) -> RootEvidence {
         RootEvidence::Backend {
             location: self.location.clone(),
             file: self.file.clone(),
@@ -623,16 +631,6 @@ pub struct ModuleTemplateDeclarations(std::sync::Arc<ModuleEvidence>);
 impl ModuleTemplateDeclarations {
     pub fn evidence(&self) -> &ModuleEvidence {
         &self.0
-    }
-    pub(crate) fn displayed_from(&self, root: &ResolvedPath) -> Self {
-        let mut evidence = self.evidence().clone();
-        let file = evidence
-            .file
-            .lexical_relative_to(root.persisted_path())
-            .unwrap_or_else(|| evidence.file.display().clone())
-            .into_source_path();
-        evidence.location = evidence.location.with_display_file(file);
-        Self(std::sync::Arc::new(evidence))
     }
 }
 
@@ -674,6 +672,18 @@ impl ModuleEvidence {
         format!(
             "This {} makes the directory a module definition.",
             self.declaration()
+        )
+    }
+    pub fn note_relative_to(&self, root: &ResolvedPath) -> String {
+        let label = self
+            .file
+            .lexical_relative_to(root.persisted_path())
+            .unwrap_or_else(|| self.file.display().clone());
+        format!(
+            "directory is a module definition because of the {} at {}:{}.",
+            self.declaration(),
+            label,
+            self.location.span().start_line()
         )
     }
     pub fn note(&self) -> String {
@@ -770,19 +780,19 @@ impl RootDirectoryVerdict {
     }
     pub fn evidence(&self) -> RootEvidence {
         match self.0.as_ref() {
-            RootDeclarations::Provider(provider) => provider.provider(),
+            RootDeclarations::Provider(provider) => provider.evidence(),
             RootDeclarations::Backend {
                 backend,
                 ownership: _,
-            } => backend.backend(),
+            } => backend.evidence(),
             RootDeclarations::Both {
                 first,
                 provider,
                 backend,
                 ownership: _,
             } => match first {
-                FirstRootDeclaration::Provider => provider.provider(),
-                FirstRootDeclaration::Backend => backend.backend(),
+                FirstRootDeclaration::Provider => provider.evidence(),
+                FirstRootDeclaration::Backend => backend.evidence(),
             },
         }
     }
@@ -794,7 +804,7 @@ impl RootDirectoryVerdict {
                 provider,
                 backend: _,
                 ownership: _,
-            } => Some(provider.provider()),
+            } => Some(provider.evidence()),
             RootDeclarations::Backend {
                 backend: _,
                 ownership: _,
@@ -812,7 +822,7 @@ impl RootDirectoryVerdict {
                 provider: _,
                 backend,
                 ownership: _,
-            } => Some(backend.backend()),
+            } => Some(backend.evidence()),
             RootDeclarations::Provider(_) => None,
         }
     }
@@ -827,14 +837,14 @@ impl RootDirectoryVerdict {
         use crate::module_resolver::ModuleError;
         match self.0.as_ref() {
             RootDeclarations::Provider(provider) => (
-                ModuleError::ProviderInModule.with_root_evidence(provider.provider()),
+                ModuleError::ProviderInModule.with_root_evidence(provider.evidence()),
                 vec![],
             ),
             RootDeclarations::Backend {
                 backend,
                 ownership: _,
             } => (
-                ModuleError::BackendInModule.with_root_evidence(backend.backend()),
+                ModuleError::BackendInModule.with_root_evidence(backend.evidence()),
                 vec![],
             ),
             RootDeclarations::Both {
@@ -843,8 +853,8 @@ impl RootDirectoryVerdict {
                 backend,
                 ownership: _,
             } => (
-                ModuleError::ProviderInModule.with_root_evidence(provider.provider()),
-                vec![ModuleError::BackendInModule.with_root_evidence(backend.backend())],
+                ModuleError::ProviderInModule.with_root_evidence(provider.evidence()),
+                vec![ModuleError::BackendInModule.with_root_evidence(backend.evidence())],
             ),
         }
     }
@@ -1046,21 +1056,26 @@ impl<C: InventoryCompleteness> DirectoryInventories<'_, C> {
                     file: file.clone(),
                     utf16_columns: block.detail().utf16_columns(),
                 };
-                let root_declaration = || RootDeclaration {
-                    location: block.location().clone(),
-                    file: file.clone(),
-                    utf16_columns: block.detail().utf16_columns(),
-                };
                 match block.detail().kind() {
                     ConfigurationBlock::Provider => {
-                        provider.get_or_insert_with(root_declaration);
+                        provider.get_or_insert_with(|| RootDeclaration {
+                            _kind: ProviderRoot,
+                            location: block.location().clone(),
+                            file: file.clone(),
+                            utf16_columns: block.detail().utf16_columns(),
+                        });
                     }
                     ConfigurationBlock::Backend => {
                         backend_count += 1;
                         if provider.is_none() && backend.is_none() {
                             first = FirstRootDeclaration::Backend;
                         }
-                        backend.get_or_insert_with(root_declaration);
+                        backend.get_or_insert_with(|| RootDeclaration {
+                            _kind: BackendRoot,
+                            location: block.location().clone(),
+                            file: file.clone(),
+                            utf16_columns: block.detail().utf16_columns(),
+                        });
                     }
                     ConfigurationBlock::Arguments => {
                         module_evidence.get_or_insert_with(|| {
@@ -1467,7 +1482,8 @@ impl ParsedSourceBuffer {
         file: &Path,
         config: &ProviderContext,
     ) -> Result<Self, parser::ParseError> {
-        let parsed = parser::parse_file(text, file, config)?;
+        let mut parsed = parser::parse_file(text, file, config)?;
+        parser::resolve_backend_attribute_values_for_buffer(&mut parsed, config);
         Ok(Self {
             file: parser::SourceFileId::new(file.to_path_buf()),
             text: text.into(),
@@ -1483,6 +1499,7 @@ impl ParsedSourceBuffer {
 struct SnapshotSource {
     file: ResolvedPath,
     text: Option<std::sync::Arc<str>>,
+    inventory: Option<parser::SyntaxInventory>,
 }
 
 struct SnapshotBufferMember {
@@ -1549,7 +1566,18 @@ impl DirectoryBufferSnapshot {
                         .ok()
                         .map(std::sync::Arc::from)
                 };
-                SnapshotSource { file, text }
+                let inventory = if file.identity() == pinned.identity() {
+                    Some(buffer.parsed().parser_binding_metadata.syntax().clone())
+                } else {
+                    text.as_deref().and_then(|text| {
+                        parser::parse_syntax_inventory(text, &file.source_label()).ok()
+                    })
+                };
+                SnapshotSource {
+                    file,
+                    text,
+                    inventory,
+                }
             })
             .collect();
         Ok(Self {
@@ -1558,31 +1586,52 @@ impl DirectoryBufferSnapshot {
         })
     }
 
-    fn recover_backend_values(&self, parsed: &mut ParsedFile, config: &ProviderContext) {
-        if parsed.backend.is_none() {
-            return;
+    /// Partial buffers still need the ordinary sibling binding fixed point.
+    /// This parse supplies scope, not a second evaluation-failure side table.
+    fn backend_with_sibling_bindings(
+        &self,
+        config: &ProviderContext,
+    ) -> Option<parser::ParserBackendConfig> {
+        self.member.buffer.parsed().backend.as_ref()?;
+        let has_sibling_bindings = self
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != self.member.index)
+            .filter_map(|(_, source)| source.inventory.as_ref())
+            .any(|inventory| {
+                !inventory.binding_names().is_empty()
+                    || inventory
+                        .declarations()
+                        .iter()
+                        .any(|declaration| declaration.kind() == DeclarationKind::UserFunction)
+            });
+        if !has_sibling_bindings {
+            return None;
         }
-        // Reuse the directory's ordinary seed fixed point. Unreadable or
-        // syntactically broken siblings cannot contribute values to recovery.
         let sources = self
             .sources
             .iter()
-            .filter_map(|source| {
-                let text = source.text.as_ref()?;
-                parser::parse_syntax_inventory(text, &source.file.source_label()).ok()?;
-                Some((source.file.source_label(), text.to_string()))
+            .enumerate()
+            .filter_map(|(index, source)| {
+                source.inventory.as_ref()?;
+                let label = if index == self.member.index {
+                    self.member.buffer.file.path().to_path_buf()
+                } else {
+                    source.file.source_label()
+                };
+                Some((label, source.text.as_ref()?.to_string()))
             })
             .collect::<Vec<_>>();
-        if let Ok(files) = parse_directory_files(&sources, config)
-            && let Some((_, member)) = files.iter().find(|(_, member)| {
-                member.source.identity() == self.sources[self.member.index].file.identity()
-            })
-        {
-            parser::recover_backend_values(parsed, &member.parsed, config);
-        } else {
-            let source = parsed.clone();
-            parser::recover_backend_values(parsed, &source, config);
-        }
+        let files = parse_directory_files(&sources, config).ok()?;
+        let (_, member) = files.into_iter().find(|(_, member)| {
+            member.source.identity() == self.sources[self.member.index].file.identity()
+        })?;
+        let mut member = member.into_inner();
+        // Backend evaluation precedes ordinary values. A later value failure
+        // does not invalidate the already produced, typed backend attributes.
+        let _ = parser::resolve_resource_refs_for_diagnostics(&mut member, config);
+        member.backend
     }
 
     fn require_scope(&self) -> DirectoryRequireScope {
@@ -1591,18 +1640,15 @@ impl DirectoryBufferSnapshot {
             .iter()
             .map(|source| {
                 source
-                    .text
+                    .inventory
                     .as_ref()
-                    .and_then(|text| {
-                        parser::parse_syntax_inventory(text, &source.file.source_label()).ok()
-                    })
                     .map(|inventory| (inventory, source.file.persisted_path()))
             })
             .collect();
         let readable = inventories
             .iter()
             .flatten()
-            .map(|(inventory, file)| (inventory, *file))
+            .map(|(inventory, file)| (*inventory, *file))
             .collect();
         let verdict = if inventories.iter().all(Option::is_some) {
             DirectoryInventories {
@@ -1635,7 +1681,9 @@ pub fn load_buffer_configuration_in_directory<'a>(
     let member = &snapshot.sources[snapshot.member.index];
     debug_assert!(member.text.as_deref() == Some(snapshot.member.buffer.text.as_ref()));
     let mut parsed = snapshot.member.buffer.parsed().clone();
-    snapshot.recover_backend_values(&mut parsed, config);
+    if let Some(backend) = snapshot.backend_with_sibling_bindings(config) {
+        parsed.backend = Some(backend);
+    }
     crate::parser::retained::set_directory_require_scope(&mut parsed, scope);
     BufferConfiguration {
         judged: crate::parser::retained::JudgedFile::new(parsed, schemas, config),
@@ -1660,7 +1708,6 @@ pub fn load_buffer_configuration_without_directory<'a>(
     .issue()
     .for_retained_nodes();
     let mut parsed = buffer.parsed().clone();
-    parser::recover_backend_values(&mut parsed, buffer.parsed(), config);
     crate::parser::retained::set_directory_require_scope(
         &mut parsed,
         DirectoryRequireScope(verdict),
@@ -2702,6 +2749,28 @@ fn parse_directory_with_overrides_impl(
     let authored_bindings =
         AuthoredBindingView::from_directory_files(&parsed_files, parsed_files.empty_assembly());
     let duplicate_declarations = find_duplicate_declarations(dir, &parsed_files);
+    let mut merged = parsed_files.empty_assembly();
+    for (_, resolved) in parsed_files.iter() {
+        merge_parsed_file(&mut merged, resolved.parsed.clone());
+    }
+
+    // Resolve cross-file references on the merged result
+    let resolve_result =
+        parser::resolve_resource_refs_in_context(&mut merged, config, None, resolution);
+    // A retained backend failure owns the same fail-fast boundary as strict
+    // loading, while its independent fields remain available to diagnostics.
+    let failed_backend = resolution.is_diagnostics()
+        && merged.backend.as_ref().is_some_and(|backend| {
+            backend
+                .attributes
+                .values()
+                .any(|value| matches!(value, parser::BackendAttributeValue::Failed(_)))
+        });
+    if let Err(error) = resolve_result
+        && !failed_backend
+    {
+        return Err(DirectoryParseFailure::from_parse_error(error));
+    }
     let semantic_files = if resolution.is_diagnostics() {
         parsed_files
             .iter()
@@ -2717,18 +2786,19 @@ fn parse_directory_with_overrides_impl(
                 semantic
                     .parser_binding_metadata
                     .retain(|name| resolved.local_variable_names.contains(name.as_str()));
-                parser::resolve_resource_refs_for_diagnostics(&mut semantic, config).map_err(
-                    |error| {
-                        let located = LocatedParseError::in_file(path, error);
-                        DirectoryParseFailure::new(DirectoryParseFailureKind::Parse {
+                if let Err(error) =
+                    parser::resolve_resource_refs_for_diagnostics(&mut semantic, config)
+                    && !failed_backend
+                {
+                    let located = LocatedParseError::in_file(path, error);
+                    return Err(DirectoryParseFailure::new(
+                        DirectoryParseFailureKind::Parse {
                             location: located.source_file.clone().unwrap_or_else(|| path.clone()),
                             source_file: located.source_file,
                             error: located.error,
-                        })
-                    },
-                )?;
-                let source = semantic.clone();
-                parser::recover_backend_values(&mut semantic, &source, config);
+                        },
+                    ));
+                }
                 Ok((path.clone(), semantic))
             })
             .collect::<Result<Vec<_>, DirectoryParseFailure>>()?
@@ -2736,21 +2806,6 @@ fn parse_directory_with_overrides_impl(
         Vec::new()
     };
 
-    let mut merged = parsed_files.empty_assembly();
-    for (_, resolved) in parsed_files {
-        merge_parsed_file(&mut merged, resolved.into_inner());
-    }
-
-    // Resolve cross-file references on the merged result
-    let resolve_result =
-        parser::resolve_resource_refs_in_context(&mut merged, config, None, resolution);
-    if let Err(error) = resolve_result {
-        return Err(DirectoryParseFailure::from_parse_error(error));
-    }
-    if resolution.is_diagnostics() {
-        let source = merged.clone();
-        parser::recover_backend_values(&mut merged, &source, config);
-    }
     // `finalize_provider_configs` is intentionally NOT called here. The
     // merged result is pre-module-expansion; deferred provider
     // attributes that reference module-call bindings cannot be resolved
