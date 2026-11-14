@@ -10912,6 +10912,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn format_38_saved_plan_is_rejected_before_source_identity_decode() {
+        let current_version = crate::commands::plan::PlanFile::CURRENT_VERSION;
         let (_dir, plan_path, mut json) = replacement_plan_json();
         json["version"] = serde_json::json!(38);
         json.as_object_mut().unwrap().remove("source_identity");
@@ -10919,7 +10920,9 @@ mod saved_plan_version_tests {
             rejected_saved_plan_message(&plan_path, &json, "format 38 must require replanning")
                 .await;
         assert!(
-            message.contains("Unsupported plan file version: 38 (expected 45)"),
+            message.contains(&format!(
+                "Unsupported plan file version: 38 (expected {current_version})"
+            )),
             "{message}"
         );
         assert!(!message.contains("corrupted"), "{message}");
