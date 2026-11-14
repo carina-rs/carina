@@ -1606,7 +1606,7 @@ impl IntoIterator for AuthoredInputReport {
 ///
 /// ```compile_fail,E0308
 /// use carina_core::{input_rules::check_authored_inputs, parser::ExpandedParsedFile, resource::{Resource, Value, ConcreteValue}, schema::SchemaRegistry};
-/// let mut patch_shaped = ExpandedParsedFile::default();
+/// let mut patch_shaped: ExpandedParsedFile = Default::default();
 /// patch_shaped.resources.push(Resource::with_provider("mock", "Review", "example", None)
 ///     .with_attribute("target", Value::Concrete(ConcreteValue::String("changed".into()))));
 /// let _ = check_authored_inputs(&patch_shaped, &SchemaRegistry::new());

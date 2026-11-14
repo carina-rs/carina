@@ -1326,7 +1326,7 @@ mod tests {
 
     fn resolved_with_graph(resources: impl IntoIterator<Item = Resource>) -> Vec<ResolvedResource> {
         let resources = resources.into_iter().collect::<Vec<_>>();
-        let parsed = carina_core::parser::ExpandedParsedFile::default();
+        let parsed: carina_core::parser::ExpandedParsedFile = Default::default();
         let graph = carina_core::resolved_graph::resolve_expanded_graph({
             let mut configuration = parsed;
             configuration.resources = resources.clone();
@@ -1473,10 +1473,10 @@ mod tests {
         plan.add(Effect::Create(ResolvedResource::new(
             (second.clone()).into_value_snapshot(),
         )));
-        let mut configuration = carina_core::parser::ExpandedParsedFile::default();
+        let mut configuration: carina_core::parser::ExpandedParsedFile = Default::default();
         configuration.resources = vec![first.clone(), second.clone()];
         configuration.upstream_states = vec![carina_core::parser::UpstreamState {
-            caller: None,
+            caller: carina_core::parser::upstream_caller_for_test(),
             binding: absolute_binding("future"),
             source: "upstream".into(),
         }];

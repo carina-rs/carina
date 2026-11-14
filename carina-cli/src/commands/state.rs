@@ -1650,7 +1650,6 @@ fn state_bucket_delete_error(
             .backend
             .as_ref()
             .and_then(|backend| backend.attributes.get("bucket"))
-            .and_then(|value| value.evaluated().ok())
             .and_then(|value| match value {
                 Value::Concrete(ConcreteValue::String(name)) => {
                     Some(name.expose_plaintext().to_owned())
@@ -3147,8 +3146,18 @@ mod tests {
         parsed
     }
 
-    fn resolve_authored_file_for_test<E>(
-        parsed: carina_core::parser::File<E>,
+    fn resolve_authored_file_for_test<E, K: carina_core::parser::BackendFixturePhase>(
+        parsed: carina_core::parser::File<
+            E,
+            carina_core::resource::ParserPlaceholder,
+            carina_core::resource::ParserPlaceholder,
+            carina_core::parser::ParsedDeferredForPhase<
+                carina_core::resource::ParserPlaceholder,
+                carina_core::resource::RelativeBindingName,
+            >,
+            carina_core::resource::RelativeBindingName,
+            K,
+        >,
         base_dir: &carina_core::paths::ResolvedPath,
     ) -> carina_core::parser::ExpandedFile<
         <E::Absolute as carina_core::parser::IntoExpandedExportParam<
@@ -3165,8 +3174,10 @@ mod tests {
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             |session| {
                 carina_core::module_resolver::resolve_modules_with_providerless_config(
-                    carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed)
-                        .admit(&SchemaRegistry::new(), session),
+                    carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(
+                        carina_core::parser::evaluate_backend_for_test(parsed, session).unwrap(),
+                    )
+                    .admit(&SchemaRegistry::new(), session),
                     base_dir,
                 )
                 .expect("test fixture crosses module resolution")
@@ -3721,8 +3732,9 @@ mod tests {
     }
 
     fn bucket_delete_configuration(name: &str) -> carina_core::parser::ExpandedInferredFile {
-        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+        let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
         parsed.backend = Some(carina_core::parser::ExpandedBackendConfig {
+            source: (),
             backend_type: "s3".into(),
             attributes: (HashMap::<String, _>::from([(
                 "bucket".into(),
@@ -4347,7 +4359,7 @@ mod tests {
             unresolved_attributes: Default::default(),
             binding: None,
         };
-        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+        let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
         parsed.providers.push(provider_config);
         parsed
             .data_sources
@@ -4444,7 +4456,7 @@ mod tests {
             unresolved_attributes: Default::default(),
             binding: None,
         };
-        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+        let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
         parsed.providers.push(provider_config);
         parsed.compositions.push(composition);
         parsed.data_sources.push(data_source);
@@ -4522,7 +4534,7 @@ mod tests {
             quoted_string_attrs: HashSet::new(),
             declaration: Default::default(),
         };
-        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+        let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
         parsed.providers.push(carina_core::parser::ProviderConfig {
             name: "test".to_string(),
             attributes: Default::default(),

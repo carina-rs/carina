@@ -401,7 +401,7 @@ fn deposed_only_deferred_preflight(explicit: bool) {
             Default::default(),
         )));
     }
-    let configuration = crate::parser::ExpandedParsedFile {
+    let configuration: crate::parser::ExpandedParsedFile = crate::parser::ExpandedParsedFile {
         resources: vec![
             Resource::with_provider("aws", "acm.Certificate", "cert", None)
                 .with_root_binding("cert"),

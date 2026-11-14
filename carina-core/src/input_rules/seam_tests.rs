@@ -954,7 +954,7 @@ fn public_ast_mutations_cannot_reseal_authored_input() {
     parsed.resources[0].attributes.clear();
     let after = check_authored_inputs(parsed.authored_inputs().unwrap(), &schemas);
     assert_eq!(before.findings, after.findings);
-    let fabricated = crate::parser::ExpandedParsedFile::default();
+    let fabricated: crate::parser::ExpandedParsedFile = Default::default();
     assert!(fabricated.authored_inputs().is_err());
 }
 

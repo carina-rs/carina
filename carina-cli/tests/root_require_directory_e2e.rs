@@ -2449,3 +2449,67 @@ fn round12_placement_keeps_the_block_location_in_human_json_and_lsp() {
         );
     }
 }
+
+#[test]
+fn round19_saved_upstream_caller_is_project_relative() {
+    let (directory, upstream) = round12_upstream_provider_fixture();
+    fs::write(
+        upstream.join("declarations.crn"),
+        "exports { value: String = 'published' }\n",
+    )
+    .unwrap();
+    round12_write_upstream_state(&upstream);
+    success(&directory.run(&[
+        "plan",
+        "--out",
+        "saved.plan",
+        directory.project.to_str().unwrap(),
+    ]));
+    let plan: Value =
+        serde_json::from_slice(&fs::read(directory.project.join("saved.plan")).unwrap()).unwrap();
+    assert_eq!(
+        plan["upstream_sources"][0]["caller"]["file"], "upstream.crn",
+        "{plan}"
+    );
+    assert_eq!(plan["version"], 47);
+}
+
+#[test]
+fn round19_nested_single_file_import_preserves_root_and_module_owners() {
+    let directory = Directory::new("true");
+    directory.clear_root_require();
+    fs::write(
+        directory.project.join("providers.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.project.join("main.crn"),
+        "let selected = use { source = './modules/a' }\nselected {}\n",
+    )
+    .unwrap();
+    fs::create_dir_all(directory.project.join("modules/a")).unwrap();
+    fs::write(
+        directory.project.join("modules/a/main.crn"),
+        "arguments { n: Int = 1 }\nlet selected = use { source = './x.crn' }\nselected {}\n",
+    )
+    .unwrap();
+    fs::write(directory.project.join("modules/a/x.crn"), "arguments {}\n").unwrap();
+    for args in [vec!["validate", "."], vec!["lint", "."]] {
+        let output = directory.run(&args);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "Error: Module resolution error: Module path './x.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.\n"
+        );
+    }
+    let output = directory.run(&["validate", "--json", "."]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["errors"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        report["errors"][0]["message"],
+        "Module path './x.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory."
+    );
+    assert_eq!(report["errors"][0]["location"]["file"], "main.crn");
+    assert_eq!(report["errors"][0]["location"]["range"]["start"]["line"], 2);
+}

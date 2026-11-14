@@ -166,7 +166,8 @@ fn unknown_reason_contains_module_if<B: BindingAddress>(reason: &ApplyTimeUnknow
     match reason {
         ApplyTimeUnknown::UpstreamExport { path: _ }
         | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
-        | ApplyTimeUnknown::PendingReRead(_) => false,
+        | ApplyTimeUnknown::PendingReRead(_)
+        | ApplyTimeUnknown::IncompleteBackendScope => false,
     }
 }
 

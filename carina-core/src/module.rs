@@ -463,7 +463,20 @@ fn resource_graph_binding(resource: &Resource, declaration_index: usize) -> Stri
 
 impl RootConfigSignature {
     /// Build a root config signature from a parsed file
-    pub fn from_parsed_file<E>(parsed: &crate::parser::File<E>, file_name: &str) -> Self {
+    pub fn from_parsed_file<E, K: crate::parser::BackendPhase>(
+        parsed: &crate::parser::File<
+            E,
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            crate::parser::ParsedDeferredForPhase<
+                crate::resource::ParserPlaceholder,
+                crate::resource::RelativeBindingName,
+            >,
+            crate::resource::RelativeBindingName,
+            K,
+        >,
+        file_name: &str,
+    ) -> Self {
         // Build imports
         let imports: Vec<ImportInfo> = parsed
             .uses
@@ -936,8 +949,18 @@ pub enum FileSignature {
 impl FileSignature {
     /// Create from a parsed file
     /// Classification comes only from the loader-issued directory verdict.
-    pub fn from_parsed_file<E>(
-        parsed: &crate::parser::File<E>,
+    pub fn from_parsed_file<E, K: crate::parser::BackendPhase>(
+        parsed: &crate::parser::File<
+            E,
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            crate::parser::ParsedDeferredForPhase<
+                crate::resource::ParserPlaceholder,
+                crate::resource::RelativeBindingName,
+            >,
+            crate::resource::RelativeBindingName,
+            K,
+        >,
         file_name: &str,
         config: &crate::parser::ProviderContext,
     ) -> Self {
@@ -946,8 +969,18 @@ impl FileSignature {
 
     /// Build metadata from the loader-issued directory verdict. Unknown buffers
     /// retain neutral file metadata; entry counts cannot establish a directory kind.
-    pub fn from_parsed_file_with_name<E>(
-        parsed: &crate::parser::File<E>,
+    pub fn from_parsed_file_with_name<E, K: crate::parser::BackendPhase>(
+        parsed: &crate::parser::File<
+            E,
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            crate::parser::ParsedDeferredForPhase<
+                crate::resource::ParserPlaceholder,
+                crate::resource::RelativeBindingName,
+            >,
+            crate::resource::RelativeBindingName,
+            K,
+        >,
         module_name: &str,
         config: &crate::parser::ProviderContext,
     ) -> Self {
@@ -1054,8 +1087,18 @@ impl ModuleSignature {
     }
 
     /// Build a module signature from a directory-based module (ParsedFile with top-level arguments/attributes)
-    pub fn from_directory_module<E>(
-        parsed: &crate::parser::File<E>,
+    pub fn from_directory_module<E, K: crate::parser::BackendPhase>(
+        parsed: &crate::parser::File<
+            E,
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            crate::parser::ParsedDeferredForPhase<
+                crate::resource::ParserPlaceholder,
+                crate::resource::RelativeBindingName,
+            >,
+            crate::resource::RelativeBindingName,
+            K,
+        >,
         module_name: &str,
         config: &crate::parser::ProviderContext,
     ) -> Self {

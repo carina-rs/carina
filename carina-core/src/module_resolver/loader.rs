@@ -223,9 +223,9 @@ pub(crate) fn load_imported_directory(
             Unavailable(match located.source_file {
                 Some(path) => ModuleError::ParseInFile {
                     path,
-                    error: located.error,
+                    error: Box::new((*located.error).into_parse_error()),
                 },
-                None => ModuleError::Parse(*located.error),
+                None => ModuleError::Parse((*located.error).into_parse_error()),
             })
         })?;
     if parsed_files.is_empty() {
@@ -369,7 +369,13 @@ pub fn load_module_from_directory(
         .map_err(|e| e.to_string())?;
     let parsed_files = inputs
         .parse_from_root(config, &dir.source_label())
-        .map_err(|e| format!("Failed to parse directory {}: {}", dir.display(), e.error))?;
+        .map_err(|e| {
+            format!(
+                "Failed to parse directory {}: {}",
+                dir.display(),
+                e.error.error()
+            )
+        })?;
 
     let mut merged = parsed_files.empty_assembly();
     for (_, parsed) in parsed_files {

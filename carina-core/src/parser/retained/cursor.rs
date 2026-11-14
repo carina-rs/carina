@@ -399,6 +399,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             | ExprKind::Declaration
             | ExprKind::RequireCondition(_)
             | ExprKind::ProviderDeclaration
+            | ExprKind::BackendDeclaration
             | ExprKind::Unsupported(_)
             | ExprKind::NestedBlock { .. } => AuthoredForm::Computed,
         }

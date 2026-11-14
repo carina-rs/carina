@@ -3514,14 +3514,19 @@ fn current_saved_plan_root_and_nested_hashes_round_trip_byte_for_byte() {
     use carina_core::resource::{
         ConcreteValue, DeferredValue, SnapshotLeaf, Value as SnapshotTree,
     };
-    assert_eq!(PlanFile::CURRENT_VERSION, 46);
-    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v46.plan.json");
-    let plan: PlanFile = serde_json::from_str(fixture).unwrap();
+    assert_eq!(PlanFile::CURRENT_VERSION, 47);
+    let mut wire: Value = serde_json::from_str(include_str!(
+        "fixtures/module_binding_wire_compat/carina.v46.plan.json"
+    ))
+    .unwrap();
+    wire["version"] = PlanFile::CURRENT_VERSION.into();
+    let fixture = carina_core::utils::pretty_with_newline(&wire).unwrap();
+    let plan: PlanFile = serde_json::from_str(&fixture).unwrap();
     assert_eq!(
         carina_core::utils::pretty_with_newline(&plan).unwrap(),
         fixture
     );
-    let mut wire: Value = serde_json::from_str(fixture).unwrap();
+    let mut wire: Value = serde_json::from_str(&fixture).unwrap();
     let attributes = wire["unresolved_resources"]
         .as_array_mut()
         .unwrap()

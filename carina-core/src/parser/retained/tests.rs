@@ -530,7 +530,12 @@ fn known_builtin_results_retain_invalid_operand_accesses() {
     assert!(admit_expression(result, &TypeExpr::Int).is_err());
 }
 
-fn source_schema_report(source: &str) -> (crate::parser::ParsedFile, ExpressionReport) {
+fn source_schema_report(
+    source: &str,
+) -> (
+    crate::parser::ParsedFile<crate::parser::StrictBackend>,
+    ExpressionReport,
+) {
     let parsed = crate::parser::parse_and_resolve(source).unwrap();
     let mut schemas = SchemaRegistry::new();
     schemas.insert(

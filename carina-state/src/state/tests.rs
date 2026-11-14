@@ -68,7 +68,7 @@ fn destroy_keeps_an_undeleted_identifierless_orphan_as_an_ordering_target() {
             state.build_state_for_resource(kept_id.as_inner()),
         ),
     ]);
-    let mut configuration = carina_core::parser::ExpandedInferredFile::default();
+    let mut configuration: carina_core::parser::ExpandedInferredFile = Default::default();
     configuration.resources.push(resource.clone());
     let graph = carina_core::resolved_graph::resolve_expanded_graph(configuration.into()).unwrap();
     let rows = state.planning_rows_after_refresh(&current);
@@ -115,7 +115,7 @@ fn destroy_refresh_projection_uses_the_stored_route_observation() {
     state.upsert_resource(row).unwrap();
     let before = serde_json::to_value(&state).unwrap();
     let resource = Resource::from_id(id.clone());
-    let mut configuration = carina_core::parser::ExpandedInferredFile::default();
+    let mut configuration: carina_core::parser::ExpandedInferredFile = Default::default();
     configuration.resources.push(resource.clone());
     let graph = carina_core::resolved_graph::resolve_expanded_graph(configuration.into()).unwrap();
     let rows = state.planning_rows_after_refresh(&current);
@@ -161,7 +161,7 @@ fn destroy_refresh_projection_rejects_an_observation_from_another_instance() {
     }));
     // The old fallback always selects this entry, whatever the map's iteration order.
     let resource = Resource::from_id(current.keys().next().unwrap().clone());
-    let mut configuration = carina_core::parser::ExpandedInferredFile::default();
+    let mut configuration: carina_core::parser::ExpandedInferredFile = Default::default();
     configuration.resources.push(resource.clone());
     let graph = carina_core::resolved_graph::resolve_expanded_graph(configuration.into()).unwrap();
     let rows = state.planning_rows_after_refresh(&current);

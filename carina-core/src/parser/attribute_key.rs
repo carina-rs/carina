@@ -495,6 +495,7 @@ mod tests {
             };
         let backend: super::super::BackendConfig<NoPlaceholder, AbsoluteBindingAddress> =
             super::super::BackendConfig {
+                source: (),
                 backend_type: "local".into(),
                 attributes: backend_attributes,
                 attribute_spans: Default::default(),

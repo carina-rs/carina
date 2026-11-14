@@ -34,7 +34,12 @@ fn mixed_tag_key_style_warnings(all_tag_keys: &[TagKeyEntry]) -> Vec<LintWarning
         .collect()
 }
 
-fn mixed_tag_key_style_warnings_for_population<E, D, B: carina_core::resource::BindingAddress>(
+fn mixed_tag_key_style_warnings_for_population<
+    E,
+    D,
+    B: carina_core::resource::BindingAddress,
+    K: carina_core::parser::BackendPhase,
+>(
     root_inputs: &[(carina_core::paths::ResolvedPath, String)],
     parsed: &carina_core::parser::File<
         E,
@@ -42,6 +47,7 @@ fn mixed_tag_key_style_warnings_for_population<E, D, B: carina_core::resource::B
         carina_core::resource::ParserPlaceholder,
         D,
         B,
+        K,
     >,
     base_dir: &carina_core::paths::ResolvedPath,
 ) -> Vec<LintWarning> {
@@ -120,13 +126,19 @@ impl LintFile {
     }
 }
 
-fn collect_list_struct_attrs_for_population<E, D, B: carina_core::resource::BindingAddress>(
+fn collect_list_struct_attrs_for_population<
+    E,
+    D,
+    B: carina_core::resource::BindingAddress,
+    K: carina_core::parser::BackendPhase,
+>(
     parsed: &carina_core::parser::File<
         E,
         carina_core::resource::ParserPlaceholder,
         carina_core::resource::ParserPlaceholder,
         D,
         B,
+        K,
     >,
     schemas: &carina_core::schema::SchemaRegistry,
     all_list_struct_attrs: &mut HashSet<String>,

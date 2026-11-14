@@ -1420,6 +1420,7 @@ mod tests {
             Value::Concrete(ConcreteValue::String(region.to_string().into())),
         );
         BackendConfig {
+            source: (),
             backend_type: "s3".to_string(),
             attributes: (attributes).into_iter().collect(),
             attribute_spans: Default::default(),
@@ -1433,6 +1434,7 @@ mod tests {
             Value::Concrete(ConcreteValue::String(path.to_string().into())),
         );
         BackendConfig {
+            source: (),
             backend_type: "local".to_string(),
             attributes: (attributes).into_iter().collect(),
             attribute_spans: Default::default(),
@@ -1609,7 +1611,7 @@ mod tests {
     }
 
     fn empty_parsed_file() -> carina_core::parser::InferredFile {
-        carina_core::parser::InferredFile::default()
+        <carina_core::parser::InferredFile>::default()
     }
 
     fn validation_with_missing_resource_provenance(

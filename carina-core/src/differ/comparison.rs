@@ -1420,7 +1420,9 @@ pub(crate) enum LeafProvenance<'a> {
 
 fn contains_pending_reread(value: &Value) -> bool {
     match value {
-        Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(_))) => true,
+        Value::Deferred(DeferredValue::Unknown(
+            ApplyTimeUnknown::PendingReRead(_) | ApplyTimeUnknown::IncompleteBackendScope,
+        )) => true,
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_pending_reread),
         Value::Concrete(ConcreteValue::Map(map)) => map.values().any(contains_pending_reread),
         Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {

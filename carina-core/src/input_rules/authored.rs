@@ -41,7 +41,9 @@ impl<'a> AuthoredResource<'a> {
 }
 
 impl AuthoredInputs {
-    fn snapshot<E, P, T, D, B>(file: &crate::parser::File<E, P, T, D, B>) -> Self
+    fn snapshot<E, P, T, D, B, K: crate::parser::BackendPhase>(
+        file: &crate::parser::File<E, P, T, D, B, K>,
+    ) -> Self
     where
         P: crate::resource::PlaceholderKind,
         T: crate::resource::PlaceholderKind,
@@ -111,12 +113,14 @@ impl AuthoredInputs {
         snapshot
     }
 
-    pub fn for_directory<E>(source: &crate::config_loader::RootDirectoryParse<E>) -> Self {
+    pub fn for_directory<E, K: crate::parser::BackendPhase>(
+        source: &crate::config_loader::RootDirectoryParse<E, K>,
+    ) -> Self {
         Self::snapshot(source.parsed())
     }
 
-    pub fn for_directory_in_session<E>(
-        source: &crate::config_loader::RootDirectoryParse<E>,
+    pub fn for_directory_in_session<E, K: crate::parser::BackendPhase>(
+        source: &crate::config_loader::RootDirectoryParse<E, K>,
         session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Self
     where
@@ -132,8 +136,8 @@ impl AuthoredInputs {
         inputs
     }
 
-    pub(crate) fn for_module_admission<E>(
-        source: &crate::module_resolver::AuthoredModuleGraph<'_, E>,
+    pub(crate) fn for_module_admission<E, K: crate::parser::BackendPhase>(
+        source: &crate::module_resolver::AuthoredModuleGraph<'_, E, K>,
         config: &crate::parser::ProviderContext,
     ) -> Self
     where
@@ -170,7 +174,9 @@ impl AuthoredInputs {
     }
 
     #[cfg(test)]
-    pub(super) fn for_test<E, P, T, D, B>(file: &crate::parser::File<E, P, T, D, B>) -> Self
+    pub(super) fn for_test<E, P, T, D, B, K: crate::parser::BackendPhase>(
+        file: &crate::parser::File<E, P, T, D, B, K>,
+    ) -> Self
     where
         P: crate::resource::PlaceholderKind,
         T: crate::resource::PlaceholderKind,

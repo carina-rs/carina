@@ -662,7 +662,7 @@ mod tests {
         let mut resource = Resource::with_provider("mock", "test.Bucket", "stored", None);
         resource.binding = Some(crate::resource::absolute_binding_address_for_test("stored"));
         let rows = applied_rows(&resource);
-        let mut configuration = crate::parser::ExpandedInferredFile::default();
+        let mut configuration: crate::parser::ExpandedInferredFile = Default::default();
         configuration.resources.push(resource.clone());
         configuration.resources.push(
             Resource::with_provider("mock", "test.Bucket", "kept", None).with_root_binding("kept"),
@@ -716,7 +716,7 @@ mod tests {
     fn destroy_requires_persisted_source_row() {
         let schemas = SchemaRegistry::new();
         let graph = crate::resolved_graph::resolve_expanded_graph(
-            crate::parser::ExpandedInferredFile::default().into(),
+            <crate::parser::ExpandedInferredFile>::default().into(),
         )
         .unwrap();
         let resource = Resource::with_provider("mock", "test.Bucket", "chosen", None);

@@ -531,7 +531,7 @@ fn r5_upstream_export_discovery_retains_unrelated_failed_inputs() {
     ]);
     let context = ProviderContext::new(EnvironmentSnapshot::empty());
     let source = carina_core::parser::UpstreamState {
-        caller: None,
+        caller: carina_core::parser::upstream_caller_for_test(),
         binding: carina_core::resource::RelativeBindingName::new("upstream"),
         source: "./upstream".into(),
     };

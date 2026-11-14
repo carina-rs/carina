@@ -1218,7 +1218,7 @@ mod tests {
             .dependencies
             .value_bindings
             .insert(absolute_binding("foo"));
-        let configuration = crate::parser::ExpandedParsedFile {
+        let configuration: crate::parser::ExpandedParsedFile = crate::parser::ExpandedParsedFile {
             resources: vec![anonymous, consumer.clone()],
             ..Default::default()
         };

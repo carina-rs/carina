@@ -2761,7 +2761,7 @@ mod tests {
             unresolved_attributes: Default::default(),
             binding: None,
         };
-        let mut parsed = carina_core::parser::InferredFile::default();
+        let mut parsed: carina_core::parser::InferredFile = Default::default();
         parsed.providers = vec![provider_config.clone(), provider_config];
         let state_path = project.path().join("state.json");
         let lock_path = state_path.with_extension("lock");
@@ -2983,7 +2983,7 @@ mod tests {
                 )
                 .unwrap();
                 let project = carina_core::paths::ResolvedPath::new(config_path).unwrap();
-                let backend_config = crate::test_support::parsed_fixture(
+                let backend_config = crate::test_support::inferred_fixture(
                     "backend s3 { bucket = 'backend-state-bucket' key = 'state.json' auto_create = false }",
                 ).backend.unwrap();
                 carina_state::BackendLock::for_config(Some(&backend_config))

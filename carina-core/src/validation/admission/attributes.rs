@@ -582,6 +582,7 @@ pub fn resource_attribute_admissions<
             B,
         >,
     E,
+    K: crate::parser::BackendPhase,
 >(
     resource: &crate::parser::AnalysisResourceRef<
         '_,
@@ -596,6 +597,7 @@ pub fn resource_attribute_admissions<
         crate::resource::ParserPlaceholder,
         D,
         B,
+        K,
     >,
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     quoted: &std::collections::HashSet<String>,
@@ -613,12 +615,12 @@ pub fn resource_attribute_admissions<
             }
             let visits = std::cell::RefCell::new(std::mem::take(coverage));
             let findings = if uses_resource_attribute_admission(resource.kind()) {
-                typed_resource_attribute_admissions::<kind::ResourceAttribute, _, _, _>(
+                typed_resource_attribute_admissions::<kind::ResourceAttribute, _, _, _, _>(
                     resource, parsed, schema, attributes, quoted, inputs, bindings, session,
                     schemas, &visits,
                 )
             } else {
-                typed_resource_attribute_admissions::<kind::DataSourceAttribute, _, _, _>(
+                typed_resource_attribute_admissions::<kind::DataSourceAttribute, _, _, _, _>(
                     resource, parsed, schema, attributes, quoted, inputs, bindings, session,
                     schemas, &visits,
                 )
@@ -635,7 +637,7 @@ pub fn resource_attribute_admissions<
 /// Retained expressions supply computed-access and arithmetic evidence to admit.
 #[allow(clippy::too_many_arguments)]
 fn typed_resource_attribute_admissions<
-    K: RechecksResolved,
+    A: RechecksResolved,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<
             crate::resource::ParserPlaceholder,
@@ -643,6 +645,7 @@ fn typed_resource_attribute_admissions<
             B,
         >,
     E,
+    K: crate::parser::BackendPhase,
 >(
     resource: &crate::parser::AnalysisResourceRef<
         '_,
@@ -657,6 +660,7 @@ fn typed_resource_attribute_admissions<
         crate::resource::ParserPlaceholder,
         D,
         B,
+        K,
     >,
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     attributes: &indexmap::IndexMap<
@@ -795,7 +799,7 @@ fn typed_resource_attribute_admissions<
             let mut findings = Default::default();
             Some(
                 reference
-                    .judge_at::<K>(contract, attr, _path, boundary, &mut findings)
+                    .judge_at::<A>(contract, attr, _path, boundary, &mut findings)
                     .map(|()| findings)
                     .map_err(|error| reference.error_with_origin(error)),
             )
@@ -897,7 +901,7 @@ fn typed_resource_attribute_admissions<
                 assignment::CandidateOrigin::of(expression.assignment_value(value))
             {
                 let mut findings = Default::default();
-                reference.judge_at::<K>(contract, attr, _path, boundary, &mut findings)?;
+                reference.judge_at::<A>(contract, attr, _path, boundary, &mut findings)?;
                 return Ok(findings);
             }
         }
@@ -982,7 +986,7 @@ fn typed_resource_attribute_admissions<
         candidate: &candidate,
         coverage,
     };
-    admit_validation_attributes_with_input::<K, _, _>(
+    admit_validation_attributes_with_input::<A, _, _>(
         schema,
         resource.id(),
         attributes,

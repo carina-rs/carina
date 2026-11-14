@@ -1256,8 +1256,8 @@ fn attribute_provenance<'a, P: ValueKind, B: BindingAddress>(
 type DependencyEdges<B> =
     std::collections::HashMap<B, Located<crate::validation::depends_on::DependencyEdgeOrigin>>;
 
-fn managed_dependency_origins<E, P, T, D, B>(
-    file: &File<E, P, T, D, B>,
+fn managed_dependency_origins<E, P, T, D, B, K: crate::parser::BackendPhase>(
+    file: &File<E, P, T, D, B, K>,
     managed: &crate::resource::Resource<ModuleSource, P, B>,
     dependencies: &[AnalysisDependencyRef<'_, B>],
     references: &[AnalysisReference<B>],
@@ -1743,7 +1743,7 @@ impl<'a, B: BindingAddress> AnalysisWaitRef<'a, B> {
 /// ```compile_fail,E0308
 /// use carina_core::parser::{AnalysisTree, ParsedFile};
 /// fn analyze(_: &AnalysisTree<'_>) {}
-/// analyze(&ParsedFile::default());
+/// analyze(&<ParsedFile>::default());
 /// ```
 pub struct AnalysisTree<
     'a,
@@ -1752,10 +1752,11 @@ pub struct AnalysisTree<
     D = ParsedDeferredForPhase<P, RelativeBindingName>,
     B: BindingAddress = RelativeBindingName,
     E = super::ParsedExportParam<P, B>,
+    K: super::BackendPhase = super::StrictBackend,
 > where
     D: DeferredForPhaseTraversal<P, T, B> + 'a,
 {
-    file: &'a File<E, P, T, D, B>,
+    file: &'a File<E, P, T, D, B, K>,
     resources: Vec<AnalysisResourceRef<'a, P, T, D, B>>,
     top_level_resource_count: usize,
     waits: Vec<AnalysisWaitRef<'a, B>>,
@@ -1777,14 +1778,14 @@ pub struct AnalysisTree<
     backend_location: Option<&'a DeclarationLocation>,
 }
 
-impl<'a, P, T, D, B, E> AnalysisTree<'a, P, T, D, B, E>
+impl<'a, P, T, D, B, E, K: crate::parser::BackendPhase> AnalysisTree<'a, P, T, D, B, E, K>
 where
     P: ValueKind,
     T: ValueKind,
     B: BindingAddress,
     D: DeferredForPhaseTraversal<P, T, B>,
 {
-    pub fn try_from_file(file: &'a File<E, P, T, D, B>) -> Result<Self, AnalysisTreeError>
+    pub fn try_from_file(file: &'a File<E, P, T, D, B, K>) -> Result<Self, AnalysisTreeError>
     where
         E: super::ExportParamLike<P, B>,
     {
@@ -2382,26 +2383,11 @@ where
             }
             provider_attribute_locations.push(locations);
         }
-        let mut source_occurrences = std::collections::HashMap::<&B, usize>::new();
         let upstream_states = file
             .upstream_states
             .iter()
-            .map(|state| {
-                let occurrence = source_occurrences.entry(&state.binding).or_default();
-                let source = syntax
-                    .upstream_sources()
-                    .iter()
-                    .filter(|source| *source.detail() == state.binding)
-                    .nth(*occurrence)
-                    .ok_or_else(|| {
-                        AnalysisTreeError::new(AnalysisTreeErrorKind::MissingSyntaxProvenance {
-                            element: format!("upstream source {}", state.binding),
-                        })
-                    })?;
-                *occurrence += 1;
-                Ok(Located::new(source.location().clone(), state))
-            })
-            .collect::<Result<_, AnalysisTreeError>>()?;
+            .map(|state| Located::new(state.caller.clone(), state))
+            .collect();
         let iterables = file
             .deferred_for_sites()
             .map(|site| {
@@ -2575,18 +2561,14 @@ where
             }
         }
         if let Some(backend) = &file.backend {
-            for value in backend
-                .attributes
-                .values()
-                .filter_map(|value| value.evaluated().ok())
-            {
+            backend.try_visit_values(&mut |value| {
                 add_value(
                     backend_location.expect("validated backend"),
                     value,
                     None,
                     None,
-                )?;
-            }
+                )
+            })?;
         }
         for state in &file.state_blocks {
             if let super::StateBlock::Import { id, .. } = state {
@@ -2634,7 +2616,7 @@ where
     }
 
     /// Core transformations can only clone the same input that was sealed.
-    pub(crate) fn file(&self) -> &'a File<E, P, T, D, B> {
+    pub(crate) fn file(&self) -> &'a File<E, P, T, D, B, K> {
         self.file
     }
 
@@ -2701,20 +2683,8 @@ where
     pub fn backend_attribute_value(
         &self,
         name: &super::AttributeKey,
-    ) -> Option<&'a super::BackendAttributeValue<P, B>> {
+    ) -> Option<&'a K::Attribute<P, B>> {
         self.file.backend.as_ref()?.attributes.get(name)
-    }
-    pub fn backend_evaluation_failures(
-        &self,
-    ) -> impl Iterator<Item = &std::sync::Arc<super::ParseError>> {
-        self.file
-            .backend
-            .iter()
-            .flat_map(|backend| backend.attributes.values())
-            .filter_map(|value| match value {
-                super::BackendAttributeValue::Failed(error) => Some(error),
-                super::BackendAttributeValue::Evaluated(_) => None,
-            })
     }
     pub fn backend_attribute_location<Q: indexmap::Equivalent<super::AttributeKey> + ?Sized>(
         &self,
@@ -2864,7 +2834,8 @@ where
     }
 }
 
-impl<'a, E, P, T, D, B> TryFrom<&'a File<E, P, T, D, B>> for AnalysisTree<'a, P, T, D, B, E>
+impl<'a, E, P, T, D, B, K: crate::parser::BackendPhase> TryFrom<&'a File<E, P, T, D, B, K>>
+    for AnalysisTree<'a, P, T, D, B, E, K>
 where
     E: super::ExportParamLike<P, B>,
     P: ValueKind,
@@ -2874,12 +2845,13 @@ where
 {
     type Error = AnalysisTreeError;
 
-    fn try_from(file: &'a File<E, P, T, D, B>) -> Result<Self, Self::Error> {
+    fn try_from(file: &'a File<E, P, T, D, B, K>) -> Result<Self, Self::Error> {
         Self::try_from_file(file)
     }
 }
 
-impl<D, B: BindingAddress, E> AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>
+impl<D, B: BindingAddress, E, K: crate::parser::BackendPhase>
+    AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E, K>
 where
     D: DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
@@ -3331,3 +3303,14 @@ mod diagnostic_order_tests {
         assert!(crate::parser::AnalysisTree::try_from_file(&parsed).is_ok());
     }
 }
+
+pub type UnexpandedAnalysis<'a, E = super::ParsedExportParam, K = super::StrictBackend> =
+    AnalysisTree<
+        'a,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        super::ParsedDeferredForPhase,
+        RelativeBindingName,
+        E,
+        K,
+    >;

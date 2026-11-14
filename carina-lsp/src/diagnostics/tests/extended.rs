@@ -18770,3 +18770,129 @@ awscc.iam.role {
         "a missing schema must not also produce the identity-basis diagnostic: {diagnostics:#?}"
     );
 }
+
+#[test]
+fn round19_backend_failure_has_one_owner_beside_unrelated_resolution_error() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = "backend s3 { bucket = cidr_subnet('bad', 8, 1) key = 'k' }\n";
+    let main = "let r = mock.test.resource { name = missing_function() }\n";
+    std::fs::write(root.path().join("backend.crn"), backend).unwrap();
+    std::fs::write(root.path().join("main.crn"), main).unwrap();
+    let engine = test_engine();
+    let backend_diagnostics = analyze_with_buffer(&engine, root.path(), "backend.crn", backend);
+    let failures: Vec<_> = backend_diagnostics
+        .iter()
+        .filter(|d| d.message.contains("invalid CIDR"))
+        .collect();
+    assert_eq!(failures.len(), 1, "{backend_diagnostics:#?}");
+    assert_eq!(
+        failures[0].message,
+        "Invalid expression at line 1: cidr_subnet(): cidr_subnet() invalid CIDR format: 'bad' (expected 'address/prefix')"
+    );
+    let diagnostics = analyze_with_buffer(&engine, root.path(), "main.crn", main);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|d| d.message == "Unknown function 'missing_function'")
+            .count(),
+        1,
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn round19_backend_defers_when_inventory_passes_but_sibling_parse_fails() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = "backend s3 { bucket = b key = 'k' typo = true }\n";
+    for (file, text) in [
+        ("backend.crn", backend),
+        ("a.crn", "let b = 'state'\n"),
+        ("broken.crn", "let duplicate = 1\nlet duplicate = 2\n"),
+    ] {
+        std::fs::write(root.path().join(file), text).unwrap();
+    }
+    let diagnostics = analyze_with_buffer(&test_engine(), root.path(), "backend.crn", backend);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|d| !d.message.contains("Invalid attribute 'bucket'")),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|d| d.message == "Unknown attribute 'typo' for backend type 's3'")
+            .count(),
+        1,
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn round19_backend_provider_parameter_uses_the_callers_session() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = "backend s3 { bucket = bucket_for('state') key = 'k' }\n";
+    for (file, text) in [
+        ("backend.crn", backend),
+        ("main.crn", "provider mock {}\n"),
+        (
+            "functions.crn",
+            "fn bucket_for(value: mock.test.resource): String { 'state' }\n",
+        ),
+    ] {
+        std::fs::write(root.path().join(file), text).unwrap();
+    }
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        carina_core::schema::PatternResourceSchema::new("test.resource")
+            .validate()
+            .unwrap(),
+    );
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let diagnostics = analyze_with_buffer(&engine, root.path(), "backend.crn", backend);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "Invalid expression at line 1: function 'bucket_for': parameter 'value': expected mock.test.resource, got string 'state'"
+    );
+    assert_eq!(
+        diagnostics[0].range,
+        Range::new(Position::new(0, 22), Position::new(0, 41))
+    );
+}
+
+#[test]
+fn round19_backend_failure_keeps_independent_late_resolution_diagnostics() {
+    let root = tempfile::tempdir().unwrap();
+    let main = "let r = mock.test.resource { name = keys('bad') }\n";
+    std::fs::write(root.path().join("main.crn"), main).unwrap();
+    std::fs::write(
+        root.path().join("backend.crn"),
+        "backend s3 { bucket = cidr_subnet('bad', 8, 1) key = 'k' }\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                Default::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    let diagnostics = analyze_with_buffer(&engine, root.path(), "main.crn", main);
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|finding| finding.severity == Some(DiagnosticSeverity::ERROR))
+        .map(|finding| finding.message.as_str())
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            "keys(): keys() argument must be a Map, got String",
+            "Invalid expression at line 1: keys(): keys() argument must be a Map, got String"
+        ]
+    );
+}

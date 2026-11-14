@@ -1001,6 +1001,8 @@ mod tests {
                         parsed,
                         fixture_source,
                     )
+                    .evaluate_backend_in_session(session)
+                    .unwrap()
                     .admit(&crate::schema::SchemaRegistry::new(), session),
                     &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                 )
@@ -1084,6 +1086,8 @@ mod tests {
                         parsed,
                         fixture_source,
                     )
+                    .evaluate_backend_in_session(session)
+                    .unwrap()
                     .admit(&crate::schema::SchemaRegistry::new(), session),
                     &crate::paths::ResolvedPath::new(".").unwrap(),
                 )

@@ -155,11 +155,6 @@ pub(crate) fn parse_float_literal(text: &str, line: usize) -> Result<crate::Fini
 /// ```
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
-    /// A strict recheck demands a failure already retained by the backend
-    /// evaluator. Display includes the cause; accessors preserve its provenance.
-    #[error("{0}")]
-    BackendEvaluation(std::sync::Arc<ParseError>),
-
     /// A live parser inventory lost a required authored correspondence.
     #[error(transparent)]
     RetainedEvidence(#[from] super::retained::MissingEvidence),
@@ -499,7 +494,6 @@ pub struct ParseWarning {
 impl ParseError {
     pub fn protected_failure(&self) -> Option<&super::ProtectedParseFailure> {
         match self {
-            Self::BackendEvaluation(error) => error.protected_failure(),
             Self::ProtectedFile(failure) => Some(failure),
             Self::Located { error, .. } => error.protected_failure(),
             Self::AtElement(finding) => finding.detail().protected_failure(),
@@ -516,7 +510,6 @@ impl ParseError {
             end_column: span.end_column(),
         };
         match self {
-            Self::BackendEvaluation(error) => error.diagnostic_range(),
             Self::Located { error, .. } => error.diagnostic_range(),
             Self::AtElement(finding) => Some(from_span(finding.location().span())),
             Self::InvalidAuthoredExpression { diagnostic, .. } => diagnostic.range(),
@@ -591,7 +584,6 @@ impl ParseError {
     /// Safe diagnostic wording, separate from terminal location presentation.
     pub fn diagnostic_message(&self) -> String {
         match self {
-            Self::BackendEvaluation(error) => error.diagnostic_message(),
             Self::Located { error, .. } => error.diagnostic_message(),
             Self::AtElement(finding) => finding.detail().diagnostic_message(),
             // Pest's Display includes the source line. Keep authored text out
@@ -675,10 +667,7 @@ impl ParseError {
     }
 
     pub(crate) fn in_file(self, path: impl Into<PathBuf>) -> Self {
-        if matches!(
-            self,
-            Self::Located { .. } | Self::AtElement(_) | Self::BackendEvaluation(_)
-        ) {
+        if matches!(self, Self::Located { .. } | Self::AtElement(_)) {
             self
         } else {
             Self::Located {
@@ -690,7 +679,7 @@ impl ParseError {
 
     pub(in crate::parser) fn at(self, location: &super::DeclarationLocation) -> Self {
         match self {
-            Self::AtElement(_) | Self::BackendEvaluation(_) => self,
+            Self::AtElement(_) => self,
             Self::Located { path, error } if path == location.file().path() => {
                 (*error).at(location)
             }
@@ -701,7 +690,6 @@ impl ParseError {
     /// Borrow an existing parser-owned finding without constructing provenance.
     pub fn element_diagnostic(&self) -> Option<&super::Located<Self>> {
         match self {
-            Self::BackendEvaluation(error) => error.element_diagnostic(),
             Self::AtElement(finding) => Some(finding),
             Self::Located { error, .. } => error.element_diagnostic(),
             _ => None,
@@ -710,7 +698,6 @@ impl ParseError {
 
     pub fn source_file(&self) -> Option<&Path> {
         match self {
-            Self::BackendEvaluation(error) => error.source_file(),
             Self::Located { path, .. } => Some(path),
             Self::AtElement(finding) => Some(finding.location().file().path()),
             _ => None,

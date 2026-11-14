@@ -5550,7 +5550,7 @@ impl StateFile {
 /// };
 /// use carina_state::{LegacyClassificationOutcome, StateFile};
 ///
-/// let configuration = ExpandedParsedFile::default();
+/// let configuration: ExpandedParsedFile = Default::default();
 /// let moves = ResolvedMovePairs::from_addressed_moves(
 ///     AddressedMoves::preserve_addresses(&configuration.state_blocks),
 /// );

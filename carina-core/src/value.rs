@@ -294,6 +294,9 @@ impl std::error::Error for SecretRehydrationSiteError {}
 impl<B: BindingAddress> std::fmt::Display for ApplyTimeUnknown<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ApplyTimeUnknown::IncompleteBackendScope => {
+                f.write_str("backend directory scope is unavailable")
+            }
             ApplyTimeUnknown::UpstreamExport { path } => {
                 write!(f, "upstream value {}", path.to_dot_string())
             }
@@ -324,6 +327,9 @@ impl std::fmt::Display for crate::resource::PendingReRead {
 /// Render an `ApplyTimeUnknown` to its plan-display string.
 pub fn render_unknown<B: BindingAddress>(reason: &ApplyTimeUnknown<B>) -> String {
     match reason {
+        ApplyTimeUnknown::IncompleteBackendScope => {
+            "(known after backend directory scope resolves)".to_owned()
+        }
         ApplyTimeUnknown::UpstreamExport { path } => {
             format!("(known after upstream apply: {})", path.to_dot_string())
         }

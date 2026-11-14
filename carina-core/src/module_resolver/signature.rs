@@ -80,16 +80,40 @@ pub(super) fn resolved_signature_with_policy<P: TypeResolutionPolicy>(
 }
 
 /// Load and resolve every module signature imported by `parsed`.
-pub fn load_resolved_module_signatures<E, B: crate::resource::BindingAddress, D>(
-    parsed: &File<E, crate::resource::ParserPlaceholder, crate::resource::ParserPlaceholder, D, B>,
+pub fn load_resolved_module_signatures<
+    E,
+    B: crate::resource::BindingAddress,
+    D,
+    K: crate::parser::BackendPhase,
+>(
+    parsed: &File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+        B,
+        K,
+    >,
     base_dir: &ResolvedPath,
     config: &ProviderContext,
 ) -> ResolvedModuleSignatures {
     load_resolved_module_signatures_with_overrides(parsed, base_dir, config, &Default::default())
 }
 
-pub fn load_resolved_module_signatures_with_overrides<E, B: crate::resource::BindingAddress, D>(
-    parsed: &File<E, crate::resource::ParserPlaceholder, crate::resource::ParserPlaceholder, D, B>,
+pub fn load_resolved_module_signatures_with_overrides<
+    E,
+    B: crate::resource::BindingAddress,
+    D,
+    K: crate::parser::BackendPhase,
+>(
+    parsed: &File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+        B,
+        K,
+    >,
     base_dir: &ResolvedPath,
     config: &ProviderContext,
     overrides: &crate::config_loader::SourceOverrides,

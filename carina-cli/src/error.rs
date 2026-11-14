@@ -1254,6 +1254,12 @@ impl std::fmt::Display for RootPlacementErrors {
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error("Cannot save upstream caller: {error}")]
+    SavedUpstreamCaller {
+        #[source]
+        error: std::io::Error,
+    },
+
     #[error("{}", .0.message)]
     ProviderTypeCheck(Box<carina_core::parser::ParseWarning>),
     #[error("{0}")]
@@ -2300,6 +2306,7 @@ pub fn human_error_lines(error: &AppError) -> Vec<HumanErrorLine> {
             source_path: _,
             replan_command: _,
         }
+        | AppError::SavedUpstreamCaller { error: _ }
         | AppError::SavedPlanSourceResolution(_)
         | AppError::SavedPlanProviderEvidence(_)
         | AppError::SavedPlanSchemaMismatch(_)

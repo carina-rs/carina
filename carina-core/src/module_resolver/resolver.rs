@@ -24,15 +24,18 @@ use super::expander::instance_prefix_for_call;
 use super::validation::{ConstraintOrigin, ModuleConstraintDiagnostic};
 
 type ModuleResolvedValue = crate::resource::Value<ParserPlaceholder, AbsoluteBindingAddress>;
-type JudgedModuleFile<'a, E> = crate::parser::retained::JudgedFile<'a, E, ParsedDeferredForPhase>;
+type JudgedModuleFile<'a, E, K = crate::parser::StrictBackend> =
+    crate::parser::retained::JudgedFile<'a, E, ParsedDeferredForPhase, RelativeBindingName, K>;
 
-type BindingResolvedFile<E, B = AbsoluteBindingAddress> = crate::parser::File<
-    E,
-    ParserPlaceholder,
-    ParserPlaceholder,
-    ParsedDeferredForPhase<ParserPlaceholder, B>,
-    B,
->;
+type BindingResolvedFile<E, B = AbsoluteBindingAddress, K = crate::parser::StrictBackend> =
+    crate::parser::File<
+        E,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        ParsedDeferredForPhase<ParserPlaceholder, B>,
+        B,
+        K,
+    >;
 
 /// Resolver-owned result of evaluating one authored module constraint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,21 +85,27 @@ impl ModuleCallConstraintReport {
 
 /// Complete graph owned by the successful module-admission boundary. Its
 /// constructor stays private to this resolver; mutable public ASTs cannot mint it.
-pub(crate) struct AuthoredModuleGraph<'a, E> {
-    file: &'a ModuleResolvedFile<E>,
+pub(crate) struct AuthoredModuleGraph<
+    'a,
+    E,
+    K: crate::parser::BackendPhase = crate::parser::StrictBackend,
+> {
+    file: &'a ModuleResolvedFile<E, crate::resource::AbsoluteBindingAddress, K>,
 }
-impl<E> AuthoredModuleGraph<'_, E> {
-    pub(crate) fn file(&self) -> &ModuleResolvedFile<E> {
+impl<E, K: crate::parser::BackendPhase> AuthoredModuleGraph<'_, E, K> {
+    pub(crate) fn file(
+        &self,
+    ) -> &ModuleResolvedFile<E, crate::resource::AbsoluteBindingAddress, K> {
         self.file
     }
 }
 
 /// Every successful module publication advances resource authority together;
 /// unavailable provider defaults remain a separate fact in that snapshot.
-fn publish_authored_module_graph<E>(
-    mut graph: ModuleResolvedFile<E>,
+fn publish_authored_module_graph<E, K: crate::parser::BackendPhase>(
+    mut graph: ModuleResolvedFile<E, crate::resource::AbsoluteBindingAddress, K>,
     config: &ProviderContext,
-) -> ModuleResolvedFile<E>
+) -> ModuleResolvedFile<E, crate::resource::AbsoluteBindingAddress, K>
 where
     E: crate::parser::ExportParamLike<ParserPlaceholder, AbsoluteBindingAddress> + Clone,
 {
@@ -115,9 +124,12 @@ pub type ModuleCallConstraintReports = Vec<ModuleCallConstraintReport>;
 /// The expanded graph is owned exclusively by [`Self::Expanded`]. Constraint
 /// and residual failures retain their typed diagnostics but cannot expose the
 /// scratch graph that produced them.
-pub enum ModuleResolutionDiagnosticResult<E> {
+pub enum ModuleResolutionDiagnosticResult<
+    E,
+    K: crate::parser::BackendPhase = crate::parser::StrictBackend,
+> {
     Expanded {
-        graph: Box<ModuleResolvedFile<E>>,
+        graph: Box<ModuleResolvedFile<E, AbsoluteBindingAddress, K>>,
     },
     ConstraintFailed {
         findings: Vec<crate::validation::ModuleCallFinding>,
@@ -207,9 +219,22 @@ impl ResidualModuleResolutionError {
         }
     }
 
-    pub fn call_diagnostics<'a, D, B: crate::resource::BindingAddress>(
+    pub fn call_diagnostics<
+        'a,
+        D,
+        B: crate::resource::BindingAddress,
+        K: crate::parser::BackendPhase,
+    >(
         &'a self,
-        tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+        tree: &crate::parser::AnalysisTree<
+            '_,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            B,
+            crate::parser::ParsedExportParam<ParserPlaceholder, B>,
+            K,
+        >,
     ) -> Vec<crate::parser::Located<&'a Self>>
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -453,8 +478,7 @@ impl ResidualModuleResolutionError {
                         ),
                     )
                 }
-                ParseError::BackendEvaluation(_)
-                | ParseError::Syntax(_)
+                ParseError::Syntax(_)
                 | ParseError::ProtectedFile(_)
                 | ParseError::Evaluation { .. }
                 | ParseError::UnavailableSecret(_)
@@ -869,8 +893,8 @@ mod diagnostic_status_tests {
 /// use carina_core::parser::{ParsedFile, ProviderContext};
 /// use carina_core::schema::SchemaRegistry;
 ///
-/// let mut first = ParsedFile::default();
-/// let mut second = ParsedFile::default();
+/// let mut first: ParsedFile = Default::default();
+/// let mut second: ParsedFile = Default::default();
 /// let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
 /// let schemas = SchemaRegistry::new();
 /// let checked = RefCheckedModuleGraph::check(
@@ -881,8 +905,12 @@ mod diagnostic_status_tests {
 /// ).unwrap();
 /// checked.expand(&mut second).unwrap();
 /// ```
-pub(crate) struct RefCheckedModuleGraph<'cfg, E> {
-    parsed: JudgedModuleFile<'cfg, E>,
+pub(crate) struct RefCheckedModuleGraph<
+    'cfg,
+    E,
+    K: crate::parser::BackendPhase = crate::parser::StrictBackend,
+> {
+    parsed: JudgedModuleFile<'cfg, E, K>,
     resolver: ModuleResolver<'cfg, StrictTypeResolution>,
     root_witness: RefCheckWitness,
 }
@@ -891,8 +919,12 @@ pub(crate) struct RefCheckedModuleGraph<'cfg, E> {
 /// the consumer need not load every provider used by the upstream project.
 /// Keeping that policy in a distinct, private graph prevents ordinary module
 /// expansion from opting into it accidentally.
-struct UpstreamRefCheckedModuleGraph<'cfg, E> {
-    parsed: JudgedModuleFile<'cfg, E>,
+struct UpstreamRefCheckedModuleGraph<
+    'cfg,
+    E,
+    K: crate::parser::BackendPhase = crate::parser::StrictBackend,
+> {
+    parsed: JudgedModuleFile<'cfg, E, K>,
     resolver: ModuleResolver<'cfg, DeferredUpstreamTypeResolution>,
     root_witness: RefCheckWitness,
 }
@@ -915,8 +947,16 @@ enum ImportErrorReporting {
 pub(crate) trait TypeResolutionPolicy {
     fn resolve_file_type_exprs<
         E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
+        K: crate::parser::BackendPhase,
     >(
-        parsed: &mut crate::parser::File<E>,
+        parsed: &mut crate::parser::File<
+            E,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            ParsedDeferredForPhase,
+            RelativeBindingName,
+            K,
+        >,
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), ModuleError>;
 
@@ -932,8 +972,19 @@ pub(crate) struct StrictTypeResolution;
 impl TypeResolutionPolicy for StrictTypeResolution {
     fn resolve_file_type_exprs<
         E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
+        K: crate::parser::BackendPhase,
     >(
-        parsed: &mut crate::parser::File<E>,
+        parsed: &mut crate::parser::File<
+            E,
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            crate::parser::ParsedDeferredForPhase<
+                crate::resource::ParserPlaceholder,
+                crate::resource::RelativeBindingName,
+            >,
+            crate::resource::RelativeBindingName,
+            K,
+        >,
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), ModuleError> {
         let type_errors = crate::validation::resolve_file_type_exprs(parsed, config)?;
@@ -958,8 +1009,19 @@ struct DeferredUpstreamTypeResolution;
 impl TypeResolutionPolicy for DeferredUpstreamTypeResolution {
     fn resolve_file_type_exprs<
         E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
+        K: crate::parser::BackendPhase,
     >(
-        parsed: &mut crate::parser::File<E>,
+        parsed: &mut crate::parser::File<
+            E,
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            crate::parser::ParsedDeferredForPhase<
+                crate::resource::ParserPlaceholder,
+                crate::resource::RelativeBindingName,
+            >,
+            crate::resource::RelativeBindingName,
+            K,
+        >,
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), ModuleError> {
         crate::validation::resolve_file_type_exprs_best_effort(parsed, config)?;
@@ -1171,11 +1233,22 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     /// before reference checking and require placement checking.
     fn judge_reference_types<
         E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
+        K: crate::parser::BackendPhase,
     >(
         &self,
-        mut parsed: crate::parser::File<E>,
+        mut parsed: crate::parser::File<
+            E,
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            crate::parser::ParsedDeferredForPhase<
+                crate::resource::ParserPlaceholder,
+                crate::resource::RelativeBindingName,
+            >,
+            crate::resource::RelativeBindingName,
+            K,
+        >,
     ) -> (
-        JudgedModuleFile<'cfg, E>,
+        JudgedModuleFile<'cfg, E, K>,
         Result<RefCheckWitness, ModuleError>,
     ) {
         let imported_modules = self.resolved_module_signatures();
@@ -1476,8 +1549,18 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     }
 }
 
-fn lift_module_attribute_handles<E>(
-    parsed: &mut crate::parser::File<E>,
+fn lift_module_attribute_handles<E, K: crate::parser::BackendPhase>(
+    parsed: &mut crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        crate::parser::ParsedDeferredForPhase<
+            crate::resource::ParserPlaceholder,
+            crate::resource::RelativeBindingName,
+        >,
+        crate::resource::RelativeBindingName,
+        K,
+    >,
     signatures: &super::ResolvedModuleSignatures,
 ) {
     let calls = parsed
@@ -1650,13 +1733,16 @@ fn lift_module_attribute_handles<E>(
     }
 }
 
-impl<'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>>
-    RefCheckedModuleGraph<'cfg, E>
+impl<
+    'cfg,
+    E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
+    K: crate::parser::BackendPhase,
+> RefCheckedModuleGraph<'cfg, E, K>
 {
     /// Load the complete reachable module graph and validate every reference
     /// boundary before making expansion available.
     fn check(
-        parsed: JudgedModuleFile<'cfg, E>,
+        parsed: JudgedModuleFile<'cfg, E, K>,
         base_dir: &ResolvedPath,
         config: &'cfg dyn crate::validation::deferred_types::ProviderTypeCheckContext,
         schemas: &'cfg SchemaRegistry,
@@ -1670,7 +1756,7 @@ impl<'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingN
     /// Bootstrap/editor variant that retains structural value checks while
     /// skipping provider-owned custom-type leaves.
     fn check_providerless(
-        parsed: JudgedModuleFile<'cfg, E>,
+        parsed: JudgedModuleFile<'cfg, E, K>,
         base_dir: &ResolvedPath,
         config: &'cfg dyn crate::validation::deferred_types::ProviderTypeCheckContext,
         schemas: &'cfg SchemaRegistry,
@@ -1683,7 +1769,7 @@ impl<'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingN
     }
 
     fn check_with_resolver(
-        parsed: JudgedModuleFile<'cfg, E>,
+        parsed: JudgedModuleFile<'cfg, E, K>,
         mut resolver: ModuleResolver<'cfg, StrictTypeResolution>,
     ) -> Result<Self, ModuleError> {
         let mut parsed = parsed.into_file();
@@ -1708,7 +1794,12 @@ impl<'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingN
     }
 
     /// Consume the checked graph and expand its root configuration.
-    fn expand(mut self) -> Result<BindingResolvedFile<E::Absolute>, ModuleError>
+    fn expand(
+        mut self,
+    ) -> Result<
+        BindingResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress, K>,
+        ModuleError,
+    >
     where
         E: ResolveExportBindingPhase<ParserPlaceholder>,
     {
@@ -1732,13 +1823,16 @@ impl<'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingN
     }
 }
 
-impl<'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>>
-    UpstreamRefCheckedModuleGraph<'cfg, E>
+impl<
+    'cfg,
+    E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
+    K: crate::parser::BackendPhase,
+> UpstreamRefCheckedModuleGraph<'cfg, E, K>
 {
     /// The sole constructor for the upstream-only, unknown-type-deferring
     /// resolver. Ordinary callers can construct only `RefCheckedModuleGraph`.
     fn check(
-        parsed: JudgedModuleFile<'cfg, E>,
+        parsed: JudgedModuleFile<'cfg, E, K>,
         base_dir: &ResolvedPath,
         config: &'cfg dyn crate::validation::deferred_types::ProviderTypeCheckContext,
         schemas: &'cfg SchemaRegistry,
@@ -1761,7 +1855,7 @@ impl<'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingN
     }
 
     fn check_providerless(
-        parsed: JudgedModuleFile<'cfg, E>,
+        parsed: JudgedModuleFile<'cfg, E, K>,
         base_dir: &ResolvedPath,
         config: &'cfg dyn crate::validation::deferred_types::ProviderTypeCheckContext,
         schemas: &'cfg SchemaRegistry,
@@ -1784,7 +1878,12 @@ impl<'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingN
         })
     }
 
-    fn expand(mut self) -> Result<BindingResolvedFile<E::Absolute>, ModuleError>
+    fn expand(
+        mut self,
+    ) -> Result<
+        BindingResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress, K>,
+        ModuleError,
+    >
     where
         E: ResolveExportBindingPhase<ParserPlaceholder>,
     {
@@ -1808,11 +1907,24 @@ impl<'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingN
     }
 }
 
-fn finish_root_expansion<E: ResolveExportBindingPhase<ParserPlaceholder>>(
-    parsed: crate::parser::File<E>,
-    contributions: Vec<crate::parser::RootBindingResolvedParsedFile>,
+fn finish_root_expansion<
+    E: ResolveExportBindingPhase<ParserPlaceholder>,
+    K: crate::parser::BackendPhase,
+>(
+    parsed: crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        crate::parser::ParsedDeferredForPhase<
+            crate::resource::ParserPlaceholder,
+            crate::resource::RelativeBindingName,
+        >,
+        crate::resource::RelativeBindingName,
+        K,
+    >,
+    contributions: Vec<crate::parser::RootBindingResolvedParsedFile<K>>,
     root: &RootScope,
-) -> BindingResolvedFile<E::Absolute> {
+) -> BindingResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress, K> {
     let mut expanded = parsed.resolve_root(root);
     for contribution in contributions {
         expanded.merge_from(crate::config_loader::relabel_export_phase(contribution));
@@ -1842,9 +1954,22 @@ fn root_expansion_scope() -> RootScope {
 /// through [`crate::config_loader::RootDirectoryParse::admit`]. Directory-result
 /// methods use the same private primitive for
 /// editor-only root views of their loader-owned semantic files.
-pub(crate) fn expand_root_directory_file<E: ResolveExportBindingPhase<ParserPlaceholder>>(
-    parsed: crate::parser::File<E>,
-) -> BindingResolvedFile<E::Absolute> {
+pub(crate) fn expand_root_directory_file<
+    E: ResolveExportBindingPhase<ParserPlaceholder>,
+    K: crate::parser::BackendPhase,
+>(
+    parsed: crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        crate::parser::ParsedDeferredForPhase<
+            crate::resource::ParserPlaceholder,
+            crate::resource::RelativeBindingName,
+        >,
+        crate::resource::RelativeBindingName,
+        K,
+    >,
+) -> BindingResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress, K> {
     let root = root_expansion_scope();
     finish_root_expansion(parsed, Vec::new(), &root)
 }
@@ -1879,7 +2004,7 @@ pub fn prepare_root_export_validation(
 /// use carina_core::paths::ResolvedPath;
 /// use carina_core::validation::deferred_types::TypeCheckSession;
 ///
-/// let parsed = ParsedFile::default();
+/// let parsed: ParsedFile = Default::default();
 /// let checks = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
 ///     resolve_modules_providerless(parsed, &ResolvedPath::new(".").unwrap())
 /// });
@@ -1899,10 +2024,10 @@ pub fn prepare_root_export_validation(
 ///     let _ = resolve_modules_providerless(parsed, base);
 /// }
 /// ```
-pub fn resolve_modules_providerless(
-    parsed: AdmittedRootDirectory<'_>,
+pub fn resolve_modules_providerless<K: crate::parser::BackendPhase>(
+    parsed: AdmittedRootDirectory<'_, crate::parser::ParsedExportParam, K>,
     base_dir: &ResolvedPath,
-) -> Result<ModuleResolvedParsedFile, ModuleError> {
+) -> Result<ModuleResolvedParsedFile<K>, ModuleError> {
     resolve_modules_with_providerless_config(parsed, base_dir)
 }
 
@@ -1911,10 +2036,14 @@ pub fn resolve_modules_providerless(
 /// Generic over the export-parameter shape so callers can pass either
 /// `ParsedFile` (parser phase) or `InferredFile` (post-loader phase) —
 /// the resolver only touches `uses`, `module_calls`, and `resources`.
-pub fn resolve_modules_with_config<E: ResolveExportBindingPhase<ParserPlaceholder>>(
-    parsed: AdmittedRootDirectory<'_, E>,
+pub fn resolve_modules_with_config<
+    E: ResolveExportBindingPhase<ParserPlaceholder>,
+    K: crate::parser::BackendPhase,
+>(
+    parsed: AdmittedRootDirectory<'_, E, K>,
     base_dir: &ResolvedPath,
-) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
+) -> Result<ModuleResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress, K>, ModuleError>
+{
     let (parsed, resolution, config) = parsed.into_parts();
     let schemas = parsed.schemas();
     let expanded =
@@ -1926,10 +2055,14 @@ pub fn resolve_modules_with_config<E: ResolveExportBindingPhase<ParserPlaceholde
 
 /// Resolve modules in a bootstrap/editor context. Every value check is
 /// classified first, and provider-owned schema types are left unchecked.
-pub fn resolve_modules_with_providerless_config<E: ResolveExportBindingPhase<ParserPlaceholder>>(
-    parsed: AdmittedRootDirectory<'_, E>,
+pub fn resolve_modules_with_providerless_config<
+    E: ResolveExportBindingPhase<ParserPlaceholder>,
+    K: crate::parser::BackendPhase,
+>(
+    parsed: AdmittedRootDirectory<'_, E, K>,
     base_dir: &ResolvedPath,
-) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
+) -> Result<ModuleResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress, K>, ModuleError>
+{
     let (parsed, resolution, config) = parsed.into_parts();
     let schemas = parsed.schemas();
     let warnings = parsed
@@ -1955,10 +2088,14 @@ pub fn resolve_modules_with_providerless_config<E: ResolveExportBindingPhase<Par
 /// This follows [`resolve_modules_with_config`] except for its
 /// [`ensure_expanded_root_graph`] check. Require scope comes from the loader;
 /// this entry point does not turn a root configuration into a module template.
-pub fn resolve_module_template_with_config<E: ResolveExportBindingPhase<ParserPlaceholder>>(
-    parsed: AdmittedRootDirectory<'_, E>,
+pub fn resolve_module_template_with_config<
+    E: ResolveExportBindingPhase<ParserPlaceholder>,
+    K: crate::parser::BackendPhase,
+>(
+    parsed: AdmittedRootDirectory<'_, E, K>,
     base_dir: &ResolvedPath,
-) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
+) -> Result<ModuleResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress, K>, ModuleError>
+{
     let (parsed, resolution, config) = parsed.into_parts();
     let schemas = parsed.schemas();
     let expanded =
@@ -1972,10 +2109,12 @@ pub fn resolve_module_template_with_config<E: ResolveExportBindingPhase<ParserPl
 /// scope, but omits the [`ensure_expanded_root_graph`] check.
 pub fn resolve_module_template_with_providerless_config<
     E: ResolveExportBindingPhase<ParserPlaceholder>,
+    K: crate::parser::BackendPhase,
 >(
-    parsed: AdmittedRootDirectory<'_, E>,
+    parsed: AdmittedRootDirectory<'_, E, K>,
     base_dir: &ResolvedPath,
-) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
+) -> Result<ModuleResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress, K>, ModuleError>
+{
     let (parsed, resolution, config) = parsed.into_parts();
     let schemas = parsed.schemas();
     let warnings = parsed
@@ -2002,11 +2141,13 @@ pub fn resolve_module_template_with_providerless_config<
 /// witness and shared value checker.
 pub(crate) fn resolve_upstream_modules_with_providerless_config<
     E: ResolveExportBindingPhase<ParserPlaceholder>,
+    K: crate::parser::BackendPhase,
 >(
-    parsed: AdmittedRootDirectory<'_, E>,
+    parsed: AdmittedRootDirectory<'_, E, K>,
     base_dir: &ResolvedPath,
     overrides: &crate::config_loader::SourceOverrides,
-) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
+) -> Result<ModuleResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress, K>, ModuleError>
+{
     let (parsed, resolution, config) = parsed.into_parts();
     let schemas = parsed.schemas();
     let expanded = UpstreamRefCheckedModuleGraph::check_providerless(
@@ -2019,11 +2160,13 @@ pub(crate) fn resolve_upstream_modules_with_providerless_config<
 
 pub(crate) fn resolve_upstream_modules_with_config<
     E: ResolveExportBindingPhase<ParserPlaceholder>,
+    K: crate::parser::BackendPhase,
 >(
-    parsed: AdmittedRootDirectory<'_, E>,
+    parsed: AdmittedRootDirectory<'_, E, K>,
     base_dir: &ResolvedPath,
     overrides: &crate::config_loader::SourceOverrides,
-) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
+) -> Result<ModuleResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress, K>, ModuleError>
+{
     let (parsed, resolution, config) = parsed.into_parts();
     let schemas = parsed.schemas();
     let expanded = UpstreamRefCheckedModuleGraph::check(
@@ -2040,11 +2183,14 @@ pub(crate) fn resolve_upstream_modules_with_config<
 /// `covered_findings` are typed source diagnostics the caller will publish.
 /// Residuals returned from this seam have those call-owned errors removed,
 /// including individual covered members of a mixed reference-type failure.
-pub fn resolve_modules_with_diagnostics<E: ResolveExportBindingPhase<ParserPlaceholder> + Clone>(
-    parsed: AdmittedRootDirectory<'_, E>,
+pub fn resolve_modules_with_diagnostics<
+    E: ResolveExportBindingPhase<ParserPlaceholder> + Clone,
+    K: crate::parser::BackendPhase,
+>(
+    parsed: AdmittedRootDirectory<'_, E, K>,
     base_dir: &ResolvedPath,
     covered_findings: &[crate::validation::ModuleCallFinding],
-) -> ModuleResolutionDiagnosticResult<E::Absolute> {
+) -> ModuleResolutionDiagnosticResult<E::Absolute, K> {
     resolve_modules_with_diagnostics_and_overrides(
         parsed,
         base_dir,
@@ -2055,12 +2201,13 @@ pub fn resolve_modules_with_diagnostics<E: ResolveExportBindingPhase<ParserPlace
 
 pub fn resolve_modules_with_diagnostics_and_overrides<
     E: ResolveExportBindingPhase<ParserPlaceholder> + Clone,
+    K: crate::parser::BackendPhase,
 >(
-    parsed: AdmittedRootDirectory<'_, E>,
+    parsed: AdmittedRootDirectory<'_, E, K>,
     base_dir: &ResolvedPath,
     covered_findings: &[crate::validation::ModuleCallFinding],
     overrides: &crate::config_loader::SourceOverrides,
-) -> ModuleResolutionDiagnosticResult<E::Absolute> {
+) -> ModuleResolutionDiagnosticResult<E::Absolute, K> {
     resolve_modules_with_import_diagnostics(
         parsed,
         base_dir,
@@ -2074,12 +2221,13 @@ pub fn resolve_modules_with_diagnostics_and_overrides<
 /// Command paths keep their established first import error behavior.
 pub fn resolve_modules_with_all_import_diagnostics_and_overrides<
     E: ResolveExportBindingPhase<ParserPlaceholder> + Clone,
+    K: crate::parser::BackendPhase,
 >(
-    parsed: AdmittedRootDirectory<'_, E>,
+    parsed: AdmittedRootDirectory<'_, E, K>,
     base_dir: &ResolvedPath,
     covered_findings: &[crate::validation::ModuleCallFinding],
     overrides: &crate::config_loader::SourceOverrides,
-) -> ModuleResolutionDiagnosticResult<E::Absolute> {
+) -> ModuleResolutionDiagnosticResult<E::Absolute, K> {
     resolve_modules_with_import_diagnostics(
         parsed,
         base_dir,
@@ -2091,13 +2239,14 @@ pub fn resolve_modules_with_all_import_diagnostics_and_overrides<
 
 fn resolve_modules_with_import_diagnostics<
     E: ResolveExportBindingPhase<ParserPlaceholder> + Clone,
+    K: crate::parser::BackendPhase,
 >(
-    parsed: AdmittedRootDirectory<'_, E>,
+    parsed: AdmittedRootDirectory<'_, E, K>,
     base_dir: &ResolvedPath,
     covered_findings: &[crate::validation::ModuleCallFinding],
     overrides: &crate::config_loader::SourceOverrides,
     import_error_reporting: ImportErrorReporting,
-) -> ModuleResolutionDiagnosticResult<E::Absolute> {
+) -> ModuleResolutionDiagnosticResult<E::Absolute, K> {
     let (parsed, resolution, config) = parsed.into_parts();
     let schemas = parsed.schemas();
     let mut resolver =
@@ -2111,11 +2260,12 @@ fn resolve_modules_with_import_diagnostics<
 /// unavailable by construction.
 pub fn resolve_modules_with_providerless_diagnostics<
     E: ResolveExportBindingPhase<ParserPlaceholder> + Clone,
+    K: crate::parser::BackendPhase,
 >(
-    parsed: AdmittedRootDirectory<'_, E>,
+    parsed: AdmittedRootDirectory<'_, E, K>,
     base_dir: &ResolvedPath,
     covered_findings: &[crate::validation::ModuleCallFinding],
-) -> ModuleResolutionDiagnosticResult<E::Absolute> {
+) -> ModuleResolutionDiagnosticResult<E::Absolute, K> {
     let (parsed, resolution, config) = parsed.into_parts();
     let schemas = parsed.schemas();
     let resolver =
@@ -2125,11 +2275,12 @@ pub fn resolve_modules_with_providerless_diagnostics<
 
 fn resolve_modules_with_diagnostics_and_resolver<
     E: ResolveExportBindingPhase<ParserPlaceholder> + Clone,
+    K: crate::parser::BackendPhase,
 >(
-    parsed: JudgedModuleFile<'_, E>,
+    parsed: JudgedModuleFile<'_, E, K>,
     mut resolver: ModuleResolver<'_, StrictTypeResolution>,
     covered_findings: &[crate::validation::ModuleCallFinding],
-) -> ModuleResolutionDiagnosticResult<E::Absolute> {
+) -> ModuleResolutionDiagnosticResult<E::Absolute, K> {
     let graph = parsed.into_file();
     let root = root_expansion_scope();
     let mut errors = resolver.process_imports_collecting(&graph.uses, &graph.module_calls);
@@ -2184,8 +2335,8 @@ fn resolve_modules_with_diagnostics_and_resolver<
 }
 
 /// Reject parser-only module conditionals at the publication boundary.
-pub fn ensure_expanded_root_graph<E, D>(
-    file: &File<E, ParserPlaceholder, ParserPlaceholder, D, AbsoluteBindingAddress>,
+pub fn ensure_expanded_root_graph<E, D, K: crate::parser::BackendPhase>(
+    file: &File<E, ParserPlaceholder, ParserPlaceholder, D, AbsoluteBindingAddress, K>,
 ) -> Result<(), ModuleError>
 where
     E: crate::parser::ExportParamLike<ParserPlaceholder, AbsoluteBindingAddress>,
@@ -2276,13 +2427,7 @@ where
         }
     }
     if let Some(backend) = &file.backend {
-        for value in backend
-            .attributes
-            .values()
-            .filter_map(|value| value.evaluated().ok())
-        {
-            audit(value, "backend attribute")?;
-        }
+        backend.try_visit_values(&mut |value| audit(value, "backend attribute"))?;
     }
     for block in &file.state_blocks {
         match block {
@@ -2381,9 +2526,9 @@ fn audit_validate_expr(
 /// substitution. A read or module-call template therefore reaches exactly one
 /// typed rejection seam, with enough information to distinguish a genuinely
 /// residual iterable from one that became concrete during module expansion.
-fn finalize_deferred_for_bodies<E, B: BindingAddress>(
-    parsed: BindingResolvedFile<E, B>,
-) -> Result<ModuleResolvedFile<E, B>, ModuleError> {
+fn finalize_deferred_for_bodies<E, B: BindingAddress, K: crate::parser::BackendPhase>(
+    parsed: BindingResolvedFile<E, B, K>,
+) -> Result<ModuleResolvedFile<E, B, K>, ModuleError> {
     let (resolved, errors) = finalize_deferred_for_bodies_collecting(parsed);
     match ModuleError::from_errors(errors) {
         Some(error) => Err(error),
@@ -2391,9 +2536,9 @@ fn finalize_deferred_for_bodies<E, B: BindingAddress>(
     }
 }
 
-fn finalize_deferred_for_bodies_collecting<E, B: BindingAddress>(
-    parsed: BindingResolvedFile<E, B>,
-) -> (ModuleResolvedFile<E, B>, Vec<ModuleError>) {
+fn finalize_deferred_for_bodies_collecting<E, B: BindingAddress, K: crate::parser::BackendPhase>(
+    parsed: BindingResolvedFile<E, B, K>,
+) -> (ModuleResolvedFile<E, B, K>, Vec<ModuleError>) {
     let known_bindings = deferred_for_known_bindings(&parsed);
     parsed.map_deferred_for_phase(|pending| {
         let mut resolved = Vec::with_capacity(pending.len());
@@ -2437,8 +2582,8 @@ fn parse_error_to_module_error(error: ParseError) -> ModuleError {
     }
 }
 
-fn deferred_for_known_bindings<E, B: BindingAddress>(
-    parsed: &BindingResolvedFile<E, B>,
+fn deferred_for_known_bindings<E, B: BindingAddress, K: crate::parser::BackendPhase>(
+    parsed: &BindingResolvedFile<E, B, K>,
 ) -> Vec<String> {
     let mut known = parsed
         .structural_binding_names()
@@ -2451,8 +2596,8 @@ fn deferred_for_known_bindings<E, B: BindingAddress>(
     known
 }
 
-pub(super) fn deferred_for_body_errors<E, B: BindingAddress>(
-    parsed: &BindingResolvedFile<E, B>,
+pub(super) fn deferred_for_body_errors<E, B: BindingAddress, K: crate::parser::BackendPhase>(
+    parsed: &BindingResolvedFile<E, B, K>,
 ) -> Vec<ModuleError> {
     let known_bindings = deferred_for_known_bindings(parsed);
     parsed
@@ -2467,13 +2612,17 @@ pub(super) fn deferred_for_body_errors<E, B: BindingAddress>(
         .collect()
 }
 
-fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
-    judged: &JudgedModuleFile<'_, E>,
+fn resolve_modules_with_resolver_collecting<
+    E,
+    P: TypeResolutionPolicy,
+    K: crate::parser::BackendPhase,
+>(
+    judged: &JudgedModuleFile<'_, E, K>,
     resolver: &mut ModuleResolver<'_, P>,
     ref_check: &RefCheckWitness,
     root: &RootScope,
 ) -> (
-    Vec<crate::parser::RootBindingResolvedParsedFile>,
+    Vec<crate::parser::RootBindingResolvedParsedFile<K>>,
     Vec<ModuleError>,
 ) {
     let parsed = judged.file();
@@ -2516,12 +2665,12 @@ fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
     (expanded_calls, errors)
 }
 
-fn resolve_modules_with_resolver<E, P: TypeResolutionPolicy>(
-    judged: &JudgedModuleFile<'_, E>,
+fn resolve_modules_with_resolver<E, P: TypeResolutionPolicy, K: crate::parser::BackendPhase>(
+    judged: &JudgedModuleFile<'_, E, K>,
     resolver: &mut ModuleResolver<'_, P>,
     ref_check: &RefCheckWitness,
     root: &RootScope,
-) -> Result<Vec<crate::parser::RootBindingResolvedParsedFile>, ModuleError> {
+) -> Result<Vec<crate::parser::RootBindingResolvedParsedFile<K>>, ModuleError> {
     resolver.check_require_placement(judged)?;
     let parsed = judged.file();
     let module_calls = &parsed.module_calls;
@@ -2570,7 +2719,7 @@ mod type_resolution_policy_tests {
                     config,
                     &schemas,
                     crate::config_loader::ParsedRootDirectory::from_parsed_for_test(
-                        crate::parser::ParsedFile::default(),
+                        <crate::parser::ParsedFile>::default(),
                     )
                     .module_resolution_context(),
                 );
@@ -2580,7 +2729,7 @@ mod type_resolution_policy_tests {
                         config,
                         &schemas,
                         crate::config_loader::ParsedRootDirectory::from_parsed_for_test(
-                            crate::parser::ParsedFile::default(),
+                            <crate::parser::ParsedFile>::default(),
                         )
                         .module_resolution_context(),
                     );

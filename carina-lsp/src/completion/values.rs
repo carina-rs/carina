@@ -2468,18 +2468,13 @@ fn resolve_upstream_export_keys(
     provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Option<carina_core::upstream_exports::UpstreamExportEntries> {
     let base = base_path?;
-    let upstream = carina_core::parser::UpstreamState {
-        caller: None,
-        binding: carina_core::resource::RelativeBindingName::new(binding),
-        source: std::path::PathBuf::from(source),
-    };
-    let mut exports = carina_core::upstream_exports::discover_upstream_exports(
+    carina_core::upstream_exports::discover_upstream_exports_for_source(
         base,
-        &[upstream],
+        &carina_core::resource::RelativeBindingName::new(binding),
+        std::path::Path::new(source),
         provider_ctx,
         Some(schemas),
-    );
-    exports.remove(binding)
+    )
 }
 
 /// Cached variant of [`resolve_upstream_export_keys`] for use inside a
@@ -2548,20 +2543,14 @@ fn infer_for_binding_type(
         .entry(iterable.binding.clone())
         .or_insert_with(|| {
             let binding = carina_core::resource::RelativeBindingName::new(iterable.binding.clone());
-            let upstream = carina_core::parser::UpstreamState {
-                caller: None,
-                binding: binding.clone(),
-                source: std::path::PathBuf::from(source),
-            };
-            let mut resolved = carina_core::upstream_exports::discover_upstream_exports(
+            carina_core::upstream_exports::discover_upstream_exports_for_source(
                 base,
-                &[upstream],
+                &binding,
+                std::path::Path::new(source),
                 provider_ctx,
                 Some(schemas),
-            );
-            // Move the entry out of `resolved` rather than cloning so we
-            // don't pay a deep `Value` clone on the per-keystroke path.
-            resolved.remove(&binding).unwrap_or_default()
+            )
+            .unwrap_or_default()
         });
     let export_type =
         structural_type_for_completion(exports.get(&iterable.export)?).structural_type()?;

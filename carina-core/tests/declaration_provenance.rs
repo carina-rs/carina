@@ -371,7 +371,7 @@ let selected_read = if enabled { read mock.test.Lookup { name = 'then read' } } 
             .unwrap()
         })
         .publish(&mut NoTypeErrors);
-        let mut child_tree = carina_core::parser::ExpandedParsedFile::default();
+        let mut child_tree: carina_core::parser::ExpandedParsedFile = Default::default();
         child_tree.resources = children;
         let analysis = AnalysisTree::try_from_file(&child_tree)?;
         let item = analysis.resources().next().unwrap();
@@ -546,7 +546,7 @@ fn declaration_provenance_is_semantically_neutral_and_not_serialized()
 
 #[test]
 fn analysis_tree_rejects_missing_declaration_provenance() {
-    let mut parsed = ParsedFile::default();
+    let mut parsed: ParsedFile = Default::default();
     parsed
         .resources
         .push(Resource::new("test.Resource", "synthetic"));

@@ -293,10 +293,10 @@ impl ProviderBoundPlanFile {
         match plan {
             InspectedPlanFile::Verified(plan) => Ok(Self::verified(plan, providers)),
             InspectedPlanFile::NeedsSecretVerification(plan) => {
-                let unresolved = carina_core::parser::ParsedFile::default();
+                let unresolved: carina_core::parser::ParsedFile = Default::default();
                 let providers = providers.check_saved_plan_config_pair(
                     carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(
-                        carina_core::parser::InferredFile::default(),
+                        <carina_core::parser::InferredFile>::default(),
                     ),
                     carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
                     base_dir,
@@ -1575,7 +1575,7 @@ mod tests {
     fn saved_provider_configs(
         configs: Vec<ExpandedProviderConfig>,
     ) -> carina_core::parser::SavedProviderConfigs {
-        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+        let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
         parsed.providers = configs;
         let resolved = carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
@@ -2461,7 +2461,7 @@ mod tests {
                         .resolve_with_schemas(context.context().schemas())
                         .unwrap(),
                 };
-                let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+                let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
                 parsed.providers = recorded.clone();
                 for config in &mut parsed.providers {
                     config.attributes.insert(

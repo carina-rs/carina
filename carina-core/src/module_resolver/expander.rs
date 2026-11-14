@@ -165,7 +165,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
     /// empty contribution and its relabel are enforced by the module
     /// boundary). The recursive parser-phase caller
     /// (`resolve_nested_modules`) merges directly.
-    pub(super) fn expand_module_call_checked(
+    pub(super) fn expand_module_call_checked<K: crate::parser::BackendPhase>(
         &self,
         authored_call: &ModuleCall,
         call: &crate::parser::ModuleCall<ParserPlaceholder, AbsoluteBindingAddress>,
@@ -173,7 +173,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         ref_check: &super::resolver::RefCheckWitness,
         binding_index: Option<&BindingIndex<'_>>,
         resolved_bindings: Option<&crate::binding_index::ResolvedBindings<ParserPlaceholder>>,
-    ) -> Result<crate::parser::RootBindingResolvedParsedFile, ModuleError> {
+    ) -> Result<crate::parser::RootBindingResolvedParsedFile<K>, ModuleError> {
         let expanded = self
             .expand_module_call_inner(
                 authored_call,
@@ -192,7 +192,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         Ok(expanded)
     }
 
-    pub(super) fn expand_module_call_checked_collecting(
+    pub(super) fn expand_module_call_checked_collecting<K: crate::parser::BackendPhase>(
         &self,
         authored_call: &ModuleCall,
         call: &crate::parser::ModuleCall<ParserPlaceholder, AbsoluteBindingAddress>,
@@ -200,7 +200,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         ref_check: &super::resolver::RefCheckWitness,
         binding_index: Option<&BindingIndex<'_>>,
         resolved_bindings: Option<&crate::binding_index::ResolvedBindings<ParserPlaceholder>>,
-    ) -> Result<crate::parser::RootBindingResolvedParsedFile, Vec<ModuleError>> {
+    ) -> Result<crate::parser::RootBindingResolvedParsedFile<K>, Vec<ModuleError>> {
         let expanded = self
             .expand_module_call_inner(
                 authored_call,
@@ -222,7 +222,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         }
     }
 
-    fn expand_module_call_inner(
+    fn expand_module_call_inner<K: crate::parser::BackendPhase>(
         &self,
         authored_call: &ModuleCall,
         call: &crate::parser::ModuleCall<ParserPlaceholder, AbsoluteBindingAddress>,
@@ -230,7 +230,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         binding_index: Option<&BindingIndex<'_>>,
         resolved_bindings: Option<&crate::binding_index::ResolvedBindings<ParserPlaceholder>>,
         expansion_source: ModuleExpansionSource<'_>,
-    ) -> Result<crate::parser::RootBindingResolvedParsedFile, ModuleError> {
+    ) -> Result<crate::parser::RootBindingResolvedParsedFile<K>, ModuleError> {
         #[cfg(feature = "test-utils")]
         let _recording_module = crate::identity_recording::enter_module(call.id());
         let module = match expansion_source.module {
@@ -1208,10 +1208,10 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
 
         // A module instance contributes only its instance-prefixed runtime
         // graph. Module-local declarations and boundary inputs remain empty
-        // on `ParsedFile::default()` because they were consumed above or are
+        // on `<ParsedFile>::default()` because they were consumed above or are
         // rejected while loading the module.
         let mut contribution =
-            crate::parser::RootBindingResolvedParsedFile::empty_with_parsed_binding_uses(
+            crate::parser::RootBindingResolvedParsedFile::<K>::empty_with_parsed_binding_uses(
                 expanded_binding_uses,
             );
         contribution.resources = resources;
@@ -1360,7 +1360,8 @@ fn source_argument_name<B: BindingAddress, C: BindingAddress>(
                 | DeferredValue::Unknown(
                     ApplyTimeUnknown::UpstreamExport { path: _ }
                     | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
-                    | ApplyTimeUnknown::PendingReRead(_),
+                    | ApplyTimeUnknown::PendingReRead(_)
+                    | ApplyTimeUnknown::IncompleteBackendScope,
                 )
                 | DeferredValue::Placeholder(
                     ParserPlaceholder::FnParam { name: _ }
@@ -1718,7 +1719,8 @@ fn authored_value_reference_path(value: &Value) -> Option<crate::resource::Autho
             | DeferredValue::Unknown(
                 ApplyTimeUnknown::UpstreamExport { path: _ }
                 | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
-                | ApplyTimeUnknown::PendingReRead(_),
+                | ApplyTimeUnknown::PendingReRead(_)
+                | ApplyTimeUnknown::IncompleteBackendScope,
             )
             | DeferredValue::Placeholder(
                 ParserPlaceholder::FnParam { name: _ }
@@ -1859,7 +1861,8 @@ pub(crate) fn module_parameter_postfix<B: BindingAddress>(
                 | DeferredValue::Unknown(
                     ApplyTimeUnknown::UpstreamExport { path: _ }
                     | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
-                    | ApplyTimeUnknown::PendingReRead(_),
+                    | ApplyTimeUnknown::PendingReRead(_)
+                    | ApplyTimeUnknown::IncompleteBackendScope,
                 )
                 | DeferredValue::Placeholder(
                     ParserPlaceholder::FnParam { name: _ }
@@ -2224,7 +2227,7 @@ fn select_deferred_module_ifs(
         }
     }
 
-    let mut contribution = ParsedFile::default();
+    let mut contribution: ParsedFile = Default::default();
     let mut forwarded = Vec::new();
     let mut selected_bindings = HashSet::new();
     for deferred in &module.deferred_module_ifs {
@@ -2316,9 +2319,9 @@ fn expand_forwarded_if_body(
     }
 }
 
-fn reject_dropped_conditional_references(
+fn reject_dropped_conditional_references<K: crate::parser::BackendPhase>(
     selected: &SelectedDeferredIfs,
-    expanded: &crate::parser::RootBindingResolvedParsedFile,
+    expanded: &crate::parser::RootBindingResolvedParsedFile<K>,
 ) -> Result<(), ModuleError> {
     if selected.dropped.is_empty() {
         return Ok(());
@@ -2635,9 +2638,15 @@ pub(super) fn evaluate_constraint_scope(
 }
 
 impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
-    pub(super) fn check_require_placement<E>(
+    pub(super) fn check_require_placement<E, K: crate::parser::BackendPhase>(
         &self,
-        judged: &crate::parser::retained::JudgedFile<'_, E, crate::parser::ParsedDeferredForPhase>,
+        judged: &crate::parser::retained::JudgedFile<
+            '_,
+            E,
+            crate::parser::ParsedDeferredForPhase,
+            crate::resource::RelativeBindingName,
+            K,
+        >,
     ) -> Result<(), ModuleError> {
         // Reference normalization re-judges the file before this check. The
         // retained report owns every root require verdict; diagnostic callers
@@ -3336,7 +3345,8 @@ fn expand_module_composition(
                             | DeferredValue::Unknown(
                                 ApplyTimeUnknown::UpstreamExport { path: _ }
                                 | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
-                                | ApplyTimeUnknown::PendingReRead(_),
+                                | ApplyTimeUnknown::PendingReRead(_)
+                                | ApplyTimeUnknown::IncompleteBackendScope,
                             )
                             | DeferredValue::Placeholder(
                                 ParserPlaceholder::FnParam { name: _ }
@@ -4098,13 +4108,14 @@ pub(super) fn split_instance_prefix(name: &str) -> Option<(&str, &str)> {
 /// `find_state_names_by_type` returns every state resource name for a given
 /// `(provider, resource_type)` — the reconciler uses them to discover which
 /// instance prefixes already exist in state.
-pub fn reconcile_anonymous_module_instances<E, P, T>(
+pub fn reconcile_anonymous_module_instances<E, P, T, K: crate::parser::BackendPhase>(
     file: &mut crate::parser::File<
         E,
         P,
         T,
         crate::parser::ResolvedDeferredForPhase<P, T, AbsoluteBindingAddress>,
         AbsoluteBindingAddress,
+        K,
     >,
     find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
     claims: &crate::identifier::StateBlockClaims,
@@ -4533,7 +4544,7 @@ mod tests {
                     &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                     session,
                     crate::config_loader::ParsedRootDirectory::from_parsed_for_test(
-                        crate::parser::ParsedFile::default(),
+                        <crate::parser::ParsedFile>::default(),
                     )
                     .module_resolution_context(),
                 );
@@ -4544,7 +4555,7 @@ mod tests {
                 // Inspect the typed contribution before finalization rejects replaying
                 // a deferred ModuleCall body. Its argument must already retain origin.
                 let expanded = resolver
-                    .expand_module_call_inner(
+                    .expand_module_call_inner::<crate::parser::StrictBackend>(
                         call,
                         &expanded_call,
                         "instance",
@@ -4632,10 +4643,11 @@ mod tests {
             ResourceIdentity::new(current_prefix.clone()),
         ));
         resource.loop_provenance = provenance;
-        let mut file = crate::parser::ModuleResolvedParsedFile {
-            resources: vec![resource],
-            ..Default::default()
-        };
+        let mut file: crate::parser::ModuleResolvedParsedFile =
+            crate::parser::ModuleResolvedParsedFile {
+                resources: vec![resource],
+                ..Default::default()
+            };
 
         reconcile_anonymous_module_instances(
             &mut file,
@@ -4695,10 +4707,11 @@ mod tests {
             None,
         );
         resource.loop_provenance = crate::resource::LoopProvenance::direct(direct);
-        let mut file = crate::parser::ModuleResolvedParsedFile {
-            resources: vec![resource],
-            ..Default::default()
-        };
+        let mut file: crate::parser::ModuleResolvedParsedFile =
+            crate::parser::ModuleResolvedParsedFile {
+                resources: vec![resource],
+                ..Default::default()
+            };
 
         reconcile_anonymous_module_instances(
             &mut file,

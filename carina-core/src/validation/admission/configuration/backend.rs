@@ -132,8 +132,8 @@ impl BackendConfigError {
     }
 }
 
-impl<P: PlaceholderKind, T: ValueKind, D, B: BindingAddress, E>
-    parser::AnalysisTree<'_, P, T, D, B, E>
+impl<P: PlaceholderKind, T: ValueKind, D, B: BindingAddress, E, K: parser::BackendAdmissionPhase>
+    parser::AnalysisTree<'_, P, T, D, B, E, K>
 where
     D: parser::DeferredForPhaseTraversal<P, T, B>,
 {
@@ -151,7 +151,19 @@ where
                 .map(|error| match error {
                     UnlocatedBackendError::Attribute(error) => {
                         LocatedBackendError::Attribute(parser::Located::new(
-                            self.backend_attribute_location(error.attribute()).clone(),
+                            match &error {
+                                BackendAttributeError::EvaluationFailed {
+                                    error: cause, ..
+                                } => cause.element_diagnostic().map_or_else(
+                                    || self.backend_attribute_location(error.attribute()).clone(),
+                                    |finding| finding.location().clone(),
+                                ),
+                                BackendAttributeError::UnknownAttribute { .. }
+                                | BackendAttributeError::MissingRequiredAttribute { .. }
+                                | BackendAttributeError::InvalidAttribute { .. } => {
+                                    self.backend_attribute_location(error.attribute()).clone()
+                                }
+                            },
                             error,
                         ))
                     }
@@ -170,9 +182,16 @@ where
 }
 
 /// Ownership and failed-value admission are shared by both source projections.
-fn admit_directory_backend<U, T, N, P: PlaceholderKind, B: BindingAddress>(
+fn admit_directory_backend<
+    U,
+    T,
+    N,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    K: parser::BackendAdmissionPhase,
+>(
     verdict: &crate::config_loader::DirectoryVerdict<U, T, N>,
-    backend: Option<&parser::BackendConfig<P, B>>,
+    backend: Option<&parser::BackendConfig<P, B, K>>,
 ) -> Option<Result<AdmittedConfiguration<kind::BackendAttribute>, BackendConfigError>> {
     match verdict {
         crate::config_loader::DirectoryVerdict::Root(root) if root.has_sole_backend() => {}
@@ -183,22 +202,13 @@ fn admit_directory_backend<U, T, N, P: PlaceholderKind, B: BindingAddress>(
     }
     let backend = backend?;
     match check(backend) {
-        Ok(builder) => Some(Ok(builder.admit_payload())),
-        Err(BackendConfigError::Invalid(mut errors)) => {
-            errors
-                .errors
-                .retain(|error| !matches!(error, BackendAttributeError::EvaluationFailed { .. }));
-            if errors.errors.is_empty() {
-                None
-            } else {
-                Some(Err(errors.into()))
-            }
-        }
+        Ok(CheckedBackend::Ready(builder)) => Some(Ok(builder.admit_payload())),
+        Ok(CheckedBackend::Deferred(_)) => None,
         Err(error) => Some(Err(error)),
     }
 }
 
-impl<E> crate::config_loader::RootDirectoryParse<E> {
+impl<E, K: parser::BackendAdmissionPhase> crate::config_loader::RootDirectoryParse<E, K> {
     /// Preserve backend admission when an authored tree cannot seal.
     pub fn admit_backend_unlocated(
         &self,
@@ -248,13 +258,22 @@ impl fmt::Display for BackendConfigErrors {
 
 impl std::error::Error for BackendConfigErrors {}
 
+fn evaluation_failure_detail(error: &parser::ParseError) -> &parser::ParseError {
+    match error {
+        parser::ParseError::AtElement(finding) => evaluation_failure_detail(finding.detail()),
+        parser::ParseError::Located { error, .. } => evaluation_failure_detail(error),
+        error => error,
+    }
+}
+
 /// One schema failure associated with a backend attribute.
 #[derive(Debug, Error)]
 pub enum BackendAttributeError {
-    #[error("{error}")]
+    #[error("{}", evaluation_failure_detail(error))]
     EvaluationFailed {
         backend_type: String,
         attribute: crate::parser::AttributeKey,
+        #[source]
         error: Arc<crate::parser::ParseError>,
     },
     #[error("Unknown attribute '{attribute}' for backend type '{backend_type}'")]
@@ -381,7 +400,7 @@ impl AdmittedConfiguration<kind::BackendAttribute> {
 ///
 /// ```
 /// use carina_core::{parser::BackendConfig, validation::admission::configuration::backend};
-/// let raw = BackendConfig::<carina_core::resource::NoPlaceholder> { backend_type: "local".into(), attributes: Default::default(), attribute_spans: Default::default() };
+/// let raw = BackendConfig::<carina_core::resource::NoPlaceholder> { backend_type: "local".into(), attributes: Default::default(), attribute_spans: Default::default(), source: () };
 /// let admitted = backend::admit(&raw).unwrap();
 /// assert!(admitted.attributes().is_empty());
 /// ```
@@ -396,15 +415,23 @@ impl AdmittedConfiguration<kind::BackendAttribute> {
 /// # fn replace(config: &mut AdmittedConfiguration<BackendAttribute>) {
 /// # }
 /// ```
-pub fn admit<P: PlaceholderKind, B: BindingAddress>(
-    config: &parser::BackendConfig<P, B>,
+pub fn admit<P: PlaceholderKind, B: BindingAddress, K: parser::BackendAdmissionPhase>(
+    config: &parser::BackendConfig<P, B, K>,
 ) -> Result<AdmittedConfiguration<kind::BackendAttribute>, BackendConfigError> {
-    check(config).map(|builder| builder.admit_payload())
+    match check(config)? {
+        CheckedBackend::Ready(builder) => Ok(builder.admit_payload()),
+        CheckedBackend::Deferred(errors) => Err(BackendConfigErrors::new(errors).into()),
+    }
 }
 
-fn check<P: PlaceholderKind, B: BindingAddress>(
-    config: &parser::BackendConfig<P, B>,
-) -> Result<ConfigurationBuilder<kind::BackendAttribute>, BackendConfigError> {
+enum CheckedBackend {
+    Ready(ConfigurationBuilder<kind::BackendAttribute>),
+    Deferred(Vec<BackendAttributeError>),
+}
+
+fn check<P: PlaceholderKind, B: BindingAddress, K: parser::BackendAdmissionPhase>(
+    config: &parser::BackendConfig<P, B, K>,
+) -> Result<CheckedBackend, BackendConfigError> {
     let kind = match config.backend_type.as_str() {
         "s3" => BackendKind::S3,
         "local" => BackendKind::Local,
@@ -418,6 +445,7 @@ fn check<P: PlaceholderKind, B: BindingAddress>(
     let backend = kind.declaration();
     let declaration = &backend.configuration;
     let mut errors = Vec::new();
+    let mut pending = Vec::new();
     for attribute in &backend.required {
         if !config.attributes.contains_key(*attribute) {
             errors.push(BackendAttributeError::MissingRequiredAttribute {
@@ -431,20 +459,20 @@ fn check<P: PlaceholderKind, B: BindingAddress>(
     let checked = crate::validation::deferred_types::TypeCheckSession::run(&catalog, |_| {
         let mut aggregate = ConfigurationBuilder::new(Arc::clone(declaration), kind);
         for (key, value) in &config.attributes {
-            let Some(destination) = declaration.destination::<kind::BackendAttribute>(
+            let destination = declaration.destination::<kind::BackendAttribute>(
                 key,
                 InstanceIdentity::Backend(kind),
                 CatalogRevision(CatalogSnapshot::Backend(declaration.identity)),
-            ) else {
+            );
+            if destination.is_none() {
                 errors.push(BackendAttributeError::UnknownAttribute {
                     backend_type: kind.name().into(),
                     attribute: key.clone(),
                 });
-                continue;
-            };
-            let value = match value {
-                parser::BackendAttributeValue::Evaluated(value) => value,
-                parser::BackendAttributeValue::Failed(error) => {
+            }
+            let value = match K::admission_input(value) {
+                parser::BackendAdmissionInput::Evaluated(value) => value,
+                parser::BackendAdmissionInput::Failed(error) => {
                     errors.push(BackendAttributeError::EvaluationFailed {
                         backend_type: kind.name().into(),
                         attribute: key.clone(),
@@ -453,6 +481,18 @@ fn check<P: PlaceholderKind, B: BindingAddress>(
                     continue;
                 }
             };
+            let Some(destination) = destination else {
+                continue;
+            };
+            if matches!(
+                value,
+                Value::Deferred(crate::resource::DeferredValue::Unknown(
+                    crate::resource::ApplyTimeUnknown::IncompleteBackendScope
+                ))
+            ) {
+                pending.push(invalid_shape(kind, key, destination.contract.attr(), value));
+                continue;
+            }
             let ty = destination.contract.attr();
             // The enum's actual namespace is intentional: backend regions do
             // not use provider-block aliases or depend on provider loading.
@@ -514,7 +554,11 @@ fn check<P: PlaceholderKind, B: BindingAddress>(
     if !errors.is_empty() {
         return Err(BackendConfigErrors::new(errors).into());
     }
-    Ok(aggregate)
+    if pending.is_empty() {
+        Ok(CheckedBackend::Ready(aggregate))
+    } else {
+        Ok(CheckedBackend::Deferred(pending))
+    }
 }
 
 #[cfg(test)]

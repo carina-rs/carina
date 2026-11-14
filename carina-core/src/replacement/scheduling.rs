@@ -489,7 +489,7 @@ mod tests {
                 .unwrap()
                 .check_inputs(&schemas, &HashMap::new())
                 .unwrap();
-            let mut configuration = crate::parser::ExpandedInferredFile::default();
+            let mut configuration: crate::parser::ExpandedInferredFile = Default::default();
             configuration.resources.push(
                 target
                     .as_inner()

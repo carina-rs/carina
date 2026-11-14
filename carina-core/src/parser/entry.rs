@@ -1472,7 +1472,7 @@ fn parse_with_seeded_bindings_inner(
     parsed.resources = resources;
     parsed.data_sources = data_sources;
     // Virtual resources are synthesized by module-call expansion, not the
-    // parser; `ParsedFile::default()` leaves compositions empty here.
+    // parser; `<ParsedFile>::default()` leaves compositions empty here.
     parsed.variables = variables;
     parsed.uses = uses;
     parsed.module_calls = module_calls;
@@ -1591,7 +1591,7 @@ fn interpolation_like_spans(content: &str) -> Vec<(usize, usize)> {
 ///
 /// Empty seed list is a no-op — single-file callers (the legacy
 /// `parse(input, config)` wrapper, parser tests) pay no cost.
-fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
+pub(super) fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
     for seed in seeds {
         match seed.kind() {
             SeedKind::Value {
@@ -1735,16 +1735,24 @@ pub fn parse_file_and_resolve(
     input: &str,
     path: &std::path::Path,
     config: &ProviderContext,
-) -> Result<ParsedFile, ParseError> {
+) -> Result<ParsedFile<super::StrictBackend>, ParseError> {
     let mut parsed = parse_file(input, path, config)?;
     resolve_resource_refs(&mut parsed, config)?;
+    let mut parsed = super::evaluate_file_backend::<super::StrictBackend, _>(
+        parsed,
+        config,
+        None,
+        crate::config_loader::strict_resolution_context(),
+    )?;
     resolve_provider_unresolved_attributes(&mut parsed, config)?;
     finalize_provider_configs(&mut parsed)?;
     Ok(parsed)
 }
 
 #[cfg(test)]
-pub(crate) fn parse_and_resolve(input: &str) -> Result<ParsedFile, ParseError> {
+pub(crate) fn parse_and_resolve(
+    input: &str,
+) -> Result<ParsedFile<super::StrictBackend>, ParseError> {
     parse_file_and_resolve(
         input,
         std::path::Path::new("test.crn"),

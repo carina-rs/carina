@@ -346,14 +346,6 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
             ..Diagnostic::new(format_error_with_source_chain(error), "error")
         },
         AppError::AnalysisResolution(error) => match error.as_ref() {
-            carina_core::parser::AnalysisResolutionError::BackendEvaluation(error) => {
-                match error.element_diagnostic() {
-                    Some(finding) => {
-                        Diagnostic::located(error.diagnostic_message(), finding.location())
-                    }
-                    None => Diagnostic::new(error.diagnostic_message(), "error"),
-                }
-            }
             carina_core::parser::AnalysisResolutionError::Diagnostic(finding) => {
                 Diagnostic::located(finding.detail().diagnostic_message(), finding.location())
             }

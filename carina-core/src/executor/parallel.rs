@@ -2060,25 +2060,28 @@ mod tests {
                 });
                 plan.add(Effect::Create(resolved(alb.clone())));
                 let listener_origin = listener.clone();
-                let configuration = crate::parser::ExpandedParsedFile {
-                    resources: vec![cert.clone(), alb.clone(), listener.clone()],
-                    wait_bindings: vec![crate::parser::WaitBinding {
-                        binding: absolute("cert_issued"),
-                        target: absolute("cert"),
-                        until_raw: "cert.status == ISSUED".to_owned(),
-                        until_predicate: crate::parser::UntilPredicateAst {
-                            root: absolute("cert"),
-                            attribute_segments: vec!["status".to_owned()],
-                            rhs: serde_json::from_value(serde_json::json!({"String": "'ISSUED'"}))
+                let configuration: crate::parser::ExpandedParsedFile =
+                    crate::parser::ExpandedParsedFile {
+                        resources: vec![cert.clone(), alb.clone(), listener.clone()],
+                        wait_bindings: vec![crate::parser::WaitBinding {
+                            binding: absolute("cert_issued"),
+                            target: absolute("cert"),
+                            until_raw: "cert.status == ISSUED".to_owned(),
+                            until_predicate: crate::parser::UntilPredicateAst {
+                                root: absolute("cert"),
+                                attribute_segments: vec!["status".to_owned()],
+                                rhs: serde_json::from_value(
+                                    serde_json::json!({"String": "'ISSUED'"}),
+                                )
                                 .unwrap(),
-                        },
-                        timeout_secs: None,
-                        depends_on: Default::default(),
-                        line: 1,
-                        declaration: Default::default(),
-                    }],
-                    ..Default::default()
-                };
+                            },
+                            timeout_secs: None,
+                            depends_on: Default::default(),
+                            line: 1,
+                            declaration: Default::default(),
+                        }],
+                        ..Default::default()
+                    };
                 let graph = crate::resolved_graph::resolve_expanded_graph(configuration.into())
                     .expect("wait fixture graph");
                 plan.add(Effect::Create(
@@ -2375,7 +2378,7 @@ mod tests {
         };
 
         let child_id = child.id.clone();
-        let configuration = crate::parser::ExpandedParsedFile {
+        let configuration: crate::parser::ExpandedParsedFile = crate::parser::ExpandedParsedFile {
             resources: vec![
                 parent
                     .as_resource_ref()

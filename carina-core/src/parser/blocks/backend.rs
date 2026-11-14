@@ -10,7 +10,6 @@ use crate::parser::context::{ParseContext, first_inner, next_pair};
 use crate::parser::error::ParseError;
 use crate::parser::expressions::string_literal::parse_string_literal;
 use crate::parser::grammar::PreprocessedFile;
-use crate::parser::parse_expression;
 use crate::parser::util::unwrap_to_primary;
 
 pub(in crate::parser) fn parse_backend_block(
@@ -30,16 +29,12 @@ pub(in crate::parser) fn parse_backend_block(
             let mut attr_inner = attr_pair.into_inner();
             let key_pair = next_pair(&mut attr_inner, "attribute name", "backend block")?;
             let key_span = SourceSpan::from_pest(&key_pair, preprocessed_file);
+            let key_location = ctx.declaration_location(&key_pair);
             let key = ctx.authored_key(key_pair);
-            let value = parse_expression(
-                next_pair(&mut attr_inner, "attribute value", "backend block")?,
-                ctx,
-            )?
-            .projection()
-            .expect("materialized parser expression")
-            .clone();
+            let value_pair = next_pair(&mut attr_inner, "attribute value", "backend block")?;
+            let value = ctx.backend_expression(&value_pair, key_location);
             attribute_spans.insert(key.clone(), key_span);
-            attributes.insert(key, value.into());
+            attributes.insert(key, value);
         }
     }
 
@@ -47,6 +42,7 @@ pub(in crate::parser) fn parse_backend_block(
         backend_type,
         attributes,
         attribute_spans,
+        source: (),
     })
 }
 
@@ -62,8 +58,7 @@ pub(in crate::parser) fn parse_upstream_state_expr(
     let (block_line, _) = pair.as_span().start_pos().line_col();
     let inner = pair.into_inner();
 
-    let mut source: Option<String> = None;
-    let mut caller = None;
+    let mut source: Option<(String, crate::parser::DeclarationLocation)> = None;
     for attr_pair in inner {
         if attr_pair.as_rule() != Rule::attribute {
             continue;
@@ -82,9 +77,7 @@ pub(in crate::parser) fn parse_upstream_state_expr(
         )?;
         match key {
             key if key.matches("source") => {
-                caller = Some(crate::parser::UpstreamCallSite::from_location(
-                    &ctx.declaration_location(&value_pair),
-                ));
+                let caller = ctx.declaration_location(&value_pair);
                 let value_text =
                     crate::parser::AuthoredExpressionText::redact(value_pair.clone(), None);
                 let invalid_source =
@@ -101,13 +94,16 @@ pub(in crate::parser) fn parse_upstream_state_expr(
                 if value.as_rule() != Rule::string {
                     return Err(invalid_source(false));
                 }
-                source = Some(parse_string_literal(value).map_err(|error| {
-                    let without_interpolation = matches!(
-                        error,
-                        ParseError::InterpolationNotAllowedInLiteralString { .. }
-                    );
-                    invalid_source(without_interpolation)
-                })?);
+                source = Some((
+                    parse_string_literal(value).map_err(|error| {
+                        let without_interpolation = matches!(
+                            error,
+                            ParseError::InterpolationNotAllowedInLiteralString { .. }
+                        );
+                        invalid_source(without_interpolation)
+                    })?,
+                    caller,
+                ));
             }
             other => {
                 return Err(ParseError::InvalidExpression {
@@ -121,7 +117,7 @@ pub(in crate::parser) fn parse_upstream_state_expr(
         }
     }
 
-    let source = source.ok_or_else(|| ParseError::InvalidExpression {
+    let (source, caller) = source.ok_or_else(|| ParseError::InvalidExpression {
         line: block_line,
         message: format!(
             "upstream_state '{}' requires a 'source' attribute",

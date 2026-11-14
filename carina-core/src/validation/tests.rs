@@ -283,7 +283,7 @@ fn planning_resolution_requires_a_successful_judgement() {
     let schemas = SchemaRegistry::new();
     let provider = LoadedProviderContext::empty_for_test();
     let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
-    let unjudged = crate::parser::ModuleResolvedParsedFile::default();
+    let unjudged: crate::parser::ModuleResolvedParsedFile = Default::default();
     assert!(matches!(
         resolve_bare_binding_uses(unjudged, &schemas, &provider, &signatures),
         Err(ResolveFileError::Unjudged(_))
@@ -707,7 +707,7 @@ fn consumer_resolution_is_distinct_from_parser_types_and_preserves_inference_fai
     };
 
     let unknown = TypeExpr::DottedUnresolved(ResourceTypePath::new("missing", "Thing"));
-    let mut parsed = ParsedFile::default();
+    let mut parsed: ParsedFile = Default::default();
     parsed.arguments.push(ArgumentParameter {
         name: "argument".to_string(),
         static_type: unknown.clone(),
@@ -766,7 +766,7 @@ fn consumer_resolution_is_distinct_from_parser_types_and_preserves_inference_fai
     let failure = InferenceError::UnknownType {
         reason: "dynamic".to_string(),
     };
-    let inferred = ParsedFile::default().map_export_params(|_exports| {
+    let inferred = <ParsedFile>::default().map_export_params(|_exports| {
         vec![
             InferredExportParam::<ParserPlaceholder, RelativeBindingName> {
                 source: Default::default(),
@@ -894,8 +894,8 @@ for item in upstream.items {
     );
 }
 
-fn module_call_findings_for_test(
-    parsed: &ParsedFile,
+fn module_call_findings_for_test<K: crate::parser::BackendPhase>(
+    parsed: &ParsedFile<K>,
     signatures: &crate::module_resolver::ResolvedModuleSignatures,
     provider_context: &LoadedProviderContext,
 ) -> Vec<ModuleCallFinding> {
@@ -976,8 +976,19 @@ fn ref_walker_does_not_inherit_function_result_sink_for_arguments() {
 
 fn validate_resource_ref_types_for_test<
     E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName> + Clone,
+    K: crate::parser::BackendPhase,
 >(
-    parsed: &crate::parser::File<E>,
+    parsed: &crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        crate::parser::ParsedDeferredForPhase<
+            crate::resource::ParserPlaceholder,
+            crate::resource::RelativeBindingName,
+        >,
+        crate::resource::RelativeBindingName,
+        K,
+    >,
     schemas: &SchemaRegistry,
 ) -> Result<(), String> {
     let mut fixture = parsed.clone();
@@ -1062,7 +1073,7 @@ fn loaded_catalog_rejects_undeclared_bare_integer_operand_type() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let parsed = ParsedFile::default();
+    let parsed: ParsedFile = Default::default();
     let schemas = SchemaRegistry::new();
     let config = loaded_context_for_test(ProviderContext::new(crate::EnvironmentSnapshot::empty()));
     let index = BindingIndex::from_parsed(&parsed, &schemas, &config);
@@ -10404,7 +10415,7 @@ fn composition_error_identity_survives_symlink_retarget() {
 #[test]
 fn deferred_loop_placeholder_access_checks_after_materialization() {
     use crate::resource::{AccessMissPolicy, LoopSlot, PathSegment, apply_postfix_access};
-    let parsed = ParsedFile::default();
+    let parsed: ParsedFile = Default::default();
     let schemas = SchemaRegistry::new();
     let provider = crate::parser::LoadedProviderContext::empty_for_test();
     let index = BindingIndex::from_parsed(&parsed, &schemas, &provider);
@@ -10591,7 +10602,10 @@ fn parser_test_location(path: &std::path::Path) -> crate::parser::DeclarationLoc
 
 fn missing_inventory_fixture(
     rhs: &str,
-) -> (ParsedFile, crate::module_resolver::ResolvedModuleSignatures) {
+) -> (
+    ParsedFile<crate::parser::StrictBackend>,
+    crate::module_resolver::ResolvedModuleSignatures,
+) {
     let provider = LoadedProviderContext::empty_for_test();
     let mut parsed = crate::parser::parse_and_resolve(&format!("let src = mock.test.Source {{}}\nlet n = \"${{src.name}}\"\nlet template = use {{ source = './child' }}\nlet child = template {{ x = {rhs} }}")).unwrap();
     *parsed.parser_binding_metadata.syntax.expressions_mut() =
@@ -10881,7 +10895,7 @@ fn expression_validation_directory(
     (dir, path)
 }
 
-fn expression_validation_directory_file(source: &str) -> ParsedFile {
+fn expression_validation_directory_file(source: &str) -> ParsedFile<crate::parser::StrictBackend> {
     let (_dir, path) = expression_validation_directory(source, "let src = mock.test.Source {}\n");
     crate::config_loader::parse_directory(&path, &expression_validation_config())
         .unwrap()

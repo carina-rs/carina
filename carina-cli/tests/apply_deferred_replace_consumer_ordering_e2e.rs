@@ -25,7 +25,7 @@ const UPDATE_DELAY_MS: &str = "200";
 
 fn resolved(resource: Resource) -> ResolvedResource {
     {
-        let mut configuration = carina_core::parser::ExpandedParsedFile::default();
+        let mut configuration: carina_core::parser::ExpandedParsedFile = Default::default();
         let mut dependencies = resource.dependencies.value_bindings.clone();
         for value in resource.attributes.values() {
             dependencies.extend(value.root_bindings());
@@ -57,7 +57,7 @@ fn absolute_binding(name: &str) -> AbsoluteBindingAddress {
 }
 
 fn mock_saved_provider_configs() -> SavedProviderConfigs {
-    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+    let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
     parsed.providers = vec![ProviderConfig {
         name: "mock".to_string(),
         attributes: Default::default(),
@@ -356,7 +356,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         template_resource,
     );
 
-    let mut configuration = carina_core::parser::ExpandedParsedFile::default();
+    let mut configuration: carina_core::parser::ExpandedParsedFile = Default::default();
     configuration.resources = vec![cert.clone()];
     let graph = carina_core::resolved_graph::resolve_expanded_graph(configuration.into())
         .expect("deferred producer graph");
@@ -421,6 +421,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         state_serial: Some(state.serial),
         provider_configs: mock_saved_provider_configs(),
         backend_config: Some(BackendConfig {
+            source: (),
             backend_type: "local".to_string(),
             attributes: (HashMap::<String, _>::from([(
                 "path".to_string(),

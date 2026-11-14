@@ -480,7 +480,9 @@ fn known_custom_type_inputs_report_kind_errors_with_protected_diagnostics() {
 
 mod collection_presence {
     use carina_core::resource::{ConcreteValue, DeferredValue, Value};
-    fn parse_fixture(name: &str) -> carina_core::parser::ParsedFile {
+    fn parse_fixture(
+        name: &str,
+    ) -> carina_core::parser::ParsedFile<carina_core::parser::StrictBackend> {
         let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../carina-cli/tests/fixtures/value_knowledge")
             .join(name);
@@ -508,7 +510,9 @@ mod collection_presence {
 }
 
 mod condition_timing {
-    fn parse(name: &str) -> Result<carina_core::parser::ParsedFile, String> {
+    fn parse(
+        name: &str,
+    ) -> Result<carina_core::parser::ParsedFile<carina_core::parser::RetainedBackend>, String> {
         let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../carina-cli/tests/fixtures/value_knowledge")
             .join(name);

@@ -32,8 +32,8 @@ pub enum ProviderRoutingDiagnostic {
 /// use carina_core::parser::{ParsedFile, check_provider_instance_routing};
 /// fn analyze(file: &ParsedFile) { check_provider_instance_routing(file); }
 /// ```
-pub fn check_provider_instance_routing<B: BindingAddress, D, E>(
-    tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
+pub fn check_provider_instance_routing<B: BindingAddress, D, E, K: crate::parser::BackendPhase>(
+    tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E, K>,
 ) -> Vec<Located<ProviderRoutingDiagnostic>>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,

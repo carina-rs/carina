@@ -28,6 +28,7 @@
 //!         ("region".to_string(), Value::Concrete(ConcreteValue::enum_identifier("aws.Region.ap_northeast_1"))),
 //!     ].into_iter().collect(),
 //!     attribute_spans: Default::default(),
+//!     source: (),
 //! };
 //! let selected = BackendSelection::verified_for_mutation(Path::new("."), Some(&raw_config))?;
 //! let MutationBackendSelection::Verified(selected) = selected else {

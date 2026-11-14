@@ -537,7 +537,13 @@ pub fn collect_tag_keys_for_file(source: &str, file: &Path) -> Vec<TagKeyEntry> 
 /// symlink aliases, repeated imports, and multiple aliases to one module.
 /// Root inputs retain the pins used to read their source text; resolution
 /// failures are reported by the caller when collecting these inputs.
-pub fn collect_all_tag_keys<E, D, S: AsRef<str>, B: crate::resource::BindingAddress>(
+pub fn collect_all_tag_keys<
+    E,
+    D,
+    S: AsRef<str>,
+    B: crate::resource::BindingAddress,
+    K: crate::parser::BackendPhase,
+>(
     root_inputs: &[(crate::paths::ResolvedPath, S)],
     parsed: &crate::parser::File<
         E,
@@ -545,6 +551,7 @@ pub fn collect_all_tag_keys<E, D, S: AsRef<str>, B: crate::resource::BindingAddr
         crate::resource::ParserPlaceholder,
         D,
         B,
+        K,
     >,
     base_dir: &crate::paths::ResolvedPath,
 ) -> Vec<TagKeyEntry> {
@@ -646,13 +653,19 @@ pub fn find_mixed_tag_key_styles(entries: &[TagKeyEntry]) -> Vec<TagKeyWarning> 
         .collect()
 }
 
-pub fn located_mixed_tag_key_styles<D, B: crate::resource::BindingAddress>(
+pub fn located_mixed_tag_key_styles<
+    D,
+    B: crate::resource::BindingAddress,
+    K: crate::parser::BackendPhase,
+>(
     tree: &crate::parser::AnalysisTree<
         '_,
         crate::resource::ParserPlaceholder,
         crate::resource::ParserPlaceholder,
         D,
         B,
+        crate::parser::ParsedExportParam<crate::resource::ParserPlaceholder, B>,
+        K,
     >,
     entries: &[TagKeyEntry],
 ) -> Vec<crate::parser::Located<TagKeyWarning>>
@@ -2700,7 +2713,7 @@ tags = {
                 .into_iter()
                 .map(|name| ModuleCall::test(name.to_string(), None, indexmap::IndexMap::new()))
                 .collect(),
-            ..ParsedFile::default()
+            ..<ParsedFile>::default()
         }
     }
 
@@ -2717,7 +2730,7 @@ tags = {
 
         let parsed = parsed_with_uses(vec![("net", "./modules/network")], vec!["net"]);
 
-        let results = collect_all_tag_keys::<_, _, String, _>(
+        let results = collect_all_tag_keys::<_, _, String, _, _>(
             &[],
             &parsed,
             &crate::paths::ResolvedPath::new(temp.path()).unwrap(),
@@ -2742,7 +2755,7 @@ tags = {
 
         let parsed = parsed_with_uses(vec![("unused", "./unused")], vec![]);
 
-        let results = collect_all_tag_keys::<_, _, String, _>(
+        let results = collect_all_tag_keys::<_, _, String, _, _>(
             &[],
             &parsed,
             &crate::paths::ResolvedPath::new(temp.path()).unwrap(),
@@ -2759,7 +2772,7 @@ tags = {
         let temp = tempfile::tempdir().unwrap();
         let parsed = parsed_with_uses(vec![("missing", "./does-not-exist")], vec!["missing"]);
 
-        let results = collect_all_tag_keys::<_, _, String, _>(
+        let results = collect_all_tag_keys::<_, _, String, _, _>(
             &[],
             &parsed,
             &crate::paths::ResolvedPath::new(temp.path()).unwrap(),
@@ -2789,7 +2802,7 @@ tags = {
             vec!["real", "alias"],
         );
 
-        let results = collect_all_tag_keys::<_, _, String, _>(
+        let results = collect_all_tag_keys::<_, _, String, _, _>(
             &[],
             &parsed,
             &crate::paths::ResolvedPath::new(temp.path()).unwrap(),

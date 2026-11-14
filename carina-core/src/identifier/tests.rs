@@ -142,6 +142,8 @@ fn parse_loop_fixture(source: &str, file: &str) -> Vec<Resource> {
                 crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
                     parsed, source,
                 )
+                .evaluate_backend_in_session(session)
+                .unwrap()
                 .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(Path::new(".")).unwrap(),
             )
@@ -1798,6 +1800,8 @@ fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
                     parsed,
                     fixture_source,
                 )
+                .evaluate_backend_in_session(session)
+                .unwrap()
                 .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
             )

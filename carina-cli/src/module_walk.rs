@@ -74,8 +74,18 @@ pub(crate) struct ModuleWalk {
 }
 
 impl ModuleWalk {
-    pub(crate) fn load<E>(
-        parsed: &carina_core::parser::File<E>,
+    pub(crate) fn load<E, K: carina_core::parser::BackendPhase>(
+        parsed: &carina_core::parser::File<
+            E,
+            carina_core::resource::ParserPlaceholder,
+            carina_core::resource::ParserPlaceholder,
+            carina_core::parser::ParsedDeferredForPhase<
+                carina_core::resource::ParserPlaceholder,
+                carina_core::resource::RelativeBindingName,
+            >,
+            carina_core::resource::RelativeBindingName,
+            K,
+        >,
         base_dir: &ResolvedPath,
         environment: &carina_core::EnvironmentSnapshot,
         schemas: &carina_core::schema::SchemaRegistry,
@@ -97,6 +107,7 @@ impl ModuleWalk {
             visit_module(
                 ModuleVisit {
                     module_path: &module_path,
+                    authored_import: &import.path,
                     diagnostic_path: Path::new(&import.path),
                     diagnostic_base: &base_dir,
                     owners: &owners,
@@ -128,6 +139,7 @@ impl ModuleWalk {
 
 struct ModuleVisit<'a> {
     module_path: &'a ResolvedPath,
+    authored_import: &'a str,
     diagnostic_path: &'a Path,
     diagnostic_base: &'a ResolvedPath,
     owners: &'a [carina_core::parser::ModuleCallId],
@@ -136,6 +148,7 @@ struct ModuleVisit<'a> {
 fn visit_module(
     ModuleVisit {
         module_path,
+        authored_import,
         diagnostic_path,
         diagnostic_base,
         owners,
@@ -170,12 +183,14 @@ fn visit_module(
         Err(ModuleLoadError::Unavailable(_)) => return,
         Err(ModuleLoadError::NotModule { error, imports }) => {
             match *error {
-                ModuleRejection::NotADirectory { path } => {
+                ModuleRejection::NotADirectory { path: _ } => {
                     walk.rejections.push(RejectedModuleAtPath {
                         label: DisplayPath::for_diagnostics_from(diagnostic_path, diagnostic_base),
                         error: std::sync::Arc::new(ModuleError::OwnedByCalls {
                             calls: owners.to_vec(),
-                            error: Box::new(ModuleError::NotADirectory { path }),
+                            error: Box::new(ModuleError::NotADirectory {
+                                path: authored_import.to_owned(),
+                            }),
                         }),
                         presentation: ImportPresentation::Resolution(diagnostic_base.clone()),
                     })
@@ -204,14 +219,16 @@ fn visit_module(
             Some((
                 module_path.join(&import.path).ok()?,
                 diagnostic_path.join(&import.path),
+                import.path.as_str(),
             ))
         })
         .collect();
 
-    for (child_module_path, child_diagnostic_path) in child_paths {
+    for (child_module_path, child_diagnostic_path, authored_import) in child_paths {
         visit_module(
             ModuleVisit {
                 module_path: &child_module_path,
+                authored_import,
                 diagnostic_path: &child_diagnostic_path,
                 diagnostic_base,
                 owners,

@@ -290,6 +290,7 @@ mod tests {
 
     fn local_config(path: &Path) -> carina_core::parser::BackendConfig {
         carina_core::parser::BackendConfig {
+            source: (),
             backend_type: "local".to_string(),
             attributes: (HashMap::<String, _>::from([(
                 "path".to_string(),
@@ -557,6 +558,7 @@ mod tests {
         // different attributes ⇒ lock differs ⇒ migration runs).
         let dst_path = base.join("relocated.state.json");
         let cfg = carina_core::parser::BackendConfig {
+            source: (),
             backend_type: "local".to_string(),
             attributes: {
                 let mut m = HashMap::new();
@@ -631,6 +633,7 @@ mod tests {
             .unwrap();
         let dst_path = base.join("moved.state.json");
         let cfg = carina_core::parser::BackendConfig {
+            source: (),
             backend_type: "local".to_string(),
             attributes: {
                 let mut m = HashMap::new();

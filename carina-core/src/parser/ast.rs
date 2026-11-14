@@ -5823,62 +5823,140 @@ impl<B: BindingAddress> ProviderConfig<ParserPlaceholder, B> {
     }
 }
 
-/// Backend configuration for state storage
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct BackendConfig<P: ValueKind = NoPlaceholder, B: BindingAddress = RelativeBindingName> {
-    /// Backend type (e.g., "s3", "gcs", "local")
+/// Backend inputs, indexed by evaluation phase. Only strict values can be saved.
+///
+/// ```compile_fail,E0277
+/// use carina_core::parser::{BackendConfig, RetainedBackend};
+/// use carina_core::resource::NoPlaceholder;
+/// fn save(backend: &BackendConfig<NoPlaceholder, carina_core::resource::RelativeBindingName, RetainedBackend>) {
+///     let _ = serde_json::to_vec(backend);
+/// }
+/// ```
+///
+/// A parser result exposes authored expressions, not evaluated values:
+///
+/// ```compile_fail,E0308
+/// use carina_core::parser::{parse_file, ProviderContext};
+/// use carina_core::resource::{ParserPlaceholder, Value};
+/// let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+/// let parsed = parse_file("backend local { path = 'state' }", std::path::Path::new("backend.crn"), &context).unwrap();
+/// let value: &Value<ParserPlaceholder> = parsed.backend.as_ref().unwrap().attributes.get("path").unwrap();
+/// ```
+#[derive(Debug, Clone)]
+pub struct BackendConfig<
+    P: ValueKind = NoPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+    K: super::BackendPhase = super::StrictBackend,
+> {
     pub backend_type: String,
-    /// Backend-specific attributes
-    pub attributes: super::ConfigurationAttributes<super::BackendAttributeValue<P, B>>,
-    /// Parser-authored source spans for attribute keys. Runtime and saved-plan
-    /// representations deliberately omit this diagnostic-only metadata.
-    #[serde(skip)]
+    pub attributes: super::ConfigurationAttributes<K::Attribute<P, B>>,
     pub attribute_spans: super::ConfigurationAttributes<SourceSpan>,
+    pub source: K::Source<P, B>,
 }
-
-impl<B: BindingAddress> BackendConfig<ParserPlaceholder, B> {
+impl<P: ValueKind, B: BindingAddress, K: super::BackendPhase> BackendConfig<P, B, K> {
+    pub(crate) fn try_visit_values<'a, E>(
+        &'a self,
+        visit: &mut impl FnMut(&'a Value<P, B>) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        P: 'a,
+    {
+        for value in self.attributes.values() {
+            K::try_visit_attribute(value, visit)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn resolve_bindings<C: BindingAddress>(
+        self,
+        resolve: &mut impl FnMut(B) -> C,
+    ) -> BackendConfig<P, C, K> {
+        let mut map =
+            |value: Value<P, B>| Ok::<_, std::convert::Infallible>(value.map_bindings(resolve));
+        let attributes = self
+            .attributes
+            .into_try_map(|value| K::try_map_attribute(value, &mut map))
+            .unwrap_or_else(|never| match never {});
+        let source =
+            K::try_map_source(self.source, &mut map).unwrap_or_else(|never| match never {});
+        BackendConfig {
+            backend_type: self.backend_type,
+            attributes,
+            attribute_spans: self.attribute_spans,
+            source,
+        }
+    }
+}
+impl<B: BindingAddress, K: super::BackendPhase> BackendConfig<ParserPlaceholder, B, K> {
     pub fn into_expanded(
         self,
-    ) -> Result<BackendConfig<NoPlaceholder, B>, crate::resource::LeftoverPlaceholder> {
+    ) -> Result<BackendConfig<NoPlaceholder, B, K>, crate::resource::LeftoverPlaceholder> {
         Ok(BackendConfig {
             backend_type: self.backend_type,
             attributes: self
                 .attributes
-                .into_try_map(super::BackendAttributeValue::into_expanded)?,
+                .into_try_map(|value| K::try_map_attribute(value, &mut Value::into_expanded))?,
             attribute_spans: self.attribute_spans,
+            source: K::try_map_source(self.source, &mut Value::into_expanded)?,
         })
     }
 }
-
-impl<P: ValueKind> BackendConfig<P, RelativeBindingName> {
+impl<P: ValueKind, K: super::BackendPhase> BackendConfig<P, RelativeBindingName, K> {
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn resolve_root(
         self,
         scope: &RootScope,
-    ) -> BackendConfig<P, AbsoluteBindingAddress> {
-        let Self {
-            backend_type,
-            attributes,
-            attribute_spans,
-        } = self;
-        BackendConfig {
-            backend_type,
-            attributes: attributes
-                .into_iter()
-                .map(|(name, value)| {
-                    (
-                        name,
-                        value.resolve_bindings(&mut |binding| scope.resolve(binding)),
-                    )
-                })
-                .collect(),
-            attribute_spans,
-        }
+    ) -> BackendConfig<P, AbsoluteBindingAddress, K> {
+        self.resolve_bindings(&mut |binding| scope.resolve(binding))
     }
-
     #[cfg(any(test, feature = "test-utils"))]
-    pub fn resolve_root_for_test(self) -> BackendConfig<P, AbsoluteBindingAddress> {
+    pub fn resolve_root_for_test(self) -> BackendConfig<P, AbsoluteBindingAddress, K> {
         self.resolve_root(&RootScope::new())
+    }
+}
+impl<P: ValueKind, K: super::BackendPhase> BackendConfig<P, AbsoluteBindingAddress, K> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let mut map =
+            |value: &mut Value<P, AbsoluteBindingAddress>| value.map_absolute_bindings(map);
+        for value in self.attributes.values_mut() {
+            K::visit_attribute_mut(value, &mut map);
+        }
+        K::visit_source_mut(&mut self.source, &mut map);
+    }
+}
+impl<P: ValueKind, B: BindingAddress> serde::Serialize for BackendConfig<P, B, super::StrictBackend>
+where
+    Value<P, B>: serde::Serialize,
+{
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut record = serializer.serialize_struct("BackendConfig", 2)?;
+        record.serialize_field("backend_type", &self.backend_type)?;
+        record.serialize_field("attributes", &self.attributes)?;
+        record.end()
+    }
+}
+impl<'de, P: ValueKind, B: BindingAddress> serde::Deserialize<'de>
+    for BackendConfig<P, B, super::StrictBackend>
+where
+    Value<P, B>: serde::Deserialize<'de>,
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(bound(deserialize = "Value<P, B>: serde::Deserialize<'de>"))]
+        struct Wire<P: ValueKind, B: BindingAddress> {
+            backend_type: String,
+            attributes: super::ConfigurationAttributes<Value<P, B>>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            backend_type: wire.backend_type,
+            attributes: wire.attributes,
+            attribute_spans: Default::default(),
+            source: (),
+        })
     }
 }
 
@@ -5901,42 +5979,89 @@ impl<P: ValueKind> BackendConfig<P, RelativeBindingName> {
 /// A diagnostic call site persisted with a saved upstream declaration. This
 /// presentation record cannot be used as parser provenance or admission evidence.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "UpstreamCallSiteWire")]
 pub struct UpstreamCallSite {
     file: PathBuf,
     line: usize,
     column: usize,
 }
+#[derive(serde::Deserialize)]
+struct UpstreamCallSiteWire {
+    file: PathBuf,
+    line: usize,
+    column: usize,
+}
+impl TryFrom<UpstreamCallSiteWire> for UpstreamCallSite {
+    type Error = &'static str;
+    fn try_from(wire: UpstreamCallSiteWire) -> Result<Self, Self::Error> {
+        if wire.file.is_absolute() || wire.file.as_os_str().is_empty() {
+            return Err("upstream caller file must be project-relative");
+        }
+        if wire.line == 0 || wire.column == 0 {
+            return Err("upstream caller positions must be positive");
+        }
+        Ok(Self {
+            file: wire.file,
+            line: wire.line,
+            column: wire.column,
+        })
+    }
+}
 impl UpstreamCallSite {
-    pub(in crate::parser) fn from_location(location: &super::DeclarationLocation) -> Self {
-        Self {
-            file: location.file().path().to_path_buf(),
+    pub fn from_location(
+        location: &super::DeclarationLocation,
+        root: &crate::paths::ResolvedPath,
+    ) -> std::io::Result<Self> {
+        let file = crate::paths::PersistedPath::new(location.file().path())?
+            .lexical_relative_to(root.persisted_path())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "upstream caller cannot be expressed relative to its project",
+                )
+            })?
+            .into_source_path();
+        Ok(Self {
+            file,
             line: location.span().start_line(),
             column: location.span().start_column(),
-        }
+        })
     }
     pub(crate) fn prefix(&self, root: &crate::paths::ResolvedPath) -> String {
-        let path = if self.file.is_absolute() {
-            crate::paths::PersistedPath::new(&self.file)
-                .ok()
-                .and_then(|file| file.lexical_relative_to(root.persisted_path()))
-                .map(crate::paths::DisplayPath::into_source_path)
-                .unwrap_or_else(|| self.file.clone())
-        } else {
-            self.file.clone()
-        };
-        let label = crate::paths::DisplayPath::for_diagnostics_from(&path, root).to_string();
-        let label = if !std::path::Path::new(&label).is_absolute() && !label.starts_with("..") {
-            format!("./{label}")
-        } else {
+        let label = crate::paths::DisplayPath::for_diagnostics_from(&self.file, root).to_string();
+        let label = if label.starts_with("..") {
             label
+        } else {
+            format!("./{label}")
         };
         format!("{label}:{}:{}: ", self.line, self.column)
     }
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test() -> Self {
+        Self {
+            file: "main.crn".into(),
+            line: 1,
+            column: 1,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn upstream_caller_for_test() -> super::DeclarationLocation {
+    super::parse_file(
+        "let prior = upstream_state { source = '../upstream' }",
+        std::path::Path::new("main.crn"),
+        &super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap()
+    .upstream_states
+    .remove(0)
+    .caller
 }
 
 #[derive(Debug, Clone)]
 pub struct UpstreamState<B: BindingAddress = RelativeBindingName> {
-    pub caller: Option<UpstreamCallSite>,
+    pub caller: super::DeclarationLocation,
     /// The binding name (e.g., "orgs")
     pub binding: B,
     /// Source directory (raw, unresolved path)
@@ -6699,6 +6824,7 @@ pub struct File<
     T: ValueKind = P,
     D = ParsedDeferredForPhase<P, RelativeBindingName>,
     B: BindingAddress = RelativeBindingName,
+    K: super::BackendPhase = super::StrictBackend,
 > {
     pub providers: Vec<ProviderConfig<P, B>>,
     pub resources: Vec<Resource<ModuleSource, P, B>>,
@@ -6710,7 +6836,7 @@ pub struct File<
     pub arguments: Vec<ArgumentParameter<TypeExpr, P, B>>,
     pub attribute_params: Vec<AttributeParameter<TypeExpr, P, B>>,
     pub export_params: Vec<E>,
-    pub backend: Option<BackendConfig<P, B>>,
+    pub backend: Option<BackendConfig<P, B, K>>,
     pub state_blocks: Vec<StateBlock<P, B>>,
     pub user_functions: IndexMap<String, UserFunction<B>>,
     pub upstream_states: Vec<UpstreamState<B>>,
@@ -6732,62 +6858,66 @@ pub struct File<
     pub expansion_trace: crate::resource::ExpansionTrace,
 }
 
-pub type ParsedFile = File<
+pub type UnexpandedFile<E = ParsedExportParam, K = super::StrictBackend> =
+    File<E, ParserPlaceholder, ParserPlaceholder, ParsedDeferredForPhase, RelativeBindingName, K>;
+pub type ParsedFile<K = super::AuthoredBackend> = File<
     ParsedExportParam<ParserPlaceholder, RelativeBindingName>,
     ParserPlaceholder,
     ParserPlaceholder,
     ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>,
     RelativeBindingName,
+    K,
 >;
-
-pub type InferredFile = File<
+pub type InferredFile<K = super::StrictBackend> = File<
     InferredExportParam<ParserPlaceholder, RelativeBindingName>,
     ParserPlaceholder,
     ParserPlaceholder,
     ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>,
     RelativeBindingName,
+    K,
 >;
-
-pub type ModuleResolvedFile<E, B = AbsoluteBindingAddress> = File<
+pub type ModuleResolvedFile<E, B = AbsoluteBindingAddress, K = super::StrictBackend> = File<
     E,
     ParserPlaceholder,
     ParserPlaceholder,
     ResolvedDeferredForPhase<ParserPlaceholder, ParserPlaceholder, B>,
     B,
+    K,
 >;
-
-pub type ModuleResolvedParsedFile =
-    ModuleResolvedFile<ParsedExportParam<ParserPlaceholder, AbsoluteBindingAddress>>;
-
+pub type ModuleResolvedParsedFile<K = super::StrictBackend> = ModuleResolvedFile<
+    ParsedExportParam<ParserPlaceholder, AbsoluteBindingAddress>,
+    AbsoluteBindingAddress,
+    K,
+>;
 pub type ModuleResolvedInferredExportParam =
     InferredExportParam<ParserPlaceholder, AbsoluteBindingAddress>;
-pub type ModuleResolvedInferredFile = ModuleResolvedFile<ModuleResolvedInferredExportParam>;
-
-pub type RootBindingResolvedFile<E> = File<
+pub type ModuleResolvedInferredFile<K = super::StrictBackend> =
+    ModuleResolvedFile<ModuleResolvedInferredExportParam, AbsoluteBindingAddress, K>;
+pub type RootBindingResolvedFile<E, K = super::StrictBackend> = File<
     E,
     ParserPlaceholder,
     ParserPlaceholder,
     ParsedDeferredForPhase<ParserPlaceholder, AbsoluteBindingAddress>,
     AbsoluteBindingAddress,
+    K,
 >;
-pub type RootBindingResolvedParsedFile =
-    RootBindingResolvedFile<ParsedExportParam<ParserPlaceholder, AbsoluteBindingAddress>>;
-pub type RootBindingResolvedInferredFile =
-    RootBindingResolvedFile<InferredExportParam<ParserPlaceholder, AbsoluteBindingAddress>>;
-
-pub type ExpandedFile<E> = File<
+pub type RootBindingResolvedParsedFile<K = super::StrictBackend> =
+    RootBindingResolvedFile<ParsedExportParam<ParserPlaceholder, AbsoluteBindingAddress>, K>;
+pub type RootBindingResolvedInferredFile<K = super::StrictBackend> =
+    RootBindingResolvedFile<InferredExportParam<ParserPlaceholder, AbsoluteBindingAddress>, K>;
+pub type ExpandedFile<E, K = super::StrictBackend> = File<
     E,
     NoPlaceholder,
     LoopSlot,
     ResolvedDeferredForPhase<NoPlaceholder, LoopSlot, AbsoluteBindingAddress>,
     AbsoluteBindingAddress,
+    K,
 >;
-
-pub type ExpandedParsedFile =
-    ExpandedFile<ParsedExportParam<NoPlaceholder, AbsoluteBindingAddress>>;
+pub type ExpandedParsedFile<K = super::StrictBackend> =
+    ExpandedFile<ParsedExportParam<NoPlaceholder, AbsoluteBindingAddress>, K>;
 pub type ExpandedParsedExportParam = ParsedExportParam<NoPlaceholder, AbsoluteBindingAddress>;
-pub type ExpandedInferredFile =
-    ExpandedFile<InferredExportParam<NoPlaceholder, AbsoluteBindingAddress>>;
+pub type ExpandedInferredFile<K = super::StrictBackend> =
+    ExpandedFile<InferredExportParam<NoPlaceholder, AbsoluteBindingAddress>, K>;
 pub type ExpandedInferredExportParam = InferredExportParam<NoPlaceholder, AbsoluteBindingAddress>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6796,7 +6926,7 @@ pub enum ParserPlaceholderBoundary {
     ModuleDefinition,
 }
 
-impl<E, P, T, D, B> Default for File<E, P, T, D, B>
+impl<E, P, T, D, B, K: crate::parser::BackendPhase> Default for File<E, P, T, D, B, K>
 where
     P: ValueKind,
     T: ValueKind,
@@ -6837,8 +6967,15 @@ where
 type CapturedTemplateDependencyValues<B> =
     Vec<(ResourceId, IndexMap<String, Value<ParserPlaceholder, B>>)>;
 
-impl<E, B: BindingAddress>
-    File<E, ParserPlaceholder, ParserPlaceholder, ParsedDeferredForPhase<ParserPlaceholder, B>, B>
+impl<E, B: BindingAddress, K: crate::parser::BackendPhase>
+    File<
+        E,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        ParsedDeferredForPhase<ParserPlaceholder, B>,
+        B,
+        K,
+    >
 {
     pub(crate) fn capture_template_dependency_values(&mut self) {
         fn capture_deferred<B: BindingAddress>(
@@ -7044,7 +7181,7 @@ impl<E, B: BindingAddress>
             Vec<DeferredForExpression<ModuleSource, ParserPlaceholder, ParserPlaceholder, B>>,
             A,
         ),
-    ) -> (ModuleResolvedFile<E, B>, A) {
+    ) -> (ModuleResolvedFile<E, B, K>, A) {
         let File {
             providers,
             resources,
@@ -7108,7 +7245,8 @@ impl<E, B: BindingAddress>
     }
 }
 
-impl<E, P> File<E, P, P, ParsedDeferredForPhase<P, RelativeBindingName>, RelativeBindingName>
+impl<E, P, K: crate::parser::BackendPhase>
+    File<E, P, P, ParsedDeferredForPhase<P, RelativeBindingName>, RelativeBindingName, K>
 where
     P: ValueKind,
     E: ResolveExportBindingPhase<P>,
@@ -7122,6 +7260,7 @@ where
         P,
         ParsedDeferredForPhase<P, AbsoluteBindingAddress>,
         AbsoluteBindingAddress,
+        K,
     > {
         self.resolve_bindings(&mut |binding| scope.resolve(binding))
     }
@@ -7135,6 +7274,7 @@ where
         P,
         ParsedDeferredForPhase<P, AbsoluteBindingAddress>,
         AbsoluteBindingAddress,
+        K,
     > {
         self.resolve_root(&RootScope::new())
     }
@@ -7148,6 +7288,7 @@ where
         P,
         ParsedDeferredForPhase<P, AbsoluteBindingAddress>,
         AbsoluteBindingAddress,
+        K,
     > {
         let File {
             providers,
@@ -7287,21 +7428,7 @@ where
                 .into_iter()
                 .map(|export| export.resolve_export_bindings(resolve))
                 .collect(),
-            backend: backend.map(|backend| {
-                let BackendConfig {
-                    backend_type,
-                    attributes,
-                    attribute_spans,
-                } = backend;
-                BackendConfig {
-                    backend_type,
-                    attributes: attributes
-                        .into_iter()
-                        .map(|(name, value)| (name, value.resolve_bindings(resolve)))
-                        .collect(),
-                    attribute_spans,
-                }
-            }),
+            backend: backend.map(|backend| backend.resolve_bindings(resolve)),
             state_blocks: state_blocks
                 .into_iter()
                 .map(|block| match block {
@@ -7404,7 +7531,7 @@ where
     }
 }
 
-impl<E, P, T, D> File<E, P, T, D, AbsoluteBindingAddress>
+impl<E, P, T, D, K: crate::parser::BackendPhase> File<E, P, T, D, AbsoluteBindingAddress, K>
 where
     P: ValueKind,
     T: ValueKind,
@@ -7524,14 +7651,7 @@ where
             }
         }
         if let Some(backend) = backend {
-            let BackendConfig {
-                backend_type: _backend_type,
-                attributes,
-                attribute_spans: _attribute_spans,
-            } = backend;
-            for value in attributes.values_mut() {
-                value.map_absolute_bindings(map);
-            }
+            backend.map_absolute_bindings(map);
         }
         for block in state_blocks {
             match block {
@@ -7582,13 +7702,14 @@ where
 }
 
 #[cfg(any(test, feature = "test-utils"))]
-impl<E>
+impl<E, K: crate::parser::BackendPhase>
     File<
         E,
         ParserPlaceholder,
         ParserPlaceholder,
         ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>,
         RelativeBindingName,
+        K,
     >
 where
     E: ResolveExportBindingPhase<ParserPlaceholder>,
@@ -7602,7 +7723,7 @@ where
         schemas: &crate::schema::SchemaRegistry,
         context: &super::ProviderContext,
     ) -> Result<
-        ExpandedFile<<E::Absolute as IntoExpandedExportParam<AbsoluteBindingAddress>>::Expanded>,
+        ExpandedFile<<E::Absolute as IntoExpandedExportParam<AbsoluteBindingAddress>>::Expanded, K>,
         crate::resource::ExpansionError,
     > {
         let mut known_bindings = self
@@ -7633,7 +7754,7 @@ where
     }
 }
 
-impl<E, P, T, D, B> File<E, P, T, D, B>
+impl<E, P, T, D, B, K: crate::parser::BackendPhase> File<E, P, T, D, B, K>
 where
     P: ValueKind,
     T: ValueKind,
@@ -7694,7 +7815,22 @@ where
         } = self;
     }
 
-    pub fn map_export_params<F>(self, f: impl FnOnce(Vec<E>) -> Vec<F>) -> File<F, P, T, D, B> {
+    pub fn map_export_params<F>(self, f: impl FnOnce(Vec<E>) -> Vec<F>) -> File<F, P, T, D, B, K> {
+        self.map_export_and_backend(f, |backend| backend)
+    }
+
+    pub(crate) fn map_backend_phase<L: super::BackendPhase>(
+        self,
+        map: impl FnOnce(Option<BackendConfig<P, B, K>>) -> Option<BackendConfig<P, B, L>>,
+    ) -> File<E, P, T, D, B, L> {
+        self.map_export_and_backend(|exports| exports, map)
+    }
+
+    fn map_export_and_backend<F, L: super::BackendPhase>(
+        self,
+        f: impl FnOnce(Vec<E>) -> Vec<F>,
+        map_backend: impl FnOnce(Option<BackendConfig<P, B, K>>) -> Option<BackendConfig<P, B, L>>,
+    ) -> File<F, P, T, D, B, L> {
         let File {
             providers,
             resources,
@@ -7734,7 +7870,7 @@ where
             arguments,
             attribute_params,
             export_params: f(export_params),
-            backend,
+            backend: map_backend(backend),
             state_blocks,
             user_functions,
             upstream_states,
@@ -7778,7 +7914,7 @@ where
     }
 }
 
-impl<E, P, T, D, B> File<E, P, T, D, B>
+impl<E, P, T, D, B, K: crate::parser::BackendPhase> File<E, P, T, D, B, K>
 where
     P: ValueKind,
     T: ValueKind,
@@ -7845,7 +7981,8 @@ fn directive_element_type(expression: &super::retained::JudgedExpr) -> Option<Ty
     }
 }
 
-impl<E, B: BindingAddress, D> File<E, ParserPlaceholder, ParserPlaceholder, D, B>
+impl<E, B: BindingAddress, D, K: crate::parser::BackendPhase>
+    File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>
 where
     D: DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
@@ -7950,7 +8087,8 @@ where
     }
 }
 
-impl<E, B: BindingAddress, D> File<E, ParserPlaceholder, ParserPlaceholder, D, B>
+impl<E, B: BindingAddress, D, K: crate::parser::BackendPhase>
+    File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>
 where
     D: ParserDeferredForPhaseAudit<B>,
 {
@@ -7963,7 +8101,8 @@ where
     }
 }
 
-impl<E, P, T, B> File<E, P, T, ResolvedDeferredForPhase<P, T, B>, B>
+impl<E, P, T, B, K: crate::parser::BackendPhase>
+    File<E, P, T, ResolvedDeferredForPhase<P, T, B>, B, K>
 where
     P: ValueKind,
     T: ValueKind,
@@ -7994,7 +8133,7 @@ where
     }
 }
 
-impl<E, P, T, D, B> File<E, P, T, D, B>
+impl<E, P, T, D, B, K: crate::parser::BackendPhase> File<E, P, T, D, B, K>
 where
     P: ValueKind,
     T: ValueKind,
@@ -8304,8 +8443,8 @@ fn collect_deferred_if_placeholders<B: BindingAddress>(
     }
 }
 
-fn leftover_placeholders<E, B: BindingAddress, D>(
-    file: &File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+fn leftover_placeholders<E, B: BindingAddress, D, K: crate::parser::BackendPhase>(
+    file: &File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
     boundary: ParserPlaceholderBoundary,
 ) -> Vec<crate::resource::LeftoverPlaceholder>
 where
@@ -8579,24 +8718,19 @@ where
     }
 
     if let Some(backend) = backend {
-        let BackendConfig {
-            backend_type,
-            attributes,
-            attribute_spans,
-        } = backend;
-        let _attribute_spans = attribute_spans;
-        for (attribute, value) in attributes {
-            let Ok(value) = value.evaluated() else {
-                continue;
-            };
-            value.collect_leftover_placeholders(
-                LeftoverPlaceholderContext::BackendAttribute {
-                    backend: backend_type.clone(),
-                    attribute: attribute.clone(),
-                },
-                reject_all,
-                &mut errors,
-            );
+        for (attribute, value) in &backend.attributes {
+            let _: Result<(), std::convert::Infallible> =
+                K::try_visit_attribute(value, &mut |value| {
+                    value.collect_leftover_placeholders(
+                        LeftoverPlaceholderContext::BackendAttribute {
+                            backend: backend.backend_type.clone(),
+                            attribute: attribute.clone(),
+                        },
+                        reject_all,
+                        &mut errors,
+                    );
+                    Ok(())
+                });
         }
     }
 
@@ -8649,8 +8783,8 @@ where
     errors
 }
 
-fn validate_expansion_boundary<E, B: BindingAddress, D>(
-    file: &File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+fn validate_expansion_boundary<E, B: BindingAddress, D, K: crate::parser::BackendPhase>(
+    file: &File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
     boundary: ParserPlaceholderBoundary,
 ) -> Result<(), LeftoverPlaceholders>
 where
@@ -8665,8 +8799,15 @@ where
     }
 }
 
-impl<E, B: BindingAddress>
-    File<E, ParserPlaceholder, ParserPlaceholder, ParsedDeferredForPhase<ParserPlaceholder, B>, B>
+impl<E, B: BindingAddress, K: crate::parser::BackendPhase>
+    File<
+        E,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        ParsedDeferredForPhase<ParserPlaceholder, B>,
+        B,
+        K,
+    >
 where
     E: IntoExpandedExportParam<B>,
 {
@@ -8679,13 +8820,14 @@ where
     }
 }
 
-impl<E, B: BindingAddress>
+impl<E, B: BindingAddress, K: crate::parser::BackendPhase>
     File<
         E,
         ParserPlaceholder,
         ParserPlaceholder,
         ResolvedDeferredForPhase<ParserPlaceholder, ParserPlaceholder, B>,
         B,
+        K,
     >
 where
     E: IntoExpandedExportParam<B>,
@@ -8699,20 +8841,21 @@ where
     }
 }
 
-impl<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
+impl<E: IntoExpandedExportParam<AbsoluteBindingAddress>, K: crate::parser::BackendPhase>
     File<
         E,
         ParserPlaceholder,
         ParserPlaceholder,
         ResolvedDeferredForPhase<ParserPlaceholder, ParserPlaceholder, AbsoluteBindingAddress>,
         AbsoluteBindingAddress,
+        K,
     >
 {
     pub fn into_expanded(
         self,
         schemas: &crate::schema::SchemaRegistry,
         context: &super::ProviderContext,
-    ) -> Result<ExpandedFile<E::Expanded>, crate::resource::ExpansionError> {
+    ) -> Result<ExpandedFile<E::Expanded, K>, crate::resource::ExpansionError> {
         let directive_errors = self.directive_resolution_errors(
             ParserPlaceholderBoundary::ExpandedFile,
             schemas,
@@ -8828,7 +8971,7 @@ impl<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
     }
 }
 
-impl<E> ExpandedFile<E> {
+impl<E, K: crate::parser::BackendPhase> ExpandedFile<E, K> {
     /// Expand deferred for-expressions against the resolved binding view.
     ///
     /// For each deferred for-expression whose iterable can now be resolved
@@ -9688,7 +9831,7 @@ mod substitute_placeholder_tests {
 
     #[test]
     fn structural_binding_names_covers_every_non_variable_kind() {
-        let mut parsed = ParsedFile::default();
+        let mut parsed: ParsedFile = Default::default();
 
         let mut resource = AuthoredResource::new("mock.compute.Instance", "resource_node");
         resource.binding = Some("resource_name".into());
@@ -9738,7 +9881,7 @@ mod substitute_placeholder_tests {
             indexmap::IndexMap::new(),
         ));
         parsed.upstream_states.push(UpstreamState {
-            caller: None,
+            caller: crate::parser::upstream_caller_for_test(),
             binding: "upstream_name".into(),
             source: "upstream".into(),
         });
@@ -10362,7 +10505,7 @@ mod substitute_placeholder_tests {
             .into_expanded(
                 &crate::schema::SchemaRegistry::new(),
                 &crate::parser::retained::judge_expressions(
-                    &crate::parser::RootBindingResolvedParsedFile::default(),
+                    &<crate::parser::RootBindingResolvedParsedFile>::default(),
                     &crate::schema::SchemaRegistry::new(),
                     &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 ),
@@ -11284,8 +11427,8 @@ impl crate::resource::InsideSecret for PlaceholderAccessError {
     }
 }
 
-impl<E, T: crate::resource::ValueKind, D>
-    File<E, crate::resource::NoPlaceholder, T, D, crate::resource::AbsoluteBindingAddress>
+impl<E, T: crate::resource::ValueKind, D, K: crate::parser::BackendPhase>
+    File<E, crate::resource::NoPlaceholder, T, D, crate::resource::AbsoluteBindingAddress, K>
 where
     D: DeferredForPhaseTraversal<
             crate::resource::NoPlaceholder,
@@ -11315,7 +11458,7 @@ where
     }
 }
 
-impl<E, P, T, D, B> File<E, P, T, D, B>
+impl<E, P, T, D, B, K: crate::parser::BackendPhase> File<E, P, T, D, B, K>
 where
     P: ValueKind,
     T: ValueKind,

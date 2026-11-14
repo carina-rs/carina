@@ -86,7 +86,7 @@ fn backend_config_directory_admits_before_concrete_extraction() {
         ("backend local { path = missing.path }", "Type mismatch"),
         (
             "backend local { path = secret('do-not-show') }",
-            "Type mismatch",
+            "secret()- and decrypt()-derived values are not allowed",
         ),
         (
             "backend s3 { bucket = 'b' key = 'k' encrypt = missing.flag region = missing.region }",
@@ -97,8 +97,8 @@ fn backend_config_directory_admits_before_concrete_extraction() {
             ("backend.crn", source),
             ("values.crn", "let ordinary_value = 'value'\n"),
         ]);
-        // Exercise raw-candidate admission too: the directory resolver already
-        // rejects secret-derived fields before this boundary can see them.
+        // Evaluate this candidate explicitly before admission: parser output
+        // contains authored operands, and cannot be admitted as evaluated.
         let path = root.path().join("backend.crn");
         let parsed = carina_core::parser::parse_file(
             &std::fs::read_to_string(&path).unwrap(),
@@ -106,7 +106,16 @@ fn backend_config_directory_admits_before_concrete_extraction() {
             &context,
         )
         .unwrap();
-        let error = backend::admit(parsed.backend.as_ref().unwrap()).unwrap_err();
+        let evaluated =
+            carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+                carina_core::parser::evaluate_backend_for_test(parsed, session)
+            });
+        let error: Box<dyn std::error::Error> = match evaluated {
+            Ok(evaluated) => {
+                Box::new(backend::admit(evaluated.backend.as_ref().unwrap()).unwrap_err())
+            }
+            Err(error) => Box::new(error),
+        };
         let rendered = format!("{error:?} {error}");
         assert!(error.to_string().contains(expected), "{source}: {rendered}");
         assert!(!rendered.contains("do-not-show"));

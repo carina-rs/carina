@@ -353,7 +353,6 @@ impl ResolvedInitialDeletePlan {
             .backend
             .as_ref()
             .and_then(|backend| backend.attributes.get("bucket"))
-            .and_then(|value| value.evaluated().ok())
             .and_then(|value| match value {
                 Value::Concrete(ConcreteValue::String(name)) => Some(name.expose_plaintext()),
                 _ => None,
@@ -379,7 +378,7 @@ impl ResolvedInitialDeletePlan {
             }
             .into());
         }
-        let mut bucket_configuration = crate::parser::ExpandedInferredFile::default();
+        let mut bucket_configuration: crate::parser::ExpandedInferredFile = Default::default();
         bucket_configuration.resources.push(resource.clone());
         let graph = resolve_expanded_graph(bucket_configuration.into())?;
         graph.initial_delete_plan(resource, identifier, schemas)
@@ -1496,7 +1495,7 @@ impl<E, D> From<File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>>
 ///
 /// ```compile_fail,E0382
 /// use carina_core::{parser::ExpandedParsedFile, resolved_graph::resolve_expanded_graph};
-/// let parsed = ExpandedParsedFile::default();
+/// let parsed: ExpandedParsedFile = Default::default();
 /// let first = resolve_expanded_graph(parsed.into());
 /// let second = resolve_expanded_graph(parsed.into());
 /// ```
@@ -1849,7 +1848,7 @@ impl ExpandedBindingIndex {
     pub fn for_test_resources<S>(
         resources: &[Resource<S>],
     ) -> Result<Self, ExpandedGraphResolutionError> {
-        let configuration = crate::parser::ExpandedParsedFile::default().with_resources_for_test(
+        let configuration = <crate::parser::ExpandedParsedFile>::default().with_resources_for_test(
             resources
                 .iter()
                 .map(|resource| Resource {
@@ -1886,19 +1885,21 @@ mod tests {
     #[test]
     fn backend_identity_error_retains_typed_source() {
         use std::error::Error;
-        let configuration = crate::parser::ExpandedInferredFile {
-            backend: Some(crate::parser::BackendConfig {
-                backend_type: "s3".into(),
-                attributes: (HashMap::<String, _>::from([(
-                    "bucket".into(),
-                    Value::Concrete(ConcreteValue::String("".into())),
-                )]))
-                .into_iter()
-                .collect(),
-                attribute_spans: Default::default(),
-            }),
-            ..Default::default()
-        };
+        let configuration: crate::parser::ExpandedInferredFile =
+            crate::parser::ExpandedInferredFile {
+                backend: Some(crate::parser::BackendConfig {
+                    source: (),
+                    backend_type: "s3".into(),
+                    attributes: (HashMap::<String, _>::from([(
+                        "bucket".into(),
+                        Value::Concrete(ConcreteValue::String("".into())),
+                    )]))
+                    .into_iter()
+                    .collect(),
+                    attribute_spans: Default::default(),
+                }),
+                ..Default::default()
+            };
         let error = ResolvedInitialDeletePlan::from_backend_configuration(
             &configuration,
             "mock",
@@ -1976,9 +1977,9 @@ mod tests {
     fn deferred_for_over_upstream_state_dotted_root_resolves_without_external_binding_set() {
         let root = crate::resource::RootScope::new();
         let absolute = |name| root.resolve(crate::resource::RelativeBindingName::new(name));
-        let mut parsed = crate::parser::ExpandedInferredFile::default();
+        let mut parsed: crate::parser::ExpandedInferredFile = Default::default();
         parsed.upstream_states.push(crate::parser::UpstreamState {
-            caller: None,
+            caller: crate::parser::upstream_caller_for_test(),
             binding: absolute("orgs"),
             source: "../organizations".into(),
         });

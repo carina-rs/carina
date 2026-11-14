@@ -44,9 +44,7 @@ use carina_state::{
 
 #[cfg(test)]
 use carina_core::parser::ProviderConfig;
-use carina_core::parser::{
-    ExpandedUpstreamState, LoadedProviderContext, ProviderContext, ResolvedProviderConfigs,
-};
+use carina_core::parser::{LoadedProviderContext, ProviderContext, ResolvedProviderConfigs};
 
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
@@ -971,15 +969,24 @@ async fn verify_upstream_snapshot(
     let mut cycle_guard = super::plan::seed_cycle_guard(project_dir);
     let mut current = HashMap::new();
     for source in sources {
-        let state = ExpandedUpstreamState {
-            caller: source.caller.clone(),
-            binding: source.binding.clone(),
-            source: source.source.clone(),
-        };
-        let loaded = super::plan::load_selected_upstream_states(
-            wiring.runtime(),
-            std::slice::from_ref(&state),
+        let identity = carina_core::upstream_exports::UpstreamSourceIdentity::resolve_saved(
+            &source.binding,
+            &source.source,
+            &source.caller,
             project_dir,
+        )
+        .and_then(|identity| {
+            identity.source().metadata()?;
+            Ok(identity)
+        })
+        .map_err(|error| AppError::UpstreamSourceResolution {
+            binding: source.binding.to_string(),
+            source_path: source.source.clone(),
+            error,
+        });
+        let loaded = super::plan::load_selected_upstream_identities(
+            wiring.runtime(),
+            std::iter::once(identity),
             provider_context,
             &mut cycle_guard,
             wiring.schemas(),
@@ -1134,7 +1141,7 @@ mod upstream_snapshot_tests {
         let runtime = crate::test_support::TestCommandRuntime::new();
         let wiring = crate::wiring::WiringContext::new_for_test(&runtime, vec![], &[]);
         let sources = [crate::commands::plan::UpstreamSource {
-            caller: None,
+            caller: carina_core::parser::UpstreamCallSite::for_test(),
             binding: carina_core::resource::absolute_binding_address_for_test("orgs"),
             source: "upstream".into(),
         }];

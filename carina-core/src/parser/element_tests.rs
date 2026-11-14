@@ -316,9 +316,9 @@ fn inventory_preserves_all_kinds_export_names_and_upstream_source_values() {
         inventory.declarations()[4].annotation(),
         DeclarationAnnotation::Unannotated
     ));
-    let upstream = &inventory.upstream_sources()[0];
-    assert_eq!(upstream.detail().as_str(), "state");
-    assert_eq!(slice(source, upstream.location()), "'../upstream'");
+    let upstream = &parsed.upstream_states[0];
+    assert_eq!(upstream.binding.as_str(), "state");
+    assert_eq!(slice(source, &upstream.caller), "'../upstream'");
 }
 
 #[test]
@@ -554,7 +554,7 @@ fn provider_finalization_returns_missing_provenance() {
     ));
 }
 
-fn provider_directory() -> ParsedFile {
+fn provider_directory() -> ParsedFile<crate::parser::StrictBackend> {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("main.crn"), "let unrelated = 'main'\n").unwrap();
     std::fs::write(

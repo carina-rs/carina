@@ -1067,9 +1067,9 @@ pub(crate) type ValidationProviderCatalog<'a> =
     dyn carina_core::validation::deferred_types::ProviderTypeCheckContext + 'a;
 
 pub(crate) trait ValidationProviderCatalogExt {
-    fn type_context<'a, E, D, B: BindingAddress>(
+    fn type_context<'a, E, D, B: BindingAddress, K: carina_core::parser::BackendPhase>(
         &'a self,
-        file: &'a carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+        file: &'a carina_core::parser::retained::JudgedFile<'_, E, D, B, K>,
         signatures: &'a carina_core::module_resolver::ResolvedModuleSignatures,
     ) -> validation::ValidationTypeContext<'a, B>
     where
@@ -1077,9 +1077,9 @@ pub(crate) trait ValidationProviderCatalogExt {
 }
 
 impl ValidationProviderCatalogExt for ValidationProviderCatalog<'_> {
-    fn type_context<'a, E, D, B: BindingAddress>(
+    fn type_context<'a, E, D, B: BindingAddress, K: carina_core::parser::BackendPhase>(
         &'a self,
-        file: &'a carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+        file: &'a carina_core::parser::retained::JudgedFile<'_, E, D, B, K>,
         signatures: &'a carina_core::module_resolver::ResolvedModuleSignatures,
     ) -> validation::ValidationTypeContext<'a, B>
     where
@@ -3478,9 +3478,10 @@ pub fn validate_resource_admissions_with_ctx<
     E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    K: carina_core::parser::BackendPhase,
 >(
     ctx: &WiringContext,
-    judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B, K>,
     bindings: &carina_core::binding_index::BindingIndex<'_, B>,
 ) -> Vec<AppError> {
     let (errors, warnings) = resource_admission_report_with_ctx(ctx, judged, bindings);
@@ -3494,9 +3495,10 @@ pub(crate) fn resource_admission_report_with_ctx<
     E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    K: carina_core::parser::BackendPhase,
 >(
     ctx: &WiringContext,
-    judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B, K>,
     bindings: &carina_core::binding_index::BindingIndex<'_, B>,
 ) -> (Vec<AppError>, Vec<carina_core::parser::ParseWarning>) {
     let mut sink = ValidationReportSink {
@@ -3584,9 +3586,10 @@ pub fn validate_resource_ref_types_with_ctx<
     E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    K: carina_core::parser::BackendPhase,
 >(
     ctx: &WiringContext,
-    judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B, K>,
     argument_names: &HashSet<String>,
 ) -> Vec<AppError> {
     let parsed = judged.file();
@@ -5036,9 +5039,19 @@ pub fn normalize_state_with_ctx(
     result
 }
 
-pub fn validate_provider_region_with_ctx<E>(
+pub fn validate_provider_region_with_ctx<E, K: carina_core::parser::BackendPhase>(
     ctx: &WiringContext,
-    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    parsed: &carina_core::parser::File<
+        E,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        carina_core::parser::ParsedDeferredForPhase<
+            ParserPlaceholder,
+            carina_core::resource::RelativeBindingName,
+        >,
+        carina_core::resource::RelativeBindingName,
+        K,
+    >,
 ) -> Vec<AppError> {
     carina_core::validation::admission::configuration::provider::analyze_configs(
         &parsed.providers,
@@ -11049,7 +11062,7 @@ pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
     use carina_core::parser::ExpandedParsedFile;
     let ctx =
         WiringContext::new_for_test(&crate::test_support::TestCommandRuntime::new(), vec![], &[]);
-    let mut parsed = ExpandedParsedFile::default();
+    let mut parsed: ExpandedParsedFile = Default::default();
     parsed.resources = resources.to_vec();
     errors_to_legacy_result(validate_resources_with_ctx(
         &ctx,
@@ -11062,7 +11075,7 @@ pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
 pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
     let ctx =
         WiringContext::new_for_test(&crate::test_support::TestCommandRuntime::new(), vec![], &[]);
-    let mut parsed = carina_core::parser::ExpandedParsedFile::default();
+    let mut parsed: carina_core::parser::ExpandedParsedFile = Default::default();
     parsed.resources = resources.to_vec();
     let errors = resolve_file_names_with_ctx(&ctx, &mut parsed);
     resources.clone_from_slice(&parsed.resources);

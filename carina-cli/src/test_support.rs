@@ -99,6 +99,11 @@ pub(crate) async fn missing_s3_backend(
     let raw = parsed_fixture(&format!(
         "backend s3 {{ bucket = \"state-bucket\" key = \"state.json\" auto_create = {auto_create} }}"
     ));
+    let raw = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::ProviderContext::new(EnvironmentSnapshot::empty()),
+        |session| carina_core::parser::evaluate_backend_for_test(raw, session),
+    )
+    .unwrap();
     let config = carina_state::BackendConfig::try_from(raw.backend.as_ref().unwrap()).unwrap();
     missing_s3_backend_with_settings(config.as_s3().unwrap()).await
 }
@@ -205,8 +210,13 @@ pub(crate) fn parsed_fixture(source: &str) -> carina_core::parser::ParsedFile {
 
 #[cfg(test)]
 pub(crate) fn inferred_fixture(source: &str) -> carina_core::parser::InferredFile {
+    let parsed = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::ProviderContext::new(EnvironmentSnapshot::empty()),
+        |session| carina_core::parser::evaluate_backend_for_test(parsed_fixture(source), session),
+    )
+    .unwrap();
     carina_core::validation::inference::apply_inference(
-        parsed_fixture(source),
+        parsed,
         &carina_core::schema::SchemaRegistry::new(),
         &carina_core::parser::ProviderContext::new(EnvironmentSnapshot::empty()),
     )
@@ -432,11 +442,11 @@ mod graph_fixtures {
         resource::{PersistedDestroyDependencies, ResolvedResourceId, Resource},
     };
     pub fn compiled_loop(template: Box<ExpandedDeferredForExpression>) -> DeferredCreatePayload {
-        let mut configuration = ExpandedParsedFile::default();
+        let mut configuration: ExpandedParsedFile = Default::default();
         configuration.upstream_states = ["orgs", "upstream"]
             .into_iter()
             .map(|binding| carina_core::parser::UpstreamState {
-                caller: None,
+                caller: carina_core::parser::upstream_caller_for_test(),
                 binding: crate::absolute_binding_for_test(binding),
                 source: "upstream".into(),
             })

@@ -1665,13 +1665,13 @@ fn resolve_cascade_targets(
     targets: DeferredCreateTargets,
     resources: &[ResolvedResource],
 ) -> ResolvedDeferredCreateTargets {
-    let configuration = crate::parser::ExpandedParsedFile {
+    let configuration: crate::parser::ExpandedParsedFile = crate::parser::ExpandedParsedFile {
         resources: resources
             .iter()
             .map(|resource| resource.as_inner().clone().into_unexpanded_for_test())
             .collect(),
         upstream_states: vec![crate::parser::UpstreamState {
-            caller: None,
+            caller: crate::parser::upstream_caller_for_test(),
             binding: absolute_binding("other"),
             source: "../other".into(),
         }],

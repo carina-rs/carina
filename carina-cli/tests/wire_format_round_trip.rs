@@ -47,7 +47,8 @@ fn assert_module_prefixed_addresses(addresses: BTreeSet<String>) {
 // source spelling and identity. Historical versions are checked at the header.
 fn current_plan_fixture(fixture: &str) -> String {
     let mut wire: Value = serde_json::from_str(fixture).unwrap();
-    assert_eq!(wire["version"], PlanFile::CURRENT_VERSION);
+    assert_eq!(wire["version"], 46);
+    wire["version"] = PlanFile::CURRENT_VERSION.into();
     let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/module_binding_wire_compat");
     wire["source_path"] =
@@ -263,12 +264,12 @@ fn v46_deferred_replacement_admission_requests_round_trip() {
 fn v46_plans_accept_resolved_scalar_template_directives() {
     use carina_core::resource::LoopDirective;
 
-    assert_eq!(PlanFile::CURRENT_VERSION, 46);
+    assert_eq!(PlanFile::CURRENT_VERSION, 47);
     for fixture in [
         include_str!("fixtures/module_binding_wire_compat/carina.v46.plan.json"),
         include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v46.plan.json"),
     ] {
-        // Format 46 retains the scalar loop-directive encoding accepted by
+        // Format 47 retains the scalar loop-directive encoding accepted by
         // main format 38 alongside complete dependency addresses.
         let wire: Value = serde_json::from_str(&current_plan_fixture(fixture)).unwrap();
         let plan: PlanFile = serde_json::from_value(wire.clone()).unwrap();

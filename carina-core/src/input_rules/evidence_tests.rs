@@ -1651,7 +1651,7 @@ fn conditional_suffix_estimation_is_shared_by_every_object_instance() {
             .into_iter()
             .map(|(name, value)| (name.to_owned(), value))
             .collect();
-        let mut file = crate::parser::ExpandedInferredFile::default();
+        let mut file: crate::parser::ExpandedInferredFile = Default::default();
         file.resources.push(resource.clone()); // allow: direct — input-rule preview fixture
         let report = check_authored_inputs(&AuthoredInputs::for_test(&file), &schemas);
         assert_eq!(report.findings().len(), 5);

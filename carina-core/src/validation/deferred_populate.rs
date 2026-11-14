@@ -57,8 +57,8 @@ impl std::fmt::Display for DeferredPopulateDiagnostic {
 ///     validate_deferred_populate_refs(file, &SchemaRegistry::new());
 /// }
 /// ```
-pub fn validate_deferred_populate_refs<B: BindingAddress, D, E>(
-    tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
+pub fn validate_deferred_populate_refs<B: BindingAddress, D, E, K: crate::parser::BackendPhase>(
+    tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E, K>,
     schemas: &SchemaRegistry,
 ) -> Vec<Located<DeferredPopulateDiagnostic>>
 where

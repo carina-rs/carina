@@ -720,8 +720,8 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
     /// silently skipped — callers (validation / LSP) treat unknown resource
     /// types as a separate diagnostic, so reporting them again here would
     /// double-count. LiveComposition bindings do not need a registry lookup.
-    pub fn from_parsed<E, D>(
-        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    pub fn from_parsed<E, D, K: crate::parser::BackendPhase>(
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
         registry: &'a SchemaRegistry,
         provider_context: &crate::parser::ProviderContext,
     ) -> Self
@@ -735,8 +735,8 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
     /// This is the pre-expansion authority for references such as `web.url`:
     /// the module call is not a [`LiveComposition`] yet, but its imported
     /// signature already declares the output type.
-    pub fn from_parsed_with_module_signatures<E, D>(
-        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    pub fn from_parsed_with_module_signatures<E, D, K: crate::parser::BackendPhase>(
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
         registry: &'a SchemaRegistry,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
         provider_context: &crate::parser::ProviderContext,
@@ -756,8 +756,8 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
     /// Build the index with statically resolved `upstream_state` exports.
     /// Bindings whose source could not be loaded are still recorded as known
     /// and therefore resolve to [`RefType::Unchecked`].
-    pub fn from_parsed_with_upstream_exports<E, D>(
-        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    pub fn from_parsed_with_upstream_exports<E, D, K: crate::parser::BackendPhase>(
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
         registry: &'a SchemaRegistry,
         upstream_exports: &'a crate::upstream_exports::UpstreamExports<B>,
         provider_context: &crate::parser::ProviderContext,
@@ -775,8 +775,12 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
     }
 
     /// Build the complete pre-expansion validation index used by the LSP.
-    pub fn from_parsed_with_upstream_exports_and_module_signatures<E, D>(
-        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    pub fn from_parsed_with_upstream_exports_and_module_signatures<
+        E,
+        D,
+        K: crate::parser::BackendPhase,
+    >(
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
         registry: &'a SchemaRegistry,
         upstream_exports: &'a crate::upstream_exports::UpstreamExports<B>,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
@@ -794,8 +798,12 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         )
     }
 
-    pub fn from_parsed_with_upstream_exports_and_module_signatures_in_session<E, D>(
-        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    pub fn from_parsed_with_upstream_exports_and_module_signatures_in_session<
+        E,
+        D,
+        K: crate::parser::BackendPhase,
+    >(
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
         registry: &'a SchemaRegistry,
         upstream_exports: Option<&'a crate::upstream_exports::UpstreamExports<B>>,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
@@ -815,8 +823,8 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         index
     }
 
-    fn build<E, D>(
-        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    fn build<E, D, K: crate::parser::BackendPhase>(
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
         registry: &'a SchemaRegistry,
         upstream_exports: Option<&'a crate::upstream_exports::UpstreamExports<B>>,
         module_signatures: Option<&'a crate::module_resolver::ResolvedModuleSignatures>,
@@ -1764,13 +1772,14 @@ impl BindingNameSet {
     /// — keeps `Variable` last because `parsed.variables` is the
     /// catch-all "any `let`-RHS placeholder lives here" map, while the
     /// preceding sources are narrower declaration forms.
-    pub fn from_parsed<E, D>(
+    pub fn from_parsed<E, D, K: crate::parser::BackendPhase>(
         parsed: &crate::parser::File<
             E,
             crate::resource::ParserPlaceholder,
             crate::resource::ParserPlaceholder,
             D,
             RelativeBindingName,
+            K,
         >,
     ) -> Self
     where
@@ -2325,13 +2334,14 @@ pub struct LivePreDataSourceReadInputs<'a> {
 impl ResolvedBindings<ParserPlaceholder> {
     /// Build the parser-placeholder validation view while resolving every
     /// authored binding name into the caller-provided root scope.
-    pub(crate) fn for_root_validation<E, D>(
+    pub(crate) fn for_root_validation<E, D, K: crate::parser::BackendPhase>(
         parsed: &crate::parser::File<
             E,
             ParserPlaceholder,
             ParserPlaceholder,
             D,
             RelativeBindingName,
+            K,
         >,
         root: &crate::resource::RootScope,
     ) -> Self
@@ -2353,8 +2363,14 @@ impl ResolvedBindings<ParserPlaceholder> {
         )
     }
 
-    fn build_validation<E, B: BindingAddress, Out: BindingAddress, D>(
-        parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    fn build_validation<
+        E,
+        B: BindingAddress,
+        Out: BindingAddress,
+        D,
+        K: crate::parser::BackendPhase,
+    >(
+        parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
         mut map_value: impl FnMut(&Value<ParserPlaceholder, B>) -> Value<ParserPlaceholder, Out>,
         mut map_binding: impl FnMut(&B) -> Out,
     ) -> ResolvedBindings<ParserPlaceholder, Out>
@@ -2454,13 +2470,14 @@ impl ResolvedBindings<ParserPlaceholder> {
     }
 
     /// Build the same incomplete validation view after scope expansion.
-    pub fn for_expanded_validation<E, D>(
+    pub fn for_expanded_validation<E, D, K: crate::parser::BackendPhase>(
         parsed: &crate::parser::File<
             E,
             ParserPlaceholder,
             ParserPlaceholder,
             D,
             AbsoluteBindingAddress,
+            K,
         >,
     ) -> Self
     where
@@ -2482,13 +2499,14 @@ impl ResolvedBindings<ParserPlaceholder, RelativeBindingName> {
     /// Build the incomplete validation view without crossing the root-binding
     /// expansion seam. Editor/source diagnostics use this view while their
     /// values still carry authored relative names.
-    pub fn for_authored_validation<E, D>(
+    pub fn for_authored_validation<E, D, K: crate::parser::BackendPhase>(
         parsed: &crate::parser::File<
             E,
             ParserPlaceholder,
             ParserPlaceholder,
             D,
             RelativeBindingName,
+            K,
         >,
     ) -> Self
     where
@@ -3474,7 +3492,7 @@ mod tests {
     #[test]
     fn round11_declared_widening_checks_identity_bound_containment() {
         let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
-        let parsed = crate::parser::ParsedFile::default();
+        let parsed: crate::parser::ParsedFile = Default::default();
         let schemas = SchemaRegistry::new();
         let bindings = BindingIndex::from_parsed(&parsed, &schemas, &context);
         for id in ["aws.iam.Role.Arn", "aws.Arn"] {
@@ -3555,7 +3573,7 @@ mod tests {
             Some(ResolvedRefType::new(wide, BTreeMap::new())),
         );
         let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
-        let parsed = crate::parser::ParsedFile::default();
+        let parsed: crate::parser::ParsedFile = Default::default();
         let schemas = SchemaRegistry::new();
         let bindings = BindingIndex::from_parsed(&parsed, &schemas, &context);
         let sink = TypeInSchema::schemaless(&narrow).with_authority(
@@ -3594,7 +3612,7 @@ mod tests {
             Some(ResolvedRefType::new(wide, BTreeMap::new())),
         );
         let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
-        let parsed = crate::parser::ParsedFile::default();
+        let parsed: crate::parser::ParsedFile = Default::default();
         let schemas = SchemaRegistry::new();
         let bindings = BindingIndex::from_parsed(&parsed, &schemas, &context);
         let sink = TypeInSchema::schemaless(&narrow).with_authority(
@@ -3629,7 +3647,7 @@ mod tests {
         let narrow =
             AttributeType::refined_string(Some(identity), None, Some((Some(8), Some(64))), None);
         let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
-        let parsed = crate::parser::ParsedFile::default();
+        let parsed: crate::parser::ParsedFile = Default::default();
         let schemas = SchemaRegistry::new();
         let bindings = BindingIndex::from_parsed(&parsed, &schemas, &context);
         let exact = TypeExpr::SchemaType {
@@ -3670,7 +3688,7 @@ mod tests {
         let narrow =
             AttributeType::refined_string(Some(identity), None, Some((Some(8), Some(64))), None);
         let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
-        let parsed = crate::parser::ParsedFile::default();
+        let parsed: crate::parser::ParsedFile = Default::default();
         let schemas = SchemaRegistry::new();
         let bindings = BindingIndex::from_parsed(&parsed, &schemas, &context);
         let exact = TypeExpr::SchemaType {
@@ -3705,7 +3723,7 @@ mod tests {
         let terminal = crate::validation::deferred_types::TypeCheckSession::run(
             &context,
             |session| {
-                let parsed = crate::parser::ParsedFile::default();
+                let parsed: crate::parser::ParsedFile = Default::default();
                 let schemas = SchemaRegistry::new();
                 let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
                 let index = BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
@@ -3757,7 +3775,7 @@ mod tests {
         let terminal = crate::validation::deferred_types::TypeCheckSession::run(
             &context,
             |session| {
-                let parsed = crate::parser::ParsedFile::default();
+                let parsed: crate::parser::ParsedFile = Default::default();
                 let schemas = SchemaRegistry::new();
                 let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
                 let index = BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
@@ -3811,7 +3829,7 @@ mod tests {
         let terminal = crate::validation::deferred_types::TypeCheckSession::run(
             &context,
             |session| {
-                let parsed = crate::parser::ParsedFile::default();
+                let parsed: crate::parser::ParsedFile = Default::default();
                 let schemas = SchemaRegistry::new();
                 let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
                 let index = BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
@@ -3864,7 +3882,7 @@ mod tests {
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap();
-        let parsed = crate::parser::ParsedFile::default();
+        let parsed: crate::parser::ParsedFile = Default::default();
         let schemas = SchemaRegistry::new();
         let provider_context = crate::parser::ProviderContext {
             custom_types: crate::parser::ProviderCustomTypes::loaded(
@@ -3918,7 +3936,7 @@ mod tests {
                 .unwrap();
                 let source = crate::validation::lift_type_expr(&declaration).unwrap();
                 let sink = AttributeType::int();
-                let parsed = crate::parser::ParsedFile::default();
+                let parsed: crate::parser::ParsedFile = Default::default();
                 let schemas = SchemaRegistry::new();
                 let loaded = crate::parser::ProviderContext {
                     custom_types: crate::parser::ProviderCustomTypes::loaded(
@@ -3958,7 +3976,7 @@ mod tests {
     fn value_declaration_source_keeps_legacy_handle_values_inferred() {
         use crate::parser::{ResourceTypePath, TypeExpr};
 
-        let parsed = crate::parser::ParsedFile::default();
+        let parsed: crate::parser::ParsedFile = Default::default();
         let schemas = SchemaRegistry::new();
         let index = BindingIndex::from_parsed(
             &parsed,
@@ -4967,7 +4985,7 @@ let vpc = aws.ec2.Vpc {
         )
         .expect("parse");
         parsed.upstream_states.push(UpstreamState {
-            caller: None,
+            caller: crate::parser::upstream_caller_for_test(),
             binding: RelativeBindingName::new("up"),
             source: "../upstream".into(),
         });
@@ -5025,7 +5043,7 @@ let vpc = aws.ec2.Vpc {
         )
         .expect("parse");
         parsed.upstream_states.push(UpstreamState {
-            caller: None,
+            caller: crate::parser::upstream_caller_for_test(),
             binding: RelativeBindingName::new("up"),
             source: "../upstream".into(),
         });
@@ -5065,7 +5083,7 @@ let vpc = aws.ec2.Vpc {
         )
         .expect("parse");
         parsed.upstream_states.push(UpstreamState {
-            caller: None,
+            caller: crate::parser::upstream_caller_for_test(),
             binding: RelativeBindingName::new("up"),
             source: "../missing".into(),
         });

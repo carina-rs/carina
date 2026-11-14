@@ -579,11 +579,11 @@ mod tests {
         bindings: &ResolvedBindings,
         identity: &DeferredIdentityInputs<'_>,
     ) -> Result<Vec<Effect>, DeferredCreateFailure> {
-        let configuration = crate::parser::ExpandedParsedFile {
+        let configuration: crate::parser::ExpandedParsedFile = crate::parser::ExpandedParsedFile {
             upstream_states: ["up", "parent", "upstream", "primary", "fallback"]
                 .into_iter()
                 .map(|binding| crate::parser::UpstreamState {
-                    caller: None,
+                    caller: crate::parser::upstream_caller_for_test(),
                     binding: RootScope::new().resolve(binding.into()),
                     source: std::path::PathBuf::from("upstream"),
                 })
@@ -662,7 +662,7 @@ mod tests {
                 upstream_states: vec![crate::parser::UpstreamState {
                     binding: RootScope::new().resolve("up".into()),
                     source: "upstream".into(),
-                    caller: None,
+                    caller: crate::parser::upstream_caller_for_test(),
                 }],
                 ..Default::default()
             }

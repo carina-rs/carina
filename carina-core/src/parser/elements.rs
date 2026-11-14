@@ -1027,7 +1027,6 @@ pub struct SyntaxInventory<
     type_annotations: Vec<Located<crate::validation::TypeResolutionContext>>,
     attribute_keys: Vec<AttributeKeyLocation>,
     providers: Vec<Located<ProviderDeclaration>>,
-    upstream_sources: Vec<Located<B>>,
     configuration_blocks: Vec<Located<ConfigurationBlockDeclaration>>,
     directory_verdict: crate::config_loader::DirectoryVerdict,
     backend_keys: Vec<Located<super::AttributeKey>>,
@@ -1044,7 +1043,6 @@ impl<B: crate::resource::BindingAddress> Default for SyntaxInventory<B> {
             type_annotations: Vec::new(),
             attribute_keys: Vec::new(),
             providers: Vec::new(),
-            upstream_sources: Vec::new(),
             configuration_blocks: Vec::new(),
             directory_verdict: crate::config_loader::DirectoryVerdict::default(),
             backend_keys: Vec::new(),
@@ -1114,9 +1112,7 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
     pub(crate) fn binding_names(&self) -> &[B] {
         &self.binding_names
     }
-    pub fn upstream_sources(&self) -> &[Located<B>] {
-        &self.upstream_sources
-    }
+
     pub(crate) fn extend(&mut self, other: Self) {
         self.expressions.extend(other.expressions);
         self.declarations.extend(other.declarations);
@@ -1124,7 +1120,6 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
         self.type_annotations.extend(other.type_annotations);
         self.attribute_keys.extend(other.attribute_keys);
         self.providers.extend(other.providers);
-        self.upstream_sources.extend(other.upstream_sources);
         self.configuration_blocks.extend(other.configuration_blocks);
         self.backend_keys.extend(other.backend_keys);
         self.anonymous_headers.extend(other.anonymous_headers);
@@ -1148,14 +1143,6 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
             anonymous_headers: self.anonymous_headers,
             loops: self.loops,
             state_targets: self.state_targets,
-            upstream_sources: self
-                .upstream_sources
-                .into_iter()
-                .map(|source| {
-                    let (location, binding) = source.into_parts();
-                    Located::new(location, map(binding))
-                })
-                .collect(),
         }
     }
 }
@@ -1366,27 +1353,6 @@ impl SyntaxInventory {
             let span = block.location().span();
             (span.start_line(), span.start_column())
         });
-        for pair in pairs.flatten() {
-            if pair.as_rule() == Rule::let_binding {
-                let mut inner = pair.into_inner();
-                let binding = inner.next().expect("let name").as_str().to_string();
-                if let Some(value) = inner.next() {
-                    for upstream in value
-                        .into_inner()
-                        .flatten()
-                        .filter(|p| p.as_rule() == Rule::upstream_state_expr)
-                    {
-                        let elements = ElementLocations::from_pair(&upstream, file, source);
-                        for (kind, location) in elements.values {
-                            if kind == ElementKind::Source {
-                                out.upstream_sources
-                                    .push(Located::new(location, binding.clone().into()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
         out
     }
 }

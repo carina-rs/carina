@@ -42,6 +42,7 @@ fn backend_with_client(
 ) -> S3Backend {
     use carina_core::resource::{ConcreteValue, NoPlaceholder, Value};
     let raw = carina_core::parser::BackendConfig::<NoPlaceholder> {
+        source: (),
         backend_type: "s3".into(),
         attributes: [
             (
@@ -540,6 +541,11 @@ async fn storage_readiness_auto_create_diagnostic_redacts_environment_bucket() {
     )
     .unwrap();
     carina_core::parser::resolve_resource_refs_with_config(&mut parsed, &context).unwrap();
+    let parsed =
+        carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+            carina_core::parser::evaluate_backend_for_test(parsed, session)
+        })
+        .unwrap();
     let config = crate::BackendConfig::try_from(parsed.backend.as_ref().unwrap()).unwrap();
     let backend = S3Backend::from_client(client, config.as_s3().unwrap(), TEST_REGION.into());
     let bootstrap = provisionable_storage(&backend).await;

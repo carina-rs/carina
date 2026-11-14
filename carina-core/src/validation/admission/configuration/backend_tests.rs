@@ -1,5 +1,19 @@
 use super::*;
 
+fn parse_evaluated_backend(
+    source: &str,
+    path: &std::path::Path,
+    config: &ProviderContext,
+) -> Result<parser::ParsedFile<parser::StrictBackend>, parser::ParseError> {
+    let authored = parser::parse_file(source, path, config)?;
+    parser::evaluate_file_backend::<parser::StrictBackend, _>(
+        authored,
+        config,
+        None,
+        crate::config_loader::strict_resolution_context(),
+    )
+}
+
 #[test]
 fn round17_retaining_loader_cannot_admit_failed_backend_without_recovery() {
     let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
@@ -18,11 +32,13 @@ fn round17_retaining_loader_cannot_admit_failed_backend_without_recovery() {
     .unwrap()
     .parsed;
     assert!(
-        parsed.admit_backend_unlocated().is_none(),
-        "a retaining loader must carry the failed evaluation itself"
+        parsed
+            .admit_backend_unlocated()
+            .is_some_and(|result| result.is_err()),
+        "admission owns the retained evaluation failure"
     );
     let tree = parser::AnalysisTree::try_from_file(&parsed).unwrap();
-    assert!(tree.admit_backend().is_none());
+    assert!(tree.admit_backend().is_some_and(|result| result.is_err()));
     assert!(
         matches!(tree.backend_attribute_value(&"bucket".into()), Some(parser::BackendAttributeValue::Failed(error)) if matches!(error.as_ref(), parser::ParseError::AtElement(_)))
     );
@@ -30,23 +46,18 @@ fn round17_retaining_loader_cannot_admit_failed_backend_without_recovery() {
         parser::BackendAttributeValue::Failed(cause) => Arc::clone(cause),
         parser::BackendAttributeValue::Evaluated(_) => panic!("expected retained failure"),
     };
-    let mut demanded = parsed.clone().into_parsed();
-    let error = parser::resolve_resource_refs_in_context(
-        &mut demanded,
-        &context,
-        None,
-        crate::config_loader::strict_resolution_context(),
-    )
-    .unwrap_err();
-    assert_eq!(error.source_file(), cause.source_file());
-    assert!(
-        matches!(error, parser::ParseError::BackendEvaluation(error) if Arc::ptr_eq(&error, &cause))
-    );
+    let error = crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        parsed
+            .clone()
+            .evaluate_backend_in_session(session)
+            .expect_err("strict backend evaluation must fail")
+    });
+    let parser::AnalysisResolutionError::Diagnostic(ref finding) = error else {
+        panic!("expected the new evaluation's source-owned cause")
+    };
+    assert_eq!(Some(finding.location().file().path()), cause.source_file());
+    assert_eq!(error.to_string(), cause.to_string());
     assert!(admit(parsed.backend.as_ref().unwrap()).is_err());
-    assert!(
-        serde_json::to_string(parsed.backend.as_ref().unwrap()).is_err(),
-        "a retained failure cannot be persisted as an ordinary value"
-    );
 }
 
 #[test]
@@ -58,7 +69,7 @@ fn backend_admission_uses_the_issued_directory_verdict() {
     ] {
         let source = format!("{declaration}\nbackend local {{ path = 1 typo = true }}\n");
         let parsed =
-            parser::parse_file(&source, std::path::Path::new("main.crn"), &context).unwrap();
+            parse_evaluated_backend(&source, std::path::Path::new("main.crn"), &context).unwrap();
         let parsed =
             crate::config_loader::RootDirectoryParse::from_parsed_source_for_test(parsed, &source);
         let tree = parser::AnalysisTree::try_from_file(&parsed).unwrap();
@@ -80,7 +91,8 @@ fn backend_admission_uses_the_issued_directory_verdict() {
         }
 
         let template =
-            parser::parse_file(declaration, std::path::Path::new("main.crn"), &context).unwrap();
+            parse_evaluated_backend(declaration, std::path::Path::new("main.crn"), &context)
+                .unwrap();
         let template = crate::config_loader::RootDirectoryParse::from_parsed_source_for_test(
             template,
             declaration,
@@ -97,7 +109,7 @@ fn backend_admission_uses_the_issued_directory_verdict() {
 #[test]
 fn backend_admission_is_owned_by_its_analysis_tree() {
     let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-    let absent = parser::parse_file(
+    let absent = parse_evaluated_backend(
         "let count = 1\n",
         std::path::Path::new("main.crn"),
         &context,
@@ -108,7 +120,7 @@ fn backend_admission_is_owned_by_its_analysis_tree() {
 
     let path = std::path::Path::new("backend.crn");
     let source = "backend local {\n  path = 1\n  typo = true\n}\n";
-    let invalid = parser::parse_file(source, path, &context).unwrap();
+    let invalid = parse_evaluated_backend(source, path, &context).unwrap();
     let tree = parser::AnalysisTree::try_from_file(&invalid).unwrap();
     assert!(matches!(
         tree.directory_verdict(),
@@ -139,7 +151,7 @@ fn backend_admission_is_owned_by_its_analysis_tree() {
 
     let path = std::path::Path::new("unsupported.crn");
     let source = "\nbackend gcs {}\n";
-    let unsupported = parser::parse_file(source, path, &context).unwrap();
+    let unsupported = parse_evaluated_backend(source, path, &context).unwrap();
     let unsupported =
         crate::config_loader::RootDirectoryParse::from_parsed_source_for_test(unsupported, source);
     let tree = parser::AnalysisTree::try_from_file(&unsupported).unwrap();
@@ -157,7 +169,8 @@ fn backend_admission_is_owned_by_its_analysis_tree() {
     assert_eq!(finding.location().span().start_column(), 1);
 
     let source = "backend local { path = 'state.json' }\n";
-    let valid = parser::parse_file(source, std::path::Path::new("valid.crn"), &context).unwrap();
+    let valid =
+        parse_evaluated_backend(source, std::path::Path::new("valid.crn"), &context).unwrap();
     let valid =
         crate::config_loader::RootDirectoryParse::from_parsed_source_for_test(valid, source);
     let tree = parser::AnalysisTree::try_from_file(&valid).unwrap();
@@ -307,12 +320,16 @@ fn round15_unlocated_backend_uses_the_same_ownership_gate() {
     )
     .unwrap()
     .parsed;
-    assert!(parsed.admit_backend_unlocated().is_none());
+    assert!(
+        parsed
+            .admit_backend_unlocated()
+            .is_some_and(|result| result.is_err())
+    );
     assert!(
         parser::AnalysisTree::try_from_file(&parsed)
             .unwrap()
             .admit_backend()
-            .is_none()
+            .is_some_and(|result| result.is_err())
     );
 }
 
@@ -345,7 +362,64 @@ fn round15_recovery_cannot_admit_failed_backend_values() {
         ));
     }
     assert!(
-        tree.admit_backend().is_none(),
-        "failed evaluation cannot issue a readiness proof"
+        tree.admit_backend().is_some_and(|result| result.is_err()),
+        "admission must report failed evaluation without issuing readiness"
+    );
+}
+
+#[test]
+fn round19_failed_backend_preserves_error_source_chain() {
+    let error = BackendAttributeError::EvaluationFailed {
+        backend_type: "s3".into(),
+        attribute: "bucket".into(),
+        error: Arc::new(parser::ParseError::InvalidExpression {
+            line: 1,
+            message: "evaluation failed".into(),
+        }),
+    };
+    assert!(std::error::Error::source(&error).is_some());
+}
+
+#[test]
+fn round19_unlocated_backend_cause_is_reported_at_its_attribute() {
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let directory = crate::test_utils::configuration::ConfigurationDirectory::new(&[
+        (
+            "backend.crn",
+            "backend s3 { bucket = cidr_subnet('bad', 8, 1) key = 'k' }",
+        ),
+        ("values.crn", "let other = 'state'"),
+    ]);
+    let loaded = crate::config_loader::load_configuration_for_metadata(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .unwrap();
+    let mut parsed = loaded.parsed.into_parsed();
+    parsed.backend.as_mut().unwrap().attributes.insert(
+        "bucket",
+        parser::BackendAttributeValue::Failed(Arc::new(parser::ParseError::InvalidExpression {
+            line: 1,
+            message: "unlocated cause".into(),
+        })),
+    );
+    let tree = parser::AnalysisTree::try_from_file(&parsed).unwrap();
+    let errors = tree
+        .admit_backend()
+        .expect("failed backend must be reported")
+        .unwrap_err();
+    assert_eq!(errors.len(), 1);
+    let LocatedBackendError::Attribute(finding) = &errors[0] else {
+        panic!("expected attribute error")
+    };
+    assert_eq!(
+        finding.location().file().path().file_name().unwrap(),
+        "backend.crn"
+    );
+    assert_eq!(finding.location().span().start_column(), 14);
+    assert_eq!(
+        finding.detail().to_string(),
+        "Invalid expression at line 1: unlocated cause"
     );
 }

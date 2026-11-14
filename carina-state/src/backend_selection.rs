@@ -577,6 +577,7 @@ mod tests {
 
     fn local_config(path: &str) -> ParserBackendConfig {
         ParserBackendConfig {
+            source: (),
             backend_type: "local".to_string(),
             attributes: (HashMap::<String, _>::from([(
                 "path".to_string(),
@@ -590,6 +591,7 @@ mod tests {
 
     fn s3_config(bucket: &str) -> ParserBackendConfig {
         ParserBackendConfig {
+            source: (),
             backend_type: "s3".to_string(),
             attributes: (HashMap::<String, _>::from([
                 (
@@ -834,6 +836,7 @@ mod configured_backend_selection_tests {
     use super::*;
     fn raw(path: &str) -> ParserBackendConfig {
         ParserBackendConfig {
+            source: (),
             backend_type: "local".into(),
             attributes: [(
                 "path".to_owned(),

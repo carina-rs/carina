@@ -67,8 +67,8 @@ fn both_pass_errors_preserve_order_duplicates_and_preflight_equivalence() {
     );
 }
 
-fn assert_both_passes<E, D, B>(
-    parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+fn assert_both_passes<E, D, B, K: crate::parser::BackendPhase>(
+    parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
     schemas: &SchemaRegistry,
     catalog: &ProviderContext,
     evaluation: ValidationEvaluation<B>,

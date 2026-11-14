@@ -111,7 +111,7 @@ fn resolved_fixture_graph(
     data_sources: &[DataSource],
 ) -> (Vec<ResolvedResource>, Vec<ResolvedDataSource>) {
     resolved_fixture_graph_with_parsed(
-        crate::parser::ExpandedParsedFile::default(),
+        <crate::parser::ExpandedParsedFile>::default(),
         managed,
         data_sources,
     )
@@ -209,7 +209,7 @@ fn resolved_fixture_resources_with_wait(
     wait_binding: &str,
     target_binding: &str,
 ) -> Vec<ResolvedResource> {
-    let mut parsed = crate::parser::ExpandedParsedFile::default();
+    let mut parsed: crate::parser::ExpandedParsedFile = Default::default();
     parsed.wait_bindings.push(crate::parser::WaitBinding {
         binding: absolute_binding(wait_binding),
         target: absolute_binding(target_binding),
@@ -327,6 +327,8 @@ fn anonymous_deferred_collision_fixture() -> (
                             parsed,
                             fixture_source,
                         )
+                        .evaluate_backend_in_session(session)
+                        .unwrap()
                         .admit(&crate::schema::SchemaRegistry::new(), session),
                         &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                     )
@@ -8320,6 +8322,8 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
             let consumer = mock.test.Thing { name = r0.identifier }
         "#,
                 )
+                .evaluate_backend_in_session(session)
+                .unwrap()
                 .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
             )
@@ -14078,9 +14082,9 @@ async fn deposed_deferred_admission(coexisting: bool, absorbed: bool, bound: boo
     let mut plan = Plan::new();
     plan.add(deposed.to_delete_effect());
     let compiled = if bound {
-        let configuration = crate::parser::ExpandedParsedFile {
+        let configuration: crate::parser::ExpandedParsedFile = crate::parser::ExpandedParsedFile {
             upstream_states: vec![crate::parser::UpstreamState {
-                caller: None,
+                caller: crate::parser::upstream_caller_for_test(),
                 binding: absolute_binding("cert"),
                 source: "../cert".into(),
             }],
@@ -14204,9 +14208,9 @@ fn review_4283_deferred_requirements_apply_to_one_concrete_sibling() {
         previous_attributes: Default::default(),
     };
     let first = old(0).id;
-    let configuration = crate::parser::ExpandedParsedFile {
+    let configuration: crate::parser::ExpandedParsedFile = crate::parser::ExpandedParsedFile {
         upstream_states: vec![crate::parser::UpstreamState {
-            caller: None,
+            caller: crate::parser::upstream_caller_for_test(),
             binding: absolute_binding("cert"),
             source: std::path::PathBuf::from("../cert"),
         }],

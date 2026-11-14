@@ -43,7 +43,9 @@ pub(super) struct MergedParseResult {
 pub(super) enum MergedModuleResolution {
     Unanalyzed,
     Expanded {
-        graph: Box<carina_core::parser::ModuleResolvedParsedFile>,
+        graph: Box<
+            carina_core::parser::ModuleResolvedParsedFile<carina_core::parser::RetainedBackend>,
+        >,
     },
     ConstraintFailed {
         findings: Vec<carina_core::validation::ModuleCallFinding>,
@@ -201,15 +203,17 @@ fn value_depends_on_module_output(
 /// if that parse or the current file identity is unavailable, only values
 /// proven independent of sibling names may fall back to the buffer parse.
 pub(super) enum SemanticView<'a> {
-    Standalone(&'a ParsedFile),
-    DirectoryParsed { merged: &'a ParsedFile },
+    Standalone(&'a ParsedFile<carina_core::parser::RetainedBackend>),
+    DirectoryParsed {
+        merged: &'a ParsedFile<carina_core::parser::RetainedBackend>,
+    },
     DirectoryUnavailable,
 }
 
 impl<'a> SemanticView<'a> {
     pub(super) fn for_analysis(
-        authored: &'a ParsedFile,
-        merged: Option<&'a ParsedFile>,
+        authored: &'a ParsedFile<carina_core::parser::RetainedBackend>,
+        merged: Option<&'a ParsedFile<carina_core::parser::RetainedBackend>>,
         directory_backed: bool,
     ) -> Self {
         if !directory_backed {
@@ -320,6 +324,8 @@ trait SemanticLookup: Sized {
             ParserPlaceholder,
             ParserPlaceholder,
             D,
+            carina_core::resource::RelativeBindingName,
+            carina_core::parser::RetainedBackend,
         >,
     ) -> Option<&'a Self>
     where
@@ -336,6 +342,8 @@ impl SemanticLookup for AttributeParameter {
             ParserPlaceholder,
             ParserPlaceholder,
             D,
+            carina_core::resource::RelativeBindingName,
+            carina_core::parser::RetainedBackend,
         >,
     ) -> Option<&'a Self>
     where
@@ -363,6 +371,8 @@ impl SemanticLookup for ParsedExportParam {
             ParserPlaceholder,
             ParserPlaceholder,
             D,
+            carina_core::resource::RelativeBindingName,
+            carina_core::parser::RetainedBackend,
         >,
     ) -> Option<&'a Self>
     where
@@ -446,6 +456,7 @@ fn anonymous_identity_graph<E: Clone, D>(
         ParserPlaceholder,
         D,
         carina_core::resource::AbsoluteBindingAddress,
+        carina_core::parser::RetainedBackend,
     >,
     schemas: &carina_core::schema::SchemaRegistry,
 ) -> Option<AnonymousIdentityGraph>
@@ -471,8 +482,12 @@ impl DiagnosticRun<'_> {
     pub(super) fn attribute_derived_anonymous_resource_diagnostics(
         &self,
         doc: &Document,
-        directory: &ParsedFile,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        directory: &ParsedFile<carina_core::parser::RetainedBackend>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            carina_core::parser::RetainedBackend,
+        >,
     ) -> Vec<Diagnostic> {
         let conflicts =
             carina_core::identifier::check_attribute_derived_anonymous_resource_conflicts(
@@ -506,15 +521,19 @@ impl DiagnosticRun<'_> {
         &self,
         doc: &Document,
         current: (
-            &carina_core::parser::RootBindingResolvedParsedFile,
+            &carina_core::parser::RootBindingResolvedParsedFile<
+                carina_core::parser::RetainedBackend,
+            >,
             &super::RootAnalysis<'_>,
         ),
         directory: (
-            &carina_core::parser::RootBindingResolvedParsedFile,
+            &carina_core::parser::RootBindingResolvedParsedFile<
+                carina_core::parser::RetainedBackend,
+            >,
             &super::RootAnalysis<'_>,
         ),
         expanded: Option<(
-            &carina_core::parser::ModuleResolvedParsedFile,
+            &carina_core::parser::ModuleResolvedParsedFile<carina_core::parser::RetainedBackend>,
             &super::ExpandedAnalysis<'_>,
         )>,
         configuration_root: Option<&std::path::Path>,
@@ -588,7 +607,11 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_configuration_placement(
         &self,
         doc: &Document,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            carina_core::parser::RetainedBackend,
+        >,
     ) -> Vec<Diagnostic> {
         carina_core::validation::configuration_placement_diagnostics(tree)
             .iter()
@@ -612,25 +635,18 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_backend_config(
         &self,
         doc: &Document,
-        tree: Option<&carina_core::parser::AnalysisTree<'_>>,
+        tree: Option<
+            &carina_core::parser::UnexpandedAnalysis<
+                '_,
+                carina_core::parser::ParsedExportParam,
+                carina_core::parser::RetainedBackend,
+            >,
+        >,
     ) -> Vec<Diagnostic> {
         let Some(tree) = tree else {
             return Vec::new();
         };
-        // Backend admission consumes the issued verdict, including cardinality
-        // from readable siblings during partial recovery.
-        let mut diagnostics: Vec<_> = tree
-            .backend_evaluation_failures()
-            .filter_map(|error| {
-                let finding = error.element_diagnostic()?;
-                render_merged(
-                    doc,
-                    finding,
-                    DiagnosticSeverity::ERROR,
-                    finding.detail().to_string(),
-                )
-            })
-            .collect();
+        let mut diagnostics = Vec::new();
         let Some(Err(findings)) = tree.admit_backend() else {
             return diagnostics;
         };
@@ -654,10 +670,17 @@ impl DiagnosticRun<'_> {
     }
 
     /// Check expanded values while retaining the authored provider locations.
-    pub(super) fn check_provider_default_tags<B: BindingAddress>(
+    pub(super) fn check_provider_default_tags<
+        B: BindingAddress,
+        K: carina_core::parser::BackendPhase,
+    >(
         &self,
         doc: &Document,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            K,
+        >,
         providers: &[carina_core::parser::ProviderConfig<ParserPlaceholder, B>],
         bindings: &GenericResolvedBindings<ParserPlaceholder, B>,
     ) -> Vec<Diagnostic> {
@@ -706,7 +729,11 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_provider_region(
         &self,
         doc: &Document,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            carina_core::parser::RetainedBackend,
+        >,
         deduplicator: &ProviderValidationDeduplicator,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
@@ -766,7 +793,11 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_unloaded_providers(
         &self,
         doc: &Document,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            carina_core::parser::RetainedBackend,
+        >,
     ) -> Vec<Diagnostic> {
         tree.providers()
             .iter()
@@ -802,9 +833,9 @@ impl DiagnosticRun<'_> {
             doc.source_file().to_path_buf(),
             doc.text(),
         )]);
-        let result = carina_core::config_loader::parse_directory_with_source_overrides_and_diagnostics_with_schemas(
+        let result = carina_core::config_loader::parse_directory_with_source_overrides_and_diagnostics_in_session(
             base_path,
-            self.provider_context.catalog(),
+            self.provider_context,
             &overrides,
             &self.schemas,
         )?;
@@ -821,7 +852,11 @@ impl DiagnosticRun<'_> {
     pub(super) fn resolve_merged_modules(
         &self,
         result: &mut MergedParseResult,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            carina_core::parser::RetainedBackend,
+        >,
         base_path: &carina_core::paths::ResolvedPath,
         upstream_exports: &carina_core::upstream_exports::UpstreamExports,
         source_overrides: &carina_core::config_loader::SourceOverrides,
@@ -911,7 +946,11 @@ impl DiagnosticRun<'_> {
     pub(super) fn module_resolver_error_diagnostics(
         &self,
         doc: &Document,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            carina_core::parser::RetainedBackend,
+        >,
         residual: &carina_core::module_resolver::ResidualModuleResolutionError,
         base: &carina_core::paths::ResolvedPath,
     ) -> Vec<Diagnostic> {
@@ -966,7 +1005,11 @@ impl DiagnosticRun<'_> {
         doc: &Document,
         base_path: &carina_core::paths::ResolvedPath,
         merged_result: &DirectoryParseResult,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            carina_core::parser::RetainedBackend,
+        >,
     ) -> Vec<Diagnostic> {
         // Reuse the exact root sources that fed the merged parse. The shared
         // core assembler also adds the CLI-equivalent module population.
@@ -1146,7 +1189,11 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_upstream_state_field_references(
         &self,
         doc: &Document,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            carina_core::parser::RetainedBackend,
+        >,
         exports: &carina_core::upstream_exports::UpstreamExports,
         resolve_errors: &[carina_core::parser::Located<
             carina_core::upstream_exports::UpstreamResolveFailure,
@@ -1201,7 +1248,11 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_for_iterable_bindings(
         &self,
         doc: &Document,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            carina_core::parser::RetainedBackend,
+        >,
     ) -> Vec<Diagnostic> {
         let mut diagnostics: Vec<_> = carina_core::validation::validate_for_iterable_bindings(tree)
             .iter()
@@ -1236,7 +1287,11 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_upstream_state_sources(
         &self,
         doc: &Document,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            carina_core::parser::RetainedBackend,
+        >,
         base: &carina_core::paths::ResolvedPath,
     ) -> Vec<Diagnostic> {
         carina_core::upstream_exports::check_upstream_state_sources(base, tree)
@@ -1255,7 +1310,11 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_user_function_ref_types(
         &self,
         doc: &Document,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            carina_core::parser::RetainedBackend,
+        >,
         binding_index: &BindingIndex<'_>,
         report: &carina_core::parser::retained::ExpressionReport,
     ) -> Vec<Diagnostic> {
@@ -1282,7 +1341,11 @@ impl DiagnosticRun<'_> {
     pub(super) fn unused_binding_diagnostics(
         &self,
         doc: &Document,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            carina_core::parser::RetainedBackend,
+        >,
         names: impl IntoIterator<Item = String>,
     ) -> Vec<Diagnostic> {
         carina_core::validation::locate_unused_bindings(tree, names)
@@ -1349,7 +1412,14 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_attributes_blocks(
         &self,
         doc: &Document,
-        authored: (&ParsedFile, &carina_core::parser::AnalysisTree<'_>),
+        authored: (
+            &ParsedFile<carina_core::parser::RetainedBackend>,
+            &carina_core::parser::UnexpandedAnalysis<
+                '_,
+                carina_core::parser::ParsedExportParam,
+                carina_core::parser::RetainedBackend,
+            >,
+        ),
         semantic_view: &SemanticView<'_>,
         binding_index: &BindingIndex<'_>,
         known_bindings: &HashSet<String>,
@@ -1571,11 +1641,17 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_exports_blocks(
         &self,
         doc: &Document,
-        parsed: &ParsedFile,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        parsed: &ParsedFile<carina_core::parser::RetainedBackend>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            carina_core::parser::RetainedBackend,
+        >,
         semantic_view: &SemanticView<'_>,
         value_bindings: &ResolvedBindings,
-        expanded: Option<&carina_core::parser::ModuleResolvedParsedFile>,
+        expanded: Option<
+            &carina_core::parser::ModuleResolvedParsedFile<carina_core::parser::RetainedBackend>,
+        >,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         let name_location = |param: &ParsedExportParam| {
@@ -1718,8 +1794,17 @@ impl DiagnosticRun<'_> {
             ParsedExportParam<ParserPlaceholder, B>,
             D,
             B,
+            carina_core::parser::RetainedBackend,
         >,
-        tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+        tree: &carina_core::parser::AnalysisTree<
+            '_,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            B,
+            carina_core::parser::ParsedExportParam<ParserPlaceholder, B>,
+            carina_core::parser::RetainedBackend,
+        >,
     ) -> Vec<Diagnostic>
     where
         D: Clone
@@ -1799,7 +1884,11 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_undefined_references(
         &self,
         doc: &Document,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            carina_core::parser::RetainedBackend,
+        >,
         defined_bindings: &HashSet<String>,
         declared_providers: &HashSet<String>,
     ) -> Vec<Diagnostic> {
@@ -1860,7 +1949,11 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_resource_ref_attributes(
         &self,
         doc: &Document,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            carina_core::parser::RetainedBackend,
+        >,
         binding_index: &BindingIndex<'_>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
@@ -1941,7 +2034,7 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_expansion_boundary(
         &self,
         doc: &Document,
-        parsed: &ParsedFile,
+        parsed: &ParsedFile<carina_core::parser::RetainedBackend>,
         boundary: ParserPlaceholderBoundary,
         scope: ExpansionBoundaryScope,
     ) -> Vec<Diagnostic> {
@@ -1970,7 +2063,11 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_depends_on(
         &self,
         doc: &Document,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            carina_core::parser::RetainedBackend,
+        >,
         argument_types: &carina_core::validation::ResolvedArgumentTypes,
     ) -> Vec<Diagnostic> {
         use carina_core::validation::depends_on::{
@@ -2010,7 +2107,11 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_wait_bindings(
         &self,
         doc: &Document,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            carina_core::parser::RetainedBackend,
+        >,
     ) -> Vec<Diagnostic> {
         carina_core::validation::wait::validate_wait_bindings(tree, &self.schemas)
             .into_iter()
@@ -2028,7 +2129,11 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_deferred_populate_refs(
         &self,
         doc: &Document,
-        tree: &carina_core::parser::AnalysisTree<'_>,
+        tree: &carina_core::parser::UnexpandedAnalysis<
+            '_,
+            carina_core::parser::ParsedExportParam,
+            carina_core::parser::RetainedBackend,
+        >,
     ) -> Vec<Diagnostic> {
         carina_core::validation::deferred_populate::validate_deferred_populate_refs(
             tree,
