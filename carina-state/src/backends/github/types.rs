@@ -2,26 +2,26 @@ use super::GitHubError;
 
 /// A blob identity is content-addressed; it is not a fencing generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlobSha(String);
+pub(crate) struct BlobSha(String);
 impl BlobSha {
-    pub fn parse(value: &str) -> Result<Self, GitHubError> {
+    pub(crate) fn parse(value: &str) -> Result<Self, GitHubError> {
         validate_sha(value)?;
         Ok(Self(value.to_ascii_lowercase()))
     }
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
 
 /// A commit identifies the snapshot used for paired metadata/raw reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommitSha(String);
+pub(crate) struct CommitSha(String);
 impl CommitSha {
-    pub fn parse(value: &str) -> Result<Self, GitHubError> {
+    pub(crate) fn parse(value: &str) -> Result<Self, GitHubError> {
         validate_sha(value)?;
         Ok(Self(value.to_ascii_lowercase()))
     }
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }

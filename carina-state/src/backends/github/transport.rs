@@ -40,8 +40,9 @@ impl ReqwestTransport {
             .into_bytes()
     }
     pub(super) fn new(token: String) -> Result<Self, GitHubError> {
+        let token = carina_core::github_auth::normalize_token(&token)?;
         let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| GitHubError::Credentials("invalid token header"))?;
+            .map_err(|_| carina_core::github_auth::GitHubTokenError::InvalidCharacters)?;
         authorization.set_sensitive(true);
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, authorization.clone());
@@ -105,12 +106,12 @@ impl GitHubTransport for ReqwestTransport {
         deadline: Instant,
     ) -> Result<GitHubResponse, GitHubError> {
         let method = request.method;
-        let limit = request.body_limit();
+        let limit = request.body_limit;
         let mut response = self
             .request(request, deadline)
             .send()
             .await
-            .map_err(transport_error)?;
+            .map_err(|error| transport_error(error, method))?;
         let status = response.status().as_u16();
         let mut headers = BTreeMap::new();
         for key in [
@@ -145,7 +146,11 @@ impl GitHubTransport for ReqwestTransport {
             limit.check(usize::try_from(size).unwrap_or(usize::MAX))?;
         }
         let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| transport_error(error, method))?
+        {
             append_chunk(&mut body, &chunk, limit)?;
         }
         body = self.response_body(method, status, body);
@@ -156,9 +161,14 @@ impl GitHubTransport for ReqwestTransport {
         })
     }
 }
-fn transport_error(error: reqwest::Error) -> GitHubError {
+fn transport_error(error: reqwest::Error, method: Method) -> GitHubError {
     if error.is_timeout() {
-        GitHubError::TransportDeadline { source: error }
+        match method {
+            Method::Get => GitHubError::TransportDeadline { source: error },
+            Method::Put | Method::Delete => {
+                GitHubError::MutationTransportDeadline { source: error }
+            }
+        }
     } else {
         GitHubError::Transport {
             kind: if error.is_connect() {
@@ -183,7 +193,7 @@ mod tests {
             .get("http://[invalid")
             .build()
             .unwrap_err();
-        let error = transport_error(source);
+        let error = transport_error(source, Method::Get);
         assert!(
             error
                 .source()
@@ -204,7 +214,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(source.is_timeout());
-        let error = transport_error(source);
+        let error = transport_error(source, Method::Get);
         assert!(
             error
                 .source()
@@ -262,22 +272,29 @@ mod tests {
 
     #[test]
     fn github_round3_compare_limit_applies_only_to_the_compare_endpoint() {
-        for (path, cap) in [
+        for (request, cap) in [
             (
-                "/repos/owner/repo/compare/sha...branch",
+                GitHubRequest::compare("/repos/owner/repo/compare/sha...branch".into()),
                 super::super::MAX_COMPARE_BYTES,
             ),
-            ("/repos/owner/repo/contents/compare/state.json", MAX_BYTES),
-            ("/repos/owner/repo/contents/state.json", MAX_BYTES),
+            (
+                GitHubRequest::get(
+                    "/repos/owner/repo/contents/compare/state.json".into(),
+                    None,
+                    super::super::JSON_MEDIA_TYPE,
+                ),
+                MAX_BYTES,
+            ),
+            (
+                GitHubRequest::get(
+                    "/repos/owner/repo/contents/state.json".into(),
+                    None,
+                    super::super::JSON_MEDIA_TYPE,
+                ),
+                MAX_BYTES,
+            ),
         ] {
-            let request = GitHubRequest {
-                method: Method::Get,
-                path: path.into(),
-                reference: None,
-                accept: super::super::JSON_MEDIA_TYPE,
-                body: None,
-            };
-            assert_eq!(request.body_limit().cap(), cap, "{path}");
+            assert_eq!(request.body_limit.cap(), cap, "{}", request.path);
         }
     }
 
@@ -292,6 +309,7 @@ mod tests {
                     reference: Some("states/prod".into()),
                     accept: super::super::RAW_MEDIA_TYPE,
                     body: None,
+                    body_limit: BodyLimit::Contents,
                 },
                 Instant::now() + std::time::Duration::from_secs(1),
             )
@@ -302,5 +320,57 @@ mod tests {
             "https://api.github.com/repos/owner/repo/contents/states/prod.json?ref=states%2Fprod"
         );
         assert_eq!(request.headers()["accept"], super::super::RAW_MEDIA_TYPE);
+    }
+
+    #[test]
+    fn github_round4_transport_normalizes_and_rejects_invalid_tokens() {
+        let transport = ReqwestTransport::new(" \tprivate-token\r\n".into()).unwrap();
+        assert_eq!(
+            transport.authorization.to_str().unwrap(),
+            "Bearer private-token"
+        );
+        for token in ["private\nsecret", "private\tsecret", "private\0secret"] {
+            let error = match ReqwestTransport::new(token.into()) {
+                Ok(_) => panic!("invalid token accepted"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("token contains invalid characters"),
+                "{error}"
+            );
+            assert!(!format!("{error:?} {error}").contains("private"));
+        }
+    }
+
+    #[tokio::test]
+    async fn github_round4_transport_deadline_wording_describes_the_dispatched_method() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        for method in [Method::Get, Method::Put, Method::Delete] {
+            let source = reqwest::Client::new()
+                .get(&url)
+                .timeout(std::time::Duration::from_millis(20))
+                .send()
+                .await
+                .unwrap_err();
+            assert!(source.is_timeout());
+            let error = transport_error(source, method);
+            let message = error.to_string();
+            assert_eq!(
+                message.contains("a dispatched mutation may have completed"),
+                method != Method::Get,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn github_round4_compare_cap_survives_path_changes() {
+        let mut request = GitHubRequest::compare("/repos/owner/repo/compare/sha...branch".into());
+        assert_eq!(request.body_limit.cap(), super::super::MAX_COMPARE_BYTES);
+        request.path = "/repos/owner/repo/contents/compare/state.json".into();
+        assert_eq!(request.body_limit.cap(), super::super::MAX_COMPARE_BYTES);
     }
 }

@@ -1,6 +1,6 @@
 //! Offline Contents store. Every mutation captures the branch head before
 //! yielding, then checks the head and GitHub's measured blob preconditions.
-use super::github::*;
+use super::*;
 use crate::{
     BackendConfig, BackendError, StateBackend, StateFile, StorageReadiness, lock::LockInfo,
 };
@@ -18,6 +18,9 @@ use tokio::time::Instant;
 struct Store {
     missing_repo: bool,
     missing_branch: bool,
+    contents_status: Option<u16>,
+    root_status: Option<u16>,
+    mutation_response: Option<GitHubResponse>,
     files: BTreeMap<String, Vec<u8>>,
     history: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
     parents: BTreeMap<String, Option<String>>,
@@ -106,7 +109,7 @@ async fn github_round3_state_timeout_is_resolved_by_one_metadata_read_on_the_nex
             let start = Instant::now();
             assert!(matches!(
                 backend.write_state(&state).await,
-                Err(BackendError::GitHub(GitHubError::Deadline))
+                Err(BackendError::GitHub(GitHubError::MutationDeadline))
             ));
             assert_eq!(start.elapsed(), Duration::from_secs(30));
             fake.0.lock().unwrap().requests.clear();
@@ -170,7 +173,7 @@ async fn github_round3_acquire_timeout_recovers_our_uuid_on_the_next_acquire() {
             let start = Instant::now();
             assert!(matches!(
                 backend.acquire_lock("apply").await,
-                Err(BackendError::GitHub(GitHubError::Deadline))
+                Err(BackendError::GitHub(GitHubError::MutationDeadline))
             ));
             assert_eq!(start.elapsed(), Duration::from_secs(30));
             let sent = fake.bytes("state.json.lock");
@@ -202,7 +205,7 @@ async fn github_round3_renew_timeout_recovers_on_the_next_acquire_or_renew() {
         transport.arm();
         assert!(matches!(
             backend.renew_lock(&lock).await,
-            Err(BackendError::GitHub(GitHubError::Deadline))
+            Err(BackendError::GitHub(GitHubError::MutationDeadline))
         ));
         let recovered = if acquire {
             backend.acquire_lock("apply").await.unwrap()
@@ -239,7 +242,7 @@ async fn github_round3_compare_timeout_does_not_strand_acquire_or_release() {
         };
         assert!(matches!(
             result,
-            Err(BackendError::GitHub(GitHubError::Deadline))
+            Err(BackendError::GitHub(GitHubError::MutationDeadline))
         ));
         fake.0.lock().unwrap().requests.clear();
         if let Some(lock) = &lock {
@@ -278,7 +281,8 @@ async fn github_round3_known_201_renewal_is_not_recovered_as_ours_after_compare_
     transport.arm();
     assert!(matches!(
         backend.renew_lock(&lock).await,
-        Err(BackendError::LockNotHeld(_)) | Err(BackendError::GitHub(GitHubError::Deadline))
+        Err(BackendError::LockNotHeld(_))
+            | Err(BackendError::GitHub(GitHubError::MutationDeadline))
     ));
     fake.0.lock().unwrap().requests.clear();
     assert!(matches!(
@@ -323,7 +327,7 @@ async fn github_round3_lost_reply_resurrection_keeps_the_existing_matching_bytes
         };
         assert!(matches!(
             result,
-            Err(BackendError::GitHub(GitHubError::Deadline))
+            Err(BackendError::GitHub(GitHubError::MutationDeadline))
         ));
         // Decision (b) is deliberately unchanged: a lost 201 is currently
         // recovered by exact bytes, even if the path was recreated.
@@ -352,7 +356,7 @@ async fn github_round3_lost_delete_reply_is_recovered_without_deleting_a_success
                 };
                 assert!(matches!(
                     result,
-                    Err(BackendError::GitHub(GitHubError::Deadline))
+                    Err(BackendError::GitHub(GitHubError::MutationDeadline))
                 ));
                 let replacement = LockInfo::new("successor");
                 if successor {
@@ -621,10 +625,10 @@ fn github_selection_constructs_no_s3_client_and_performs_no_http() {
         assert!(matches!(read.selected_config(), BackendConfig::GitHub(_)));
         let url =
             crate::StateUrl::parse("github://owner/repo/state.json?branch=states%2Fprod").unwrap();
-        super::create_explicit_backend(&url).await.unwrap();
+        super::super::create_explicit_backend(&url).await.unwrap();
     });
     assert_eq!(
-        super::s3::S3_CONSTRUCTIONS.load(std::sync::atomic::Ordering::Relaxed),
+        super::super::s3::S3_CONSTRUCTIONS.load(std::sync::atomic::Ordering::Relaxed),
         0
     );
 }
@@ -667,6 +671,11 @@ impl GitHubTransport for Fake {
         let (head, delay) = {
             let mut store = self.0.lock().unwrap();
             store.requests.push(request.clone());
+            if request.method != Method::Get
+                && let Some(response) = store.mutation_response.take()
+            {
+                return Ok(response);
+            }
             if request.method == Method::Get
                 && let Some((path, bytes)) = store.after_success_pending.take()
             {
@@ -742,6 +751,18 @@ impl GitHubTransport for Fake {
                 json!({"status":"diverged","ahead_by":1,"behind_by":1}),
             ));
         }
+        if request.path == "/repos/owner/repo/contents" {
+            assert_eq!(request.method, Method::Get);
+            assert!(
+                store
+                    .history
+                    .contains_key(request.reference.as_ref().unwrap())
+            );
+            return Ok(reply(
+                store.root_status.unwrap_or(200),
+                json!([{"type":"file", "name":"README.md"}]),
+            ));
+        }
         let path = request
             .path
             .strip_prefix("/repos/owner/repo/contents/")
@@ -751,6 +772,12 @@ impl GitHubTransport for Fake {
             .unwrap()
             .into_owned();
         if request.method == Method::Get {
+            if let Some(status) = store.contents_status {
+                return Ok(reply(
+                    status,
+                    json!({"message":"Resource not accessible by integration"}),
+                ));
+            }
             let reference = request
                 .reference
                 .as_deref()
@@ -914,7 +941,7 @@ async fn github_readiness_and_absence_distinguish_destination_failures() {
     fake.0.lock().unwrap().response = Some(reply(401, json!({"message":"Bad credentials"})));
     assert!(matches!(
         fake.backend().storage_readiness().await,
-        Err(BackendError::GitHub(GitHubError::Api { status: 401, .. }))
+        Err(BackendError::GitHub(GitHubError::Credentials(_)))
     ));
 }
 
@@ -1871,9 +1898,9 @@ async fn github_round2_cleanup_request_counts_cover_cold_and_cached_small_and_la
                 let fake = Fake::default();
                 let mut previous = StateFile::new();
                 previous.carina_version = "x".repeat(1_000_001);
-                fake.put("state.json", serde_json::to_vec(&previous).unwrap());
                 let backend = fake.backend();
                 if cached {
+                    fake.put("state.json", serde_json::to_vec(&previous).unwrap());
                     backend.read_state().await.unwrap();
                 }
                 let lock = if locked {
@@ -1894,7 +1921,9 @@ async fn github_round2_cleanup_request_counts_cover_cold_and_cached_small_and_la
                 } else {
                     backend.write_state_for_cleanup(&state).await.unwrap();
                 }
-                let expected = 2 + usize::from(locked) * 2 + usize::from(!cached) * 2;
+                // Cold saves only create absent state, including one root
+                // Contents read proving that the absence is visible to this token.
+                let expected = 2 + usize::from(locked) * 2 + usize::from(!cached) * 3;
                 let store = fake.0.lock().unwrap();
                 assert_eq!(
                     store.requests.len(),
@@ -2128,6 +2157,7 @@ async fn github_round2_fake_matches_deleted_sha_create_and_existing_missing_sha_
         path: "/repos/owner/repo/contents/state.json".into(),
         reference: None,
         accept: JSON_MEDIA_TYPE,
+        body_limit: BodyLimit::Contents,
         body: Some({
             let mut body = json!({"message":"carina: test","branch":"states/prod","content": STANDARD.encode(b"new")});
             if let Some(sha) = sha {
@@ -2372,6 +2402,452 @@ async fn github_round2_unstructured_errors_and_request_ids_redact_url_queries() 
                 assert!(!rendered.contains(secret), "{rendered}");
             }
             assert!(rendered.contains("https://example.com/state"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn github_round4_mismatched_ack_never_adopts_a_third_writers_state() {
+    for replacing in [false, true] {
+        let fake = Fake::default();
+        let backend = fake.backend();
+        if replacing {
+            fake.put("state.json", serde_json::to_vec(&StateFile::new()).unwrap());
+        }
+        backend.read_state().await.unwrap();
+        fake.0.lock().unwrap().wrong_blob_sha = true;
+        let mut state = StateFile::new();
+        state.serial = 1;
+        assert!(matches!(
+            backend.write_state(&state).await,
+            Err(BackendError::GitHub(GitHubError::UnexpectedOutcome { .. }))
+        ));
+        fake.0.lock().unwrap().wrong_blob_sha = false;
+        let mut third = StateFile::new();
+        third.serial = 3;
+        let third_bytes = serde_json::to_vec(&third).unwrap();
+        fake.put("state.json", third_bytes.clone());
+        fake.0.lock().unwrap().requests.clear();
+        for _ in 0..2 {
+            state.serial = 2;
+            assert!(matches!(
+                backend.write_state(&state).await,
+                Err(BackendError::StateWriteConflict { .. })
+            ));
+        }
+        assert_eq!(fake.bytes("state.json").unwrap(), third_bytes);
+        assert!(
+            fake.0
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .all(|r| r.method == Method::Get)
+        );
+    }
+}
+
+#[tokio::test]
+async fn github_round4_unread_state_cannot_be_adopted_by_a_write_or_raw_export() {
+    for raw_export in [false, true] {
+        let fake = Fake::default();
+        let backend = fake.backend();
+        let state = StateFile::new();
+        fake.put("state.json", serde_json::to_vec(&state).unwrap());
+        if raw_export {
+            backend.read_state_bytes().await.unwrap();
+        }
+        let mut third = StateFile::new();
+        third.serial = 3;
+        let third_bytes = serde_json::to_vec(&third).unwrap();
+        fake.put("state.json", third_bytes.clone());
+        fake.0.lock().unwrap().requests.clear();
+        assert!(matches!(
+            backend.write_state(&state).await,
+            Err(BackendError::StateWriteConflict { .. })
+        ));
+        assert_eq!(fake.bytes("state.json").unwrap(), third_bytes);
+        assert!(
+            fake.0
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .all(|r| r.method == Method::Get)
+        );
+        backend.read_state().await.unwrap();
+        backend.write_state(&state).await.unwrap();
+    }
+}
+
+fn assert_located_message(error: &BackendError, fragments: &[&str]) {
+    assert!(matches!(error, BackendError::GitHub(_)), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains("owner/repo@states/prod"), "{message}");
+    for fragment in fragments {
+        assert!(
+            message.contains(fragment),
+            "missing {fragment:?}: {message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn github_round4_repository_missing_or_inaccessible_has_actionable_location() {
+    let fake = Fake::default();
+    fake.0.lock().unwrap().missing_repo = true;
+    let StorageReadiness::Unavailable(unavailable) =
+        fake.backend().storage_readiness().await.unwrap()
+    else {
+        panic!("missing repository");
+    };
+    let error = unavailable.into_error();
+    assert!(matches!(
+        error,
+        BackendError::GitHub(GitHubError::RepositoryNotFoundOrInaccessible { .. })
+    ));
+    assert_located_message(
+        &error,
+        &[
+            "missing",
+            "token",
+            "access",
+            "Contents",
+            "fine-grained",
+            "repository selection",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn github_round4_branch_missing_has_actionable_location() {
+    let fake = Fake::default();
+    fake.0.lock().unwrap().missing_branch = true;
+    let error = fake.backend().read_state().await.unwrap_err();
+    assert!(matches!(
+        error,
+        BackendError::GitHub(GitHubError::BranchNotFound { .. })
+    ));
+    assert_located_message(&error, &["branch", "not found"]);
+}
+
+#[tokio::test]
+async fn github_round4_archived_or_disabled_repository_has_actionable_location() {
+    for flag in ["archived", "disabled"] {
+        let fake = Fake::default();
+        fake.0.lock().unwrap().response = Some(reply(200, json!({"id":1,flag:true})));
+        let StorageReadiness::Unavailable(unavailable) =
+            fake.backend().storage_readiness().await.unwrap()
+        else {
+            panic!("inactive repository");
+        };
+        let error = unavailable.into_error();
+        assert!(matches!(
+            error,
+            BackendError::GitHub(GitHubError::RepositoryArchivedOrDisabled { .. })
+        ));
+        assert_located_message(&error, &["archived", "disabled"]);
+    }
+}
+
+#[tokio::test]
+async fn github_round4_unauthorized_names_both_credential_sources() {
+    let fake = Fake::default();
+    fake.0.lock().unwrap().response = Some(reply(401, json!({"message":"Bad credentials"})));
+    let error = fake.backend().read_state().await.unwrap_err();
+    assert!(matches!(
+        error,
+        BackendError::GitHub(GitHubError::Credentials(_))
+    ));
+    let message = error.to_string();
+    assert!(
+        message.contains("GITHUB_TOKEN") && message.contains("gh auth login"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn github_round4_put_and_delete_access_errors_name_contents_write() {
+    for method in [Method::Put, Method::Delete] {
+        for status in [403, 404] {
+            let fake = Fake::default();
+            let backend = fake.backend();
+            backend.read_state().await.unwrap();
+            let lock = backend.acquire_lock("apply").await.unwrap();
+            let mut denied = reply(
+                status,
+                json!({"message":"Resource not accessible by integration"}),
+            );
+            denied
+                .headers
+                .insert("x-ratelimit-remaining".into(), "0".into());
+            fake.0.lock().unwrap().mutation_response = Some(denied);
+            let error = if method == Method::Put {
+                backend.write_state(&StateFile::new()).await.unwrap_err()
+            } else {
+                backend.release_lock(&lock).await.unwrap_err()
+            };
+            assert_located_message(&error, &["token", "Contents write"]);
+            assert!(matches!(
+                error,
+                BackendError::GitHub(GitHubError::ContentsWriteDenied { .. })
+            ));
+            assert_eq!(
+                fake.bytes("state.json.lock").unwrap(),
+                serde_json::to_vec(&lock).unwrap()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn github_round4_delete_404_is_typed_for_release_and_force_unlock() {
+    for force in [false, true] {
+        let fake = Fake::default();
+        let backend = fake.backend();
+        let lock = backend.acquire_lock("apply").await.unwrap();
+        fake.0.lock().unwrap().remove_before_mutation = true;
+        let result = if force {
+            backend.force_unlock(lock.id()).await
+        } else {
+            backend.release_lock(&lock).await
+        };
+        if force {
+            assert!(
+                matches!(result, Err(BackendError::LockNotFound(ref id)) if id == lock.id()),
+                "{result:?}"
+            );
+        } else {
+            result.unwrap();
+        }
+        assert!(fake.bytes("state.json.lock").is_none());
+    }
+}
+
+#[tokio::test]
+async fn github_round4_absent_lease_is_released_but_force_unlock_is_not_found() {
+    let fake = Fake::default();
+    let backend = fake.backend();
+    let lock = LockInfo::new("apply");
+    backend.release_lock(&lock).await.unwrap();
+    assert!(matches!(backend.force_unlock(lock.id()).await,
+        Err(BackendError::LockNotFound(ref id)) if id == lock.id()));
+    assert!(
+        fake.0
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|r| r.method == Method::Get)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round4_deadline_wording_only_warns_after_mutation_dispatch() {
+    let fake = Fake::default();
+    let transport = LostReply::new(fake.clone(), Method::Put, true);
+    let backend = GitHubBackend::with_transport(settings(), transport.clone());
+    backend.read_state().await.unwrap();
+    transport.arm();
+    let message = backend
+        .write_state(&StateFile::new())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("a dispatched mutation may have completed"),
+        "{message}"
+    );
+    fake.0.lock().unwrap().delay = Some(Duration::from_secs(60));
+    let message = backend.read_state().await.unwrap_err().to_string();
+    assert!(message.contains("deadline"), "{message}");
+    assert!(!message.contains("mutation"), "{message}");
+    let message = fake
+        .backend()
+        .write_state_for_cleanup(&StateFile::new())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        !message.contains("mutation"),
+        "no PUT dispatched: {message}"
+    );
+}
+
+#[test]
+fn github_round4_rate_limit_display_is_actionable_without_option_debug() {
+    for retry_after in [
+        None,
+        Some(Duration::from_secs(60)),
+        Some(Duration::from_millis(500)),
+    ] {
+        let message = GitHubError::RateLimited {
+            status: 403,
+            retry_after,
+            request_id: None,
+        }
+        .to_string();
+        assert!(message.contains("403"), "{message}");
+        assert!(
+            !message.contains("Some(") && !message.contains("None"),
+            "{message}"
+        );
+        if let Some(hint) = retry_after {
+            assert!(
+                message.contains(&hint.as_secs_f64().to_string()),
+                "{message}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn github_round4_absence_requires_readable_root_at_the_same_commit() {
+    for raw in [false, true] {
+        let fake = Fake::default();
+        let backend = fake.backend();
+        if raw {
+            assert!(backend.read_state_bytes().await.unwrap().is_none());
+        } else {
+            assert!(backend.read_state().await.unwrap().is_none());
+        }
+        let store = fake.0.lock().unwrap();
+        assert_eq!(
+            store.requests.len(),
+            3,
+            "branch, state metadata, root proof"
+        );
+        assert_eq!(store.requests[2].path, "/repos/owner/repo/contents");
+        assert_eq!(store.requests[1].reference, store.requests[2].reference);
+    }
+}
+
+#[tokio::test]
+async fn github_round4_hidden_contents_fail_closed_without_a_state_put() {
+    for contents_status in [403, 404] {
+        for root_status in [301, 403, 404, 500] {
+            for writing in [false, true] {
+                let fake = Fake::default();
+                let backend = fake.backend();
+                {
+                    let mut store = fake.0.lock().unwrap();
+                    store.contents_status = Some(contents_status);
+                    store.root_status = Some(root_status);
+                }
+                let error = if writing {
+                    backend.write_state(&StateFile::new()).await.unwrap_err()
+                } else {
+                    backend.read_state().await.unwrap_err()
+                };
+                assert_located_message(&error, &["token", "Contents read"]);
+                assert!(matches!(
+                    error,
+                    BackendError::GitHub(GitHubError::ContentsReadDenied { .. })
+                ));
+                let store = fake.0.lock().unwrap();
+                assert!(store.requests.iter().all(|r| r.method == Method::Get));
+                assert_eq!(
+                    store
+                        .requests
+                        .iter()
+                        .filter(|r| r.path == "/repos/owner/repo/contents")
+                        .count(),
+                    usize::from(contents_status == 404)
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn github_round4_existing_state_needs_no_root_probe() {
+    let fake = Fake::default();
+    fake.put("state.json", serde_json::to_vec(&StateFile::new()).unwrap());
+    fake.backend()
+        .read_state()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_state();
+    assert_eq!(fake.0.lock().unwrap().requests.len(), 2);
+}
+
+#[tokio::test]
+async fn github_round4_delete_404_without_readable_absence_reports_contents_write() {
+    struct HiddenAfterDelete {
+        fake: Fake,
+        status: u16,
+    }
+    #[async_trait]
+    impl GitHubTransport for HiddenAfterDelete {
+        async fn execute(
+            &self,
+            request: GitHubRequest,
+            deadline: Instant,
+        ) -> Result<GitHubResponse, GitHubError> {
+            if request.method == Method::Delete {
+                let mut store = self.fake.0.lock().unwrap();
+                store.requests.push(request);
+                store.contents_status = Some(self.status);
+                store.root_status = Some(403);
+                return Ok(reply(404, json!({"message":"Not Found"})));
+            }
+            self.fake.execute(request, deadline).await
+        }
+    }
+    for status in [403, 404] {
+        let fake = Fake::default();
+        let backend = GitHubBackend::with_transport(
+            settings(),
+            Arc::new(HiddenAfterDelete {
+                fake: fake.clone(),
+                status,
+            }),
+        );
+        let lock = backend.acquire_lock("apply").await.unwrap();
+        let error = backend.release_lock(&lock).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                BackendError::GitHub(GitHubError::ContentsWriteDenied { .. })
+            ),
+            "{error}"
+        );
+        assert_located_message(&error, &["token", "Contents write"]);
+        assert!(fake.bytes("state.json.lock").is_some());
+    }
+}
+
+#[tokio::test]
+async fn github_round4_mutation_rate_limits_keep_the_round2_classification() {
+    for delete in [false, true] {
+        for (status, message, header) in [
+            (
+                403,
+                "API rate limit exceeded",
+                Some(("x-ratelimit-remaining", "0")),
+            ),
+            (403, "secondary rate limit", None),
+            (403, "slow down", Some(("retry-after", "120"))),
+            (429, "slow down", None),
+        ] {
+            let fake = Fake::default();
+            let backend = fake.backend();
+            backend.read_state().await.unwrap();
+            let lock = backend.acquire_lock("apply").await.unwrap();
+            let mut response = reply(status, json!({"message": message}));
+            if let Some((key, value)) = header {
+                response.headers.insert(key.into(), value.into());
+            }
+            fake.0.lock().unwrap().mutation_response = Some(response);
+            let error = if delete {
+                backend.release_lock(&lock).await.unwrap_err()
+            } else {
+                backend.write_state(&StateFile::new()).await.unwrap_err()
+            };
+            assert!(
+                matches!(error, BackendError::GitHub(GitHubError::RateLimited { status: found, .. }) if found == status)
+            );
         }
     }
 }

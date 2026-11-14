@@ -185,6 +185,17 @@ state repository. Read-only consumers of `upstream_state`, exports, or state
 commands need only **Contents read**. The token is kept outside backend
 configuration, backend locks, and saved plans.
 
+Carina trims surrounding ASCII whitespace from either credential source.
+A whitespace-only `GITHUB_TOKEN` falls back to `gh`; control characters left
+inside a token cause a credential error without displaying the token.
+For fine-grained tokens, include the state repository in the repository selection.
+
+State reads fail closed when Contents access is uncertain. If the state path
+returns 404, Carina makes one additional root Contents request at the same
+commit. Only HTTP 200 proves Contents is readable and allows the state to be
+treated as absent. Branch visibility alone is insufficient; denied root
+access produces a Contents read permission error.
+
 For read-only access without a configuration directory, use:
 
 ```sh
@@ -247,14 +258,22 @@ can also fail or race with another client, and does not undo a successor's
 work during that window.
 
 If a mutation times out, Carina returns the deadline error and remembers the
-uncertain write in memory. The next mutation in the same process resolves it
-with one Contents metadata read: a blob SHA matching the exact sent bytes is
-currently treated as our write, the prior SHA means it did not commit, and a
-different SHA is a conflict. An acquisition or renewal recovered this way
-recognizes its own lock UUID. Other lost replies can also be recovered within
-the original deadline. For a release or force-unlock with a lost reply, an
-absent lease or a different lock UUID confirms release and preserves any
-successor's lease.
+uncertain write in memory. A mismatched blob acknowledgement also retains this
+uncertainty. The next mutation in the same process resolves it with a Contents
+metadata read (plus the root access check if state is absent): a blob SHA
+matching the exact sent bytes is currently treated as our write, the prior SHA
+means it did not commit, and a different SHA is a conflict. An acquisition or
+renewal recovered this way recognizes its own lock UUID. Other lost replies
+can also be recovered within the original deadline. For a release or
+force-unlock with a lost reply, an absent lease or a different lock UUID
+confirms release and preserves any successor's lease.
+
+An existing state must be loaded by the backend before it can be replaced.
+A fresh backend may create an absent state; discovering an existing blob SHA
+during a save or raw export does not authorize replacing its contents.
+Releasing an already absent lease succeeds. A force-unlock that confirms the
+lease is absent returns `LockNotFound`; recovery of an earlier lost DELETE
+reply still follows the release rule above.
 
 A lost mutation response also loses its 201/200 status and commit parent.
 Matching bytes cannot establish whether that PUT recreated a deleted path.

@@ -8,7 +8,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -25,16 +25,20 @@ use crate::{
 mod transport;
 mod types;
 use transport::ReqwestTransport;
-pub use types::{BlobSha, CommitSha};
+pub(crate) use types::{BlobSha, CommitSha};
 
-pub const MAX_BYTES: usize = 10_000_000;
+#[cfg(test)]
+#[path = "github_tests.rs"]
+mod tests;
+
+pub(crate) const MAX_BYTES: usize = 10_000_000;
 /// Reviewer measurement on real GitHub (2026-11-15, #4436): comparing six
 /// commits adding 0.9–20 MB files returned 32,493 bytes, with large patches
 /// omitted. Small text diffs do include patches. Allow >32x headroom while
 /// bounding that unrelated payload independently of the decoded state cap.
-pub const MAX_COMPARE_BYTES: usize = 1024 * 1024;
-pub const RAW_MEDIA_TYPE: &str = "application/vnd.github.raw+json";
-pub const JSON_MEDIA_TYPE: &str = "application/vnd.github+json";
+pub(crate) const MAX_COMPARE_BYTES: usize = 1024 * 1024;
+pub(crate) const RAW_MEDIA_TYPE: &str = "application/vnd.github.raw+json";
+pub(crate) const JSON_MEDIA_TYPE: &str = "application/vnd.github+json";
 
 /// Terminal protocol failures. Only sanitized API error excerpts enter
 /// diagnostics; state/lease content and credentials are never included.
@@ -63,8 +67,13 @@ pub enum GitHubError {
         #[source]
         source: reqwest::Error,
     },
-    #[error("GitHub operation deadline exceeded; a dispatched mutation may have completed")]
+    #[error("GitHub operation deadline exceeded")]
     TransportDeadline {
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("GitHub operation deadline exceeded; a dispatched mutation may have completed")]
+    MutationTransportDeadline {
         #[source]
         source: reqwest::Error,
     },
@@ -75,9 +84,23 @@ pub enum GitHubError {
         request_id: Option<String>,
     },
     #[error(
-        "GitHub repository or branch is missing or unusable; create it before using this backend"
+        "GitHub repository {target} may be missing or the token may lack access; check Contents permission and fine-grained token repository selection"
     )]
-    Unavailable,
+    RepositoryNotFoundOrInaccessible { target: String },
+    #[error("GitHub branch not found at {target}; create the branch before using this backend")]
+    BranchNotFound { target: String },
+    #[error(
+        "GitHub repository {target} is archived or disabled; enable writes before using this backend"
+    )]
+    RepositoryArchivedOrDisabled { target: String },
+    #[error(
+        "GitHub token needs Contents read on repository {target}; check Contents permission and fine-grained token repository selection"
+    )]
+    ContentsReadDenied { target: String },
+    #[error(
+        "GitHub token needs Contents write on repository {target}; check Contents permission and fine-grained token repository selection"
+    )]
+    ContentsWriteDenied { target: String },
     #[error("Malformed GitHub response")]
     MalformedResponse,
     #[error("GitHub state path refers to a non-file object")]
@@ -92,7 +115,7 @@ pub enum GitHubError {
         "State write conflict: the state file had been deleted concurrently; the PUT recreated it and the created file has been kept"
     )]
     StateDeletedConcurrently,
-    #[error("GitHub rate limit (HTTP {status}); retry hint: {retry_after:?}")]
+    #[error("GitHub rate limit (HTTP {status}); {hint}", hint = retry_description(*.retry_after))]
     RateLimited {
         status: u16,
         retry_after: Option<Duration>,
@@ -104,8 +127,10 @@ pub enum GitHubError {
         "GitHub write was committed but could not be verified: compare response size {size} bytes exceeds its {cap}-byte cap"
     )]
     CompareTooLarge { size: usize, cap: usize },
-    #[error("GitHub operation deadline exceeded; a dispatched mutation may have completed")]
+    #[error("GitHub operation deadline exceeded")]
     Deadline,
+    #[error("GitHub operation deadline exceeded; a dispatched mutation may have completed")]
+    MutationDeadline,
 }
 
 impl From<carina_core::github_auth::GitHubTokenError> for GitHubError {
@@ -113,13 +138,15 @@ impl From<carina_core::github_auth::GitHubTokenError> for GitHubError {
         use carina_core::github_auth::GitHubTokenError;
         match source {
             GitHubTokenError::Deadline => Self::CredentialsDeadline { source },
-            GitHubTokenError::Unavailable => Self::CredentialsUnavailable { source },
+            GitHubTokenError::Unavailable | GitHubTokenError::InvalidCharacters => {
+                Self::CredentialsUnavailable { source }
+            }
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Method {
+pub(crate) enum Method {
     Get,
     Put,
     Delete,
@@ -128,21 +155,36 @@ pub enum Method {
 /// HTTP boundary only. Domain addresses remain validated types until this
 /// request is serialized. Deliberately has no Debug implementation.
 #[derive(Clone)]
-pub struct GitHubRequest {
-    pub method: Method,
-    pub path: String,
-    pub reference: Option<String>,
-    pub accept: &'static str,
-    pub body: Option<Value>,
+pub(crate) struct GitHubRequest {
+    method: Method,
+    path: String,
+    reference: Option<String>,
+    accept: &'static str,
+    body: Option<Value>,
+    body_limit: BodyLimit,
 }
 impl GitHubRequest {
-    fn body_limit(&self) -> BodyLimit {
-        // Routes are /repos/{owner}/{repo}/{endpoint}/... . A Contents path
-        // may itself contain a directory named "compare".
-        if self.method == Method::Get && self.path.split('/').nth(4) == Some("compare") {
-            BodyLimit::Compare
-        } else {
-            BodyLimit::Contents
+    fn get(path: String, reference: Option<&CommitSha>, accept: &'static str) -> Self {
+        Self {
+            method: Method::Get,
+            path,
+            reference: reference.map(|sha| sha.as_str().into()),
+            accept,
+            body: None,
+            body_limit: BodyLimit::Contents,
+        }
+    }
+    fn compare(path: String) -> Self {
+        Self {
+            body_limit: BodyLimit::Compare,
+            ..Self::get(path, None, JSON_MEDIA_TYPE)
+        }
+    }
+    fn mutation(method: Method, path: String, body: Value) -> Self {
+        Self {
+            method,
+            body: Some(body),
+            ..Self::get(path, None, JSON_MEDIA_TYPE)
         }
     }
 }
@@ -176,17 +218,17 @@ impl BodyLimit {
     }
 }
 
-pub struct GitHubResponse {
-    pub status: u16,
-    pub headers: BTreeMap<String, String>,
-    pub body: Vec<u8>,
+pub(crate) struct GitHubResponse {
+    pub(crate) status: u16,
+    pub(crate) headers: BTreeMap<String, String>,
+    pub(crate) body: Vec<u8>,
 }
 
 /// Injectable, bounded transport. Implementations must cap streamed response
 /// bodies at the request's Contents or compare limit, sanitize reflected credentials in error responses,
 /// and respect the caller's absolute deadline.
 #[async_trait]
-pub trait GitHubTransport: Send + Sync {
+pub(crate) trait GitHubTransport: Send + Sync {
     async fn execute(
         &self,
         request: GitHubRequest,
@@ -198,9 +240,8 @@ pub struct GitHubBackend {
     settings: GitHubBackendSettings,
     transport: Arc<dyn GitHubTransport>,
     mutations: tokio::sync::Mutex<()>,
-    // None = unknown. Raw export reads
-    // deliberately never update this writer's precondition.
-    expected_state: Mutex<Option<Expected>>,
+    // Raw export reads deliberately never update this writer's precondition.
+    expected_state: Mutex<Expected>,
     pending_lease: Mutex<Option<PendingLease>>,
     migration_logged: OnceLock<crate::MigrationInfo>,
 }
@@ -219,6 +260,7 @@ struct Operation {
     deadline: Instant,
     cleanup: bool,
     rate_retries: AtomicUsize,
+    mutation_dispatched: AtomicBool,
 }
 impl Operation {
     fn new(cleanup: bool) -> Self {
@@ -231,6 +273,14 @@ impl Operation {
                 },
             cleanup,
             rate_retries: AtomicUsize::new(0),
+            mutation_dispatched: AtomicBool::new(false),
+        }
+    }
+    fn deadline_error(&self) -> GitHubError {
+        if self.mutation_dispatched.load(Ordering::Relaxed) {
+            GitHubError::MutationDeadline
+        } else {
+            GitHubError::Deadline
         }
     }
 }
@@ -271,6 +321,9 @@ struct ObservedFile {
 }
 #[derive(Clone)]
 enum Expected {
+    // No state was loaded by this backend. Only an absent path can be written
+    // without first calling read_state; observing a SHA is not consent to replace it.
+    Unread,
     Known(Option<BlobSha>),
     Ambiguous(AmbiguousWrite),
 }
@@ -309,6 +362,24 @@ fn matching_write_is_ours(current: Option<&BlobSha>, sent: &BlobSha) -> bool {
     current == Some(sent)
 }
 
+fn lease_released(id: &str, current: Option<&LockInfo>) -> bool {
+    current.is_none_or(|lock| lock.id() != id)
+}
+
+#[derive(Clone, Copy)]
+enum ReleaseKind {
+    Release,
+    ForceUnlock,
+}
+impl ReleaseKind {
+    fn absent(self, id: &str) -> BackendResult<()> {
+        match self {
+            Self::Release => Ok(()),
+            Self::ForceUnlock => Err(BackendError::LockNotFound(id.into())),
+        }
+    }
+}
+
 enum Mutation<'a> {
     CreateState {
         bytes: &'a [u8],
@@ -334,6 +405,7 @@ enum Mutation<'a> {
     DeleteLease {
         id: &'a str,
         sha: &'a BlobSha,
+        kind: ReleaseKind,
     },
 }
 impl Mutation<'_> {
@@ -411,10 +483,10 @@ impl Mutation<'_> {
             | Self::RenewLease { .. } => {
                 Ok(matching_write_is_ours(current.map(|file| &file.sha), sent))
             }
-            Self::DeleteLease { id, .. } => Ok(match current {
-                None => true,
-                Some(file) => decode_lease(&file.bytes)?.id() != *id,
-            }),
+            Self::DeleteLease { id, .. } => {
+                let current = current.map(|file| decode_lease(&file.bytes)).transpose()?;
+                Ok(lease_released(id, current.as_ref()))
+            }
         }
     }
 }
@@ -433,7 +505,7 @@ impl GitHubBackend {
             settings,
             transport,
             mutations: tokio::sync::Mutex::new(()),
-            expected_state: Mutex::new(None),
+            expected_state: Mutex::new(Expected::Unread),
             pending_lease: Mutex::new(None),
             migration_logged: OnceLock::new(),
         }
@@ -451,6 +523,19 @@ impl GitHubBackend {
 
     fn repository_route(&self) -> String {
         format!("/repos/{}", self.settings.repository().as_str())
+    }
+    fn target(&self) -> String {
+        format!(
+            "{}@{}",
+            self.settings.repository().as_str(),
+            self.settings.branch().as_str()
+        )
+    }
+    fn contents_read_error(&self) -> BackendError {
+        GitHubError::ContentsReadDenied {
+            target: self.target(),
+        }
+        .into()
     }
     fn contents_route(&self, path: ContentsPath<'_>) -> String {
         format!(
@@ -476,16 +561,33 @@ impl GitHubBackend {
         request: GitHubRequest,
         operation: &Operation,
     ) -> BackendResult<GitHubResponse> {
-        let limit = request.body_limit();
+        let limit = request.body_limit;
         loop {
-            let response = bounded(operation.deadline, async {
+            let response = bounded(operation, async {
+                if request.method != Method::Get {
+                    operation.mutation_dispatched.store(true, Ordering::Relaxed);
+                }
                 self.transport
                     .execute(request.clone(), operation.deadline)
                     .await
+                    .map_err(|error| match error {
+                        GitHubError::TransportDeadline { source }
+                            if operation.mutation_dispatched.load(Ordering::Relaxed) =>
+                        {
+                            GitHubError::MutationTransportDeadline { source }
+                        }
+                        _ => error,
+                    })
                     .map_err(BackendError::from)
             })
             .await?;
             limit.check(response.body.len())?;
+            if response.status == 401 {
+                return Err(GitHubError::Credentials(
+                    "HTTP 401; set GITHUB_TOKEN or run `gh auth login --hostname github.com`",
+                )
+                .into());
+            }
             if matches!(response.status, 403 | 429) {
                 let primary = response
                     .headers
@@ -543,6 +645,16 @@ impl GitHubBackend {
         }
         .into()
     }
+    fn mutation_error(&self, response: &GitHubResponse) -> BackendError {
+        if matches!(response.status, 403 | 404) {
+            GitHubError::ContentsWriteDenied {
+                target: self.target(),
+            }
+            .into()
+        } else {
+            Self::api_error(response)
+        }
+    }
     async fn get(
         &self,
         path: String,
@@ -550,24 +662,18 @@ impl GitHubBackend {
         accept: &'static str,
         operation: &Operation,
     ) -> BackendResult<GitHubResponse> {
-        self.request(
-            GitHubRequest {
-                method: Method::Get,
-                path,
-                reference: reference.map(|sha| sha.as_str().into()),
-                accept,
-                body: None,
-            },
-            operation,
-        )
-        .await
+        self.request(GitHubRequest::get(path, reference, accept), operation)
+            .await
     }
     async fn destination(&self, operation: &Operation) -> BackendResult<CommitSha> {
         let response = self
             .get(self.repository_route(), None, JSON_MEDIA_TYPE, operation)
             .await?;
         if response.status == 404 {
-            return Err(GitHubError::Unavailable.into());
+            return Err(GitHubError::RepositoryNotFoundOrInaccessible {
+                target: self.target(),
+            }
+            .into());
         }
         if response.status != 200 {
             return Err(Self::api_error(&response));
@@ -585,7 +691,10 @@ impl GitHubBackend {
             }
         }
         if unavailable {
-            return Err(GitHubError::Unavailable.into());
+            return Err(GitHubError::RepositoryArchivedOrDisabled {
+                target: self.target(),
+            }
+            .into());
         }
         self.branch_snapshot(operation).await
     }
@@ -606,7 +715,10 @@ impl GitHubBackend {
             )
             .await?;
         if response.status == 404 {
-            return Err(GitHubError::Unavailable.into());
+            return Err(GitHubError::BranchNotFound {
+                target: self.target(),
+            }
+            .into());
         }
         if response.status != 200 {
             return Err(Self::api_error(&response));
@@ -619,10 +731,31 @@ impl GitHubBackend {
         path: ContentsPath<'_>,
         operation: &Operation,
     ) -> BackendResult<Option<ObservedFile>> {
-        // Access to the exact branch confirms the destination before a missing
-        // path can mean absence. Metadata and bytes share one immutable ref.
+        // Metadata, raw bytes and the fail-closed Contents access probe share
+        // one immutable ref; branch visibility alone does not prove Contents access.
         let commit = self.branch_snapshot(operation).await?;
         self.observe_at(path, &commit, operation).await
+    }
+    async fn verify_contents_readable(
+        &self,
+        commit: &CommitSha,
+        operation: &Operation,
+    ) -> BackendResult<()> {
+        // Fail closed: Contents 404 can hide a missing Contents read grant.
+        // An existing branch has a non-empty root; a 200 at this exact commit
+        // is positive evidence of read access before treating state as absent.
+        let root = self
+            .get(
+                format!("{}/contents", self.repository_route()),
+                Some(commit),
+                JSON_MEDIA_TYPE,
+                operation,
+            )
+            .await?;
+        if root.status != 200 {
+            return Err(self.contents_read_error());
+        }
+        Ok(())
     }
     async fn metadata_at(
         &self,
@@ -639,7 +772,13 @@ impl GitHubBackend {
             )
             .await?;
         if response.status == 404 {
+            if matches!(path, ContentsPath::State(_)) {
+                self.verify_contents_readable(commit, operation).await?;
+            }
             return Ok(None);
+        }
+        if response.status == 403 {
+            return Err(self.contents_read_error());
         }
         if response.status != 200 {
             return Err(Self::api_error(&response));
@@ -690,6 +829,9 @@ impl GitHubBackend {
                 )
                 .await?;
             if response.status != 200 {
+                if matches!(response.status, 403 | 404) {
+                    return Err(self.contents_read_error());
+                }
                 return Err(Self::api_error(&response));
             }
             response.body
@@ -707,6 +849,19 @@ impl GitHubBackend {
             .await?
             .map(|file| Ok((decode_lease(&file.bytes)?, file.sha)))
             .transpose()
+    }
+    async fn confirm_lease_absence(&self, operation: &Operation) -> BackendResult<bool> {
+        let commit = self.branch_snapshot(operation).await?;
+        let path = self.settings.path().lock_path();
+        if self
+            .metadata_at((&path).into(), &commit, operation)
+            .await?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        self.verify_contents_readable(&commit, operation).await?;
+        Ok(true)
     }
     async fn verify_owner(&self, lock: &LockInfo, operation: &Operation) -> BackendResult<()> {
         if self.lease_is_revoked(lock.id()) {
@@ -728,7 +883,7 @@ impl GitHubBackend {
         match mutation {
             Mutation::CreateState { .. } | Mutation::ReplaceState { .. } => {
                 *self.expected_state.lock().expect("state revision mutex") =
-                    Some(Expected::Known(sha.clone()));
+                    Expected::Known(sha.clone());
             }
             Mutation::CreateLease { .. }
             | Mutation::TakeOverLease { .. }
@@ -747,7 +902,7 @@ impl GitHubBackend {
         match mutation {
             Mutation::CreateState { .. } | Mutation::ReplaceState { .. } => {
                 *self.expected_state.lock().expect("state revision mutex") =
-                    Some(Expected::Ambiguous(write));
+                    Expected::Ambiguous(write);
             }
             Mutation::CreateLease { lock } | Mutation::TakeOverLease { lock, .. } => {
                 *self.pending_lease.lock().expect("lease revision mutex") =
@@ -783,19 +938,6 @@ impl GitHubBackend {
     fn reject_mutation(&self, mutation: &Mutation<'_>) {
         self.remember_mutation(mutation, mutation.expected().cloned());
         self.finish_mutation(mutation);
-    }
-    fn forget_mutation(&self, mutation: &Mutation<'_>) {
-        match mutation {
-            Mutation::CreateState { .. } | Mutation::ReplaceState { .. } => {
-                *self.expected_state.lock().expect("state revision mutex") = None;
-            }
-            Mutation::CreateLease { .. }
-            | Mutation::TakeOverLease { .. }
-            | Mutation::RenewLease { .. }
-            | Mutation::DeleteLease { .. } => {
-                *self.pending_lease.lock().expect("lease revision mutex") = None;
-            }
-        }
     }
     fn resolve_pending_lease(&self, current: Option<&BlobSha>) -> Option<(Resolution, String)> {
         let mut pending = self.pending_lease.lock().expect("lease revision mutex");
@@ -843,15 +985,13 @@ impl GitHubBackend {
         // compare/{sha}...exp%2Fslash-branch and ...exp/slash-branch returned
         // "ahead". Component encoding is valid for compare's head branch too.
         let response = self
-            .get(
-                format!(
+            .request(
+                GitHubRequest::compare(format!(
                     "{}/compare/{}...{}",
                     self.repository_route(),
                     commit.as_str(),
                     encode_component(self.settings.branch().as_str())
-                ),
-                None,
-                JSON_MEDIA_TYPE,
+                )),
                 operation,
             )
             .await?;
@@ -922,13 +1062,7 @@ impl GitHubBackend {
         if let Some(bytes) = bytes.as_deref() {
             body["content"] = json!(STANDARD.encode(bytes));
         }
-        let request = GitHubRequest {
-            method,
-            path: self.contents_route(path),
-            reference: None,
-            accept: JSON_MEDIA_TYPE,
-            body: Some(body),
-        };
+        let request = GitHubRequest::mutation(method, self.contents_route(path), body);
         for attempt in 1..=MAX_ATTEMPTS {
             if let Some(lock) = mutation.lease_to_verify() {
                 self.verify_owner(lock, operation).await?;
@@ -939,7 +1073,10 @@ impl GitHubBackend {
                 Ok(response) => response,
                 Err(
                     error @ BackendError::GitHub(
-                        GitHubError::TransportDeadline { .. } | GitHubError::Deadline,
+                        GitHubError::TransportDeadline { .. }
+                        | GitHubError::MutationTransportDeadline { .. }
+                        | GitHubError::Deadline
+                        | GitHubError::MutationDeadline,
                     ),
                 ) => {
                     // There is no time left to observe. The next mutation uses
@@ -1024,14 +1161,31 @@ impl GitHubBackend {
                 let jitter = (uuid::Uuid::new_v4().as_u128() % 25) as u64;
                 let delay = Duration::from_millis(10 * attempt as u64 + jitter);
                 if delay >= operation.deadline.saturating_duration_since(Instant::now()) {
-                    return Err(GitHubError::Deadline.into());
+                    return Err(operation.deadline_error().into());
                 }
                 tokio::time::sleep(delay).await;
                 continue;
             }
+            if response.status == 404
+                && let Mutation::DeleteLease { id, kind, .. } = &mutation
+            {
+                // DELETE 404 can also mean denied access. Confirm absence at
+                // an immutable, readable snapshot before typing it as released.
+                let absent = match self.confirm_lease_absence(operation).await {
+                    // Without positive evidence of absence, retain the
+                    // original DELETE access diagnostic (Contents write).
+                    Err(BackendError::GitHub(GitHubError::ContentsReadDenied { .. })) => false,
+                    result => result?,
+                };
+                if absent {
+                    self.finish_mutation(&mutation);
+                    kind.absent(id)?;
+                    return Ok(None);
+                }
+            }
             if !matches!(response.status, 200 | 201) {
                 self.reject_mutation(&mutation);
-                return Err(Self::api_error(&response));
+                return Err(self.mutation_error(&response));
             }
             let malformed = || GitHubError::UnexpectedOutcome {
                 reason: "successful mutation returned malformed metadata",
@@ -1048,8 +1202,10 @@ impl GitHubBackend {
                     )
                     .map_err(|_| malformed())?;
                     if sha != sent {
-                        // Never cache an acknowledgement for unrelated bytes.
-                        self.forget_mutation(&mutation);
+                        // Keep the state intent recorded before dispatch: the
+                        // next save must resolve prior/sent or report a conflict.
+                        // Never adopt an acknowledgement for unrelated bytes.
+                        self.finish_mutation(&mutation);
                         return Err(GitHubError::UnexpectedOutcome {
                             reason: "acknowledged blob SHA differs from the requested bytes",
                         }
@@ -1108,9 +1264,14 @@ impl GitHubBackend {
                     Mutation::RenewLease { id, .. } => {
                         // A known 201 must roll back only our returned SHA,
                         // even when compare failed. DELETE cannot recur here.
-                        if Box::pin(
-                            self.conditional(Mutation::DeleteLease { id, sha: &sent }, operation),
-                        )
+                        if Box::pin(self.conditional(
+                            Mutation::DeleteLease {
+                                id,
+                                sha: &sent,
+                                kind: ReleaseKind::Release,
+                            },
+                            operation,
+                        ))
                         .await
                         .is_err()
                         {
@@ -1158,8 +1319,8 @@ impl GitHubBackend {
             .expect("state revision mutex")
             .clone();
         let expected = match cached {
-            Some(Expected::Known(sha)) => sha,
-            unknown @ (None | Some(Expected::Ambiguous(_))) => {
+            Expected::Known(sha) => sha,
+            unresolved @ (Expected::Unread | Expected::Ambiguous(_)) => {
                 let commit = self.branch_snapshot(operation).await?;
                 // Only the precondition is needed; never download a large
                 // state's raw bytes just to learn its SHA during cleanup.
@@ -1167,13 +1328,18 @@ impl GitHubBackend {
                     .metadata_at(self.settings.path().into(), &commit, operation)
                     .await?
                     .map(|file| file.sha);
-                if let Some(Expected::Ambiguous(write)) = unknown
-                    && matches!(write.resolve(sha.as_ref()), Resolution::Conflict)
-                {
+                let conflict = match unresolved {
+                    Expected::Unread => sha.is_some(),
+                    Expected::Ambiguous(write) => {
+                        matches!(write.resolve(sha.as_ref()), Resolution::Conflict)
+                    }
+                    Expected::Known(_) => unreachable!("known preconditions need no observation"),
+                };
+                if conflict {
                     return Err(BackendError::StateWriteConflict { attempts: 1 });
                 }
                 *self.expected_state.lock().expect("state revision mutex") =
-                    Some(Expected::Known(sha.clone()));
+                    Expected::Known(sha.clone());
                 sha
             }
         };
@@ -1214,26 +1380,40 @@ impl GitHubBackend {
         .await?;
         Ok(renewed)
     }
-    async fn release(&self, id: &str, operation: &Operation) -> BackendResult<()> {
+    async fn release(
+        &self,
+        id: &str,
+        kind: ReleaseKind,
+        operation: &Operation,
+    ) -> BackendResult<()> {
         let observed = self.lease(operation).await?;
         {
             let mut pending = self.pending_lease.lock().expect("lease revision mutex");
             if matches!(pending.as_ref(), Some(PendingLease::Delete { id: pending_id }) if pending_id == id)
-                && observed.as_ref().is_none_or(|(lock, _)| lock.id() != id)
+                && lease_released(id, observed.as_ref().map(|(lock, _)| lock))
             {
                 *pending = None;
                 return Ok(());
             }
         }
-        let (current, sha) = observed.ok_or_else(|| BackendError::LockNotFound(id.into()))?;
+        let Some((current, sha)) = observed else {
+            return kind.absent(id);
+        };
         if current.id() != id {
             return Err(BackendError::LockMismatch {
                 expected: id.into(),
                 actual: current.id().into(),
             });
         }
-        self.conditional(Mutation::DeleteLease { id, sha: &sha }, operation)
-            .await?;
+        self.conditional(
+            Mutation::DeleteLease {
+                id,
+                sha: &sha,
+                kind,
+            },
+            operation,
+        )
+        .await?;
         Ok(())
     }
     async fn write_with_budget(
@@ -1243,7 +1423,7 @@ impl GitHubBackend {
         cleanup: bool,
     ) -> BackendResult<()> {
         let operation = Operation::new(cleanup);
-        bounded(operation.deadline, async {
+        bounded(&operation, async {
             let bytes = Self::state_bytes(state)?;
             let _gate = self.mutations.lock().await;
             // A renewal adds a mutation and compare without fencing state
@@ -1254,11 +1434,16 @@ impl GitHubBackend {
         })
         .await
     }
-    async fn release_with_budget(&self, id: &str, cleanup: bool) -> BackendResult<()> {
+    async fn release_with_budget(
+        &self,
+        id: &str,
+        kind: ReleaseKind,
+        cleanup: bool,
+    ) -> BackendResult<()> {
         let operation = Operation::new(cleanup);
-        bounded(operation.deadline, async {
+        bounded(&operation, async {
             let _gate = self.mutations.lock().await;
-            self.release(id, &operation).await
+            self.release(id, kind, &operation).await
         })
         .await
     }
@@ -1369,37 +1554,42 @@ fn retry_hint(response: &GitHubResponse) -> Option<Duration> {
         u64::try_from(reset.saturating_sub(chrono::Utc::now().timestamp())).unwrap_or(0),
     ))
 }
-async fn bounded<T>(
-    deadline: Instant,
-    operation: impl std::future::Future<Output = BackendResult<T>>,
-) -> BackendResult<T> {
-    if Instant::now() >= deadline {
-        return Err(GitHubError::Deadline.into());
+fn retry_description(hint: Option<Duration>) -> String {
+    match hint {
+        Some(delay) => format!("retry after {} seconds", delay.as_secs_f64()),
+        None => "no retry time provided".into(),
     }
-    tokio::time::timeout_at(deadline, operation)
+}
+async fn bounded<T>(
+    operation: &Operation,
+    future: impl std::future::Future<Output = BackendResult<T>>,
+) -> BackendResult<T> {
+    if Instant::now() >= operation.deadline {
+        return Err(operation.deadline_error().into());
+    }
+    tokio::time::timeout_at(operation.deadline, future)
         .await
-        .map_err(|_| GitHubError::Deadline)?
+        .map_err(|_| operation.deadline_error())?
 }
 
 #[async_trait]
 impl StateBackend for GitHubBackend {
     async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
         let operation = Operation::new(false);
-        bounded(operation.deadline, async {
+        bounded(&operation, async {
             let _gate = self.mutations.lock().await;
             let Some(file) = self
                 .observe(self.settings.path().into(), &operation)
                 .await?
             else {
-                *self.expected_state.lock().expect("state revision mutex") =
-                    Some(Expected::Known(None));
+                *self.expected_state.lock().expect("state revision mutex") = Expected::Known(None);
                 return Ok(None);
             };
             let (state, migration) = crate::check_and_migrate_bytes(&file.bytes)
                 .map_err(|error| error.with_state_read_remote_location(&self.location()))?
                 .into_parts();
             *self.expected_state.lock().expect("state revision mutex") =
-                Some(Expected::Known(Some(file.sha)));
+                Expected::Known(Some(file.sha));
             Ok(Some(if let Some(info) = migration {
                 crate::log_state_migration_once(&self.migration_logged, info, &self.location());
                 LoadedState::Migrated { state, info }
@@ -1411,7 +1601,7 @@ impl StateBackend for GitHubBackend {
     }
     async fn read_state_bytes(&self) -> BackendResult<Option<RawState>> {
         let operation = Operation::new(false);
-        bounded(operation.deadline, async {
+        bounded(&operation, async {
             Ok(self
                 .observe(self.settings.path().into(), &operation)
                 .await?
@@ -1424,7 +1614,7 @@ impl StateBackend for GitHubBackend {
     }
     async fn acquire_lock(&self, operation_name: &str) -> BackendResult<LockInfo> {
         let operation = Operation::new(false);
-        bounded(operation.deadline, async {
+        bounded(&operation, async {
             let _gate = self.mutations.lock().await;
             let observed = self.lease(&operation).await?;
             match self.resolve_pending_lease(observed.as_ref().map(|(_, sha)| sha)) {
@@ -1460,11 +1650,12 @@ impl StateBackend for GitHubBackend {
         .await
     }
     async fn release_lock(&self, lock: &LockInfo) -> BackendResult<()> {
-        self.release_with_budget(lock.id(), false).await
+        self.release_with_budget(lock.id(), ReleaseKind::Release, false)
+            .await
     }
     async fn renew_lock(&self, lock: &LockInfo) -> BackendResult<LockInfo> {
         let operation = Operation::new(false);
-        bounded(operation.deadline, async {
+        bounded(&operation, async {
             let _gate = self.mutations.lock().await;
             self.renew(lock, &operation).await
         })
@@ -1484,19 +1675,27 @@ impl StateBackend for GitHubBackend {
         self.write_with_budget(state, Some(lock), true).await
     }
     async fn release_lock_for_cleanup(&self, lock: &LockInfo) -> BackendResult<()> {
-        self.release_with_budget(lock.id(), true).await
+        self.release_with_budget(lock.id(), ReleaseKind::Release, true)
+            .await
     }
     async fn force_unlock(&self, id: &str) -> BackendResult<()> {
-        self.release_with_budget(id, false).await
+        self.release_with_budget(id, ReleaseKind::ForceUnlock, false)
+            .await
     }
     async fn storage_readiness(&self) -> BackendResult<StorageReadiness> {
         let operation = Operation::new(false);
-        bounded(operation.deadline, async {
+        bounded(&operation, async {
             match self.destination(&operation).await {
                 Ok(_) => Ok(StorageReadiness::Ready),
-                Err(error @ BackendError::GitHub(GitHubError::Unavailable)) => Ok(
-                    StorageReadiness::Unavailable(StorageUnavailable::new(error)),
-                ),
+                Err(
+                    error @ BackendError::GitHub(
+                        GitHubError::RepositoryNotFoundOrInaccessible { .. }
+                        | GitHubError::BranchNotFound { .. }
+                        | GitHubError::RepositoryArchivedOrDisabled { .. },
+                    ),
+                ) => Ok(StorageReadiness::Unavailable(StorageUnavailable::new(
+                    error,
+                ))),
                 Err(error) => Err(error),
             }
         })

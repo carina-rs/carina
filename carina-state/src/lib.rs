@@ -94,12 +94,12 @@ pub use backend_selection::{
     ResolvedReadBackend, VerifiedMutationBackendSelection, inspect_backend_drift,
 };
 pub use backends::{
-    LocalBackend, LocalStateFile, S3AutoCreate, S3AutoCreateDisabled, S3Bootstrap, S3BootstrapInfo,
-    StateUrl, anchored_local_path, load_encoded_published_exports_from_url, load_local_state_file,
-    load_state_from_url,
+    GitHubBackend, GitHubError, LocalBackend, LocalStateFile, S3AutoCreate, S3AutoCreateDisabled,
+    S3Bootstrap, S3BootstrapInfo, StateUrl, anchored_local_path,
+    load_encoded_published_exports_from_url, load_local_state_file, load_state_from_url,
 };
 #[cfg(any(test, feature = "test-utils"))]
-pub use backends::{github_backend_for_test, local_backend_for_test, s3_backend_for_test};
+pub use backends::{local_backend_for_test, s3_backend_for_test};
 pub use heartbeat::{HeartbeatGuard, LockHeartbeat, LockLost, LockedStateWriter};
 pub use lock::LockInfo;
 pub use state::{

@@ -24,7 +24,7 @@ fn github_round1_url_variant_is_constructible_with_validated_fields() {
 #[test]
 fn github_round1_credential_errors_keep_distinct_types_and_sources() {
     use carina_core::github_auth::GitHubTokenError;
-    use carina_state::backends::github::GitHubError;
+    use carina_state::GitHubError;
     use std::error::Error;
     for (error, deadline) in [
         (GitHubTokenError::Deadline, true),
@@ -59,4 +59,22 @@ fn github_round1_credential_errors_keep_distinct_types_and_sources() {
             );
         }
     }
+}
+
+#[test]
+fn github_round4_invalid_token_error_keeps_its_typed_source() {
+    use carina_core::github_auth::GitHubTokenError;
+    use carina_state::GitHubError;
+    use std::error::Error;
+    let error = GitHubError::from(GitHubTokenError::InvalidCharacters);
+    assert!(matches!(error, GitHubError::CredentialsUnavailable { .. }));
+    assert!(matches!(
+        error.source().unwrap().downcast_ref::<GitHubTokenError>(),
+        Some(GitHubTokenError::InvalidCharacters)
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains("token contains invalid characters")
+    );
 }

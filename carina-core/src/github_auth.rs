@@ -10,12 +10,21 @@ pub enum GitHubTokenError {
     Unavailable,
     #[error("`gh auth token --hostname github.com` exceeded its deadline")]
     Deadline,
+    #[error(
+        "GitHub token contains invalid characters; set GITHUB_TOKEN or run `gh auth login --hostname github.com`"
+    )]
+    InvalidCharacters,
 }
 
 pub const TOKEN_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn get_github_token() -> Result<String, GitHubTokenError> {
-    select_token(std::env::var("GITHUB_TOKEN").ok(), || {
+    let environment = match std::env::var("GITHUB_TOKEN") {
+        Ok(token) => Some(token),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => return Err(GitHubTokenError::InvalidCharacters),
+    };
+    select_token(environment, || {
         command_token(
             std::ffi::OsStr::new("gh"),
             &["auth", "token", "--hostname", "github.com"],
@@ -24,19 +33,33 @@ pub fn get_github_token() -> Result<String, GitHubTokenError> {
     })
 }
 
-fn select_token(
-    environment: Option<String>,
-    fallback: impl FnOnce() -> Result<Vec<u8>, GitHubTokenError>,
-) -> Result<String, GitHubTokenError> {
-    if let Some(token) = environment.filter(|token| !token.is_empty()) {
-        return Ok(token);
+/// Normalize either credential source before it reaches an HTTP header.
+/// Diagnostics never retain the input, including when validation fails.
+pub fn normalize_token(token: &str) -> Result<&str, GitHubTokenError> {
+    let token = token.trim_matches(|ch: char| ch.is_ascii() && ch.is_whitespace());
+    if token.chars().any(char::is_control) {
+        return Err(GitHubTokenError::InvalidCharacters);
     }
-    let bytes = fallback()?;
-    let token = String::from_utf8_lossy(&bytes).trim().to_owned();
     if token.is_empty() {
         return Err(GitHubTokenError::Unavailable);
     }
     Ok(token)
+}
+
+fn select_token(
+    environment: Option<String>,
+    fallback: impl FnOnce() -> Result<Vec<u8>, GitHubTokenError>,
+) -> Result<String, GitHubTokenError> {
+    if let Some(token) = environment {
+        match normalize_token(&token) {
+            Ok(token) => return Ok(token.to_owned()),
+            Err(GitHubTokenError::Unavailable) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let bytes = fallback()?;
+    let token = std::str::from_utf8(&bytes).map_err(|_| GitHubTokenError::InvalidCharacters)?;
+    normalize_token(token).map(str::to_owned)
 }
 
 fn command_token(
@@ -102,12 +125,11 @@ mod tests {
 
     #[test]
     fn github_credentials_nonempty_environment_has_exact_precedence() {
-        for token in ["explicit-token", " "] {
-            assert_eq!(
-                select_token(Some(token.into()), || panic!("must not invoke gh")).unwrap(),
-                token
-            );
-        }
+        let token = "explicit-token";
+        assert_eq!(
+            select_token(Some(token.into()), || panic!("must not invoke gh")).unwrap(),
+            token
+        );
     }
 
     #[test]
@@ -120,6 +142,55 @@ mod tests {
         }
         assert!(select_token(None, || Ok(b" \n".to_vec())).is_err());
         assert!(select_token(None, || Err(GitHubTokenError::Deadline)).is_err());
+    }
+
+    #[test]
+    fn github_round4_credentials_trim_ascii_whitespace_from_both_sources() {
+        for token in [" token ", "\t\r\ntoken\r\n\t", "\x0b\x0ctoken\x0c\x0b"] {
+            assert_eq!(
+                select_token(Some(token.into()), || panic!("must not invoke gh")).unwrap(),
+                "token"
+            );
+            assert_eq!(
+                select_token(None, || Ok(token.as_bytes().to_vec())).unwrap(),
+                "token"
+            );
+        }
+        assert_eq!(
+            select_token(Some(" \t\r\n".into()), || Ok(b" fallback\n".to_vec())).unwrap(),
+            "fallback"
+        );
+    }
+
+    #[test]
+    fn github_round4_credentials_reject_controls_without_printing_tokens_or_falling_back() {
+        for token in [
+            "private\nsecret",
+            "private\rsecret",
+            "private\tsecret",
+            "private\0secret",
+            "private\x7fsecret",
+            "private\u{0085}secret",
+        ] {
+            for environment in [false, true] {
+                let error = if environment {
+                    select_token(Some(token.into()), || {
+                        panic!("invalid environment must not invoke gh")
+                    })
+                } else {
+                    select_token(None, || Ok(token.as_bytes().to_vec()))
+                }
+                .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("token contains invalid characters"),
+                    "{error}"
+                );
+                assert!(!format!("{error:?} {error}").contains("private"));
+                assert!(!format!("{error:?} {error}").contains("secret"));
+            }
+        }
     }
 
     #[cfg(unix)]

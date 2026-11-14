@@ -170,7 +170,7 @@ pub struct UpstreamExportReadError {
 #[derive(Debug, Error)]
 pub enum BackendError {
     #[error(transparent)]
-    GitHub(#[from] crate::backends::github::GitHubError),
+    GitHub(#[from] crate::GitHubError),
     #[error(transparent)]
     GitHubUrl(#[from] crate::backends::GitHubUrlError),
     #[error(transparent)]
