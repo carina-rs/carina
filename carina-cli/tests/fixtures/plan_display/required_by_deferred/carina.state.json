@@ -1,0 +1,35 @@
+{
+  "version": 7,
+  "serial": 1,
+  "lineage": "required-by-dependents",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "acm.Certificate",
+      "identity": "cert",
+      "provider": "aws",
+      "identifier": "cert-old",
+      "attributes": {
+        "domain_name": "old.example.com",
+        "arn": "arn:old"
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "cert",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "domain_name": {
+            "kind": "leaf"
+          }
+        }
+      }
+    }
+  ]
+}

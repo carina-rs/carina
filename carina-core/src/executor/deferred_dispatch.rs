@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
@@ -162,10 +162,7 @@ impl std::fmt::Display for DeferredCreateFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DeferredCreateFailure::Replacement { error } => match &error.required_by {
-                Some(dependent) => write!(
-                    formatter,
-                    "create_before_destroy required by dependent `{dependent}`"
-                ),
+                Some(dependents) => write!(formatter, "{}", dependents.diagnostic("")),
                 None => formatter.write_str("replacement admission failed"),
             },
             DeferredCreateFailure::IterableAbsent {
@@ -465,7 +462,7 @@ fn admit_materialized<S: Clone>(
     children: Vec<Effect<S>>,
     schemas: &crate::schema::SchemaRegistry,
     ordinary_old: &[crate::effect::DeferredReplaceDelete],
-    requirements: &HashMap<crate::resource::ResolvedResourceId, String>,
+    requirements: &crate::replacement::CreateFirstRequirements,
     existing: &crate::replacement::AdmittedReplacementEffects<S>,
 ) -> Result<crate::replacement::AdmittedReplacementEffects<S>, DeferredCreateFailure> {
     let mut replacements = Vec::new();
@@ -507,27 +504,22 @@ fn admit_materialized<S: Clone>(
         let Ok(old) = crate::effect::NonEmptyDeletes::try_new(old) else {
             continue;
         };
-        let required_by = match effect {
-            Effect::DeferredReplace(payload) => payload
-                .required_by_child(&resource.resolved_id())
-                .or_else(|| {
-                    old.iter()
-                        .find_map(|old| payload.required_by_child(&old.id))
-                }),
-            _ => None,
+        let mut required_by = std::collections::BTreeSet::new();
+        for id in
+            std::iter::once(resource.resolved_id()).chain(old.iter().map(|old| old.id.clone()))
+        {
+            if let Effect::DeferredReplace(payload) = effect
+                && let Some(dependents) = payload.required_by_child(&id)
+            {
+                required_by.extend(dependents.iter().cloned());
+            }
+            if let Some(dependents) = requirements.get(&id) {
+                required_by.extend(dependents.iter().cloned());
+            }
         }
-        .or_else(|| {
-            requirements
-                .get(&resource.resolved_id())
-                .map(String::as_str)
-        })
-        .or_else(|| {
-            old.iter()
-                .find_map(|old| requirements.get(&old.id).map(String::as_str))
-        });
         let mut request = crate::replacement::ReplacementRequest::new(resource.clone(), old);
-        if let Some(dependent) = required_by {
-            request = request.require_create_first(dependent);
+        if let Ok(dependents) = crate::replacement::Dependents::try_from(required_by) {
+            request = request.require_create_first(dependents);
         }
         replacements.push(request);
     }
@@ -541,7 +533,7 @@ pub(super) struct PureMetaCtx<'a, S> {
     pub(super) existing: &'a crate::replacement::AdmittedReplacementEffects<S>,
     pub(super) identity_inputs: DeferredIdentityInputs<'a>,
     pub(super) ordinary_old: &'a [crate::effect::DeferredReplaceDelete],
-    pub(super) requirements: &'a HashMap<crate::resource::ResolvedResourceId, String>,
+    pub(super) requirements: &'a crate::replacement::CreateFirstRequirements,
 }
 
 /// Dispatch a DeferredCreate meta-effect by materializing its runtime
@@ -653,6 +645,110 @@ mod tests {
                 )
             },
         )
+    }
+
+    #[test]
+    fn issue_4418_materialization_unions_template_child_and_every_old_route() {
+        use crate::effect::{
+            DeferredReplaceDelete, DeferredReplacePayload, EffectGeneration, NonEmptyDeletes,
+        };
+        use crate::replacement::{
+            AdmittedReplacementEffects, Dependent, Dependents, ReplacementLineage,
+        };
+        use crate::resource::{ResolvedResource, ResolvedResourceId};
+        let graph = crate::resolved_graph::resolve_expanded_graph(
+            crate::parser::ExpandedParsedFile {
+                upstream_states: vec![crate::parser::UpstreamState {
+                    binding: RootScope::new().resolve("up".into()),
+                    source: "upstream".into(),
+                }],
+                ..Default::default()
+            }
+            .into(),
+        )
+        .unwrap();
+        let (template, dependencies) = graph.compile_deferred_for(coalesced_template()).unwrap();
+        let child = ResolvedResource::new(
+            Resource::new("test.Child", "children[0]").with_dependency_phase(()),
+        );
+        let old = |route: &'static str| DeferredReplaceDelete {
+            id: ResolvedResourceId::with_provider_identity(
+                "",
+                "test.Child",
+                "children[0]",
+                Some(route.into()),
+            ),
+            identifier: crate::provider::AppliedIdentifier::new(route).unwrap(),
+            generation: EffectGeneration::Current,
+            binding: Some(RootScope::new().resolve("children[0]".into())),
+            directives: Default::default(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+            previous_attributes: Default::default(),
+        };
+        let first = old("old-a");
+        let second = old("old-b");
+        let dependent =
+            |identity| Dependent::new(ResolvedResourceId::with_identity("test.Consumer", identity));
+        let mut payload = DeferredReplacePayload::new(
+            NonEmptyDeletes::try_new(vec![first.clone(), second.clone()]).unwrap(),
+            Box::new(template),
+            dependencies,
+        );
+        payload
+            .unadmitted_request_mut()
+            .require_create_first_in_place(dependent("a").into());
+        payload.require_create_first_with_lineage(
+            &HashMap::from([(
+                child.resolved_id(),
+                std::collections::BTreeSet::from([dependent("b")]),
+            )]),
+            &ReplacementLineage::default(),
+        );
+        let requirements = HashMap::from([
+            (
+                child.resolved_id(),
+                std::collections::BTreeSet::from([dependent("c")]),
+            ),
+            (first.id, std::collections::BTreeSet::from([dependent("d")])),
+            (
+                second.id,
+                std::collections::BTreeSet::from([dependent("e")]),
+            ),
+        ]);
+        let mut schemas = crate::schema::SchemaRegistry::new();
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("test.Child")
+                .with_conflicting_replacement()
+                .validate()
+                .unwrap(),
+        );
+        let old_effects = payload
+            .deletes
+            .iter()
+            .map(DeferredReplaceDelete::to_delete_effect)
+            .collect::<Vec<_>>();
+        let existing =
+            AdmittedReplacementEffects::resolve(&old_effects, &schemas, |_| HashMap::new())
+                .unwrap();
+        let error = admit_materialized(
+            &Effect::DeferredReplace(Box::new(payload)),
+            vec![Effect::Create(child)],
+            &schemas,
+            &[],
+            &requirements,
+            &existing,
+        )
+        .unwrap_err();
+        let DeferredCreateFailure::Replacement { error } = error else {
+            panic!("expected admission error")
+        };
+        assert_eq!(
+            error.required_by,
+            Some(Dependents::try_from_iter(["a", "b", "c", "d", "e"].map(dependent)).unwrap())
+        );
     }
 
     #[test]

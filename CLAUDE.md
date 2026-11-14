@@ -702,7 +702,7 @@ A struct type represents a nested object with typed fields.
   identity/member labels; identified leaves show every identity-conjunction
   pattern. Shared provider docgen
   must render both layers too. This change needs no WIT change.
-  Schema fingerprints use v13 and saved plans use format 45; format 44 plans
+  Schema fingerprints use v13 and saved plans use format 46; format 45 plans
   must fail the version gate before decoding the payload. Saved module
   `pending_constraints` contain `ValidateExpr` values, not retained types.
   Condition strings, `require` messages, and wait RHS strings retain checked

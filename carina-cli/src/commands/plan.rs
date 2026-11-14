@@ -1206,7 +1206,8 @@ impl PlanFile {
 /// Format 43 requires explicit schema-pattern modes. Format 44 records v13
 /// schema fingerprints and separate identity/member constraint layers. Format 45
 /// retains quoted condition literals, require messages, and wait RHS strings
-/// so decoding can reject interpolation.
+/// so decoding can reject interpolation. Format 46 stores non-empty dependent
+/// sets ordered by system-assigned resource/deferred effect identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanFileWire {
     version: u32,
@@ -2157,7 +2158,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 45;
+    pub const CURRENT_VERSION: u32 = 46;
 
     #[cfg(test)]
     pub(crate) fn decode_for_test(self) -> DecodedPlanFile {

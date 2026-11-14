@@ -126,7 +126,7 @@ pub enum PlanErrorKind {
     /// A referenced producer cannot coexist with its old generation, but a
     /// managed or deferred dependent requires its replacement first.
     CreateBeforeDestroyRequiredByDependent {
-        dependent: String,
+        dependents: crate::replacement::Dependents,
         cause: CreateBeforeDestroyError,
     },
     /// An existing state row cannot safely be mutated because it has no
@@ -357,9 +357,12 @@ impl PlanErrorKind {
         f: &mut std::fmt::Formatter<'_>,
         project_dir: &Path,
     ) -> std::fmt::Result {
-        // Input-rule requirements already own their diagnostic budget. Budget
-        // only this plan's prefix so the shared requirement remains verbatim.
-        if matches!(self, Self::InputRule { .. }) {
+        // Input-rule and dependent-list diagnostics already own their budget.
+        // Preserve their complete truncation marker rather than budgeting twice.
+        if matches!(
+            self,
+            Self::InputRule { .. } | Self::CreateBeforeDestroyRequiredByDependent { .. }
+        ) {
             return self.fmt_context(f, project_dir);
         }
         struct Context<'a> {
@@ -411,8 +414,8 @@ impl PlanErrorKind {
             Self::SchemaNotRegistered(err) => write!(f, "{err}"),
             Self::ReplacementCannotCoexist(err) => write!(f, "{err}"),
             Self::InvalidPreparedReplacementName(err) => write!(f, "{err}"),
-            Self::CreateBeforeDestroyRequiredByDependent { dependent, cause } => {
-                write!(f, "{cause}; create_before_destroy required by dependent `{dependent}`")
+            Self::CreateBeforeDestroyRequiredByDependent { dependents, cause } => {
+                write!(f, "{}", dependents.diagnostic(&format!("{cause}; ")))
             }
             Self::MissingProviderIdentifier => f.write_str(
                 "saved state has no provider identifier; add a `removed` block for this resource and apply it, then add an `import` block with the provider identifier to restore management",
