@@ -299,16 +299,20 @@ pub fn parse_file_scoped(
     parse_file(input, path, config).map_err(|error| Box::new(super::FileScoped::new(path, error)))
 }
 
-/// Parse the sealed declaration inventory even when semantic evaluation (such
+/// Retain syntax and directive findings even when semantic evaluation (such
 /// as duplicate-binding rejection) cannot produce a complete runtime tree.
 pub fn parse_syntax_inventory(
     input: &str,
     path: &Path,
-) -> Result<super::SyntaxInventory, Box<super::FileScoped<ParseError>>> {
+) -> Result<ParserBindingMetadata, Box<super::FileScoped<ParseError>>> {
     let parse = || {
         let file = super::preprocess_file(input)?;
         let pairs = file.parse()?;
-        Ok(super::SyntaxInventory::from_pairs(pairs, &file, path))
+        let (syntax, directive_findings) = super::SyntaxInventory::from_pairs(pairs, &file, path);
+        let mut metadata = ParserBindingMetadata::default();
+        metadata.syntax = Box::new(syntax);
+        metadata.directive_findings = directive_findings;
+        Ok(metadata)
     };
     parse().map_err(|error| Box::new(super::FileScoped::new(path, error)))
 }
@@ -986,7 +990,7 @@ fn parse_with_seeded_bindings_inner(
 ) -> Result<ParsedFile, super::resolve::RootInputFailure> {
     let preprocessed_file = Arc::new(super::preprocess_file(input)?);
     let pairs = preprocessed_file.parse()?;
-    let mut syntax =
+    let (mut syntax, directive_findings) =
         super::SyntaxInventory::from_pairs(pairs.clone(), &preprocessed_file, source_file);
     // Bootstrap passes use provisional sibling names and exist only to
     // classify declarations. The final pass both emits source warnings and
@@ -1375,6 +1379,7 @@ fn parse_with_seeded_bindings_inner(
     // `get_variable`, so the closure was already available where it
     // mattered.
     let mut parser_binding_metadata = ParserBindingMetadata::default();
+    parser_binding_metadata.directive_findings = directive_findings;
     for (name, binding) in &ctx.bindings {
         // Directory seeds are context, not declarations owned by this file.
         // In particular a provisional seed means only "this name exists";

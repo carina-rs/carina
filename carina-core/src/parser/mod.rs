@@ -18,7 +18,7 @@ pub use failed_file::{
 mod protected_regions;
 pub(crate) use ast::ParserSeedMetadata;
 pub use authored_text::{AuthoredExpressionDiagnostic, AuthoredExpressionText};
-pub use grammar::SyntaxDiagnostic;
+pub use grammar::{SyntaxDiagnostic, decode_attribute_key};
 mod attribute_key;
 pub use attribute_key::{AttributeKey, ConfigurationAttributes};
 pub use protected_regions::DiagnosticFileText;
@@ -61,6 +61,7 @@ pub use resolve::{
     resolve_provider_unresolved_attributes_for_analysis, resolve_resource_refs_from_analysis,
 };
 
+mod resource_body;
 mod static_eval;
 mod types;
 mod util;

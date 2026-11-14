@@ -117,6 +117,7 @@ impl DeclarationLocation {
             pair.as_rule(),
             Rule::interpolation
                 | Rule::let_binding
+                | Rule::local_binding
                 | Rule::resource_expr
                 | Rule::anonymous_resource
                 | Rule::read_resource_expr

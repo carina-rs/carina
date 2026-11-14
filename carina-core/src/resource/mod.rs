@@ -74,7 +74,7 @@ pub(crate) use binding_address::{
 };
 pub use directive_expr::{
     ArgumentValueOrigin, DirectiveExpr, DirectiveResolutionError, DirectiveResolutionErrors,
-    ExpansionError, LifecycleDirective, LoopDirective, LoopDirectiveExpr,
+    ExpansionError, LifecycleDirective, LoopDirective, LoopDirectiveExpr, ResourceDirective,
     SerializableDirectivePhase,
 };
 pub use enum_value::{

@@ -1,0 +1,6 @@
+mock.test.resource {
+  name = "example"
+  directives {
+    prevent_destory = true
+  }
+}
