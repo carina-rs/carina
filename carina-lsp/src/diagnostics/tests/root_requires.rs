@@ -977,3 +977,26 @@ fn unsaved_backend_decides_root_and_runs_schema_checks() {
         );
     }
 }
+
+#[test]
+fn round12_partial_directory_retains_duplicate_backend_ownership() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("main.crn");
+    let source = "backend s3 { typo = 1 }\n";
+    std::fs::write(&path, source).unwrap();
+    std::fs::write(directory.path().join("other.crn"), "backend local {}\n").unwrap();
+    for broken in [false, true] {
+        if broken {
+            std::fs::write(directory.path().join("broken.crn"), "let broken = [\n").unwrap();
+        }
+        let diagnostics =
+            test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+        assert!(
+            diagnostics.iter().all(
+                |finding| !finding.message.contains("Unknown attribute 'typo'")
+                    && !finding.message.contains("Missing required attribute")
+            ),
+            "{diagnostics:#?}"
+        );
+    }
+}

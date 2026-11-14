@@ -523,6 +523,7 @@ impl CompleteDirectoryVerdict {
 pub struct RootDirectoryVerdict {
     evidence: std::sync::Arc<RootEvidence>,
     additional_evidence: Option<std::sync::Arc<RootEvidence>>,
+    sole_backend: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -650,6 +651,11 @@ impl<U, T, N> DirectoryVerdict<U, T, N> {
 }
 
 impl RootDirectoryVerdict {
+    /// Whether exactly one readable inventory declaration owns the backend.
+    pub fn has_sole_backend(&self) -> bool {
+        self.sole_backend
+    }
+
     pub fn evidence(&self) -> &RootEvidence {
         &self.evidence
     }
@@ -696,27 +702,58 @@ impl RootEvidence {
     /// resolves an authored relative label from the process working directory.
     pub fn file_locator(&self) -> &crate::paths::PersistedPath {
         match self {
-            Self::Provider { file, .. } | Self::Backend { file, .. } => file,
+            Self::Provider {
+                file,
+                location: _,
+                utf16_columns: _,
+            }
+            | Self::Backend {
+                file,
+                location: _,
+                utf16_columns: _,
+            } => file,
         }
     }
     pub fn location(&self) -> &parser::DeclarationLocation {
         match self {
-            Self::Provider { location, .. } | Self::Backend { location, .. } => location,
+            Self::Provider {
+                location,
+                file: _,
+                utf16_columns: _,
+            }
+            | Self::Backend {
+                location,
+                file: _,
+                utf16_columns: _,
+            } => location,
         }
     }
     pub fn utf16_columns(&self) -> (u32, u32) {
         match self {
-            Self::Provider { utf16_columns, .. } | Self::Backend { utf16_columns, .. } => {
-                *utf16_columns
+            Self::Provider {
+                utf16_columns,
+                location: _,
+                file: _,
             }
+            | Self::Backend {
+                utf16_columns,
+                location: _,
+                file: _,
+            } => *utf16_columns,
         }
     }
     pub fn related_message(&self) -> &'static str {
         match self {
-            Self::Provider { .. } => {
-                "This provider block makes the directory a root configuration."
-            }
-            Self::Backend { .. } => "This backend block makes the directory a root configuration.",
+            Self::Provider {
+                location: _,
+                file: _,
+                utf16_columns: _,
+            } => "This provider block makes the directory a root configuration.",
+            Self::Backend {
+                location: _,
+                file: _,
+                utf16_columns: _,
+            } => "This backend block makes the directory a root configuration.",
         }
     }
     pub fn note(&self) -> String {
@@ -728,8 +765,16 @@ impl RootEvidence {
             )
         };
         match self {
-            Self::Provider { location, .. } => located("provider", location),
-            Self::Backend { location, .. } => located("backend", location),
+            Self::Provider {
+                location,
+                file: _,
+                utf16_columns: _,
+            } => located("provider", location),
+            Self::Backend {
+                location,
+                file: _,
+                utf16_columns: _,
+            } => located("backend", location),
         }
     }
 }
@@ -832,39 +877,44 @@ impl<C: InventoryCompleteness> DirectoryInventories<'_, C> {
         let mut evidence = None;
         let mut additional_evidence = None;
         let mut module_evidence = None;
+        let mut backend_count = 0;
         for (inventory, file) in self.inventories {
             for block in inventory.configuration_blocks() {
+                let module_declaration = |kind| ModuleEvidence {
+                    kind,
+                    location: block.location().clone(),
+                    file: file.clone(),
+                    utf16_columns: block.detail().utf16_columns(),
+                };
                 let authored = match block.detail().kind() {
                     ConfigurationBlock::Provider => Some(RootEvidence::Provider {
                         location: block.location().clone(),
                         file: file.clone(),
                         utf16_columns: block.detail().utf16_columns(),
                     }),
-                    ConfigurationBlock::Backend => Some(RootEvidence::Backend {
-                        location: block.location().clone(),
-                        file: file.clone(),
-                        utf16_columns: block.detail().utf16_columns(),
-                    }),
-                    ConfigurationBlock::Arguments
-                    | ConfigurationBlock::Attributes
-                    | ConfigurationBlock::Require => {
-                        module_evidence.get_or_insert_with(|| ModuleEvidence {
-                            kind: match block.detail().kind() {
-                                ConfigurationBlock::Arguments => ModuleEvidenceKind::Arguments,
-                                ConfigurationBlock::Attributes => ModuleEvidenceKind::Attributes,
-                                ConfigurationBlock::Require => ModuleEvidenceKind::Require,
-                                ConfigurationBlock::Provider
-                                | ConfigurationBlock::Backend
-                                | ConfigurationBlock::State
-                                | ConfigurationBlock::UpstreamState
-                                | ConfigurationBlock::Exports => {
-                                    unreachable!("matched module declaration")
-                                }
-                            },
+                    ConfigurationBlock::Backend => {
+                        backend_count += 1;
+                        Some(RootEvidence::Backend {
                             location: block.location().clone(),
                             file: file.clone(),
                             utf16_columns: block.detail().utf16_columns(),
+                        })
+                    }
+                    ConfigurationBlock::Arguments => {
+                        module_evidence.get_or_insert_with(|| {
+                            module_declaration(ModuleEvidenceKind::Arguments)
                         });
+                        None
+                    }
+                    ConfigurationBlock::Attributes => {
+                        module_evidence.get_or_insert_with(|| {
+                            module_declaration(ModuleEvidenceKind::Attributes)
+                        });
+                        None
+                    }
+                    ConfigurationBlock::Require => {
+                        module_evidence
+                            .get_or_insert_with(|| module_declaration(ModuleEvidenceKind::Require));
                         None
                     }
                     ConfigurationBlock::State
@@ -890,6 +940,7 @@ impl<C: InventoryCompleteness> DirectoryInventories<'_, C> {
             Some(evidence) => DirectoryVerdict::Root(RootDirectoryVerdict {
                 evidence: std::sync::Arc::new(evidence),
                 additional_evidence,
+                sole_backend: backend_count == 1,
             }),
             None => self.completeness.without_root(module_evidence),
         }
@@ -1474,6 +1525,15 @@ pub(crate) struct ParsedDirectoryFiles {
     verdict: CompleteDirectoryVerdict,
 }
 impl ParsedDirectoryFiles {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CompleteDirectoryVerdict,
+        Vec<(PathBuf, DirectoryResolvedFile)>,
+    ) {
+        (self.verdict, self.files)
+    }
+
     pub(crate) fn empty_assembly(&self) -> ParsedFile {
         let mut parsed = ParsedFile::default();
         crate::parser::retained::set_directory_require_scope(

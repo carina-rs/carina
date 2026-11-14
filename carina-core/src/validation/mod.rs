@@ -7052,12 +7052,12 @@ fn is_string_compatible_type_on_path<'a>(
 /// declaration classification as require admission.
 pub fn validate_no_module_declarations_in_root<E>(
     parsed: &crate::parser::File<E>,
-) -> Result<(), ConfigurationPlacementDiagnostic> {
+) -> Result<(), crate::parser::Located<ConfigurationPlacementDiagnostic>> {
     match placement_diagnostics_for_inventory(parsed.parser_binding_metadata.syntax())
         .into_iter()
         .find(|finding| finding.detail().root_evidence().is_some())
     {
-        Some(finding) => Err(finding.into_parts().1),
+        Some(finding) => Err(finding),
         None => Ok(()),
     }
 }

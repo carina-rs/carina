@@ -137,6 +137,7 @@ impl UpstreamDiscoveryContext<'_> {
 pub struct UpstreamSourceIdentity {
     binding: String,
     source: ResolvedPath,
+    declared_source: std::path::PathBuf,
 }
 
 impl UpstreamSourceIdentity {
@@ -147,6 +148,7 @@ impl UpstreamSourceIdentity {
         Ok(Self {
             binding: upstream.binding.to_string(),
             source: base.join_display(&base.persisted_path().display().join(&upstream.source))?,
+            declared_source: upstream.source.clone(),
         })
     }
 
@@ -171,7 +173,7 @@ impl UpstreamSourceIdentity {
                 message,
             }
         })?;
-        let surface = resolve_upstream_source_surface(&loaded, &self.source, context, schemas)?;
+        let surface = resolve_upstream_source_surface(&loaded, self, context, schemas)?;
         Ok(ResolvedUpstreamSource {
             identity: self.clone(),
             backend: loaded
@@ -190,6 +192,8 @@ impl UpstreamSourceIdentity {
 pub enum UpstreamSourceLoadError {
     #[error("upstream_state '{binding}': {message}")]
     Configuration { binding: String, message: String },
+    #[error("{0}")]
+    Rejected(Box<UpstreamResolveFailure>),
     #[error(transparent)]
     Invariant(#[from] crate::parser::AnalysisTreeError),
     #[error(transparent)]
@@ -220,8 +224,12 @@ impl ResolvedUpstreamSource {
     pub fn upstream_states(&self) -> &[UpstreamState<RelativeBindingName>] {
         &self.upstream_states
     }
-    pub fn unavailable_reason(&self) -> Option<&str> {
-        self.surface.entries.as_ref().err().map(String::as_str)
+    pub fn unavailable_reason(&self) -> Option<&UpstreamSourceUnavailable> {
+        self.surface
+            .entries
+            .as_ref()
+            .err()
+            .map(std::sync::Arc::as_ref)
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -230,13 +238,16 @@ impl ResolvedUpstreamSource {
             identity: UpstreamSourceIdentity {
                 binding: binding.into(),
                 source: ResolvedPath::new(".").expect("fixture directory exists"),
+                declared_source: ".".into(),
             },
             backend: None,
             upstream_states: vec![],
             surface: SourceSurface {
-                entries: entries
-                    .cloned()
-                    .ok_or_else(|| "test fixture has no source surface".into()),
+                entries: entries.cloned().ok_or_else(|| {
+                    std::sync::Arc::new(UpstreamSourceUnavailable::Configuration(
+                        "test fixture has no source surface".into(),
+                    ))
+                }),
             },
         }
     }
@@ -244,32 +255,66 @@ impl ResolvedUpstreamSource {
 
 #[derive(Debug, Clone)]
 struct SourceSurface {
-    entries: Result<UpstreamExportEntries, String>,
+    entries: Result<UpstreamExportEntries, std::sync::Arc<UpstreamSourceUnavailable>>,
+}
+
+/// Non-rejecting source failures preserve unchecked admission and their typed
+/// causes. A module-template rejection cannot inhabit this unavailable surface.
+#[derive(Debug, thiserror::Error)]
+pub enum UpstreamSourceUnavailable {
+    #[error("{0}")]
+    Configuration(String),
+    #[error("{error}")]
+    Module {
+        base: std::path::PathBuf,
+        error: Box<crate::module_resolver::ModuleError>,
+    },
+    #[error("{}", .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"))]
+    Boundaries(Vec<crate::validation::ExportBoundaryError>),
 }
 
 /// Discover admission authority from an actual loader-owned source snapshot.
 /// Unavailable declarations preserve the unchecked policy without warnings.
 fn resolve_upstream_source_surface(
     loaded: &crate::config_loader::LoadedConfig,
-    source: &ResolvedPath,
+    identity: &UpstreamSourceIdentity,
     context: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: &crate::schema::SchemaRegistry,
-) -> Result<SourceSurface, crate::parser::AnalysisTreeError> {
+) -> Result<SourceSurface, UpstreamSourceLoadError> {
     let entries = match loaded.upstream_export_source(context.catalog(), schemas) {
         Ok(parsed) => match resolve_upstream_exports_from_parsed(
             parsed,
-            source,
+            identity.source(),
             context,
             Some(schemas),
             &Default::default(),
         ) {
             Ok(entries) => Ok(entries),
-            Err(UpstreamExportSourceError::Invariant(error)) => return Err(error),
-            Err(reason) => Err(reason.to_string()),
+            Err(UpstreamExportSourceError::Invariant(error)) => return Err(error.into()),
+            Err(UpstreamExportSourceError::ModuleTemplate(template)) => {
+                return Err(UpstreamSourceLoadError::Rejected(Box::new(
+                    UpstreamResolveFailure::module_template(
+                        identity.binding.clone(),
+                        identity.declared_source.clone(),
+                        template,
+                    ),
+                )));
+            }
+            Err(UpstreamExportSourceError::Unavailable(reason)) => {
+                Err(UpstreamSourceUnavailable::Configuration(reason))
+            }
+            Err(UpstreamExportSourceError::Module { base, error }) => {
+                Err(UpstreamSourceUnavailable::Module { base, error })
+            }
+            Err(UpstreamExportSourceError::Boundaries(errors)) => {
+                Err(UpstreamSourceUnavailable::Boundaries(errors))
+            }
         },
-        Err(reason) => Err(reason),
+        Err(reason) => Err(UpstreamSourceUnavailable::Configuration(reason)),
     };
-    Ok(SourceSurface { entries })
+    Ok(SourceSurface {
+        entries: entries.map_err(std::sync::Arc::new),
+    })
 }
 
 /// Identity of the immutable type evidence used to discover a source surface.
@@ -464,6 +509,13 @@ pub struct UpstreamResolveError {
     pub binding: String,
     pub source: std::path::PathBuf,
     pub reason: String,
+    kind: UpstreamResolveErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpstreamResolveErrorKind {
+    ParseFailure,
+    ModuleTemplate,
 }
 
 impl UpstreamResolveError {
@@ -484,7 +536,16 @@ impl UpstreamResolveError {
 
 impl std::fmt::Display for UpstreamResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.fmt_reason(f, &self.reason)
+        match self.kind {
+            UpstreamResolveErrorKind::ParseFailure => self.fmt_reason(f, &self.reason),
+            UpstreamResolveErrorKind::ModuleTemplate => write!(
+                f,
+                "upstream_state `{}`: source `{}` {}",
+                self.binding,
+                self.source.display(),
+                self.reason
+            ),
+        }
     }
 }
 
@@ -514,6 +575,7 @@ impl UpstreamResolveFailure {
                 binding,
                 source,
                 reason,
+                kind: UpstreamResolveErrorKind::ParseFailure,
             },
             cause: UpstreamResolveCause::Message,
         }
@@ -533,6 +595,7 @@ impl UpstreamResolveFailure {
                 binding,
                 source,
                 reason,
+                kind: UpstreamResolveErrorKind::ParseFailure,
             },
             cause: UpstreamResolveCause::Boundaries(boundaries),
         }
@@ -547,6 +610,7 @@ impl UpstreamResolveFailure {
                 binding,
                 source,
                 reason: error.to_string(),
+                kind: UpstreamResolveErrorKind::ParseFailure,
             },
             cause: UpstreamResolveCause::Parse(std::sync::Arc::new(error)),
         }
@@ -562,6 +626,7 @@ impl UpstreamResolveFailure {
                 binding,
                 source,
                 reason: String::new(),
+                kind: UpstreamResolveErrorKind::ParseFailure,
             },
             cause: UpstreamResolveCause::Module {
                 base,
@@ -579,6 +644,7 @@ impl UpstreamResolveFailure {
                 binding,
                 source,
                 reason: String::new(),
+                kind: UpstreamResolveErrorKind::ModuleTemplate,
             },
             cause: UpstreamResolveCause::ModuleTemplate(template),
         }
@@ -678,7 +744,7 @@ impl UpstreamResolveFailure {
             }
             UpstreamResolveCause::ModuleTemplate(template) => {
                 self.legacy.reason = format!(
-                    "source is a module definition and has no state to read\nNote: {}",
+                    "is a module definition and has no state to read\nNote: {}",
                     template.evidence().note()
                 )
             }
@@ -2098,6 +2164,71 @@ mod tests {
     }
 
     #[test]
+    fn round12_identity_load_rejects_module_templates_with_typed_evidence() {
+        for declaration in ["arguments {}", "require false, 'PRIVATE_GUARD'"] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("mod");
+            fs::create_dir(&source).unwrap();
+            write_crn(
+                &source,
+                "declarations.crn",
+                &format!("// module\n{declaration}\n"),
+            );
+            write_crn(&source, "locals.crn", "// sibling\n");
+            let context = ctx();
+            let base = ResolvedPath::new(directory.path()).unwrap();
+            let caller = crate::parser::parse_file(
+                "let prior = upstream_state { source = './mod' }\n",
+                &directory.path().join("caller.crn"),
+                &context,
+            )
+            .unwrap();
+            let identity =
+                UpstreamSourceIdentity::resolve(&caller.upstream_states[0], &base).unwrap();
+            crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                let error = identity
+                    .load(
+                        &UpstreamBootstrapContext::from_runtime(&context),
+                        session,
+                        &SchemaRegistry::new(),
+                    )
+                    .unwrap_err();
+                let message = error.to_string();
+                assert!(
+                    message
+                        .contains("source `./mod` is a module definition and has no state to read"),
+                    "{message}"
+                );
+                assert!(message.contains("mod/declarations.crn:2"), "{message}");
+                assert!(!message.contains("PRIVATE_GUARD"), "{message}");
+            });
+        }
+    }
+
+    #[test]
+    fn round12_legacy_template_failure_matches_display() {
+        let directory = tempfile::tempdir().unwrap();
+        write_crn(directory.path(), "arguments.crn", "arguments {}\n");
+        write_crn(directory.path(), "locals.crn", "// sibling\n");
+        let parsed = crate::config_loader::parse_directory(
+            &ResolvedPath::new(directory.path()).unwrap(),
+            &ctx(),
+        )
+        .unwrap();
+        let crate::config_loader::DirectoryVerdict::ModuleTemplate(template) =
+            parsed.complete_directory_verdict()
+        else {
+            panic!("template");
+        };
+        let failure =
+            UpstreamResolveFailure::module_template("prior".into(), "../mod".into(), template);
+        assert_eq!(
+            failure.clone().into_legacy().to_string(),
+            failure.to_string()
+        );
+    }
+
+    #[test]
     fn module_template_upstream_rejection_retains_the_first_issued_evidence() {
         for declaration in [
             "arguments {}",
@@ -2307,7 +2438,7 @@ mod tests {
         assert_eq!(
             errors[0].detail().reason,
             format!(
-                "source is a module definition and has no state to read\nNote: directory is a module definition because of the arguments block at {}:1.",
+                "is a module definition and has no state to read\nNote: directory is a module definition because of the arguments block at {}:1.",
                 crate::paths::DisplayPath::for_diagnostics(
                     directory.path().join("upstream/exports.crn")
                 )

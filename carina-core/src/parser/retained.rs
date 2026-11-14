@@ -4031,10 +4031,13 @@ mod judgement {
             self.visiting.push(id);
             let rejected_require = match &root.kind {
                 ExprKind::RequireCondition(require) => match &require.scope {
-                    RequireScope::Directory(verdict) => {
+                    RequireScope::Directory(verdict)
+                    | RequireScope::UnvalidatedDirectory(verdict) => {
                         Some((require.statement.clone(), verdict.clone()))
                     }
-                    _ => None,
+                    RequireScope::Unknown
+                    | RequireScope::ModuleTemplate(_)
+                    | RequireScope::ModuleCall => None,
                 },
                 _ => None,
             };

@@ -673,32 +673,15 @@ impl DiagnosticRun<'_> {
         else {
             return Vec::new();
         };
-        // Partial snapshots run root checks only with authored root evidence.
-        // Template and Unknown checks remain deferred.
+        // The issued directory fact owns backend cardinality, including all
+        // readable sibling inventories during partial recovery.
         match parsed.directory_verdict() {
-            carina_core::config_loader::DirectoryVerdict::Root(_)
-            | carina_core::config_loader::DirectoryVerdict::NoEvidence(_) => {}
-            carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
-            | carina_core::config_loader::DirectoryVerdict::Unknown(_) => return Vec::new(),
-        }
-        // A duplicate backend has no single semantic owner. The parser
-        // inventory still supplies every declaration for placement checks.
-        if let Some(merged) = merged {
-            if merged.directory.sole_backend_file.is_none() {
-                return Vec::new();
+            carina_core::config_loader::DirectoryVerdict::Root(root) if root.has_sole_backend() => {
             }
-        } else if parsed
-            .parser_binding_metadata
-            .syntax()
-            .configuration_blocks()
-            .iter()
-            .filter(|block| {
-                block.detail().kind() == carina_core::parser::ConfigurationBlock::Backend
-            })
-            .count()
-            != 1
-        {
-            return Vec::new();
+            carina_core::config_loader::DirectoryVerdict::Root(_)
+            | carina_core::config_loader::DirectoryVerdict::NoEvidence(_)
+            | carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
+            | carina_core::config_loader::DirectoryVerdict::Unknown(_) => return Vec::new(),
         }
         let Some(backend) = parsed.backend.as_ref() else {
             return Vec::new();

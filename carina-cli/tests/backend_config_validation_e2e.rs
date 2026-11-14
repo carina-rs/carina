@@ -135,7 +135,8 @@ fn validate_module_backend_reports_only_the_structural_error() {
         diagnostics,
         vec![
             format!(
-                "arguments blocks are only valid inside module definitions, not in root configurations.\nNote: directory is a root configuration because of the backend block at {}:1.",
+                "{}:1:1: arguments blocks are only valid inside module definitions, not in root configurations.\nNote: directory is a root configuration because of the backend block at {}:1.",
+                carina_core::paths::DisplayPath::for_diagnostics(fixture.path().join("main.crn")),
                 carina_core::paths::DisplayPath::for_diagnostics(
                     fixture.path().join("backend.crn")
                 )

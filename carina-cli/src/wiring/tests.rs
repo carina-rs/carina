@@ -2007,7 +2007,8 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
     };
 
     let expected = format!(
-        "arguments blocks are only valid inside module definitions, not in root configurations.\nNote: directory is a root configuration because of the provider block at {}/providers.crn:1.\nalpha failed\nzeta failed",
+        "{}:1:1: arguments blocks are only valid inside module definitions, not in root configurations.\nNote: directory is a root configuration because of the provider block at {}/providers.crn:1.\nalpha failed\nzeta failed",
+        carina_core::paths::DisplayPath::for_diagnostics(fixture.path().join("arguments.crn")),
         fixture.path().display()
     );
     assert_eq!(evaluated_error.to_string(), expected);
@@ -16318,7 +16319,8 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
     };
 
     let expected = format!(
-        "arguments blocks are only valid inside module definitions, not in root configurations.\nNote: directory is a root configuration because of the provider block at {}:1.\nalpha failed\nzeta failed",
+        "{}:3:1: arguments blocks are only valid inside module definitions, not in root configurations.\nNote: directory is a root configuration because of the provider block at {}:1.\nalpha failed\nzeta failed",
+        carina_core::paths::DisplayPath::for_diagnostics(&source_file),
         carina_core::paths::DisplayPath::for_diagnostics(&source_file)
     );
     assert_eq!(evaluated_error.to_string(), expected);

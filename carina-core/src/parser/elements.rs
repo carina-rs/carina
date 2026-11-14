@@ -1276,7 +1276,15 @@ impl SyntaxInventory {
                     ConfigurationBlock::Require => {
                         DeclarationLocation::from_pair(&pair, file, source)
                     }
-                    _ => DeclarationLocation::block_header_from_pair(&pair, file, source),
+                    ConfigurationBlock::Arguments
+                    | ConfigurationBlock::Attributes
+                    | ConfigurationBlock::Provider
+                    | ConfigurationBlock::State
+                    | ConfigurationBlock::Backend
+                    | ConfigurationBlock::UpstreamState
+                    | ConfigurationBlock::Exports => {
+                        DeclarationLocation::block_header_from_pair(&pair, file, source)
+                    }
                 };
                 let declaration = ConfigurationBlockDeclaration::new(kind, &location, file);
                 out.configuration_blocks

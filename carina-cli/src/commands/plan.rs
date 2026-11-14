@@ -6853,6 +6853,7 @@ async fn load_provider_referenced_upstream_states<E>(
                     .diagnostic_path
                     .as_ref()
                     .is_some_and(carina_core::resource::DiagnosticPath::is_secret)
+                    && !matches!(&error, AppError::UpstreamSourceRejected(failure) if failure.module_evidence().is_some())
                 {
                     AppError::Config(carina_core::resource::INSIDE_SECRET_MESSAGE.into())
                 } else {

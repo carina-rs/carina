@@ -628,6 +628,11 @@ fn assert_root_declaration_rejected(block: &str, declaration: &str, same_file: b
         },
     )
     .unwrap();
+    let declaration_file = if same_file {
+        "guards.crn"
+    } else {
+        "declarations.crn"
+    };
     let block_error = format!(
         "{block} blocks are only valid inside module definitions, not in root configurations."
     );
@@ -641,7 +646,7 @@ fn assert_root_declaration_rejected(block: &str, declaration: &str, same_file: b
     assert_eq!(
         String::from_utf8(human.stderr).unwrap(),
         format!(
-            "Error: {block_error}\n  {evidence_note}\nError: guards.crn at line {require_line}\nError: {ROOT_REQUIRE_ERROR}\n  {evidence_note}\n"
+            "Error: {declaration_file}:1:1: {block_error}\n  {evidence_note}\nError: guards.crn at line {require_line}\nError: {ROOT_REQUIRE_ERROR}\n  {evidence_note}\n"
         )
     );
 
@@ -653,7 +658,7 @@ fn assert_root_declaration_rejected(block: &str, declaration: &str, same_file: b
     assert_eq!(
         report["errors"],
         json!([
-            {"message": format!("{block_error}\n{evidence_note}"), "severity": "error", "code": null, "location": null},
+            {"message": format!("{block_error}\n{evidence_note}"), "severity": "error", "code": null, "location": {"file": declaration_file, "range": {"start": {"line": 1, "column": 1}, "end": {"line": 1, "column": block.len() + 1}}}},
             {"message": require_error, "severity": "error", "code": null,
              "location": {"file": "guards.crn", "range": {
                  "start": {"line": require_line, "column": 1},
@@ -673,7 +678,7 @@ fn assert_root_declaration_rejected(block: &str, declaration: &str, same_file: b
     assert_eq!(
         String::from_utf8(lint.stderr).unwrap(),
         format!(
-            "warning: .:1  {block_error}\n  {evidence_note}\nError: Found 1 lint warning(s).\n"
+            "warning: .:1  {declaration_file}:1:1: {block_error}\n  {evidence_note}\nError: Found 1 lint warning(s).\n"
         )
     );
 
@@ -694,7 +699,7 @@ fn assert_root_declaration_rejected(block: &str, declaration: &str, same_file: b
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
             format!(
-                "Error: {block_error}\n  {evidence_note}\nError: guards.crn at line {require_line}\nError: {ROOT_REQUIRE_ERROR}\n  {evidence_note}\n"
+                "Error: {declaration_file}:1:1: {block_error}\n  {evidence_note}\nError: guards.crn at line {require_line}\nError: {ROOT_REQUIRE_ERROR}\n  {evidence_note}\n"
             ),
             "{command:?}"
         );
@@ -1823,26 +1828,30 @@ fn no_evidence_directory_is_root_for_upstream_and_module_info() {
 #[test]
 fn direct_module_template_rejects_root_only_declarations() {
     for evidence in ["arguments {}\n", "require true, 'x'\n"] {
-        for (file, declaration, message) in [
+        for (file, declaration, message, end_column) in [
             (
                 "exports.crn",
                 "exports { value: Int = 1 }\n",
                 "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
+                8,
             ),
             (
                 "exports.crn",
                 "exports {}\n",
                 "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
+                8,
             ),
             (
                 "state.crn",
                 "removed { from = mock.test.resource 'old' }\n",
                 "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
+                8,
             ),
             (
                 "upstream.crn",
                 "let previous = upstream_state { source = '../upstream' }\n",
                 "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
+                4,
             ),
         ] {
             let directory = Directory::new("true");
@@ -1862,7 +1871,7 @@ fn direct_module_template_rejects_root_only_declarations() {
             assert_eq!(String::from_utf8(human.stdout).unwrap(), "Validating...\n");
             assert_eq!(
                 String::from_utf8(human.stderr).unwrap(),
-                format!("Error: {message}\n")
+                format!("Error: checked/{file}:1:1: {message}\n")
             );
             let output = directory.run(&["validate", "--json", "checked"]);
             assert_eq!(output.status.code(), Some(1));
@@ -1871,7 +1880,7 @@ fn direct_module_template_rejects_root_only_declarations() {
             assert_eq!(report["errors"].as_array().unwrap().len(), 1);
             assert_eq!(
                 report["errors"],
-                json!([{ "message": message, "severity": "error", "code": null, "location": null }])
+                json!([{ "message": message, "severity": "error", "code": null, "location": {"file": format!("checked/{file}"), "range": {"start": {"line": 1, "column": 1}, "end": {"line": 1, "column": end_column}}} }])
             );
         }
     }
@@ -2078,6 +2087,241 @@ fn incomplete_root_directory_reports_only_the_sibling_load_failure() {
         assert_eq!(
             report["errors"],
             json!([{"message":message,"severity":"error","code":null,"location":{"file":"z-broken.crn","range":range}}])
+        );
+    }
+}
+
+fn round12_upstream_provider_fixture() -> (Directory, PathBuf) {
+    let directory = Directory::new("true");
+    directory.clear_root_require();
+    success(&directory.run(&["apply", "--auto-approve", "."]));
+    let upstream = directory.project.parent().unwrap().join("mod");
+    fs::create_dir(&upstream).unwrap();
+    fs::write(upstream.join("locals.crn"), "// independent sibling\n").unwrap();
+    fs::write(directory.project.join("providers.crn"), "backend local { path = 'carina.state.json' }\nprovider mock { password = prior.value ?? 'fallback' }\n").unwrap();
+    fs::write(
+        directory.project.join("upstream.crn"),
+        "let prior = upstream_state { source = '../mod' }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.project.join("main.crn"),
+        "let r = mock.test.resource { name = 'root' comment = 'planned update' }\n",
+    )
+    .unwrap();
+    (directory, upstream)
+}
+
+fn round12_write_upstream_state(upstream: &std::path::Path) {
+    let mut state = serde_json::to_value(carina_state::StateFile::new()).unwrap();
+    state["exports"] = json!({"value": "published"});
+    fs::write(
+        upstream.join("carina.state.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+}
+
+fn round12_assert_template_rejection(output: &Output, kind: &str, evidence_dir: &std::path::Path) {
+    assert_eq!(output.status.code(), Some(1), "{}", output_text(output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let message =
+        "upstream_state `prior`: source `../mod` is a module definition and has no state to read";
+    let note = format!(
+        "  Note: directory is a module definition because of the {kind} at {}:2.\n",
+        evidence_dir.join("declarations.crn").display()
+    );
+    assert_eq!(stderr.matches(message).count(), 1, "{stderr}");
+    assert!(stderr.contains(&note), "{stderr}");
+    assert!(!stderr.contains("PRIVATE_GUARD"), "{stderr}");
+}
+
+fn round12_template_blocks_state_command(args: &[&str]) {
+    for (declaration, kind) in [
+        ("require false, 'PRIVATE_GUARD'", "require statement"),
+        ("arguments {}", "arguments block"),
+    ] {
+        for state in ["absent", "present", "corrupt"] {
+            let (directory, upstream) = round12_upstream_provider_fixture();
+            fs::write(
+                upstream.join("declarations.crn"),
+                format!("// authored module\n{declaration}\n"),
+            )
+            .unwrap();
+            match state {
+                "present" => round12_write_upstream_state(&upstream),
+                "corrupt" => {
+                    fs::write(upstream.join("carina.state.json"), "invalid state sentinel").unwrap()
+                }
+                "absent" => {}
+                _ => unreachable!(),
+            }
+            let paths = [
+                directory.project.join("carina.state.json"),
+                directory.home.join("mock-state.json"),
+                upstream.join("carina.state.json"),
+            ];
+            let before = paths.each_ref().map(|path| fs::read(path).ok());
+            let output = directory.run(args);
+            round12_assert_template_rejection(&output, kind, &upstream);
+            assert!(!output_text(&output).contains("invalid state sentinel"));
+            assert_eq!(before, paths.each_ref().map(|path| fs::read(path).ok()));
+        }
+    }
+}
+
+#[test]
+fn round12_upstream_template_blocks_destroy_before_state_read() {
+    round12_template_blocks_state_command(&["destroy", "--auto-approve", "."]);
+}
+
+#[test]
+fn round12_upstream_template_blocks_state_refresh_before_state_read() {
+    round12_template_blocks_state_command(&["state", "refresh", "."]);
+}
+
+#[test]
+fn round12_upstream_template_plan_and_live_apply_render_evidence() {
+    for (declaration, kind) in [
+        ("require false, 'PRIVATE_GUARD'", "require statement"),
+        ("arguments {}", "arguments block"),
+    ] {
+        let (directory, upstream) = round12_upstream_provider_fixture();
+        fs::write(
+            upstream.join("declarations.crn"),
+            format!("// authored module\n{declaration}\n"),
+        )
+        .unwrap();
+        for args in [
+            &["plan", "."][..],
+            &["plan", "--out", "rejected.plan", "."],
+            &["apply", "--auto-approve", "."],
+        ] {
+            let output = directory.run(args);
+            round12_assert_template_rejection(&output, kind, std::path::Path::new("../mod"));
+            assert!(output.stdout.is_empty(), "{}", output_text(&output));
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr),
+                format!(
+                    "Error: ./upstream.crn:1:39: upstream_state `prior`: source `../mod` is a module definition and has no state to read\n  Note: directory is a module definition because of the {kind} at ../mod/declarations.crn:2.\n"
+                )
+            );
+            assert!(!directory.project.join("rejected.plan").exists());
+        }
+    }
+}
+
+#[test]
+fn round12_saved_plan_apply_rejects_current_upstream_template() {
+    for (declaration, kind) in [
+        ("require false, 'PRIVATE_GUARD'", "require statement"),
+        ("arguments {}", "arguments block"),
+    ] {
+        let (directory, upstream) = round12_upstream_provider_fixture();
+        fs::write(
+            upstream.join("declarations.crn"),
+            "exports { value: String = 'published' }\n",
+        )
+        .unwrap();
+        round12_write_upstream_state(&upstream);
+        success(&directory.run(&["plan", "--out", "saved.plan", "."]));
+        fs::write(
+            upstream.join("declarations.crn"),
+            format!("// authored module\n{declaration}\n"),
+        )
+        .unwrap();
+        fs::write(upstream.join("carina.state.json"), "invalid state sentinel").unwrap();
+        let paths = [
+            directory.project.join("carina.state.json"),
+            directory.home.join("mock-state.json"),
+            upstream.join("carina.state.json"),
+            directory.project.join("saved.plan"),
+        ];
+        let before = paths.each_ref().map(|path| fs::read(path).unwrap());
+        round12_assert_template_rejection(
+            &directory.run(&["apply", "--auto-approve", "saved.plan"]),
+            kind,
+            &upstream,
+        );
+        assert_eq!(before, paths.each_ref().map(|path| fs::read(path).unwrap()));
+    }
+}
+
+#[test]
+fn round12_secret_provider_keeps_template_evidence_without_map_keys() {
+    for args in [
+        &["destroy", "--auto-approve", "."][..],
+        &["state", "refresh", "."],
+    ] {
+        let (directory, upstream) = round12_upstream_provider_fixture();
+        fs::write(directory.project.join("providers.crn"), "backend local { path = 'carina.state.json' }\nprovider mock { password = secret({ PRIVATE_UPSTREAM_MAP_KEY = prior.value ?? 'fallback' }) }\n").unwrap();
+        fs::write(
+            upstream.join("declarations.crn"),
+            "// authored module\narguments {}\n",
+        )
+        .unwrap();
+        fs::write(upstream.join("carina.state.json"), "invalid state sentinel").unwrap();
+        let paths = [
+            directory.project.join("carina.state.json"),
+            directory.home.join("mock-state.json"),
+            upstream.join("carina.state.json"),
+        ];
+        let before = paths.each_ref().map(|path| fs::read(path).unwrap());
+        let output = directory.run(args);
+        round12_assert_template_rejection(&output, "arguments block", &upstream);
+        assert!(!output_text(&output).contains("PRIVATE_UPSTREAM_MAP_KEY"));
+        assert_eq!(before, paths.each_ref().map(|path| fs::read(path).unwrap()));
+    }
+}
+
+#[test]
+fn round12_placement_keeps_the_block_location_in_human_json_and_lsp() {
+    for (block, width) in [("arguments", 9), ("attributes", 10)] {
+        let directory = Directory::new("true");
+        directory.clear_root_require();
+        let path = directory.project.join("declarations.crn");
+        let source = format!("// authored block\n  {block} {{}}\n");
+        fs::write(&path, &source).unwrap();
+        let message = format!(
+            "{block} blocks are only valid inside module definitions, not in root configurations."
+        );
+        let human = directory.run(&["validate", "."]);
+        assert_eq!(human.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&human.stderr)
+                .contains(&format!("Error: declarations.crn:2:3: {message}\n")),
+            "{}",
+            output_text(&human)
+        );
+        let output = directory.run(&["validate", "--json", "."]);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["errors"][0]["location"],
+            json!({"file":"declarations.crn", "range":{"start":{"line":2,"column":3},"end":{"line":2,"column":3+width}}})
+        );
+        let providers = Arc::new(loaded_provider_snapshot_from_factories(
+            Arc::new(vec![Box::new(ConfiguredBuiltinMock::new(
+                MockBehavior::default(),
+                MockScope::memory(),
+            ))]),
+            SchemaRegistry::new(),
+            carina_core::EnvironmentSnapshot::empty(),
+        ));
+        let diagnostics = DiagnosticEngine::new(providers.clone(), vec!["mock".into()]).analyze(
+            &Document::new_with_path(
+                source,
+                path.clone(),
+                Arc::new(providers.provider_context().as_provider_context().clone()),
+            ),
+            Some(&path),
+        );
+        let finding = diagnostics
+            .iter()
+            .find(|finding| finding.message == message)
+            .unwrap();
+        assert_eq!(
+            finding.range,
+            Range::new(Position::new(1, 2), Position::new(1, 2 + width))
         );
     }
 }

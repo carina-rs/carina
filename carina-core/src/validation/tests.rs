@@ -4454,11 +4454,17 @@ fn arguments_with_backend_errors() {
     );
     let error = validate_no_module_declarations_in_root(parsed.parsed()).unwrap_err();
     assert_eq!(
-        error.to_string(),
+        error.detail().to_string(),
         format!(
             "arguments blocks are only valid inside module definitions, not in root configurations.\nNote: directory is a root configuration because of the backend block at {}:2.",
             crate::paths::DisplayPath::for_diagnostics(
-                error.root_evidence().unwrap().location().file().path()
+                error
+                    .detail()
+                    .root_evidence()
+                    .unwrap()
+                    .location()
+                    .file()
+                    .path()
             )
         )
     );
@@ -4469,11 +4475,17 @@ fn arguments_with_provider_errors() {
     let parsed = admitted_placement_directory("arguments { vpc_cidr: String }\nprovider aws {}\n");
     let error = validate_no_module_declarations_in_root(parsed.parsed()).unwrap_err();
     assert_eq!(
-        error.to_string(),
+        error.detail().to_string(),
         format!(
             "arguments blocks are only valid inside module definitions, not in root configurations.\nNote: directory is a root configuration because of the provider block at {}:2.",
             crate::paths::DisplayPath::for_diagnostics(
-                error.root_evidence().unwrap().location().file().path()
+                error
+                    .detail()
+                    .root_evidence()
+                    .unwrap()
+                    .location()
+                    .file()
+                    .path()
             )
         )
     );
@@ -4486,7 +4498,7 @@ fn authored_arguments_in_root_are_rejected_regardless_of_entries() {
             let parsed = admitted_placement_directory(&format!("{root}\n{block}\n"));
             let error = validate_no_module_declarations_in_root(parsed.parsed()).unwrap_err();
             assert_eq!(
-                error.to_string(),
+                error.detail().to_string(),
                 format!(
                     "arguments blocks are only valid inside module definitions, not in root configurations.\nNote: directory is a root configuration because of the {} block at {}:1.",
                     if root.starts_with("provider") {
@@ -4495,7 +4507,13 @@ fn authored_arguments_in_root_are_rejected_regardless_of_entries() {
                         "backend"
                     },
                     crate::paths::DisplayPath::for_diagnostics(
-                        error.root_evidence().unwrap().location().file().path()
+                        error
+                            .detail()
+                            .root_evidence()
+                            .unwrap()
+                            .location()
+                            .file()
+                            .path()
                     )
                 ),
                 "{root}; {block}"

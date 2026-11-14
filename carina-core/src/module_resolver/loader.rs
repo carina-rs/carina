@@ -15,6 +15,7 @@ use super::error::ModuleError;
 /// files were still separate.
 pub struct LoadedModule {
     directory: ResolvedPath,
+    verdict: crate::config_loader::CompleteDirectoryVerdict,
     pub parsed: ParsedFile,
     pub duplicate_declarations: Vec<crate::config_loader::DuplicateDeclaration>,
 }
@@ -64,7 +65,7 @@ impl ModuleLoadError {
     pub fn into_errors(self) -> Vec<ModuleError> {
         let error = match self {
             Self::Unavailable(error) => error,
-            Self::NotModule { error, .. } => *error,
+            Self::NotModule { error, imports: _ } => *error,
         };
         match error {
             ModuleError::Multiple(errors) => errors.into_vec(),
@@ -190,30 +191,23 @@ pub(crate) fn load_imported_directory(
     let duplicate_declarations =
         crate::config_loader::find_duplicate_declarations(&dir_path.source_label(), &parsed_files);
     let mut merged = parsed_files.empty_assembly();
+    let (verdict, parsed_files) = parsed_files.into_parts();
     for (_, parsed) in parsed_files {
         crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
     }
     let module = LoadedModule {
         directory: dir_path.clone(),
+        verdict,
         parsed: merged,
         duplicate_declarations,
     };
     // The issued verdict is the importability decision. A root cannot escape
     // rejection even if a public AST list is later changed: the evidence itself
     // still identifies a prohibited root block.
-    match module.parsed.directory_verdict() {
-        crate::config_loader::DirectoryVerdict::Root(root) => {
-            let error = ModuleError::from_errors(module.placement_errors()).unwrap_or_else(|| {
-                match root.evidence() {
-                    crate::config_loader::RootEvidence::Provider { .. } => {
-                        ModuleError::ProviderInModule
-                    }
-                    crate::config_loader::RootEvidence::Backend { .. } => {
-                        ModuleError::BackendInModule
-                    }
-                }
-                .with_root_evidence(root.evidence().clone())
-            });
+    match module.verdict {
+        crate::config_loader::DirectoryVerdict::Root(_) => {
+            let error = ModuleError::from_errors(module.placement_errors())
+                .expect("issued root evidence supplies at least one import prohibition");
             return Err(ModuleLoadError::NotModule {
                 error: Box::new(error),
                 imports: module.parsed.uses,
@@ -224,9 +218,6 @@ pub(crate) fn load_imported_directory(
         // preserving independent diagnostics from an otherwise importable body.
         crate::config_loader::DirectoryVerdict::ModuleTemplate(_)
         | crate::config_loader::DirectoryVerdict::NoEvidence(_) => {}
-        crate::config_loader::DirectoryVerdict::Unknown(_) => {
-            unreachable!("a successfully parsed complete directory has an issued verdict")
-        }
     }
     let mut module = module;
     crate::parser::retained::judge_configuration(&mut module.parsed, schemas, config);
@@ -235,7 +226,7 @@ pub(crate) fn load_imported_directory(
 
 impl LoadedModule {
     pub(crate) fn placement_errors(&self) -> Vec<ModuleError> {
-        let root = self.parsed.directory_verdict().root();
+        let root = self.verdict.root();
         let provider = root
             .and_then(|root| root.provider_evidence())
             .map(|evidence| ModuleError::ProviderInModule.with_root_evidence(evidence.clone()));

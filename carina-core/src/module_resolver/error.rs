@@ -265,27 +265,93 @@ impl ModuleError {
     /// Decompose only evidence-bearing import rejections. Other resolver
     /// failures keep their established grouping and source rendering.
     pub(crate) fn into_root_evidence_errors(self) -> Vec<Self> {
-        if self.root_evidence().is_none() {
+        self.decompose_root_evidence_errors(false)
+    }
+
+    fn decompose_root_evidence_errors(self, inherited_evidence: bool) -> Vec<Self> {
+        if !inherited_evidence && self.root_evidence().is_none() {
             return vec![self];
         }
         match self {
             Self::Multiple(errors) => errors
                 .into_vec()
                 .into_iter()
-                .flat_map(Self::into_root_evidence_errors)
+                .flat_map(|error| error.decompose_root_evidence_errors(inherited_evidence))
                 .collect(),
             Self::OwnedByCalls { calls, error } => error
-                .into_root_evidence_errors()
+                .decompose_root_evidence_errors(inherited_evidence)
                 .into_iter()
                 .map(|error| error.with_owning_calls(calls.clone()))
                 .collect(),
             Self::AtCall { call, error } => error
-                .into_root_evidence_errors()
+                .decompose_root_evidence_errors(inherited_evidence)
                 .into_iter()
                 .map(|error| error.with_failing_call(call.clone()))
                 .collect(),
-            // Every other variant is retained, including future diagnostic kinds.
-            error => vec![error],
+            Self::WithRootEvidence { error, root } => error
+                .decompose_root_evidence_errors(true)
+                .into_iter()
+                .map(|error| error.with_root_evidence(root.clone()))
+                .collect(),
+            Self::WithProviderTypeWarnings { error, warnings } => error
+                .decompose_root_evidence_errors(inherited_evidence)
+                .into_iter()
+                .map(|error| Self::WithProviderTypeWarnings {
+                    error: Box::new(error),
+                    warnings: warnings.clone(),
+                })
+                .collect(),
+            error @ (Self::AnalysisInvariant(_)
+            | Self::NoConfigurationFiles { path: _ }
+            | Self::NotFound(_)
+            | Self::CircularImport(_)
+            | Self::MissingArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::InvalidArgumentType {
+                module: _,
+                argument: _,
+                mismatch: _,
+            }
+            | Self::BareStructuralHandleArgument {
+                module: _,
+                argument: _,
+                source_path: _,
+                line: _,
+                message: _,
+            }
+            | Self::ArgumentValueAccess {
+                module: _,
+                source_path: _,
+                line: _,
+                diagnostic: _,
+            }
+            | Self::DroppedConditionalBinding {
+                binding: _,
+                condition: _,
+                source_path: _,
+                line: _,
+            }
+            | Self::UnexpandedModuleTemplate { context: _ }
+            | Self::ReferenceType(_)
+            | Self::Io(_)
+            | Self::Parse(_)
+            | Self::ParseInFile { path: _, error: _ }
+            | Self::TypeResolution(_)
+            | Self::UnknownArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::UnknownModule(_)
+            | Self::ProviderInModule
+            | Self::StateBlockInModule
+            | Self::BackendInModule
+            | Self::UpstreamStateInModule
+            | Self::ExportsInModule
+            | Self::Constraint(_)
+            | Self::RequireOutsideModule(_)
+            | Self::NotADirectory { path: _ }) => vec![error],
         }
     }
 
@@ -1033,6 +1099,64 @@ fn display_source_path_relative_to(path: &Path, root: &Path) -> String {
 mod tests {
     use super::*;
     use crate::parser::ProviderContext;
+
+    #[test]
+    fn round12_root_evidence_decomposition_crosses_nested_wrappers() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        std::fs::write(directory.path().join("locals.crn"), "// sibling\n").unwrap();
+        let parsed = crate::config_loader::parse_directory(
+            &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let crate::config_loader::DirectoryVerdict::Root(root) =
+            parsed.complete_directory_verdict()
+        else {
+            panic!("root");
+        };
+        let evidence = root.evidence().clone();
+        let warning = crate::parser::ParseWarning {
+            file: Some("types.crn".into()),
+            line: 1,
+            kind: crate::parser::WarningKind::ProviderSchemasNotLoaded,
+            span: None,
+            message: "provider schema unavailable".into(),
+        };
+        for outer_evidence in [false, true] {
+            let multiple = ModuleError::from_errors(vec![
+                ModuleError::ProviderInModule,
+                ModuleError::BackendInModule,
+            ])
+            .unwrap();
+            let wrapped = if outer_evidence {
+                ModuleError::WithProviderTypeWarnings {
+                    error: Box::new(multiple),
+                    warnings: vec![warning.clone()],
+                }
+                .with_root_evidence(evidence.clone())
+            } else {
+                ModuleError::WithProviderTypeWarnings {
+                    error: Box::new(multiple.with_root_evidence(evidence.clone())),
+                    warnings: vec![warning.clone()],
+                }
+            };
+            let leaves = wrapped.into_root_evidence_errors();
+            assert_eq!(leaves.len(), 2);
+            assert!(matches!(
+                leaves[0].root_cause(),
+                ModuleError::ProviderInModule
+            ));
+            assert!(matches!(
+                leaves[1].root_cause(),
+                ModuleError::BackendInModule
+            ));
+            for leaf in leaves {
+                assert_eq!(leaf.root_evidence(), Some(&evidence));
+                assert_eq!(leaf.provider_type_warnings(), vec![&warning]);
+            }
+        }
+    }
 
     #[test]
     fn module_errors_stay_below_clippy_large_error_threshold() {

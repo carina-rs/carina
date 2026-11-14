@@ -708,7 +708,7 @@ fn validate_and_resolve_configuration(
         Ok(tree) => errors.extend(
             carina_core::validation::configuration_placement_diagnostics(&tree)
                 .into_iter()
-                .map(|finding| AppError::RootDeclaration(Box::new(finding.into_parts().1))),
+                .map(|finding| AppError::RootDeclaration(Box::new(finding))),
         ),
         Err(error) => errors.push(AppError::AnalysisInvariant(error)),
     }

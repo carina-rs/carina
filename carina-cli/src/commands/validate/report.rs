@@ -295,6 +295,9 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
         AppError::ExpressionType(finding) => {
             Diagnostic::located(finding.detail().to_string(), finding.location())
         }
+        AppError::RootDeclaration(finding) => {
+            Diagnostic::located(finding.detail().to_string(), finding.location())
+        }
         AppError::DependsOn(finding) => {
             Diagnostic::located(finding.detail().to_string(), finding.location())
         }
