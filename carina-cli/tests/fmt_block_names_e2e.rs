@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::Arc;
@@ -107,7 +107,7 @@ fn formatting_factory_builder() -> FactoryBuilder {
                 )
             })
             .collect();
-        (factories, HashMap::new(), fingerprint)
+        (factories, BTreeMap::new(), fingerprint)
     })
 }
 

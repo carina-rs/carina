@@ -2087,7 +2087,7 @@ fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &Schema
         let directory = carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
             &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
             context,
-            &HashMap::new(),
+            &indexmap::IndexMap::new(),
         )
         .expect("the fixture directory must parse before module expansion");
         let signatures = carina_core::module_resolver::load_resolved_module_signatures(
@@ -2814,7 +2814,7 @@ fn standalone_module_type_resolution_keeps_cli_location_and_lsp_range() {
         match carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
             &carina_core::paths::ResolvedPath::new(&module).unwrap(),
             &strict_context,
-            &HashMap::new(),
+            &indexmap::IndexMap::new(),
         ) {
             Ok(_result) => panic!("the enriched directory parse must reject NoSuchType"),
             Err(failure) => failure,

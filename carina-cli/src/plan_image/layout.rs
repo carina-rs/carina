@@ -869,6 +869,8 @@ fn cycle_removed_ordering_edges(
                 .push(edge.to.clone());
         }
     }
+    #[allow(clippy::iter_over_hash_type)]
+    // keyed rebuild: adjacency lists are independently sorted and deduplicated
     for targets in outgoing.values_mut() {
         work::visit();
         targets.sort_by_key(|id| layout_node_sort_key(model, id));
@@ -1131,6 +1133,8 @@ fn longest_path_layers(model: &GraphModel, edges: &[OrientedEdge]) -> HashMap<Gr
             *indegree.entry(edge.to.clone()).or_default() += 1;
         }
     }
+    #[allow(clippy::iter_over_hash_type)]
+    // keyed rebuild: adjacency lists are independently sorted and deduplicated
     for targets in outgoing.values_mut() {
         work::visit();
         targets.sort_by_key(|(id, _)| id.stable_key());
@@ -1681,6 +1685,8 @@ fn relax_coordinates(
         neighbors.entry(from.clone()).or_default().push(to.clone());
         neighbors.entry(to.clone()).or_default().push(from.clone());
     }
+    #[allow(clippy::iter_over_hash_type)]
+    // keyed rebuild: neighbor lists are independently sorted and deduplicated
     for adjacent in neighbors.values_mut() {
         work::visit();
         adjacent.sort_by_key(LayoutVertexId::stable_key);
@@ -1988,6 +1994,8 @@ fn spread_card_ports(routes: &mut [EdgeRoute], node_rects: &HashMap<GraphNodeId,
         }
     }
 
+    #[allow(clippy::iter_over_hash_type)]
+    // keyed rebuild: disjoint endpoint groups assign gates before routes expand
     for ((card, side), endpoints) in &mut groups {
         work::visit();
         let Some(rect) = node_rects.get(card) else {
@@ -2549,6 +2557,8 @@ mod tests {
             "filtered executor graph must be acyclic for {fixture_name}: {:?}",
             reversed_edges
         );
+        #[allow(clippy::iter_over_hash_type)]
+        // commutative: every expected edge is checked independently
         for (from, to) in expected {
             let from_rect = layout.node(&from).expect("visible executor edge source");
             let to_rect = layout.node(&to).expect("visible executor edge target");
@@ -3818,6 +3828,8 @@ mod tests {
                 .or_default()
                 .push(edge.to.clone());
         }
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: test adjacency lists are independently sorted and deduplicated
         for targets in accepted.values_mut() {
             targets.sort_by_key(GraphNodeId::stable_key);
             targets.dedup();

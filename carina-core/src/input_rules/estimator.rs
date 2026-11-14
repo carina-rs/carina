@@ -165,20 +165,26 @@ struct Summary {
 
 #[derive(Clone, Copy)]
 struct Query<'a> {
-    predicate: &'a InputPredicate<crate::schema::CompiledPattern>,
+    predicate: &'a StringPredicate<'a, CompiledPattern>,
     limit: usize,
     supported_window: bool,
 }
 
 impl<'a> Query<'a> {
-    fn new(predicate: &'a InputPredicate<crate::schema::CompiledPattern>) -> Self {
-        use InputPredicate::*;
-        let limit = match predicate {
+    fn new(predicate: &'a StringPredicate<'a, CompiledPattern>) -> Self {
+        use StringPredicateKind::*;
+        let limit = match predicate.kind() {
             NoSubstring(token) => token.as_str().chars().count().saturating_sub(1),
             NoPrefix(token) | NoSuffix(token) => token.as_str().chars().count(),
             ForbiddenPrefix { prefix, .. } => prefix.as_str().chars().count(),
             NotIpv4 => 16,
-            _ => 1,
+            Length { .. }
+            | AllowedChars(_)
+            | FirstChar(_)
+            | LastChar(_)
+            | NoAdjacent { .. }
+            | Matches(_)
+            | NotMatches(_) => 1,
         };
         Self {
             predicate,
@@ -201,8 +207,8 @@ impl Summary {
         } else {
             alphabet.clone()
         };
-        let occurrence = match query.predicate {
-            InputPredicate::NoSubstring(token) => {
+        let occurrence = match query.predicate.kind() {
+            StringPredicateKind::NoSubstring(token) => {
                 let chars = token.as_str().chars().collect::<Vec<_>>();
                 let fits = length.max.is_none_or(|max| max >= chars.len() as u64);
                 Occurrence {
@@ -213,7 +219,7 @@ impl Summary {
                             .all(|ch| alphabet.subset(&Characters::one(*ch))),
                 }
             }
-            InputPredicate::NoAdjacent { left, right } => Occurrence {
+            StringPredicateKind::NoAdjacent { left, right } => Occurrence {
                 possible: length.max.is_none_or(|max| max >= 2)
                     && !alphabet.disjoint(&Characters::from_set(left))
                     && !alphabet.disjoint(&Characters::from_set(right)),
@@ -221,13 +227,32 @@ impl Summary {
                     && alphabet.subset(&Characters::from_set(left))
                     && alphabet.subset(&Characters::from_set(right)),
             },
-            _ => Occurrence::default(),
+            StringPredicateKind::Length { .. }
+            | StringPredicateKind::AllowedChars(_)
+            | StringPredicateKind::FirstChar(_)
+            | StringPredicateKind::LastChar(_)
+            | StringPredicateKind::NoPrefix(_)
+            | StringPredicateKind::ForbiddenPrefix { .. }
+            | StringPredicateKind::NoSuffix(_)
+            | StringPredicateKind::NotIpv4
+            | StringPredicateKind::Matches(_)
+            | StringPredicateKind::NotMatches(_) => Occurrence::default(),
         };
-        let bad_character = match query.predicate {
-            InputPredicate::AllowedChars(set) => {
+        let bad_character = match query.predicate.kind() {
+            StringPredicateKind::AllowedChars(set) => {
                 length.min > 0 && alphabet.disjoint(&Characters::from_set(set))
             }
-            _ => false,
+            StringPredicateKind::Length { .. }
+            | StringPredicateKind::FirstChar(_)
+            | StringPredicateKind::LastChar(_)
+            | StringPredicateKind::NoSubstring(_)
+            | StringPredicateKind::NoPrefix(_)
+            | StringPredicateKind::ForbiddenPrefix { .. }
+            | StringPredicateKind::NoSuffix(_)
+            | StringPredicateKind::NoAdjacent { .. }
+            | StringPredicateKind::NotIpv4
+            | StringPredicateKind::Matches(_)
+            | StringPredicateKind::NotMatches(_) => false,
         };
         Self {
             length,
@@ -275,18 +300,27 @@ impl Summary {
                 .map(|ch| Characters::one(*ch))
                 .collect(),
         ]);
-        let found = match query.predicate {
-            InputPredicate::NoSubstring(token) => value.contains(token.as_str()),
-            InputPredicate::NoAdjacent { left, right } => chars
+        let found = match query.predicate.kind() {
+            StringPredicateKind::NoSubstring(token) => value.contains(token.as_str()),
+            StringPredicateKind::NoAdjacent { left, right } => chars
                 .windows(2)
                 .any(|pair| left.contains(pair[0]) && right.contains(pair[1])),
-            _ => false,
+            StringPredicateKind::Length { .. }
+            | StringPredicateKind::AllowedChars(_)
+            | StringPredicateKind::FirstChar(_)
+            | StringPredicateKind::LastChar(_)
+            | StringPredicateKind::NoPrefix(_)
+            | StringPredicateKind::ForbiddenPrefix { .. }
+            | StringPredicateKind::NoSuffix(_)
+            | StringPredicateKind::NotIpv4
+            | StringPredicateKind::Matches(_)
+            | StringPredicateKind::NotMatches(_) => false,
         };
         summary.occurrence = Occurrence {
             possible: found,
             mandatory: found,
         };
-        if let InputPredicate::AllowedChars(set) = query.predicate {
+        if let StringPredicateKind::AllowedChars(set) = query.predicate.kind() {
             summary.bad_character = chars.iter().any(|ch| !set.contains(*ch));
         }
         summary.finite = Some(vec![value.to_string()]);
@@ -397,10 +431,28 @@ fn token_occurrence(window: &[Characters], token: &str, ignore_ascii_case: bool)
 }
 
 fn crossing_occurrences(a: &Windows, b: &Windows, query: &Query<'_>) -> Occurrence {
-    use InputPredicate::*;
-    if !matches!(query.predicate, NoSubstring(_) | NoAdjacent { .. }) {
-        return Occurrence::default();
+    use StringPredicateKind::*;
+    enum Crossing<'a> {
+        Substring(&'a str),
+        Adjacent {
+            left: &'a CharSet,
+            right: &'a CharSet,
+        },
     }
+    let crossing = match query.predicate.kind() {
+        NoSubstring(token) => Crossing::Substring(token.as_str()),
+        NoAdjacent { left, right } => Crossing::Adjacent { left, right },
+        Length { .. }
+        | AllowedChars(_)
+        | FirstChar(_)
+        | LastChar(_)
+        | NoPrefix(_)
+        | ForbiddenPrefix { .. }
+        | NoSuffix(_)
+        | NotIpv4
+        | Matches(_)
+        | NotMatches(_) => return Occurrence::default(),
+    };
     if !query.supported_window {
         return Occurrence {
             possible: true,
@@ -413,23 +465,23 @@ fn crossing_occurrences(a: &Windows, b: &Windows, query: &Query<'_>) -> Occurren
     };
     for a in &a.0 {
         for b in &b.0 {
-            let found = match query.predicate {
-                NoSubstring(token) => {
+            let found = match crossing {
+                Crossing::Substring(token) => {
                     let joined = a.iter().chain(b).cloned().collect::<Vec<_>>();
-                    let size = token.as_str().chars().count();
+                    let size = token.chars().count();
                     let mut found = Occurrence::default();
                     for start in 0..a.len() {
                         if start + size <= a.len() || start + size > joined.len() {
                             continue;
                         }
                         let occurrence =
-                            token_occurrence(&joined[start..start + size], token.as_str(), false);
+                            token_occurrence(&joined[start..start + size], token, false);
                         found.possible |= occurrence.possible;
                         found.mandatory |= occurrence.mandatory;
                     }
                     found
                 }
-                NoAdjacent { left, right } => {
+                Crossing::Adjacent { left, right } => {
                     a.last()
                         .zip(b.first())
                         .map_or(Occurrence::default(), |(a, b)| Occurrence {
@@ -439,7 +491,6 @@ fn crossing_occurrences(a: &Windows, b: &Windows, query: &Query<'_>) -> Occurren
                                 && b.subset(&Characters::from_set(right)),
                         })
                 }
-                _ => unreachable!(),
             };
             result.possible |= found.possible;
             result.mandatory &= found.mandatory;
@@ -806,16 +857,26 @@ impl Estimator<'_> {
 /// Every owner enters through its bound, admitted rule and concrete instance.
 pub(super) fn estimate(
     applicable: &BoundInputRule<'_, '_>,
+    predicate: &StringPredicate<'_, CompiledPattern>,
     input: rule_input::EstimatorInput<'_>,
 ) -> InputVerdict {
-    let (expression, keys) = input.into_parts();
     let rule = applicable.rule;
-    if matches!(
-        rule.predicate(),
-        InputPredicate::Matches(_) | InputPredicate::NotMatches(_)
-    ) {
-        return InputVerdict::Undecided;
+    match predicate.kind() {
+        StringPredicateKind::Matches(_) | StringPredicateKind::NotMatches(_) => {
+            return InputVerdict::Undecided;
+        }
+        StringPredicateKind::Length { .. }
+        | StringPredicateKind::AllowedChars(_)
+        | StringPredicateKind::FirstChar(_)
+        | StringPredicateKind::LastChar(_)
+        | StringPredicateKind::NoSubstring(_)
+        | StringPredicateKind::NoPrefix(_)
+        | StringPredicateKind::ForbiddenPrefix { .. }
+        | StringPredicateKind::NoSuffix(_)
+        | StringPredicateKind::NoAdjacent { .. }
+        | StringPredicateKind::NotIpv4 => {}
     }
+    let (expression, keys) = input.into_parts();
     let defs = applicable.site.schema.as_schema().defs();
     let mut estimator = Estimator {
         types: Some(expression.declarations()),
@@ -825,7 +886,7 @@ pub(super) fn estimate(
                 _ => None,
             }
         }),
-        query: Query::new(rule.predicate()),
+        query: Query::new(predicate),
         steps: 0,
     };
     let summary = estimator.at_path(expression.value(), &[], keys, 0);
@@ -860,11 +921,11 @@ fn key_spelling_is_stable(
 }
 
 fn decide(summary: Summary, rule: &InputRule<Compiled>, query: &Query<'_>) -> InputVerdict {
-    use InputPredicate::*;
+    use StringPredicateKind::*;
     let result = if let Some(values) = &summary.finite {
         let passes = values
             .iter()
-            .map(|value| evaluate_string(rule, value).is_ok())
+            .map(|value| evaluate_string(query.predicate, value))
             .collect::<Vec<_>>();
         if passes.iter().all(|pass| *pass) {
             Some(true)
@@ -874,7 +935,7 @@ fn decide(summary: Summary, rule: &InputRule<Compiled>, query: &Query<'_>) -> In
             None
         }
     } else {
-        match rule.predicate() {
+        match query.predicate.kind() {
             Length { min, max } => {
                 let accepted = LengthInterval::from_bounds(Some(&(*min, *max)));
                 if accepted.contains(summary.length) {
@@ -897,7 +958,7 @@ fn decide(summary: Summary, rule: &InputRule<Compiled>, query: &Query<'_>) -> In
                 }
             }
             FirstChar(set) | LastChar(set) => {
-                let endpoint = if matches!(rule.predicate(), FirstChar(_)) {
+                let endpoint = if matches!(query.predicate.kind(), FirstChar(_)) {
                     &summary.first
                 } else {
                     &summary.last
@@ -923,7 +984,7 @@ fn decide(summary: Summary, rule: &InputRule<Compiled>, query: &Query<'_>) -> In
                 &summary,
                 token.as_str(),
                 false,
-                matches!(rule.predicate(), NoSuffix(_)),
+                matches!(query.predicate.kind(), NoSuffix(_)),
                 query,
             ),
             ForbiddenPrefix {
@@ -936,7 +997,7 @@ fn decide(summary: Summary, rule: &InputRule<Compiled>, query: &Query<'_>) -> In
                 .iter()
                 .any(|window| window_can_be_ipv4(window)))
             .then_some(true),
-            Present | Absent | Equals(_) | Matches(_) | NotMatches(_) => None,
+            Matches(_) | NotMatches(_) => None,
         }
     };
     match result {
@@ -1060,6 +1121,9 @@ mod tests {
         let predicate = InputPredicate::Length {
             min: Some(0),
             max: Some(10),
+        };
+        let PredicateClass::String(predicate) = predicate::classify(&predicate) else {
+            panic!("length is a string predicate");
         };
         let mut estimator = Estimator {
             types: None,

@@ -17,6 +17,8 @@ const V2_SECRET_PREFIX: &str = "$argon2id$";
 
 #[test]
 fn saved_plan_rejects_legacy_or_interpolated_constraint_strings_before_apply() {
+    use carina_cli::commands::plan::PlanFile;
+
     let scenario =
         Scenario::new("backend local { path = 'carina.state.json' }\nprovider mock {}\n");
     scenario.write_root_file("main.crn", "backend local { path = 'carina.state.json' }\nprovider mock {}\nlet vpc = mock.test.resource { name = 'vpc' }\nlet checked = use { source = './checked' }\nchecked { r = vpc }\n");
@@ -27,15 +29,20 @@ fn saved_plan_rejects_legacy_or_interpolated_constraint_strings_before_apply() {
     assert_success("save literal constraint", &scenario.plan());
     let original = read_json(&scenario.project.join("plan.json"));
     let current_version = original["version"].clone();
-    assert_eq!(current_version, 45);
+    assert_eq!(current_version, PlanFile::CURRENT_VERSION);
+    let previous_version = PlanFile::CURRENT_VERSION - 1;
+    let old_version_error = format!(
+        "Unsupported plan file version: {previous_version} (expected {})",
+        PlanFile::CURRENT_VERSION
+    );
     let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
     let provider_before = fs::read(&scenario.mock_state).ok();
 
     for (version, string, expected) in [
         (
-            Value::from(44),
+            Value::from(previous_version),
             "${secret('CANARY_4386')}",
-            "Unsupported plan file version: 44",
+            old_version_error.as_str(),
         ),
         (
             current_version.clone(),
@@ -52,9 +59,7 @@ fn saved_plan_rejects_legacy_or_interpolated_constraint_strings_before_apply() {
         document["version"] = version;
         document["compositions"][0]["pending_constraints"][0]["expression"]["Compare"]["rhs"]["String"] =
             Value::from(string);
-        let decode =
-            serde_json::from_value::<carina_cli::commands::plan::PlanFile>(document.clone())
-                .unwrap_err();
+        let decode = serde_json::from_value::<PlanFile>(document.clone()).unwrap_err();
         // The plan reader retains JSON coordinates, but has no project command.
         assert!(
             decode
@@ -1135,7 +1140,7 @@ fn saved_plan_rejects_changed_provider_config_secret_before_provider_call() {
     )];
     const CHANGED: &[(&str, &str)] = &[(
         "SAVED_PLAN_PROVIDER_ONLY_3861",
-        r#"{"fixture":{"Ok":{"Resolved":"CHANGED_PROVIDER_3861"}}}"#,
+        "CHANGED_PROVIDER_3861_NOT_JSON",
     )];
     let scenario = Scenario::new_with_wasm_provider(
         r#"backend local { path = "carina.state.json" }
@@ -1165,6 +1170,20 @@ mock.test.creation_constrained {
         rendered.contains("secret changed since the plan") && rendered.contains("carina plan"),
         "changed provider secret must produce replan guidance:\n{rendered}",
     );
+    for forbidden in [
+        "InvalidInput",
+        "invalid input",
+        "expected value",
+        "expected ident",
+        "invalid JSON",
+        "JSON parse",
+        "mock initialization failure",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "guest initialization ran before secret verification: {rendered}"
+        );
+    }
     assert_eq!(
         read_json(&scenario.project.join("plan.json"))["provider_artifacts"]["mock"]["kind"],
         "wasm"
@@ -1178,6 +1197,84 @@ mock.test.creation_constrained {
         state_before,
         "state must remain unchanged when provider-config verification fails",
     );
+}
+
+fn assert_saved_plan_uses_recorded_configuration(secret: bool, change_validation: bool) {
+    let delay = if secret { "secret(0)" } else { "0" };
+    let recorded = format!(
+        r#"provider mock {{
+  source = 'file://provider.wasm'
+  reference_table = '{{"fixture":{{"Ok":{{"Resolved":"RECORDED_SETTING_4411"}}}}}}'
+  validate_delay_millis = {delay}
+  validate_config_trap = false
+}}
+"#
+    );
+    let resource = "mock.test.creation_constrained { name = 'recorded-setting' }\n";
+    let scenario = Scenario::new_with_wasm_provider(
+        &format!("backend local {{ path = 'carina.state.json' }}\n{recorded}\n{resource}"),
+        &[],
+    );
+    scenario.write_main(resource);
+    scenario.write_root_file(
+        "backend.crn",
+        "backend local { path = 'carina.state.json' }\n",
+    );
+    scenario.write_root_file("providers.crn", &recorded);
+    assert_success("save recorded provider setting", &scenario.plan());
+    let plan = read_json(&scenario.project.join("plan.json"));
+    assert_eq!(
+        plan.pointer("/provider_configs/0/attributes/reference_table/String")
+            .and_then(Value::as_str),
+        Some(r#"{"fixture":{"Ok":{"Resolved":"RECORDED_SETTING_4411"}}}"#),
+    );
+    assert_eq!(plan["provider_artifacts"]["mock"]["kind"], "wasm");
+    if secret {
+        provider_attribute_placeholder_hash(&plan, "validate_delay_millis");
+    } else {
+        assert!(!plan.to_string().contains("RedactedSecret"));
+    }
+    let changed = if change_validation {
+        recorded.replace(
+            "validate_config_trap = false",
+            "validate_config_trap = true",
+        )
+    } else {
+        recorded.replace(
+            r#"{"fixture":{"Ok":{"Resolved":"RECORDED_SETTING_4411"}}}"#,
+            "UNRECORDED_CURRENT_SETTING_4411_NOT_JSON",
+        )
+    };
+    scenario.write_root_file("providers.crn", &changed);
+    let applied = scenario.apply_plan();
+    assert_success(
+        "apply must initialize with the recorded JSON, never the changed current table",
+        &applied,
+    );
+    assert_eq!(
+        state_resource_by_name(&scenario.state_json(), "recorded-setting")["attributes"]["name"],
+        "recorded-setting"
+    );
+}
+
+#[test]
+fn saved_plan_with_secret_initializes_the_recorded_provider_setting() {
+    assert_saved_plan_uses_recorded_configuration(true, false);
+}
+
+#[test]
+fn saved_plan_without_secret_initializes_the_recorded_provider_setting() {
+    assert_saved_plan_uses_recorded_configuration(false, false);
+}
+
+#[test]
+fn saved_plan_with_secret_validates_the_recorded_provider_setting() {
+    assert_saved_plan_uses_recorded_configuration(true, true);
+}
+
+#[test]
+fn saved_plan_without_secret_validates_the_recorded_provider_setting() {
+    assert_saved_plan_uses_recorded_configuration(false, true);
 }
 
 #[test]
@@ -3417,8 +3514,8 @@ fn current_saved_plan_root_and_nested_hashes_round_trip_byte_for_byte() {
     use carina_core::resource::{
         ConcreteValue, DeferredValue, SnapshotLeaf, Value as SnapshotTree,
     };
-    assert_eq!(PlanFile::CURRENT_VERSION, 45);
-    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v45.plan.json");
+    assert_eq!(PlanFile::CURRENT_VERSION, 46);
+    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v46.plan.json");
     let plan: PlanFile = serde_json::from_str(fixture).unwrap();
     assert_eq!(
         carina_core::utils::pretty_with_newline(&plan).unwrap(),

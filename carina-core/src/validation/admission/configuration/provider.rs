@@ -75,18 +75,15 @@ impl Deref for AnalyzedConfiguration {
 ///     assert_eq!(session.configuration().attributes(), config.attributes());
 /// }
 /// ```
-/// ```compile_fail
-/// use carina_core::provider::ProviderPlan;
+/// Configuration pending admission cannot be named; resource pending work remains available.
+///
+/// ```compile_fail,E0277
 /// use carina_core::validation::admission::{PendingAdmission, kind::ProviderConfigAttribute};
-/// fn pending(plan: &ProviderPlan, value: PendingAdmission<ProviderConfigAttribute>) {
-///     let _ = plan.session(&value); // forbidden: pending admission cannot construct a session
-/// }
+/// fn pending(_: Option<PendingAdmission<ProviderConfigAttribute>>) {}
 /// ```
 /// ```
-/// # use carina_core::provider::ProviderPlan;
-/// # use carina_core::validation::admission::{PendingAdmission, kind::ProviderConfigAttribute};
-/// # fn pending(plan: &ProviderPlan, value: PendingAdmission<ProviderConfigAttribute>) {
-/// # }
+/// use carina_core::validation::admission::{PendingAdmission, kind::ResourceAttribute};
+/// fn pending(_: Option<PendingAdmission<ResourceAttribute>>) {}
 /// ```
 /// ```compile_fail
 /// use carina_core::provider::ProviderReadyConfig;
@@ -155,7 +152,6 @@ trait PreparationPhase {
         destination: &Destination<kind::ProviderConfigAttribute>,
         key: &crate::parser::AttributeKey,
         value: &Value,
-        session: &dyn ProviderTypeCheckContext,
         lookup: &dyn ValidatedCustomTypeLookup,
         aggregate: &mut ConfigurationBuilder<kind::ProviderConfigAttribute>,
     ) -> Result<(), ConfigurationErrors>;
@@ -175,19 +171,18 @@ impl PreparationPhase for Analysis {
         destination: &Destination<kind::ProviderConfigAttribute>,
         key: &crate::parser::AttributeKey,
         value: &Value,
-        session: &dyn ProviderTypeCheckContext,
         lookup: &dyn ValidatedCustomTypeLookup,
         aggregate: &mut ConfigurationBuilder<kind::ProviderConfigAttribute>,
     ) -> Result<(), ConfigurationErrors> {
-        match field(destination, value, session, lookup)? {
-            Admission::Ready(placed) => {
+        match field(destination, value, lookup)? {
+            ConfigurationAdmission::Ready(placed) => {
                 aggregate.place(key.clone(), placed);
                 Ok(())
             }
-            Admission::Pending(pending) => Err(KnowledgeError::<
+            ConfigurationAdmission::Unresolved(sites) => Err(KnowledgeError::<
                 crate::resource::AbsoluteBindingAddress,
             >::UnresolvedAtBoundary {
-                sites: pending.inner.sites,
+                sites,
             }
             .into()),
         }
@@ -216,14 +211,10 @@ impl PreparationPhase for Complete {
         destination: &Destination<kind::ProviderConfigAttribute>,
         key: &crate::parser::AttributeKey,
         value: &Value,
-        session: &dyn ProviderTypeCheckContext,
         lookup: &dyn ValidatedCustomTypeLookup,
         aggregate: &mut ConfigurationBuilder<kind::ProviderConfigAttribute>,
     ) -> Result<(), ConfigurationErrors> {
-        aggregate.place(
-            key.clone(),
-            complete_field(destination, value, session, lookup)?,
-        );
+        aggregate.place(key.clone(), complete_field(destination, value, lookup)?);
         Ok(())
     }
     fn unresolved<P: PlaceholderKind, B: BindingAddress>(
@@ -444,7 +435,7 @@ fn prepare_fields<M: PreparationPhase, P: PlaceholderKind, B: BindingAddress>(
     let inputs =
         ProviderValidationInputs::collect(provider_name, fields.iter().map(|field| &field.value));
     let lookup = crate::parser::custom_type_lookup_for_factory(factory, &inputs);
-    let checked = crate::validation::deferred_types::TypeCheckSession::run(&catalog, |session| {
+    let checked = crate::validation::deferred_types::TypeCheckSession::run(&catalog, |_| {
         let mut aggregate = ConfigurationBuilder::new(Arc::clone(&declaration), instance.clone());
         for entry in &fields {
             let key = &entry.key;
@@ -454,11 +445,16 @@ fn prepare_fields<M: PreparationPhase, P: PlaceholderKind, B: BindingAddress>(
                 .to_expanded()
                 .and_then(Value::try_into_address_free_absolute)
             {
-                M::declared(destination, key, &known, session, &lookup, &mut aggregate)
+                M::declared(destination, key, &known, &lookup, &mut aggregate)
                     .map_err(|error| attribute_error(provider_name, key, error))?;
             } else {
-                field(destination, value, session, &lookup)
-                    .map_err(|error| attribute_error(provider_name, key, error))?;
+                // Only validate this non-expandable value; M::unresolved decides how to handle unresolved sites.
+                match field(destination, value, &lookup)
+                    .map_err(|error| attribute_error(provider_name, key, error))?
+                {
+                    ConfigurationAdmission::Ready(_) => {}
+                    ConfigurationAdmission::Unresolved(_) => {}
+                }
                 M::unresolved(value).map_err(|error| attribute_error(provider_name, key, error))?;
             }
         }

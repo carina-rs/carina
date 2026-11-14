@@ -4218,6 +4218,8 @@ pub fn reconcile_anonymous_module_instances<E, P, T>(
     let mut state_synthetic_by_module: HashMap<String, HashSet<SimHash>> = HashMap::new();
     let mut claimed_state_by_module: HashMap<String, HashSet<SimHash>> = HashMap::new();
 
+    #[allow(clippy::iter_over_hash_type)]
+    // keyed rebuild: state prefixes are unioned into keyed sets
     for (provider, resource_type) in &touched_types {
         let state_names = claims.screen_entries(
             provider,
@@ -4257,6 +4259,8 @@ pub fn reconcile_anonymous_module_instances<E, P, T>(
     // that filter, two distinct anonymous calls could collapse onto the same
     // state entry when only one of them existed before.
     let mut prefix_remap: HashMap<(String, SimHash), SimHash> = HashMap::new();
+    #[allow(clippy::iter_over_hash_type)]
+    // keyed rebuild: each module produces independent prefix-remap keys
     for (module, current_hashes) in &current_synthetic_by_module {
         let Some(state_hashes) = state_synthetic_by_module.get(module) else {
             continue;
@@ -4274,6 +4278,8 @@ pub fn reconcile_anonymous_module_instances<E, P, T>(
         if orphan_state_hashes.is_empty() {
             continue;
         }
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: distinct current hashes produce distinct keys; equal-distance candidates are rejected
         for current_hash in current_hashes {
             if state_hashes.contains(current_hash) {
                 continue;

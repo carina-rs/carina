@@ -38,7 +38,9 @@ use carina_core::resource::{ConcreteValue, State};
 use carina_core::shutdown::ShutdownToken;
 use carina_core::upstream_exports::AdmittedRemoteBindings;
 use carina_core::value::{RenderedKey, render_value};
-use carina_state::{LockInfo, RowBasis, StateBackend, StateFile};
+use carina_state::{
+    LockInfo, RowBasis, S3AutoCreate, S3Bootstrap, StateBackend, StateFile, StorageReadiness,
+};
 
 #[cfg(test)]
 use carina_core::parser::ProviderConfig;
@@ -49,10 +51,9 @@ use carina_core::parser::{
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::{
-    CheckExportsPreApplyInput, LivePlanFileValues, PlanFile, PlanFileDecodeError,
-    PreparedPlanIdentityData, ReloadedPlanFile, ResolvedProviderInputs, SavedDataSourceValue,
-    UpstreamMissingStatePolicy, collect_historical_display_attributes,
-    load_and_resolve_provider_configs, prepare_plan_identity_and_provider_inputs,
+    CheckExportsPreApplyInput, LivePlanFileValues, PlanFile, PlanFileDecodeError, ReloadedPlanFile,
+    ResolvedProviderInputs, SavedDataSourceValue, UpstreamMissingStatePolicy,
+    collect_historical_display_attributes, load_and_resolve_provider_configs,
 };
 use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
@@ -84,7 +85,6 @@ use crate::error::{
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     AddressedDataSourceReadInputs, ProjectedPhase1RefreshInputs, ProviderLoad, ValidatedConfig,
-    create_normalizers_from_configs_with_ctx, create_providers_from_configs_with_ctx,
     get_provider_with_ctx, module_constraint_plan_errors, prepare_default_provider_construction,
     read_managed_state_with_retry, refresh_loaded_orphan_with_retry,
 };
@@ -93,8 +93,8 @@ use crate::wiring::{ValidatedWiring, WiringContext, read_with_retry};
 use carina_core::hint::ProjectCommand;
 use saved_plan::{
     HistoricalResourceAddresses, InputCheckedExecutablePlanFile, InspectedPlanFile,
-    ProviderBoundPlanFile, ReloadedProviderBoundPlanFile, SavedPlanSecretCandidates,
-    SchemaCheckedPendingPlanFile,
+    ProviderBoundPlanFile, RehydratedProviderInputs, ReloadedProviderBoundPlanFile,
+    SavedPlanSecretCandidates, SchemaCheckedPendingPlanFile, VerifiedSavedPlanProviderInputs,
 };
 
 /// Re-export ExecutionResult as the public API for apply results.
@@ -187,7 +187,10 @@ fn saved_plan_secret_preparation_error(
     apply_target: ApplyTarget<'_>,
 ) -> AppError {
     match source {
-        error @ AppError::SavedPlanProviderScopeMismatch(_) => error,
+        error @ (AppError::SavedPlanProviderScopeMismatch(_)
+        | AppError::SavedPlanSecretVerification(_)
+        | AppError::SavedProviderConfig { .. }
+        | AppError::ValueWalk { .. }) => error,
         error => saved_plan_secret_evaluation_error(error, apply_target),
     }
 }
@@ -300,8 +303,25 @@ async fn prepare_bootstrap_permit(
         })
 }
 
-async fn create_auto_bootstrap_bucket(backend: &dyn StateBackend) -> Result<(), AppError> {
-    backend.create_bucket().await.map_err(AppError::Backend)
+#[derive(Debug)]
+enum S3BucketBootstrap<'a> {
+    Declared(&'a Resource),
+    AutoCreate(S3AutoCreate),
+}
+
+fn select_s3_bucket_bootstrap(
+    bootstrap: S3Bootstrap,
+    bucket_resource: Option<&Resource>,
+) -> Result<S3BucketBootstrap<'_>, AppError> {
+    if let Some(resource) = bucket_resource {
+        Ok(S3BucketBootstrap::Declared(resource))
+    } else {
+        Ok(S3BucketBootstrap::AutoCreate(
+            bootstrap
+                .auto_create()
+                .map_err(|disabled| AppError::Config(disabled.to_string()))?,
+        ))
+    }
 }
 
 async fn create_checked_bootstrap_resource(
@@ -1014,6 +1034,7 @@ fn diff_upstream_snapshot(
     current: &AdmittedRemoteBindings,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), String> {
+    #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
     for (binding, planned_attrs) in snapshot {
         match current.get(binding) {
             None => {
@@ -1030,6 +1051,7 @@ fn diff_upstream_snapshot(
             Some(_) => {}
         }
     }
+    #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
     for binding in current.keys() {
         if !snapshot.contains_key(binding) {
             return Err(format!(
@@ -1939,7 +1961,6 @@ async fn run_apply_with_observer_factory(
     observer_factory: &ObserverFactory<'_>,
 ) -> Result<(), AppError> {
     let path = project_argument;
-    let color_mode = runtime.color_mode();
     let loaded = load_configuration_with_config(
         project,
         provider_context,
@@ -1957,7 +1978,7 @@ async fn run_apply_with_observer_factory(
         base_dir,
         &mut crate::commands::human_provider_notices(runtime.color_mode()),
     )?;
-    let mut validated_config = providers.validate_config_pair(
+    let validated_config = providers.validate_config_pair(
         parsed,
         loaded.unresolved_parsed,
         base_dir,
@@ -1982,178 +2003,18 @@ async fn run_apply_with_observer_factory(
         .map_err(AppError::Backend)?
         .into();
 
-    // Handle bootstrap if S3 backend is configured
-    let s3_bootstrap = verified_backend
-        .s3_settings()
-        .map(|settings| (settings.bucket().to_owned(), settings.auto_create()));
-    if let Some((bucket_name, auto_create)) = s3_bootstrap {
-        // Check if bucket exists (bootstrap detection)
-        let bucket_exists = backend.bucket_exists().await.map_err(AppError::Backend)?;
-
-        if !bucket_exists {
-            println!(
-                "{}",
-                "State bucket not found. Running bootstrap..."
-                    .yellow(color_mode)
-                    .bold(color_mode)
-            );
-
-            // Check if there's a bucket resource defined with matching name
-            let backend_resource_type = backend
-                .resource_type()
-                .ok_or("Backend does not specify a resource type")?;
-            if let Some(bucket_resource) = validated_config
-                .resources()
-                .parsed()
-                .find_resource_by_attr(backend_resource_type, "bucket", &bucket_name)
-            {
-                println!("Found state bucket resource in configuration.");
-                println!(
-                    "Creating bucket '{}' before other resources...",
-                    bucket_name.cyan(color_mode)
-                );
-
-                // Create the bucket resource using the factory pattern
-                let backend_provider_name = backend
-                    .provider_name()
-                    .ok_or("Backend does not specify a provider name")?;
-                // This is the only pre-lock path that constructs a provider.
-                // Resolve its attributes here; every other apply path waits
-                // for the post-reconciliation lock-held resolution below.
-                let bootstrap_provider_inputs = load_apply_provider_inputs(
-                    runtime,
-                    validated_config.resources().parsed(),
-                    base_dir,
-                    &validated_config
-                        .context()
-                        .provider_context()
-                        .with_runtime(provider_context),
-                    validated_config.context().schemas(),
-                )
-                .await?;
-                let (bucket_provider, bucket_normalizer) = create_state_bucket_bootstrap_provider(
-                    &validated_config,
-                    bootstrap_provider_inputs.configs(),
-                    backend_provider_name,
-                    validated_config.provider_plan(),
-                )
-                .await?;
-                // Module expansion can place a module-owned state-bucket
-                // resource in `parsed.resources`; `find_resource_by_attr`
-                // does not imply top-level ownership. Gate bootstrap with
-                // the same expanded compositions and resolved config values
-                // that are available before any provider effect runs.
-                create_checked_bootstrap_resource(
-                    color_mode,
-                    &bucket_provider,
-                    &bucket_provider,
-                    bucket_resource.clone(),
-                    BootstrapCreateContext {
-                        provider_context: validated_config.context().provider_context(),
-                        backend: backend.as_ref(),
-                        parsed: validated_config.resources().parsed(),
-                        provider_configs: bootstrap_provider_inputs.configs(),
-                        normalizer: bucket_normalizer.as_ref(),
-                        schemas: validated_config.context().schemas(),
-                    },
-                )
-                .await?;
-                println!(
-                    "  {} Created state bucket: {}",
-                    "✓".green(color_mode),
-                    bucket_name
-                );
-            } else {
-                // Auto-create the bucket if auto_create is enabled
-                if auto_create {
-                    println!(
-                        "Auto-creating state bucket: {}",
-                        bucket_name.cyan(color_mode)
-                    );
-                    create_auto_bootstrap_bucket(backend.as_ref()).await?;
-                    println!("  {} Created state bucket", "✓".green(color_mode));
-
-                    let backend_provider_name = backend
-                        .provider_name()
-                        .ok_or("Backend does not specify a provider name")?;
-
-                    // Append resource definition to backend file
-                    let target_file = backend_file.as_ref().unwrap_or(project);
-
-                    let resource_code = backend
-                        .resource_definition(&bucket_name)
-                        .ok_or("Backend does not support resource definition generation")?;
-
-                    append_bootstrap_resource(target_file, &resource_code)?;
-                    println!(
-                        "  {} Added resource definition to {}",
-                        "✓".green(color_mode),
-                        target_file.display()
-                    );
-
-                    // Re-parse and re-resolve the updated configuration so the
-                    // bucket resource is fully addressed (in particular: its
-                    // anonymous identifier is computed) before we seed state.
-                    // Without this, the seed can't use the resolved name and
-                    // the differ produces phantom Create + Delete entries on
-                    // the next plan (#2533). `skip_resource_validation = true`
-                    // reuses the heavier preflight pipeline only for its
-                    // resolve+anon-id steps; the schema validation already
-                    // ran on the pre-injection configuration.
-                    // Keep the authored pre-injection canonical snapshot for
-                    // resource pairing; replace only the resolved snapshot so
-                    // the lock-held path sees the injected bucket row.
-                    validated_config = reload_apply_configuration_after_bootstrap(
-                        project,
-                        base_dir,
-                        provider_context,
-                        validated_config,
-                        bootstrap_unresolved,
-                    )?;
-                    let parsed = validated_config.resources().parsed();
-
-                    let backend_resource_type = backend
-                        .resource_type()
-                        .ok_or("Backend does not specify a resource type")?;
-                    let bucket_resource_name = parsed
-                        .find_resource_by_attr(backend_resource_type, "bucket", &bucket_name)
-                        .and_then(|r| r.id.identity().cloned())
-                        .ok_or_else(|| {
-                            format!(
-                                "Auto-injected state bucket resource '{}' not found after re-parse",
-                                bucket_name
-                            )
-                        })?;
-                    let initial_state = StateFile::with_managed_state_bucket(
-                        backend_provider_name,
-                        backend_resource_type,
-                        bucket_resource_name,
-                        AppliedIdentifier::new(&bucket_name).map_err(|source| {
-                            AppError::Config(format!(
-                                "State bucket has an invalid provider identifier: {source}"
-                            ))
-                        })?,
-                    )
-                    .map_err(|source| {
-                        AppError::Config(format!("Failed to encode initial state bucket: {source}"))
-                    })?;
-                    backend
-                        .write_state(&initial_state)
-                        .await
-                        .map_err(AppError::Backend)?;
-                    println!(
-                        "  {} Registered state bucket as protected resource",
-                        "✓".green(color_mode)
-                    );
-                } else {
-                    return Err(AppError::Config(format!(
-                        "Backend bucket '{}' not found and auto_create is disabled",
-                        bucket_name
-                    )));
-                }
-            }
-        }
-    }
+    // Must stay before acquire_lock and before operation providers are built.
+    let validated_config = prepare_apply_storage(
+        runtime,
+        project,
+        provider_context,
+        validated_config,
+        bootstrap_unresolved,
+        backend_file.as_ref(),
+        backend.as_ref(),
+    )
+    .await?;
+    let color_mode = runtime.color_mode();
 
     // Acquire lock (unless --lock=false)
     let state_lock = if lock {
@@ -2198,6 +2059,184 @@ async fn run_apply_with_observer_factory(
     }
 
     Ok(())
+}
+
+/// Prepare storage before apply acquires a lock or constructs operation providers.
+async fn prepare_apply_storage(
+    runtime: &crate::runtime::CommandRuntime,
+    project: &ResolvedPath,
+    provider_context: &ProviderContext,
+    mut validated_config: ValidatedConfig,
+    bootstrap_unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
+    backend_file: Option<&ResolvedPath>,
+    backend: &dyn StateBackend,
+) -> Result<ValidatedConfig, AppError> {
+    let color_mode = runtime.color_mode();
+    let base_dir = project;
+    match backend
+        .storage_readiness()
+        .await
+        .map_err(AppError::Backend)?
+    {
+        StorageReadiness::Ready => {}
+        StorageReadiness::Unavailable(unavailable) => {
+            return Err(AppError::Backend(unavailable.into_error()));
+        }
+        StorageReadiness::Provisionable(bootstrap) => {
+            let storage = bootstrap.info().clone();
+            let bucket_name = storage.settings().bucket().to_owned();
+            println!(
+                "{}",
+                "State bucket not found. Running bootstrap..."
+                    .yellow(color_mode)
+                    .bold(color_mode)
+            );
+
+            // Check if there's a bucket resource defined with matching name
+            let backend_resource_type = storage.resource_type();
+            let bucket_resource = validated_config.resources().parsed().find_resource_by_attr(
+                backend_resource_type,
+                "bucket",
+                &bucket_name,
+            );
+            match select_s3_bucket_bootstrap(bootstrap, bucket_resource)? {
+                S3BucketBootstrap::Declared(bucket_resource) => {
+                    println!("Found state bucket resource in configuration.");
+                    println!(
+                        "Creating bucket '{}' before other resources...",
+                        bucket_name.cyan(color_mode)
+                    );
+
+                    // Create the bucket resource using the factory pattern
+                    let backend_provider_name = storage.provider_name();
+                    // This is the only pre-lock path that constructs a provider.
+                    // Resolve its attributes here; every other apply path waits
+                    // for the post-reconciliation lock-held resolution below.
+                    let bootstrap_provider_inputs = load_apply_provider_inputs(
+                        runtime,
+                        validated_config.resources().parsed(),
+                        base_dir,
+                        &validated_config
+                            .context()
+                            .provider_context()
+                            .with_runtime(provider_context),
+                        validated_config.context().schemas(),
+                    )
+                    .await?;
+                    let (bucket_provider, bucket_normalizer) =
+                        create_state_bucket_bootstrap_provider(
+                            &validated_config,
+                            bootstrap_provider_inputs.configs(),
+                            backend_provider_name,
+                            validated_config.provider_plan(),
+                        )
+                        .await?;
+                    // Module expansion can place a module-owned state-bucket
+                    // resource in `parsed.resources`; `find_resource_by_attr`
+                    // does not imply top-level ownership. Gate bootstrap with
+                    // the same expanded compositions and resolved config values
+                    // that are available before any provider effect runs.
+                    create_checked_bootstrap_resource(
+                        color_mode,
+                        &bucket_provider,
+                        &bucket_provider,
+                        bucket_resource.clone(),
+                        BootstrapCreateContext {
+                            provider_context: validated_config.context().provider_context(),
+                            backend,
+                            parsed: validated_config.resources().parsed(),
+                            provider_configs: bootstrap_provider_inputs.configs(),
+                            normalizer: bucket_normalizer.as_ref(),
+                            schemas: validated_config.context().schemas(),
+                        },
+                    )
+                    .await?;
+                    println!(
+                        "  {} Created state bucket: {}",
+                        "✓".green(color_mode),
+                        bucket_name
+                    );
+                }
+                S3BucketBootstrap::AutoCreate(auto_create) => {
+                    println!(
+                        "Auto-creating state bucket: {}",
+                        bucket_name.cyan(color_mode)
+                    );
+                    auto_create.create().await.map_err(AppError::Backend)?;
+                    println!("  {} Created state bucket", "✓".green(color_mode));
+
+                    let backend_provider_name = storage.provider_name();
+
+                    // Append resource definition to backend file
+                    let target_file = backend_file.unwrap_or(project);
+
+                    let resource_code = storage.resource_definition();
+
+                    append_bootstrap_resource(target_file, &resource_code)?;
+                    println!(
+                        "  {} Added resource definition to {}",
+                        "✓".green(color_mode),
+                        target_file.display()
+                    );
+
+                    // Re-parse and re-resolve the updated configuration so the
+                    // bucket resource is fully addressed (in particular: its
+                    // anonymous identifier is computed) before we seed state.
+                    // Without this, the seed can't use the resolved name and
+                    // the differ produces phantom Create + Delete entries on
+                    // the next plan (#2533). `skip_resource_validation = true`
+                    // reuses the heavier preflight pipeline only for its
+                    // resolve+anon-id steps; the schema validation already
+                    // ran on the pre-injection configuration.
+                    // Keep the authored pre-injection canonical snapshot for
+                    // resource pairing; replace only the resolved snapshot so
+                    // the lock-held path sees the injected bucket row.
+                    validated_config = reload_apply_configuration_after_bootstrap(
+                        project,
+                        base_dir,
+                        provider_context,
+                        validated_config,
+                        bootstrap_unresolved,
+                    )?;
+                    let parsed = validated_config.resources().parsed();
+
+                    let backend_resource_type = storage.resource_type();
+                    let bucket_resource_name = parsed
+                        .find_resource_by_attr(backend_resource_type, "bucket", &bucket_name)
+                        .and_then(|r| r.id.identity().cloned())
+                        .ok_or_else(|| {
+                            format!(
+                                "Auto-injected state bucket resource '{}' not found after re-parse",
+                                bucket_name
+                            )
+                        })?;
+                    let initial_state = StateFile::with_managed_state_bucket(
+                        backend_provider_name,
+                        backend_resource_type,
+                        bucket_resource_name,
+                        AppliedIdentifier::new(&bucket_name).map_err(|source| {
+                            AppError::Config(format!(
+                                "State bucket has an invalid provider identifier: {source}"
+                            ))
+                        })?,
+                    )
+                    .map_err(|source| {
+                        AppError::Config(format!("Failed to encode initial state bucket: {source}"))
+                    })?;
+                    backend
+                        .write_state(&initial_state)
+                        .await
+                        .map_err(AppError::Backend)?;
+                    println!(
+                        "  {} Registered state bucket as protected resource",
+                        "✓".green(color_mode)
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(validated_config)
 }
 
 /// Deterministic test rendezvous, following plan's state-drift handshake.
@@ -3367,7 +3406,8 @@ fn import_identifiers_from_current_config<S, V: PlanValueKind>(
 
 /// Reproduce the state-aware desired-side preparation that plan runs before
 /// persisting secret placeholders. The supplied wiring has already passed the
-/// saved-plan schema check; only then may this function build normalizers.
+/// saved-plan schema check. Provider configuration hashes are verified before
+/// either provider or normalizer construction.
 struct PreparedSavedPlanSecretCandidates {
     candidates: SavedPlanSecretCandidates,
     provider: ProviderRouter,
@@ -3383,17 +3423,16 @@ async fn prepare_saved_plan_secret_candidates(
 ) -> Result<PreparedSavedPlanSecretCandidates, AppError> {
     let color_mode = validated_config.context().runtime().color_mode();
     let mut candidate_state = state_file.clone();
-    let PreparedPlanIdentityData {
-        provider_inputs,
-        state_blocks,
-    } = prepare_plan_identity_and_provider_inputs(
+    let (current_candidates, state_blocks) = saved_plan::prepare_current_candidates(
         &mut validated_config,
         &mut candidate_state,
         base_dir,
         provider_context,
-        UpstreamMissingStatePolicy::Strict,
     )
     .await?;
+
+    let (verified_inputs, remote_bindings) =
+        pending_plan.verify_provider_inputs(current_candidates, apply_target)?;
 
     // Reuse the exact I/O-free prelude the plan path uses. `candidate_state`
     // is the identity-reconciled state view produced above; the current-state
@@ -3402,12 +3441,9 @@ async fn prepare_saved_plan_secret_candidates(
     let wiring = validated_config.context();
     let canonical_resources = validated_config.resources();
     let parsed = canonical_resources.parsed();
-    let provider = create_providers_from_configs_with_ctx(
-        wiring,
-        provider_inputs.configs(),
-        validated_config.provider_plan(),
-    )
-    .await?;
+    let provider = verified_inputs
+        .create_providers(wiring, validated_config.provider_plan())
+        .await?;
     let expansion_prelude = crate::wiring::DeferredForExpansionPrelude::new(
         canonical_resources,
         &state_blocks.targets.removed_from,
@@ -3418,7 +3454,7 @@ async fn prepare_saved_plan_secret_candidates(
         wiring,
         &provider,
         &parsed.data_sources,
-        provider_inputs.configs().as_provider_configs(),
+        verified_inputs.configs().as_provider_configs(),
         &state_blocks.claims,
     )?;
     let replay_moves = expansion_prelude.saved_plan_replay_moves(parsed);
@@ -3444,21 +3480,21 @@ async fn prepare_saved_plan_secret_candidates(
     let (mut validated_expansion, _expansion) = validated_config
         .expand_deferred_for(
             &prepared_expansion,
-            provider_inputs.remote_bindings(),
+            &remote_bindings,
             crate::wiring::DeferredForWarningPolicy::Suppress,
             &provider,
         )
         .await?;
 
-    let normalizers = create_normalizers_from_configs_with_ctx(
-        validated_expansion.context(),
-        provider_inputs.configs(),
-        validated_expansion.provider_plan(),
-    )
-    .await?;
+    let normalizers = verified_inputs
+        .create_normalizers(
+            validated_expansion.context(),
+            validated_expansion.provider_plan(),
+        )
+        .await?;
     validated_expansion
         .prepare_desired_side_for_plan(
-            provider_inputs.configs().as_provider_configs(),
+            verified_inputs.configs().as_provider_configs(),
             &normalizers,
         )
         .await
@@ -3466,7 +3502,7 @@ async fn prepare_saved_plan_secret_candidates(
 
     let candidates = SavedPlanSecretCandidates::from_expansion(
         validated_expansion,
-        provider_inputs,
+        verified_inputs,
         base_dir.clone(),
     );
 
@@ -3476,21 +3512,7 @@ async fn prepare_saved_plan_secret_candidates(
     })
 }
 
-fn rehydrate_desired_plan_file(
-    plan_file: ReloadedPlanFile<SnapshotLeaf>,
-    candidates: &SavedPlanSecretCandidates,
-    apply_target: ApplyTarget<'_>,
-) -> Result<ReloadedPlanFile, AppError> {
-    rehydrate_desired_plan_file_from_parts(
-        plan_file,
-        candidates.parsed(),
-        candidates.provider_inputs(),
-        &candidates.source,
-        apply_target,
-        candidates.provider_context(),
-    )
-}
-
+#[cfg(test)]
 fn rehydrate_desired_plan_file_from_parts(
     plan_file: ReloadedPlanFile<SnapshotLeaf>,
     parsed: &carina_core::parser::ExpandedInferredFile,
@@ -3499,6 +3521,45 @@ fn rehydrate_desired_plan_file_from_parts(
     apply_target: ApplyTarget<'_>,
     provider_context: &carina_core::parser::LoadedProviderContext,
 ) -> Result<ReloadedPlanFile, AppError> {
+    let fresh = carina_core::parser::SavedProviderConfigs::from(provider_inputs.configs());
+    let provider_configs = plan_file
+        .provider_configs()
+        .rehydrate_secrets(&fresh)
+        .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
+    let provider_inputs = VerifiedSavedPlanProviderInputs::for_test(
+        ResolvedProviderConfigs::try_from(provider_configs).map_err(|error| {
+            AppError::SavedProviderConfig {
+                error,
+                replan_command: apply_target.replan_command().to_string(),
+            }
+        })?,
+    );
+    rehydrate_desired_plan_file_with_verified_configs(
+        plan_file,
+        parsed,
+        provider_inputs,
+        source,
+        apply_target,
+        provider_context,
+    )
+    .map(|(plan_file, _provider_inputs)| plan_file)
+}
+
+fn rehydrate_desired_plan_file_with_verified_configs(
+    plan_file: ReloadedPlanFile<SnapshotLeaf>,
+    parsed: &carina_core::parser::ExpandedInferredFile,
+    provider_inputs: VerifiedSavedPlanProviderInputs,
+    source: &ResolvedPath,
+    apply_target: ApplyTarget<'_>,
+    provider_context: &carina_core::parser::LoadedProviderContext,
+) -> Result<
+    (
+        ReloadedPlanFile,
+        VerifiedSavedPlanProviderInputs<RehydratedProviderInputs>,
+    ),
+    AppError,
+> {
+    let (provider_configs, provider_inputs) = provider_inputs.into_rehydrated();
     crate::wiring::settle_type_checks(
         carina_core::validation::deferred_types::TypeCheckSession::run(
             provider_context,
@@ -3580,12 +3641,6 @@ fn rehydrate_desired_plan_file_from_parts(
                     carina_core::resource::DataSource::to_value_data_source,
                 )?;
 
-                let fresh_provider_configs =
-                    carina_core::parser::SavedProviderConfigs::from(provider_inputs.configs());
-                let provider_configs = plan_file
-                    .provider_configs()
-                    .rehydrate_secrets(&fresh_provider_configs)
-                    .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
                 let upstream_snapshot = plan_file
                     .upstream_snapshot()
                     .iter()
@@ -3620,7 +3675,7 @@ fn rehydrate_desired_plan_file_from_parts(
             },
         ),
         AppError::Validation,
-    )
+    ).map(|plan_file| (plan_file, provider_inputs))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4127,9 +4182,15 @@ async fn run_apply_from_plan_locked_owned(
             // both that exact load and its retained current-config pair, so
             // validation is not repeated under the lock and execution cannot
             // substitute either half.
-            let (validated_plan, initialized_provider) = match inspected_plan {
+            let (validated_plan, provider, verified_provider_inputs) = match inspected_plan {
                 ReloadedProviderBoundPlanFile::Verified { plan, providers } => {
-                    (plan.verify_provider_load(providers, apply_target)?, None)
+                    let validated_plan = plan.verify_provider_load(providers, apply_target)?;
+                    let provider_inputs = validated_plan.provider_inputs(apply_target)?;
+                    let provider = provider_inputs
+                        .create_providers(validated_plan.context(), &validated_plan.provider_plan())
+                        .await?;
+                    let (_saved, provider_inputs) = provider_inputs.into_rehydrated();
+                    (validated_plan, provider, provider_inputs)
                 }
                 ReloadedProviderBoundPlanFile::NeedsSecretVerification { plan, providers } => {
                     let (pending, validated_config) =
@@ -4148,35 +4209,14 @@ async fn run_apply_from_plan_locked_owned(
                         candidates,
                         provider,
                     } = prepared;
-                    (
-                        pending.verify_desired(candidates, apply_target)?,
-                        Some(provider),
-                    )
+                    let (validated_plan, provider_inputs) =
+                        pending.verify_desired(candidates, apply_target)?;
+                    (validated_plan, provider, provider_inputs)
                 }
             };
-            let wiring = validated_plan.context();
-
-            let resolved_provider_configs =
-                ResolvedProviderConfigs::try_from(validated_plan.provider_configs().clone())
-                    .map_err(|error| AppError::SavedProviderConfig {
-                        error,
-                        replan_command: apply_target.replan_command().to_string(),
-                    })?;
+            let resolved_provider_configs = verified_provider_inputs.configs();
             let raw_provider_configs = resolved_provider_configs.as_provider_configs();
 
-            // Secret-bearing plans initialize once while reproducing the
-            // provider-aware expansion used to verify desired values. Plans
-            // without desired placeholders initialize here. Either way, the
-            // same initialized instances continue through drift and execution.
-            let provider = match initialized_provider {
-                Some(provider) => provider,
-                None => {
-                    create_providers_from_configs_with_ctx(wiring,
-&resolved_provider_configs,
-&validated_plan.provider_plan())
-                        .await?
-                }
-            };
             let validated_plan = validated_plan.verify_provider_scopes(provider, apply_target)?;
             let wiring = validated_plan.context();
 
@@ -4521,7 +4561,7 @@ async fn run_apply_from_plan_locked_owned(
                 ApplyExecutionContext {
                     provider: provider.as_ref(),
                     normalizer: provider.as_ref(),
-                    provider_configs: &resolved_provider_configs,
+                    provider_configs: resolved_provider_configs,
                     factories: wiring.factories(),
                     schemas: wiring.schemas(),
                     cancel: cancel.clone(),

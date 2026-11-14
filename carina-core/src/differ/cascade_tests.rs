@@ -663,7 +663,11 @@ fn auto_promote_with_missing_unique_name_attribute_emits_plan_error() {
     assert_eq!(
         &plan.errors()[0].kind,
         &PlanErrorKind::CreateBeforeDestroyRequiredByDependent {
-            dependent: "subnet".into(),
+            dependents: crate::replacement::Dependent::new(ResolvedResourceId::with_identity(
+                "ec2.Subnet",
+                "my-subnet"
+            ))
+            .into(),
             cause: ReplacementCannotCoexistError {
                 resource_type: "ec2.Vpc".to_string(),
                 resource_identity: "vpc".to_string(),
@@ -675,7 +679,7 @@ fn auto_promote_with_missing_unique_name_attribute_emits_plan_error() {
         plan.errors()[0]
             .display_with_project_dir(std::path::Path::new("."))
             .to_string(),
-        "ec2.Vpc.my-vpc: resource type 'ec2.Vpc' does not support create_before_destroy: the replacement cannot coexist with the original; create_before_destroy required by dependent `subnet`"
+        "ec2.Vpc.my-vpc: resource type 'ec2.Vpc' does not support create_before_destroy: the replacement cannot coexist with the original; create_before_destroy required by dependent `ec2.Subnet.my-subnet`"
     );
 }
 
@@ -1479,7 +1483,10 @@ fn impossible_cbd_promotion_names_deferred_and_managed_dependents() {
         standard_states(),
         &schemas,
     );
-    for (plan, dependent) in [(&deferred, "subnets"), (&managed, "subnet")] {
+    for (plan, dependent) in [
+        (&deferred, "ec2.Subnet.subnets[?]"),
+        (&managed, "ec2.Subnet.my-subnet"),
+    ] {
         assert_eq!(plan.errors().len(), 1, "{:?}", plan.errors());
         let message = plan.errors()[0]
             .display_with_project_dir(std::path::Path::new("."))
@@ -1971,7 +1978,7 @@ fn review_4283_reversed_dependencies_are_resolved_during_planning() {
         );
         if conflicting {
             assert!(plan.errors().iter().any(|error| error.resource_id == *b_id.as_inner()
-                && matches!(&error.kind, PlanErrorKind::CreateBeforeDestroyRequiredByDependent { dependent, .. } if dependent == "test.Parent.a")),
+                && matches!(&error.kind, PlanErrorKind::CreateBeforeDestroyRequiredByDependent { dependents, .. } if dependents.iter().any(|dependent| dependent == &crate::replacement::Dependent::new(ResolvedResourceId::with_identity("test.Parent", "a"))))),
                 "a reversed dependency must identify B and its old dependent A: {:?}", plan.errors());
         } else {
             assert!(!plan.has_errors(), "{:?}", plan.errors());
@@ -1981,4 +1988,48 @@ fn review_4283_reversed_dependencies_are_resolved_during_planning() {
             );
         }
     }
+}
+
+#[test]
+fn issue_4418_promote_reports_all_resource_dependents_in_identity_order() {
+    let mut schemas = base_schemas(false);
+    schemas.insert(
+        "",
+        PatternResourceSchema::new("ec2.Vpc")
+            .attribute(
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .with_conflicting_replacement()
+            .validate()
+            .unwrap(),
+    );
+    let (vpc, _) = vpc_resources(false);
+    let child = |identity: &str, binding: &str| {
+        Resource::new(
+            "ec2.Subnet",
+            crate::resource::ResourceIdentity::new(identity),
+        )
+        .with_root_binding(binding)
+        .with_attribute("name", string("same-display-name"))
+        .with_attribute("vpc_id", ref_value("vpc", "vpc_id"))
+        .with_attribute("cidr_block", string("10.1.0.0/24"))
+    };
+    let resources = vec![
+        vpc,
+        child("z-child", "aaa_binding"),
+        child("a-child", "zzz_binding"),
+    ];
+    let plan = plan_for(resources.clone(), resources, standard_states(), &schemas);
+    let message = plan.errors()[0]
+        .display_with_project_dir(std::path::Path::new("."))
+        .to_string();
+    println!("RESOURCE DEPENDENTS: {message}");
+    assert!(message.ends_with("create_before_destroy required by dependents `ec2.Subnet.a-child`, `ec2.Subnet.z-child`"), "{message}");
 }

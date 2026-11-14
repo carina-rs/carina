@@ -2145,6 +2145,8 @@ pub(crate) async fn run_state_refresh_locked(
     if let Some(migrated) = validated.migrated_state {
         state_file = Some(migrated);
         if let Some(state) = state_file.as_ref() {
+            #[allow(clippy::iter_over_hash_type)]
+            // keyed rebuild: dependency metadata is assigned independently by resource ID
             for (id, current) in &mut managed_current {
                 if let Some(row) = state.find_resource_for_id(id) {
                     current.set_dependency_bindings(row.dependency_bindings.clone());
@@ -3365,24 +3367,10 @@ mod tests {
             Ok(())
         }
 
-        async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
-            Ok(true)
-        }
-
-        async fn create_bucket(&self) -> carina_state::BackendResult<()> {
-            Ok(())
-        }
-
-        fn resource_type(&self) -> Option<&str> {
-            None
-        }
-
-        fn provider_name(&self) -> Option<&str> {
-            None
-        }
-
-        fn resource_definition(&self, _bucket_name: &str) -> Option<String> {
-            None
+        async fn storage_readiness(
+            &self,
+        ) -> carina_state::BackendResult<carina_state::StorageReadiness> {
+            Ok(carina_state::StorageReadiness::Ready)
         }
     }
 
@@ -5027,6 +5015,8 @@ mod tests {
                     let Some(saved) = saved_attrs.get(id) else {
                         continue;
                     };
+                    #[allow(clippy::iter_over_hash_type)]
+                    // keyed rebuild: saved keys hydrate independently; the probe fixture records one value
                     for (key, value) in saved {
                         state
                             .attributes

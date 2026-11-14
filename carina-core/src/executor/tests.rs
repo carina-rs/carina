@@ -9803,8 +9803,12 @@ fn test_build_dependency_levels_consistent_with_dependency_map() {
 
     // Verify levels are consistent with the dependency map:
     // For every effect, its level must be greater than all its dependencies' levels.
+    #[allow(clippy::iter_over_hash_type)]
+    // commutative: dependency-level assertions are independent per effect
     for (idx, deps) in &dep_map {
         let idx_level = levels.iter().position(|group| group.contains(idx)).unwrap();
+        #[allow(clippy::iter_over_hash_type)]
+        // commutative: dependency-level assertions are independent per edge
         for dep in deps {
             let dep_level = levels.iter().position(|group| group.contains(dep)).unwrap();
             assert!(
@@ -14551,7 +14555,13 @@ async fn deferred_reversed_history(coexisting_child: bool) {
                 error.cause,
                 crate::plan::CreateBeforeDestroyError::ReplacementCannotCoexist(_)
             ));
-            assert_eq!(error.required_by.as_deref(), Some("test.cert"));
+            assert_eq!(
+                error.required_by,
+                Some(
+                    crate::replacement::Dependent::new(ResolvedResourceId::new(parent_id.clone()))
+                        .into()
+                )
+            );
             return;
         }
     };

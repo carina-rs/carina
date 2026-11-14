@@ -94,6 +94,8 @@ pub(crate) fn apply_name_overrides(resources: &mut [Resource], state_file: &Opti
 
     for resource in resources.iter_mut() {
         if let Some(name_overrides) = overrides.get(&resource.id) {
+            #[allow(clippy::iter_over_hash_type)]
+            // order reaches output; migration tracked in #4414
             for (attr, value) in name_overrides {
                 resource.attributes.insert(
                     attr.clone(),
@@ -561,6 +563,8 @@ impl ExportResolution {
                 next.insert(skipped.name.clone(), prior.clone());
             }
         }
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: distinct resolved exports have explicit precedence over retained skipped entries
         for (name, value) in resolved {
             next.insert(name, value);
         }
@@ -1786,6 +1790,8 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
         runtime_replacements,
     )?;
     let mut permanent_name_overrides = plan.permanent_name_overrides_for_state();
+    #[allow(clippy::iter_over_hash_type)]
+    // keyed rebuild: distinct resources have fixed runtime-over-planned override precedence
     for (id, overrides) in runtime_name_overrides {
         permanent_name_overrides
             .entry(id.clone())
@@ -1903,6 +1909,8 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
         );
     }
 
+    #[allow(clippy::iter_over_hash_type)]
+    // commutative: clearing distinct current rows preserves retained row order
     for id in &writeback.clear_currents {
         state.clear_current_instance_preserving_address_metadata(
             &id.provider,
@@ -1911,6 +1919,8 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
         );
     }
 
+    #[allow(clippy::iter_over_hash_type)]
+    // commutative: removing distinct rows preserves survivor order
     for id in &writeback.cleanups {
         state.remove_resource(&id.provider, &id.resource_type, id.identity_str());
     }

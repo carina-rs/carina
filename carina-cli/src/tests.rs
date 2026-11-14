@@ -94,8 +94,8 @@ fn absolute_binding(spelling: &str) -> carina_core::resource::AbsoluteBindingAdd
 }
 
 #[test]
-fn saved_plan_version_is_45_for_checked_validation_strings() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 45);
+fn saved_plan_version_is_46_for_ordered_dependents() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 46);
 }
 
 #[test]
@@ -2546,20 +2546,10 @@ impl StateBackend for MockBackend {
     async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
         Ok(())
     }
-    async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
-        Ok(true)
-    }
-    async fn create_bucket(&self) -> carina_state::BackendResult<()> {
-        Ok(())
-    }
-    fn resource_type(&self) -> Option<&str> {
-        None
-    }
-    fn provider_name(&self) -> Option<&str> {
-        None
-    }
-    fn resource_definition(&self, _bucket_name: &str) -> Option<String> {
-        None
+    async fn storage_readiness(
+        &self,
+    ) -> carina_state::BackendResult<carina_state::StorageReadiness> {
+        Ok(carina_state::StorageReadiness::Ready)
     }
 }
 
@@ -2667,20 +2657,10 @@ impl StateBackend for LockTrackingBackend {
     async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
         Ok(())
     }
-    async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
-        Ok(true)
-    }
-    async fn create_bucket(&self) -> carina_state::BackendResult<()> {
-        Ok(())
-    }
-    fn resource_type(&self) -> Option<&str> {
-        None
-    }
-    fn provider_name(&self) -> Option<&str> {
-        None
-    }
-    fn resource_definition(&self, _bucket_name: &str) -> Option<String> {
-        None
+    async fn storage_readiness(
+        &self,
+    ) -> carina_state::BackendResult<carina_state::StorageReadiness> {
+        Ok(carina_state::StorageReadiness::Ready)
     }
 }
 
@@ -2804,20 +2784,10 @@ impl StateBackend for RefreshTestBackend {
     async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
         Ok(())
     }
-    async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
-        Ok(true)
-    }
-    async fn create_bucket(&self) -> carina_state::BackendResult<()> {
-        Ok(())
-    }
-    fn resource_type(&self) -> Option<&str> {
-        None
-    }
-    fn provider_name(&self) -> Option<&str> {
-        None
-    }
-    fn resource_definition(&self, _bucket_name: &str) -> Option<String> {
-        None
+    async fn storage_readiness(
+        &self,
+    ) -> carina_state::BackendResult<carina_state::StorageReadiness> {
+        Ok(carina_state::StorageReadiness::Ready)
     }
 }
 
@@ -5255,20 +5225,10 @@ impl StateBackend for CapturingBackend {
     async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
         Ok(())
     }
-    async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
-        Ok(true)
-    }
-    async fn create_bucket(&self) -> carina_state::BackendResult<()> {
-        Ok(())
-    }
-    fn resource_type(&self) -> Option<&str> {
-        None
-    }
-    fn provider_name(&self) -> Option<&str> {
-        None
-    }
-    fn resource_definition(&self, _bucket_name: &str) -> Option<String> {
-        None
+    async fn storage_readiness(
+        &self,
+    ) -> carina_state::BackendResult<carina_state::StorageReadiness> {
+        Ok(carina_state::StorageReadiness::Ready)
     }
 }
 

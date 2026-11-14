@@ -110,9 +110,13 @@ impl HistoricalDisplayAttributes {
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn for_planning(plan: &Plan, saved: &crate::provider::LiftedSavedAttrs) -> Self {
         let mut display = Self::for_plan(plan);
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: each historical update receives saved attributes by exact resource ID
         for (id, attributes) in &mut display.updates {
             attributes.stored_attributes = saved.get(id).cloned();
         }
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: each historical delete receives saved attributes and metadata by exact key
         for (key, attributes) in &mut display.deletes {
             attributes.stored_attributes = saved.get(key.id()).cloned();
             attributes.nested_write_only = saved.nested_write_only(key.id()).clone();
@@ -3747,7 +3751,7 @@ mod tests {
             ))
         };
         let attributes = |plaintext: &str| {
-            HashMap::from([
+            IndexMap::from([
                 ("password".to_string(), secret(plaintext)),
                 (
                     "credentials".to_string(),

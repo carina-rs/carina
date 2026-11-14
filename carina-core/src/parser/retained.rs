@@ -3970,6 +3970,8 @@ mod judgement {
                 .into(),
         };
         let mut snapshots = HashMap::new();
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: each instance snapshot depends only on that instance and the common report
         for (id, previous) in expressions.report.resource_reports.iter() {
             let snapshot = snapshots
                 .entry(previous.instance.clone())
@@ -4343,18 +4345,7 @@ mod judgement {
                 if let TypeExpr::Ref(path) | TypeExpr::DottedUnresolved(path) = &current
                     && self
                         .schemas
-                        .get(
-                            &path.provider,
-                            &path.resource_type,
-                            crate::schema::SchemaKind::Resource,
-                        )
-                        .or_else(|| {
-                            self.schemas.get(
-                                &path.provider,
-                                &path.resource_type,
-                                crate::schema::SchemaKind::DataSource,
-                            )
-                        })
+                        .get_kindless(&path.provider, &path.resource_type)
                         .is_none()
                 {
                     return Err(InferenceIssue::NotInferable(

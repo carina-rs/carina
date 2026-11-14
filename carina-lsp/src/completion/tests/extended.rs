@@ -396,8 +396,10 @@ fn availability_zone_completions_use_dynamic_prefix() {
 fn struct_field_completions_via_block_name() {
     let provider = test_provider();
     // Use singular "operating_region" (block_name) to get struct fields
-    let completions =
-        provider.struct_field_completions("awscc.ec2.ipam", &["operating_region".to_string()]);
+    let completions = provider.struct_field_completions(
+        &managed_selector("awscc.ec2.ipam"),
+        &["operating_region".to_string()],
+    );
     assert!(
         !completions.is_empty(),
         "Should provide struct field completions via block_name"
@@ -434,9 +436,9 @@ outer {
         matches!(
             context,
             CompletionContext::InsideStructBlock {
-                ref resource_type,
+                ref selector,
                 ref attr_path,
-            } if resource_type == "test.nested.resource"
+            } if selector == &managed_selector("test.nested.resource")
                 && attr_path == &["outer".to_string(), "inner".to_string()]
         ),
         "Should detect InsideStructBlock with nested path, got: {:?}",
@@ -445,7 +447,7 @@ outer {
 
     // Verify actual completions work
     let completions = provider.struct_field_completions(
-        "test.nested.resource",
+        &managed_selector("test.nested.resource"),
         &["outer".to_string(), "inner".to_string()],
     );
     let field_names: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
@@ -552,11 +554,11 @@ fn map_comma_still_starts_a_new_field_segment() {
         matches!(
             context,
             CompletionContext::AfterEqualsInStruct {
-                ref resource_type,
+                ref selector,
                 ref attr_path,
                 ref field_name,
                 ..
-            } if resource_type == "test.review.Resource"
+            } if selector == &managed_selector("test.review.Resource")
                 && attr_path == &["outer".to_string(), "tags".to_string()]
                 && field_name == "Env"
         ),
@@ -586,9 +588,9 @@ fn assignment_expressions_and_control_blocks_keep_struct_context() {
             matches!(
                 context,
                 CompletionContext::InsideStructBlock {
-                    ref resource_type,
+                    ref selector,
                     ref attr_path,
-                } if resource_type == "test.review.Resource" && attr_path == &expected_path
+                } if selector == &managed_selector("test.review.Resource") && attr_path == &expected_path
             ),
             "assignment expression should retain {expected_path:?}: {context:?}"
         );
@@ -747,11 +749,11 @@ outer {
         matches!(
             context,
             CompletionContext::AfterEqualsInStruct {
-                ref resource_type,
+                ref selector,
                 ref attr_path,
                 ref field_name,
                 ..
-            } if resource_type == "test.nested.resource"
+            } if selector == &managed_selector("test.nested.resource")
                 && attr_path == &["outer".to_string(), "inner".to_string()]
                 && field_name == "leaf_field"
         ),
@@ -818,7 +820,7 @@ fn list_enum_completions() {
 #[ignore = "requires provider schemas"]
 fn attribute_completions_include_block_name_snippet() {
     let provider = test_provider();
-    let completions = provider.attribute_completions_for_type("awscc.ec2.ipam");
+    let completions = provider.attribute_completions_for_type(&managed_selector("awscc.ec2.ipam"));
     let block_name_completion = completions.iter().find(|c| c.label == "operating_region");
     assert!(
         block_name_completion.is_some(),
@@ -924,7 +926,8 @@ fn attribute_completions_return_empty_when_resource_type_unknown() {
     // attribute_completions_for_type should return an empty list instead of
     // falling back to all attributes from all schemas.
     let provider = test_provider();
-    let completions = provider.attribute_completions_for_type("nonexistent.resource.type");
+    let completions =
+        provider.attribute_completions_for_type(&managed_selector("nonexistent.resource.type"));
     assert!(
         completions.is_empty(),
         "Should return no completions for unknown resource type, but got {} completions: {:?}",
@@ -959,11 +962,13 @@ fn no_completions_for_unknown_resource_type_in_block() {
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
 
-    // Simulate being inside a block where resource type detection yields empty string
-    let completions = provider.attribute_completions_for_type("");
+    // A block with no type path has no selector and offers no schema attributes.
+    assert!(schema_selector("", SchemaKind::Resource).is_none());
+    let completions =
+        provider.complete_for_test(&create_document("{\n  "), Position::new(1, 2), None);
     assert!(
         completions.is_empty(),
-        "Should return no completions when resource type is empty string, but got {} completions",
+        "Should return no completions when the block has no type path, but got {} completions",
         completions.len()
     );
 }
@@ -976,7 +981,7 @@ fn nested_struct_completions_via_block_name_in_path() {
     let provider = test_provider_with_block_name_nested();
     // Path: config -> transition (block_name for "transitions")
     let completions = provider.struct_field_completions(
-        "test.block.resource",
+        &managed_selector("test.block.resource"),
         &["config".to_string(), "transition".to_string()],
     );
     let field_names: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
@@ -1204,7 +1209,7 @@ fn readonly_attributes_excluded_from_resource_block_completions() {
     // Read-only attributes (e.g., vpc_id, arn) should NOT appear as completion
     // candidates inside a resource block, since users cannot set them.
     let provider = test_provider();
-    let completions = provider.attribute_completions_for_type("awscc.ec2.Vpc");
+    let completions = provider.attribute_completions_for_type(&managed_selector("awscc.ec2.Vpc"));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     // vpc_id is read-only on ec2.vpc — should NOT be suggested
@@ -1659,9 +1664,9 @@ fn struct_field_completion_with_assignment_syntax() {
         matches!(
             context,
             CompletionContext::InsideStructBlock {
-                ref resource_type,
+                ref selector,
                 ref attr_path,
-            } if resource_type == "test.nested.resource"
+            } if selector == &managed_selector("test.nested.resource")
                 && attr_path == &["outer".to_string()]
         ),
         "Should detect InsideStructBlock for assignment syntax 'outer = {{}}', got: {:?}",
@@ -1764,8 +1769,10 @@ fn map_key_completions_from_enum_key_type() {
     let provider = super::super::CompletionProvider::new(Arc::new(schemas), vec![], vec![], vec![]);
 
     // Simulate being inside `condition = { | }` — attr_path = ["condition"]
-    let completions =
-        provider.struct_field_completions("test.resource", &["condition".to_string()]);
+    let completions = provider.struct_field_completions(
+        &managed_selector("test.resource"),
+        &["condition".to_string()],
+    );
 
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
@@ -1828,7 +1835,7 @@ fn union_struct_field_completions() {
 
     // Inside principal = { | } — attr_path = ["statement", "principal"]
     let completions = provider.struct_field_completions(
-        "test.resource",
+        &managed_selector("test.resource"),
         &["statement".to_string(), "principal".to_string()],
     );
 

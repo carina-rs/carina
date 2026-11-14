@@ -274,6 +274,8 @@ fn imported_module_directory(
 
 fn invocation_import_map(directories: &DirectoryConfigs) -> DirectoryImportMap {
     let mut import_map = DirectoryImportMap::new();
+    #[allow(clippy::iter_over_hash_type)]
+    // keyed rebuild: distinct callers populate module maps whose caller keys are already ordered
     for (identity, (caller, config)) in directories {
         for import in &config.uses {
             if let Ok(module) = imported_module_directory(caller, import) {

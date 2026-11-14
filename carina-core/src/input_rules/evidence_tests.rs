@@ -8,6 +8,423 @@ use crate::{
     },
 };
 
+// carina#4440: secrecy is node evidence, independent of the plaintext payload.
+mod secret_predicate_tests {
+    use super::*;
+    use crate::resource::{FunctionArgument, InterpolationPart};
+
+    fn text(value: &str) -> Value {
+        Value::Concrete(ConcreteValue::String(value.into()))
+    }
+
+    fn schema() -> ResourceSchema {
+        ResourceSchema::new("Review")
+            .attribute(AttributeSchema::optional("type", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("value", AttributeType::string()).build())
+            .input_rule(rule(
+                "value",
+                InputPredicate::Secret,
+                InputCondition::Equals {
+                    path: path("type"),
+                    literal: InputLiteral::String("secure_string".into()),
+                },
+            ))
+    }
+
+    fn schemas() -> SchemaRegistry {
+        registry(schema())
+    }
+
+    fn verdict(value: Value) -> InputVerdict {
+        let mut verdicts = evaluate(
+            &schemas(),
+            [("type", text("secure_string")), ("value", value)],
+        );
+        assert_eq!(verdicts.len(), 1);
+        verdicts.remove(0)
+    }
+
+    #[test]
+    fn secret_predicate_proves_known_and_pending_secret_payloads() {
+        let decrypt = Value::Deferred(DeferredValue::FunctionCall {
+            name: BuiltinFunction::decrypt,
+            args: vec![FunctionArgument::from_value(text("ciphertext"))],
+            source_line: DiagnosticSourceLine::default(),
+        });
+        for payload in [text("DO-NOT-PRINT"), pending(), decrypt] {
+            assert_eq!(verdict(payload.into_secret()), InputVerdict::Proven);
+        }
+    }
+
+    #[test]
+    fn secret_predicate_reports_failed_public_and_secret_payloads() {
+        let schemas = schemas();
+        // Failed collections retain Present node evidence, while scalar
+        // failures are already returned as InputRead::Failed.
+        for value in [
+            failed_value(),
+            failed_value().into_secret(),
+            object([("nested", failed_value())]),
+            object([("nested", failed_value())]).into_secret(),
+        ] {
+            assert_failed(&verdict(value.clone()));
+            let resource = Resource::with_provider("mock", "Review", "example", None)
+                .with_attribute("type", text("secure_string"))
+                .with_attribute("value", value);
+            let report =
+                check_authored_inputs(&AuthoredInputs::resource_for_test(&resource), &schemas);
+            assert!(report.preparation_errors().is_empty());
+            assert!(report.pending().is_empty());
+            assert_eq!(report.findings().len(), 1);
+            assert_eq!(report.findings()[0].severity(), InputFindingSeverity::Error);
+            assert_eq!(
+                report.findings()[0].violation().reason(),
+                InputViolationReason::EvaluationFailed
+            );
+            assert!(
+                !report.findings()[0]
+                    .to_string()
+                    .contains("private attempted failure")
+            );
+        }
+    }
+
+    #[test]
+    fn secret_predicate_rejects_known_public_strings_without_disclosing_them() {
+        for value in ["DO-NOT-PRINT", "", "secret(x)", "decrypt(x)"] {
+            let result = verdict(text(value));
+            assert!(
+                matches!(&result, InputVerdict::Violation(v) if v.reason() == InputViolationReason::Secret),
+                "{result:?}"
+            );
+            let InputVerdict::Violation(violation) = result else {
+                unreachable!()
+            };
+            assert_eq!(
+                violation.message().to_string(),
+                "must be a secret value (for example `secret(...)` or `decrypt(...)`) when type equals \"secure_string\""
+            );
+            assert!(!format!("{violation:?} {violation}").contains("DO-NOT-PRINT"));
+        }
+    }
+
+    #[test]
+    fn secret_predicate_keeps_public_pending_references_and_expressions_undecided() {
+        let reference = Value::root_resource_ref("producer", "value", vec![]);
+        let interpolation = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Expr(text("a").into_secret()),
+            InterpolationPart::Literal("-".into()),
+            InterpolationPart::Expr(reference.clone()),
+        ]));
+        let coalesce = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(reference.clone()),
+            default: Box::new(text("fallback").into_secret()),
+        });
+        for value in [pending(), reference, interpolation, coalesce] {
+            assert_eq!(verdict(value), InputVerdict::Undecided);
+        }
+    }
+
+    #[test]
+    fn secret_predicate_keeps_a_pending_if_undecided() {
+        use crate::parser::{DeferredIfCondition, DeferredValueIf};
+        use crate::resource::RelativeBindingName;
+
+        let condition = Value::<ParserPlaceholder, RelativeBindingName>::resource_ref(
+            RelativeBindingName::new("producer"),
+            "enabled",
+            vec![],
+        );
+        let value = Value::Deferred(DeferredValue::ModuleIf(Box::new(DeferredValueIf::new(
+            DeferredIfCondition::new(condition, "main.crn".into(), 1),
+            Value::Concrete(ConcreteValue::String("protected".into())).into_secret(),
+            Value::Concrete(ConcreteValue::String("public".into())),
+        ))));
+        let value = value.to_expanded().unwrap().map_bindings(&mut |binding| {
+            crate::resource::absolute_binding_address_for_test(binding.as_str())
+        });
+        assert_eq!(verdict(value), InputVerdict::Undecided);
+    }
+
+    #[test]
+    fn secret_predicate_proves_an_absent_optional_target() {
+        assert_eq!(
+            evaluate(&schemas(), [("type", text("secure_string"))]),
+            vec![InputVerdict::Proven]
+        );
+    }
+
+    #[test]
+    fn secret_predicate_only_fires_for_secure_string() {
+        for kind in ["string", "string_list"] {
+            assert_eq!(
+                evaluate(&schemas(), [("type", text(kind)), ("value", text("plain"))]),
+                vec![InputVerdict::Proven],
+                "{kind}"
+            );
+        }
+        assert!(matches!(verdict(text("plain")), InputVerdict::Violation(_)));
+        assert_eq!(
+            evaluate(&schemas(), [("type", pending()), ("value", text("plain"))]),
+            vec![InputVerdict::Undecided]
+        );
+    }
+
+    fn authored_report(expression: &str) -> AuthoredInputReport {
+        let mut config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::new([(
+            "CARINA_4440_PUBLIC_VALUE".into(),
+            "DO-NOT-PRINT".into(),
+        )]));
+        config.decryptor = Some(std::sync::Arc::new(|_, _| Ok("DO-NOT-PRINT".into())));
+        let source = format!(
+            "provider mock {{}}\nlet clear = 'DO-NOT-PRINT'\nlet protected = secret('DO-NOT-PRINT')\nlet example = mock.Review {{ type = 'secure_string' value = {expression} }}\n"
+        );
+        let parsed =
+            crate::parser::parse_file(&source, std::path::Path::new("main.crn"), &config).unwrap();
+        let catalog = crate::parser::LoadedProviderContext::empty_for_test().with_runtime(&config);
+        crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+            let inputs = parsed
+                .authored_inputs()
+                .unwrap()
+                .resolved_in_session(session);
+            check_authored_inputs(&inputs, &schemas())
+        })
+    }
+
+    #[test]
+    fn secret_predicate_rejects_resolved_env_and_plain_let_values() {
+        for expression in ["'DO-NOT-PRINT'", "env('CARINA_4440_PUBLIC_VALUE')", "clear"] {
+            let report = authored_report(expression);
+            assert!(report.preparation_errors().is_empty());
+            assert!(report.pending().is_empty(), "{expression}");
+            assert_eq!(report.findings().len(), 1, "{expression}");
+            assert_eq!(report.findings()[0].severity(), InputFindingSeverity::Error);
+            assert_eq!(
+                report.findings()[0].violation().reason(),
+                InputViolationReason::Secret
+            );
+            assert!(!report.findings()[0].to_string().contains("DO-NOT-PRINT"));
+        }
+    }
+
+    #[test]
+    fn secret_predicate_preserves_secret_let_and_known_interpolation_provenance() {
+        for expression in [
+            "secret('DO-NOT-PRINT')",
+            "protected",
+            "\"p-${secret('DO-NOT-PRINT')}\"",
+            "decrypt('ciphertext')",
+        ] {
+            let report = authored_report(expression);
+            assert!(report.preparation_errors().is_empty());
+            assert!(
+                report.findings().is_empty(),
+                "{expression}: {:?}",
+                report.findings()
+            );
+            assert!(report.pending().is_empty(), "{expression}");
+        }
+    }
+
+    #[test]
+    fn secret_predicate_classification_excludes_plaintext_estimation() {
+        let schemas = schemas();
+        for (value, protected) in [(text("plain"), false), (text("plain").into_secret(), true)] {
+            let resource = Resource::with_provider("mock", "Review", "example", None)
+                .with_attribute("type", text("secure_string"))
+                .with_attribute("value", value);
+            let site =
+                classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+                    .unwrap()
+                    .unwrap();
+            let applicable = site.applicable_rules().next().unwrap();
+            let InputRuleBinding::Instance(bound) = applicable.binding else {
+                panic!("concrete resource rule");
+            };
+            assert!(matches!(
+                predicate::classify(bound.rule.predicate()),
+                PredicateClass::Secret
+            ));
+            let expected = if protected {
+                InputVerdict::Proven
+            } else {
+                InputVerdict::Violation(rule_violation(bound.rule))
+            };
+            assert_eq!(target_verdict(&bound), expected);
+        }
+    }
+
+    #[test]
+    fn secret_predicate_type_flip_rechecks_an_unchanged_plain_value_at_plan() {
+        let schemas = schemas();
+        let resource = Resource::with_provider("mock", "Review", "example", None)
+            .with_attribute("type", text("secure_string"))
+            .with_attribute("value", text("DO-NOT-PRINT"));
+        let previous = crate::resource::State::existing(
+            resource.id.clone(),
+            crate::test_support::snapshot_attributes::<crate::resource::NoPlaceholder>(
+                HashMap::from([
+                    ("type".into(), text("string")),
+                    ("value".into(), text("DO-NOT-PRINT")),
+                ]),
+            ),
+        )
+        .with_identifier("existing");
+        let desired = resolved_input_fixture(resource, &schemas);
+        let changed = vec!["type".into()];
+        let patch = crate::provider::plan_update_patch(
+            &changed,
+            &desired,
+            &previous,
+            schemas.get_for(&desired).unwrap().schema().as_schema(),
+        )
+        .unwrap();
+        assert_eq!(patch.ops.len(), 1);
+        assert_eq!(patch.ops[0].key(), "type");
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            from: Box::new(previous),
+            identifier: crate::provider::AppliedIdentifier::new("existing").unwrap(),
+            to: desired,
+            changed_attributes: changed,
+        });
+        let failure = FinalizedPlan::new(plan)
+            .check_inputs(&schemas, &HashMap::new())
+            .unwrap_err();
+        assert_eq!(failure.errors().len(), 1);
+        assert!(matches!(
+            &failure.errors()[0].kind,
+            PlanErrorKind::InputRule { path, code, reason, context: InputWriteContext::Update }
+                if path == "value" && code == "review.rule"
+                && reason == "must be a secret value (for example `secret(...)` or `decrypt(...)`) when type equals \"secure_string\""
+        ));
+        assert!(!format!("{:?}", failure.errors()).contains("DO-NOT-PRINT"));
+    }
+
+    #[test]
+    fn secret_predicate_rechecks_a_write_only_reassertion_at_plan() {
+        let schemas = registry(
+            ResourceSchema::new("Review")
+                .attribute(AttributeSchema::optional("type", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::optional("description", AttributeType::string()).build(),
+                )
+                .attribute(
+                    AttributeSchema::optional("value", AttributeType::string())
+                        .write_only()
+                        .build(),
+                )
+                .input_rule(rule(
+                    "value",
+                    InputPredicate::Secret,
+                    InputCondition::Equals {
+                        path: path("type"),
+                        literal: InputLiteral::String("secure_string".into()),
+                    },
+                )),
+        );
+        // Neither the condition nor the target is in changed_attributes. The
+        // target participates solely because the patch reasserts it.
+        for secret in [true, false] {
+            let value = if secret {
+                text("DO-NOT-PRINT").into_secret()
+            } else {
+                text("DO-NOT-PRINT")
+            };
+            let resource = Resource::with_provider("mock", "Review", "example", None)
+                .with_attribute("type", text("secure_string"))
+                .with_attribute("description", text("new"))
+                .with_attribute("value", value.clone());
+            let previous = crate::resource::State::existing(
+                resource.id.clone(),
+                crate::test_support::snapshot_attributes::<crate::resource::NoPlaceholder>(
+                    HashMap::from([
+                        ("type".into(), text("secure_string")),
+                        ("description".into(), text("old")),
+                    ]),
+                ),
+            )
+            .with_identifier("existing");
+            let desired = resolved_input_fixture(resource, &schemas);
+            let changed = vec!["description".into()];
+            let patch = crate::provider::plan_update_patch(
+                &changed,
+                &desired,
+                &previous,
+                schemas.get_for(&desired).unwrap().schema().as_schema(),
+            )
+            .unwrap();
+            assert_eq!(patch.ops.len(), 2);
+            assert!(
+                matches!(&patch.ops[1], crate::provider::PatchOp::Reassert { key, value: reasserted } if key == "value" && reasserted == &value)
+            );
+            let mut plan = Plan::new();
+            plan.add(Effect::Update {
+                from: Box::new(previous),
+                identifier: crate::provider::AppliedIdentifier::new("existing").unwrap(),
+                to: desired,
+                changed_attributes: changed,
+            });
+            let finalized = FinalizedPlan::new(plan);
+            let current = HashMap::new();
+            let site = finalized
+                .write_sites(&schemas, &current)
+                .next()
+                .unwrap()
+                .unwrap();
+            let applicable = site.applicable_rules().collect::<Vec<_>>();
+            assert_eq!(
+                applicable.len(),
+                1,
+                "the reassertion must activate the rule"
+            );
+            let result = applicable[0].verdict_for_test();
+            if secret {
+                assert_eq!(result, InputVerdict::Proven);
+            } else {
+                assert!(matches!(result, InputVerdict::Violation(_)));
+            }
+            drop(applicable);
+            drop(site);
+            match finalized.check_inputs(&schemas, &current) {
+                Ok(checked) => {
+                    assert!(secret, "a plain reassertion must fail");
+                    assert!(checked.pending_inputs().is_empty());
+                }
+                Err(failure) => {
+                    assert!(!secret, "a Secret reassertion must pass");
+                    assert_eq!(failure.errors().len(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn secret_predicate_retains_pending_values_for_plan_rechecking() {
+        let schemas = schemas();
+        let reference = Value::root_resource_ref("producer", "value", vec![]);
+        for value in [
+            reference.clone(),
+            Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Expr(text("a").into_secret()),
+                InterpolationPart::Literal("-".into()),
+                InterpolationPart::Expr(reference),
+            ])),
+        ] {
+            let resource = Resource::with_provider("mock", "Review", "example", None)
+                .with_attribute("type", text("secure_string"))
+                .with_attribute("value", value);
+            let mut plan = Plan::new();
+            plan.add(Effect::Create(resolved_input_fixture(resource, &schemas)));
+            let checked = FinalizedPlan::new(plan)
+                .check_inputs(&schemas, &HashMap::new())
+                .unwrap();
+            assert_eq!(checked.pending_inputs().len(), 1);
+            assert_eq!(checked.pending_rows(0).len(), 1);
+        }
+    }
+}
+
 fn path(name: &str) -> InputPath {
     InputPath::new(name).unwrap()
 }

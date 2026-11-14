@@ -39,7 +39,7 @@ fn identity(
 }
 
 impl SchemaRegistry {
-    fn admission_attribute<K: DestinationKind>(
+    fn admission_attribute<K: AssignmentKind>(
         &self,
         id: &ResourceId,
         attribute: &str,
@@ -89,7 +89,7 @@ impl SchemaRegistry {
 }
 
 impl crate::schema::OwnerBoundResourceSchema<'_> {
-    fn untyped_attribute<K: DestinationKind>(
+    fn untyped_attribute<K: AssignmentKind>(
         self,
         id: &ResourceId,
         name: &str,
@@ -98,7 +98,7 @@ impl crate::schema::OwnerBoundResourceSchema<'_> {
         Destination::catalogued(identity(self, id, catalog), name.into())
     }
 
-    pub(crate) fn admission_attribute<K: DestinationKind>(
+    pub(crate) fn admission_attribute<K: AssignmentKind>(
         self,
         id: &ResourceId,
         attribute: &str,
@@ -119,7 +119,7 @@ impl crate::schema::OwnerBoundResourceSchema<'_> {
         ))
     }
 
-    fn admission_selected_attribute<K: DestinationKind>(
+    fn admission_selected_attribute<K: AssignmentKind>(
         self,
         id: &ResourceId,
         attribute: &str,
@@ -143,7 +143,7 @@ impl crate::schema::OwnerBoundResourceSchema<'_> {
     }
 }
 
-fn admission_findings<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
+fn admission_findings<K: AssignmentKind, P: PlaceholderKind, B: BindingAddress>(
     result: &mut Result<Admission<K, P, B>, AdmissionErrors>,
 ) -> crate::schema::ValueValidationFindings {
     match result {

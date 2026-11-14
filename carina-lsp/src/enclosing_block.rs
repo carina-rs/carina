@@ -1,69 +1,513 @@
-use carina_core::schema::SchemaRegistry;
+use carina_core::parser::ResourceTypePath;
+use carina_core::schema::{OwnerBoundResourceSchema, SchemaKind, SchemaRegistry};
 use tower_lsp::lsp_types::Position;
 
-use crate::lex::{LexKind, lex};
+use crate::lex::{LexKind, LexedDocument, lex};
 
-/// Schema keys in the only ordering that source matching may use.
-///
-/// Keeping the sorted, deduplicated list behind this type prevents hover and
-/// completion from rebuilding subtly different resource-header matchers.
-pub(crate) struct ResourceTypePatterns(Vec<String>);
-
-struct ResourceHeader<'a> {
-    resource_type: &'a str,
-    binding: Option<String>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SchemaSelector {
+    path: ResourceTypePath,
+    kind: SelectorKind,
 }
 
-impl ResourceTypePatterns {
-    pub(crate) fn from_schemas(schemas: &SchemaRegistry) -> Self {
-        let mut patterns: Vec<String> = schemas
-            .iter()
-            .map(|(provider, resource_type, _kind, _schema)| {
-                if provider.is_empty() {
-                    resource_type.to_string()
-                } else {
-                    format!("{provider}.{resource_type}")
-                }
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SelectorKind {
+    Syntax(SchemaKind),
+    Kindless,
+}
+
+impl SchemaSelector {
+    /// Handles and Ref/annotation types carry a path but no syntax kind.
+    pub(crate) fn kindless(path: ResourceTypePath) -> Self {
+        Self {
+            path,
+            kind: SelectorKind::Kindless,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &ResourceTypePath {
+        &self.path
+    }
+
+    pub(crate) fn lookup<'a>(
+        &self,
+        schemas: &'a SchemaRegistry,
+    ) -> Option<OwnerBoundResourceSchema<'a>> {
+        if self.path.provider.is_empty() {
+            return None;
+        }
+        match self.kind {
+            SelectorKind::Syntax(kind) => {
+                schemas.get(&self.path.provider, &self.path.resource_type, kind)
+            }
+            SelectorKind::Kindless => {
+                schemas.get_kindless(&self.path.provider, &self.path.resource_type)
+            }
+        }
+    }
+}
+
+pub(crate) struct ResourceHeader {
+    pub(crate) selector: SchemaSelector,
+    binding: Option<String>,
+    is_block_header: bool,
+}
+
+fn walk_back_prefix(lexed: &LexedDocument, mut line: usize, prefix: &str) -> (String, usize) {
+    let prefix = prefix.trim_end();
+    if !prefix.is_empty() {
+        return (prefix.to_string(), line);
+    }
+    let expression_line = line;
+    while line > 0 {
+        line -= 1;
+        let preceding = &lexed.lines()[line];
+        let last_significant = preceding
+            .text()
+            .char_indices()
+            .zip(preceding.chars())
+            .filter(|((_, ch), classified)| {
+                !ch.is_whitespace() && classified.kind() != LexKind::Comment
             })
-            .collect();
-        patterns.sort();
-        patterns.dedup();
-        patterns.sort_by_key(|pattern| std::cmp::Reverse(pattern.len()));
-        Self(patterns)
-    }
-
-    pub(crate) fn find_in<'a>(&'a self, segment: &str) -> Option<&'a str> {
-        self.0
-            .iter()
-            .find(|pattern| segment.contains(pattern.as_str()))
-            .map(String::as_str)
-    }
-
-    fn resource_header<'a>(&'a self, segment: &str) -> Option<ResourceHeader<'a>> {
-        let trimmed = segment.trim();
-        let assignment = parse_let_assignment(trimmed);
-        let (binding, after_binding) = match assignment {
-            Some(assignment) => (Some(assignment.binding.to_string()), assignment.expression),
-            None => (None, trimmed),
+            .last();
+        // Skip only raw blank/comment-only lines. Masked strings and heredocs
+        // are statement boundaries, including a literal after `let x =`.
+        let Some(((byte, ch), classified)) = last_significant else {
+            continue;
         };
-        let candidate = strip_keyword(after_binding, "read")
-            .unwrap_or(after_binding)
-            .trim();
+        let code = preceding.masked_code();
+        let code = code.as_str().trim_end();
+        if classified.kind() == LexKind::Code
+            && crate::position::char_len(&preceding.text()[..byte + ch.len_utf8()])
+                == crate::position::char_len(code)
+            && (code.ends_with(['=', ':']) || strip_read(code).is_some())
+        {
+            return (code.to_string(), line);
+        }
+        break;
+    }
+    (String::new(), expression_line)
+}
 
-        self.0
-            .iter()
-            .find(|pattern| candidate == pattern.as_str())
-            .map(|pattern| ResourceHeader {
-                resource_type: pattern,
-                binding,
-            })
+fn strip_read(prefix: &str) -> Option<&str> {
+    prefix.strip_suffix("read").filter(|prefix| {
+        !prefix.ends_with(|ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.'))
+    })
+}
+
+pub(crate) struct ResourceExpressionPrefix {
+    pub(crate) before_expression: String,
+    pub(crate) read_start: Option<Position>,
+}
+
+/// Snippet insertion and header selection share the same continuation rule.
+pub(crate) fn resource_expression_prefix(
+    lexed: &LexedDocument,
+    position: Position,
+) -> Option<ResourceExpressionPrefix> {
+    let line = position.line as usize;
+    let code = lexed.lines().get(line)?.masked_code();
+    let (prefix, line) = walk_back_prefix(
+        lexed,
+        line,
+        crate::position::line_prefix(code.as_str(), position.character),
+    );
+    let (before_expression, read_start) = match strip_read(&prefix) {
+        Some(before_read) => {
+            let read_start = Position::new(line as u32, crate::position::char_len(&prefix) - 4);
+            let (prefix, _) = walk_back_prefix(lexed, line, before_read);
+            (prefix, Some(read_start))
+        }
+        None => (prefix, None),
+    };
+    Some(ResourceExpressionPrefix {
+        before_expression,
+        read_start,
+    })
+}
+
+/// Parse the complete type-path token at the cursor (or before a block opener).
+/// Only the preceding code token `read` selects a data source. Across physical
+/// lines, only raw trivia and explicit continuation tokens may join a header.
+/// Schema registration never affects this syntax decision.
+pub(crate) fn resource_header(lexed: &LexedDocument, position: Position) -> Option<ResourceHeader> {
+    parse_resource_header(lexed, position, false)
+}
+
+fn parse_resource_header(
+    lexed: &LexedDocument,
+    position: Position,
+    resource_value_position: bool,
+) -> Option<ResourceHeader> {
+    let line_index = position.line as usize;
+    let code = lexed.lines().get(line_index)?.masked_code();
+    let code = code.as_str();
+    let is_path_char = |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.');
+    let offset = crate::position::line_prefix(code, position.character).len();
+    let end = offset
+        + code[offset..]
+            .find(|ch| !is_path_char(ch))
+            .unwrap_or(code.len() - offset);
+    let before_end = code[..end].trim_end();
+    let start = before_end
+        .rmatch_indices(|ch| !is_path_char(ch))
+        .next()
+        .map_or(0, |(index, ch)| index + ch.len());
+    let token = &before_end[start..];
+    if !token.split('.').all(is_module_identifier) {
+        return None;
+    }
+    let resource_type = ResourceTypePath::parse(token)?;
+    let expression_prefix = resource_expression_prefix(
+        lexed,
+        Position::new(position.line, crate::position::char_len(&code[..start])),
+    )?;
+    let kind = if expression_prefix.read_start.is_some() {
+        SchemaKind::DataSource
+    } else {
+        SchemaKind::Resource
+    };
+    let prefix = expression_prefix
+        .before_expression
+        .rsplit(['{', '}', ','])
+        .next()?
+        .trim();
+    let assignment = parse_let_assignment(prefix).filter(|a| a.expression.is_empty());
+    let is_block_header = resource_value_position
+        || (prefix.is_empty() || assignment.is_some()) && code[end..].trim_start().starts_with('{');
+    // Outside a resource header, a path (including nested annotation types)
+    // carries no kind. Only `read` or a managed header supplies a syntax kind.
+    let selector = if !is_block_header && kind == SchemaKind::Resource {
+        SchemaSelector::kindless(resource_type)
+    } else {
+        SchemaSelector {
+            path: resource_type,
+            kind: SelectorKind::Syntax(kind),
+        }
+    };
+    Some(ResourceHeader {
+        selector,
+        binding: assignment.as_ref().map(|a| a.binding.to_string()),
+        is_block_header,
+    })
+}
+
+/// Scan bindings using the same header seam as hover and enclosing blocks.
+/// Only direct resource/read declarations and conditionals whose branch tails
+/// are direct declarations supply a selector. Every tail must have the same
+/// exact path and kind, regardless of which branch core evaluates. Parentheses,
+/// coalescing and nested conditional tails do not preserve a resource selector.
+/// Associate selectors with declaration lines before deduplicating names
+/// buffer-first. An unsaved scalar binding therefore keeps its `None` selector
+/// instead of receiving the selector of a later on-disk declaration.
+pub(crate) fn resource_binding_selectors(text: &str) -> Vec<(String, Option<SchemaSelector>)> {
+    let lexed = lex(text);
+    let tokens = binding_expression_tokens(&lexed);
+    let mut seen = std::collections::HashSet::new();
+    lexed
+        .lines()
+        .iter()
+        .enumerate()
+        .filter_map(|(line_index, line)| {
+            let code = line.masked_code();
+            let (name, _) = crate::let_parse::parse_let_header(code.as_str())?;
+            if !seen.insert(name.to_string()) {
+                return None;
+            }
+            let start = Position::new(
+                line_index as u32,
+                crate::position::char_len(&code.as_str()[..code.as_str().find('=')? + 1]),
+            );
+            let mut parser = BindingSelectorParser {
+                lexed: &lexed,
+                tokens: &tokens,
+                cursor: tokens.partition_point(|token| token.position < start),
+            };
+            let selector = match parser.expression(0, true) {
+                Ok(BindingSelector::Resource(selector)) => Some(selector),
+                _ => None,
+            };
+            Some((name.to_string(), selector))
+        })
+        .collect()
+}
+
+struct BindingExpressionToken {
+    text: String,
+    position: Position,
+}
+
+/// Keep literals as opaque operands rather than erasing them into trivia.
+/// Comments, interpolation punctuation and heredoc bodies cannot supply headers.
+fn binding_expression_tokens(lexed: &LexedDocument) -> Vec<BindingExpressionToken> {
+    let mut tokens = Vec::new();
+    let mut in_literal = false;
+    for (line_index, line) in lexed.lines().iter().enumerate() {
+        let position = |column| Position::new(line_index as u32, column);
+        let code = line.masked_code();
+        let code = code.as_str();
+        let mut chars = code.char_indices().peekable();
+        while let Some((start, ch)) = chars.next() {
+            if ch.is_whitespace() {
+                continue;
+            }
+            let mut end = start + ch.len_utf8();
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.') {
+                while let Some(&(offset, next)) = chars.peek() {
+                    if !next.is_ascii_alphanumeric() && !matches!(next, '_' | '.') {
+                        break;
+                    }
+                    chars.next();
+                    end = offset + next.len_utf8();
+                }
+            } else if matches!(
+                (ch, chars.peek().map(|(_, ch)| *ch)),
+                ('?', Some('?')) | ('|', Some('>')) | ('>', Some('>'))
+            ) {
+                end = chars.next().unwrap().0 + 1;
+            }
+            tokens.push(BindingExpressionToken {
+                text: code[start..end].to_string(),
+                position: position(crate::position::char_len(&code[..start])),
+            });
+        }
+        let heredoc = carina_core::heredoc::find_heredoc_opener_range(line.text());
+        if let Some(range) = heredoc {
+            tokens.push(BindingExpressionToken {
+                text: String::new(),
+                position: position(crate::position::char_len(&line.text()[..range.start])),
+            });
+        }
+        let mut column = 0;
+        for (ch, classified) in line.text().chars().zip(line.chars()) {
+            let literal = !matches!(classified.kind(), LexKind::Code | LexKind::Comment);
+            if literal && !in_literal && !line.is_heredoc_body() {
+                tokens.push(BindingExpressionToken {
+                    text: String::new(),
+                    position: position(column),
+                });
+            }
+            in_literal = literal;
+            column += ch.len_utf16() as u32;
+        }
+    }
+    tokens.sort_by_key(|token| token.position);
+    tokens
+}
+
+/// A small syntax walk over the resource-valued RHS forms. Other primaries
+/// remain opaque: a resource inside a list, call or map does not type the
+/// enclosing value. Incomplete alternatives and conflicting selectors fail
+/// closed, independently of whether the rest of the edited file parses.
+struct BindingSelectorParser<'a> {
+    lexed: &'a LexedDocument,
+    tokens: &'a [BindingExpressionToken],
+    cursor: usize,
+}
+
+#[derive(PartialEq, Eq)]
+enum BindingSelector {
+    Resource(SchemaSelector),
+    NonResource,
+    Conflict,
+}
+
+impl BindingSelectorParser<'_> {
+    fn peek(&self) -> Option<&str> {
+        self.tokens
+            .get(self.cursor)
+            .map(|token| token.text.as_str())
+    }
+
+    fn expect(&mut self, text: &str) -> Result<(), ()> {
+        if self.peek() != Some(text) {
+            return Err(());
+        }
+        self.cursor += 1;
+        Ok(())
+    }
+
+    fn expression(&mut self, depth: usize, resource_position: bool) -> Result<BindingSelector, ()> {
+        // Edited source must not be able to exhaust the LSP's stack.
+        if depth > 128 {
+            return Err(());
+        }
+        let mut selector = self.operand(depth, resource_position)?;
+        while self.peek() == Some("??") {
+            self.cursor += 1;
+            self.operand(depth + 1, false)?;
+            selector = BindingSelector::NonResource;
+        }
+        Ok(selector)
+    }
+
+    fn operand(&mut self, depth: usize, resource_position: bool) -> Result<BindingSelector, ()> {
+        let mut selector = self.primary(depth, resource_position)?;
+        loop {
+            match self.peek() {
+                Some("+") | Some("-") | Some("*") | Some("/") | Some("%") | Some("|>")
+                | Some(">>") => {
+                    self.cursor += 1;
+                    self.primary(depth + 1, false)?;
+                }
+                Some("[") => self.group()?,
+                Some(field) if field.starts_with('.') => self.cursor += 1,
+                _ => break,
+            }
+            selector = BindingSelector::NonResource;
+        }
+        Ok(selector)
+    }
+
+    fn primary(&mut self, depth: usize, resource_position: bool) -> Result<BindingSelector, ()> {
+        let token = self.tokens.get(self.cursor).ok_or(())?;
+        match token.text.as_str() {
+            "(" => {
+                self.cursor += 1;
+                self.expression(depth + 1, false)?;
+                self.expect(")")?;
+                Ok(BindingSelector::NonResource)
+            }
+            "if" => self.conditional(depth + 1, resource_position),
+            "[" | "{" => {
+                self.group()?;
+                Ok(BindingSelector::NonResource)
+            }
+            "for" => {
+                if !resource_position {
+                    return Err(());
+                }
+                self.body_start()?;
+                self.group()?;
+                Ok(BindingSelector::NonResource)
+            }
+            "}" | ")" | "]" | "??" | "let" | "else" => Err(()),
+            _ => {
+                self.cursor += 1;
+                let mut path_position = token.position;
+                if token.text == "read" {
+                    path_position = self.tokens.get(self.cursor).ok_or(())?.position;
+                    self.cursor += 1;
+                }
+                match self.peek() {
+                    Some("{") => {
+                        // Conditions and branch-local lets are value positions
+                        // in core, so declarations cannot appear there.
+                        if !resource_position {
+                            return Err(());
+                        }
+                        let header = parse_resource_header(self.lexed, path_position, true);
+                        // Preserve completion for a direct resource declaration
+                        // whose body is still being edited. Alternatives must
+                        // always have complete bodies.
+                        if self.group().is_err() && depth != 0 {
+                            return Err(());
+                        }
+                        Ok(header.map_or(BindingSelector::NonResource, |header| {
+                            BindingSelector::Resource(header.selector)
+                        }))
+                    }
+                    Some("(") => {
+                        self.group()?;
+                        Ok(BindingSelector::NonResource)
+                    }
+                    _ => Ok(BindingSelector::NonResource),
+                }
+            }
+        }
+    }
+
+    fn conditional(
+        &mut self,
+        depth: usize,
+        resource_position: bool,
+    ) -> Result<BindingSelector, ()> {
+        let condition_start = self.cursor + 1;
+        self.body_start()?;
+        let mut condition = BindingSelectorParser {
+            lexed: self.lexed,
+            tokens: &self.tokens[condition_start..self.cursor],
+            cursor: 0,
+        };
+        condition.expression(depth + 1, false)?;
+        if condition.cursor != condition.tokens.len() {
+            return Err(());
+        }
+        let selector = self.branch(depth, resource_position)?;
+        if self.peek() == Some("else") {
+            self.cursor += 1;
+            if self.branch(depth, resource_position)? != selector {
+                return Ok(BindingSelector::Conflict);
+            }
+        }
+        Ok(selector)
+    }
+
+    fn branch(&mut self, depth: usize, resource_position: bool) -> Result<BindingSelector, ()> {
+        self.expect("{")?;
+        while self.peek() == Some("let") {
+            self.cursor += 2; // keyword and local binding name
+            self.expect("=")?;
+            self.expression(depth + 1, false)?;
+        }
+        // Core lowers only direct declarations as structural branch tails.
+        // Nested value conditionals remain usable inside local value bindings.
+        if resource_position && self.peek() == Some("if") {
+            return Err(());
+        }
+        let selector = self.expression(depth + 1, resource_position)?;
+        self.expect("}")?;
+        Ok(selector)
+    }
+
+    fn body_start(&mut self) -> Result<(), ()> {
+        self.cursor += 1; // if/for
+        let condition_start = self.cursor;
+        loop {
+            match self.peek().ok_or(())? {
+                // Parenthesized conditions, calls and iterable lists can
+                // contain braces that do not open the control-flow body.
+                "(" | "[" => self.group()?,
+                "{" if self.cursor > condition_start => {
+                    let opener = self.cursor;
+                    self.group()?;
+                    // A resource/module-valued condition consumes its own
+                    // block before the brace that opens the branch body.
+                    if self.peek() != Some("{") {
+                        self.cursor = opener;
+                        return Ok(());
+                    }
+                }
+                "{" => self.group()?,
+                "}" | ")" | "]" | "else" | "let" => return Err(()),
+                _ => self.cursor += 1,
+            }
+        }
+    }
+
+    fn group(&mut self) -> Result<(), ()> {
+        let mut closers = Vec::new();
+        loop {
+            let token = self.peek().ok_or(())?;
+            match token {
+                "(" => closers.push(")"),
+                "[" => closers.push("]"),
+                "{" => closers.push("}"),
+                ")" | "]" | "}" if closers.pop() != Some(token) => return Err(()),
+                _ => {}
+            }
+            self.cursor += 1;
+            if closers.is_empty() {
+                return Ok(());
+            }
+        }
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum EnclosingBlock {
     Resource {
-        resource_type: String,
+        selector: SchemaSelector,
         struct_path: StructPath,
         binding: Option<String>,
     },
@@ -108,7 +552,7 @@ struct LineSegment {
 
 enum BraceOpener {
     Resource {
-        resource_type: String,
+        selector: SchemaSelector,
         binding: Option<String>,
     },
     Path(PathSegment),
@@ -141,14 +585,51 @@ struct PathSegment {
     syntax: SegmentSyntax,
 }
 
+/// Whether the innermost open code brace is a for/if/else expression body.
+pub(crate) fn in_control_flow_body(lexed: &LexedDocument, position: Position) -> bool {
+    let mut depth = 0;
+    for (line_index, line) in lexed
+        .lines()
+        .iter()
+        .enumerate()
+        .take(position.line as usize + 1)
+        .rev()
+    {
+        let chars: Vec<_> = line.text().chars().collect();
+        let limit = if line_index == position.line as usize {
+            crate::position::utf16_offset_to_char_offset(line.text(), position.character)
+                .unwrap_or(chars.len())
+        } else {
+            chars.len()
+        };
+        for index in (0..limit).rev() {
+            if line.chars()[index].kind() != LexKind::Code {
+                continue;
+            }
+            match chars[index] {
+                '}' => depth += 1,
+                '{' if depth > 0 => depth -= 1,
+                '{' => {
+                    let segment = scan_line_segment(
+                        &chars,
+                        line.chars(),
+                        index,
+                        SegmentScanMode::BeforeOpener,
+                    );
+                    return is_control_flow_segment(&segment.block_code)
+                        || is_else_segment(&segment.code);
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 /// Classify the block enclosing `position` with one lexer-aware backwards walk.
 /// Only ordinary code punctuation is structural: interpolation expressions,
 /// strings, comments, and heredoc bodies are deliberately invisible here.
-pub(crate) fn enclosing_block(
-    text: &str,
-    position: Position,
-    resource_types: &ResourceTypePatterns,
-) -> EnclosingBlock {
+pub(crate) fn enclosing_block(text: &str, position: Position) -> EnclosingBlock {
     let lexed = lex(text);
     let source_lines: Vec<&str> = text
         .split('\n')
@@ -214,10 +695,20 @@ pub(crate) fn enclosing_block(
                         char_index,
                         SegmentScanMode::BeforeOpener,
                     );
+                    let header = resource_header(
+                        &lexed,
+                        Position::new(
+                            line_index as u32,
+                            crate::position::char_offset_to_utf16_offset(
+                                source_lines[line_index],
+                                char_index,
+                            ),
+                        ),
+                    );
                     match pending_element {
                         PendingElement::None => {}
                         PendingElement::Unnamed => {
-                            match classify_brace_opener(&segment, resource_types) {
+                            match classify_brace_opener(&segment, header.as_ref()) {
                                 BraceOpener::Path(PathSegment {
                                     name,
                                     syntax: SegmentSyntax::Assignment,
@@ -234,12 +725,9 @@ pub(crate) fn enclosing_block(
                                     continue;
                                 }
                                 BraceOpener::ControlFlow => continue,
-                                BraceOpener::Resource {
-                                    resource_type,
-                                    binding,
-                                } => {
+                                BraceOpener::Resource { selector, binding } => {
                                     return EnclosingBlock::Resource {
-                                        resource_type,
+                                        selector,
                                         struct_path: StructPath::Unresolvable,
                                         binding,
                                     };
@@ -257,13 +745,10 @@ pub(crate) fn enclosing_block(
                             }
                         }
                     }
-                    match classify_brace_opener(&segment, resource_types) {
-                        BraceOpener::Resource {
-                            resource_type,
-                            binding,
-                        } => {
+                    match classify_brace_opener(&segment, header.as_ref()) {
+                        BraceOpener::Resource { selector, binding } => {
                             return EnclosingBlock::Resource {
-                                resource_type,
+                                selector,
                                 struct_path: resource_struct_path(reverse_path),
                                 binding,
                             };
@@ -488,14 +973,11 @@ fn parse_list_attribute_segment(segment: &LineSegment) -> Option<PathSegment> {
     })
 }
 
-fn classify_brace_opener(
-    segment: &LineSegment,
-    resource_types: &ResourceTypePatterns,
-) -> BraceOpener {
-    if let Some(header) = resource_types.resource_header(&segment.code) {
+fn classify_brace_opener(segment: &LineSegment, header: Option<&ResourceHeader>) -> BraceOpener {
+    if let Some(header) = header.filter(|header| header.is_block_header) {
         BraceOpener::Resource {
-            resource_type: header.resource_type.to_string(),
-            binding: header.binding,
+            selector: header.selector.clone(),
+            binding: header.binding.clone(),
         }
     } else if is_else_segment(&segment.code) {
         BraceOpener::Else

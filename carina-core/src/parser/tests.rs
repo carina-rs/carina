@@ -1034,6 +1034,45 @@ fn declaration_if_expressions_are_rejected_as_integer_operands_everywhere() {
 }
 
 #[test]
+fn resource_valued_let_rhs_shapes_match_lsp_selector_contract() {
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    for (case, rhs, accepted) in [
+        ("a", "(mock.ec2.Vpc {})", false),
+        ("b", "y ?? mock.ec2.Vpc {}", false),
+        ("c", "mock.ec2.Vpc {} ?? y", false),
+        (
+            "d",
+            "if c { mock.ec2.Vpc {} } else { if d { mock.ec2.Vpc {} } else { mock.ec2.Vpc {} } }",
+            false,
+        ),
+        (
+            "e",
+            "if c { mock.ec2.Vpc {} } else { mock.ec2.Vpc {} }",
+            true,
+        ),
+        ("f", "if c { let l = 1\n mock.ec2.Vpc {} }", true),
+        (
+            "g",
+            "if c { read mock.ec2.Vpc {} } else { read mock.ec2.Vpc {} }",
+            true,
+        ),
+    ] {
+        for condition in [false, true] {
+            let source =
+                format!("let c = {condition}\nlet d = false\nlet y = 'a'\nlet x = {rhs}\n");
+            let result = parse_file(&source, std::path::Path::new("main.crn"), &context);
+            match &result {
+                Ok(_) => println!("{case} (c={condition}): accepted"),
+                Err(error) => println!("{case} (c={condition}): rejected: {error}"),
+            }
+            // Core does not lower the nested else tail when c is true.
+            let accepted = accepted || case == "d" && condition;
+            assert_eq!(result.is_ok(), accepted, "case {case}, c={condition}");
+        }
+    }
+}
+
+#[test]
 fn let_rhs_coalesce_errors_keep_the_authored_line() {
     let closure_error = parse(
         "let source = mock.test.Thing {}\nlet a = source.value\nlet x = a ?? join(\",\")",
