@@ -159,11 +159,82 @@ carina state bucket-delete <bucket-name> --force
 
 This is a destructive operation that removes the bucket and all state history.
 
+## Configuring the GitHub backend
+
+Store state in an existing GitHub.com repository and branch:
+
+```crn
+backend github {
+  repository = 'owner/infra-state'
+  branch = 'carina-state'
+  path = 'states/prod/carina.state.json'
+}
+```
+
+All three fields are required. Concrete expressions such as `env()` are
+accepted. The repository and branch must already exist; Carina never creates
+them or chooses a default branch. The path must be relative, with no empty or
+`..` segments, and must not end in `.lock`. Carina stores its lease at
+`<path>.lock`. Only `api.github.com` is supported.
+
+Authentication uses a non-empty `GITHUB_TOKEN`, otherwise
+`gh auth token --hostname github.com`. Grant **Contents read/write** on the
+state repository. Read-only consumers of `upstream_state`, exports, or state
+commands need only **Contents read**. The token is kept outside backend
+configuration, backend locks, and saved plans.
+
+For read-only access without a configuration directory, use:
+
+```sh
+carina state show --state-url 'github://owner/infra-state/states/prod/carina.state.json?branch=carina-state'
+carina export --state-url 'github://owner/infra-state/states/prod/carina.state.json?branch=states%2Fprod'
+```
+
+The `branch` query parameter is required. Percent-encode `/` in branch names
+as `%2F`. These URLs never acquire a lock or modify state. Offline
+`state migrate --check` accepts only a local copy, not a GitHub URL.
+
+Use **one branch per independently applied state**. State and lease writes
+use the Contents API with the observed blob SHA; mutations of different paths
+on one branch can also conflict. Carina retries branch contention a bounded
+number of times, and stops on a changed target or an unexpected response.
+The maximum state size is **10,000,000 decoded bytes (10 MB)**, checked on reads
+and before writes. Larger states fail with a size error; they are not split.
+
+### Measured concurrency, not a GitHub guarantee
+
+The concurrency behavior is measured, **not guaranteed by GitHub's
+documentation**. In experiments on November 14, 2026, simultaneous creates
+of the same lock file had exactly one winner in **50 of 50 trials**, and
+simultaneous updates using the same blob SHA had exactly one winner in
+**50 of 50 trials**. Every loser returned HTTP 409. Simultaneous creates of
+different paths on the same branch also conflicted in **50 of 50 trials**.
+These observations do not establish a guarantee during incidents or future
+GitHub changes. Blob SHAs identify content, not monotonically increasing
+generations, and checking the lease and writing state are separate requests.
+
+### State history is kept
+
+Keep the state repository **private, with narrow access**. Every version stays
+in Git history. Once committed, a value cannot be removed from every copy,
+including other people's clones; deleting it from the latest state does not
+erase earlier versions. This retention is an explicit user decision, without
+whole-state encryption.
+
+State contains the following:
+
+- **Plain text:** values not written as secrets, provider-populated outputs,
+  and resume tokens of unfinished creates.
+- **Hashed:** values written as secrets.
+
+S3 by default keeps only the latest state. GitHub retains every committed
+state and lease version, including values later changed or removed.
+
 ## Moving state to a different backend
 
 <!-- derived-from ../reference/cli/init.md -->
 
-When you change the `backend` block — switching from local state to S3,
+When you change the `backend` block — switching between local, S3, and GitHub,
 or changing the `key` while reorganizing component directories — the
 state file must move with it. There is a single answer:
 

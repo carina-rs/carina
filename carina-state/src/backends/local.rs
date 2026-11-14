@@ -706,7 +706,7 @@ mod tests {
         };
         match crate::BackendConfig::try_from(&raw).unwrap() {
             crate::BackendConfig::Local(settings) => settings,
-            crate::BackendConfig::S3(_) => unreachable!(),
+            crate::BackendConfig::S3(_) | crate::BackendConfig::GitHub(_) => unreachable!(),
         }
     }
 

@@ -263,7 +263,8 @@ pub enum StateCommands {
         path: Option<PathBuf>,
 
         /// Read state directly from a URL, bypassing .crn / backend
-        /// resolution. Accepts s3://bucket/key, file://path, or a bare
+        /// resolution. Accepts github://owner/repo/path?branch=name,
+        /// s3://bucket/key, file://path, or a bare
         /// local path. Mutually exclusive with [PATH].
         #[arg(long, conflicts_with = "path")]
         state_url: Option<String>,
@@ -279,7 +280,8 @@ pub enum StateCommands {
         path: Option<PathBuf>,
 
         /// Read state directly from a URL, bypassing .crn / backend
-        /// resolution. Accepts s3://bucket/key, file://path, or a bare
+        /// resolution. Accepts github://owner/repo/path?branch=name,
+        /// s3://bucket/key, file://path, or a bare
         /// local path. Mutually exclusive with [PATH].
         #[arg(long, conflicts_with = "path")]
         state_url: Option<String>,
@@ -295,7 +297,8 @@ pub enum StateCommands {
         path: Option<PathBuf>,
 
         /// Read state directly from a URL, bypassing .crn / backend
-        /// resolution. Accepts s3://bucket/key, file://path, or a bare
+        /// resolution. Accepts github://owner/repo/path?branch=name,
+        /// s3://bucket/key, file://path, or a bare
         /// local path. Mutually exclusive with [PATH].
         #[arg(long, conflicts_with = "path")]
         state_url: Option<String>,

@@ -1,16 +1,20 @@
 //! Backend implementations for state storage
 
+pub mod github;
+#[cfg(test)]
+mod github_tests;
 mod local;
 mod s3;
 #[cfg(test)]
 mod s3_winterbaume_tests;
 mod url;
 
+pub use github::{GitHubBackend, GitHubError};
 pub use local::LocalBackend;
 pub use s3::{S3AutoCreate, S3AutoCreateDisabled, S3Backend, S3Bootstrap, S3BootstrapInfo};
 pub use url::{
-    LocalStateFile, StateUrl, load_encoded_published_exports_from_url, load_local_state_file,
-    load_state_from_url,
+    GitHubUrlError, LocalStateFile, StateUrl, load_encoded_published_exports_from_url,
+    load_local_state_file, load_state_from_url,
 };
 
 use carina_core::paths::ResolvedPath;
@@ -39,6 +43,18 @@ pub(crate) async fn create_explicit_backend(
     url: &StateUrl,
 ) -> BackendResult<Box<dyn StateBackend>> {
     match url {
+        StateUrl::GitHub {
+            repository,
+            branch,
+            path,
+        } => Ok(Box::new(
+            GitHubBackend::from_config(&crate::GitHubBackendSettings::from_parts(
+                repository.clone(),
+                branch.clone(),
+                path.clone(),
+            ))
+            .await?,
+        )),
         StateUrl::S3 { bucket, key } => Ok(Box::new(
             S3Backend::from_url_parts(bucket.clone(), key.clone()).await?,
         )),
@@ -65,6 +81,16 @@ pub fn s3_backend_for_test(
     region: String,
 ) -> Box<dyn StateBackend> {
     Box::new(S3Backend::from_client(client, settings, region))
+}
+
+/// Inject an offline GitHub transport while preserving admitted destination
+/// settings. Production backend construction remains selection-owned.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn github_backend_for_test(
+    settings: &crate::GitHubBackendSettings,
+    transport: std::sync::Arc<dyn github::GitHubTransport>,
+) -> Box<dyn StateBackend> {
+    Box::new(GitHubBackend::with_transport(settings.clone(), transport))
 }
 
 /// Resolve a local backend's state file path, anchoring a relative

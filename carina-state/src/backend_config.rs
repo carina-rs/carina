@@ -16,6 +16,7 @@ use carina_core::validation::admission::{
 use std::collections::HashMap;
 
 pub use backend::{BackendAttributeError, BackendConfigError, BackendConfigErrors};
+pub use backend::{GitBranch, RepositoryPath, RepositorySlug};
 
 use crate::backend::{LOCAL_BACKEND_TYPE, S3_BACKEND_TYPE};
 
@@ -79,6 +80,7 @@ use crate::backend::{LOCAL_BACKEND_TYPE, S3_BACKEND_TYPE};
 pub enum BackendConfig {
     S3(S3BackendSettings),
     Local(LocalBackendSettings),
+    GitHub(GitHubBackendSettings),
 }
 
 impl BackendConfig {
@@ -99,7 +101,7 @@ impl BackendConfig {
     pub fn as_s3(&self) -> Option<&S3BackendSettings> {
         match self {
             Self::S3(settings) => Some(settings),
-            Self::Local(_) => None,
+            Self::Local(_) | Self::GitHub(_) => None,
         }
     }
 
@@ -107,6 +109,26 @@ impl BackendConfig {
     /// plans. Enum values use API spelling.
     pub fn to_parser_config(&self) -> parser::BackendConfig<NoPlaceholder, AbsoluteBindingAddress> {
         match self {
+            Self::GitHub(settings) => parser::BackendConfig {
+                backend_type: "github".into(),
+                attributes: [
+                    (
+                        "repository".to_string(),
+                        Value::Concrete(ConcreteValue::String(settings.repository.as_str().into())),
+                    ),
+                    (
+                        "branch".to_string(),
+                        Value::Concrete(ConcreteValue::String(settings.branch.as_str().into())),
+                    ),
+                    (
+                        "path".to_string(),
+                        Value::Concrete(ConcreteValue::String(settings.path.as_str().into())),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                attribute_spans: Default::default(),
+            },
             Self::S3(settings) => {
                 let mut attributes = HashMap::from([
                     (
@@ -156,6 +178,36 @@ impl BackendConfig {
                 }
             }
         }
+    }
+}
+
+/// Credentials are deliberately absent from persistent backend settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubBackendSettings {
+    repository: RepositorySlug,
+    branch: GitBranch,
+    path: RepositoryPath,
+}
+impl GitHubBackendSettings {
+    pub(crate) fn from_parts(
+        repository: RepositorySlug,
+        branch: GitBranch,
+        path: RepositoryPath,
+    ) -> Self {
+        Self {
+            repository,
+            branch,
+            path,
+        }
+    }
+    pub fn repository(&self) -> &RepositorySlug {
+        &self.repository
+    }
+    pub fn branch(&self) -> &GitBranch {
+        &self.branch
+    }
+    pub fn path(&self) -> &RepositoryPath {
+        &self.path
     }
 }
 
@@ -387,6 +439,29 @@ impl LocalBackendSettings {
 impl From<AdmittedConfiguration<BackendAttribute>> for BackendConfig {
     fn from(configuration: AdmittedConfiguration<BackendAttribute>) -> Self {
         match configuration.backend_kind() {
+            BackendKind::GitHub => Self::GitHub(GitHubBackendSettings {
+                repository: RepositorySlug::parse(
+                    configuration
+                        .string("repository")
+                        .expect("required repository")
+                        .expose_plaintext(),
+                )
+                .expect("admitted repository"),
+                branch: GitBranch::parse(
+                    configuration
+                        .string("branch")
+                        .expect("required branch")
+                        .expose_plaintext(),
+                )
+                .expect("admitted branch"),
+                path: RepositoryPath::state_path(
+                    configuration
+                        .string("path")
+                        .expect("required path")
+                        .expose_plaintext(),
+                )
+                .expect("admitted path"),
+            }),
             BackendKind::S3 => Self::S3(S3BackendSettings {
                 bucket: configuration
                     .string("bucket")
@@ -433,7 +508,7 @@ mod tests {
     fn s3_region(source: &str) -> String {
         match resolve(source).expect("backend must resolve") {
             BackendConfig::S3(settings) => settings.region().unwrap().to_string(),
-            BackendConfig::Local(_) => panic!("expected s3 backend"),
+            BackendConfig::Local(_) | BackendConfig::GitHub(_) => panic!("expected s3 backend"),
         }
     }
 

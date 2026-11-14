@@ -11,6 +11,19 @@ use carina_core::schema::{
 mod basic;
 mod extended;
 
+#[test]
+fn github_admission_completion_uses_backend_declarations() {
+    let items = schema_selection_completions("backend | ");
+    assert!(items.iter().any(|item| item.label == "github"), "{items:?}");
+    let items = schema_selection_completions("backend github {\n  |\n}");
+    for field in ["repository", "branch", "path"] {
+        assert!(
+            items.iter().any(|item| item.label == field),
+            "{field}: {items:?}"
+        );
+    }
+}
+
 fn schema_selector(path: &str, kind: SchemaKind) -> Option<SchemaSelector> {
     let prefix = match kind {
         SchemaKind::Resource => "",

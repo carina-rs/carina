@@ -1,7 +1,7 @@
 //! Carina State Management
 //!
 //! This crate provides state management for the Carina infrastructure tool.
-//! It supports storing infrastructure state in various backends (currently S3)
+//! It supports storing infrastructure state locally, in S3, and in GitHub
 //! with locking support for safe concurrent access.
 //!
 //! # Overview
@@ -82,8 +82,9 @@ pub use backend::{
     read_published_exports,
 };
 pub use backend_config::{
-    BackendAttributeError, BackendConfig, BackendConfigError, BackendConfigErrors,
-    LocalBackendSettings, LocalStateLocateError, S3BackendSettings,
+    BackendAttributeError, BackendConfig, BackendConfigError, BackendConfigErrors, GitBranch,
+    GitHubBackendSettings, LocalBackendSettings, LocalStateLocateError, RepositoryPath,
+    RepositorySlug, S3BackendSettings,
 };
 pub use backend_lock::BackendLock;
 pub use backend_selection::{
@@ -98,7 +99,7 @@ pub use backends::{
     load_state_from_url,
 };
 #[cfg(any(test, feature = "test-utils"))]
-pub use backends::{local_backend_for_test, s3_backend_for_test};
+pub use backends::{github_backend_for_test, local_backend_for_test, s3_backend_for_test};
 pub use heartbeat::{HeartbeatGuard, LockHeartbeat, LockLost, LockedStateWriter};
 pub use lock::LockInfo;
 pub use state::{

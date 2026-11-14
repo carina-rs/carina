@@ -140,3 +140,76 @@ fn backend_config_directory_preserves_region_defaults_and_env_strings() {
     };
     assert_eq!(region.api_value(), "us-west-2");
 }
+
+#[test]
+fn github_admission_accepts_concrete_directory_expressions() {
+    let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([(
+        "STATE_REPOSITORY".into(),
+        "owner/repo".into(),
+    )]));
+    let admitted = directory(
+        "backend github { repository = env('STATE_REPOSITORY') branch = state_branch path = 'states/prod.json' }",
+        "let state_branch = 'states/prod'", &context,
+    ).unwrap();
+    assert_eq!(admitted.backend_kind().name(), "github");
+    assert_eq!(
+        admitted.string("branch").unwrap().expose_plaintext(),
+        "states/prod"
+    );
+}
+
+#[test]
+fn github_admission_rejects_missing_invalid_secret_and_unresolved_fields() {
+    let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    for (fields, expected) in [
+        ("", "Missing required attribute: branch"),
+        (
+            "repository = 'owner' branch = 'b' path = 's.json'",
+            "repository",
+        ),
+        (
+            "repository = 'owner/repo/extra' branch = 'b' path = 's.json'",
+            "repository",
+        ),
+        (
+            "repository = 'owner/repo' branch = '' path = 's.json'",
+            "branch",
+        ),
+        (
+            "repository = 'owner/repo' branch = 'b' path = '../s.json'",
+            "path",
+        ),
+        (
+            "repository = 'owner/repo' branch = 'b' path = 'a//s.json'",
+            "path",
+        ),
+        (
+            "repository = 'owner/repo' branch = 'b' path = '/s.json'",
+            "path",
+        ),
+        (
+            "repository = 'owner/repo' branch = 'b' path = 's.json.lock'",
+            "path",
+        ),
+        (
+            "repository = secret('never-print-token') branch = 'b' path = 's.json'",
+            "repository",
+        ),
+        (
+            "repository = pending.repo branch = 'b' path = 's.json'",
+            "repository",
+        ),
+        (
+            "repository = 'owner/repo' branch = 'b' path = 's.json' typo = true",
+            "Unknown attribute 'typo'",
+        ),
+    ] {
+        let source = format!("backend github {{ {fields} }}");
+        let parsed =
+            carina_core::parser::parse_file(&source, std::path::Path::new("backend.crn"), &context)
+                .unwrap();
+        let error = backend::admit(parsed.backend.as_ref().unwrap()).unwrap_err();
+        assert!(error.to_string().contains(expected), "{source}: {error}");
+        assert!(!format!("{error:?} {error}").contains("never-print-token"));
+    }
+}

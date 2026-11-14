@@ -4,6 +4,10 @@ use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::timeout::TimeoutConfig;
+
+#[cfg(test)]
+pub(super) static S3_CONSTRUCTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::operation::head_bucket::HeadBucketError;
 use aws_sdk_s3::primitives::ByteStream;
@@ -259,6 +263,8 @@ impl S3Backend {
     /// redirects, so any region from the chain reaches buckets in other
     /// regions.
     pub(crate) async fn from_config(config: &S3BackendSettings) -> BackendResult<Self> {
+        #[cfg(test)]
+        S3_CONSTRUCTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sdk_region = sdk_chain_region().await;
         let region = resolve_region(config.region(), sdk_region.as_deref())?;
         let client = build_s3_client(&region).await;
@@ -268,6 +274,8 @@ impl S3Backend {
     /// URL origin retains encryption and forbids automatic bucket creation.
     /// The URL's candidate enters the same declared-settings admission path.
     pub(crate) async fn from_url_parts(bucket: String, key: String) -> BackendResult<Self> {
+        #[cfg(test)]
+        S3_CONSTRUCTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let settings = S3BackendSettings::from_url_parts(bucket, key)?;
         Self::from_config(&settings).await
     }

@@ -1,0 +1,5 @@
+[
+  {"field":"branch", "line":3, "message":"Invalid attribute 'branch' for backend type 'github': Validation failed: GitHub branch must not be empty"},
+  {"field":"path", "line":4, "message":"Invalid attribute 'path' for backend type 'github': Validation failed: GitHub path must be relative, non-empty, and contain no empty, '.' or '..' segments"},
+  {"field":"repository", "line":2, "message":"Invalid attribute 'repository' for backend type 'github': Validation failed: GitHub repository must be an owner/repo slug"}
+]

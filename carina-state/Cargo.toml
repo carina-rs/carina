@@ -31,6 +31,9 @@ async-trait = "0.1"
 thiserror = "2"
 hostname = "0.4"
 log = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+base64 = "0.22"
+percent-encoding = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
@@ -39,6 +42,7 @@ carina-core = { path = "../carina-core", features = ["test-utils"] }
 hex = "0.4"
 indexmap = "2"
 tempfile = "3"
+sha1 = "0.10"
 # In-process AWS service emulator: the S3 backend's integration tests
 # inject a winterbaume-backed S3 client and exercise the StateBackend
 # I/O path with no real AWS and no external process (#3203).

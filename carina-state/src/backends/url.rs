@@ -5,10 +5,11 @@
 //! resolution path entirely (carina#3336). This module owns the URL
 //! parsing and the read-only state loader that backs that flag.
 //!
-//! Three URL forms are accepted:
+//! Four URL forms are accepted:
 //!
 //! | Form | Example | Resolution |
 //! | ---- | ------- | ---------- |
+//! | `github://owner/repo/path?branch=name` | `github://org/states/prod.json?branch=states%2Fprod` | GitHub.com Contents reads from an explicit branch. |
 //! | `s3://bucket/key` | `s3://my-states/prod/state.json` | Constructs an `S3Backend` via the shared region + SDK-client helpers in `s3.rs`. |
 //! | `file://path` | `file:///tmp/state.json` | Reads the absolute path after the scheme. |
 //! | Bare path | `./state.json`, `/abs/state.json` | Read directly from the local filesystem. |
@@ -27,6 +28,56 @@ use std::path::PathBuf;
 use crate::backend::{BackendError, BackendResult, StateBackend};
 use crate::backend_selection::BackendSelection;
 use crate::state::{PublishedExports, StateFile};
+use crate::{GitBranch, RepositoryPath, RepositorySlug};
+
+#[derive(Debug, thiserror::Error)]
+pub enum GitHubUrlError {
+    #[error("GitHub state URL is missing its owner")]
+    MissingOwner,
+    #[error("GitHub state URL is missing its repository")]
+    MissingRepository,
+    #[error("GitHub state URL requires a non-empty state path")]
+    EmptyPath,
+    #[error("GitHub state URL requires a branch query parameter")]
+    MissingBranch,
+    #[error("GitHub state URL contains a duplicate branch query parameter")]
+    DuplicateBranch,
+    #[error("GitHub state URL contains an unknown query key; only branch is accepted")]
+    UnknownQueryKey,
+    #[error("GitHub state URL has invalid percent encoding or a fragment")]
+    Encoding,
+    #[error(transparent)]
+    Destination(
+        #[from] carina_core::validation::admission::configuration::backend::GitHubDestinationError,
+    ),
+}
+
+pub(crate) const COMPONENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
+pub(crate) fn encode_component(value: &str) -> String {
+    percent_encoding::utf8_percent_encode(value, COMPONENT).to_string()
+}
+
+fn decode_component(value: &str) -> Result<String, GitHubUrlError> {
+    for (index, byte) in value.bytes().enumerate() {
+        if byte == b'%'
+            && !value
+                .as_bytes()
+                .get(index + 1..index + 3)
+                .is_some_and(|bytes| bytes.iter().all(u8::is_ascii_hexdigit))
+        {
+            return Err(GitHubUrlError::Encoding);
+        }
+    }
+    percent_encoding::percent_decode_str(value)
+        .decode_utf8()
+        .map(|value| value.into_owned())
+        .map_err(|_| GitHubUrlError::Encoding)
+}
 
 /// A local state file for offline commands. Remote URLs cannot inhabit this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +147,12 @@ pub async fn load_local_state_file(file: &LocalStateFile) -> BackendResult<State
 /// parser's scheme + emptiness checks first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StateUrl {
+    #[non_exhaustive]
+    GitHub {
+        repository: RepositorySlug,
+        branch: GitBranch,
+        path: RepositoryPath,
+    },
     /// `s3://bucket/key` — bucket is the URL host, key is the path
     /// (leading `/` stripped). Region / credentials come from the AWS
     /// SDK default chain at load time.
@@ -117,7 +174,9 @@ impl StateUrl {
     /// only the local-file form is meaningful for state lookup).
     /// Anything else is treated as a bare filesystem path.
     pub fn parse(raw: &str) -> BackendResult<Self> {
-        if let Some(rest) = raw.strip_prefix("s3://") {
+        if let Some(rest) = raw.strip_prefix("github://") {
+            Self::parse_github(rest).map_err(BackendError::from)
+        } else if let Some(rest) = raw.strip_prefix("s3://") {
             let (bucket, key) = rest.split_once('/').ok_or_else(|| {
                 BackendError::configuration(format!(
                     "Invalid s3:// URL '{}': expected s3://<bucket>/<key>",
@@ -145,7 +204,7 @@ impl StateUrl {
             // treating them as bare paths — the user almost certainly
             // meant something else.
             Err(BackendError::configuration(format!(
-                "Unsupported URL scheme in '{}': only s3://, file://, or a bare path are accepted",
+                "Unsupported URL scheme in '{}': only github://, s3://, file://, or a bare path are accepted",
                 raw
             )))
         } else {
@@ -155,10 +214,68 @@ impl StateUrl {
         }
     }
 
+    fn parse_github(rest: &str) -> Result<Self, GitHubUrlError> {
+        if rest.contains('#') {
+            return Err(GitHubUrlError::Encoding);
+        }
+        let (address, query) = rest
+            .split_once('?')
+            .map_or((rest, None), |(address, query)| (address, Some(query)));
+        let mut parts = address.splitn(3, '/');
+        let owner = parts
+            .next()
+            .filter(|owner| !owner.is_empty())
+            .ok_or(GitHubUrlError::MissingOwner)?;
+        let repo = parts
+            .next()
+            .filter(|repo| !repo.is_empty())
+            .ok_or(GitHubUrlError::MissingRepository)?;
+        let path = parts
+            .next()
+            .filter(|path| !path.is_empty())
+            .ok_or(GitHubUrlError::EmptyPath)?;
+        let repository = RepositorySlug::parse(&format!(
+            "{}/{}",
+            decode_component(owner)?,
+            decode_component(repo)?
+        ))?;
+        let path = RepositoryPath::state_path(&decode_component(path)?)?;
+        let mut branch = None;
+        for pair in query.ok_or(GitHubUrlError::MissingBranch)?.split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            if decode_component(key)? != "branch" {
+                return Err(GitHubUrlError::UnknownQueryKey);
+            }
+            if branch.is_some() {
+                return Err(GitHubUrlError::DuplicateBranch);
+            }
+            branch = Some(GitBranch::parse(&decode_component(value)?)?);
+        }
+        Ok(Self::GitHub {
+            repository,
+            branch: branch.ok_or(GitHubUrlError::MissingBranch)?,
+            path,
+        })
+    }
+
     /// Human-readable form, suitable for migration-warning display
     /// targets and error messages.
     pub fn display_target(&self) -> String {
         match self {
+            StateUrl::GitHub {
+                repository,
+                branch,
+                path,
+            } => format!(
+                "github://{}/{}?branch={}",
+                repository.as_str(),
+                path.as_str()
+                    .split('/')
+                    .map(encode_component)
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                encode_component(branch.as_str())
+            ),
             StateUrl::S3 { bucket, key } => format!("s3://{}/{}", bucket, key),
             StateUrl::File { path } => path.display().to_string(),
         }

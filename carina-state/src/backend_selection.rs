@@ -490,6 +490,9 @@ impl ConfiguredBackend {
     }
     pub(crate) async fn open(&self) -> BackendResult<Box<dyn crate::StateBackend>> {
         match self.config() {
+            BackendConfig::GitHub(settings) => Ok(Box::new(
+                crate::backends::GitHubBackend::from_config(settings).await?,
+            )),
             BackendConfig::S3(settings) => Ok(Box::new(
                 crate::backends::S3Backend::from_config(settings).await?,
             )),
@@ -516,6 +519,10 @@ async fn resolve_migration_backend(
     base: &ResolvedPath,
 ) -> BackendResult<(Box<dyn crate::StateBackend>, Option<ResolvedPath>)> {
     match config {
+        BackendConfig::GitHub(settings) => Ok((
+            Box::new(crate::backends::GitHubBackend::from_config(settings).await?),
+            None,
+        )),
         BackendConfig::Local(settings) => {
             let location = settings.pin_address(base)?;
             let path = location.path().clone();

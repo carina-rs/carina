@@ -245,32 +245,7 @@ fn filter_workflow_runs(
 ///
 /// Tries `GITHUB_TOKEN` env var first, then falls back to `gh auth token`.
 pub fn get_github_token() -> Result<String, String> {
-    if let Ok(token) = std::env::var("GITHUB_TOKEN")
-        && !token.is_empty()
-    {
-        return Ok(token);
-    }
-
-    let output = std::process::Command::new("gh")
-        .args(["auth", "token", "--hostname", "github.com"])
-        .output()
-        .map_err(|e| {
-            format!(
-                "Failed to run `gh auth token --hostname github.com`: {e}. Set GITHUB_TOKEN or install gh CLI."
-            )
-        })?;
-
-    if !output.status.success() {
-        return Err(
-            "Failed to get GitHub token. Set GITHUB_TOKEN environment variable or run `gh auth login`.".to_string()
-        );
-    }
-
-    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if token.is_empty() {
-        return Err("GitHub token is empty. Run `gh auth login` or set GITHUB_TOKEN.".to_string());
-    }
-    Ok(token)
+    carina_core::github_auth::get_github_token().map_err(|error| error.to_string())
 }
 
 /// Resolve a git ref (branch, tag, or SHA) to a full commit SHA.
