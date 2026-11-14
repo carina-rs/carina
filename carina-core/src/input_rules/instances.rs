@@ -79,22 +79,20 @@ fn active(site: &WriteSite<'_>, owner: &OwnerPath, rule: &InputRule<Compiled>) -
     if let Some(root) = owner.root() {
         return site.input.changed(root);
     }
-    match (rule.condition(), rule.predicate()) {
-        (
-            InputCondition::Always,
-            InputPredicate::Present | InputPredicate::Absent | InputPredicate::Equals(_),
-        ) => site.input.changed(rule.path().root()),
-        (InputCondition::Always, _) => {
-            site.input.changed(rule.path().root())
-                && !matches!(
-                    site.input.patch_read(rule.path().root()),
-                    PatchRead::Remove(_)
-                )
-        }
-        (
-            InputCondition::Present(_) | InputCondition::Equals { .. } | InputCondition::Not(_),
-            _,
-        ) => {
+    match rule.condition() {
+        InputCondition::Always => match predicate::classify(rule.predicate()) {
+            PredicateClass::Presence(_) | PredicateClass::Equals(_) => {
+                site.input.changed(rule.path().root())
+            }
+            PredicateClass::Secret | PredicateClass::String(_) => {
+                site.input.changed(rule.path().root())
+                    && !matches!(
+                        site.input.patch_read(rule.path().root()),
+                        PatchRead::Remove(_)
+                    )
+            }
+        },
+        InputCondition::Present(_) | InputCondition::Equals { .. } | InputCondition::Not(_) => {
             site.input.changed(rule.path().root())
                 || rule
                     .condition()

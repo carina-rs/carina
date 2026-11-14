@@ -1,7 +1,7 @@
 //! Plan generation from diffs and cascading update logic.
 
 use crate::resource::{PersistedDirectives, ResolvedDependencies};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::effect::{
     ChangedCreateOnly, DeferredCreatePayload, DeferredReplaceDelete, DeferredReplacePayload,
@@ -15,7 +15,7 @@ use crate::plan::{
     ReplacementGroup,
 };
 use crate::provider::{LiftedSavedAttrs, ProviderRouter};
-use crate::replacement::{ReplacementRequest, resolve_replacement};
+use crate::replacement::{Dependent, Dependents, ReplacementRequest, resolve_replacement};
 use crate::resource::{
     AbsoluteBindingAddress, ConcreteValue, Current, Directives, PlanInputCurrent, PlanInputDesired,
     PlanInputDesiredResources, ResolvedDataSource, ResolvedResource, ResolvedResourceId, Resource,
@@ -1792,16 +1792,11 @@ fn promote_referenced_replaces_to_cbd(
     registry: &SchemaRegistry,
 ) -> std::ops::ControlFlow<()> {
     let mut outcome = std::ops::ControlFlow::Continue(());
-    let mut promote = Vec::new();
+    let mut promote: BTreeMap<ResolvedResourceId, BTreeSet<Dependent>> = BTreeMap::new();
 
     let managed_dependencies = dependents.managed.iter().map(|resource| {
         (
-            Some(&resource.id),
-            resource
-                .binding
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| resource.id.to_string()),
+            Dependent::new(resource.resolved_id()),
             resource
                 .all_dependencies()
                 .cloned()
@@ -1810,37 +1805,32 @@ fn promote_referenced_replaces_to_cbd(
     });
     let deferred_dependencies = dependents.deferred.0.iter().map(|compiled| {
         (
-            None,
-            compiled.template.target().display_name(),
+            Dependent::new(compiled.template.deferred_effect_id().clone()),
             compiled.dependencies.dependencies(),
         )
     });
-    for (dependent_id, dependent_name, dependencies) in
-        managed_dependencies.chain(deferred_dependencies)
-    {
+    for (dependent, dependencies) in managed_dependencies.chain(deferred_dependencies) {
         for dependency in dependencies.iter() {
             let Some(pending) = pending_replaces.get(dependency) else {
                 continue;
             };
             if pending.replacement.is_create_first()
-                || dependent_id.is_some_and(|id| pending.replacement.target().id == *id)
+                || dependent == Dependent::new(pending.replacement.target().resolved_id())
             {
                 continue;
             }
-            promote.push((dependency.clone(), dependent_name.clone()));
+            promote
+                .entry(dependency.clone())
+                .or_default()
+                .insert(dependent.clone());
         }
     }
-    promote.sort_by(|(left_id, left_name), (right_id, right_name)| {
-        left_id
-            .cmp(right_id)
-            .then_with(|| left_name.cmp(right_name))
-    });
-    promote.dedup_by(|(left, _), (right, _)| left == right);
 
-    for (identity, dependent) in promote {
-        let result = pending_replaces
-            .get_mut(&identity)
-            .map(|pending| mark_pending_create_before_destroy(pending, registry, &dependent));
+    for (identity, dependents) in promote {
+        let dependents = Dependents::try_from(dependents).expect("every promotion has a dependent");
+        let result = pending_replaces.get_mut(&identity).map(|pending| {
+            mark_pending_create_before_destroy(pending, registry, dependents.clone())
+        });
         if let Some(Err(err)) = result
             && let Some(pending) = pending_replaces.remove(&identity)
         {
@@ -1848,7 +1838,7 @@ fn promote_referenced_replaces_to_cbd(
             plan.add_error(PlanError::new(
                 pending.replacement.target().id.clone(),
                 PlanErrorKind::CreateBeforeDestroyRequiredByDependent {
-                    dependent,
+                    dependents,
                     cause: err,
                 },
             ));
@@ -1860,7 +1850,7 @@ fn promote_referenced_replaces_to_cbd(
 fn mark_pending_create_before_destroy(
     pending: &mut ReplacementGroup,
     registry: &SchemaRegistry,
-    dependent: &str,
+    dependents: Dependents,
 ) -> Result<(), CreateBeforeDestroyError> {
     if pending.replacement.is_create_first() {
         return Ok(());
@@ -1869,7 +1859,7 @@ fn mark_pending_create_before_destroy(
         .replacement
         .clone()
         .into_request()
-        .require_create_first(dependent);
+        .require_create_first(dependents);
     pending.replacement = resolve_replacement(request, registry)?;
     Ok(())
 }

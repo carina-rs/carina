@@ -2,6 +2,32 @@ use super::*;
 use tower_lsp::lsp_types::{Position, Range};
 
 #[test]
+fn round18_single_file_module_import_matches_main_diagnostic() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("modules")).unwrap();
+    std::fs::write(directory.path().join("modules/x.crn"), "arguments {}\n").unwrap();
+    std::fs::write(
+        directory.path().join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
+    let path = directory.path().join("main.crn");
+    let source = "let selected = use { source = './modules/x.crn' }\nselected {}\n";
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert_eq!(
+        diagnostics,
+        vec![Diagnostic {
+            range: Range::new(Position::new(1, 0), Position::new(1, 8)),
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some("carina".into()),
+            message: "Module path './modules/x.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.".into(),
+            ..Default::default()
+        }]
+    );
+}
+
+#[test]
 fn root_placement_recovery_reuses_complete_declaration_evidence() {
     let directory = tempfile::tempdir().unwrap();
     let providers = directory.path().join("providers.crn");

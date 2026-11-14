@@ -937,3 +937,71 @@ fn creation_admission_does_not_duplicate_existing_replacement_error() {
         .unwrap_err();
     assert_eq!(rejected.errors(), &[diagnostic]);
 }
+
+fn issue_4418_authored_pending() -> ReplacementGroup {
+    let mut raw = resource(None).into_inner();
+    raw.directives.create_before_destroy = true;
+    let producer = ResolvedResource::new(raw);
+    let old = delete(&producer);
+    ReplacementGroup {
+        replacement: resolve_replacement(
+            ReplacementRequest::new(producer, NonEmptyDeletes::try_new(vec![old]).unwrap()),
+            &schemas(),
+        )
+        .unwrap(),
+        changed_create_only: ChangedCreateOnly::new(vec!["name".into()]).unwrap(),
+        cascade_ref_hints: Vec::new(),
+        consumer_updates: Default::default(),
+    }
+}
+
+#[test]
+fn issue_4418_authored_create_first_promotion_keeps_required_by_absent() {
+    let group = issue_4418_authored_pending();
+    let id = group.replacement.target().resolved_id();
+    let before = serde_json::to_value(group.replacement.clone().into_request()).unwrap();
+    assert!(group.replacement.target().directives.create_before_destroy);
+    let child = ResolvedResource::from_resolved_parts(
+        Resource::with_provider("mock", "Bucket", "consumer", None).with_dependency_phase(()),
+        std::iter::once(id.clone()).collect(),
+        Default::default(),
+    );
+    let mut pending = HashMap::from([(id.clone(), group)]);
+    let mut plan = Plan::new();
+    let dependents = CascadeDependents::new(
+        std::slice::from_ref(&child),
+        ResolvedDeferredCreateTargets::default(),
+    );
+    assert!(
+        promote_referenced_replaces_to_cbd(&mut plan, &mut pending, &dependents, &schemas())
+            .is_continue()
+    );
+    let after = pending[&id].replacement.clone().into_request();
+    assert!(
+        after.required_by().is_none(),
+        "authored create-first must not acquire a dependent requirement"
+    );
+    assert_eq!(serde_json::to_value(after).unwrap(), before);
+    assert!(plan.errors().is_empty());
+}
+
+#[test]
+fn issue_4418_authored_create_first_mark_keeps_required_by_absent() {
+    let mut group = issue_4418_authored_pending();
+    let before = serde_json::to_value(group.replacement.clone().into_request()).unwrap();
+    mark_pending_create_before_destroy(
+        &mut group,
+        &schemas(),
+        Dependent::new(ResolvedResourceId::with_provider_identity(
+            "mock", "Bucket", "consumer", None,
+        ))
+        .into(),
+    )
+    .unwrap();
+    let after = group.replacement.into_request();
+    assert!(
+        after.required_by().is_none(),
+        "marking an admitted create-first replacement must be a no-op"
+    );
+    assert_eq!(serde_json::to_value(after).unwrap(), before);
+}
