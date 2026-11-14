@@ -51,6 +51,7 @@ fn record_projection_copy(value: &Value<ParserPlaceholder, RelativeBindingName>)
 }
 
 pub(crate) mod conversion;
+pub(crate) use conversion::ConversionContext;
 pub(crate) use conversion::ConversionVerdict;
 pub(crate) use conversion::TransportJudgement;
 pub(crate) use conversion::check as check_conversion;

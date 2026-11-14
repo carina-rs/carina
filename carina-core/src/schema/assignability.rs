@@ -392,15 +392,10 @@ impl NominalScalarConstraints {
             (Self::String(source), Self::String(sink)) => disjoint(source, sink),
             (Self::Int(source), Self::Int(sink)) => disjoint(source, sink),
             (Self::Float(source), Self::Float(sink)) => disjoint(source, sink),
-            (Self::Int(source), Self::Float(sink)) => {
-                let (source_min, source_max) = source.unwrap_or((None, None));
-                let (sink_min, sink_max) = sink.unwrap_or((None, None));
-                sink_min.is_some_and(|min| {
-                    super::compare_int_float(source_max.unwrap_or(i64::MAX), min).is_lt()
-                }) || sink_max.is_some_and(|max| {
-                    super::compare_int_float(source_min.unwrap_or(i64::MIN), max).is_gt()
-                })
-            }
+            (Self::Int(source), Self::Float(sink)) => crate::numeric::int_float_ranges_disjoint(
+                source.unwrap_or((None, None)),
+                sink.unwrap_or((None, None)),
+            ),
             (Self::String(_), Self::Int(_) | Self::Float(_))
             | (Self::Int(_), Self::String(_))
             | (Self::Float(_), Self::String(_) | Self::Int(_)) => true,

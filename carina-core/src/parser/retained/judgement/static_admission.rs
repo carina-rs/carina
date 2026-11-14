@@ -148,7 +148,14 @@ impl<'d> StaticSourceMode<'d> for JudgeSourceMode<'d> {
         }
         let declaration = declaration
             .ok_or_else(|| MissingEvidence::new("static conversion destination declaration"))?;
-        let mut verdict = converted.compute(declaration, self.defs, config);
+        let mut verdict = match converted.compute(declaration, self.defs, config) {
+            conversion::ComputedSource::Judged(verdict) => *verdict,
+            // Target and destination were checked; the twin supplies no static
+            // scalar source. The walk's slot value check owns the source side.
+            conversion::ComputedSource::WalkOwned => {
+                return Ok(StaticSourceData::WalkOwned);
+            }
+        };
         let outcome = verdict.outcome.clone();
         verdict.set_binding_receipt(Arc::new(StaticSourceReceipt {
             expected: sink.clone(),

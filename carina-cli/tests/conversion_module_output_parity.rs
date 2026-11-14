@@ -279,7 +279,7 @@ fn conversion_module_body_kinds_have_one_presented_owner_and_context() {
         ),
         (
             "mock.Sink { attr = ['ok'] as mock.Name }",
-            "conversion_source",
+            "conversion_not_scalar",
         ),
         (
             "mock.Sink { ambiguous = 'ok' as mock.Name }",
@@ -684,15 +684,8 @@ fn r11_nonexpanded_structural_and_module_conversions_follow_their_judge_precheck
                 );
             }
             let json = round4_validate(directory.path());
-            let checked_empty_element = name == "empty_for" && !conversion.is_empty();
             let conversions = round4_conversions(&json);
-            let correct = if checked_empty_element {
-                json["status"] == "error"
-                    && conversions.len() == 1
-                    && conversions[0]["code"] == "conversion_source"
-            } else {
-                json["status"] == "ok" && conversions.is_empty()
-            };
+            let correct = json["status"] == "ok" && conversions.is_empty();
             if !correct {
                 failures.push(format!("{name}, conversion={conversion:?}: {json}"));
             }

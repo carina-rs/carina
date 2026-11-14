@@ -149,8 +149,8 @@ mod conversion_review_tests;
 
 pub use crate::schema::value_validation::WalkCoverage;
 use assignment::AssignmentVerdict;
-pub(crate) use assignment::LocalPath;
 pub use assignment::{AssignmentProof, ReferenceCandidate, SchemaObligation};
+pub(crate) use assignment::{LocalPath, ReferenceSource};
 
 pub(crate) fn conversion_local<K: DestinationKind>(
     path: &LeafPath,

@@ -61,7 +61,10 @@ fn conversion_missing_operand_judgement_uses_only_the_conversion_channel() {
         &crate::schema::LeafPath::from_segments([]),
         cursor.clone(),
         schema.schema().as_schema().defs(),
-        &catalog,
+        crate::parser::retained::ConversionContext {
+            catalog: &catalog,
+            reference: crate::validation::admission::ReferenceSource::Unchecked,
+        },
     )
     .expect("a conversion cannot return an ordinary seam error");
     let findings = match outcome {
@@ -136,7 +139,10 @@ fn ordinary_if_and_coalesce_missing_children_do_not_claim_a_conversion() {
             &crate::schema::LeafPath::from_segments([]),
             cursor,
             schema.schema().as_schema().defs(),
-            &catalog,
+            crate::parser::retained::ConversionContext {
+                catalog: &catalog,
+                reference: crate::validation::admission::ReferenceSource::Unchecked,
+            },
         )
         .expect("ordinary alternatives cannot fail the conversion seam");
         assert!(

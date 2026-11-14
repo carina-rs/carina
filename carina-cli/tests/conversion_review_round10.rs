@@ -1,6 +1,9 @@
 #[path = "support/conversion_factory.rs"]
 mod base;
 
+#[path = "support/conversion_round13.rs"]
+mod round13;
+
 use carina_core::{
     paths::ResolvedPath,
     provider::*,
@@ -133,6 +136,54 @@ impl ProviderFactory for MeasuringFactory {
                 .unwrap(),
         );
         schemas.push(
+            ResourceSchema::new("FloatSink")
+                .attribute(
+                    AttributeSchema::optional(
+                        "attr",
+                        AttributeType::refined_float(
+                            Some(TypeIdentity::from_dotted("mock.Ratio")),
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        schemas.push(
+            ResourceSchema::new("BoundedFloatSink")
+                .attribute(
+                    AttributeSchema::optional(
+                        "attr",
+                        AttributeType::refined_float(
+                            Some(TypeIdentity::from_dotted("mock.BoundedRatio")),
+                            Some((
+                                Some(carina_core::FiniteF64::new(1.0).unwrap()),
+                                Some(carina_core::FiniteF64::new(8.0).unwrap()),
+                            )),
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        schemas.push(
+            ResourceSchema::new("IntSink")
+                .attribute(
+                    AttributeSchema::optional(
+                        "attr",
+                        AttributeType::refined_int(
+                            Some(TypeIdentity::from_dotted("mock.Count")),
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        schemas.push(
             ResourceSchema::new("NestedQuery")
                 .as_data_source()
                 .attribute(
@@ -214,6 +265,11 @@ impl Provider for MeasuringProvider {
         request: CreateRequest,
         attempt: CreateAttempt,
     ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
+        self.events.lock().unwrap().push(json!({
+            "op": "create",
+            "id": id.to_string(),
+            "attributes": serde_json::to_value(&request.resource().as_resource().attributes).unwrap(),
+        }));
         self.inner.create(id, request, attempt)
     }
     fn resume_create(
@@ -428,7 +484,7 @@ async fn deferred(case: DeferredCase, read: bool, resource_iterable: bool) {
             "n as mock.Other",
             Some("conversion_destination"),
         ),
-        DeferredCase::WrongKind => ("Query", "Sink", "n as mock.Name", Some("conversion_source")),
+        DeferredCase::WrongKind => ("Query", "Sink", "n as mock.Name", None),
         DeferredCase::LiteralKind => (
             "Query",
             "Sink",
@@ -534,7 +590,7 @@ async fn deferred(case: DeferredCase, read: bool, resource_iterable: bool) {
         assert_eq!(conversion_count(&result["validate"]), 0);
         assert_eq!(lsp_conversion_count(&result["lsp"]), 0);
         assert_eq!(result["plan"]["ok"], true, "{result}");
-    } else if matches!(case, DeferredCase::PlainLoop) {
+    } else if matches!(case, DeferredCase::PlainLoop | DeferredCase::WrongKind) {
         assert_eq!(result["validate"]["status"], "ok", "{result}");
         assert_eq!(conversion_count(&result["validate"]), 0);
         assert_eq!(lsp_conversion_count(&result["lsp"]), 0);

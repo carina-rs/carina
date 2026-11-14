@@ -3844,67 +3844,86 @@ impl PatternAttributeType<Compiled> {
         &self,
         value: ConcreteValueRef<'_, P, B>,
     ) -> Result<(), TypeError> {
-        let constraints = || match (&self.kind, value) {
-            (AttrTypeKind::UnloadedSchemaType(_), _) => {
-                Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into())
+        let constraints = || {
+            match value_validation::scalar_value_kind_fit(self, value) {
+                Some(value_validation::ScalarKindFit::Rejected) => {
+                    return Err(TypeError::value_type_mismatch(
+                        self.type_name(),
+                        value.type_name().to_string(),
+                    ));
+                }
+                Some(value_validation::ScalarKindFit::IntToFloat) => {
+                    let (AttrTypeKind::Float { range, .. }, ConcreteValueRef::Int(integer)) =
+                        (&self.kind, value)
+                    else {
+                        return Err(TypeError::value_type_mismatch(
+                            self.type_name(),
+                            value.type_name().to_string(),
+                        ));
+                    };
+                    return validate_int_in_float_range(*range, integer);
+                }
+                Some(value_validation::ScalarKindFit::Exact) | None => {}
             }
-            (
-                AttrTypeKind::String {
-                    identity_layer,
-                    member_layer,
-                },
-                ConcreteValueRef::String(s),
-            ) => {
-                let StringIdentityLayer {
-                    binding,
-                    pattern,
-                    length,
-                    to_dsl: _to_dsl,
-                } = identity_layer;
-                validate_string_layers(
-                    binding,
-                    pattern.as_ref(),
-                    *length,
-                    member_layer.pattern.as_ref(),
-                    member_layer.length,
-                    s,
-                )
+            match (&self.kind, value) {
+                (AttrTypeKind::UnloadedSchemaType(_), _) => {
+                    Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into())
+                }
+                (
+                    AttrTypeKind::String {
+                        identity_layer,
+                        member_layer,
+                    },
+                    ConcreteValueRef::String(s),
+                ) => {
+                    let StringIdentityLayer {
+                        binding,
+                        pattern,
+                        length,
+                        to_dsl: _to_dsl,
+                    } = identity_layer;
+                    validate_string_layers(
+                        binding,
+                        pattern.as_ref(),
+                        *length,
+                        member_layer.pattern.as_ref(),
+                        member_layer.length,
+                        s,
+                    )
+                }
+                (
+                    AttrTypeKind::Reference {
+                        identity,
+                        pattern,
+                        length,
+                    },
+                    ConcreteValueRef::String(s),
+                ) => validate_string_refinement(Some(identity), pattern.as_ref(), *length, s),
+                (AttrTypeKind::StringLiteralSet { values }, ConcreteValueRef::String(value))
+                    if values.iter().any(|candidate| candidate == value) =>
+                {
+                    Ok(())
+                }
+                (
+                    AttrTypeKind::Int {
+                        identity_layer,
+                        member_layer,
+                    },
+                    ConcreteValueRef::Int(i),
+                ) => {
+                    validate_int_range(identity_layer.range, i)?;
+                    validate_int_range(member_layer.parts().range, i)
+                }
+                (AttrTypeKind::Float { range, .. }, ConcreteValueRef::Float(f)) => {
+                    validate_float_range(*range, f)
+                }
+                (AttrTypeKind::Bool, ConcreteValueRef::Bool(_)) => Ok(()),
+                (AttrTypeKind::Duration, ConcreteValueRef::Duration(_)) => Ok(()),
+                _ => Err(TypeError::value_type_mismatch(
+                    self.type_name(),
+                    value.type_name().to_string(),
+                )),
             }
-            (
-                AttrTypeKind::Reference {
-                    identity,
-                    pattern,
-                    length,
-                },
-                ConcreteValueRef::String(s),
-            ) => validate_string_refinement(Some(identity), pattern.as_ref(), *length, s),
-            (AttrTypeKind::StringLiteralSet { values }, ConcreteValueRef::String(value))
-                if values.iter().any(|candidate| candidate == value) =>
-            {
-                Ok(())
-            }
-            (
-                AttrTypeKind::Int {
-                    identity_layer,
-                    member_layer,
-                },
-                ConcreteValueRef::Int(i),
-            ) => {
-                validate_int_range(identity_layer.range, i)?;
-                validate_int_range(member_layer.parts().range, i)
-            }
-            (AttrTypeKind::Float { range, .. }, ConcreteValueRef::Float(f)) => {
-                validate_float_range(*range, f)
-            }
-            (AttrTypeKind::Float { range, .. }, ConcreteValueRef::Int(i)) => {
-                validate_int_in_float_range(*range, i)
-            }
-            (AttrTypeKind::Bool, ConcreteValueRef::Bool(_)) => Ok(()),
-            (AttrTypeKind::Duration, ConcreteValueRef::Duration(_)) => Ok(()),
-            _ => Err(TypeError::value_type_mismatch(
-                self.type_name(),
-                value.type_name().to_string(),
-            )),
         };
         match &self.kind {
             AttrTypeKind::String {
@@ -4266,6 +4285,13 @@ impl KnownAssignment<'_, '_> {
 }
 
 impl<'source, R: PatternForm> TypeInSchema<'source, R> {
+    /// Borrow the source declaration after resolving its own definition scope.
+    pub(crate) fn resolve(self) -> Result<ResolvedAttrType<'source, R>, TypeError> {
+        resolve_refs_on_path(self.attr, self.defs, &mut Vec::new())
+            .map(|resolved| ResolvedAttrType::new_after_peel(resolved.attr))
+            .map_err(RefResolutionFailure::into_validation_error)
+    }
+
     /// Pair a structurally Ref-free type with an empty definition context.
     ///
     /// Use this only when the type cannot contain [`AttrTypeKind::Ref`] at any
@@ -5932,13 +5958,9 @@ fn inspect_value_structure_on_path<
             _,
         ) => {
             attr.inspect_primitive(concrete).ok()?;
-            let exactness = if matches!(
-                (&attr.kind, concrete),
-                (AT::Float { .. }, ConcreteValueRef::Int(_))
-            ) {
-                FitExactness::COERCIBLE
-            } else {
-                FitExactness::EXACT
+            let exactness = match value_validation::scalar_value_kind_fit(attr, concrete) {
+                Some(fit) => fit.exactness()?,
+                None => FitExactness::EXACT,
             };
             Some(Fit::with_kind(exactness, attr, FitKind::PassThrough))
         }
@@ -6387,13 +6409,9 @@ fn inspect_value_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAd
             _,
         ) => {
             attr.inspect_primitive(concrete).ok()?;
-            let exactness = if matches!(
-                (&attr.kind, concrete),
-                (AT::Float { .. }, ConcreteValueRef::Int(_))
-            ) {
-                FitExactness::COERCIBLE
-            } else {
-                FitExactness::EXACT
+            let exactness = match value_validation::scalar_value_kind_fit(attr, concrete) {
+                Some(fit) => fit.exactness()?,
+                None => FitExactness::EXACT,
             };
             Some(Fit::with_kind(exactness, attr, FitKind::PassThrough))
         }

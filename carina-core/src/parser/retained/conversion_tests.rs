@@ -198,7 +198,7 @@ fn conversion_discarded_union_claim_is_judged_once_and_covers_wrapped_leaf() {
             ordinary: &|_, _, _, _, _| { ordinary.set(ordinary.get() + 1); Ok(Default::default()) },
             authored: AuthoredChecks::Validation(&|attr, checked, path, cursor| {
                 if matches!(&cursor.kind, CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) if usage.form() == AuthoredForm::Convert) { conversions.set(conversions.get() + 1); }
-                check_conversion::<crate::validation::admission::kind::ResourceAttribute, ParserPlaceholder, RelativeBindingName>(attr, checked, path, cursor, schema.schema().as_schema().defs(), &catalog)
+                check_conversion::<crate::validation::admission::kind::ResourceAttribute, ParserPlaceholder, RelativeBindingName>(attr, checked, path, cursor, schema.schema().as_schema().defs(), crate::parser::retained::ConversionContext { catalog: &catalog, reference: crate::validation::admission::ReferenceSource::Unchecked })
             }), scope: AssignmentScope::Full,
         }, &mut Default::default(),
     ).unwrap();
@@ -359,7 +359,10 @@ fn conversion_live_covered_and_discarded_uses_each_supply_a_verdict() {
                             path,
                             cursor,
                             schema.schema().as_schema().defs(),
-                            &catalog,
+                            crate::parser::retained::ConversionContext {
+                                catalog: &catalog,
+                                reference: crate::validation::admission::ReferenceSource::Unchecked,
+                            },
                         )?;
                         if is_convert {
                             assert!(
@@ -473,7 +476,10 @@ fn conversion_claim_preserves_ordinary_checks_below_a_rejected_wrapper() {
                         path,
                         cursor,
                         schema.schema().as_schema().defs(),
-                        &catalog,
+                        crate::parser::retained::ConversionContext {
+                            catalog: &catalog,
+                            reference: crate::validation::admission::ReferenceSource::Unchecked,
+                        },
                     )
                 }),
                 scope: AssignmentScope::Full,
@@ -857,7 +863,17 @@ fn r5b_unloaded_transport_destinations_decline_before_child_admission() {
                         crate::validation::admission::kind::ResourceAttribute,
                         ParserPlaceholder,
                         RelativeBindingName,
-                    >(attr, checked, path, cursor, &Default::default(), &catalog)
+                    >(
+                        attr,
+                        checked,
+                        path,
+                        cursor,
+                        &Default::default(),
+                        crate::parser::retained::ConversionContext {
+                            catalog: &catalog,
+                            reference: crate::validation::admission::ReferenceSource::Unchecked,
+                        },
+                    )
                 }),
                 scope: AssignmentScope::Full,
             },

@@ -35,6 +35,17 @@ impl DeclarationAddress {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SourceCheck {
+    Static,
+    ValueCheck,
+}
+
+pub(in crate::parser::retained) enum ComputedSource {
+    Judged(Box<StaticVerdict>),
+    WalkOwned,
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::parser::retained) struct StaticVerdict {
     pub(in crate::parser::retained) outcome: Result<TypeExpr, ConversionError>,
@@ -46,6 +57,7 @@ pub(in crate::parser::retained) struct StaticVerdict {
     declaration: DeclarationAddress,
     resolved: DeclarationAddress,
     members: Arc<[(DeclarationAddress, bool)]>,
+    source_check: SourceCheck,
 }
 impl StaticVerdict {
     pub(in crate::parser::retained) fn set_binding_receipt(
@@ -203,7 +215,7 @@ impl ConversionTypeJudgement {
         source: &JudgedExpr,
         declaration: &CompiledAttributeType,
         defs: &std::collections::BTreeMap<String, CompiledAttributeType>,
-        config: &crate::parser::ProviderContext,
+        context: &ConversionContext<'_>,
         knowledge: SourceKnowledge,
     ) -> StaticVerdict {
         judge_conversion(
@@ -212,7 +224,7 @@ impl ConversionTypeJudgement {
             source,
             declaration,
             defs,
-            config,
+            context,
             knowledge,
         )
     }
@@ -267,16 +279,26 @@ impl ConversionTypeJudgement {
         declaration: &CompiledAttributeType,
         defs: &std::collections::BTreeMap<String, CompiledAttributeType>,
         config: &crate::parser::ProviderContext,
-    ) -> StaticVerdict {
-        judge_conversion(
+    ) -> ComputedSource {
+        let verdict = judge_conversion(
             &self.site,
             &self.target,
             &self.source,
             declaration,
             defs,
-            config,
+            &ConversionContext {
+                catalog: config,
+                reference: crate::validation::admission::ReferenceSource::Unchecked,
+            },
             SourceKnowledge::StaticOnly,
-        )
+        );
+        match (&verdict.outcome, verdict.source_check) {
+            (Ok(_), SourceCheck::ValueCheck) => ComputedSource::WalkOwned,
+            (Ok(_), SourceCheck::Static)
+            | (Err(_), SourceCheck::Static | SourceCheck::ValueCheck) => {
+                ComputedSource::Judged(Box::new(verdict))
+            }
+        }
     }
     pub(in crate::parser::retained) fn record(
         &self,
@@ -347,13 +369,15 @@ pub(super) fn judge_conversion(
     source: &JudgedExpr,
     declaration: &CompiledAttributeType,
     defs: &std::collections::BTreeMap<String, CompiledAttributeType>,
-    config: &crate::parser::ProviderContext,
+    context: &ConversionContext<'_>,
     knowledge: SourceKnowledge,
 ) -> StaticVerdict {
+    let config = context.catalog;
     let mut matched_destination = false;
     let mut union_destination = false;
     let mut resolved_address = DeclarationAddress::of(declaration);
     let mut probes = Vec::new();
+    let mut source_check = SourceCheck::Static;
     let outcome = (|| {
         let target = diagnostic::resolve_target(path, &site.location, config)
             .map_err(|error| error.owned_by(site.node))?;
@@ -387,34 +411,82 @@ pub(super) fn judge_conversion(
             }
         }
         let discarded = knowledge == SourceKnowledge::Discarded;
-        let message = if discarded {
-            "discarded conversion operand has an incompatible scalar kind"
-        } else {
-            "conversion operand has no compatible scalar source judgement"
+        let check_deferred = || {
+            deferred_union_check(
+                site,
+                site.parsing.secret || source.diagnostic_is_secret(),
+                union_destination,
+                knowledge,
+            )
         };
-        let source_type = check_scalar_kind(selected, source)
-            .map_err(|kind| static_error(site, source, kind, message))?;
-        deferred_union_check(
-            site,
-            site.parsing.secret || source.diagnostic_is_secret(),
-            union_destination,
-            knowledge,
-        )?;
-        if !discarded && let TypeExpr::SchemaType { owned } = source_type {
-            let source_declaration = diagnostic::source_declaration(owned, &site.location, config)
-                .map_err(|error| error.owned_by(site.node))?;
-            if let Some(bounds) = DeclarationBounds::from_declaration(selected)
-                && DeclarationBounds::from_declaration(&source_declaration)
-                    .is_some_and(|source| source.disjoint(&bounds))
-            {
-                return Err(static_error(
-                    site,
-                    source,
-                    Kind::Disjoint,
-                    "conversion source and destination declaration bounds are disjoint",
-                ));
+        let mut check_source = |evidence| {
+            match check_scalar_kind(selected, evidence) {
+                ScalarKindCheck::Compatible(scalar) => {
+                    check_deferred()?;
+                    if !discarded {
+                        let source_bounds = match scalar {
+                            CompatibleScalar::Declaration(source) => {
+                                DeclarationBounds::from_declaration(source.as_attr())
+                            }
+                            CompatibleScalar::Judged(source_type) => {
+                                if let TypeExpr::SchemaType { owned } = source_type {
+                                    let declaration = diagnostic::source_declaration(
+                                        owned,
+                                        &site.location,
+                                        config,
+                                    )
+                                    .map_err(|error| error.owned_by(site.node))?;
+                                    DeclarationBounds::from_declaration(&declaration)
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+                        if let Some(bounds) = DeclarationBounds::from_declaration(selected)
+                            && source_bounds.is_some_and(|source| source.disjoint(&bounds))
+                        {
+                            return Err(static_error(
+                                site,
+                                source,
+                                Kind::Disjoint,
+                                "conversion source and destination declaration bounds are disjoint",
+                            ));
+                        }
+                    }
+                }
+                ScalarKindCheck::WrongScalarKind => {
+                    return Err(static_error(
+                        site,
+                        source,
+                        Kind::ScalarKind,
+                        "conversion operand has an incompatible scalar kind",
+                    ));
+                }
+                ScalarKindCheck::NotScalar => {
+                    return Err(static_error(
+                        site,
+                        source,
+                        Kind::NotScalar,
+                        "conversion operand is not a scalar value",
+                    ));
+                }
+                ScalarKindCheck::NoStaticJudgement => {
+                    source_check = SourceCheck::ValueCheck;
+                    check_deferred()?;
+                }
             }
-        }
+            Ok(())
+        };
+        match &context.reference {
+            crate::validation::admission::ReferenceSource::Unchecked => {
+                check_source(ScalarSource::Judged(source))?;
+            }
+            crate::validation::admission::ReferenceSource::Typed(reference) => {
+                for declaration in reference.constraints() {
+                    check_source(ScalarSource::Declaration(declaration))?;
+                }
+            }
+        };
         Ok(TypeExpr::SchemaType { owned: target })
     })()
     .map_err(|error: ConversionError| {
@@ -434,5 +506,6 @@ pub(super) fn judge_conversion(
         declaration: DeclarationAddress::of(declaration),
         resolved: resolved_address,
         members: probes.into(),
+        source_check,
     }
 }

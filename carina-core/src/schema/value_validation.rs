@@ -16,6 +16,72 @@ use references::{
 };
 use syntax_children::{ChildStep, DeclineSink};
 
+/// Scalar membership and union ranking share this rule. Widening admits the
+/// original integer value; it does not replace it with a float.
+pub(crate) enum ScalarKindFit {
+    Exact,
+    IntToFloat,
+    Rejected,
+}
+
+pub(crate) fn scalar_kind_fit(
+    expected: RefinedScalarKind,
+    actual: RefinedScalarKind,
+) -> ScalarKindFit {
+    use RefinedScalarKind::{Float, Int, String};
+    match (expected, actual) {
+        (String, String) | (Int, Int) | (Float, Float) => ScalarKindFit::Exact,
+        (Float, Int) => ScalarKindFit::IntToFloat,
+        (String, Int | Float) | (Int, String | Float) | (Float, String) => ScalarKindFit::Rejected,
+    }
+}
+
+impl ScalarKindFit {
+    pub(super) fn exactness(self) -> Option<FitExactness> {
+        match self {
+            Self::Exact => Some(FitExactness::EXACT),
+            Self::IntToFloat => Some(FitExactness::COERCIBLE),
+            Self::Rejected => None,
+        }
+    }
+}
+
+pub(super) fn scalar_value_kind_fit<R: PatternForm, P: ValueKind, B: BindingAddress>(
+    declaration: &PatternAttributeType<R>,
+    value: ConcreteValueRef<'_, P, B>,
+) -> Option<ScalarKindFit> {
+    let expected = match declaration.kind() {
+        AttrTypeKind::String { .. } => RefinedScalarKind::String,
+        AttrTypeKind::Int { .. } => RefinedScalarKind::Int,
+        AttrTypeKind::Float { .. } => RefinedScalarKind::Float,
+        AttrTypeKind::UnloadedSchemaType(_)
+        | AttrTypeKind::Reference { .. }
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. }
+        | AttrTypeKind::List { .. }
+        | AttrTypeKind::Map { .. }
+        | AttrTypeKind::Struct { .. }
+        | AttrTypeKind::Union(_)
+        | AttrTypeKind::Ref(_) => return None,
+    };
+    let actual = match value {
+        ConcreteValueRef::String(_) => RefinedScalarKind::String,
+        ConcreteValueRef::Int(_) => RefinedScalarKind::Int,
+        ConcreteValueRef::Float(_) => RefinedScalarKind::Float,
+        ConcreteValueRef::EnumIdentifier(_)
+        | ConcreteValueRef::CanonicalEnum(_)
+        | ConcreteValueRef::Bool(_)
+        | ConcreteValueRef::Duration(_)
+        | ConcreteValueRef::List(_)
+        | ConcreteValueRef::StringList(_)
+        | ConcreteValueRef::Map(_) => return None,
+    };
+    Some(scalar_kind_fit(expected, actual))
+}
+
 #[cfg(test)]
 mod cursor_allocations {
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -4777,13 +4843,20 @@ impl<'a, M: WalkMode> ValueValidator<'a, '_, M> {
             if let Err(error) = attr.validate_leaf_value(value) {
                 return WalkCheckedValue::rejected(path, error);
             }
-            let exactness = if matches!(
-                (&attr.kind, value.as_concrete()),
-                (AttrTypeKind::Float { .. }, Some(ConcreteValueRef::Int(_)))
-            ) {
-                FitExactness::COERCIBLE
-            } else {
-                FitExactness::EXACT
+            let exactness = match value
+                .as_concrete()
+                .and_then(|value| scalar_value_kind_fit(attr, value))
+            {
+                Some(fit) => match fit.exactness() {
+                    Some(exactness) => exactness,
+                    None => {
+                        return WalkCheckedValue::rejected(
+                            path,
+                            TypeError::value_type_mismatch(attr.type_name(), value.type_name()),
+                        );
+                    }
+                },
+                None => FitExactness::EXACT,
             };
             Fit::with_kind(exactness, attr, FitKind::PassThrough)
         };

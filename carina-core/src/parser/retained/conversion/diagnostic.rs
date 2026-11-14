@@ -28,6 +28,7 @@ pub enum ConversionErrorKind {
     Target,
     Source,
     ScalarKind,
+    NotScalar,
     Disjoint,
 }
 
@@ -40,6 +41,7 @@ impl ConversionErrorKind {
             Self::Target => "conversion_target",
             Self::Source => "conversion_source",
             Self::ScalarKind => "conversion_scalar_kind",
+            Self::NotScalar => "conversion_not_scalar",
             Self::Disjoint => "conversion_disjoint",
         }
     }
@@ -511,9 +513,12 @@ impl DeclarationBounds {
             (Self::Float { min: a, max: b }, Self::Float { min: c, max: d }) => {
                 disjoint(*a, *b, *c, *d)
             }
+            (Self::Int { min: a, max: b }, Self::Float { min: c, max: d })
+            | (Self::Float { min: c, max: d }, Self::Int { min: a, max: b }) => {
+                crate::numeric::int_float_ranges_disjoint((*a, *b), (*c, *d))
+            }
             (Self::String { .. }, Self::Int { .. } | Self::Float { .. })
-            | (Self::Int { .. }, Self::String { .. } | Self::Float { .. })
-            | (Self::Float { .. }, Self::String { .. } | Self::Int { .. }) => false,
+            | (Self::Int { .. } | Self::Float { .. }, Self::String { .. }) => false,
         }
     }
 }

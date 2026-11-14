@@ -1820,7 +1820,11 @@ fn r11_judge_owned_static_conversion_failures_do_not_require_admission() {
             ConversionErrorKind::Destination,
         ),
         ("7 as mock.Name", named(), ConversionErrorKind::ScalarKind),
-        ("['ok'] as mock.Name", named(), ConversionErrorKind::Source),
+        (
+            "['ok'] as mock.Name",
+            named(),
+            ConversionErrorKind::NotScalar,
+        ),
         (
             "'ok' as mock.Name",
             AttributeType::union(vec![named(), named()]),
@@ -1899,7 +1903,10 @@ fn r11_walk_consumes_a_judge_verdict_without_resolving_the_target_again() {
             &crate::schema::LeafPath::from_segments([]),
             cursor.clone(),
             destination.schema().as_schema().defs(),
-            &empty,
+            crate::parser::retained::ConversionContext {
+                catalog: &empty,
+                reference: crate::validation::admission::ReferenceSource::Unchecked,
+            },
         )
         .unwrap();
         let witness = match verdict {

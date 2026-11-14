@@ -3,10 +3,14 @@
 pub(crate) mod diagnostic;
 pub(crate) mod flow;
 mod static_source;
-pub(in crate::parser::retained) use static_source::{ConversionTypeJudgement, StaticVerdict};
+pub(in crate::parser::retained) use static_source::{
+    ComputedSource, ConversionTypeJudgement, StaticVerdict,
+};
 
 use super::*;
-use crate::schema::value_validation::{AssignmentFindings, AuthoredOutcome, CheckValue};
+use crate::schema::value_validation::{
+    AssignmentFindings, AuthoredOutcome, CheckValue, ScalarKindFit, scalar_kind_fit,
+};
 use crate::schema::{AttrTypeKind, CompiledAttributeType, LeafPath, RefinedScalarKind, TypeError};
 use crate::validation::admission::DestinationKind;
 use diagnostic::{
@@ -561,32 +565,90 @@ fn rejection<B: BindingAddress>(
 
 /// Shared with the future ordinary discarded-node rule (#4370). This reads
 /// static judgement only: no Convert, value, token, or pending obligation.
+pub(crate) enum ScalarKindCheck<'a> {
+    Compatible(CompatibleScalar<'a>),
+    WrongScalarKind,
+    NotScalar,
+    NoStaticJudgement,
+}
+
+pub(crate) enum ScalarSource<'a> {
+    Judged(&'a JudgedExpr),
+    Declaration(crate::schema::TypeInSchema<'a, crate::schema::Compiled>),
+}
+
+pub(crate) enum CompatibleScalar<'a> {
+    Judged(&'a TypeExpr),
+    Declaration(crate::schema::ResolvedAttrType<'a, crate::schema::Compiled>),
+}
+
+pub(crate) struct ConversionContext<'a> {
+    pub(crate) catalog: &'a crate::parser::ProviderContext,
+    pub(crate) reference: crate::validation::admission::ReferenceSource,
+}
+
 pub(crate) fn check_scalar_kind<'a>(
     declaration: &CompiledAttributeType,
-    judgement: &'a JudgedExpr,
-) -> Result<&'a TypeExpr, Kind> {
-    let expected = diagnostic::scalar_kind(declaration).ok_or(Kind::Source)?;
-    let source = judgement.assignment_source_type().ok_or(Kind::Source)?;
-    let actual = match source {
-        TypeExpr::String | TypeExpr::StringLiteral(_) => RefinedScalarKind::String,
-        TypeExpr::Int => RefinedScalarKind::Int,
-        TypeExpr::Float => RefinedScalarKind::Float,
-        TypeExpr::SchemaType { owned } => owned.scalar_kind(),
-        TypeExpr::Bool
-        | TypeExpr::Duration
-        | TypeExpr::Simple(_)
-        | TypeExpr::Ref(_)
-        | TypeExpr::DottedUnresolved(_)
-        | TypeExpr::UnloadedSchemaType(_)
-        | TypeExpr::List(_)
-        | TypeExpr::Map(_)
-        | TypeExpr::Union(_)
-        | TypeExpr::Struct { .. } => return Err(Kind::Source),
+    evidence: ScalarSource<'a>,
+) -> ScalarKindCheck<'a> {
+    let Some(expected) = diagnostic::scalar_kind(declaration) else {
+        return ScalarKindCheck::NotScalar;
     };
-    if actual == expected {
-        Ok(source)
-    } else {
-        Err(Kind::ScalarKind)
+    let (actual, source) = match evidence {
+        ScalarSource::Declaration(source) => {
+            let source = match source.resolve() {
+                Ok(source) => source,
+                Err(_) => return ScalarKindCheck::NoStaticJudgement,
+            };
+            let actual = match diagnostic::scalar_kind(source.as_attr()) {
+                Some(kind) => kind,
+                None => match source.as_attr().kind() {
+                    AttrTypeKind::StringLiteralSet { .. } | AttrTypeKind::Enum { .. } => {
+                        RefinedScalarKind::String
+                    }
+                    AttrTypeKind::UnloadedSchemaType(_)
+                    | AttrTypeKind::Union(_)
+                    | AttrTypeKind::Ref(_) => return ScalarKindCheck::NoStaticJudgement,
+                    AttrTypeKind::String { .. }
+                    | AttrTypeKind::Int { .. }
+                    | AttrTypeKind::Float { .. }
+                    | AttrTypeKind::Reference { .. }
+                    | AttrTypeKind::ResourceHandle { .. }
+                    | AttrTypeKind::Bool
+                    | AttrTypeKind::Duration
+                    | AttrTypeKind::List { .. }
+                    | AttrTypeKind::Map { .. }
+                    | AttrTypeKind::Struct { .. } => return ScalarKindCheck::NotScalar,
+                },
+            };
+            (actual, CompatibleScalar::Declaration(source))
+        }
+        ScalarSource::Judged(judgement) => {
+            let Some(source) = judgement.assignment_source_type() else {
+                return ScalarKindCheck::NoStaticJudgement;
+            };
+            let actual = match source {
+                TypeExpr::String | TypeExpr::StringLiteral(_) => RefinedScalarKind::String,
+                TypeExpr::Int => RefinedScalarKind::Int,
+                TypeExpr::Float => RefinedScalarKind::Float,
+                TypeExpr::SchemaType { owned } => owned.scalar_kind(),
+                TypeExpr::Bool
+                | TypeExpr::Duration
+                | TypeExpr::Ref(_)
+                | TypeExpr::List(_)
+                | TypeExpr::Map(_)
+                | TypeExpr::Struct { .. } => return ScalarKindCheck::NotScalar,
+                TypeExpr::Simple(_)
+                | TypeExpr::DottedUnresolved(_)
+                | TypeExpr::UnloadedSchemaType(_)
+                | TypeExpr::Union(_) => return ScalarKindCheck::NoStaticJudgement,
+            };
+            (actual, CompatibleScalar::Judged(source))
+        }
+    };
+    match scalar_kind_fit(expected, actual) {
+        ScalarKindFit::Exact | ScalarKindFit::IntToFloat => ScalarKindCheck::Compatible(source),
+        ScalarKindFit::Rejected => ScalarKindCheck::WrongScalarKind,
     }
 }
 
@@ -646,7 +708,7 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
     path: &LeafPath,
     cursor: AuthoredCursor<'_, B>,
     defs: &std::collections::BTreeMap<String, CompiledAttributeType>,
-    config: &crate::parser::ProviderContext,
+    context: ConversionContext<'_>,
 ) -> Result<AuthoredOutcome, TypeError> {
     let (usage, covered) = match &cursor.kind {
         CursorKind::Authored(usage) => (usage.clone(), false),
@@ -790,7 +852,7 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
             };
             let verdict = match record.owner(declaration) {
                 StaticOwner::WalkOwned => record
-                    .check_walk(source, declaration, defs, config, knowledge)
+                    .check_walk(source, declaration, defs, &context, knowledge)
                     .consume::<K>(path, knowledge, static_source::VerdictOrigin::Walk),
                 StaticOwner::JudgedStatically(verdict) => {
                     verdict.consume::<K>(path, knowledge, static_source::VerdictOrigin::Judge)

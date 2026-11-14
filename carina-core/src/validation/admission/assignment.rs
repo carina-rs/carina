@@ -223,6 +223,50 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> From<&AdmissionContext<'a, P, B>
 }
 
 impl<B: BindingAddress> ReferenceCandidate<B> {
+    /// The same resolved source feeds ordinary reference assignment and a
+    /// conversion's static source check. Existence errors keep their ordinary
+    /// path/error shape; no assignment relation has been applied here.
+    pub(crate) fn source(
+        &self,
+        context: &ReferenceContext<'_, B>,
+    ) -> Result<ReferenceSource, TypeError> {
+        let Some(bindings) = context.bindings else {
+            return Ok(ReferenceSource::Unchecked);
+        };
+        let source = match self.reference.as_ref() {
+            crate::resource::ReferencePathRef::Access(path) => bindings.postfix_ref_type(path),
+            crate::resource::ReferencePathRef::Binding(binding) => bindings.ref_type(binding),
+            reference @ crate::resource::ReferencePathRef::BindingAccess { .. } => {
+                bindings.ref_type(reference)
+            }
+        };
+        match source {
+            RefType::Typed(source) => Ok(ReferenceSource::Typed(source)),
+            RefType::Unchecked => Ok(ReferenceSource::Unchecked),
+            RefType::UnknownBinding { binding, attribute } => {
+                Err(reference_error(AdmissionReferenceError::UnknownBinding {
+                    binding,
+                    attribute,
+                }))
+            }
+            RefType::UnknownAttribute(crate::binding_index::RefTypeError::InvalidAccess {
+                step,
+                actual,
+                ..
+            }) => Err(reference_error(AdmissionReferenceError::Computed(
+                crate::validation::DeferredAccessTypeError::InvalidAccess {
+                    error: crate::validation::inference::InferenceError::InvalidAccess {
+                        base_type: actual,
+                        step,
+                    },
+                },
+            ))),
+            RefType::UnknownAttribute(error) => {
+                Err(reference_error(AdmissionReferenceError::Path(error)))
+            }
+        }
+    }
+
     pub(super) fn error_with_origin(&self, error: TypeError) -> TypeError {
         match error {
             TypeError::TypeMismatch { types } => {
@@ -335,15 +379,8 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
             }
             return Ok(());
         }
-        let source = match self.reference.as_ref() {
-            crate::resource::ReferencePathRef::Access(path) => bindings.postfix_ref_type(path),
-            crate::resource::ReferencePathRef::Binding(binding) => bindings.ref_type(binding),
-            reference @ crate::resource::ReferencePathRef::BindingAccess { .. } => {
-                bindings.ref_type(reference)
-            }
-        };
-        match source {
-            RefType::Typed(source) => {
+        match self.source(context)? {
+            ReferenceSource::Typed(source) => {
                 // The value walk supplies each Union member's own sink. Every
                 // kind judges that sink even when several members share a shape:
                 // reject if none fit, admit if all fit, without guessing a sink.
@@ -379,7 +416,7 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
                     }
                 }
             }
-            RefType::Unchecked => {
+            ReferenceSource::Unchecked => {
                 // A known binding without representable type authority cannot
                 // confer placement. The owned obligation is retried on discharge.
                 findings
@@ -387,32 +424,14 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
                     .requirements
                     .push(SchemaRequirement::Reference);
             }
-            RefType::UnknownBinding { binding, attribute } => {
-                return Err(reference_error(AdmissionReferenceError::UnknownBinding {
-                    binding,
-                    attribute,
-                }));
-            }
-            RefType::UnknownAttribute(crate::binding_index::RefTypeError::InvalidAccess {
-                step,
-                actual,
-                ..
-            }) => {
-                return Err(reference_error(AdmissionReferenceError::Computed(
-                    crate::validation::DeferredAccessTypeError::InvalidAccess {
-                        error: crate::validation::inference::InferenceError::InvalidAccess {
-                            base_type: actual,
-                            step,
-                        },
-                    },
-                )));
-            }
-            RefType::UnknownAttribute(error) => {
-                return Err(reference_error(AdmissionReferenceError::Path(error)));
-            }
         }
         Ok(())
     }
+}
+
+pub(crate) enum ReferenceSource {
+    Typed(crate::binding_index::ResolvedRefType),
+    Unchecked,
 }
 
 pub(super) fn reference_error(error: AdmissionReferenceError) -> TypeError {
@@ -528,13 +547,49 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                  checked: crate::schema::value_validation::CheckValue<'_, P, B>,
                  path: &LeafPath,
                  cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
+                    let source = match &cursor.kind {
+                        crate::parser::retained::CursorKind::Authored(usage)
+                        | crate::parser::retained::CursorKind::CoveredBy(usage)
+                            if matches!(
+                                usage.node().kind(),
+                                crate::parser::retained::ExprKind::Convert { .. }
+                            ) =>
+                        {
+                            let operand = usage
+                                .child(0, crate::parser::retained::EdgeRole::ConvertOperand)
+                                .map_err(assignment_seam_error)?;
+                            let operand =
+                                crate::parser::retained::AuthoredCursor::authored(operand);
+                            match operand.source_reference().filter(|_| match &operand.kind {
+                                crate::parser::retained::CursorKind::Authored(usage)
+                                | crate::parser::retained::CursorKind::CoveredBy(usage) => {
+                                    usage.node().judgement().assignment_source_type().is_none()
+                                }
+                                crate::parser::retained::CursorKind::Projected(_) => false,
+                            }) {
+                                Some(source) => ReferenceCandidate {
+                                    reference: source.into_path(),
+                                }
+                                .source(&reference_context)?,
+                                None => ReferenceSource::Unchecked,
+                            }
+                        }
+                        crate::parser::retained::CursorKind::Authored(_)
+                        | crate::parser::retained::CursorKind::CoveredBy(_)
+                        | crate::parser::retained::CursorKind::Projected(_) => {
+                            ReferenceSource::Unchecked
+                        }
+                    };
                     crate::parser::retained::check_conversion::<K, P, B>(
                         attr,
                         checked,
                         &join(&contract.path, path),
                         cursor,
                         contract.defs(),
-                        context.provider.catalog(),
+                        crate::parser::retained::ConversionContext {
+                            catalog: context.provider.catalog(),
+                            reference: source,
+                        },
                     )
                 };
             #[cfg(test)]

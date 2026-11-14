@@ -505,11 +505,9 @@ fn conversion_source_kind_is_not_inferred_from_a_string_projection() -> TestResu
 }
 
 #[test]
-fn conversion_unknown_source_type_never_enters_ordinary_admission() -> TestResult {
+fn conversion_unknown_source_type_defers_to_destination_value_admission() -> TestResult {
     let source = "fn supply() { 'ok' }\nlet sink = mock.Sink { target = supply() as mock.Name }";
-    Fixture::string()
-        .check(source)?
-        .assert_findings(&[(ConversionErrorKind::Source, site(source, "supply() as"))]);
+    Fixture::string().check(source)?.assert_accepted();
     Ok(())
 }
 
@@ -518,7 +516,7 @@ fn conversion_non_scalar_source_never_enters_ordinary_admission() -> TestResult 
     let source = "let sink = mock.Sink { target = ['ok'] as mock.Name }";
     Fixture::string()
         .check(source)?
-        .assert_findings(&[(ConversionErrorKind::Source, site(source, "['ok'] as"))]);
+        .assert_findings(&[(ConversionErrorKind::NotScalar, site(source, "['ok'] as"))]);
     Ok(())
 }
 
@@ -547,12 +545,22 @@ fn conversion_rebuild_r2_2_member_bounds_reject_disjoint_source() -> TestResult 
 }
 
 #[test]
-fn conversion_rebuild_r2_1_rejected_int_to_float_never_enters_ordinary_admission() -> TestResult {
+fn conversion_int_to_float_source_uses_slot_widening() -> TestResult {
     let source = "let sink = mock.Sink { target = 42 as mock.Ratio }";
     let target = AttributeType::refined_float(Some(TypeIdentity::from_dotted("mock.Ratio")), None);
     Fixture::new(AttributeType::int(), target)
         .check(source)?
-        .assert_findings(&[(ConversionErrorKind::ScalarKind, site(source, "42 as"))]);
+        .assert_accepted();
+    Ok(())
+}
+
+#[test]
+fn conversion_float_to_int_source_follows_slot_rejection() -> TestResult {
+    let source = "let sink = mock.Sink { target = 3.5 as mock.Count }";
+    let target = AttributeType::refined_int(Some(TypeIdentity::from_dotted("mock.Count")), None);
+    Fixture::new(AttributeType::float(), target)
+        .check(source)?
+        .assert_findings(&[(ConversionErrorKind::ScalarKind, site(source, "3.5 as"))]);
     Ok(())
 }
 
@@ -567,8 +575,32 @@ fn conversion_rebuild_r2_3_source_matches_ordinary_interpolation() -> TestResult
 }
 
 #[test]
-fn conversion_int_and_float_sources_require_only_same_kind_and_non_disjoint_bounds() -> TestResult {
+fn conversion_numeric_sources_follow_slot_kind_fit_and_non_disjoint_bounds() -> TestResult {
     for (source, target, path, accepted) in [
+        (
+            AttributeType::refined_int(
+                Some(TypeIdentity::from_dotted("foreign.Count")),
+                Some((Some(1), Some(64))),
+            ),
+            AttributeType::refined_float(
+                Some(TypeIdentity::from_dotted("mock.Ratio")),
+                Some((Some(crate::finite(1.0)), Some(crate::finite(8.0)))),
+            ),
+            "mock.Ratio",
+            true,
+        ),
+        (
+            AttributeType::refined_int(
+                Some(TypeIdentity::from_dotted("foreign.Count")),
+                Some((Some(20), Some(40))),
+            ),
+            AttributeType::refined_float(
+                Some(TypeIdentity::from_dotted("mock.Ratio")),
+                Some((Some(crate::finite(1.0)), Some(crate::finite(8.0)))),
+            ),
+            "mock.Ratio",
+            false,
+        ),
         (
             AttributeType::refined_int(
                 Some(TypeIdentity::from_dotted("foreign.Count")),
@@ -1284,10 +1316,10 @@ fn conversion_changed_bindings_are_rejudged_before_admission() -> TestResult {
 #[test]
 fn conversion_empty_supplied_report_cannot_hide_authored_syntax() -> TestResult {
     let fixture = Fixture::new(
-        AttributeType::int(),
-        AttributeType::refined_float(Some(TypeIdentity::from_dotted("mock.Ratio")), None),
+        AttributeType::float(),
+        AttributeType::refined_int(Some(TypeIdentity::from_dotted("mock.Count")), None),
     );
-    let source = "let sink = mock.Sink { target = 42 as mock.Ratio }";
+    let source = "let sink = mock.Sink { target = 3.5 as mock.Count }";
     let parsed = crate::parser::parse_file(source, Path::new("conversion.crn"), &fixture.catalog)
         .map_err(|e| format!("normal parse rejected authored source: {e}"))?
         .resolve_root_for_test();
@@ -1300,7 +1332,7 @@ fn conversion_empty_supplied_report_cannot_hide_authored_syntax() -> TestResult 
         &fixture.catalog,
         Some(empty.expression_report()),
     )?
-    .assert_findings(&[(ConversionErrorKind::ScalarKind, site(source, "42 as"))]);
+    .assert_findings(&[(ConversionErrorKind::ScalarKind, site(source, "3.5 as"))]);
     Ok(())
 }
 

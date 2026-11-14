@@ -208,7 +208,7 @@ fn conversion_disjoint_intervals_are_symmetric_and_endpoints_are_inclusive() {
         assert!(!left.disjoint(&unbounded));
         assert!(!unbounded.disjoint(&left));
     }
-    // Scalar-kind mismatch is a separate error, not disjointness evidence.
+    // String and numeric bounds are incomparable; kind mismatch is a separate error.
     assert!(
         !DeclarationBounds::String { min: 0, max: None }.disjoint(&DeclarationBounds::Int {
             min: None,

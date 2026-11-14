@@ -381,7 +381,7 @@ fn r5b_read_only_commands_use_mains_ordinary_judge_gate() {
                 "Judge-owned conversion kind",
                 "mock.actions.OidcSubject { claim_keys = [1 as mock.actions.OidcSubject.ClaimKey] }\n",
                 false,
-                "conversion operand has no compatible scalar source judgement",
+                "conversion operand has an incompatible scalar kind",
             ),
         ] {
             write(directory.path(), "main.crn", body);
