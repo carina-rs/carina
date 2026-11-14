@@ -93,7 +93,7 @@ impl StaticVerdict {
     }
     /// A Judge-owned destination is never resolved or selected a second time.
     /// Only the source relation deferred by that Judge use can run here.
-    pub(super) fn resume<K: DestinationKind>(
+    pub(super) fn resume<K: AssignmentKind>(
         mut self,
         path: &LeafPath,
         knowledge: SourceKnowledge,
@@ -108,7 +108,7 @@ impl StaticVerdict {
         };
         self.consume::<K>(path, knowledge, origin)
     }
-    pub(super) fn consume<K: DestinationKind>(
+    pub(super) fn consume<K: AssignmentKind>(
         mut self,
         path: &LeafPath,
         knowledge: SourceKnowledge,

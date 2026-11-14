@@ -1,3 +1,5 @@
+#![deny(clippy::iter_over_hash_type)]
+
 //! Render plan output from a `tests/fixtures/plan_display` fixture.
 //!
 //! Mirrors `carina plan --refresh=false` but skips provider plugin loading,

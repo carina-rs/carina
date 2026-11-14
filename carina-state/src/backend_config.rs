@@ -52,18 +52,15 @@ use crate::backend::{LOCAL_BACKEND_TYPE, S3_BACKEND_TYPE};
 /// ```
 /// # use carina_core::validation::admission::{configuration::AdmittedConfiguration, kind::BackendAttribute};
 /// ```
-/// ```compile_fail
+/// Backend pending admission cannot be named; resource pending work remains available.
+///
+/// ```compile_fail,E0277
 /// use carina_core::validation::admission::{PendingAdmission, kind::BackendAttribute};
-/// use carina_state::BackendConfig;
-/// fn bypass(pending: PendingAdmission<BackendAttribute>) {
-///     let _ = BackendConfig::from(pending); // forbidden: pending values are not constructor authority
-/// }
+/// fn hold(_: Option<PendingAdmission<BackendAttribute>>) {}
 /// ```
 /// ```
-/// # use carina_core::validation::admission::{PendingAdmission, kind::BackendAttribute};
-/// # use carina_state::BackendConfig;
-/// # fn bypass(pending: PendingAdmission<BackendAttribute>) {
-/// # }
+/// use carina_core::validation::admission::{PendingAdmission, kind::ResourceAttribute};
+/// fn hold(_: Option<PendingAdmission<ResourceAttribute>>) {}
 /// ```
 /// ```compile_fail
 /// use carina_core::validation::admission::{configuration::AdmittedConfiguration, kind::ProviderConfigAttribute};

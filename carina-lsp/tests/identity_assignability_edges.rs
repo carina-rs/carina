@@ -6,7 +6,7 @@ use carina_core::parser::ProviderContext;
 use carina_lsp::{
     Backend, backend::FactoryBuilder, diagnostics::DiagnosticEngine, document::Document,
 };
-use std::{collections::HashMap, path::Path, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, path::Path, path::PathBuf, sync::Arc};
 use support::TestClient;
 use tempfile::TempDir;
 use tower_lsp::{LanguageServer, LspService, lsp_types::*};
@@ -60,7 +60,7 @@ impl Scenario {
         engine.analyze(&doc, Some(&path))
     }
 
-    fn factory_builder(&self, errors: HashMap<String, String>) -> FactoryBuilder {
+    fn factory_builder(&self, errors: BTreeMap<String, String>) -> FactoryBuilder {
         let owners = self.owners.clone();
         Arc::new(move |_| {
             let factories = owners
@@ -74,7 +74,7 @@ impl Scenario {
         })
     }
 
-    async fn client_with_errors(&self, errors: HashMap<String, String>) -> TestClient {
+    async fn client_with_errors(&self, errors: BTreeMap<String, String>) -> TestClient {
         let mut client = TestClient::with_factory_builder(Some(self.factory_builder(errors))).await;
         let root = Url::from_directory_path(self.directory.path()).unwrap();
         client.initialize_with_root(Some(root.as_str())).await;
@@ -94,7 +94,7 @@ impl Scenario {
     }
 
     async fn complete(&self, text: &str, position: Position) -> Vec<CompletionItem> {
-        let builder = self.factory_builder(HashMap::new());
+        let builder = self.factory_builder(BTreeMap::new());
         let (service, socket) = LspService::new(|client| {
             Backend::new(
                 client,
@@ -188,7 +188,7 @@ fn subdirectory_with_broken_providers(scenario: &Scenario) -> PathBuf {
 async fn broken_subdirectory_providers_defer_instead_of_using_ancestor_catalog() {
     let scenario = Scenario::new(&[("mock", true)]);
     let path = subdirectory_with_broken_providers(&scenario);
-    let mut client = scenario.client_with_errors(HashMap::new()).await;
+    let mut client = scenario.client_with_errors(BTreeMap::new()).await;
     let diagnostics = open_diagnostics(
         &mut client,
         &path,
@@ -215,7 +215,7 @@ async fn broken_subdirectory_providers_defer_instead_of_using_ancestor_catalog()
 async fn broken_subdirectory_providers_do_not_apply_ancestor_completion_edges() {
     let scenario = Scenario::new(&[("mock", true)]);
     let path = subdirectory_with_broken_providers(&scenario);
-    let mut client = scenario.client_with_errors(HashMap::new()).await;
+    let mut client = scenario.client_with_errors(BTreeMap::new()).await;
     let items = request_completions(
         &mut client,
         &path,
@@ -237,7 +237,7 @@ async fn broken_subdirectory_providers_do_not_apply_ancestor_completion_edges() 
 async fn broken_subdirectory_providers_defer_instead_of_using_empty_catalog() {
     let scenario = Scenario::new(&[]);
     let path = subdirectory_with_broken_providers(&scenario);
-    let mut client = scenario.client_with_errors(HashMap::new()).await;
+    let mut client = scenario.client_with_errors(BTreeMap::new()).await;
     let diagnostics = open_diagnostics(
         &mut client,
         &path,
@@ -269,7 +269,7 @@ async fn named_provider_errors_do_not_make_the_exact_directory_fallback_partial(
     )
     .unwrap();
     let mut client = scenario
-        .client_with_errors(HashMap::from([(
+        .client_with_errors(BTreeMap::from([(
             "other".into(),
             "unavailable named instance".into(),
         )]))
@@ -359,7 +359,7 @@ async fn identity_edge_diagnostics_retain_loaded_catalog_with_incomplete_sibling
         "let draft = mock.Bucket {\n  bucket = \n}\n",
     )
     .unwrap();
-    let mut client = scenario.client_with_errors(HashMap::new()).await;
+    let mut client = scenario.client_with_errors(BTreeMap::new()).await;
     let diagnostics = open_diagnostics(
         &mut client,
         &scenario.consumer_path(),

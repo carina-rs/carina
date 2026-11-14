@@ -12,7 +12,7 @@ use crate::schema::value_validation::{
     AssignmentFindings, AuthoredOutcome, CheckValue, ScalarKindFit, scalar_kind_fit,
 };
 use crate::schema::{AttrTypeKind, CompiledAttributeType, LeafPath, RefinedScalarKind, TypeError};
-use crate::validation::admission::DestinationKind;
+use crate::validation::admission::AssignmentKind;
 use diagnostic::{
     ConversionError, ConversionErrorKind as Kind, ConversionTypePath, DeclarationBounds,
 };
@@ -702,7 +702,7 @@ fn destination<'d>(
 
 /// The sole authored B1 policy. Syntax navigation and value descent remain in
 /// the existing schema walk; this function only reads direct child evidence.
-pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: BindingAddress>(
+pub(crate) fn check<K: AssignmentKind, P: crate::resource::PlaceholderKind, B: BindingAddress>(
     declaration: &CompiledAttributeType,
     checked: CheckValue<'_, P, B>,
     path: &LeafPath,

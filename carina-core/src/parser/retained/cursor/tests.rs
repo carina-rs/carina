@@ -578,7 +578,7 @@ fn round1_seam_expansion_records_a_decision_without_a_parse_projection() {
     let condition = usage.node.node.children[0].node_id();
     let instance = usage.node.environment.clone();
     let mut snapshot = (*slot.snapshot).clone();
-    Arc::make_mut(&mut snapshot.projections).remove(&(instance, condition));
+    Arc::make_mut(&mut snapshot.projections).shift_remove(&(instance, condition));
     slot.snapshot = Arc::new(snapshot);
     slot.conditions = ConditionSnapshot::default();
     // Model an unavailable parse-time projection and the value already

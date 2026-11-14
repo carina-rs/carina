@@ -269,6 +269,8 @@ impl ResolvedIgnoreChanges {
             .filter(|path| !path.write_only)
             .map(|path| path.attribute.clone())
             .collect::<HashSet<_>>();
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: distinct top-level attributes are masked independently
         for attribute in attributes {
             if self
                 .for_attribute(&attribute)

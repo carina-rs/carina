@@ -604,6 +604,8 @@ impl CompletionProvider {
                     &mut exports_cache,
                     provider_ctx,
                 );
+                #[allow(clippy::iter_over_hash_type)]
+                // order reaches output; migration tracked in #4414
                 for (export_name, entry) in exports {
                     let completion_type = structural_type_for_completion(entry);
                     if !completion_type.is_candidate_for_target(
@@ -1967,6 +1969,8 @@ impl CompletionProvider {
                 &mut exports_cache,
                 provider_ctx,
             );
+            #[allow(clippy::iter_over_hash_type)]
+            // sorted immediately after: reference items are sorted by unique full label
             for (export_name, entry) in exports {
                 let completion_type = structural_type_for_completion(entry);
                 if !completion_type.is_candidate_for_target(target, &self.schemas, provider_ctx) {
@@ -2366,6 +2370,8 @@ impl CompletionProvider {
         let zone_letters = ['a', 'b', 'c', 'd'];
         let mut completions = Vec::new();
 
+        #[allow(clippy::iter_over_hash_type)]
+        // sorted immediately after: unique region/zone completion labels are sorted
         for (region_code, region_name) in &region_names {
             for &zone_letter in &zone_letters {
                 let az = format!("{}{}", region_code, zone_letter);
@@ -2521,7 +2527,7 @@ fn resolve_upstream_exports_cached<'a>(
 /// re-read and re-parse the upstream project directory.
 fn infer_for_binding_type(
     binding: &super::top_level::ForScopeBinding,
-    upstream_sources: &std::collections::HashMap<String, String>,
+    upstream_sources: &indexmap::IndexMap<String, String>,
     base_path: Option<&carina_core::paths::ResolvedPath>,
     schemas: &carina_core::schema::SchemaRegistry,
     exports_cache: &mut std::collections::HashMap<
@@ -2792,7 +2798,7 @@ fn collect_named_provider_instance_bindings(
     let parsed = match carina_core::config_loader::parse_directory_for_metadata(
         &dir,
         provider_ctx.catalog(),
-        &std::collections::HashMap::new(),
+        &indexmap::IndexMap::new(),
         &carina_core::schema::SchemaRegistry::new(),
     ) {
         Ok(p) => p,

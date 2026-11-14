@@ -681,7 +681,7 @@ where
     D: Borrow<Value>,
     S: Borrow<Value>,
 {
-    let mut map_field_buckets: HashMap<&str, HashMap<u64, Vec<usize>>> = HashMap::new();
+    let mut map_field_buckets: BTreeMap<&str, HashMap<u64, Vec<usize>>> = BTreeMap::new();
     let mut value_buckets: HashMap<u64, Vec<usize>> = HashMap::new();
     for (saved_index, saved_value) in saved.iter().enumerate() {
         match saved_value.borrow() {
@@ -730,6 +730,8 @@ where
         }) else {
             continue;
         };
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: buckets repeat the same representative/operand/path checks and fill distinct cache keys
         for (value_hash, bucket) in value_buckets {
             if bucket.len() != saved.len()
                 || !bucket.iter().copied().eq(0..saved.len())
@@ -765,6 +767,8 @@ where
     if !has_reference_leaves(attr_type, defs)
         && let Some(representative) = saved.first().map(Borrow::borrow)
     {
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: buckets repeat the same representative/operand checks and fill distinct cache keys
         for (value_hash, bucket) in &value_buckets {
             if bucket.len() == saved.len()
                 && bucket.iter().copied().eq(0..saved.len())

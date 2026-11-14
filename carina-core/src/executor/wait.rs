@@ -9,7 +9,7 @@
 
 #[cfg(test)]
 use crate::provider::{Provider, ProviderError};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -258,7 +258,7 @@ pub(super) const SKIP_REASON_CANCELLED: &str = "cancelled";
 /// Wait future has already completed and removed itself from
 /// `wait_cancellers`, so signaling that channel is a no-op.
 pub(super) fn signal_in_flight_waits(
-    wait_cancellers: &HashMap<usize, tokio::sync::watch::Sender<WaitSignal>>,
+    wait_cancellers: &BTreeMap<usize, tokio::sync::watch::Sender<WaitSignal>>,
 ) {
     for tx in wait_cancellers.values() {
         // Receiver dropped == Wait future completed; nothing to cancel.
@@ -269,7 +269,7 @@ pub(super) fn signal_in_flight_waits(
 pub(super) fn cancel_waits_if_terminal(
     in_flight_kinds: &HashMap<usize, InFlightKind>,
     undispatched_count: usize,
-    wait_cancellers: &HashMap<usize, tokio::sync::watch::Sender<WaitSignal>>,
+    wait_cancellers: &BTreeMap<usize, tokio::sync::watch::Sender<WaitSignal>>,
 ) {
     let only_waits = !in_flight_kinds.is_empty()
         && in_flight_kinds
@@ -310,7 +310,7 @@ pub(super) fn count_effectively_undispatched<S>(
 pub(super) struct WaitAwareInFlight<'fut, R, S> {
     inner: FuturesUnordered<Pin<Box<dyn Future<Output = (usize, R)> + 'fut>>>,
     kinds: HashMap<usize, InFlightKind>,
-    cancellers: HashMap<usize, tokio::sync::watch::Sender<WaitSignal>>,
+    cancellers: BTreeMap<usize, tokio::sync::watch::Sender<WaitSignal>>,
     interrupted: Arc<Mutex<InterruptedRegistry<S>>>,
 }
 
@@ -564,7 +564,7 @@ impl<'fut, R, S> WaitAwareInFlight<'fut, R, S> {
         Self {
             inner: FuturesUnordered::new(),
             kinds: HashMap::new(),
-            cancellers: HashMap::new(),
+            cancellers: BTreeMap::new(),
             interrupted: Arc::new(Mutex::new(InterruptedRegistry::default())),
         }
     }

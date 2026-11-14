@@ -789,6 +789,7 @@ validated_config.provider_plan())
     if let Some(migrated) = validated.migrated_state {
         state_file = Some(migrated);
         if let Some(state) = state_file.as_ref() {
+            #[allow(clippy::iter_over_hash_type)] // keyed rebuild: dependency metadata is copied independently by resource ID
             for (id, current) in &mut managed_current {
                 if let Some(row) = state.find_resource_for_id(id) {
                     current.set_dependency_bindings(row.dependency_bindings.clone());
@@ -2100,7 +2101,11 @@ fn compute_delete_depths(
     deletion_deps: &HashMap<usize, HashSet<usize>>,
 ) -> Vec<usize> {
     let mut create_parents: HashMap<usize, HashSet<usize>> = HashMap::new();
+    #[allow(clippy::iter_over_hash_type)]
+    // keyed rebuild: reverse dependency sets union duplicate edges idempotently
     for (&parent, children) in deletion_deps {
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: parent membership and maximum depth do not depend on traversal
         for &child in children {
             create_parents.entry(child).or_default().insert(parent);
         }

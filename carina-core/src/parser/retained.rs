@@ -463,7 +463,7 @@ impl<P: ValueKind, B: BindingAddress> AuthoredExpr<P, B> {
 }
 
 type AuthoredNodes<B> =
-    HashMap<(ExpressionInstance, NodeId), Arc<AuthoredExpr<ParserPlaceholder, B>>>;
+    IndexMap<(ExpressionInstance, NodeId), Arc<AuthoredExpr<ParserPlaceholder, B>>>;
 
 // Syntax equality predates identity. Keep its existing semantics for callers
 // comparing parser output; admission uses NodeId explicitly.
@@ -908,11 +908,11 @@ pub struct Expressions<B: BindingAddress = RelativeBindingName> {
     roots: Vec<ExprValue<ParserPlaceholder, B>>,
     definitions: IndexMap<B, ExprValue<ParserPlaceholder, B>>,
     report: Arc<ExpressionReport<B>>,
-    arguments: HashMap<B, TypeExpr>,
+    arguments: IndexMap<B, TypeExpr>,
     instance: ExpressionInstance,
     require_scope: Option<RequireScope>,
     captures: Arc<CapturedNodes>,
-    projections: Arc<HashMap<(ExpressionInstance, NodeId), Value<ParserPlaceholder, B>>>,
+    projections: Arc<IndexMap<(ExpressionInstance, NodeId), Value<ParserPlaceholder, B>>>,
     template_placements: crate::ConversionChannel,
 }
 
@@ -943,7 +943,7 @@ impl<B: BindingAddress> Default for Expressions<B> {
             roots: Vec::new(),
             definitions: IndexMap::new(),
             report: Arc::new(ExpressionReport::empty()),
-            arguments: HashMap::new(),
+            arguments: IndexMap::new(),
             instance: ExpressionInstance::Root,
             require_scope: None,
             captures: Arc::default(),
@@ -1729,7 +1729,7 @@ pub(in crate::parser) struct CapturedNodes {
         HashMap<NodeId, super::RequireBlock<ParserPlaceholder, RelativeBindingName>>,
     >,
     resource_declarations: HashMap<NodeId, SlotDeclarationId>,
-    values: std::sync::RwLock<HashMap<NodeId, Value<ParserPlaceholder, RelativeBindingName>>>,
+    values: std::sync::RwLock<IndexMap<NodeId, Value<ParserPlaceholder, RelativeBindingName>>>,
     conditions: ConditionRecorder,
 }
 impl std::fmt::Debug for CapturedNodes {
@@ -4482,7 +4482,7 @@ mod judgement {
 
     #[derive(Clone)]
     pub struct ExpressionReport<B: BindingAddress = RelativeBindingName> {
-        bindings: Arc<HashMap<B, JudgedExpr>>,
+        bindings: Arc<IndexMap<B, JudgedExpr>>,
         expressions: Arc<IndexMap<ExpressionLocation, JudgedExpr>>,
         pub(super) nodes: Arc<HashMap<(ExpressionInstance, NodeId), JudgedExpr>>,
         pub(crate) placements: Arc<crate::ConversionChannel>,
@@ -4491,12 +4491,12 @@ mod judgement {
         pub(super) use_interner: Arc<cursor::UseInterner>,
         pub(super) definitions: Arc<IndexMap<B, ExprValue<ParserPlaceholder, B>>>,
         pub(super) projections:
-            Arc<HashMap<(ExpressionInstance, NodeId), Value<ParserPlaceholder, B>>>,
+            Arc<IndexMap<(ExpressionInstance, NodeId), Value<ParserPlaceholder, B>>>,
         findings: Arc<Vec<Located<InferenceError>>>,
         function_errors: Arc<Vec<Located<InferenceError>>>,
         operands: Arc<HashMap<ExpressionLocation, [JudgedExpr; 2]>>,
         module_attributes: Arc<IndexMap<(B, String), JudgedExpr>>,
-        resource_reports: Arc<HashMap<crate::resource::ResourceId, Arc<ExpressionReport<B>>>>,
+        resource_reports: Arc<IndexMap<crate::resource::ResourceId, Arc<ExpressionReport<B>>>>,
         parameters: Arc<HashMap<String, JudgedExpr>>,
         pub(super) instance: ExpressionInstance,
         authored: bool,
@@ -4606,7 +4606,7 @@ mod judgement {
                         .clone();
                     (id.clone(), report)
                 })
-                .collect::<HashMap<_, _>>()
+                .collect::<IndexMap<_, _>>()
                 .into();
             ExpressionReport {
                 instance: self.instance.clone(),
@@ -4615,7 +4615,7 @@ mod judgement {
                     .bindings
                     .iter()
                     .map(|(name, expression)| (map(name.clone()), expression.clone()))
-                    .collect::<HashMap<_, _>>()
+                    .collect::<IndexMap<_, _>>()
                     .into(),
                 expressions: self.expressions.clone(),
                 nodes: self.nodes.clone(),
@@ -5032,7 +5032,7 @@ mod judgement {
             placement_owner: None,
             by_location: IndexMap::new(),
             by_node: HashMap::new(),
-            syntax_nodes: HashMap::new(),
+            syntax_nodes: IndexMap::new(),
             visiting: Vec::new(),
             findings: Vec::new(),
             placements: conversion::flow::PlacementFindings::new(
@@ -5042,7 +5042,7 @@ mod judgement {
             operands: HashMap::new(),
             module_attributes: Some(&expressions.report.module_attributes),
         };
-        let mut judged_bindings = HashMap::new();
+        let mut judged_bindings = IndexMap::new();
         for (name, expression) in &expressions.definitions {
             judged_bindings.insert(name.clone(), judge.judge(expression));
         }

@@ -1180,10 +1180,8 @@ fn resolve_upstream_state_source(
 /// completion runs on partial, often syntactically invalid buffers. We only
 /// need binding → source to feed `resolve_upstream_exports`, which then
 /// parses the *upstream* directory (separate from the downstream buffer).
-fn collect_upstream_state_bindings(
-    src: DslSource<'_>,
-) -> std::collections::HashMap<String, String> {
-    let mut out = std::collections::HashMap::new();
+fn collect_upstream_state_bindings(src: DslSource<'_>) -> indexmap::IndexMap<String, String> {
+    let mut out = indexmap::IndexMap::new();
     scan_upstream_state_let(src.merged_text(), &mut out);
     out
 }
@@ -1196,7 +1194,7 @@ fn collect_upstream_state_bindings(
 /// A bare `find("let ")` walk would match `let ` embedded in comments or
 /// string literals; requiring `let` at the start of a trimmed line dodges
 /// those false positives.
-fn scan_upstream_state_let(text: &str, out: &mut std::collections::HashMap<String, String>) {
+fn scan_upstream_state_let(text: &str, out: &mut indexmap::IndexMap<String, String>) {
     let mut pending: Option<String> = None;
     for line in text.lines() {
         let trimmed = line.trim_start();

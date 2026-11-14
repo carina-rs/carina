@@ -1,3 +1,5 @@
+#![deny(clippy::iter_over_hash_type)]
+
 #[cfg(feature = "test-utils")]
 pub mod admission_coverage;
 pub mod backend;

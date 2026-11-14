@@ -62,7 +62,7 @@ fn reference_judgement_uses_the_contract_already_found() {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct AssignmentProof<K: DestinationKind> {
+pub struct AssignmentProof<K: AssignmentKind> {
     destination: Destination<K>,
 }
 
@@ -154,7 +154,7 @@ impl SchemaObligation {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(super) enum AssignmentVerdict<K: DestinationKind> {
+pub(super) enum AssignmentVerdict<K: AssignmentKind> {
     Proven(AssignmentProof<K>),
     NeedsLocal(K::LocalObligation),
     NeedsSchema(SchemaObligation),
@@ -284,7 +284,7 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
     /// This entry is available only on reference evidence. Placement still
     /// requires `admit`, which also checks the boundary proof and actual value.
     #[cfg(test)]
-    pub(super) fn judge_assignment<K: DestinationKind, P: PlaceholderKind>(
+    pub(super) fn judge_assignment<K: AssignmentKind, P: PlaceholderKind>(
         &self,
         destination: &Destination<K>,
         context: &AdmissionContext<'_, P, B>,
@@ -311,7 +311,7 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
         Ok(verdict(destination, findings))
     }
 
-    pub(super) fn judge_at<K: DestinationKind>(
+    pub(super) fn judge_at<K: AssignmentKind>(
         &self,
         contract: &DestinationContract,
         attr: &CompiledAttributeType,
@@ -441,7 +441,7 @@ pub(super) fn reference_error(error: AdmissionReferenceError) -> TypeError {
     }
 }
 
-fn defer_reference_check<K: DestinationKind>(
+fn defer_reference_check<K: AssignmentKind>(
     path: &LeafPath,
     findings: &mut crate::schema::value_validation::AssignmentFindings,
 ) {
@@ -451,7 +451,7 @@ fn defer_reference_check<K: DestinationKind>(
     }
 }
 
-fn verdict<K: DestinationKind>(
+fn verdict<K: AssignmentKind>(
     destination: &Destination<K>,
     findings: crate::schema::value_validation::AssignmentFindings,
 ) -> AssignmentVerdict<K> {
@@ -474,25 +474,17 @@ fn verdict<K: DestinationKind>(
     }
 }
 
-pub(super) struct AssignmentJudgement<K: DestinationKind> {
+pub(super) struct AssignmentJudgement<K: AssignmentKind> {
     pub(super) verdict: AssignmentVerdict<K>,
     pub(super) findings: crate::schema::ValueValidationFindings,
 }
 
-pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
+pub(super) fn judge_with_findings<K: AssignmentKind, P: PlaceholderKind, B: BindingAddress>(
     destination: &Destination<K>,
     candidate: &Candidate<P, B>,
     context: &AdmissionContext<'_, P, B>,
 ) -> Result<AssignmentJudgement<K>, AdmissionErrors> {
-    let cursor = match &context.lookup {
-        super::AdmissionLookup::Catalog(cursor) => cursor,
-        super::AdmissionLookup::Configuration(_) => {
-            return Err(KnowledgeError::<B>::InvalidStage {
-                operation: "configuration input cannot enter authored assignment",
-            }
-            .into());
-        }
-    };
+    let cursor = &context.cursor;
     if candidate.obligations.identity != context.identity {
         return Err(KnowledgeError::<B>::InvalidStage {
             operation: "candidate/proof pairing",

@@ -47,7 +47,7 @@
 //! ```compile_fail,E0277
 //! use carina_core::validation::admission::DestinationKind;
 //! struct External;
-//! impl DestinationKind for External { type LocalObligation = std::convert::Infallible; }
+//! impl DestinationKind for External { type Contract = (); }
 //! ```
 //!
 //! ```
@@ -107,20 +107,94 @@
 //! }
 //! ```
 //!
-//! Every destination kind retains the same resolved-value obligation.
-//! Discharge has the same generic boundary.
+//! Assignment destinations retain resolved-value obligations.
+//! Configuration unresolved sites stay at their configuration boundary.
 //!
 //! ```
-//! use carina_core::validation::admission::{DestinationKind, PendingAdmission, kind};
-//! fn hold<K: DestinationKind>(_: Option<PendingAdmission<K>>) {}
+//! use carina_core::validation::admission::{AssignmentKind, PendingAdmission, kind};
+//! fn hold<K: AssignmentKind>(_: Option<PendingAdmission<K>>) {}
 //! hold::<kind::ResourceAttribute>(None);
 //! hold::<kind::DataSourceAttribute>(None);
-//! hold::<kind::ProviderConfigAttribute>(None);
-//! hold::<kind::BackendAttribute>(None);
 //! hold::<kind::ModuleArgument>(None);
 //! hold::<kind::AnnotatedAttribute>(None);
 //! hold::<kind::Export>(None);
 //! hold::<kind::UpstreamExport>(None);
+//! ```
+
+//! Configuration never enters resource assignment or retains discharge work.
+//!
+//! ```
+//! use carina_core::validation::admission::{admit, Candidate, Destination, AdmissionContext, kind::ResourceAttribute};
+//! fn check(destination: &Destination<ResourceAttribute>, candidate: Candidate, context: &AdmissionContext<'_>) {
+//!     let _ = admit(destination, candidate, context);
+//! }
+//! ```
+//!
+//! ```compile_fail,E0277
+//! use carina_core::validation::admission::{admit, Candidate, Destination, AdmissionContext, kind::ProviderConfigAttribute};
+//! fn check(destination: &Destination<ProviderConfigAttribute>, candidate: Candidate, context: &AdmissionContext<'_>) {
+//!     let _ = admit(destination, candidate, context);
+//! }
+//! ```
+//!
+//! ```compile_fail,E0277
+//! use carina_core::validation::admission::{admit, Candidate, Destination, AdmissionContext, kind::BackendAttribute};
+//! fn check(destination: &Destination<BackendAttribute>, candidate: Candidate, context: &AdmissionContext<'_>) {
+//!     let _ = admit(destination, candidate, context);
+//! }
+//! ```
+//!
+//! ```
+//! use carina_core::{binding_index::ResolvedBindings, validation::{admission::{PendingAdmission, kind::ResourceAttribute}, deferred_types::ProviderTypeCheckContext}};
+//! fn check(pending: PendingAdmission<ResourceAttribute>, bindings: &ResolvedBindings, context: &dyn ProviderTypeCheckContext) {
+//!     let _ = pending.discharge(bindings, context);
+//! }
+//! ```
+//!
+//! ```compile_fail,E0277
+//! use carina_core::{binding_index::ResolvedBindings, validation::{admission::{PendingAdmission, kind::ProviderConfigAttribute}, deferred_types::ProviderTypeCheckContext}};
+//! fn check(pending: PendingAdmission<ProviderConfigAttribute>, bindings: &ResolvedBindings, context: &dyn ProviderTypeCheckContext) {
+//!     let _ = pending.discharge(bindings, context);
+//! }
+//! ```
+//!
+//! ```compile_fail,E0277
+//! use carina_core::{binding_index::ResolvedBindings, validation::{admission::{PendingAdmission, kind::BackendAttribute}, deferred_types::ProviderTypeCheckContext}};
+//! fn check(pending: PendingAdmission<BackendAttribute>, bindings: &ResolvedBindings, context: &dyn ProviderTypeCheckContext) {
+//!     let _ = pending.discharge(bindings, context);
+//! }
+//! ```
+//!
+//! ```
+//! use carina_core::validation::admission::{PendingAdmission, kind::ResourceAttribute};
+//! fn check(_: Option<PendingAdmission<ResourceAttribute>>) {}
+//! ```
+//!
+//! ```compile_fail,E0277
+//! use carina_core::validation::admission::{PendingAdmission, kind::ProviderConfigAttribute};
+//! fn check(_: Option<PendingAdmission<ProviderConfigAttribute>>) {}
+//! ```
+//!
+//! ```compile_fail,E0277
+//! use carina_core::validation::admission::{PendingAdmission, kind::BackendAttribute};
+//! fn check(_: Option<PendingAdmission<BackendAttribute>>) {}
+//! ```
+
+//! Configuration destinations always carry their declared field contract.
+//!
+//! ```
+//! use carina_core::validation::admission::{DestinationKind, kind::ResourceAttribute};
+//! fn empty_contract() -> <ResourceAttribute as DestinationKind>::Contract { None }
+//! ```
+//!
+//! ```compile_fail,E0308
+//! use carina_core::validation::admission::{DestinationKind, kind::ProviderConfigAttribute};
+//! fn empty_contract() -> <ProviderConfigAttribute as DestinationKind>::Contract { None }
+//! ```
+//!
+//! ```compile_fail,E0308
+//! use carina_core::validation::admission::{DestinationKind, kind::BackendAttribute};
+//! fn empty_contract() -> <BackendAttribute as DestinationKind>::Contract { None }
 //! ```
 
 use std::marker::PhantomData;
@@ -152,7 +226,7 @@ use assignment::AssignmentVerdict;
 pub use assignment::{AssignmentProof, ReferenceCandidate, SchemaObligation};
 pub(crate) use assignment::{LocalPath, ReferenceSource};
 
-pub(crate) fn conversion_local<K: DestinationKind>(
+pub(crate) fn conversion_local<K: AssignmentKind>(
     path: &LeafPath,
 ) -> crate::schema::value_validation::AssignmentFindings {
     let mut findings = crate::schema::value_validation::AssignmentFindings::default();
@@ -164,20 +238,20 @@ pub(crate) fn conversion_local<K: DestinationKind>(
 }
 
 mod sealed {
-    pub trait Sealed: Sized {
+    pub trait Sealed: Sized {}
+    pub trait Assignment: Sealed {
+        type LocalObligation: std::fmt::Debug + Clone + PartialEq;
         fn local(
             destination: &super::Destination<Self>,
             paths: Vec<super::assignment::LocalPath>,
             schema: super::SchemaObligation,
-        ) -> Result<<Self as super::DestinationKind>::LocalObligation, super::SchemaObligation>
+        ) -> Result<Self::LocalObligation, super::SchemaObligation>
         where
-            Self: super::DestinationKind;
+            Self: super::AssignmentKind;
         fn defer_reference_check(path: &super::LeafPath) -> Option<super::assignment::LocalPath>;
-        fn schema(
-            obligation: &<Self as super::DestinationKind>::LocalObligation,
-        ) -> &super::SchemaObligation
+        fn schema(obligation: &Self::LocalObligation) -> &super::SchemaObligation
         where
-            Self: super::DestinationKind;
+            Self: super::AssignmentKind;
         fn reference_assignment<'a, B: super::BindingAddress>(
             source: crate::schema::TypeInSchema<'a, crate::schema::Compiled>,
             sink: crate::schema::AssignmentSink<'a, crate::schema::Compiled>,
@@ -193,7 +267,12 @@ mod sealed {
 }
 
 pub trait DestinationKind: sealed::Sealed {
-    type LocalObligation: std::fmt::Debug + Clone + PartialEq;
+    type Contract: Clone + std::fmt::Debug;
+}
+
+pub trait AssignmentKind:
+    DestinationKind<Contract = Option<Box<DestinationContract>>> + sealed::Assignment
+{
 }
 
 pub mod kind {
@@ -202,8 +281,10 @@ pub mod kind {
             $(#[$meta])*
             #[derive(Debug, Clone, Copy, PartialEq, Eq)]
             pub struct $name;
-            impl super::sealed::Sealed for $name {
-                fn local(destination: &super::Destination<Self>, paths: Vec<super::assignment::LocalPath>, schema: super::SchemaObligation) -> Result<<Self as super::DestinationKind>::LocalObligation, super::SchemaObligation> {
+            impl super::sealed::Sealed for $name {}
+            impl super::sealed::Assignment for $name {
+                type LocalObligation = super::DeferredLocal<Self>;
+                fn local(destination: &super::Destination<Self>, paths: Vec<super::assignment::LocalPath>, schema: super::SchemaObligation) -> Result<Self::LocalObligation, super::SchemaObligation> {
                     if paths.is_empty() {
                         return Err(schema);
                     }
@@ -212,7 +293,7 @@ pub mod kind {
                 fn defer_reference_check(path: &super::LeafPath) -> Option<super::assignment::LocalPath> {
                     Some(super::assignment::LocalPath::for_recheck(Self, path.clone()))
                 }
-                fn schema(obligation: &<Self as super::DestinationKind>::LocalObligation) -> &super::SchemaObligation { &obligation.schema }
+                fn schema(obligation: &Self::LocalObligation) -> &super::SchemaObligation { &obligation.schema }
                 fn reference_assignment<'a, B: super::BindingAddress>(
                     source: crate::schema::TypeInSchema<'a, crate::schema::Compiled>,
                     sink: crate::schema::AssignmentSink<'a, crate::schema::Compiled>,
@@ -226,14 +307,24 @@ pub mod kind {
                     reference: &super::ReferenceCandidate<B>,
                 ) -> crate::schema::assignability::AssignmentRelation<'a> { source.identified_reference_assignment_to(sink, reference) }
             }
-            impl super::DestinationKind for $name { type LocalObligation = super::DeferredLocal<Self>; }
+            impl super::DestinationKind for $name { type Contract = Option<Box<super::DestinationContract>>; }
+            impl super::AssignmentKind for $name {}
             impl super::sealed::Rechecks for $name {}
             impl super::RechecksResolved for $name {}
         )+};
     }
-    rechecks!(
-        ResourceAttribute,
-        DataSourceAttribute,
+    macro_rules! configuration {
+        ($($(#[$meta:meta])* $name:ident),+ $(,)?) => {$(
+            $(#[$meta])*
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+            pub struct $name;
+            impl super::sealed::Sealed for $name {}
+            impl super::DestinationKind for $name {
+                type Contract = Box<super::configuration::ConfigurationContract>;
+            }
+        )+};
+    }
+    configuration!(
         /// Provider fields consume only provider placements.
         ///
         /// ```
@@ -252,7 +343,11 @@ pub mod kind {
         /// # }
         /// ```
         ProviderConfigAttribute,
-        BackendAttribute,
+        BackendAttribute
+    );
+    rechecks!(
+        ResourceAttribute,
+        DataSourceAttribute,
         ModuleArgument,
         AnnotatedAttribute,
         Export,
@@ -261,19 +356,19 @@ pub mod kind {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct DeferredLocal<K: DestinationKind> {
+pub struct DeferredLocal<K: AssignmentKind> {
     destination: Destination<K>,
     paths: Vec<LeafPath>,
     schema: SchemaObligation,
 }
-impl<K: DestinationKind> DeferredLocal<K> {
+impl<K: AssignmentKind> DeferredLocal<K> {
     pub fn paths(&self) -> &[LeafPath] {
         &self.paths
     }
 }
 
 pub trait RechecksResolved:
-    DestinationKind<LocalObligation = DeferredLocal<Self>> + sealed::Rechecks
+    AssignmentKind<LocalObligation = DeferredLocal<Self>> + sealed::Rechecks
 {
 }
 
@@ -344,19 +439,20 @@ struct DestinationIdentity {
     revision: CatalogRevision,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct DestinationContract {
-    schema: ContractSchema,
-    attribute: String,
-    owner: DeclarationOwner,
-    ancestry: FieldAncestry,
-    path: LeafPath,
+mod contract {
+    use super::*;
+
+    #[derive(Debug, Clone)]
+    pub struct DestinationContract {
+        pub(super) schema: std::sync::Arc<crate::schema::CompiledResourceSchema>,
+        pub(super) attribute: String,
+        pub(super) owner: crate::parser::SchemaTypeOwner,
+        pub(super) ancestry: FieldAncestry,
+        pub(super) path: LeafPath,
+    }
 }
-#[derive(Debug, Clone)]
-enum ContractSchema {
-    Resource(std::sync::Arc<crate::schema::CompiledResourceSchema>),
-    Configuration(std::sync::Arc<crate::schema::ValidatedConfigSchema>),
-}
+use contract::DestinationContract;
+
 impl DestinationContract {
     fn resource(
         schema: std::sync::Arc<crate::schema::CompiledResourceSchema>,
@@ -366,37 +462,27 @@ impl DestinationContract {
         path: LeafPath,
     ) -> Self {
         Self {
-            schema: ContractSchema::Resource(schema),
+            schema,
             attribute,
-            owner: DeclarationOwner::Provider(owner),
+            owner,
             ancestry,
             path,
         }
     }
 
     fn attr(&self) -> &CompiledAttributeType {
-        match &self.schema {
-            ContractSchema::Resource(schema) => &schema.attributes()[&self.attribute].attr_type,
-            ContractSchema::Configuration(schema) => &schema.parts()[&self.attribute],
-        }
+        &self.schema.attributes()[&self.attribute].attr_type
     }
 
     fn defs(&self) -> &std::collections::BTreeMap<String, CompiledAttributeType> {
-        match &self.schema {
-            ContractSchema::Resource(schema) => schema.defs(),
-            ContractSchema::Configuration(_) => crate::schema::empty_defs_for_schema_walks(),
-        }
+        self.schema.defs()
     }
 
     fn lookup<'a>(
         &'a self,
         catalog: &'a ProviderContext,
     ) -> impl crate::schema::ValidatedCustomTypeLookup + 'a {
-        let DeclarationOwner::Provider(crate::parser::SchemaTypeOwner::Provider(owner)) =
-            &self.owner
-        else {
-            unreachable!("backend configuration owns its builtin lookup")
-        };
+        let crate::parser::SchemaTypeOwner::Provider(owner) = &self.owner;
         crate::parser::custom_type_lookup_for_owner(catalog.custom_type_resolver(), owner)
     }
 
@@ -405,14 +491,9 @@ impl DestinationContract {
         attr: &'a CompiledAttributeType,
         catalog: &'a ProviderContext,
     ) -> crate::schema::AssignmentSink<'a, crate::schema::Compiled> {
-        let DeclarationOwner::Provider(owner) = &self.owner else {
-            // Built-in backends enter configuration admission, which consumes
-            // concrete settings and never judges resource references.
-            unreachable!("backend configuration has no resource assignment sink")
-        };
         attr.in_schema(self.defs()).with_authority(
             &catalog.custom_types,
-            crate::schema::SinkAuthority::Owner(owner),
+            crate::schema::SinkAuthority::Owner(&self.owner),
         )
     }
 }
@@ -421,7 +502,7 @@ impl DestinationContract {
 pub struct Destination<K: DestinationKind> {
     identity: Box<DestinationIdentity>,
     label: String,
-    contract: Option<Box<DestinationContract>>,
+    contract: K::Contract,
     kind: PhantomData<K>,
 }
 impl<K: DestinationKind> PartialEq for Destination<K> {
@@ -448,7 +529,7 @@ impl<K: DestinationKind> Clone for Destination<K> {
         }
     }
 }
-impl<K: DestinationKind> Destination<K> {
+impl<K: AssignmentKind> Destination<K> {
     fn catalogued(identity: DestinationIdentity, label: String) -> Self {
         Self {
             identity: Box::new(identity),
@@ -503,11 +584,6 @@ enum AdmissionProof<'a, P: PlaceholderKind, B: BindingAddress> {
     },
 }
 
-enum AdmissionLookup<'a, B: BindingAddress> {
-    Catalog(crate::parser::retained::AuthoredCursor<'a, B>),
-    Configuration(&'a dyn crate::schema::ValidatedCustomTypeLookup),
-}
-
 /// Main's ordinary assignment work requires a current, expression-origin value.
 /// Authored policy instead uses AssignmentCheck, including discarded positions.
 type OrdinaryAssignmentCheck<'a, P, B> =
@@ -543,7 +619,7 @@ pub struct AdmissionContext<
     proof: AdmissionProof<'a, P, B>,
     bindings: Option<&'a BindingIndex<'a, B>>,
     provider: &'a dyn ProviderTypeCheckContext,
-    lookup: AdmissionLookup<'a, B>,
+    cursor: crate::parser::retained::AuthoredCursor<'a, B>,
     assignment: AssignmentChecks<'a, P, B>,
     scope: crate::schema::value_validation::AssignmentScope,
     coverage: std::cell::RefCell<crate::schema::value_validation::WalkCoverage>,
@@ -653,9 +729,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
             },
             bindings: None,
             provider,
-            lookup: AdmissionLookup::Catalog(crate::parser::retained::AuthoredCursor::projected(
-                phase,
-            )),
+            cursor: crate::parser::retained::AuthoredCursor::projected(phase),
             assignment: Default::default(),
             scope: crate::schema::value_validation::AssignmentScope::Full,
             coverage: Default::default(),
@@ -678,37 +752,6 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
         provider: &'a dyn ProviderTypeCheckContext,
         cursor: crate::parser::retained::AuthoredCursor<'a, B>,
     ) -> (Self, AdmissionContext<'a, P, B>) {
-        Self::paired_in(
-            value,
-            proof,
-            bindings,
-            provider,
-            AdmissionLookup::Catalog(cursor),
-        )
-    }
-
-    fn configuration<'a>(
-        value: &'a Value<P, B>,
-        provider: &'a dyn ProviderTypeCheckContext,
-        lookup: &'a dyn crate::schema::ValidatedCustomTypeLookup,
-        proof: crate::resource::knowledge::Classification<'a, P, B>,
-    ) -> (Self, AdmissionContext<'a, P, B>) {
-        Self::paired_in(
-            value.clone(),
-            AdmissionProof::Validation(proof),
-            None,
-            provider,
-            AdmissionLookup::Configuration(lookup),
-        )
-    }
-
-    fn paired_in<'a>(
-        value: Value<P, B>,
-        proof: AdmissionProof<'a, P, B>,
-        bindings: Option<&'a BindingIndex<'a, B>>,
-        provider: &'a dyn ProviderTypeCheckContext,
-        lookup: AdmissionLookup<'a, B>,
-    ) -> (Self, AdmissionContext<'a, P, B>) {
         #[cfg(test)]
         tests::candidate_constructed();
         let identity = DeclarationId::default();
@@ -725,7 +768,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
                 proof,
                 bindings,
                 provider,
-                lookup,
+                cursor,
                 assignment: Default::default(),
                 scope: crate::schema::value_validation::AssignmentScope::Full,
                 coverage: Default::default(),
@@ -928,7 +971,7 @@ impl<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> PlacedValue<K, P
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingAdmission<
-    K: DestinationKind,
+    K: AssignmentKind,
     P: PlaceholderKind = NoPlaceholder,
     B: BindingAddress = AbsoluteBindingAddress,
 > {
@@ -936,7 +979,7 @@ pub struct PendingAdmission<
     inner: Box<PendingCandidate<K, P, B>>,
 }
 #[derive(Debug, Clone, PartialEq)]
-struct PendingCandidate<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> {
+struct PendingCandidate<K: AssignmentKind, P: PlaceholderKind, B: BindingAddress> {
     findings: crate::schema::ValueValidationFindings,
     candidate: Candidate<P, B>,
     assignment: AssignmentVerdict<K>,
@@ -944,7 +987,7 @@ struct PendingCandidate<K: DestinationKind, P: PlaceholderKind, B: BindingAddres
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Admission<
-    K: DestinationKind,
+    K: AssignmentKind,
     P: PlaceholderKind = NoPlaceholder,
     B: BindingAddress = AbsoluteBindingAddress,
 > {
@@ -1174,17 +1217,11 @@ impl AdmissionErrors {
 ///     let _ = admit(destination, value, context);
 /// }
 /// ```
-pub fn admit<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
+pub fn admit<K: AssignmentKind, P: PlaceholderKind, B: BindingAddress>(
     destination: &Destination<K>,
     candidate: Candidate<P, B>,
     context: &AdmissionContext<'_, P, B>,
 ) -> Result<Admission<K, P, B>, AdmissionErrors> {
-    match &context.lookup {
-        AdmissionLookup::Configuration(lookup) => {
-            return configuration::admit_field(destination, candidate, context, *lookup);
-        }
-        AdmissionLookup::Catalog(_) => {}
-    }
     if context.is_apply() {
         return admit_apply(destination, candidate, context).map(Admission::Ready);
     }
@@ -1214,7 +1251,7 @@ pub fn admit<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
 }
 
 /// Apply can only produce placement or an error; pending work cannot escape.
-fn admit_apply<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
+fn admit_apply<K: AssignmentKind, P: PlaceholderKind, B: BindingAddress>(
     destination: &Destination<K>,
     candidate: Candidate<P, B>,
     context: &AdmissionContext<'_, P, B>,
@@ -1242,15 +1279,15 @@ fn admit_apply<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
     }
 }
 
-impl<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> PendingAdmission<K, P, B> {
+impl<K: AssignmentKind, P: PlaceholderKind, B: BindingAddress> PendingAdmission<K, P, B> {
     /// Resolve and prove pending work at apply. Success is ready for placement.
     ///
     /// ```
     /// use carina_core::{binding_index::ResolvedBindings, validation::{
-    ///     admission::{AdmissionErrors, DestinationKind, PendingAdmission, PlacedValue},
+    ///     admission::{AdmissionErrors, AssignmentKind, PendingAdmission, PlacedValue},
     ///     deferred_types::ProviderTypeCheckContext,
     /// }};
-    /// fn discharge<K: DestinationKind>(
+    /// fn discharge<K: AssignmentKind>(
     ///     pending: PendingAdmission<K>,
     ///     resolved: &ResolvedBindings,
     ///     context: &dyn ProviderTypeCheckContext,
@@ -1348,7 +1385,7 @@ impl<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> TypedSlot<K, P, 
         self.value.as_ref().map(PlacedValue::value)
     }
 }
-impl<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> Admission<K, P, B> {
+impl<K: AssignmentKind, P: PlaceholderKind, B: BindingAddress> Admission<K, P, B> {
     pub(crate) fn take_findings(&mut self) -> crate::schema::ValueValidationFindings {
         match self {
             Self::Ready(placed) => placed.take_findings(),

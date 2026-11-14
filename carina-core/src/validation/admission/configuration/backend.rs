@@ -376,7 +376,7 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
     }
     let catalog = ProviderContext::new(crate::EnvironmentSnapshot::new([]));
     let lookup = BuiltinLookup;
-    let checked = crate::validation::deferred_types::TypeCheckSession::run(&catalog, |session| {
+    let checked = crate::validation::deferred_types::TypeCheckSession::run(&catalog, |_| {
         let mut aggregate = ConfigurationBuilder::new(Arc::clone(declaration), kind);
         for (key, value) in &config.attributes {
             let Some(destination) = declaration.destination::<kind::BackendAttribute>(
@@ -390,18 +390,16 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
                 });
                 continue;
             };
-            let ty = destination
-                .contract
-                .as_ref()
-                .expect("backend field contract")
-                .attr();
+            let ty = destination.contract.attr();
             // The enum's actual namespace is intentional: backend regions do
             // not use provider-block aliases or depend on provider loading.
-            let canonical = match key
-                .schema_type(&declaration.schema)
-                .expect("declared backend field")
-                .canonicalize_provider_config(AWS_PROVIDER_NAME, value.clone())
-            {
+            let canonical = match crate::value::canonicalize_provider_config_with_type_and_ancestry(
+                AWS_PROVIDER_NAME,
+                value.clone(),
+                ty,
+                crate::schema::empty_defs_for_schema_walks(),
+                FieldAncestry::WRITABLE,
+            ) {
                 Ok(value) => value,
                 Err(error) => {
                     errors.push(BackendAttributeError::InvalidAttribute {
@@ -412,7 +410,7 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
                     continue;
                 }
             };
-            let admission = match field(&destination, &canonical, session, &lookup) {
+            let admission = match field(&destination, &canonical, &lookup) {
                 Ok(admission) => admission,
                 Err(error) => {
                     errors.push(attribute_error(kind, key, error));
@@ -425,9 +423,12 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
                 errors.push(invalid_shape(kind, key, ty, &canonical));
                 continue;
             }
-            let Admission::Ready(placed) = admission else {
-                errors.push(invalid_shape(kind, key, ty, &canonical));
-                continue;
+            let placed = match admission {
+                ConfigurationAdmission::Ready(placed) => placed,
+                ConfigurationAdmission::Unresolved(_) => {
+                    errors.push(invalid_shape(kind, key, ty, &canonical));
+                    continue;
+                }
             };
             // This changes only phase/address parameters on the exact checked
             // concrete value; no replacement payload can accompany a receipt.

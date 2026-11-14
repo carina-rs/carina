@@ -150,6 +150,8 @@ pub(super) fn build_dependency_levels(
     // Group by level
     let max_level = levels.values().copied().max().unwrap_or(0);
     let mut result: Vec<Vec<usize>> = vec![Vec::new(); max_level + 1];
+    #[allow(clippy::iter_over_hash_type)]
+    // sorted immediately after: test dependency levels sort effect indices within each group
     for (idx, &level) in &levels {
         result[level].push(*idx);
     }
@@ -216,16 +218,22 @@ fn dependency_cycle_components(
     }
 
     let mut reverse: HashMap<usize, Vec<usize>> = HashMap::new();
+    #[allow(clippy::iter_over_hash_type)]
+    // sorted immediately after: reverse adjacency lists are sorted before SCC traversal
     for (&node, dependencies) in deps_of {
         if !remaining.contains(&node) {
             continue;
         }
+        #[allow(clippy::iter_over_hash_type)]
+        // sorted immediately after: reverse adjacency lists are sorted before SCC traversal
         for &dependency in dependencies {
             if remaining.contains(&dependency) {
                 reverse.entry(dependency).or_default().push(node);
             }
         }
     }
+    #[allow(clippy::iter_over_hash_type)]
+    // keyed rebuild: reverse adjacency lists are independently sorted
     for neighbors in reverse.values_mut() {
         neighbors.sort_unstable();
     }

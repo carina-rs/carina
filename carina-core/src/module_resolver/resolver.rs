@@ -2,6 +2,7 @@
 //! and the top-level `resolve_modules*` entry points.
 
 use crate::paths::{PersistedPath, ResolvedPath};
+use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
@@ -1004,7 +1005,7 @@ pub(crate) struct ModuleResolver<'cfg, P = StrictTypeResolution> {
     /// Base directory for resolving relative imports
     pub(super) base_dir: PathBuf,
     pub(super) io_base_dir: ResolvedPath,
-    pub(super) module_locations: HashMap<ModuleLocationKey, ResolvedPath>,
+    pub(super) module_locations: IndexMap<ModuleLocationKey, ResolvedPath>,
     /// Root of the configuration being expanded. Unlike `base_dir`, this does
     /// not change while recursively resolving nested module imports and is
     /// therefore the stable base for user-facing source labels.
@@ -1132,7 +1133,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         let base_dir = base_dir.source_label();
         Self {
             io_base_dir,
-            module_locations: HashMap::new(),
+            module_locations: IndexMap::new(),
             configuration_root: base_dir.clone(),
             source_overrides: Default::default(),
             resolution,
