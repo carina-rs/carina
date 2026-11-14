@@ -1,7 +1,9 @@
 //! Syntax-owned element provenance. Every location is minted from a grammar pair.
 use pest::iterators::{Pair, Pairs};
 
+use super::resource_body::{BlockContent, BlockContents, ResourceBody};
 use super::{DeclarationLocation, Located, PreprocessedFile, Rule};
+use crate::resource::ResourceDirective;
 use std::{
     path::Path,
     sync::{Arc, OnceLock},
@@ -315,21 +317,14 @@ impl ElementLocations {
         path: &Path,
     ) -> Self {
         let mut out = Self { ..Self::default() };
-        if matches!(
-            pair.as_rule(),
-            Rule::resource_expr | Rule::anonymous_resource | Rule::read_resource_expr
-        ) {
-            let resource_type = pair
-                .clone()
-                .into_inner()
-                .next()
-                .expect("resource grammar has a type");
+        if let Some(body) = ResourceBody::from_pair(pair.clone()) {
+            let (resource_type, contents) = body.into_parts();
             out.values.push((
                 ElementKind::ResourceType,
                 DeclarationLocation::from_pair(&resource_type, file, path),
             ));
-        }
-        if pair.as_rule() == Rule::wait_expr {
+            collect_keys(contents, &[], file, path, &mut out);
+        } else if pair.as_rule() == Rule::wait_expr {
             let mut inner = pair.clone().into_inner();
             let target = inner.next().expect("wait grammar has a target");
             out.values.push((
@@ -355,7 +350,13 @@ impl ElementLocations {
                 }
             }
         } else {
-            collect_keys(pair.clone().into_inner(), &[], file, path, &mut out);
+            collect_keys(
+                BlockContents::ordinary(pair.clone().into_inner()),
+                &[],
+                file,
+                path,
+                &mut out,
+            );
         }
         out
     }
@@ -370,24 +371,45 @@ impl ElementLocations {
 }
 
 fn collect_keys(
-    pairs: Pairs<'_, Rule>,
+    contents: BlockContents<'_>,
     parent: &[super::AttributePathSegment],
     file: &PreprocessedFile,
     source: &Path,
     out: &mut ElementLocations,
 ) {
     use super::AttributePathSegment as Segment;
-    let pairs: Vec<_> = pairs
-        .map(|pair| {
-            if pair.as_rule() == Rule::block_content {
-                pair.into_inner().next().expect("block content item")
-            } else {
-                pair
-            }
-        })
-        .collect();
     let mut block_indices = std::collections::HashMap::new();
-    for pair in pairs {
+    for content in contents {
+        let pair = match content {
+            BlockContent::Ordinary(pair) => pair,
+            BlockContent::Directives(block) => {
+                for attribute in block.attributes() {
+                    let mut parts = attribute.into_inner();
+                    let name = parts.next().expect("directive key");
+                    let key = super::extract_key_string(name.clone());
+                    match key.as_deref().ok().and_then(ResourceDirective::from_name) {
+                        Some(ResourceDirective::Provider) => {
+                            let value = parts.next().expect("directive value");
+                            out.values.push((
+                                ElementKind::Provider,
+                                DeclarationLocation::from_pair(&value, file, source),
+                            ));
+                        }
+                        Some(ResourceDirective::IgnoreChanges) => out.values.push((
+                            ElementKind::IgnoreChanges,
+                            DeclarationLocation::from_pair(&name, file, source),
+                        )),
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+        };
+        let pair = if pair.as_rule() == Rule::block_content {
+            pair.into_inner().next().expect("block content item")
+        } else {
+            pair
+        };
         match pair.as_rule() {
             Rule::attribute | Rule::map_entry | Rule::nested_block | Rule::module_call_arg => {
                 let is_block = pair.as_rule() == Rule::nested_block;
@@ -396,25 +418,6 @@ fn collect_keys(
                 let mut inner = pair.into_inner();
                 let key_pair = inner.next().expect("attribute grammar has a key");
                 let key = super::extract_key_string(key_pair.clone()).expect("grammar key");
-                if is_block && parent.is_empty() && key == "directives" {
-                    for attribute in inner.flatten().filter(|p| p.as_rule() == Rule::attribute) {
-                        let mut parts = attribute.into_inner();
-                        let name = parts.next().expect("directive key");
-                        if name.as_str() == "provider" {
-                            let value = parts.next().expect("directive value");
-                            out.values.push((
-                                ElementKind::Provider,
-                                DeclarationLocation::from_pair(&value, file, source),
-                            ));
-                        } else if name.as_str() == "ignore_changes" {
-                            out.values.push((
-                                ElementKind::IgnoreChanges,
-                                DeclarationLocation::from_pair(&name, file, source),
-                            ));
-                        }
-                    }
-                    continue;
-                }
                 let mut path = parent.to_vec();
                 let kind = if parent.is_empty() {
                     super::ProtectedPathKind::Attribute
@@ -445,7 +448,7 @@ fn collect_keys(
                         list_literal: false,
                         literal_container: true,
                     });
-                    collect_keys(inner, &path, file, source, out);
+                    collect_keys(BlockContents::ordinary(inner), &path, file, source, out);
                 } else if let Some(value) = inner.next() {
                     out.attribute_values
                         .push(value_location(&value, &path, file, source));
@@ -458,7 +461,13 @@ fn collect_keys(
                     collect_value_keys(value, &path, file, source, out);
                 }
             }
-            Rule::block_content => collect_keys(pair.into_inner(), parent, file, source, out),
+            Rule::block_content => collect_keys(
+                BlockContents::ordinary(pair.into_inner()),
+                parent,
+                file,
+                source,
+                out,
+            ),
             _ => {}
         }
     }
@@ -472,7 +481,13 @@ fn collect_value_keys(
     out: &mut ElementLocations,
 ) {
     if pair.as_rule() == Rule::map {
-        collect_keys(pair.into_inner(), parent, file, source, out);
+        collect_keys(
+            BlockContents::ordinary(pair.into_inner()),
+            parent,
+            file,
+            source,
+            out,
+        );
     } else if pair.as_rule() == Rule::list {
         for (index, value) in pair.into_inner().enumerate() {
             let mut path = parent.to_vec();
@@ -1147,7 +1162,7 @@ impl SyntaxInventory {
         pairs: Pairs<'_, Rule>,
         file: &PreprocessedFile,
         source: &Path,
-    ) -> Self {
+    ) -> Result<Self, super::ParseError> {
         let expressions = super::retained::Expressions::from_pairs(pairs.clone(), file, source);
         let declarations = declaration_inventory(pairs.clone(), file, source);
         use crate::validation::{
@@ -1273,32 +1288,17 @@ impl SyntaxInventory {
             }
         }
         let mut attributes = ElementLocations::default();
-        for resource in pairs.clone().flatten().filter(|pair| {
-            matches!(
-                pair.as_rule(),
-                Rule::resource_expr | Rule::anonymous_resource | Rule::read_resource_expr
-            )
-        }) {
-            for content in resource
-                .into_inner()
-                .filter(|pair| pair.as_rule() == Rule::block_content)
-            {
-                let block = content.into_inner().next().expect("resource content");
-                if block.as_rule() != Rule::nested_block {
-                    continue;
-                }
-                let mut parts = block.into_inner();
-                let name = parts.next().expect("nested block name");
-                if name.as_str() != "directives" {
-                    continue;
-                }
-                for content in parts {
-                    let attribute = content.into_inner().next().expect("directive content");
-                    if attribute.as_rule() == Rule::attribute {
+        for body in pairs.clone().flatten().filter_map(ResourceBody::from_pair) {
+            let (_, contents) = body.into_parts();
+            for content in contents {
+                if let BlockContent::Directives(block) = content {
+                    block
+                        .ensure_unique(|pair| DeclarationLocation::from_pair(pair, file, source))?;
+                    for attribute in block.attributes() {
                         let key = attribute.into_inner().next().expect("directive key");
                         out.directive_keys.push(Located::new(
                             DeclarationLocation::from_pair(&key, file, source),
-                            super::AttributeKey::authored_in_file(key, file),
+                            super::AttributeKey::literal_in_file(key, file),
                         ));
                     }
                 }
@@ -1370,6 +1370,6 @@ impl SyntaxInventory {
                 }
             }
         }
-        out
+        Ok(out)
     }
 }

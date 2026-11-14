@@ -257,3 +257,117 @@ fn unknown_directive_key_in_an_uncalled_module_is_collected_once() {
             .ends_with("child/resources.crn")
     );
 }
+
+#[test]
+fn nested_directives_get_the_ordinary_schema_error_in_cli_and_lsp() {
+    let directory = fixture();
+    std::fs::write(directory.path().join("resources.crn"),
+        "mock.test.resource {\n  name = 'example'\n  rule {\n    directives { prevent_destory = true }\n  }\n}\n").unwrap();
+    let human = validate(directory.path(), false);
+    let json = validate(directory.path(), true);
+    assert_eq!(human.status.code(), Some(1), "{human:?}");
+    assert_eq!(json.status.code(), Some(1), "{json:?}");
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let errors = report["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{report:#}");
+    let message = "List item at index 0: Unknown field 'directives' in Rule";
+    assert_eq!(errors[0]["message"], message);
+    assert_eq!(errors[0]["location"]["file"], "resources.crn");
+    assert_eq!(
+        errors[0]["location"]["range"],
+        serde_json::json!({
+            "start": {"line": 3, "column": 3}, "end": {"line": 3, "column": 7}
+        })
+    );
+    assert!(String::from_utf8(human.stderr).unwrap().contains(message));
+    let diagnostics = lsp(directory.path(), "resources.crn");
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "Unknown field 'directives' in Rule for 'rule[0].directives'"
+    );
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(
+        diagnostics[0].range,
+        Range::new(Position::new(3, 4), Position::new(3, 14))
+    );
+
+    let source = std::fs::read_to_string(directory.path().join("resources.crn")).unwrap();
+    std::fs::write(
+        directory.path().join("resources.crn"),
+        source.replace("directives", "ordinary"),
+    )
+    .unwrap();
+    let ordinary = validate(directory.path(), true);
+    let ordinary: serde_json::Value = serde_json::from_slice(&ordinary.stdout).unwrap();
+    assert_eq!(
+        ordinary["errors"][0]["message"],
+        message.replace("'directives'", "'ordinary'")
+    );
+    assert_eq!(ordinary["errors"][0]["location"], errors[0]["location"]);
+    let ordinary = lsp(directory.path(), "resources.crn");
+    assert_eq!(ordinary.len(), 1, "{ordinary:#?}");
+    assert_eq!(ordinary[0].severity, diagnostics[0].severity);
+    assert_eq!(
+        ordinary[0].message,
+        diagnostics[0].message.replace("directives", "ordinary")
+    );
+    assert_eq!(ordinary[0].range.start, diagnostics[0].range.start);
+    assert_eq!(ordinary[0].range.end, Position::new(3, 12));
+}
+
+#[test]
+fn quoted_directive_keys_are_accepted_by_cli_and_lsp() {
+    let directory = fixture();
+    std::fs::write(directory.path().join("resources.crn"),
+        "mock.test.resource {\n  name = 'example'\n  directives {\n    \"prevent_destroy\" = true\n    'ignore_changes' = [name]\n    \"depends_on\" = []\n  }\n}\n").unwrap();
+    for json in [false, true] {
+        let output = validate(directory.path(), json);
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+    for name in ["main.crn", "providers.crn", "resources.crn"] {
+        let diagnostics = lsp(directory.path(), name);
+        assert!(diagnostics.is_empty(), "{name}: {diagnostics:#?}");
+    }
+}
+
+#[test]
+fn duplicate_directives_have_identical_cli_and_lsp_errors_at_the_second_name() {
+    let directory = fixture();
+    std::fs::write(directory.path().join("resources.crn"),
+        "mock.test.resource {\n  name = 'example'\n  directives { prevent_destroy = true }\n  directives { force_delete = true }\n}\n").unwrap();
+    let message = "Duplicate attribute 'directives' (first defined on line 3)";
+    let human = validate(directory.path(), false);
+    let json = validate(directory.path(), true);
+    assert_eq!(human.status.code(), Some(1), "{human:?}");
+    assert_eq!(json.status.code(), Some(1), "{json:?}");
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let errors = report["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{report:#}");
+    assert_eq!(errors[0]["message"], message);
+    assert_eq!(errors[0]["severity"], "error");
+    assert_eq!(errors[0]["location"]["file"], "resources.crn");
+    assert_eq!(
+        errors[0]["location"]["range"],
+        serde_json::json!({
+            "start": {"line": 4, "column": 3}, "end": {"line": 4, "column": 13}
+        })
+    );
+    assert!(
+        String::from_utf8(human.stderr)
+            .unwrap()
+            .contains(&format!("resources.crn:4:3: {message}"))
+    );
+    let diagnostics = lsp(directory.path(), "resources.crn");
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].message, message);
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(
+        diagnostics[0].range,
+        Range::new(Position::new(3, 2), Position::new(3, 12))
+    );
+    for name in ["main.crn", "providers.crn"] {
+        assert!(lsp(directory.path(), name).is_empty(), "{name}");
+    }
+}

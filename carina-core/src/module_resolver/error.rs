@@ -676,6 +676,7 @@ fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
         | ParseError::InvalidResourceType(_)
         | ParseError::DuplicateModule(_)
         | ParseError::DuplicateBinding { .. }
+        | ParseError::DuplicateDirectives { .. }
         | ParseError::UndefinedIdentifier { .. }
         | ParseError::ModuleNotFound(_)
         | ParseError::InternalError { .. }

@@ -1,4 +1,5 @@
 use super::*;
+use tower_lsp::lsp_types::InsertTextFormat;
 
 #[test]
 #[ignore = "requires provider schemas"]
@@ -2663,18 +2664,59 @@ fn directives_block_completion_includes_all_six_keys() {
         None,
     );
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
-    for key in [
-        "force_delete",
-        "create_before_destroy",
-        "prevent_destroy",
-        "depends_on",
-        "ignore_changes",
-        "provider",
-    ] {
-        assert!(
-            labels.contains(&key),
-            "directives block completion missing `{key}`; got {labels:?}"
-        );
+    let expected = [
+        (
+            "create_before_destroy",
+            "Create the replacement before destroying the old resource",
+            "create_before_destroy = ",
+            None,
+        ),
+        (
+            "depends_on",
+            "Explicit ordering edges to sibling let bindings",
+            "depends_on = [$0]",
+            Some(InsertTextFormat::SNIPPET),
+        ),
+        (
+            "force_delete",
+            "Force-delete the resource (e.g., non-empty S3 buckets)",
+            "force_delete = ",
+            None,
+        ),
+        (
+            "ignore_changes",
+            "Preserve externally managed attribute paths on update",
+            "ignore_changes = [$0]",
+            Some(InsertTextFormat::SNIPPET),
+        ),
+        (
+            "prevent_destroy",
+            "Block any plan that would destroy this resource",
+            "prevent_destroy = ",
+            None,
+        ),
+        (
+            "provider",
+            "Route this resource to a named provider instance \
+             (`let <name> = provider <kind> { ... }`)",
+            "provider = ",
+            None,
+        ),
+    ];
+    assert_eq!(labels, expected.map(|(label, ..)| label));
+    assert_eq!(
+        completions.len(),
+        carina_core::resource::ResourceDirective::ALL.len()
+    );
+    for (item, (_, detail, insert, format)) in completions.iter().zip(expected) {
+        assert_eq!(item.kind, Some(CompletionItemKind::PROPERTY));
+        assert_eq!(item.detail.as_deref(), Some(detail));
+        assert_eq!(item.insert_text.as_deref(), Some(insert));
+        assert_eq!(item.insert_text_format, format);
+        let command = item.command.as_ref().unwrap();
+        assert_eq!(command.title, "Trigger Suggest");
+        assert_eq!(command.command, "editor.action.triggerSuggest");
+        assert!(command.arguments.is_none());
     }
 }
 

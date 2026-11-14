@@ -24,16 +24,21 @@ macro_rules! resource_directives {
         }
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub(crate) enum ResourceDirective {
+        pub enum ResourceDirective {
             Lifecycle(LifecycleDirective),
             $($other),+
         }
 
         impl ResourceDirective {
-            pub(crate) const ALL: &'static [(&'static str, Self)] = &[
+            /// All resource directive names and their typed parser identities.
+            pub const ALL: &'static [(&'static str, Self)] = &[
                 $((stringify!($field), Self::Lifecycle(LifecycleDirective::$variant)),)+
                 $((stringify!($key), Self::$other)),+
             ];
+
+            pub(crate) fn from_name(key: &str) -> Option<Self> {
+                Self::ALL.iter().find_map(|(name, directive)| (*name == key).then_some(*directive))
+            }
 
             pub(crate) fn from_key(key: &crate::parser::AttributeKey) -> Option<Self> {
                 Self::ALL.iter().find_map(|(name, directive)| key.matches(name).then_some(*directive))

@@ -11,7 +11,7 @@ use carina_core::builtins;
 use carina_core::parser::{TypeExpr, snake_to_pascal};
 use carina_core::paths::{CanonicalPath, ResolvedPath};
 use carina_core::provider_text::DiagnosticText;
-use carina_core::resource::EnumValueResolver;
+use carina_core::resource::{EnumValueResolver, LifecycleDirective, ResourceDirective};
 use carina_core::schema::{
     AssignmentSink, CompiledAttributeType as AttributeType, EffectiveType, SchemaRegistry, Shape,
     TypeIdentity, TypeInSchema,
@@ -1129,76 +1129,58 @@ impl CompletionProvider {
         }
     }
 
-    /// Attribute-name candidates for `directives { | }` (#2873). The
-    /// five directives — `create_before_destroy`, `depends_on`,
-    /// `force_delete`, `prevent_destroy`, `provider` — exhaustively.
-    /// Order is alphabetical to match `KEYWORDS` ordering in
-    /// `keywords.rs`. `provider` was added in carina#2191 Phase 5 for
-    /// routing to named provider instances.
+    /// All resource directives, in alphabetical order like `KEYWORDS`.
     pub(super) fn directives_block_completions(&self) -> Vec<CompletionItem> {
         let trigger_suggest = Command {
             title: "Trigger Suggest".to_string(),
             command: "editor.action.triggerSuggest".to_string(),
             arguments: None,
         };
-        vec![
-            CompletionItem {
-                label: "create_before_destroy".to_string(),
-                kind: Some(CompletionItemKind::PROPERTY),
-                detail: Some(
-                    "Create the replacement before destroying the old resource".to_string(),
-                ),
-                insert_text: Some("create_before_destroy = ".to_string()),
-                command: Some(trigger_suggest.clone()),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "depends_on".to_string(),
-                kind: Some(CompletionItemKind::PROPERTY),
-                detail: Some("Explicit ordering edges to sibling let bindings".to_string()),
-                insert_text: Some("depends_on = [$0]".to_string()),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                command: Some(trigger_suggest.clone()),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "force_delete".to_string(),
-                kind: Some(CompletionItemKind::PROPERTY),
-                detail: Some("Force-delete the resource (e.g., non-empty S3 buckets)".to_string()),
-                insert_text: Some("force_delete = ".to_string()),
-                command: Some(trigger_suggest.clone()),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "ignore_changes".to_string(),
-                kind: Some(CompletionItemKind::PROPERTY),
-                detail: Some("Preserve externally managed attribute paths on update".to_string()),
-                insert_text: Some("ignore_changes = [$0]".to_string()),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                command: Some(trigger_suggest.clone()),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "prevent_destroy".to_string(),
-                kind: Some(CompletionItemKind::PROPERTY),
-                detail: Some("Block any plan that would destroy this resource".to_string()),
-                insert_text: Some("prevent_destroy = ".to_string()),
-                command: Some(trigger_suggest.clone()),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "provider".to_string(),
-                kind: Some(CompletionItemKind::PROPERTY),
-                detail: Some(
-                    "Route this resource to a named provider instance \
-                     (`let <name> = provider <kind> { ... }`)"
-                        .to_string(),
-                ),
-                insert_text: Some("provider = ".to_string()),
-                command: Some(trigger_suggest),
-                ..Default::default()
-            },
-        ]
+        let mut directives = ResourceDirective::ALL.to_vec();
+        directives.sort_unstable_by_key(|(name, _)| *name);
+        directives
+            .into_iter()
+            .map(|(name, directive)| {
+                let (detail, list) = match directive {
+                    ResourceDirective::Lifecycle(LifecycleDirective::CreateBeforeDestroy) => (
+                        "Create the replacement before destroying the old resource",
+                        false,
+                    ),
+                    ResourceDirective::DependsOn => {
+                        ("Explicit ordering edges to sibling let bindings", true)
+                    }
+                    ResourceDirective::Lifecycle(LifecycleDirective::ForceDelete) => (
+                        "Force-delete the resource (e.g., non-empty S3 buckets)",
+                        false,
+                    ),
+                    ResourceDirective::IgnoreChanges => (
+                        "Preserve externally managed attribute paths on update",
+                        true,
+                    ),
+                    ResourceDirective::Lifecycle(LifecycleDirective::PreventDestroy) => {
+                        ("Block any plan that would destroy this resource", false)
+                    }
+                    ResourceDirective::Provider => (
+                        "Route this resource to a named provider instance \
+                     (`let <name> = provider <kind> { ... }`)",
+                        false,
+                    ),
+                };
+                CompletionItem {
+                    label: name.to_string(),
+                    kind: Some(CompletionItemKind::PROPERTY),
+                    detail: Some(detail.to_string()),
+                    insert_text: Some(if list {
+                        format!("{name} = [$0]")
+                    } else {
+                        format!("{name} = ")
+                    }),
+                    insert_text_format: list.then_some(InsertTextFormat::SNIPPET),
+                    command: Some(trigger_suggest.clone()),
+                    ..Default::default()
+                }
+            })
+            .collect()
     }
 
     /// Schema-authored path candidates for `ignore_changes = [|]`.

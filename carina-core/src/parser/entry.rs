@@ -308,7 +308,7 @@ pub fn parse_syntax_inventory(
     let parse = || {
         let file = super::preprocess_file(input)?;
         let pairs = file.parse()?;
-        Ok(super::SyntaxInventory::from_pairs(pairs, &file, path))
+        super::SyntaxInventory::from_pairs(pairs, &file, path)
     };
     parse().map_err(|error| Box::new(super::FileScoped::new(path, error)))
 }
@@ -987,7 +987,7 @@ fn parse_with_seeded_bindings_inner(
     let preprocessed_file = Arc::new(super::preprocess_file(input)?);
     let pairs = preprocessed_file.parse()?;
     let mut syntax =
-        super::SyntaxInventory::from_pairs(pairs.clone(), &preprocessed_file, source_file);
+        super::SyntaxInventory::from_pairs(pairs.clone(), &preprocessed_file, source_file)?;
     // Bootstrap passes use provisional sibling names and exist only to
     // classify declarations. The final pass both emits source warnings and
     // evaluates static conditions against the now-typed seed table.

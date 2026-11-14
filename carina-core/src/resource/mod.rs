@@ -21,7 +21,7 @@ pub(crate) use dependencies::{
     retain_deferred_iterable_dependencies,
 };
 pub(crate) mod directive_expr;
-pub(crate) use directive_expr::{ResourceDirective, Substituted};
+pub(crate) use directive_expr::Substituted;
 mod enum_value;
 mod ignore_changes;
 pub mod knowledge;
@@ -74,7 +74,7 @@ pub(crate) use binding_address::{
 };
 pub use directive_expr::{
     ArgumentValueOrigin, DirectiveExpr, DirectiveResolutionError, DirectiveResolutionErrors,
-    ExpansionError, LifecycleDirective, LoopDirective, LoopDirectiveExpr,
+    ExpansionError, LifecycleDirective, LoopDirective, LoopDirectiveExpr, ResourceDirective,
     SerializableDirectivePhase,
 };
 pub use enum_value::{

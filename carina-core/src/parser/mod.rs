@@ -61,6 +61,7 @@ pub use resolve::{
     resolve_provider_unresolved_attributes_for_analysis, resolve_resource_refs_from_analysis,
 };
 
+mod resource_body;
 mod static_eval;
 mod types;
 mod util;

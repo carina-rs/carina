@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use carina_core::parser::{ProviderContext, parse_file, parse_syntax_inventory};
+use carina_core::resource::{ConcreteValue, Value};
 use carina_core::validation::unknown_directive_keys;
 
 #[test]
@@ -46,7 +47,10 @@ fn directive_inventory_includes_unevaluated_resources_but_not_ordinary_nested_ke
 let hidden = if false { mock.test.resource { directives { provder = absent } } }
 let read_back = read mock.test.resource { directives { ignore_change = [] } }
 mock.test.resource {
-  config { directives { nested_attribute = true } }
+  config {
+    directives { nested_attribute = true }
+    deeper { directives { prevent_destory = true provider = "ordinary" } }
+  }
   directives { unsupported_key = { nested_attribute = true } another_key = absent }
 }
 "#;
@@ -66,6 +70,27 @@ mock.test.resource {
             "Unknown directive 'another_key'",
         ]
     );
+    let parsed = parse_file(
+        source,
+        Path::new("resources.crn"),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .expect("nested directives use ordinary attribute semantics");
+    let Value::Concrete(ConcreteValue::List(config)) = &parsed.resources[0].attributes["config"]
+    else {
+        panic!("config block was not retained");
+    };
+    let Value::Concrete(ConcreteValue::Map(config)) = &config[0] else {
+        panic!("config attributes were not retained");
+    };
+    assert!(config.contains_key("directives"));
+    let Value::Concrete(ConcreteValue::List(deeper)) = &config["deeper"] else {
+        panic!("deeper block was not retained");
+    };
+    let Value::Concrete(ConcreteValue::Map(deeper)) = &deeper[0] else {
+        panic!("deeper attributes were not retained");
+    };
+    assert!(deeper.contains_key("directives"));
 }
 
 #[test]
