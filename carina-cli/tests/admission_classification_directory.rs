@@ -90,6 +90,7 @@ async fn multifile_validation_and_editor_admission_diagnostics() {
             .replace(root.to_str().unwrap(), "$PROJECT");
         records.push(serde_json::json!({"document": name, "coverage": coverage, "diagnostics": serde_json::from_str::<serde_json::Value>(&diagnostics).unwrap()}));
     }
+    // carina#2926: LSP reports attribute validation failures as warnings.
     insta::assert_snapshot!(serde_json::to_string_pretty(&records).unwrap());
 }
 
@@ -110,14 +111,16 @@ async fn production_analysis_exercises_all_three_resource_admission_branches() {
     // buffer. Its module-origin resource contributes one expanded admission
     // in every case; the remaining counters identify this resource's route.
     let setup = format!("{}\n{}", line("let choice ="), line("let child ="));
-    for (case, prefix, relative, expanded, decline) in [
-        ("relative entry", "let direct =", 1, 1, None),
-        ("composition preflight", "let composed =", 0, 2, None),
+    for (case, prefix, relative, expanded, preflight, decline) in [
+        ("relative entry", "let direct =", 1, 1, 0, None),
+        ("composition preflight", "let composed =", 0, 2, 1, None),
+        // carina#4407: pins a known lookup gap, not intended design.
         (
-            "declined expansion",
+            "anonymous resource misses the expanded lookup",
             "mock.test.resource {",
             1,
             1,
+            0,
             Some(ExpandedDeclineReason::MissingResource),
         ),
     ] {
@@ -129,6 +132,10 @@ async fn production_analysis_exercises_all_three_resource_admission_branches() {
         );
         assert_eq!(
             coverage.expanded.reached_admission, expanded,
+            "{case}: {coverage:?}; {diagnostics:?}"
+        );
+        assert_eq!(
+            coverage.classification_preflight_ran, preflight,
             "{case}: {coverage:?}; {diagnostics:?}"
         );
         let expected = decline

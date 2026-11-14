@@ -17,6 +17,7 @@ expression: "serde_json::to_string_pretty(&records).unwrap()"
   },
   {
     "coverage": {
+      "classification_preflight_ran": 1,
       "expanded": {
         "reached_admission": 2,
         "skipped_missing_schema": {}
@@ -127,6 +128,7 @@ expression: "serde_json::to_string_pretty(&records).unwrap()"
   },
   {
     "coverage": {
+      "classification_preflight_ran": 0,
       "expanded": {
         "reached_admission": 1,
         "skipped_missing_schema": {}
@@ -144,6 +146,7 @@ expression: "serde_json::to_string_pretty(&records).unwrap()"
   },
   {
     "coverage": {
+      "classification_preflight_ran": 0,
       "expanded": {
         "reached_admission": 1,
         "skipped_missing_schema": {}
@@ -161,6 +164,7 @@ expression: "serde_json::to_string_pretty(&records).unwrap()"
   },
   {
     "coverage": {
+      "classification_preflight_ran": 0,
       "expanded": {
         "reached_admission": 1,
         "skipped_missing_schema": {}
@@ -178,6 +182,7 @@ expression: "serde_json::to_string_pretty(&records).unwrap()"
   },
   {
     "coverage": {
+      "classification_preflight_ran": 0,
       "expanded": {
         "reached_admission": 0,
         "skipped_missing_schema": {}
@@ -211,6 +216,7 @@ expression: "serde_json::to_string_pretty(&records).unwrap()"
   },
   {
     "coverage": {
+      "classification_preflight_ran": 0,
       "expanded": {
         "reached_admission": 0,
         "skipped_missing_schema": {}

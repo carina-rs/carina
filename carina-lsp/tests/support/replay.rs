@@ -57,6 +57,7 @@ use tower_lsp::lsp_types::Diagnostic;
 
 pub fn merge(total: &mut AdmissionCoverage, coverage: &AdmissionCoverage) {
     total.resolved_inputs_fell_back += coverage.resolved_inputs_fell_back;
+    total.classification_preflight_ran += coverage.classification_preflight_ran;
     total.relative.reached_admission += coverage.relative.reached_admission;
     total.expanded.reached_admission += coverage.expanded.reached_admission;
     fn add<K: Ord + Clone>(total: &mut BTreeMap<K, u64>, values: &BTreeMap<K, u64>) {

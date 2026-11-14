@@ -574,6 +574,7 @@ pub(super) fn with_classified_inputs<B: BindingAddress, R>(
     let mut classified = inputs.classify(&context, &mut failed);
     #[cfg(test)]
     classification_tests::collect_injected_errors(&classified, &mut failed);
+    // The binding type selects the evaluator through its typed constructor.
     let dispatch = match evaluation {
         ValidationEvaluation::None => return (judge(inputs, &classified), diagnostics),
         ValidationEvaluation::Expanded(mode) | ValidationEvaluation::RelativeStatic(mode) => {

@@ -1,6 +1,6 @@
 #[cfg(feature = "test-utils")]
 use crate::admission_coverage::{
-    self as replay_coverage, ExpandedDeclineReason, Path as AdmissionPath,
+    self as replay_coverage, ExpandedDeclineReason, Path as AdmissionPath, classification_preflight,
 };
 
 mod buffer;
@@ -33,11 +33,12 @@ use carina_core::resource::{
 };
 use carina_core::schema::{SchemaRegistry, TypeError};
 use carina_core::validation::DeferredAccessTypeError;
+#[cfg(not(feature = "test-utils"))]
+use carina_core::validation::admission::attributes::classification_preflight;
 #[cfg(test)]
 use carina_core::validation::admission::attributes::uses_resource_attribute_admission;
 use carina_core::validation::admission::attributes::{
-    ClassificationDiagnostics, ValidationEvaluation, classification_preflight,
-    resource_attribute_admissions,
+    ClassificationDiagnostics, ValidationEvaluation, resource_attribute_admissions,
 };
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
