@@ -774,6 +774,7 @@ fn input_rule_to_protocol(rule: &InputRule<Compiled>) -> protocol::InputRule {
     let predicate = match predicate {
         InputPredicate::Present => protocol::InputPredicate::Present,
         InputPredicate::Absent => protocol::InputPredicate::Absent,
+        InputPredicate::Secret => protocol::InputPredicate::Secret,
         InputPredicate::Equals(literal) => {
             protocol::InputPredicate::Equals(input_literal_to_protocol(literal))
         }
@@ -875,6 +876,7 @@ fn protocol_to_input_rule(rule: &protocol::InputRule) -> Result<InputRule, Input
     let predicate = match predicate {
         protocol::InputPredicate::Present => InputPredicate::Present,
         protocol::InputPredicate::Absent => InputPredicate::Absent,
+        protocol::InputPredicate::Secret => InputPredicate::Secret,
         protocol::InputPredicate::Equals(literal) => {
             InputPredicate::Equals(protocol_to_input_literal(literal))
         }

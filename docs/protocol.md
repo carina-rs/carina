@@ -26,6 +26,47 @@ v0.13.1 speaks protocol **24**, with minimum provider protocol **24**.
 | 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
 
+## Secret input-rule predicate
+
+The predicate's record exists at protocol 28, but providers must not declare it
+until the next protocol version bump; a host that predates the predicate rejects
+such a schema with a decode error.
+
+Input-rule predicates add `{"kind":"secret"}`. A provider can require it on a
+scalar String `value` target, including refined Strings and String definition
+references. List, Map, other scalar shapes, and `map_keys` targets are rejected
+at schema admission. For example:
+
+```json
+{
+  "scope": "every_write",
+  "target": {"kind": "value", "path": "value"},
+  "code": "value.secret",
+  "condition": {
+    "kind": "equals",
+    "value": {
+      "path": "type",
+      "literal": {"kind": "string", "value": "secure_string"}
+    }
+  },
+  "predicate": {"kind": "secret"}
+}
+```
+
+The schema rule owns this requirement. Evaluation checks failure, then
+protection scope, then knownness without inspecting plaintext. A Secret node
+satisfies the predicate even with a pending payload. A known Public node
+violates it; a pending Public value and every withheld target remain pending
+for plan and dispatch rechecks. An absent optional target is proven. Validate
+and LSP diagnostics report known violations and leave pending inputs for plan.
+
+An unknown predicate kind fails schema JSON decoding; the host does not admit
+the schema with that rule omitted.
+
+Schemas still travel as JSON, so WIT is unchanged. Secret uses the next free
+fingerprint predicate tag, 15; existing fingerprints, encoding v13, and saved-plan
+format 45 remain unchanged.
+
 ## Version 28
 
 WIT package `carina:provider@0.3.0` adds required `error-detail.retryability`.

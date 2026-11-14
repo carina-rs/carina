@@ -1888,6 +1888,7 @@ pub enum InputPredicate {
     Present,
     Absent,
     Equals(InputLiteral),
+    Secret,
     Length {
         min: Option<u64>,
         max: Option<u64>,
