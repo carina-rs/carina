@@ -109,7 +109,7 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
     /// Imported modules (alias -> path)
     pub(super) imported_modules: HashMap<String, String>,
     /// User-defined functions
-    pub(super) user_functions: Arc<HashMap<String, UserFunction>>,
+    pub(super) user_functions: Arc<IndexMap<String, UserFunction>>,
     /// Interned user-function definitions used by deferred call nodes.
     /// Invalidated together with `user_function_scope` whenever the mutable
     /// parser table changes.
@@ -455,7 +455,7 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
             bindings: IndexMap::new(),
             resource_bindings: HashMap::new(),
             imported_modules: HashMap::new(),
-            user_functions: Arc::new(HashMap::new()),
+            user_functions: Arc::new(IndexMap::new()),
             resolved_user_functions: RefCell::new(HashMap::new()),
             seeded_user_functions: HashSet::new(),
             evaluating_functions: Vec::new(),
@@ -544,20 +544,20 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
         self.resolved_user_functions.borrow_mut().clear();
     }
 
-    pub(super) fn replace_user_functions(&mut self, functions: HashMap<String, UserFunction>) {
+    pub(super) fn replace_user_functions(&mut self, functions: IndexMap<String, UserFunction>) {
         self.user_functions = Arc::new(functions);
         self.invalidate_user_function_cache();
     }
 
     pub(super) fn replace_shared_user_functions(
         &mut self,
-        functions: Arc<HashMap<String, UserFunction>>,
+        functions: Arc<IndexMap<String, UserFunction>>,
     ) {
         self.user_functions = functions;
         self.invalidate_user_function_cache();
     }
 
-    pub(super) fn extend_user_functions(&mut self, functions: HashMap<String, UserFunction>) {
+    pub(super) fn extend_user_functions(&mut self, functions: IndexMap<String, UserFunction>) {
         Arc::make_mut(&mut self.user_functions).extend(functions);
         self.invalidate_user_function_cache();
     }
@@ -567,7 +567,7 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
         self.invalidate_user_function_cache();
     }
 
-    pub(super) fn user_functions_mut(&mut self) -> &mut HashMap<String, UserFunction> {
+    pub(super) fn user_functions_mut(&mut self) -> &mut IndexMap<String, UserFunction> {
         self.invalidate_user_function_cache();
         Arc::make_mut(&mut self.user_functions)
     }
@@ -583,7 +583,7 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
         Some(function)
     }
 
-    pub(super) fn shared_user_function_scope(&self) -> Arc<HashMap<String, UserFunction>> {
+    pub(super) fn shared_user_function_scope(&self) -> Arc<IndexMap<String, UserFunction>> {
         Arc::clone(&self.user_functions)
     }
 

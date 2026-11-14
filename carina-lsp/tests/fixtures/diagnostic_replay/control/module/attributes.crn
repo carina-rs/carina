@@ -1,0 +1,1 @@
+attributes { output: String = "module-output" }

@@ -976,10 +976,6 @@ impl ProviderFactory for RawEnumStateFactory {
         "raw enum state test provider"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -1002,6 +998,7 @@ impl ProviderFactory for RawEnumStateFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async {
             Ok(Box::new(carina_core::provider::NoopNormalizer) as Box<dyn ProviderNormalizer>)
@@ -1060,7 +1057,7 @@ impl ProviderFactory for RawEnumStateFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -3080,10 +3077,6 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
             "test"
         }
 
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
-
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -3103,7 +3096,7 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                Default::default(),
                 Default::default(),
                 Vec::new(),
             )
@@ -4096,10 +4089,6 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
             "Failing normalizer factory"
         }
 
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
-
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -4131,6 +4120,7 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
         fn create_normalizer(
             &self,
             _config: &carina_core::provider::ProviderSession,
+            _: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
             Box::pin(async { Err(ProviderError::internal("normalizer initialization failed")) })
         }
@@ -4138,7 +4128,7 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                Default::default(),
                 Default::default(),
                 Vec::new(),
             )
@@ -4239,10 +4229,6 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
             "Progress ordering factory"
         }
 
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
-
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -4280,7 +4266,7 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                Default::default(),
                 Default::default(),
                 Vec::new(),
             )
@@ -4338,11 +4324,7 @@ async fn provider_progress_uses_schema_region() {
     let configs = validated_provider_configs(vec![
         ProviderConfig {
             name: "test".to_string(),
-            attributes: (IndexMap::<String, _>::from([(
-                "region".to_string(),
-                Value::Concrete(ConcreteValue::String("us-west-2".into())),
-            )]))
-            .into(),
+            attributes: Default::default(),
             default_tags: Default::default(),
             source: None,
             version: None,
@@ -4393,10 +4375,6 @@ async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
             "Failing initialize factory"
         }
 
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
-
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -4422,7 +4400,7 @@ async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                Default::default(),
                 Default::default(),
                 Vec::new(),
             )
@@ -4505,22 +4483,6 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
         "provider config constraint test provider"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
-            "role_arn".to_string(),
-            PatternAttributeType::refined_string(
-                None,
-                Some(carina_core::schema::PatternSpec::new(
-                    r"^arn:aws:iam::[0-9]{12}:role/.+$".to_string(),
-                    carina_core::schema::PatternMatch::Full,
-                )),
-                None,
-                None,
-            ),
-        )]))
-        .expect("test provider config schema must be valid")
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -4551,7 +4513,19 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
+                "role_arn".to_string(),
+                PatternAttributeType::refined_string(
+                    None,
+                    Some(carina_core::schema::PatternSpec::new(
+                        r"^arn:aws:iam::[0-9]{12}:role/.+$".to_string(),
+                        carina_core::schema::PatternMatch::Full,
+                    )),
+                    None,
+                    None,
+                ),
+            )]))
+            .expect("test provider config schema must be valid"),
             Default::default(),
             Vec::new(),
         )
@@ -4600,7 +4574,9 @@ async fn sourced_default_provider_executes_the_factory_retained_by_wiring_contex
 
     let router = create_providers_from_configs_with_ctx(
         &ctx,
-        &configs,
+        &crate::commands::apply::saved_plan::VerifiedSavedPlanProviderInputs::for_test(
+            configs.clone(),
+        ),
         &carina_core::provider::ProviderPlan::state_only(),
     )
     .await
@@ -4711,10 +4687,6 @@ impl ProviderFactory for CascadeAwsccFactory {
         "AWSCC cascade test provider"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -4737,7 +4709,7 @@ impl ProviderFactory for CascadeAwsccFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -5068,10 +5040,6 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
         "managed/data-source collision test provider"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -5094,6 +5062,7 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async {
             Ok(Box::new(SavedAttrsHydratingNormalizer) as Box<dyn ProviderNormalizer>)
@@ -5103,7 +5072,7 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -5472,10 +5441,6 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
             "block-in-place validation test provider"
         }
 
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
-
         fn validate_config(
             &self,
             attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -5501,7 +5466,13 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                carina_core::schema::ValidatedConfigSchema::validate(
+                    std::collections::BTreeMap::from([(
+                        "region".into(),
+                        carina_core::schema::AttributeType::string(),
+                    )]),
+                )
+                .unwrap(),
                 Default::default(),
                 Vec::new(),
             )
@@ -5610,10 +5581,6 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
             "capture"
         }
 
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
-
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -5633,7 +5600,13 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                carina_core::schema::ValidatedConfigSchema::validate(
+                    std::collections::BTreeMap::from([(
+                        "region".into(),
+                        carina_core::schema::AttributeType::string(),
+                    )]),
+                )
+                .unwrap(),
                 Default::default(),
                 Vec::new(),
             )
@@ -5673,10 +5646,23 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
         config("second-named-region", Some("secondary")),
         config("default-region", None),
     ]);
-    let ready = prepare_default_provider_ready_config(&CaptureFactory, "capture", &configs)
-        .expect("the default provider instance must win");
+    let construction = prepare_default_provider_construction(
+        &CaptureFactory,
+        "capture",
+        &configs,
+        &provider_mod::ProviderPlan::state_only(),
+    )
+    .expect("the default provider instance must win");
     assert_eq!(
-        ready.attributes().get("region"),
+        construction.session().configuration().instance(),
+        &provider_mod::ProviderInstanceKey::new("capture", None)
+    );
+    assert_eq!(
+        construction
+            .session()
+            .configuration()
+            .attributes()
+            .get("region"),
         Some(&Value::Concrete(ConcreteValue::String(
             "default-region".into()
         )))
@@ -5686,19 +5672,47 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
         config("first-named-region", Some("main")),
         config("second-named-region", Some("secondary")),
     ]);
-    let ready = prepare_default_provider_ready_config(&CaptureFactory, "capture", &configs)
-        .expect("the first named provider instance must supply backend config");
+    let construction = prepare_default_provider_construction(
+        &CaptureFactory,
+        "capture",
+        &configs,
+        &provider_mod::ProviderPlan::state_only(),
+    )
+    .expect("the first named provider instance must supply backend config");
     assert_eq!(
-        ready.attributes().get("region"),
+        construction.session().configuration().instance(),
+        &provider_mod::ProviderInstanceKey::new("capture", None)
+    );
+    assert_eq!(
+        construction
+            .session()
+            .configuration()
+            .attributes()
+            .get("region"),
         Some(&Value::Concrete(ConcreteValue::String(
             "first-named-region".into()
         )))
     );
 
     let configs = validated_provider_configs(Vec::new());
-    let ready = prepare_default_provider_ready_config(&CaptureFactory, "capture", &configs)
-        .expect("an undeclared provider kind must retain the empty fallback");
-    assert!(ready.attributes().is_empty());
+    let construction = prepare_default_provider_construction(
+        &CaptureFactory,
+        "capture",
+        &configs,
+        &provider_mod::ProviderPlan::state_only(),
+    )
+    .expect("an undeclared provider kind must retain the empty fallback");
+    assert!(
+        construction
+            .session()
+            .configuration()
+            .attributes()
+            .is_empty()
+    );
+    assert_eq!(
+        construction.session().configuration().instance(),
+        &provider_mod::ProviderInstanceKey::new("capture", None)
+    );
 }
 
 /// Verify that host default-tag merging prevents false diffs when default_tags are
@@ -7813,10 +7827,6 @@ impl ProviderFactory for DeferredForCollisionFactory {
         "AWS deferred-for collision test provider"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -7849,6 +7859,7 @@ impl ProviderFactory for DeferredForCollisionFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
         carina_core::provider::ProviderResult<Box<dyn carina_core::provider::ProviderNormalizer>>,
@@ -7862,7 +7873,7 @@ impl ProviderFactory for DeferredForCollisionFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -7949,10 +7960,6 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
         "AWSCC association create-only test provider"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -7985,6 +7992,7 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
         carina_core::provider::ProviderResult<Box<dyn carina_core::provider::ProviderNormalizer>>,
@@ -7998,7 +8006,7 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -11350,20 +11358,6 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
         "AWSCC region identity test provider"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
-            "region".to_string(),
-            PatternAttributeType::enum_(
-                carina_core::schema::TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
-                Some(vec!["ap-northeast-1".to_string()]),
-                vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
-                None,
-                None,
-            ),
-        )]))
-        .expect("test provider config schema must be valid")
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -11396,6 +11390,7 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
         carina_core::provider::ProviderResult<Box<dyn carina_core::provider::ProviderNormalizer>>,
@@ -11409,7 +11404,21 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
+                "region".to_string(),
+                PatternAttributeType::enum_(
+                    carina_core::schema::TypeIdentity::new(
+                        Some("aws"),
+                        Vec::<String>::new(),
+                        "Region",
+                    ),
+                    Some(vec!["ap-northeast-1".to_string()]),
+                    vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
+                    None,
+                    None,
+                ),
+            )]))
+            .expect("test provider config schema must be valid"),
             Default::default(),
             Vec::new(),
         )
@@ -14685,10 +14694,6 @@ mod resolved_value_constraint_gate {
             "resolved constraint test provider"
         }
 
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
-
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -14735,6 +14740,7 @@ mod resolved_value_constraint_gate {
         fn create_normalizer(
             &self,
             _config: &carina_core::provider::ProviderSession,
+            _: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
             Box::pin(async {
                 Ok(Box::new(carina_core::provider::NoopNormalizer) as Box<dyn ProviderNormalizer>)
@@ -14744,7 +14750,7 @@ mod resolved_value_constraint_gate {
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                Default::default(),
                 Default::default(),
                 Vec::new(),
             )
@@ -14831,10 +14837,6 @@ mod resolved_value_constraint_gate {
             "module constraint refresh test provider"
         }
 
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
-
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -14858,7 +14860,7 @@ mod resolved_value_constraint_gate {
         fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
             carina_core::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                Default::default(),
                 Default::default(),
                 Vec::new(),
             )
@@ -15980,7 +15982,9 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                 std::fs::write(&maximum, "existing observation").unwrap();
                 let _normalizers = create_normalizers_from_configs_with_ctx(
                     ctx,
-                    &resolved,
+                    &crate::commands::apply::saved_plan::VerifiedSavedPlanProviderInputs::for_test(
+                        resolved.clone(),
+                    ),
                     &carina_core::provider::ProviderPlan::state_only(),
                 )
                 .await
@@ -16368,4 +16372,123 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors_
 
     assert!(message.contains("broken provider failed"), "{message}");
     assert!(message.contains("arguments blocks"), "{message}");
+}
+
+#[tokio::test]
+async fn provider_config_directory_builtin_rejects_undeclared_values() {
+    for declaration in ["provider mock", "let east = provider mock"] {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("providers.crn"),
+            format!(
+                "{}{declaration} {{ opaque = Opaque }}\n",
+                if declaration.starts_with("let ") {
+                    "provider mock {}\n"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("values.crn"),
+            "let Opaque = 18446744073709551615s\n",
+        )
+        .unwrap();
+        let context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let schemas = carina_core::schema::SchemaRegistry::new();
+        let loaded = carina_core::config_loader::load_configuration_with_config(
+            &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+            &context,
+            &schemas,
+        )
+        .unwrap();
+        let providers = (*loaded.parsed)
+            .clone()
+            .into_expanded(&schemas, &context)
+            .unwrap()
+            .providers;
+        let resolved = validated_provider_configs(providers);
+        let runtime = crate::test_support::TestCommandRuntime::with_mock(
+            Default::default(),
+            carina_provider_mock::MockScope::memory(),
+        );
+        let load = ProviderLoad::load(
+            &runtime,
+            resolved.as_provider_configs(),
+            &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+            &mut crate::commands::human_provider_notices(runtime.color_mode()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+        let error = get_provider_with_ctx(
+            &load.context,
+            &resolved,
+            ProgressSink::Human,
+            &carina_core::provider::ProviderPlan::state_only(),
+        )
+        .await
+        .err()
+        .expect("undeclared keys must fail before wire conversion");
+        assert!(error.to_string().contains("Unknown attribute 'opaque'"));
+    }
+}
+
+fn builtin_normalization_fixture() -> (WiringContext, ResolvedProviderConfigs) {
+    let configs = carina_core::test_utils::configuration::provider_directory(
+        "provider mock { validate_config_trap = true }",
+        "let sibling = 'value'",
+    );
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let ctx = WiringContext::new_for_test_with_provider_phase(
+        &runtime,
+        vec![],
+        configs.as_provider_configs(),
+    );
+    (ctx, configs)
+}
+
+#[test]
+fn state_normalization_does_not_construct_the_builtin_provider() {
+    let (ctx, configs) = builtin_normalization_fixture();
+    normalize_state_with_ctx(
+        &ctx,
+        &configs,
+        &mut HashMap::new(),
+        &provider_mod::ProviderPlan::state_only(),
+    )
+    .expect("native state normalization has no provider factory call");
+}
+
+#[tokio::test]
+async fn builtin_normalization_uses_only_its_dedicated_factory() {
+    let (ctx, configs) = builtin_normalization_fixture();
+    create_normalizers_from_configs_with_ctx(
+        &ctx,
+        &crate::commands::apply::saved_plan::VerifiedSavedPlanProviderInputs::for_test(
+            configs.clone(),
+        ),
+        &provider_mod::ProviderPlan::state_only(),
+    )
+    .await
+    .expect("native normalization admits the dedicated factory's empty configuration");
+}
+
+#[test]
+fn schema_override_errors_choose_the_first_argument() {
+    for _ in 0..64 {
+        let overrides = [
+            ("zulu".to_owned(), PathBuf::from("missing-zulu.wasm")),
+            ("alpha".to_owned(), PathBuf::from("missing-alpha.wasm")),
+        ]
+        .into_iter()
+        .collect();
+        let error = schema_check_provider_configs(&[], &overrides).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "provider schema override names undeclared default provider 'zulu'"
+        );
+    }
 }

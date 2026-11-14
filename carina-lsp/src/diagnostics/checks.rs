@@ -1,6 +1,9 @@
 //! Semantic checks: provider region, module calls, unused bindings, undefined references.
 
 use carina_core::parser::ExportParamLike;
+use carina_core::validation::admission::configuration::backend::{
+    BackendAttributeError, LocatedBackendError,
+};
 use std::collections::HashSet;
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
@@ -663,6 +666,7 @@ impl DiagnosticRun<'_> {
         merged: Option<&MergedParseResult>,
         tree: Option<&carina_core::parser::AnalysisTree<'_>>,
         buffer: Option<&ParsedFile>,
+        reported_directory_failure: Option<&carina_core::parser::DeclarationLocation>,
     ) -> Vec<Diagnostic> {
         let Some(tree) = tree else {
             return Vec::new();
@@ -673,71 +677,53 @@ impl DiagnosticRun<'_> {
         else {
             return Vec::new();
         };
-        // The issued directory fact owns backend cardinality, including all
-        // readable sibling inventories during partial recovery.
-        match parsed.directory_verdict() {
-            carina_core::config_loader::DirectoryVerdict::Root(root) if root.has_sole_backend() => {
-            }
-            carina_core::config_loader::DirectoryVerdict::Root(_)
-            | carina_core::config_loader::DirectoryVerdict::NoEvidence(_)
-            | carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
-            | carina_core::config_loader::DirectoryVerdict::Unknown(_) => return Vec::new(),
-        }
-        let Some(backend) = parsed.backend.as_ref() else {
-            return Vec::new();
-        };
-        let Err(error) = carina_state::BackendConfig::try_from(backend) else {
+        // Backend admission consumes the issued verdict, including cardinality
+        // from readable siblings during partial recovery.
+        let Some(Err(findings)) = tree.admit_backend() else {
             return Vec::new();
         };
 
-        let attribute_diagnostic = |error: &carina_state::BackendAttributeError| {
-            // Directory resolution deliberately retains user-function calls
-            // that failed evaluation so other editor checks can continue.
-            // Suppress only those calls, including nested ones. A deferred
-            // builtin with unresolved arguments is still a genuine value-type
-            // mismatch and must remain visible, matching CLI validation.
-            if backend
-                .attributes
-                .get(error.attribute())
-                .is_some_and(|value| {
-                    contains_matching_function_call(value, &|name| {
-                        parsed.user_functions.contains_key(name)
+        let attribute_diagnostic =
+            |finding: carina_core::parser::Located<BackendAttributeError>| {
+                let error = finding.detail();
+                // A failed evaluation already owns this attribute. Keep other
+                // schema errors active, including unknown keys at this site.
+                if matches!(error, BackendAttributeError::InvalidAttribute { .. })
+                    && reported_directory_failure == Some(finding.location())
+                {
+                    return None;
+                }
+                // Directory resolution deliberately retains user-function calls
+                // that failed evaluation so other editor checks can continue.
+                // Suppress only those calls, including nested ones. A deferred
+                // builtin with unresolved arguments is still a genuine value-type
+                // mismatch and must remain visible, matching CLI validation.
+                if tree
+                    .backend_attribute_value(error.attribute())
+                    .is_some_and(|value| {
+                        contains_matching_function_call(value, &|name| {
+                            parsed.user_functions.contains_key(name)
+                        })
                     })
-                })
-            {
-                return None;
-            }
+                {
+                    return None;
+                }
 
-            let finding = carina_core::parser::Located::new(
-                tree.backend_attribute_location(error.attribute()).clone(),
-                error,
-            );
-            render_merged(doc, &finding, DiagnosticSeverity::ERROR, error.to_string())
-        };
+                render_merged(doc, &finding, DiagnosticSeverity::ERROR, error.to_string())
+            };
 
-        match error {
-            carina_state::BackendConfigError::Invalid(errors) => errors
-                .errors()
-                .iter()
-                .filter_map(attribute_diagnostic)
-                .collect(),
-            unsupported @ carina_state::BackendConfigError::UnsupportedBackend(_) => {
-                let finding = carina_core::parser::Located::new(
-                    tree.backend_location()
-                        .expect("backend declaration provenance")
-                        .clone(),
-                    unsupported,
-                );
-                render_merged(
+        findings
+            .into_iter()
+            .filter_map(|finding| match finding {
+                LocatedBackendError::Attribute(finding) => attribute_diagnostic(finding),
+                LocatedBackendError::Unsupported(finding) => render_merged(
                     doc,
                     &finding,
                     DiagnosticSeverity::ERROR,
                     finding.detail().to_string(),
-                )
-                .into_iter()
-                .collect()
-            }
-        }
+                ),
+            })
+            .collect()
     }
 
     /// Check expanded values while retaining the authored provider locations.
@@ -798,7 +784,12 @@ impl DiagnosticRun<'_> {
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         for (index, provider) in tree.providers().iter().enumerate() {
-            let Some(factory) = self.factories.iter().find(|f| f.name() == provider.name) else {
+            let Some(factory) = self
+                .factories
+                .iter()
+                .chain(self.configuration_factories.iter())
+                .find(|f| f.name() == provider.name)
+            else {
                 continue;
             };
             let validation = carina_core::executor::provider_ready::validate_parser_provider_config(
@@ -812,17 +803,34 @@ impl DiagnosticRun<'_> {
                 }) {
                     continue;
                 }
-                let location = error
-                    .attribute()
-                    .map(|key| tree.provider_attribute_location(index, key))
-                    .unwrap_or_else(|| tree.provider_attribute_location(index, "region"));
-                let finding = carina_core::parser::Located::new(location.clone(), error);
-                diagnostics.extend(render_merged(
-                    doc,
-                    &finding,
-                    DiagnosticSeverity::WARNING,
-                    finding.detail().to_string(),
-                ));
+                for diagnostic in error.diagnostics() {
+                    let unknown = matches!(
+                        diagnostic.schema_error(),
+                        Some(carina_core::schema::TypeError::UnknownAttribute { .. })
+                    );
+                    let location = diagnostic
+                        .attribute()
+                        .map(|key| {
+                            if unknown {
+                                tree.provider_attribute_key_location(index, key)
+                            } else {
+                                tree.provider_attribute_location(index, key)
+                            }
+                        })
+                        .unwrap_or_else(|| tree.provider_attribute_location(index, "region"));
+                    let severity = if unknown {
+                        DiagnosticSeverity::ERROR
+                    } else {
+                        DiagnosticSeverity::WARNING
+                    };
+                    let finding = carina_core::parser::Located::new(location.clone(), diagnostic);
+                    diagnostics.extend(render_merged(
+                        doc,
+                        &finding,
+                        severity,
+                        finding.detail().to_string(),
+                    ));
+                }
             }
         }
         diagnostics
@@ -1874,7 +1882,7 @@ impl DiagnosticRun<'_> {
             .iter()
             .filter(|factory| declared_providers.contains(factory.name()))
         {
-            for attr_type in factory.provider_config_attribute_types().parts().values() {
+            for attr_type in factory.schema_witness().config().parts().values() {
                 collect_enum_provider_namespaces(attr_type, &mut enum_namespaces);
             }
         }
@@ -1953,7 +1961,7 @@ impl DiagnosticRun<'_> {
                             let known_attrs: Vec<&str> =
                                 known_attributes.iter().map(String::as_str).collect();
                             let suggestion =
-                                suggest_similar_name(&diagnostic_attribute, &known_attrs)
+                                suggest_similar_name(&diagnostic_attribute, &known_attrs, &[])
                                     .map(|suggestion| format!(" Did you mean '{}'?", suggestion))
                                     .unwrap_or_default();
                             format!(
@@ -1975,9 +1983,10 @@ impl DiagnosticRun<'_> {
                                 .attribute_location(&diagnostic_binding, &diagnostic_attribute);
                             let known_attrs: Vec<&str> =
                                 known_attributes.iter().map(String::as_str).collect();
-                            let suffix = suggest_similar_name(&diagnostic_attribute, &known_attrs)
-                                .map(|suggestion| format!(". Did you mean '{}'?", suggestion))
-                                .unwrap_or_else(|| ".".to_string());
+                            let suffix =
+                                suggest_similar_name(&diagnostic_attribute, &known_attrs, &[])
+                                    .map(|suggestion| format!(". Did you mean '{}'?", suggestion))
+                                    .unwrap_or_else(|| ".".to_string());
                             format!(
                                 "Unknown attribute '{}' on '{}'{}",
                                 diagnostic_attribute, diagnostic_binding, suffix,

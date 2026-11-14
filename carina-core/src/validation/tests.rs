@@ -583,7 +583,7 @@ fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType 
 
 fn module_arguments(
     values: impl IntoIterator<Item = (String, Value)>,
-) -> HashMap<String, ModuleArgument> {
+) -> indexmap::IndexMap<String, ModuleArgument> {
     values
         .into_iter()
         .map(|(name, value)| (name, ModuleArgument::new(value)))
@@ -833,7 +833,7 @@ fn empty_parsed() -> ParsedFile {
         export_params: vec![],
         backend: None,
         state_blocks: Vec::new(),
-        user_functions: HashMap::new(),
+        user_functions: indexmap::IndexMap::new(),
         upstream_states: Vec::new(),
         wait_bindings: Vec::new(),
         requires: Vec::new(),
@@ -9548,10 +9548,6 @@ impl crate::provider::ProviderFactory for RecordingFactory {
         &self.name
     }
 
-    fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         attributes: &crate::provider::CanonicalProviderConfigAttributes,
@@ -9578,7 +9574,28 @@ impl crate::provider::ProviderFactory for RecordingFactory {
     fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
         crate::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            crate::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from([
+                ("region".into(), crate::schema::AttributeType::string()),
+                (
+                    "assume_role".into(),
+                    crate::schema::AttributeType::struct_(
+                        "AssumeRole",
+                        vec![
+                            crate::schema::StructField::required(
+                                "role_arn",
+                                crate::schema::AttributeType::string(),
+                            )
+                            .build(),
+                            crate::schema::StructField::optional(
+                                "session_name",
+                                crate::schema::AttributeType::string(),
+                            )
+                            .build(),
+                        ],
+                    ),
+                ),
+            ]))
+            .unwrap(),
             Default::default(),
             Vec::new(),
         )
@@ -9637,7 +9654,11 @@ fn validate_provider_config_skips_attributes_with_deferred_refs() {
     let (factory, seen_handle) = RecordingFactory::new("aws");
     let factories: Vec<Box<dyn crate::provider::ProviderFactory>> = vec![Box::new(factory)];
 
-    validate_provider_config(&parsed, &factories).expect("validate must not error");
+    admission::configuration::provider::analyze_configs(
+        &parsed.providers,
+        &factories.iter().map(Box::as_ref).collect::<Vec<_>>(),
+    )
+    .expect("validate must not error");
 
     let seen = seen_handle
         .lock()
@@ -9672,20 +9693,6 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
             "awscc"
         }
 
-        fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-            crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
-                "region".to_string(),
-                PatternAttributeType::enum_(
-                    crate::schema::enum_identity("Region", Some("aws")),
-                    Some(vec!["ap-northeast-1".to_string()]),
-                    vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
-                    None,
-                    None,
-                ),
-            )]))
-            .expect("test provider config schema must be valid")
-        }
-
         fn validate_config(
             &self,
             attributes: &crate::provider::CanonicalProviderConfigAttributes,
@@ -9712,7 +9719,17 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
         fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
             crate::schema::ValidatedProviderSchemaWitness::new(
                 self.schemas(),
-                self.provider_config_attribute_types(),
+                crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "region".to_string(),
+                    PatternAttributeType::enum_(
+                        crate::schema::enum_identity("Region", Some("aws")),
+                        Some(vec!["ap-northeast-1".to_string()]),
+                        vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
+                        None,
+                        None,
+                    ),
+                )]))
+                .expect("test provider config schema must be valid"),
                 Default::default(),
                 Vec::new(),
             )
@@ -9747,7 +9764,11 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
             seen: std::sync::Arc::clone(&seen),
         })];
 
-    validate_provider_config(&parsed, &factories).expect("enum config must validate");
+    admission::configuration::provider::analyze_configs(
+        &parsed.providers,
+        &factories.iter().map(Box::as_ref).collect::<Vec<_>>(),
+    )
+    .expect("enum config must validate");
 
     let calls = seen.lock().unwrap();
     assert!(matches!(

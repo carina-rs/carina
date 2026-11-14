@@ -9,7 +9,9 @@ use carina_core::paths::ResolvedPath;
 use std::path::PathBuf;
 
 use carina_core::parser::BackendConfig as ParserBackendConfig;
-use carina_core::resource::{BindingAddress, PlaceholderKind};
+use carina_core::resource::{
+    AbsoluteBindingAddress, BindingAddress, NoPlaceholder, PlaceholderKind,
+};
 use thiserror::Error;
 
 use crate::backend::{BackendError, BackendResult};
@@ -43,26 +45,96 @@ pub enum BackendDriftStatus {
     Drifted(Box<BackendDrift>),
 }
 
-/// Opaque proof that a backend address was chosen through a named selection
-/// path rather than constructed directly from raw configuration.
+/// Select operation-specific capabilities for project or URL-backed state.
 #[derive(Debug, Clone)]
 pub struct BackendSelection {
-    target: BackendTarget,
+    _private: (),
+}
+
+/// A project backend selected from admitted settings and its source directory.
+#[derive(Debug, Clone)]
+pub(crate) struct ConfiguredBackend {
+    origin: AdmittedBackendOrigin,
+    base_dir: ResolvedPath,
+}
+
+/// A backend candidate together with the source that selected it.
+/// An implicit source always denotes the admitted local default.
+#[derive(Debug)]
+pub enum BackendConfigurationSource<
+    'a,
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    Implicit,
+    Declared(&'a ParserBackendConfig<P, B>),
+}
+impl<P: PlaceholderKind, B: BindingAddress> Copy for BackendConfigurationSource<'_, P, B> {}
+impl<P: PlaceholderKind, B: BindingAddress> Clone for BackendConfigurationSource<'_, P, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'a, P: PlaceholderKind, B: BindingAddress> From<Option<&'a ParserBackendConfig<P, B>>>
+    for BackendConfigurationSource<'a, P, B>
+{
+    fn from(config: Option<&'a ParserBackendConfig<P, B>>) -> Self {
+        match config {
+            Some(config) => Self::Declared(config),
+            None => Self::Implicit,
+        }
+    }
+}
+impl<P: PlaceholderKind, B: BindingAddress> BackendConfigurationSource<'_, P, B> {
+    fn admit(self) -> BackendResult<AdmittedBackendOrigin> {
+        match self {
+            Self::Implicit => Ok(AdmittedBackendOrigin::implicit()),
+            Self::Declared(config) => Ok(AdmittedBackendOrigin::Declared(BackendConfig::try_from(
+                config,
+            )?)),
+        }
+    }
+    pub fn backend_lock(self) -> BackendResult<BackendLock> {
+        Ok(BackendLock::from_config(self.admit()?.config()))
+    }
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum BackendTarget {
-    Configured {
-        config: Option<BackendConfig>,
-        base_dir: ResolvedPath,
-    },
-    ExplicitUrl(StateUrl),
+enum AdmittedBackendOrigin {
+    Implicit(BackendConfig),
+    Declared(BackendConfig),
+    Locked(BackendConfig),
+}
+impl AdmittedBackendOrigin {
+    fn implicit() -> Self {
+        Self::Implicit(BackendConfig::Local(BackendConfig::implicit_local()))
+    }
+    fn config(&self) -> &BackendConfig {
+        match self {
+            Self::Implicit(config) | Self::Declared(config) | Self::Locked(config) => config,
+        }
+    }
+    fn kind(&self) -> ReadBackendOrigin {
+        match self {
+            Self::Implicit(_) => ReadBackendOrigin::Implicit,
+            Self::Declared(_) => ReadBackendOrigin::Declared,
+            Self::Locked(_) => ReadBackendOrigin::Locked,
+        }
+    }
+}
+
+/// Source selected by the lock-aware read owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadBackendOrigin {
+    Implicit,
+    Declared,
+    Locked,
 }
 
 /// Lock-aware selection for a read-only operation.
 #[derive(Debug, Clone)]
 pub struct ReadBackendSelection {
-    selection: BackendSelection,
+    configured: ConfiguredBackend,
     lock_present: bool,
     drift: Option<BackendDrift>,
 }
@@ -81,15 +153,16 @@ impl ReadBackendSelection {
         self,
         warn: impl FnOnce(&BackendDrift),
     ) -> BackendResult<ResolvedReadBackend> {
-        let selected_config = self.selection.configured_config().cloned();
+        let selected_config = self.configured.config().clone();
         let migration_pending = self.drift.is_some();
-        let backend = crate::backends::create_backend(&self.selection).await?;
+        let backend = crate::backends::create_backend(&self.configured).await?;
         if let Some(drift) = self.drift.as_ref() {
             warn(drift);
         }
         Ok(ResolvedReadBackend {
             backend,
             selected_config,
+            origin: self.configured.origin(),
             migration_pending,
         })
     }
@@ -98,7 +171,8 @@ impl ReadBackendSelection {
 /// A backend narrowed to the operations used by read-only commands.
 pub struct ResolvedReadBackend {
     backend: Box<dyn crate::StateBackend>,
-    selected_config: Option<BackendConfig>,
+    selected_config: BackendConfig,
+    origin: ReadBackendOrigin,
     migration_pending: bool,
 }
 
@@ -123,8 +197,12 @@ impl ResolvedReadBackend {
         self.backend.resource_type()
     }
 
-    pub fn selected_config(&self) -> Option<&BackendConfig> {
-        self.selected_config.as_ref()
+    pub fn selected_config(&self) -> &BackendConfig {
+        &self.selected_config
+    }
+
+    pub fn origin(&self) -> ReadBackendOrigin {
+        self.origin
     }
 
     pub fn migration_pending(&self) -> bool {
@@ -136,18 +214,16 @@ impl ResolvedReadBackend {
 /// configured backend.
 #[derive(Debug, Clone)]
 pub struct VerifiedMutationBackendSelection {
-    selection: BackendSelection,
+    configured: ConfiguredBackend,
 }
 
 impl VerifiedMutationBackendSelection {
     pub fn s3_settings(&self) -> Option<&S3BackendSettings> {
-        self.selection
-            .configured_config()
-            .and_then(BackendConfig::as_s3)
+        self.configured.config().as_s3()
     }
 
     pub async fn resolve(&self) -> BackendResult<Box<dyn crate::StateBackend>> {
-        crate::backends::create_backend(&self.selection).await
+        crate::backends::create_backend(&self.configured).await
     }
 }
 
@@ -221,12 +297,12 @@ impl BucketDeleteBackendSelection {
 /// Selection for a user-supplied `--state-url`.
 #[derive(Debug, Clone)]
 pub(crate) struct ExplicitUrlBackendSelection {
-    selection: BackendSelection,
+    url: StateUrl,
 }
 
 impl ExplicitUrlBackendSelection {
     pub(crate) async fn read_state(&self) -> BackendResult<Option<crate::LoadedState>> {
-        crate::backends::create_backend(&self.selection)
+        crate::backends::create_explicit_backend(&self.url)
             .await?
             .read_state()
             .await
@@ -235,14 +311,14 @@ impl ExplicitUrlBackendSelection {
     pub(crate) async fn read_published_exports(
         &self,
     ) -> BackendResult<Option<crate::PublishedExports>> {
-        let backend = crate::backends::create_backend(&self.selection).await?;
+        let backend = crate::backends::create_explicit_backend(&self.url).await?;
         crate::backend::read_published_exports(backend.as_ref()).await
     }
 }
 
 struct BackendInspection {
     project_dir: ResolvedPath,
-    configured: Option<BackendConfig>,
+    configured: AdmittedBackendOrigin,
     status: BackendDriftStatus,
 }
 
@@ -252,27 +328,34 @@ impl BackendSelection {
     /// A pending migration selects the old backend recorded in the lock and
     /// returns its drift metadata without printing. Missing locks are allowed
     /// here so the command layer can retain command-specific policy.
-    pub fn for_read<P: PlaceholderKind, B: BindingAddress>(
+    pub fn for_read<'a, P: PlaceholderKind + 'a, B: BindingAddress + 'a>(
         project_dir: &ResolvedPath,
-        configured: Option<&ParserBackendConfig<P, B>>,
+        configured: impl Into<BackendConfigurationSource<'a, P, B>>,
     ) -> BackendResult<ReadBackendSelection> {
-        let inspection = inspect(project_dir, configured)?;
+        let inspection = inspect(project_dir, configured.into())?;
         Self::for_read_inspection(inspection)
     }
 
     fn for_read_inspection(inspection: BackendInspection) -> BackendResult<ReadBackendSelection> {
         let lock_present = !matches!(inspection.status, BackendDriftStatus::Fresh);
-        let (selected_config, drift) = match inspection.status {
+        let (configured, drift) = match inspection.status {
             BackendDriftStatus::Drifted(drift) => {
                 let config = drift.existing.to_state_config()?;
-                (Some(config), Some(*drift))
+                (
+                    ConfiguredBackend::new(
+                        AdmittedBackendOrigin::Locked(config),
+                        inspection.project_dir,
+                    ),
+                    Some(*drift),
+                )
             }
-            BackendDriftStatus::Fresh | BackendDriftStatus::Unchanged => {
-                (inspection.configured, None)
-            }
+            BackendDriftStatus::Fresh | BackendDriftStatus::Unchanged => (
+                ConfiguredBackend::new(inspection.configured, inspection.project_dir),
+                None,
+            ),
         };
         Ok(ReadBackendSelection {
-            selection: Self::configured_target(selected_config, inspection.project_dir),
+            configured,
             lock_present,
             drift,
         })
@@ -281,11 +364,11 @@ impl BackendSelection {
     /// Select a backend for an operation that may mutate state.
     ///
     /// Only the `Verified` result carries a constructible backend token.
-    pub fn verified_for_mutation<P: PlaceholderKind, B: BindingAddress>(
+    pub fn verified_for_mutation<'a, P: PlaceholderKind + 'a, B: BindingAddress + 'a>(
         project_dir: &ResolvedPath,
-        configured: Option<&ParserBackendConfig<P, B>>,
+        configured: impl Into<BackendConfigurationSource<'a, P, B>>,
     ) -> BackendResult<MutationBackendSelection> {
-        let inspection = inspect(project_dir, configured)?;
+        let inspection = inspect(project_dir, configured.into())?;
         Self::verified_for_mutation_inspection(inspection)
     }
 
@@ -304,7 +387,7 @@ impl BackendSelection {
             }),
             BackendDriftStatus::Unchanged => Ok(MutationBackendSelection::Verified(
                 VerifiedMutationBackendSelection {
-                    selection: Self::configured_target(
+                    configured: ConfiguredBackend::new(
                         inspection.configured,
                         inspection.project_dir,
                     ),
@@ -316,13 +399,12 @@ impl BackendSelection {
 
     /// Resolve the old and new backend addresses carried by a proven drift.
     pub async fn for_migration(drift: &BackendDrift) -> BackendResult<MigrationBackends> {
-        let project_dir = drift.project_dir.clone();
-        let source =
-            Self::configured_target(Some(drift.existing.to_state_config()?), project_dir.clone());
-        let target =
-            Self::configured_target(Some(drift.configured.to_state_config()?), project_dir);
-        let (source, local_source_path) = source.resolve_migration_backend().await?;
-        let (target, local_target_path) = target.resolve_migration_backend().await?;
+        let (source, local_source_path) =
+            resolve_migration_backend(&drift.existing.to_state_config()?, &drift.project_dir)
+                .await?;
+        let (target, local_target_path) =
+            resolve_migration_backend(&drift.configured.to_state_config()?, &drift.project_dir)
+                .await?;
         if let (Some(source), Some(target)) = (&local_source_path, &local_target_path)
             && source.identity() == target.identity()
         {
@@ -338,24 +420,6 @@ impl BackendSelection {
             target,
             local_source_path,
         })
-    }
-
-    /// Resolve once so migration's alias check and IO use the same pins.
-    async fn resolve_migration_backend(
-        &self,
-    ) -> BackendResult<(Box<dyn crate::StateBackend>, Option<ResolvedPath>)> {
-        match self.target() {
-            BackendTarget::Configured {
-                config: Some(BackendConfig::Local(settings)),
-                base_dir,
-            } => {
-                let path = crate::backends::anchored_local_path(settings, base_dir)
-                    .map_err(|error| BackendError::Io(error.to_string()))?;
-                let backend = crate::backends::LocalBackend::with_resolved_path(path.clone())?;
-                Ok((Box::new(backend), Some(path)))
-            }
-            _ => Ok((crate::backends::create_backend(self).await?, None)),
-        }
     }
 
     /// Select the configured S3 backend only when the requested bucket is the
@@ -383,11 +447,7 @@ impl BackendSelection {
     /// Select the exact URL supplied by the user, bypassing project backend
     /// configuration and its lock by explicit contract.
     pub(crate) fn explicit_url(url: &StateUrl) -> ExplicitUrlBackendSelection {
-        ExplicitUrlBackendSelection {
-            selection: Self {
-                target: BackendTarget::ExplicitUrl(url.clone()),
-            },
-        }
+        ExplicitUrlBackendSelection { url: url.clone() }
     }
 
     /// Force-release a backend lock, selecting the old locked backend during
@@ -398,27 +458,61 @@ impl BackendSelection {
         lock_id: &str,
     ) -> BackendResult<()> {
         let selected = Self::for_read(project_dir, configured)?;
-        crate::backends::create_backend(&selected.selection)
+        crate::backends::create_backend(&selected.configured)
             .await?
             .force_unlock(lock_id)
             .await
     }
+}
 
-    pub(crate) fn target(&self) -> &BackendTarget {
-        &self.target
+impl ConfiguredBackend {
+    fn new(origin: AdmittedBackendOrigin, base_dir: ResolvedPath) -> Self {
+        Self { origin, base_dir }
     }
-
-    fn configured_target(config: Option<BackendConfig>, base_dir: ResolvedPath) -> Self {
-        Self {
-            target: BackendTarget::Configured { config, base_dir },
+    pub(crate) fn origin(&self) -> ReadBackendOrigin {
+        self.origin.kind()
+    }
+    pub(crate) fn config(&self) -> &BackendConfig {
+        self.origin.config()
+    }
+    pub(crate) async fn open(&self) -> BackendResult<Box<dyn crate::StateBackend>> {
+        match self.config() {
+            BackendConfig::S3(settings) => Ok(Box::new(
+                crate::backends::S3Backend::from_config(settings).await?,
+            )),
+            BackendConfig::Local(settings) => {
+                let backend = match self.origin {
+                    AdmittedBackendOrigin::Implicit(_) => {
+                        crate::backends::LocalBackend::from_location(
+                            settings.pin_address(&self.base_dir)?,
+                        )?
+                    }
+                    AdmittedBackendOrigin::Declared(_) | AdmittedBackendOrigin::Locked(_) => {
+                        crate::backends::LocalBackend::from_config(settings, &self.base_dir)?
+                    }
+                };
+                Ok(Box::new(backend))
+            }
         }
     }
+}
 
-    fn configured_config(&self) -> Option<&BackendConfig> {
-        match &self.target {
-            BackendTarget::Configured { config, .. } => config.as_ref(),
-            BackendTarget::ExplicitUrl(_) => None,
+/// Migration's alias check and IO consume the same pin, regardless of origin.
+async fn resolve_migration_backend(
+    config: &BackendConfig,
+    base: &ResolvedPath,
+) -> BackendResult<(Box<dyn crate::StateBackend>, Option<ResolvedPath>)> {
+    match config {
+        BackendConfig::Local(settings) => {
+            let location = settings.pin_address(base)?;
+            let path = location.path().clone();
+            let backend = crate::backends::LocalBackend::from_location(location)?;
+            Ok((Box::new(backend), Some(path)))
         }
+        BackendConfig::S3(settings) => Ok((
+            Box::new(crate::backends::S3Backend::from_config(settings).await?),
+            None,
+        )),
     }
 }
 
@@ -427,29 +521,22 @@ pub fn inspect_backend_drift<P: PlaceholderKind, B: BindingAddress>(
     project_dir: &ResolvedPath,
     configured: Option<&ParserBackendConfig<P, B>>,
 ) -> BackendResult<BackendDriftStatus> {
-    inspect(project_dir, configured).map(|inspection| inspection.status)
+    inspect(project_dir, configured.into()).map(|inspection| inspection.status)
 }
 
 fn inspect<P: PlaceholderKind, B: BindingAddress>(
     project_dir: &ResolvedPath,
-    configured: Option<&ParserBackendConfig<P, B>>,
+    configured: BackendConfigurationSource<'_, P, B>,
 ) -> BackendResult<BackendInspection> {
-    let configured = configured
-        .map(BackendConfig::try_from)
-        .transpose()
-        .map_err(BackendError::from)?;
-    inspect_resolved(project_dir, configured)
+    inspect_resolved(project_dir, configured.admit()?)
 }
 
 fn inspect_resolved(
     project_dir: &ResolvedPath,
-    configured: Option<BackendConfig>,
+    configured: AdmittedBackendOrigin,
 ) -> BackendResult<BackendInspection> {
     let project_dir = project_dir.clone();
-    let configured_lock = configured
-        .as_ref()
-        .map(BackendLock::from_config)
-        .unwrap_or_else(BackendLock::local_default);
+    let configured_lock = BackendLock::from_config(configured.config());
     let existing = BackendLock::load(&project_dir)?;
     let status = match existing {
         None => BackendDriftStatus::Fresh,
@@ -524,7 +611,7 @@ mod tests {
         .unwrap();
         let resolved = selected.resolve_with_drift_warning(|_| {}).await.unwrap();
 
-        let Some(BackendConfig::Local(settings)) = resolved.selected_config() else {
+        let BackendConfig::Local(settings) = resolved.selected_config() else {
             panic!("read must select the old local backend")
         };
         assert_eq!(settings.path(), Some("old.json"));
@@ -664,9 +751,154 @@ mod tests {
             None::<&ParserBackendConfig>,
         )
         .unwrap();
-        let BackendTarget::Configured { base_dir, .. } = selected.selection.target() else {
-            panic!("project read must select a configured backend target")
-        };
+        let base_dir = &selected.configured.base_dir;
         assert_eq!(base_dir.display().to_string(), alias.display().to_string());
+    }
+}
+
+#[cfg(test)]
+mod implicit_local_admission_tests {
+    use super::*;
+    #[tokio::test]
+    async fn implicit_local_is_admitted_when_selected_and_retains_its_migration_pin() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("values.crn"), "let input = 'value'\n").unwrap();
+        let selected = ConfiguredBackend::new(
+            AdmittedBackendOrigin::implicit(),
+            ResolvedPath::new(root.path()).unwrap(),
+        );
+        assert!(
+            matches!(selected.config(), BackendConfig::Local(_)),
+            "implicit selection must contain admitted local settings"
+        );
+        let (_, path) = resolve_migration_backend(selected.config(), &selected.base_dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            path.unwrap().identity(),
+            ResolvedPath::new(root.path().join("carina.state.json"))
+                .unwrap()
+                .identity()
+        );
+    }
+}
+
+#[cfg(test)]
+mod configured_backend_selection_tests {
+    use super::*;
+    fn raw(path: &str) -> ParserBackendConfig {
+        ParserBackendConfig {
+            backend_type: "local".into(),
+            attributes: [(
+                "path".to_owned(),
+                carina_core::resource::Value::Concrete(
+                    carina_core::resource::ConcreteValue::String(path.into()),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+            attribute_spans: Default::default(),
+        }
+    }
+    #[test]
+    fn project_capabilities_hold_only_configured_backends() {
+        fn accepts_configured(_: &ConfiguredBackend) {}
+        let root = tempfile::tempdir().unwrap();
+        let base = ResolvedPath::new(root.path()).unwrap();
+        let read = BackendSelection::for_read(&base, None::<&ParserBackendConfig>).unwrap();
+        accepts_configured(&read.configured);
+        BackendLock::for_config(None::<&ParserBackendConfig>)
+            .unwrap()
+            .save(&base)
+            .unwrap();
+        let MutationBackendSelection::Verified(verified) =
+            BackendSelection::verified_for_mutation(&base, None::<&ParserBackendConfig>).unwrap()
+        else {
+            panic!("verified")
+        };
+        accepts_configured(&verified.configured);
+        let explicit = BackendSelection::explicit_url(&StateUrl::parse("state.json").unwrap());
+        assert!(matches!(explicit.url, StateUrl::File { .. }));
+    }
+    #[tokio::test]
+    async fn resolved_read_origin_is_implicit_declared_or_locked() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("main.crn"), "let unused = 'fixture'\n").unwrap();
+        let base = ResolvedPath::new(root.path()).unwrap();
+        let read = BackendSelection::for_read(&base, None::<&ParserBackendConfig>)
+            .unwrap()
+            .resolve_with_drift_warning(|_| {})
+            .await
+            .unwrap();
+        assert_eq!(read.origin(), ReadBackendOrigin::Implicit);
+        let declared = raw("new.json");
+        let read = BackendSelection::for_read(&base, Some(&declared))
+            .unwrap()
+            .resolve_with_drift_warning(|_| {})
+            .await
+            .unwrap();
+        assert_eq!(read.origin(), ReadBackendOrigin::Declared);
+        BackendLock::for_config(Some(&raw("old.json")))
+            .unwrap()
+            .save(&base)
+            .unwrap();
+        let read = BackendSelection::for_read(&base, Some(&declared))
+            .unwrap()
+            .resolve_with_drift_warning(|_| {})
+            .await
+            .unwrap();
+        assert_eq!(read.origin(), ReadBackendOrigin::Locked);
+        assert_eq!(read.selected_config().as_s3(), None);
+        let BackendConfig::Local(settings) = read.selected_config() else {
+            panic!("local")
+        };
+        assert_eq!(settings.path(), Some("old.json"));
+    }
+    #[tokio::test]
+    async fn migration_locate_error_uses_address_wording() {
+        let root = tempfile::tempdir().unwrap();
+        let base = ResolvedPath::new(root.path()).unwrap();
+        let settings = BackendConfig::try_from(&raw("bad\0state")).unwrap();
+        let BackendConfig::Local(local) = &settings else {
+            panic!("local")
+        };
+        let io = crate::backends::anchored_local_path(local, &base).unwrap_err();
+        let selected = ConfiguredBackend::new(AdmittedBackendOrigin::Declared(settings), base);
+        let error = resolve_migration_backend(selected.config(), &selected.base_dir)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), format!("I/O error: {io}"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn implicit_locate_error_uses_address_wording() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let base = ResolvedPath::new(root.path()).unwrap();
+        let name = crate::backends::LocalBackend::DEFAULT_STATE_FILE;
+        symlink(name, root.path().join(name)).unwrap();
+        let io = base.join(name).unwrap_err();
+        let read = BackendSelection::for_read(&base, None::<&ParserBackendConfig>).unwrap();
+        let error = read.resolve_with_drift_warning(|_| {}).await.err().unwrap();
+        assert_eq!(error.to_string(), format!("I/O error: {io}"));
+    }
+}
+
+#[cfg(test)]
+mod migration_settings_tests {
+    use super::*;
+    #[tokio::test]
+    async fn migration_uses_admitted_implicit_local_path() {
+        let root = tempfile::tempdir().unwrap();
+        let base = ResolvedPath::new(root.path()).unwrap();
+        let config = BackendConfig::Local(BackendConfig::implicit_local());
+        let (_, path) = resolve_migration_backend(&config, &base).await.unwrap();
+        assert_eq!(
+            path.unwrap().identity(),
+            base.join("carina.state.json").unwrap().identity()
+        );
     }
 }

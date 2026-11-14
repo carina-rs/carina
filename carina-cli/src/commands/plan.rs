@@ -1,3 +1,6 @@
+mod backend_config;
+pub use backend_config::SavedBackendConfig;
+
 use carina_core::resource::{PersistedDestroyDependencies, ResolvedResourceId};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Deref;
@@ -487,7 +490,7 @@ mod provider_scope_evidence_tests {
             state_lineage: None,
             state_serial: None,
             provider_configs,
-            backend_config: None,
+            backend_config: SavedBackendConfig::default(),
             plan: SnapshotPlan::default(),
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
@@ -790,7 +793,7 @@ pub struct PlanFileContents<S = ModuleSource, P = SnapshotPlan<S>, V: PlanValueK
     /// Provider configurations
     pub provider_configs: SavedProviderConfigs<V>,
     /// Backend configuration
-    pub backend_config: Option<BackendConfig>,
+    pub backend_config: SavedBackendConfig,
     /// The plan (effects)
     pub plan: P,
     /// Dependency-resolved resources sorted by dependencies and keyed with
@@ -1658,7 +1661,7 @@ impl From<PlanFile> for PlanFileWire {
             state_lineage,
             state_serial,
             provider_configs,
-            backend_config,
+            backend_config: backend_config.into_wire(),
             plan,
             sorted_resources,
             sorted_value_destroy_dependencies,
@@ -1723,7 +1726,7 @@ impl TryFrom<PlanFileWire> for PlanFile {
             state_lineage,
             state_serial,
             provider_configs,
-            backend_config,
+            backend_config: backend_config.into(),
             plan,
             sorted_resources,
             sorted_value_destroy_dependencies,
@@ -2450,13 +2453,9 @@ impl PlanFile {
         } = &self.contents;
 
         provider_configs.contains_redacted_secret()
-            || backend_config.as_ref().is_some_and(|backend| {
-                let BackendConfig {
-                    backend_type: _backend_type,
-                    attributes,
-                    attribute_spans: _attribute_spans,
-                } = backend;
-                attributes
+            || backend_config.candidate().is_some_and(|backend| {
+                backend
+                    .attributes
                     .values()
                     .any(carina_core::value::contains_redacted_secret)
             })
@@ -3953,6 +3952,10 @@ pub(crate) struct ReloadedPlanFile<
 }
 
 impl UnresolvedReloadedPlanFile {
+    pub(crate) fn provider_configs(&self) -> &SavedProviderConfigs {
+        &self.contents.provider_configs
+    }
+
     pub(crate) fn legacy_dependency_classification(
         &self,
     ) -> Option<&LegacyDependencyClassification> {
@@ -4646,6 +4649,7 @@ mod managed_current_serde {
 
 #[cfg(test)]
 mod managed_current_serde_tests {
+    use super::SavedBackendConfig;
     use super::{
         CurrentStateEntry, PlanFile, PlanFileContents, ReloadSavedManagedCurrent,
         ReloadedCurrentStateEntry, SavedManagedCurrent, SavedManagedCurrentKind,
@@ -4681,7 +4685,7 @@ mod managed_current_serde_tests {
             state_serial: None,
             provider_configs: serde_json::from_value(serde_json::json!([]))
                 .expect("empty saved provider configs"),
-            backend_config: None,
+            backend_config: SavedBackendConfig::default(),
             plan: (carina_core::plan::Plan::new()).to_snapshot(),
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
@@ -5138,7 +5142,7 @@ impl std::error::Error for PlanSaveError {}
 fn build_plan_file<E>(
     path: &ResolvedPath,
     provider_configs: &ResolvedProviderConfigs,
-    backend_config: Option<BackendConfig>,
+    backend_config: SavedBackendConfig,
     state_file: &Option<StateFile>,
     directive_changes: Vec<PersistedDirectiveChange>,
     validated_plan: &ValidatedConfig<crate::wiring::ExpandedPlanContext<E>>,
@@ -5165,7 +5169,7 @@ pub(crate) fn build_plan_file_from_parts<E, R>(
     path: &ResolvedPath,
     parsed: &carina_core::parser::ExpandedFile<E>,
     provider_configs: &ResolvedProviderConfigs,
-    backend_config: Option<BackendConfig>,
+    backend_config: SavedBackendConfig,
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
     validated_config: &ValidatedConfig<R>,
@@ -5194,7 +5198,7 @@ fn build_plan_file_contents<E>(
     path: &ResolvedPath,
     parsed: &carina_core::parser::ExpandedFile<E>,
     provider_configs: &ResolvedProviderConfigs,
-    backend_config: Option<BackendConfig>,
+    backend_config: SavedBackendConfig,
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
     checked: &carina_core::input_rules::InputCheckedPlan,
@@ -5892,10 +5896,8 @@ pub(crate) async fn run_plan_using(
         ReadBackendWarningPolicy::CommandBoundary { project_dir: path },
     )
     .await?;
-    let plan_file_backend_config = plan_backend
-        .selected_config()
-        .map(carina_state::BackendConfig::to_parser_config);
     let use_locked_backend = plan_backend.migration_pending();
+    let plan_file_backend_config = SavedBackendConfig::from_read_backend(&plan_backend);
     let drift_note = use_locked_backend.then(|| {
         format!(
             "Backend migration pending: plan read state from the OLD backend recorded in \
@@ -5910,7 +5912,8 @@ pub(crate) async fn run_plan_using(
     let mut state_bucket_name = String::new();
     let mut state_file: Option<StateFile> = None;
 
-    if let Some(config) = plan_backend.selected_config() {
+    {
+        let config = plan_backend.selected_config();
         let bucket_exists = plan_backend
             .bucket_exists()
             .await
@@ -5969,15 +5972,6 @@ pub(crate) async fn run_plan_using(
                 }
             }
         }
-    } else {
-        // Use local backend by default. Plan is read-only; drop any
-        // pending-migration token (carina#3315 — lock-held callers
-        // persist instead).
-        state_file = plan_backend
-            .read_state()
-            .await
-            .map_err(AppError::Backend)?
-            .map(|loaded| loaded.into_state());
     }
 
     // T0 fingerprint; see `StateSnapshot` for the TOCTOU rationale.
@@ -6668,6 +6662,10 @@ impl<C> ResolvedProviderInputs<C> {
     }
     pub(crate) fn remote_bindings(&self) -> &AdmittedRemoteBindings {
         &self.remote_bindings
+    }
+
+    pub(crate) fn into_parts(self) -> (C, AdmittedRemoteBindings) {
+        (self.configs, self.remote_bindings)
     }
 }
 
@@ -7739,9 +7737,7 @@ mod load_upstream_states_tests {
         fn display_name(&self) -> &str {
             "mock enum metadata"
         }
-        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-            Default::default()
-        }
+
         fn validate_config(
             &self,
             _: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -9558,7 +9554,7 @@ mod run_plan_out_tests {
             &carina_core::paths::ResolvedPath::new(&path).unwrap(),
             &parsed,
             &provider_configs,
-            None,
+            SavedBackendConfig::default(),
             &Some(state_file),
             &ctx,
             &ValidatedConfig::from_factories_for_test(
@@ -9617,7 +9613,7 @@ mod run_plan_out_tests {
         fs::write(
             dir.join("main.crn"),
             r#"
-                provider mock { target = bucket.name }
+                provider mock { source = 'file://in-process-test.wasm' target = bucket.name }
                 let bucket = mock.test.resource { name_prefix = "pref-" }
             "#,
         )
@@ -9648,7 +9644,7 @@ mod run_plan_out_tests {
         .unwrap();
 
         let plan_path = dir.join("plan.json");
-        run_plan(
+        run_plan_using(
             &runtime,
             dir,
             Some(&plan_path),
@@ -9661,6 +9657,15 @@ mod run_plan_out_tests {
             false,
             false,
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            |runtime, providers, _| {
+                Ok(crate::wiring::ProviderLoad::for_test_with_provider_phase(
+                    runtime,
+                    crate::wiring::LoadedProviderFactory::for_test(vec![Box::new(
+                        crate::test_support::ConfigurableMockFactory::with_string_setting("target"),
+                    )]),
+                    providers,
+                ))
+            },
         )
         .await
         .expect("plan should resolve provider attributes after name reconciliation");
@@ -9969,7 +9974,7 @@ mod run_plan_out_tests {
             &carina_core::paths::ResolvedPath::new(&path).unwrap(),
             &parsed,
             &provider_configs,
-            None,
+            SavedBackendConfig::default(),
             &None,
             &ctx,
             &ValidatedConfig::from_factories_for_test(
@@ -10076,7 +10081,7 @@ mod run_plan_out_tests {
             &carina_core::paths::ResolvedPath::new(&path).unwrap(),
             &parsed,
             &provider_configs,
-            None,
+            SavedBackendConfig::default(),
             &None,
             &ctx,
             &ValidatedConfig::from_factories_for_test(
@@ -10155,7 +10160,7 @@ mod run_plan_out_tests {
             &carina_core::paths::ResolvedPath::new(&path).unwrap(),
             &parsed,
             &provider_configs,
-            None,
+            SavedBackendConfig::default(),
             &None,
             &ctx,
             &ValidatedConfig::from_factories_for_test(
@@ -10236,7 +10241,7 @@ mod run_plan_out_tests {
             &carina_core::paths::ResolvedPath::new(&path).unwrap(),
             &parsed,
             &provider_configs,
-            None,
+            SavedBackendConfig::default(),
             &None,
             &ctx,
             &wiring,

@@ -751,9 +751,6 @@ impl carina_core::provider::ProviderFactory for ConfiguredBuiltinMock {
     fn display_name(&self) -> &str {
         "Mock provider"
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        ValidatedConfigSchema::default()
-    }
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -795,9 +792,6 @@ impl carina_core::provider::ProviderFactory for MockNormalizer {
     fn display_name(&self) -> &str {
         "Mock normalizer"
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        ValidatedConfigSchema::default()
-    }
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -825,6 +819,7 @@ impl carina_core::provider::ProviderFactory for MockNormalizer {
     fn create_normalizer(
         &self,
         _: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         let normalizer = self.clone();
         Box::pin(async move { Ok(Box::new(normalizer) as Box<dyn ProviderNormalizer>) })
@@ -2094,6 +2089,11 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn builtin_native_configuration_declaration_is_empty() {
+        assert!(builtin_schema_witness().config().parts().is_empty());
+    }
+
+    #[test]
     fn builtin_schemas_are_all_valid() {
         let schemas = builtin_schemas();
         assert!(!schemas.is_empty());
@@ -2213,11 +2213,12 @@ mod tests {
                 file.resources.push(desired);
                 let session = carina_core::validation::ResolvedFile::for_test(file)
                     .provider_plan()
-                    .session(&id.provider, id.provider_instance.as_deref(), None);
-                let boundary =
-                    carina_core::provider::ProviderBoundary::initialize(&factory, &session)
-                        .await
-                        .unwrap();
+                    .test_session(&id.provider, id.provider_instance.as_deref(), None);
+                let boundary = carina_core::provider::ProviderBoundary::initialize_for_test(
+                    &factory, &session,
+                )
+                .await
+                .unwrap();
                 assert_eq!(request.resource().id, id);
                 let prepared = carina_core::replacement::create_permit_with_schemas_for_test(
                     request, &schemas,

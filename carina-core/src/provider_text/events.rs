@@ -2,7 +2,7 @@
 use super::*;
 use crate::provider::{HostError, ProviderError};
 use crate::resource::{ConcreteValue, ResourceId, Value};
-use crate::schema::{EffectiveType, SchemaKind, SchemaRegistry};
+use crate::schema::{EffectiveType, SchemaRegistry};
 use carina_provider_protocol::diagnostics as wire;
 use carina_provider_protocol::types as protocol;
 use std::collections::HashMap;
@@ -950,13 +950,9 @@ fn bind_event(
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let schema = resolved.and_then(|(host, _paths)| {
-                schemas.as_ref().and_then(|schemas| {
-                    schemas
-                        .get(&host.provider, &host.resource_type, SchemaKind::Resource)
-                        .or_else(|| {
-                            schemas.get(&host.provider, &host.resource_type, SchemaKind::DataSource)
-                        })
-                })
+                schemas
+                    .as_ref()
+                    .and_then(|schemas| schemas.get_kindless(&host.provider, &host.resource_type))
             });
             if let Some((host, _paths)) = resolved {
                 push(ProviderText::new(host.to_string()))?;
@@ -1362,7 +1358,7 @@ mod writer_tests {
         const CHILD: &str = "CARINA_4334_FIX4_WRITER_CHILD";
         if std::env::var_os(CHILD).is_some() {
             let session = crate::provider::ProviderPlan::state_only()
-                .session_builder("writer-test", None, None)
+                .test_session_builder("writer-test", None, None)
                 .with_diagnostic_sink(write_default_event)
                 .build();
             let (inputs, call) = session.guest_inventory().for_diagnostic_call();

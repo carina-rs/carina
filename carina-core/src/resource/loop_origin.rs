@@ -139,6 +139,11 @@ impl Hash for LoopSource {
 }
 
 impl LoopSource {
+    #[cfg(feature = "test-utils")]
+    pub fn recording_parts(&self) -> (LoopKind, &ResourceIdentity) {
+        (self.kind, &self.system_identity)
+    }
+
     pub(crate) fn authored(
         source_file: &Path,
         span: SourceSpan,
@@ -262,6 +267,11 @@ impl LoopSource {
     }
 }
 
+#[cfg(not(feature = "test-utils"))]
+type LoopIdentityHasher = Sha256;
+#[cfg(feature = "test-utils")]
+type LoopIdentityHasher = crate::identity_recording::RecordingSha256;
+
 fn loop_system_identity(
     file_or_parent_identity: &str,
     start: usize,
@@ -269,12 +279,19 @@ fn loop_system_identity(
     kind: LoopKind,
     module_scope: Option<&str>,
 ) -> ResourceIdentity {
-    fn component(hasher: &mut Sha256, value: &[u8]) {
+    fn component(hasher: &mut LoopIdentityHasher, value: &[u8]) {
         hasher.update((value.len() as u64).to_be_bytes());
         hasher.update(value);
     }
 
-    let mut hasher = Sha256::new();
+    let hasher = Sha256::new();
+    #[cfg(not(feature = "test-utils"))]
+    let mut hasher = hasher;
+    #[cfg(feature = "test-utils")]
+    let mut hasher =
+        crate::identity_recording::RecordingSha256::new(hasher, "loop-system-identity");
+    #[cfg(feature = "test-utils")]
+    let recording = hasher.result_link();
     component(&mut hasher, file_or_parent_identity.as_bytes());
     hasher.update((start as u64).to_be_bytes());
     hasher.update((end as u64).to_be_bytes());
@@ -289,7 +306,12 @@ fn loop_system_identity(
         }
         None => hasher.update([0]),
     }
-    ResourceIdentity::new(format!("_loop_{}", hex::encode(&hasher.finalize()[..8])))
+    let identity = ResourceIdentity::new(format!("_loop_{}", hex::encode(&hasher.finalize()[..8])));
+    #[cfg(feature = "test-utils")]
+    if let Some(recording) = recording {
+        recording.loop_result(&identity, module_scope.map(|_| file_or_parent_identity));
+    }
+    identity
 }
 
 /// Provenance for one concrete resource emitted by an unbound `for` or `if`.
@@ -303,6 +325,15 @@ pub struct LoopElementOrigin {
 }
 
 impl LoopElementOrigin {
+    #[cfg(feature = "test-utils")]
+    pub fn recording_parts(&self) -> (&LoopSource, &str, Option<&ResourceIdentity>) {
+        (
+            &self.source,
+            self.legacy.exact_state_name(),
+            self.current_parent.as_ref(),
+        )
+    }
+
     pub(crate) fn new(kind: LoopOriginKind, source: LoopSource, legacy: LegacyLoopAddress) -> Self {
         Self {
             kind,
@@ -513,6 +544,21 @@ pub struct LoopProvenance {
 }
 
 impl LoopProvenance {
+    #[cfg(feature = "test-utils")]
+    pub fn recording_parts(
+        &self,
+    ) -> (
+        Option<&LoopElementOrigin>,
+        impl Iterator<Item = (&LoopElementOrigin, &ResourceIdentity)>,
+    ) {
+        (
+            self.direct_origin(),
+            self.module_prefixes
+                .iter()
+                .map(|prefix| (prefix.origin(), prefix.current_prefix())),
+        )
+    }
+
     pub(crate) fn direct(origin: LoopElementOrigin) -> Self {
         Self {
             direct: Some(Box::new(origin)),

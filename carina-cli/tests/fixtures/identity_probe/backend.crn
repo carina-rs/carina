@@ -1,0 +1,3 @@
+backend local {
+  path = "must-not-read-or-write.state.json"
+}

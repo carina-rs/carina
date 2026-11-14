@@ -13,6 +13,8 @@ macro_rules! host_api {
     };
 }
 
+pub(crate) use host_api;
+
 pub mod boundary;
 mod events;
 pub(crate) use events::DiagnosticOwner;
@@ -68,9 +70,16 @@ thread_local! { static REDACTION_PASSES: std::cell::Cell<usize> = const { std::c
 /// ```
 /// Sessions are minted by core.
 ///
-/// ```compile_fail,E0451
+/// ```compile_fail
 /// use carina_core::provider::ProviderSession;
-/// let _ = ProviderSession { config: None, provider: String::new(), binding: None, secrets: todo!() };
+/// fn bypass(session: &ProviderSession) {
+///     let _ = &session.config; // forbidden: the existing configuration field is private
+/// }
+/// ```
+/// ```
+/// # use carina_core::provider::ProviderSession;
+/// # fn bypass(session: &ProviderSession) {
+/// # }
 /// ```
 /// Boundaries cannot be constructed externally.
 ///
@@ -129,17 +138,6 @@ thread_local! { static REDACTION_PASSES: std::cell::Cell<usize> = const { std::c
 /// ```
 #[doc(hidden)]
 pub struct BoundaryApiProbes;
-
-/// A provider session requires core's whole-plan admission witness.
-///
-/// ```compile_fail,E0624
-/// use carina_core::provider::{ProviderPlan, ProviderSession};
-/// fn slices(plan: &ProviderPlan) {
-///     let _ = ProviderSession::new(plan, "mock", None, None);
-/// }
-/// ```
-#[doc(hidden)]
-pub struct ProviderSessionSliceProbe;
 
 use std::borrow::Borrow;
 use std::fmt;

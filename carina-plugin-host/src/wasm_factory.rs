@@ -57,8 +57,7 @@ use carina_core::resource::Resource;
 use carina_core::resource::Value;
 use carina_core::resource::{ResourceId, ResourceIdentityState, SnapshotState, State};
 use carina_core::schema::{
-    CompletionValue, TypeIdentity, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
-    ValidatedResourceSchema,
+    CompletionValue, TypeIdentity, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
 use carina_core::wait::BindingPattern;
 use carina_core::wait::predicate::AttrPath;
@@ -917,15 +916,14 @@ impl WasmLoadNoticeSink {
     }
     fn validation_inputs(&self, provider: &str) -> carina_core::provider::ProviderValidationInputs {
         let notices = self.clone();
-        carina_core::provider::ProviderPlan::state_only()
-            .session_builder(provider, None, None)
-            .with_filtered_diagnostic_sink(move |event| {
+        carina_core::provider::ProviderValidationInputs::for_schema_with_filtered_diagnostic_sink(
+            provider,
+            move |event| {
                 notices.emit(WasmLoadNotice::ProviderDiagnostic(
                     ValidationProviderNotice(event),
                 ))
-            })
-            .build()
-            .guest_inputs()
+            },
+        )
     }
 }
 
@@ -2378,9 +2376,7 @@ fn build_sandboxed_wasi_ctx_with(
     env_value: impl FnMut(&str) -> Option<String>,
 ) -> WasiCtx {
     let engine = Engine::default();
-    let inputs = carina_core::provider::ProviderPlan::state_only()
-        .session("", None, None)
-        .guest_inventory();
+    let inputs = carina_core::provider::ProviderValidationInputs::for_schema("").guest_inventory();
     let store = carina_core::provider_text::GuestStoreData::new_store(&engine, (), inputs);
     build_sandboxed_wasi_ctx_for_store(store.data(), capabilities, env_value)
 }
@@ -4360,10 +4356,6 @@ impl ProviderFactory for SchemaOnlyWasmProviderFactory {
         &self.display_name
     }
 
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        self.schema_witness.config().clone()
-    }
-
     fn validate_config(
         &self,
         _attributes: &CanonicalProviderConfigAttributes,
@@ -4423,10 +4415,6 @@ impl ProviderFactory for WasmProviderFactory {
         &self.display_name
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        self.schema_witness.config().clone()
-    }
-
     fn validate_config(
         &self,
         attributes: &CanonicalProviderConfigAttributes,
@@ -4460,13 +4448,7 @@ impl ProviderFactory for WasmProviderFactory {
         config: &carina_core::provider::ProviderSession,
         initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
-        let Some(ready) = config.configuration() else {
-            return Box::pin(async {
-                Err(ProviderError::invalid_input(
-                    "WASM providers require checked configuration",
-                ))
-            });
-        };
+        let ready = config.configuration();
         self.create_provider_in_context(
             config.binding(),
             ready,
@@ -4478,14 +4460,9 @@ impl ProviderFactory for WasmProviderFactory {
     fn create_normalizer(
         &self,
         config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
-        let Some(ready) = config.configuration() else {
-            return Box::pin(async {
-                Err(ProviderError::invalid_input(
-                    "WASM providers require checked configuration",
-                ))
-            });
-        };
+        let ready = config.configuration();
         self.create_normalizer_in_context(config.binding(), ready, Some(config.guest_inputs()))
     }
 

@@ -371,3 +371,90 @@ pub use crate::provider_text_fixtures::{boundary, normalizer};
 #[cfg(test)]
 #[path = "../../carina-core/tests/support/creation.rs"]
 pub(crate) mod creation_fixture;
+
+/// A test-only declaration whose values are consumed by the configuration harness.
+#[cfg(test)]
+pub(crate) struct ConfigurableMockFactory {
+    config: carina_core::test_utils::configuration::ConfigFactory,
+    provider: ConfiguredBuiltinMock,
+}
+#[cfg(test)]
+impl ConfigurableMockFactory {
+    pub(crate) fn with_string_setting(key: &str) -> Self {
+        Self {
+            config: carina_core::test_utils::configuration::ConfigFactory::new(
+                carina_core::schema::ValidatedConfigSchema::validate(
+                    std::collections::BTreeMap::from([(
+                        key.into(),
+                        carina_core::schema::AttributeType::string(),
+                    )]),
+                )
+                .unwrap(),
+            )
+            .named("mock"),
+            provider: ConfiguredBuiltinMock::new(Default::default(), MockScope::memory()),
+        }
+    }
+}
+#[cfg(test)]
+impl carina_core::provider::ProviderFactory for ConfigurableMockFactory {
+    fn name(&self) -> &str {
+        "mock"
+    }
+    fn display_name(&self) -> &str {
+        "configuration test provider"
+    }
+    fn validate_config(
+        &self,
+        attrs: &carina_core::provider::CanonicalProviderConfigAttributes,
+        inputs: &carina_core::provider::ProviderValidationInputs,
+    ) -> carina_core::provider::ProviderResult<()> {
+        self.config.validate_config(attrs, inputs)
+    }
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        carina_provider_mock::builtin_schemas()
+    }
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.config.schema.clone(),
+            Default::default(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+    fn create_provider(
+        &self,
+        session: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
+    ) -> carina_core::provider::BoxFuture<
+        '_,
+        carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
+    > {
+        assert_eq!(
+            self.config.seen.lock().unwrap().last(),
+            Some(session.configuration().attributes())
+        );
+        let provider = self.provider.create_provider();
+        Box::pin(async {
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(provider)))
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_mock_wasm(directory: &std::path::Path) {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    let source = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
+        .into_iter()
+        .map(|name| workspace.join("target/wasm32-wasip2/debug").join(name))
+        .find(|path| path.is_file())
+        .expect("the mock WASM fixture must be built");
+    std::fs::copy(&source, directory.join("mock.wasm")).unwrap();
+    let installed = directory.join(".carina/providers/file/mock/mock.wasm");
+    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    std::fs::copy(source, installed).unwrap();
+}

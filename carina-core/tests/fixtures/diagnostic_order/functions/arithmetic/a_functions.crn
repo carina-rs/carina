@@ -1,0 +1,2 @@
+fn zebra(value: Float): Int { value + 1 }
+fn mango(value: Float): Int { value + 2 }

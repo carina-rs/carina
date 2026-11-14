@@ -1,0 +1,33 @@
+{
+  "case": "backend",
+  "count": 2,
+  "errors": [
+    {
+      "message": "cidr_subnet(): cidr_subnet() invalid CIDR format: 'bad' (expected 'address/prefix')",
+      "range": {
+        "end": {
+          "character": 8,
+          "line": 1
+        },
+        "start": {
+          "character": 2,
+          "line": 1
+        }
+      }
+    },
+    {
+      "message": "Invalid expression at line 2: cidr_subnet(): cidr_subnet() invalid CIDR format: 'bad' (expected 'address/prefix')",
+      "range": {
+        "end": {
+          "character": 8,
+          "line": 1
+        },
+        "start": {
+          "character": 2,
+          "line": 1
+        }
+      }
+    }
+  ],
+  "file": "backend.crn"
+}

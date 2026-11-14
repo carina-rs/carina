@@ -702,7 +702,7 @@ fn function_leaf() -> crate::parser::UserFunction<RelativeBindingName> {
     )
     .unwrap()
     .user_functions
-    .remove("leaf")
+    .shift_remove("leaf")
     .unwrap()
 }
 #[test]
@@ -716,7 +716,7 @@ fn function_body_graph_is_classified_once_per_call() {
     for level in 0..20 {
         let call = Parsed::Deferred(DeferredValue::ResolvedFunctionCall {
             function: function.clone(),
-            functions: Arc::new(std::collections::HashMap::new()),
+            functions: Arc::new(indexmap::IndexMap::new()),
             args: vec![],
             source_line: 1.into(),
         });
@@ -727,7 +727,7 @@ fn function_body_graph_is_classified_once_per_call() {
     }
     let value = Parsed::Deferred(DeferredValue::ResolvedFunctionCall {
         function,
-        functions: Arc::new(std::collections::HashMap::new()),
+        functions: Arc::new(indexmap::IndexMap::new()),
         args: vec![],
         source_line: 1.into(),
     });
@@ -772,7 +772,7 @@ fn secret_propagates_classification_errors() {
     let value = Value::<ParserPlaceholder, RelativeBindingName>::Deferred(DeferredValue::Secret(
         Box::new(Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
-            functions: std::sync::Arc::new(std::collections::HashMap::new()),
+            functions: std::sync::Arc::new(indexmap::IndexMap::new()),
             args: vec![],
             source_line: 1.into(),
         }))
@@ -852,7 +852,7 @@ fn lexical_call(
 ) -> Value<ParserPlaceholder, RelativeBindingName> {
     Value::Deferred(DeferredValue::ResolvedFunctionCall {
         function,
-        functions: std::sync::Arc::new(std::collections::HashMap::new()),
+        functions: std::sync::Arc::new(indexmap::IndexMap::new()),
         args: vec![],
         source_line: 1.into(),
     })
@@ -869,11 +869,11 @@ fn shared_lexical_body_keeps_each_invocations_operand_timing() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let function = Arc::new(parsed.user_functions.remove("identity").unwrap());
+    let function = Arc::new(parsed.user_functions.shift_remove("identity").unwrap());
     let call = |argument: Parsed| {
         Parsed::Deferred(DeferredValue::ResolvedFunctionCall {
             function: Arc::clone(&function),
-            functions: Arc::new(HashMap::new()),
+            functions: Arc::new(indexmap::IndexMap::new()),
             args: vec![argument.into()],
             source_line: 1.into(),
         })

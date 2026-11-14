@@ -1,4 +1,6 @@
 //! Integration tests for the general mock and the isolated wasi:http probe guests.
+#[path = "support/configuration_schema.rs"]
+mod configuration_schema_fixture;
 #[path = "wasm_integration/provider_diagnostics.rs"]
 mod provider_diagnostics;
 
@@ -78,18 +80,16 @@ fn mock_identifier() -> AppliedIdentifier {
     AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty")
 }
 
-struct WireConfigFactory;
+struct MalformedConfigFactory;
 
-impl ProviderFactory for WireConfigFactory {
+impl ProviderFactory for MalformedConfigFactory {
     fn name(&self) -> &str {
         "mock"
     }
     fn display_name(&self) -> &str {
         "native wire fixture"
     }
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        carina_core::schema::ValidatedConfigSchema::validate(Default::default()).unwrap()
-    }
+
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -113,7 +113,18 @@ impl ProviderFactory for WireConfigFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            carina_core::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from(
+                [(
+                    "unique_values".into(),
+                    carina_core::schema::AttributeType::refined_list(
+                        carina_core::schema::AttributeType::string(),
+                        true,
+                        None,
+                        carina_core::schema::ListElements::Unique,
+                    ),
+                )],
+            ))
+            .unwrap(),
             Default::default(),
             Vec::new(),
         )
@@ -122,50 +133,88 @@ impl ProviderFactory for WireConfigFactory {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn wire_boundary_factory_config_has_native_and_wasm_parity() {
-    let wasm = wasm_path().expect("carina#4212 requires the mock WASM fixture");
+async fn configuration_duration_overflow_fails_before_native_and_wasm_hooks() {
+    let wasm = wasm_path().expect("mock WASM fixture must be built");
     let (factory, _cache) = load_factory(&wasm).await;
     let attributes = indexmap::IndexMap::from([(
-        "extra".into(),
-        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
-            "unrelated".into(),
-            Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
-                u64::MAX,
-            ))),
-        )]))),
+        "duration".into(),
+        Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+            u64::MAX,
+        ))),
     )]);
     let config = resolved_provider_config("mock", attributes);
-    let mut errors = Vec::new();
-    for factory in [&factory as &dyn ProviderFactory, &WireConfigFactory] {
-        errors.push(
-            carina_core::executor::prepare_provider_ready_config(factory, &config)
-                .expect_err("both factories must fail before semantic validation"),
-        );
-    }
-    assert_eq!(errors[0].to_string(), errors[1].to_string());
-    assert!(errors[0].to_string().contains("extra.unrelated"));
-    for error in &errors {
-        let carina_core::executor::ProviderConfigPreparationError::Wire(error) = error else {
-            panic!("expected a shared wire error: {error}")
+    for factory in [&factory as &dyn ProviderFactory, &MalformedConfigFactory] {
+        let declared = configuration_schema_fixture::DurationConfiguration(factory);
+        let error =
+            carina_core::executor::prepare_provider_ready_config(&declared, &config).unwrap_err();
+        let carina_core::executor::ProviderConfigPreparationError::Wire(wire) = &error else {
+            panic!("expected shared configuration wire overflow: {error:?}");
         };
+        assert!(matches!(
+            wire.conversion_error(),
+            carina_core::protocol_convert::ProtocolConvertError::DurationOutOfRange
+        ));
         assert_eq!(
-            error.target(),
+            wire.target(),
             &carina_core::provider::ProviderWireTarget::Configuration {
                 provider: "mock".into()
             }
         );
-        assert_eq!(error.attribute(), "extra");
-        assert_eq!(
-            error.path(),
-            &[carina_core::protocol_convert::WirePathSegment::Key(
-                "unrelated".into()
-            )]
+        assert_eq!(wire.attribute(), "duration");
+        assert!(!error.to_string().contains(&u64::MAX.to_string()));
+        assert!(std::error::Error::source(&error).is_none());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn false_configuration_trap_flags_reach_guest_validation_without_trapping() {
+    let path = wasm_path().expect("mock WASM fixture must be built");
+    let (factory, _cache) = load_factory(&path).await;
+    for key in [
+        "__mock_validate_config_trap__",
+        "validate_config_trap",
+        "__mock_initialize_error__",
+    ] {
+        let config = resolved_provider_config(
+            "mock",
+            indexmap::IndexMap::from([(key.into(), Value::Concrete(ConcreteValue::Bool(false)))]),
         );
+        let ready = carina_core::executor::prepare_provider_ready_config(&factory, &config)
+            .expect("false must not request a guest validation trap");
+        factory
+            .initialize_fixture(None, &ready)
+            .await
+            .expect("false must not request a guest initialization failure");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_config_declared_types_have_native_and_wasm_parity() {
+    let wasm = wasm_path().expect("the mock WASM fixture must be built");
+    let (factory, _cache) = load_factory(&wasm).await;
+    let attributes = indexmap::IndexMap::from([(
+        "unique_values".into(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Duration(std::time::Duration::from_secs(u64::MAX)),
+        )])),
+    )]);
+    let config = resolved_provider_config("mock", attributes);
+    let mut errors = Vec::new();
+    for factory in [&factory as &dyn ProviderFactory, &MalformedConfigFactory] {
+        errors.push(
+            carina_core::executor::prepare_provider_ready_config(factory, &config)
+                .expect_err("both factories must reject the declared field's invalid type"),
+        );
+    }
+    assert_eq!(errors[0].to_string(), errors[1].to_string());
+    assert!(errors[0].to_string().contains("unique_values"));
+    assert!(errors[0].to_string().contains("Type mismatch"));
+    assert!(!errors[0].to_string().contains(&u64::MAX.to_string()));
+    for error in &errors {
         assert!(matches!(
-            error.conversion_error(),
-            carina_core::protocol_convert::ProtocolConvertError::DurationOutOfRange
+            error,
+            carina_core::executor::ProviderConfigPreparationError::InvalidAttribute { .. }
         ));
-        assert!(std::error::Error::source(error).is_none());
     }
 }
 
@@ -6312,7 +6361,7 @@ async fn test_wasm_create_normalizer_propagates_instance_initialization_failure(
     let (factory, _cache) = load_factory(&path).await;
     let attributes = indexmap::IndexMap::from([(
         "__mock_initialize_error__".to_string(),
-        Value::Concrete(ConcreteValue::String("normalizer init failed".into())),
+        Value::Concrete(ConcreteValue::Bool(true)),
     )]);
     let config = ready_config(&factory, &attributes);
 
@@ -6738,12 +6787,12 @@ async fn test_wasm_normalize_state_trap_is_an_error_and_does_not_mutate_state() 
     let attributes = indexmap::IndexMap::new();
     let config = ready_config(&factory, &attributes);
     let session =
-        carina_core::provider::ProviderPlan::state_only().session("mock", None, Some(&config));
-    let provider = carina_core::provider::ProviderBoundary::initialize(&factory, &session)
+        carina_core::provider::ProviderPlan::state_only().test_session("mock", None, Some(&config));
+    let provider = carina_core::provider::ProviderBoundary::initialize_for_test(&factory, &session)
         .await
         .expect("provider should initialize");
     let normalizer =
-        carina_core::provider::ProviderBoundary::initialize_normalizer(&factory, &session)
+        carina_core::provider::ProviderBoundary::initialize_normalizer_for_test(&factory, &session)
             .await
             .expect("normalizer should initialize");
     let id = ResourceId::with_provider_identity(
@@ -6921,12 +6970,12 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
     let attributes = indexmap::IndexMap::new();
     let config = ready_config(&factory, &attributes);
     let session =
-        carina_core::provider::ProviderPlan::state_only().session("mock", None, Some(&config));
-    let provider = carina_core::provider::ProviderBoundary::initialize(&factory, &session)
+        carina_core::provider::ProviderPlan::state_only().test_session("mock", None, Some(&config));
+    let provider = carina_core::provider::ProviderBoundary::initialize_for_test(&factory, &session)
         .await
         .expect("provider should initialize");
     let normalizer =
-        carina_core::provider::ProviderBoundary::initialize_normalizer(&factory, &session)
+        carina_core::provider::ProviderBoundary::initialize_normalizer_for_test(&factory, &session)
             .await
             .expect("normalizer should initialize");
 
@@ -7656,5 +7705,70 @@ async fn wasm_pattern_modes_preserve_matching_and_reason() {
                 );
             }
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn undeclared_provider_config_keys_reject_before_native_and_wasm_factories() {
+    let path =
+        wasm_path().expect("mock WASM fixture must be built for configuration rejection tests");
+    let (factory, _cache) = load_factory(&path).await;
+    let native = carina_provider_mock::ConfiguredBuiltinMock::new(
+        Default::default(),
+        carina_provider_mock::MockScope::memory(),
+    );
+    let wasm_attributes = indexmap::IndexMap::from([
+        (
+            "__mock_reference_scope_region__".into(),
+            Value::Concrete(ConcreteValue::String("region".into())),
+        ),
+        (
+            "__mock_validate_config_cause__".into(),
+            Value::Concrete(ConcreteValue::String(
+                "must not reach semantic validation".into(),
+            )),
+        ),
+    ]);
+    for (factory, mut attrs, declared_key) in [
+        (
+            &factory as &dyn ProviderFactory,
+            wasm_attributes,
+            Some("__mock_reference_scope_region__"),
+        ),
+        (
+            &native as &dyn ProviderFactory,
+            indexmap::IndexMap::new(),
+            None,
+        ),
+    ] {
+        attrs.insert(
+            "undeclared_probe".into(),
+            Value::Concrete(ConcreteValue::String("not printed".into())),
+        );
+        match declared_key {
+            Some(key) => assert!(factory.schema_witness().config().parts().contains_key(key)),
+            None => assert!(factory.schema_witness().config().parts().is_empty()),
+        }
+        assert!(
+            !factory
+                .schema_witness()
+                .config()
+                .parts()
+                .contains_key("undeclared_probe")
+        );
+        let config = resolved_provider_config("mock", attrs);
+        let error = carina_core::executor::prepare_provider_ready_config(factory, &config)
+            .expect_err("an undeclared field cannot produce factory construction authority");
+        assert!(matches!(error, carina_core::executor::provider_ready::ProviderConfigPreparationError::UnknownAttributes(_)));
+        let message = error.to_string();
+        assert!(
+            message.contains("Unknown attribute 'undeclared_probe'"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("must not reach semantic validation"),
+            "{message}"
+        );
+        assert!(!message.contains("not printed"), "{message}");
     }
 }

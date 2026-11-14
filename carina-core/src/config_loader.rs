@@ -400,6 +400,54 @@ pub struct RootDirectoryParse<E = crate::parser::ParsedExportParam> {
 pub type ParsedRootDirectory = RootDirectoryParse<crate::parser::ParsedExportParam>;
 pub type InferredRootDirectory = RootDirectoryParse<crate::parser::InferredExportParam>;
 
+/// One sealed root snapshot with the directory authority for resolving its copy.
+pub struct InferredRootAnalysis<'a> {
+    root: &'a InferredRootDirectory,
+    tree: parser::AnalysisTree<
+        'a,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        parser::ParsedDeferredForPhase,
+        crate::resource::RelativeBindingName,
+        parser::InferredExportParam,
+    >,
+}
+
+impl<'a> InferredRootAnalysis<'a> {
+    pub fn tree(
+        &self,
+    ) -> &parser::AnalysisTree<
+        'a,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        parser::ParsedDeferredForPhase,
+        crate::resource::RelativeBindingName,
+        parser::InferredExportParam,
+    > {
+        &self.tree
+    }
+
+    /// Resolve this snapshot's declarations without rebuilding its analysis.
+    pub fn resolve_type_exprs_report(
+        self,
+        config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> (
+        InferredRootDirectory,
+        crate::validation::FileTypeResolutionReport,
+    ) {
+        let (parsed, report) =
+            crate::validation::resolve_file_type_exprs_from_analysis(&self.tree, config, None);
+        (
+            RootDirectoryParse {
+                parsed,
+                resolution: self.root.resolution,
+                verdict: self.root.verdict.clone(),
+            },
+            report,
+        )
+    }
+}
+
 /// A loader-owned directory admitted as resolver input with its judgement.
 /// Judgement, including bootstrap/metadata inference, already retains require
 /// placement findings; commands decide whether to publish or reject them.
@@ -1106,6 +1154,13 @@ impl<E> RootDirectoryParse<E> {
 }
 
 impl RootDirectoryParse<crate::parser::InferredExportParam> {
+    pub fn analysis(&self) -> Result<InferredRootAnalysis<'_>, parser::AnalysisTreeError> {
+        Ok(InferredRootAnalysis {
+            root: self,
+            tree: parser::AnalysisTree::try_from_file(&self.parsed)?,
+        })
+    }
+
     /// Retry export inference with the provider schemas loaded for this root.
     pub fn retry_unchecked_export_inference(
         &mut self,
@@ -3128,7 +3183,7 @@ fn parse_local_variable_union(
     config: &ProviderContext,
     seeds: &[parser::BindingSeed<'_>],
     local_variables_by_file: &[HashSet<String>],
-    user_functions: &HashMap<String, parser::UserFunction>,
+    user_functions: &IndexMap<String, parser::UserFunction>,
 ) -> Result<DirectorySeedState, LocatedParseError> {
     let mut variables = IndexMap::new();
     let mut metadata = crate::parser::ParserSeedMetadata::default();
@@ -3229,6 +3284,43 @@ mod tests {
     use super::*;
     use crate::resource::Value;
     use std::fs;
+
+    #[test]
+    fn inferred_root_analysis_preserves_the_issued_directory_verdict() {
+        for source in [
+            "backend local {}\narguments {}\nrequire true, 'private'\n",
+            "provider mock {}\n",
+            "arguments {}\n",
+            "attributes {}\n",
+            "require true, 'module guard'\n",
+            "let count = 1\n",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let file = directory.path().join("main.crn");
+            fs::write(&file, source).unwrap();
+            let path = ResolvedPath::new(directory.path()).unwrap();
+            let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+            let schemas = SchemaRegistry::new();
+            let root = load_configuration_with_config(&path, &config, &schemas)
+                .unwrap()
+                .parsed;
+            let verdict = root.complete_directory_verdict();
+            let retained = root.parsed().directory_verdict().clone();
+            fs::remove_file(file).unwrap();
+            let analysis = root.analysis().unwrap();
+            assert_eq!(analysis.tree().directory_verdict(), &retained);
+            crate::validation::deferred_types::with_session_for_test(&config, |session| {
+                let (resolved, _) = analysis.resolve_type_exprs_report(session);
+                assert_eq!(resolved.complete_directory_verdict(), verdict, "{source}");
+                assert_eq!(resolved.parsed().directory_verdict(), &retained, "{source}");
+                assert_eq!(
+                    resolved.expression_report().findings().len(),
+                    root.expression_report().findings().len(),
+                    "{source}"
+                );
+            });
+        }
+    }
 
     #[test]
     fn incomplete_snapshots_can_only_establish_readable_root_evidence() {

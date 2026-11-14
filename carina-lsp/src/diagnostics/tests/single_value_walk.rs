@@ -5,7 +5,7 @@ use carina_core::provider::{
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
-    ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+    ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
 use tower_lsp::lsp_types::{Position, Range};
 
@@ -24,9 +24,7 @@ impl ProviderFactory for WalkFactory {
     fn schemas(&self) -> Vec<ValidatedResourceSchema> {
         vec![self.0.clone()]
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        Default::default()
-    }
+
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas(),

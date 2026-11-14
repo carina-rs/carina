@@ -222,7 +222,7 @@ See the codex skill for the full subcontracting protocol.
 - Always write a failing reproducing test BEFORE implementing the fix.
 - For TTY/rendering bugs, use PTY-based reproduction.
 - When bugs are found or issues are pointed out, write a test that captures the fix so the regression is caught and the expected behavior is documented.
-- Run full verify/review/CI gates before merge.
+- Run the local checks, review and CI gates before merge (see Verify Protocol).
 
 ## Review Checklist — Carina-Specific Concerns
 
@@ -324,13 +324,32 @@ When selecting kinds, only their required tools are checked before execution.
 the selected packages, so feature unification can differ from CI's `--workspace`
 run. When in doubt, run `scripts/verify.sh` without `--local`.
 
-1. Run `scripts/verify.sh --local` before `gh pr create` and before pushing
-   follow-up commits to an open PR. It runs the same check definitions and
+1. Before `gh pr create` and before pushing follow-up commits to an open PR,
+   run only the checks that belong to the change: the pre-commit hook (fmt and
+   clippy on the touched crates; do not set `SKIP_CLIPPY`), the tests the
+   change adds or affects, selected by name, and `cargo check -p` for
+   dependent crates when a type or public API changed. PR CI runs the full
+   check set; do not run `scripts/verify.sh --local`, a workspace-wide
+   nextest, the determinism repeats or the parity script locally as a gate.
+   When CI fails, read the failed job's log, fix it, and re-run only the
+   failed tests locally before pushing.
+   `scripts/verify.sh --local` remains available for debugging a CI failure
+   that cannot be reproduced by name. It runs the same check definitions and
    feature flags as CI; only crate scope comes from `scripts/touched-crates.sh`.
    Local scope includes touched crates and their transitive reverse dependents
    in the workspace, including dependents through dev and build dependencies.
    Use `--base <ref>` to override the helper's default base of `origin/main`.
 2. PR CI must be green before merge.
+
+Use `scripts/validate-parity.py` for main/candidate text and JSON parity (carina#4394).
+Run `python3 scripts/validate-parity.py --main <main> --candidate <candidate>
+--repo . --infra ../../../infra --evidence <dir>`.
+Use `--binary <path> --repeat 8 --repo . --evidence <dir>` to compare fresh
+processes of the same binary over every tracked configuration directory without
+reordering output. The `carina-cli` nextest `validate_diagnostic_order` integration
+tests retain this gate in four checked shards; each shard reports validation,
+provider-not-installed, and setup failure counts and must reach validation for
+every named `diagnostic_order/*` fixture it owns.
 
 CI keeps its parallel jobs by selecting kinds from `scripts/verify.sh`.
 The archive job builds the WASM mock fixtures and host test archive once;
@@ -568,9 +587,9 @@ A struct type represents a nested object with typed fields.
   (carina#3981, carina#3984). Accepted write-only values, including nested
   leaves, are recorded in state (since state v18; secrets as hashes) so plans
   converge.
-- **Provider input wire checks**: `WireReady<T>::try_new` is the sole admission
-  constructor for complete desired resources, data sources, final update
-  patches and provider configuration. It caches the checked projection after
+- **Provider input wire checks**: `WireReady<T>::try_new` checks and caches the
+  transport projection of complete desired resources, data sources, final update
+  patches and admitted provider configuration. It does not mint declaration admission. It caches the checked projection after
   host rewrites, including default tags and observed ignored patch leaves.
   Each final payload is projected once. Wire failures remain
   `ProviderPreparationError::Wire`, with protected diagnostic paths retained.
@@ -707,13 +726,21 @@ A struct type represents a nested object with typed fields.
   Declaration compatibility admits types, not resolved-value validity.
   `NeedsLocal` exists only in the admission-facing reference relation, requiring
   a `ReferenceCandidate`; it cannot convert back into general type compatibility.
-  Resource/data-source attributes use `admit_apply_resource`/`admit_apply_data_source`
-  in `executor/provider_ready.rs`; provider config uses
-  `validate_provider_config_attributes` on resolved values. These validate the full
-  destination declaration before dispatch. Function parameters/returns additionally
-  use runtime `check_resolved_constraints_at`; backend schemas have no anonymous
-  refinements. Member String failures keep their structured pattern/
-  length category and label the slot's member constraint; identity failures run first.
+  Resource/data-source final inputs use `admit_apply_resource` and
+  `admit_apply_data_source`. Provider/backend configuration enters `admit()` through
+  `validation/admission/configuration/`, including compact-list callbacks.
+  Complete admissions own the canonical payload and placements; analysis cannot
+  authorize construction. Undeclared keys are rejected before value checks or
+  factory validation, using resource unknown-attribute suggestions. The payload
+  contains exactly its placed fields. The native mock has no configuration
+  fields; WASM mock controls belong to its own declaration.
+  Provider construction binds admitted configuration to its factory and instance.
+  Core owns the S3/local declarations; state extracts settings only from
+  `AdmittedConfiguration<BackendAttribute>`. Native file addresses retain their
+  own pins and non-UTF-8 bytes. S3 URLs keep encryption on and auto-creation off.
+  CLI and LSP share the owner. Function parameters/returns use
+  `check_resolved_constraints_at`. Member String failures retain their pattern/
+  length category and member label; identity failures run first.
   Int-to-Float widening between identified scalars uses identity-bound containment
   too. Float pairs with identities on both sides retain strict declaration range
   containment; same-identity Float reference admission retains resolved-value
@@ -1250,8 +1277,8 @@ High-value patterns in this repo:
 
 Constraints specific to this repo:
 
-- A workflow does NOT relax any gate. Each agent still runs
-  `scripts/verify.sh --local` as described in the Verify Protocol. Findings
+- A workflow does NOT relax any gate. Each agent still runs the local
+  checks described in the Verify Protocol, and PR CI must be green. Findings
   still need a reproducing test before a fix lands.
 - Agents that mutate files in parallel must use `isolation: 'worktree'`
   to avoid clobbering each other; read-only finders do not need it.

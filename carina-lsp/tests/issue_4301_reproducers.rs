@@ -95,7 +95,7 @@ fn issue_4014_quoted_enum_and_secret_union_report_once() {
             schemas
                 .get("aws", "s3.bucket", SchemaKind::Resource)
                 .unwrap(),
-            &std::collections::HashMap::from([(
+            &indexmap::IndexMap::from([(
                 attribute.into(),
                 value
                     .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())

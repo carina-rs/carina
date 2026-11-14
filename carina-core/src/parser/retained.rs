@@ -2220,6 +2220,8 @@ pub(crate) fn value_dependent_judgement_for_test() -> JudgedExpr {
 // particular, the syntax compiler and provisional evaluators cannot mint it.
 mod judgement {
     #[cfg(test)]
+    mod diagnostic_order_tests;
+    #[cfg(test)]
     mod round2_tests;
 
     use super::*;
@@ -3341,7 +3343,7 @@ mod judgement {
     #[derive(Clone)]
     pub struct ExpressionReport<B: BindingAddress = RelativeBindingName> {
         bindings: Arc<HashMap<B, JudgedExpr>>,
-        expressions: Arc<HashMap<ExpressionLocation, JudgedExpr>>,
+        expressions: Arc<IndexMap<ExpressionLocation, JudgedExpr>>,
         pub(super) nodes: Arc<HashMap<(ExpressionInstance, NodeId), JudgedExpr>>,
         pub(super) syntax_nodes: Arc<AuthoredNodes<B>>,
         pub(super) use_roots: Arc<Vec<cursor::UseRoot<B>>>,
@@ -3352,7 +3354,7 @@ mod judgement {
         findings: Arc<Vec<Located<InferenceError>>>,
         function_errors: Arc<Vec<Located<InferenceError>>>,
         operands: Arc<HashMap<ExpressionLocation, [JudgedExpr; 2]>>,
-        module_attributes: Arc<HashMap<(B, String), JudgedExpr>>,
+        module_attributes: Arc<IndexMap<(B, String), JudgedExpr>>,
         resource_reports: Arc<HashMap<crate::resource::ResourceId, Arc<ExpressionReport<B>>>>,
         parameters: Arc<HashMap<String, JudgedExpr>>,
         pub(super) instance: ExpressionInstance,
@@ -3535,7 +3537,7 @@ mod judgement {
                             expression.clone(),
                         )
                     })
-                    .collect::<HashMap<_, _>>()
+                    .collect::<IndexMap<_, _>>()
                     .into(),
                 resource_reports,
                 parameters: self.parameters.clone(),
@@ -3809,7 +3811,7 @@ mod judgement {
         }
         fn index<'a, B: BindingAddress>(
             expression: &'a ExprValue<ParserPlaceholder, B>,
-            authored: &mut HashMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
+            authored: &mut IndexMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
             visited: &mut std::collections::HashSet<usize>,
         ) {
             if !visited.insert(Arc::as_ptr(&expression.authored) as usize) {
@@ -3822,7 +3824,7 @@ mod judgement {
                 index(child, authored, visited);
             }
         }
-        let mut authored = HashMap::new();
+        let mut authored = IndexMap::new();
         let mut visited = std::collections::HashSet::new();
         for expression in expressions
             .roots
@@ -3831,19 +3833,15 @@ mod judgement {
         {
             index(expression, &mut authored, &mut visited);
         }
-        let functions = authored
-            .values()
-            .filter_map(|expression| {
-                if let ExprKind::Function { name, signature } = &expression.authored.kind {
-                    Some((
-                        (expression.authored.location.instance.clone(), name.clone()),
-                        signature.clone(),
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut functions = HashMap::new();
+        for expression in authored.values() {
+            if let ExprKind::Function { name, signature } = &expression.authored.kind {
+                // Match the parser seed rule when duplicate declarations survive analysis.
+                functions
+                    .entry((expression.authored.location.instance.clone(), name.clone()))
+                    .or_insert_with(|| signature.clone());
+            }
+        }
         let authority = Arc::new(config.clone());
         let mut judge = Judge {
             authority: authority.clone(),
@@ -3855,7 +3853,7 @@ mod judgement {
             config,
             memo: HashMap::new(),
             scope: DiagnosticScope::Public,
-            by_location: HashMap::new(),
+            by_location: IndexMap::new(),
             by_node: HashMap::new(),
             syntax_nodes: HashMap::new(),
             visiting: Vec::new(),
@@ -3974,7 +3972,7 @@ mod judgement {
 
     struct Judge<'a, B: BindingAddress> {
         authority: Arc<super::super::ProviderContext>,
-        authored: HashMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
+        authored: IndexMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
         expressions: &'a Expressions<B>,
         bindings: &'a InferenceBindings<ParserPlaceholder, B>,
         functions: HashMap<(ExpressionInstance, String), Arc<FunctionSignature>>,
@@ -3982,14 +3980,14 @@ mod judgement {
         config: &'a super::super::ProviderContext,
         memo: HashMap<(usize, DiagnosticScope), JudgedExpr>,
         scope: DiagnosticScope,
-        by_location: HashMap<ExpressionLocation, JudgedExpr>,
+        by_location: IndexMap<ExpressionLocation, JudgedExpr>,
         by_node: HashMap<(ExpressionInstance, NodeId), JudgedExpr>,
         syntax_nodes: AuthoredNodes<B>,
         visiting: Vec<usize>,
         findings: Vec<Located<InferenceError>>,
         function_errors: Vec<Located<InferenceError>>,
         operands: HashMap<ExpressionLocation, [JudgedExpr; 2]>,
-        module_attributes: Option<&'a HashMap<(B, String), JudgedExpr>>,
+        module_attributes: Option<&'a IndexMap<(B, String), JudgedExpr>>,
     }
 
     impl<B: BindingAddress> Judge<'_, B> {
@@ -4287,18 +4285,7 @@ mod judgement {
                 if let TypeExpr::Ref(path) | TypeExpr::DottedUnresolved(path) = &current
                     && self
                         .schemas
-                        .get(
-                            &path.provider,
-                            &path.resource_type,
-                            crate::schema::SchemaKind::Resource,
-                        )
-                        .or_else(|| {
-                            self.schemas.get(
-                                &path.provider,
-                                &path.resource_type,
-                                crate::schema::SchemaKind::DataSource,
-                            )
-                        })
+                        .get_kindless(&path.provider, &path.resource_type)
                         .is_none()
                 {
                     return Err(InferenceIssue::NotInferable(

@@ -292,6 +292,37 @@ impl std::fmt::Display for SavedPlanSchemaMismatchError {
 
 impl std::error::Error for SavedPlanSchemaMismatchError {}
 
+/// Terminal saved-plan configuration report, retaining typed owner diagnostics.
+#[derive(Debug)]
+pub struct SavedPlanProviderConfigurationError {
+    pub error: Box<carina_core::executor::provider_ready::ProviderConfigPreparationError>,
+    pub replan_command: String,
+}
+
+impl SavedPlanProviderConfigurationError {
+    pub fn configuration_error(
+        &self,
+    ) -> &carina_core::executor::provider_ready::ProviderConfigPreparationError {
+        &self.error
+    }
+}
+
+impl std::fmt::Display for SavedPlanProviderConfigurationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Saved plan provider configuration is invalid:")?;
+        for diagnostic in self.error.diagnostics() {
+            write!(f, "\n  - {diagnostic}")?;
+        }
+        write!(
+            f,
+            "\nRe-run `{}` to produce a new saved plan before applying.",
+            self.replan_command
+        )
+    }
+}
+
+impl std::error::Error for SavedPlanProviderConfigurationError {}
+
 /// Recorded and currently loaded artifact summaries for one provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedPlanProviderArtifactDifference {
@@ -1256,6 +1287,8 @@ pub enum AppError {
     ProviderConfiguration(
         Box<carina_core::executor::provider_ready::ProviderConfigPreparationError>,
     ),
+    #[error("{0}")]
+    SavedPlanProviderConfiguration(Box<SavedPlanProviderConfigurationError>),
 
     #[error("{}", validation_finding_display(prefix.as_deref(), finding.detail()))]
     ParameterReference {
@@ -1426,6 +1459,32 @@ pub enum AppError {
     /// Routed ids did not agree with the operator-authored `moved` block.
     #[error(transparent)]
     ResolvedMove(#[from] carina_core::effect::ResolvedMoveMismatch),
+
+    /// A backend schema failure at its authored attribute.
+    #[error("{0}")]
+    BackendAttribute(
+        Box<
+            carina_core::parser::Located<
+                carina_core::validation::admission::configuration::backend::BackendAttributeError,
+            >,
+        >,
+    ),
+
+    /// One backend failure when analysis cannot provide an authored location.
+    #[error("{0}")]
+    UnlocatedBackend(
+        Box<carina_core::validation::admission::configuration::backend::UnlocatedBackendError>,
+    ),
+
+    /// An unsupported backend at its authored block.
+    #[error("{0}")]
+    UnsupportedBackend(
+        Box<
+            carina_core::parser::Located<
+                carina_core::validation::admission::configuration::backend::UnsupportedBackendError,
+            >,
+        >,
+    ),
 
     /// State backend errors (lock contention, I/O, serialization, etc.)
     #[error(transparent)]
@@ -2085,6 +2144,7 @@ pub fn human_error_lines(error: &AppError) -> Vec<HumanErrorLine> {
         | AppError::UpstreamReference(_)
         | AppError::AttributePrefix(_)
         | AppError::ProviderConfiguration(_)
+        | AppError::SavedPlanProviderConfiguration(_)
         | AppError::ParameterReference {
             prefix: _,
             finding: _,
@@ -2145,6 +2205,9 @@ pub fn human_error_lines(error: &AppError) -> Vec<HumanErrorLine> {
             existing_to: _,
         }
         | AppError::ResolvedMove(_)
+        | AppError::BackendAttribute(_)
+        | AppError::UnlocatedBackend(_)
+        | AppError::UnsupportedBackend(_)
         | AppError::Backend(_)
         | AppError::StateForget(_)
         | AppError::LockedStateReload(_)
@@ -3248,6 +3311,65 @@ mod tests {
         assert!(
             out.contains("Expected:    111111111111, 222222222222 (allowed_account_ids)"),
             "expected list missing: {out}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod terminal_locate_rendering_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_locate_rendering_keeps_inspectable_cause_once() {
+        let backend = BackendError::from(carina_state::LocalStateLocateError::from(
+            std::io::Error::other("typed locate cause"),
+        ));
+        assert!(std::error::Error::source(&backend).is_none());
+        let error = AppError::from(backend);
+        let AppError::Backend(locate) = &error else {
+            panic!("terminal locate error")
+        };
+        assert!(std::error::Error::source(locate).is_none());
+        assert_eq!(
+            format_error_with_source_chain(&error),
+            "I/O error: Failed to locate state file: typed locate cause",
+        );
+    }
+}
+
+#[cfg(test)]
+mod backend_locate_chain_tests {
+    use super::*;
+
+    fn locate() -> BackendError {
+        carina_state::LocalStateLocateError::from(std::io::Error::other("native locate cause"))
+            .into()
+    }
+
+    #[test]
+    fn backend_locate_is_terminal_with_file_context() {
+        let error = locate();
+        assert_eq!(
+            error.to_string(),
+            "I/O error: Failed to locate state file: native locate cause"
+        );
+        assert!(std::error::Error::source(&error).is_none());
+        let BackendError::LocateLocal(locate) = error else {
+            panic!("locate")
+        };
+        assert!(std::error::Error::source(&locate).is_none());
+        assert_eq!(locate.io_error().kind(), std::io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn generic_backend_chain_renders_locate_cause_once() {
+        let error =
+            StateBucketSeedError::new("bucket".into(), "aws.s3.Bucket.bucket".into(), locate());
+        let rendered = format_error_with_source_chain(&error);
+        assert_eq!(
+            rendered.matches("native locate cause").count(),
+            1,
+            "{rendered}"
         );
     }
 }

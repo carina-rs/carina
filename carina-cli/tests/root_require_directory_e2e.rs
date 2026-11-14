@@ -2091,14 +2091,36 @@ fn incomplete_root_directory_reports_only_the_sibling_load_failure() {
     }
 }
 
+fn round12_write_upstream_provider(directory: &Directory, value: &str) -> String {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    let wasm = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
+        .into_iter()
+        .map(|name| workspace.join("target/wasm32-wasip2/debug").join(name))
+        .find(|path| path.is_file())
+        .expect("the mock WASM fixture must be built");
+    let source = format!("file://{}", wasm.display());
+    fs::write(
+        directory.project.join("providers.crn"),
+        format!("backend local {{ path = 'carina.state.json' }}\nprovider mock {{ source = '{source}' unique_values = [{value}] }}\n"),
+    )
+    .unwrap();
+    source
+}
+
 fn round12_upstream_provider_fixture() -> (Directory, PathBuf) {
     let directory = Directory::new("true");
     directory.clear_root_require();
     success(&directory.run(&["apply", "--auto-approve", "."]));
+    // The native mock has no configuration fields. Its WASM counterpart
+    // declares this field and ignores it during provider initialization.
+    let source = round12_write_upstream_provider(&directory, "'seed'");
+    success(&directory.run(&["init", ".", "--accept-egress", &source]));
     let upstream = directory.project.parent().unwrap().join("mod");
     fs::create_dir(&upstream).unwrap();
     fs::write(upstream.join("locals.crn"), "// independent sibling\n").unwrap();
-    fs::write(directory.project.join("providers.crn"), "backend local { path = 'carina.state.json' }\nprovider mock { password = prior.value ?? 'fallback' }\n").unwrap();
+    round12_write_upstream_provider(&directory, "prior.value ?? 'fallback'");
     fs::write(
         directory.project.join("upstream.crn"),
         "let prior = upstream_state { source = '../mod' }\n",
@@ -2106,7 +2128,7 @@ fn round12_upstream_provider_fixture() -> (Directory, PathBuf) {
     .unwrap();
     fs::write(
         directory.project.join("main.crn"),
-        "let r = mock.test.resource { name = 'root' comment = 'planned update' }\n",
+        "let r = mock.test.read_back { present = 'planned update' }\n",
     )
     .unwrap();
     (directory, upstream)
@@ -2254,7 +2276,10 @@ fn round12_secret_provider_keeps_template_evidence_without_map_keys() {
         &["state", "refresh", "."],
     ] {
         let (directory, upstream) = round12_upstream_provider_fixture();
-        fs::write(directory.project.join("providers.crn"), "backend local { path = 'carina.state.json' }\nprovider mock { password = secret({ PRIVATE_UPSTREAM_MAP_KEY = prior.value ?? 'fallback' }) }\n").unwrap();
+        round12_write_upstream_provider(
+            &directory,
+            "secret({ PRIVATE_UPSTREAM_MAP_KEY = prior.value ?? 'fallback' }).PRIVATE_UPSTREAM_MAP_KEY",
+        );
         fs::write(
             upstream.join("declarations.crn"),
             "// authored module\narguments {}\n",

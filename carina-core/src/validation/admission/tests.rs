@@ -166,8 +166,11 @@ fn destination_contracts_share_the_registered_schema_allocation() {
             .unwrap();
         for destination in [&destination, &destination.clone()] {
             let contract = destination.contract.as_deref().unwrap();
+            let ContractSchema::Resource(schema) = &contract.schema else {
+                panic!("resource destination")
+            };
             assert!(std::ptr::eq(
-                contract.schema.as_ref(),
+                schema.as_ref(),
                 registered.schema().as_schema()
             ));
             assert!(std::ptr::eq(
@@ -1154,10 +1157,11 @@ fn slot_identity_mismatches_do_not_mutate() {
                         }
                         SlotMismatch::Path => wrong.inner.destination.identity.path.push(99),
                         SlotMismatch::CatalogRevision => {
-                            wrong.inner.destination.identity.revision = CatalogRevision(
-                                ProviderContext::new(crate::EnvironmentSnapshot::empty())
-                                    .custom_types,
-                            )
+                            wrong.inner.destination.identity.revision =
+                                CatalogRevision(CatalogSnapshot::Provider(
+                                    ProviderContext::new(crate::EnvironmentSnapshot::empty())
+                                        .custom_types,
+                                ));
                         }
                     }
                     assert_eq!(slot.place(wrong), Err(mismatch));
@@ -1521,12 +1525,11 @@ fn different_identity_edges_do_not_relax_local_containment() {
                 };
                 let contract = destination.contract.as_deref().unwrap();
                 assert!(matches!(
-                    source.constraints().next().unwrap().assignment_to(
-                        contract.attr().in_schema(contract.defs()).with_authority(
-                            &catalog.custom_types,
-                            crate::schema::SinkAuthority::Owner(&contract.owner)
-                        )
-                    ),
+                    source
+                        .constraints()
+                        .next()
+                        .unwrap()
+                        .assignment_to(contract.sink_type(contract.attr(), catalog)),
                     crate::schema::TypeAssignability::Mismatch
                 ));
                 assert!(validate(destination, &reference(), bindings, session).is_err());
@@ -3164,7 +3167,7 @@ fn round7_hook_error_without_attribute_has_one_diagnostic_owner() {
         .knowledge(&KnowledgeContext::validation())
         .unwrap()
         .into_classification();
-    let attributes = HashMap::from([("input".into(), proof)]);
+    let attributes = indexmap::IndexMap::from([("input".into(), proof)]);
     let destination = schemas
         .resource_attribute_destination(resource.id(), "input", &catalog)
         .unwrap();
@@ -3184,6 +3187,7 @@ fn round7_hook_error_without_attribute_has_one_diagnostic_owner() {
             .as_schema()
             .validate_admission_report(
                 &attributes,
+                attributes.iter(),
                 &|_| false,
                 &AttributeAdmission {
                     known: &|_, _, proof| {

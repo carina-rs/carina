@@ -73,10 +73,15 @@ use carina_core::effect::{AddressedMoves, ResolvedExplicitMove, ResolvedMovePair
 use carina_core::paths::ResolvedPath;
 use carina_core::provider::{MetadataComparisonResolver, ResourceComparisonResolver};
 use carina_core::resource::PersistedDirectives;
+use carina_core::validation::admission::configuration::provider::{
+    construction as prepare_provider_construction, empty_construction,
+};
 use legacy_migration::DeferredForExpansionWitness;
 pub(crate) use legacy_migration::{
     MaterializedConfiguration, classify_legacy_state, replay_legacy_migration,
 };
+#[cfg(feature = "test-utils")]
+pub mod identity_probe;
 mod legacy_migration;
 
 use std::collections::hash_map::Entry;
@@ -111,8 +116,7 @@ use carina_core::executor::normalized::{
     apply_host_desired_normalization_slice, states_contain_unknown,
 };
 use carina_core::executor::{
-    ProviderReadyConfig, UnresolvedDataSourceInput, UnresolvedResource,
-    prepare_provider_ready_config, unresolved_data_source_inputs,
+    UnresolvedDataSourceInput, UnresolvedResource, unresolved_data_source_inputs,
 };
 use carina_core::hint::ProjectCommand;
 use carina_core::identifier::{
@@ -565,7 +569,12 @@ pub(crate) struct ReportingProviderLoad {
 /// module can construct it. That keeps the pipeline's raw canonical-pair
 /// result behind the owner-minting transitions.
 pub(crate) struct ValidationPipelineAccess {
-    _private: (),
+    provider_configuration: ProviderConfigurationPurpose,
+}
+
+enum ProviderConfigurationPurpose {
+    SourceExecution,
+    SavedPlanSecretCandidates,
 }
 
 /// Marker for a configuration that may still contain reusable module-template
@@ -583,7 +592,40 @@ pub struct ExpandedConfig;
 
 impl ValidationPipelineAccess {
     fn new() -> Self {
-        Self { _private: () }
+        Self {
+            provider_configuration: ProviderConfigurationPurpose::SourceExecution,
+        }
+    }
+
+    fn saved_plan_secret_candidates() -> Self {
+        Self {
+            provider_configuration: ProviderConfigurationPurpose::SavedPlanSecretCandidates,
+        }
+    }
+
+    pub(crate) fn check_provider_configuration<E>(
+        &self,
+        ctx: &WiringContext,
+        parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    ) -> Vec<AppError> {
+        match self.provider_configuration {
+            ProviderConfigurationPurpose::SourceExecution => {
+                validate_provider_region_with_ctx(ctx, parsed)
+            }
+            // Current values supply only secret candidates. Full admission and
+            // factory callbacks belong to the verified recorded configuration.
+            ProviderConfigurationPurpose::SavedPlanSecretCandidates => {
+                carina_core::validation::admission::configuration::provider::validate_keys(
+                    &parsed.providers,
+                    &ctx.configuration_factories(),
+                )
+                .err()
+                .into_iter()
+                .flat_map(|error| error.into_diagnostics())
+                .map(|error| AppError::ProviderConfiguration(Box::new(error)))
+                .collect()
+            }
+        }
     }
 
     /// Resolve both configuration snapshots inside the sealed validation
@@ -1370,6 +1412,7 @@ fn sorted_provider_load_errors(load_errors: &HashMap<String, String>) -> Vec<App
 
 #[allow(clippy::too_many_arguments)]
 fn resolve_config_pair_errors_with_context(
+    access: &ValidationPipelineAccess,
     context: &WiringContext,
     load_errors: &HashMap<String, String>,
     parsed: carina_core::config_loader::InferredRootDirectory,
@@ -1386,6 +1429,7 @@ fn resolve_config_pair_errors_with_context(
         skip_resource_validation,
     );
     resolve_config_pair_errors_with_catalog(
+        access,
         ProviderValidationInputs {
             context,
             catalog,
@@ -1411,6 +1455,7 @@ struct ProviderValidationInputs<'a> {
 
 /// Resolve and settle using the same catalog through binding readiness.
 fn resolve_config_pair_errors_with_catalog(
+    access: &ValidationPipelineAccess,
     providers: ProviderValidationInputs<'_>,
     parsed: carina_core::config_loader::InferredRootDirectory,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
@@ -1426,7 +1471,7 @@ fn resolve_config_pair_errors_with_catalog(
     let checks =
         carina_core::validation::deferred_types::TypeCheckSession::run(&catalog, |catalog| {
             let result = crate::commands::validate_and_resolve_errors_inner(
-                &ValidationPipelineAccess::new(),
+                access,
                 parsed,
                 base_dir,
                 context,
@@ -1472,6 +1517,7 @@ fn resolve_config_pair_with_context(
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> Result<ReadyConfigPair, AppError> {
     resolve_config_pair_errors_with_context(
+        &ValidationPipelineAccess::new(),
         context,
         load_errors,
         parsed,
@@ -1760,6 +1806,7 @@ impl ProviderLoad {
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<ValidatedConfig, AppError> {
         let canonical_resources = match resolve_config_pair_errors_with_context(
+            &ValidationPipelineAccess::new(),
             &self.context,
             &self.load_errors,
             parsed,
@@ -1850,7 +1897,7 @@ impl MigrationCheckProviderLoad {
             carina_core::resource::RelativeBindingName,
         >],
         base_dir: &ResolvedPath,
-        schema_overrides: &HashMap<String, PathBuf>,
+        schema_overrides: &IndexMap<String, PathBuf>,
         notices: &mut ProviderNoticeSink,
     ) -> Result<Self, AppError> {
         let effective = schema_check_provider_configs(providers, schema_overrides)?;
@@ -1895,8 +1942,9 @@ impl MigrationCheckProviderLoad {
 }
 
 impl CompleteProviderLoad {
-    /// Validate the current config once and retain its canonical pair with the
-    /// exact complete load that will verify and execute a saved plan.
+    /// Check current source for secret candidates, retaining its canonical pair
+    /// with this load. Provider-config value callbacks wait for verification of
+    /// the recorded configuration; current keys receive host-only checks.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn check_saved_plan_config_pair(
         self,
@@ -1906,7 +1954,8 @@ impl CompleteProviderLoad {
         skip_resource_validation: bool,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<CheckedSavedPlanInputs, AppError> {
-        let canonical_resources = resolve_config_pair_with_context(
+        let canonical_resources = resolve_config_pair_errors_with_context(
+            &ValidationPipelineAccess::saved_plan_secret_candidates(),
             &self.context,
             &HashMap::new(),
             parsed,
@@ -1914,7 +1963,8 @@ impl CompleteProviderLoad {
             base_dir,
             skip_resource_validation,
             duplicate_declarations,
-        )?;
+        )
+        .map_err(|errors| crate::commands::collapse_errors(errors.into_vec()))?;
         Ok(CheckedSavedPlanInputs {
             load: self,
             canonical_resources: Box::new(canonical_resources),
@@ -2936,6 +2986,25 @@ impl WiringContext {
 
     pub fn factories(&self) -> &[Box<dyn ProviderFactory>] {
         self.loaded_providers.factories()
+    }
+
+    /// Construction and configuration admission also include the host-owned
+    /// native factory, without registering it as a plugin custom-type source.
+    pub fn configuration_factories(&self) -> Vec<&dyn ProviderFactory> {
+        self.factories()
+            .iter()
+            .map(Box::as_ref)
+            .chain(
+                self.builtin_mock()
+                    .map(|factory| factory as &dyn ProviderFactory),
+            )
+            .collect()
+    }
+
+    fn configuration_factory(&self, name: &str) -> Option<&dyn ProviderFactory> {
+        self.configuration_factories()
+            .into_iter()
+            .find(|factory| factory.name() == name)
     }
 
     pub fn factories_arc(&self) -> Arc<Vec<Box<dyn ProviderFactory>>> {
@@ -4041,7 +4110,7 @@ fn detect_anonymous_to_named_moves_with_ctx(
         providers,
         &|provider_name| {
             provider_mod::find_factory(ctx.factories(), provider_name)
-                .map(ProviderFactory::provider_config_attribute_types)
+                .map(|factory| factory.schema_witness().config().clone())
         },
     )?;
     Ok(identifier::detect_anonymous_to_named_renames(
@@ -4633,7 +4702,7 @@ fn project_plan_attributes<'a>(
     attributes: &'a IndexMap<String, Value>,
     bindings: &ResolvedBindings,
     errors: &mut Vec<PlanError>,
-) -> HashMap<String, carina_core::resource::knowledge::PlanResolved<'a>> {
+) -> IndexMap<String, carina_core::resource::knowledge::PlanResolved<'a>> {
     use carina_core::resource::knowledge::{KnowledgeContext, PlanResolved};
     let cx = KnowledgeContext::plan(bindings);
     attributes
@@ -4749,16 +4818,16 @@ fn append_resolved_value_constraint_errors<
     K: carina_core::validation::admission::RechecksResolved,
 >(
     plan_errors: &mut Vec<PlanError>,
-    id: &ResourceId,
+    resource: &ResourceId,
     schema: OwnerBoundResourceSchema<'_>,
-    attributes: &HashMap<String, carina_core::resource::knowledge::PlanResolved<'_>>,
+    attributes: &IndexMap<String, carina_core::resource::knowledge::PlanResolved<'_>>,
     quoted_string_attrs: &HashSet<String>,
     origin_attributes: &IndexMap<String, Value>,
     session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) {
     let report = carina_core::validation::admission::attributes::admit_plan_attributes::<K>(
         schema,
-        id,
+        resource,
         attributes,
         quoted_string_attrs,
         session,
@@ -4767,7 +4836,7 @@ fn append_resolved_value_constraint_errors<
         let (attributes, origins) =
             resolved_constraint_context(error, origin_attributes, schema.schema().as_schema());
         plan_errors.push(PlanError::new(
-            id.clone(),
+            resource.clone(),
             PlanErrorKind::ResolvedValueConstraint {
                 attributes,
                 origins,
@@ -4925,14 +4994,13 @@ pub fn normalize_state_with_ctx(
             configs.push(implicit.as_ref());
         }
         for resolved_config in configs {
-            let config = rt
+            let construction = rt
                 .block_on(async {
-                    prepare_provider_ready_config(factory.as_ref(), resolved_config)
+                    prepare_provider_construction(factory.as_ref(), resolved_config, plan)
                 })
                 .map_err(HostError::from)?;
-            let session = plan.session(factory.name(), resolved_config.binding(), Some(&config));
             router.add_initialized_normalizer(rt.block_on(
-                provider_mod::ProviderBoundary::initialize_normalizer(factory.as_ref(), &session),
+                provider_mod::ProviderBoundary::initialize_normalizer(&construction),
             )?);
         }
     }
@@ -4968,11 +5036,15 @@ pub fn validate_provider_region_with_ctx<E>(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
 ) -> Vec<AppError> {
-    validation::validate_provider_config_report(parsed, ctx.factories())
-        .err()
-        .map(|error| AppError::ProviderConfiguration(Box::new(error)))
-        .into_iter()
-        .collect()
+    carina_core::validation::admission::configuration::provider::analyze_configs(
+        &parsed.providers,
+        &ctx.configuration_factories(),
+    )
+    .err()
+    .into_iter()
+    .flat_map(|error| error.into_diagnostics())
+    .map(|error| AppError::ProviderConfiguration(Box::new(error)))
+    .collect()
 }
 
 /// Preserve source-local module-output diagnostics when module expansion
@@ -5322,16 +5394,21 @@ async fn build_provider_router<C: ProviderConfigurations>(
         progress_sink.line("Using mock provider".cyan(color_mode));
         router.add_provider(
             BUILTIN_PROVIDER_NAME.to_string(),
-            provider_mod::ProviderBoundary::initialize(
+            provider_mod::ProviderBoundary::initialize(&empty_construction(
                 builtin_mock,
-                &plan.session(BUILTIN_PROVIDER_NAME, None, None),
-            )
+                &provider_mod::ProviderInstanceKey::new(BUILTIN_PROVIDER_NAME, None),
+                plan,
+            )?)
             .await?,
         );
         router.add_provider(
             String::new(),
-            provider_mod::ProviderBoundary::initialize(builtin_mock, &plan.session("", None, None))
-                .await?,
+            provider_mod::ProviderBoundary::initialize(&empty_construction(
+                builtin_mock,
+                &provider_mod::ProviderInstanceKey::new("", None),
+                plan,
+            )?)
+            .await?,
         );
     }
 
@@ -5358,14 +5435,22 @@ fn kind_default_source<'a, C: ProviderConfigurations>(
 ///
 /// Both state-bucket bootstrap and deletion route through this typed seam, so
 /// neither can recover an attribute map from `parsed.providers`. Providers
-/// without a declared block retain the historical empty-config fallback.
-pub(crate) fn prepare_default_provider_ready_config<C: ProviderConfigurations>(
-    factory: &dyn ProviderFactory,
+/// without a declared block use admitted empty configuration.
+pub(crate) fn prepare_default_provider_construction<'a, C: ProviderConfigurations>(
+    factory: &'a dyn ProviderFactory,
     provider_name: &str,
     configs: &C,
-) -> Result<ProviderReadyConfig, carina_core::executor::ProviderConfigPreparationError> {
+    plan: &provider_mod::ProviderPlan,
+) -> Result<
+    carina_core::validation::admission::configuration::provider::ProviderConstruction<'a>,
+    carina_core::executor::ProviderConfigPreparationError,
+> {
     let config = configs.provider_or_implicit(provider_name);
-    prepare_provider_ready_config(factory, config.as_ref())
+    carina_core::validation::admission::configuration::provider::default_construction(
+        factory,
+        config.as_ref(),
+        plan,
+    )
 }
 
 /// Format the "Using <provider>" announcement emitted by both the
@@ -5415,38 +5500,27 @@ async fn instantiate_provider_into_router(
 ) -> Result<(), AppError> {
     let color_mode = ctx.runtime().color_mode();
     let binding = provider_config.binding();
-    if let Some(factory) = provider_mod::find_factory(ctx.factories(), provider_config.name()) {
-        let config = prepare_provider_ready_config(factory, provider_config)?;
+    if let Some(factory) = ctx.configuration_factory(provider_config.name()) {
+        let construction = prepare_provider_construction(factory, provider_config, plan)?;
+        let config = construction.session().configuration();
         let displayed_source = provider_config.source().or(inherited_source);
-        let session = plan.session(factory.name(), binding, Some(&config));
-        let provider = provider_mod::ProviderBoundary::initialize(factory, &session)
+        let provider = provider_mod::ProviderBoundary::initialize(&construction)
             .await
             .map_err(|e| e.for_provider(provider_config.name().to_string()))?;
-        progress_sink.line(
+        let announcement = if ctx.builtin_mock().is_some()
+            && factory.name() == BUILTIN_PROVIDER_NAME
+        {
+            "Using mock provider".to_owned()
+        } else {
             format_provider_using_line(factory.name(), config.region(), binding, displayed_source)
-                .cyan(color_mode),
-        );
+        };
+        progress_sink.line(announcement.cyan(color_mode));
         router.add_provider_instance(
             provider_mod::ProviderInstanceKey::new(
                 provider_config.name(),
                 binding.map(str::to_owned),
             ),
             provider,
-        );
-    } else if let Some(builtin_mock) = ctx.builtin_mock()
-        && provider_config.name() == BUILTIN_PROVIDER_NAME
-    {
-        progress_sink.line("Using mock provider".cyan(color_mode));
-        router.add_provider_instance(
-            provider_mod::ProviderInstanceKey::new(
-                provider_config.name(),
-                binding.map(str::to_owned),
-            ),
-            provider_mod::ProviderBoundary::initialize(
-                builtin_mock,
-                &plan.session(provider_config.name(), binding, None),
-            )
-            .await?,
         );
     } else if let Some(message) = missing_provider_message(provider_config, inherited_source) {
         eprintln!("{}", message.red(color_mode));
@@ -5540,56 +5614,41 @@ fn take_unverified_official_load_error<E>(
         .unwrap_or_else(|_| unreachable!("the identity failure was checked as unverified")))
 }
 
-/// Build a router exclusively from factories already retained by `ctx`.
-/// Read/delete configuration cannot select this desired-provider entry.
-///
-/// ```compile_fail,E0308
-/// use carina_cli::wiring::{WiringContext, create_providers_from_configs_with_ctx};
-/// use carina_core::{parser::ReadOnlyProviderConfigs, provider::ProviderPlan};
-/// fn desired(ctx: &WiringContext, config: &ReadOnlyProviderConfigs, plan: &ProviderPlan) {
-///     let _ = create_providers_from_configs_with_ctx(ctx, config, plan);
-/// }
-/// ```
-pub async fn create_providers_from_configs_with_ctx(
+/// Construct saved-plan providers only from verified recorded configuration.
+pub(crate) async fn create_providers_from_configs_with_ctx<S>(
     ctx: &WiringContext,
-    configs: &ResolvedProviderConfigs,
+    inputs: &crate::commands::apply::saved_plan::VerifiedSavedPlanProviderInputs<S>,
     plan: &provider_mod::ProviderPlan,
 ) -> Result<ProviderRouter, AppError> {
-    build_provider_router(ctx, configs, ProgressSink::Human, plan).await
+    build_provider_router(ctx, inputs.configs(), ProgressSink::Human, plan).await
 }
 
-/// Build only the desired-state normalizers needed to reproduce the plan-time
-/// candidate shape. Runtime providers are intentionally not constructed here:
-/// saved-plan secret verification must finish before CRUD-capable objects
-/// become available to the apply path.
-pub(crate) async fn create_normalizers_from_configs_with_ctx(
+/// Reproduce plan-time normalization using verified recorded configuration.
+pub(crate) async fn create_normalizers_from_configs_with_ctx<S>(
     ctx: &WiringContext,
-    configs: &ResolvedProviderConfigs,
+    inputs: &crate::commands::apply::saved_plan::VerifiedSavedPlanProviderInputs<S>,
     plan: &provider_mod::ProviderPlan,
 ) -> Result<NormalizerRouter, AppError> {
     let mut router = NormalizerRouter::new();
 
-    for config in configs.iter() {
+    for config in inputs.configs().iter() {
         if let Some(factory) = provider_mod::find_factory(ctx.factories(), config.name()) {
-            let ready = prepare_provider_ready_config(factory, config)?;
+            let construction = prepare_provider_construction(factory, config, plan)?;
             router.add_initialized_normalizer(
-                provider_mod::ProviderBoundary::initialize_normalizer(
-                    factory,
-                    &plan.session(factory.name(), config.binding(), Some(&ready)),
-                )
-                .await?,
+                provider_mod::ProviderBoundary::initialize_normalizer(&construction).await?,
             );
         }
     }
 
     if let Some(builtin_mock) = ctx.builtin_mock() {
-        let session = plan.session(BUILTIN_PROVIDER_NAME, None, None);
+        let factory = builtin_mock.create_normalizer();
+        let construction = empty_construction(
+            &factory,
+            &provider_mod::ProviderInstanceKey::new(BUILTIN_PROVIDER_NAME, None),
+            plan,
+        )?;
         router.add_initialized_normalizer(
-            provider_mod::ProviderBoundary::initialize_normalizer(
-                &builtin_mock.create_normalizer(),
-                &session,
-            )
-            .await?,
+            provider_mod::ProviderBoundary::initialize_normalizer(&construction).await?,
         );
     }
     Ok(router)
@@ -11079,7 +11138,7 @@ mod tests;
 
 fn schema_check_provider_configs(
     providers: &[ProviderConfig<ParserPlaceholder, carina_core::resource::RelativeBindingName>],
-    overrides: &HashMap<String, PathBuf>,
+    overrides: &IndexMap<String, PathBuf>,
 ) -> Result<
     Vec<ProviderConfig<ParserPlaceholder, carina_core::resource::RelativeBindingName>>,
     AppError,

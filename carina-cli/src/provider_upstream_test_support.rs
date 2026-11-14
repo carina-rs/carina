@@ -21,10 +21,6 @@ impl ProviderFactory for ProviderConfigCaptureFactory {
         "provider upstream state capture"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -41,10 +37,8 @@ impl ProviderFactory for ProviderConfigCaptureFactory {
         '_,
         carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
     > {
-        *self.received_role_arn.lock().unwrap() = config
-            .configuration()
-            .and_then(|config| config.attributes().get("role_arn"))
-            .cloned();
+        *self.received_role_arn.lock().unwrap() =
+            config.configuration().attributes().get("role_arn").cloned();
         Box::pin(async {
             Ok(
                 carina_core::provider::InitializeOutcome::unavailable().with_provider(Box::new(
@@ -61,7 +55,13 @@ impl ProviderFactory for ProviderConfigCaptureFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            carina_core::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from(
+                [(
+                    "role_arn".into(),
+                    carina_core::schema::AttributeType::string(),
+                )],
+            ))
+            .unwrap(),
             Default::default(),
             Vec::new(),
         )

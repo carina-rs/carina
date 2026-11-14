@@ -1,7 +1,7 @@
 use super::*;
 use crate::provider::{
     BoxFuture, CanonicalProviderConfigAttributes, InitializeOutcomeMint, LoadedProviderSnapshot,
-    ProviderInitialization, ProviderResult,
+    ProviderFactory, ProviderInitialization, ProviderResult,
 };
 use crate::schema::{
     AttributeSchema, AttributeType as DraftType, RawShape, ResourceSchema, SchemaKind,
@@ -25,9 +25,7 @@ impl ProviderFactory for Factory {
     fn display_name(&self) -> &str {
         self.owner
     }
-    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
-        ValidatedConfigSchema::validate(self.config.clone()).unwrap()
-    }
+
     fn validate_config(
         &self,
         _: &CanonicalProviderConfigAttributes,
@@ -56,7 +54,7 @@ impl ProviderFactory for Factory {
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            ValidatedConfigSchema::validate(self.config.clone()).unwrap(),
             Default::default(),
             vec![],
         )
@@ -1553,11 +1551,11 @@ fn typed_function_result(type_expr: TypeExpr) -> Value {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let mut function = parsed.user_functions.remove("result").unwrap();
+    let mut function = parsed.user_functions.shift_remove("result").unwrap();
     function.return_type = Some(type_expr);
     Value::Deferred(crate::resource::DeferredValue::ResolvedFunctionCall {
         function: Arc::new(function),
-        functions: Arc::new(HashMap::new()),
+        functions: Arc::new(indexmap::IndexMap::new()),
         args: Vec::new(),
         source_line: 1.into(),
     })

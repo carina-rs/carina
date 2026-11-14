@@ -1,5 +1,6 @@
 //! Fixtures available to downstream tests with the `test-utils` feature.
 
+pub mod configuration;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod loopback;
 
@@ -14,10 +15,7 @@ pub fn admit_resource_attribute_report<
     B: crate::resource::BindingAddress,
 >(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
-    attributes: &std::collections::HashMap<
-        String,
-        crate::resource::knowledge::Classification<'_, P, B>,
-    >,
+    attributes: &indexmap::IndexMap<String, crate::resource::knowledge::Classification<'_, P, B>>,
     is_string_literal: &dyn Fn(&str) -> bool,
     custom_types: &crate::parser::ProviderCustomTypes,
 ) -> crate::schema::ResourceValueValidation {
@@ -93,10 +91,7 @@ pub fn admit_resource_attributes<
     B: crate::resource::BindingAddress,
 >(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
-    attributes: &std::collections::HashMap<
-        String,
-        crate::resource::knowledge::Classification<'_, P, B>,
-    >,
+    attributes: &indexmap::IndexMap<String, crate::resource::knowledge::Classification<'_, P, B>>,
     is_string_literal: &dyn Fn(&str) -> bool,
     custom_types: &crate::parser::ProviderCustomTypes,
 ) -> Result<(), Vec<crate::schema::TypeError>> {
@@ -363,9 +358,7 @@ pub fn loaded_fixture_snapshot(
         fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
             self.witness.clone()
         }
-        fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-            Default::default()
-        }
+
         fn validate_config(
             &self,
             _: &crate::provider::CanonicalProviderConfigAttributes,

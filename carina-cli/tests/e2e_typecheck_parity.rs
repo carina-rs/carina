@@ -52,6 +52,9 @@ mod seam_round3;
 #[path = "e2e_typecheck_parity/substituted_reference.rs"]
 mod substituted_reference;
 
+#[path = "e2e_typecheck_parity/reference_identified_string.rs"]
+mod reference_identified_string;
+
 #[path = "e2e_typecheck_parity/nested_reference.rs"]
 mod nested_reference;
 
@@ -4052,10 +4055,6 @@ impl ProviderFactory for TestProviderFactory {
         "Test provider"
     }
 
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -4081,6 +4080,7 @@ impl ProviderFactory for TestProviderFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -4088,7 +4088,7 @@ impl ProviderFactory for TestProviderFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -6123,9 +6123,7 @@ impl ProviderFactory for WasmStyleProviderFactory {
     fn display_name(&self) -> &str {
         "WASM-style test provider"
     }
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
+
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -6181,13 +6179,14 @@ impl ProviderFactory for WasmStyleProviderFactory {
     fn create_normalizer(
         &self,
         _config: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )
@@ -7089,18 +7088,7 @@ impl ProviderFactory for Round1ConfigFactory {
     fn display_name(&self) -> &str {
         "round 1 config provider"
     }
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
-            "params".into(),
-            AttributeType::list(AttributeType::refined_string(
-                Some(carina_core::schema::TypeIdentity::bare("VpcId")),
-                None,
-                Some((None, Some(3))),
-                None,
-            )),
-        )]))
-        .unwrap()
-    }
+
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
@@ -7131,7 +7119,18 @@ impl ProviderFactory for Round1ConfigFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             Vec::new(),
-            self.provider_config_attribute_types(),
+            {
+                carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "params".into(),
+                    AttributeType::list(AttributeType::refined_string(
+                        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+                        None,
+                        Some((None, Some(3))),
+                        None,
+                    )),
+                )]))
+                .unwrap()
+            },
             Default::default(),
             Vec::new(),
         )

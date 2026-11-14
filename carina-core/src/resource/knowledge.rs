@@ -603,7 +603,7 @@ pub fn collect_classified_attributes<
     attributes: impl IntoIterator<Item = (String, &'a Value<P, B>)>,
     context: &KnowledgeContext<'_, P, B, S>,
     mut failed: impl FnMut(&str, KnowledgeError<B>),
-) -> HashMap<String, Classification<'a, P, B>> {
+) -> IndexMap<String, Classification<'a, P, B>> {
     attributes
         .into_iter()
         .map(|(name, source)| {

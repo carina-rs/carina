@@ -2020,6 +2020,7 @@ impl RootlessType {
     /// Validate a rootless value with the same recursive local/provider walk
     /// used by resource values. Rootless configuration retains only its primary
     /// local error; resource validation also reports sibling provider findings.
+    #[cfg(test)]
     pub(crate) fn validate_with_lookup<P: PlaceholderKind, B: BindingAddress>(
         &self,
         value: &Value<P, B>,
@@ -2301,7 +2302,7 @@ fn knowledge_type_error<B: BindingAddress>(
 #[cfg(test)]
 pub(crate) fn classified_attributes<'v, P: PlaceholderKind, B: BindingAddress>(
     attributes: &'v HashMap<String, Value<P, B>>,
-) -> Result<HashMap<String, Classification<'v, P, B>>, Vec<TypeError>> {
+) -> Result<indexmap::IndexMap<String, Classification<'v, P, B>>, Vec<TypeError>> {
     attributes
         .iter()
         .map(|(name, value)| {
@@ -4116,6 +4117,9 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     ///    also reject. Enum identities are checked before base recursion;
     ///    identity-less scalar bases follow rule 8a's overlap-or-defer rule,
     ///    with enum values checked at the resolved destination.
+    ///    Reference sources into identified String sinks use this identity
+    ///    admission too; identity-less String and Reference sinks retain their
+    ///    wire-scalar compatibility.
     /// 8. Compatible scalar pairs are String→String, Int→Int, Float→Float,
     ///    and Int→Float:
     ///    - 8a. Identity-less pairs use overlap-or-defer (carina#4362).
@@ -4145,10 +4149,10 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     /// Anonymous String/Int/Float refinements occur only in provider schema slots;
     /// annotations, module/export boundaries and function signatures use identified
     /// refinements or unconstrained scalars. Resolved resource/data-source inputs
-    /// pass through `admit_apply_resource`/`admit_apply_data_source`; provider config
-    /// uses `validate_provider_config_attributes` on resolved values. These checks
-    /// validate the full destination declaration before dispatch, preserving
-    /// #2218's safety without static containment. Function parameters/returns also
+    /// pass through `admit_apply_resource`/`admit_apply_data_source`; provider/backend
+    /// configuration enters `admit()` through `validation/admission/configuration/`.
+    /// These checks validate the full destination declaration before dispatch,
+    /// preserving #2218's safety without static containment. Function parameters/returns also
     /// have runtime constraint checks; backend schemas have no anonymous refinements.
     ///
     /// Preserve the #4362 invariant: adding constraints to a source never reduces
@@ -4237,14 +4241,18 @@ impl std::fmt::Display for MismatchTypeNames {
 }
 
 /// A scalar kind comparison cannot discard the destination value obligation.
-#[derive(Debug, PartialEq, Eq)]
-enum KnownAssignment {
+enum KnownAssignment<'source, 'sink> {
     Assignable,
     Mismatch,
     DeferToSinkValue,
+    IdentityAdmission {
+        source_identity: &'source TypeIdentity,
+        source_length: Option<(Option<u64>, Option<u64>)>,
+        target_binding: &'sink RefinementBinding,
+    },
 }
 
-impl KnownAssignment {
+impl KnownAssignment<'_, '_> {
     fn from_bool(assignable: bool) -> Self {
         if assignable {
             Self::Assignable
@@ -4382,7 +4390,10 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
 
     /// Scalar structural rules. Nominal and recursive decisions are made by
     /// `assignment_on_paths`, which always carries the sink's authority.
-    fn is_assignable_to_known(self, sink: AssignmentSink<'_, R>) -> KnownAssignment {
+    fn is_assignable_to_known<'sink>(
+        self,
+        sink: AssignmentSink<'sink, R>,
+    ) -> KnownAssignment<'source, 'sink> {
         use AttrTypeKind::*;
         match (&self.attr.kind, &sink.attr.kind) {
             // Scalar destinations without identity share one resolved-value
@@ -4433,9 +4444,9 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     range: _,
                 },
             ) if target.identity().is_none() => KnownAssignment::DeferToSinkValue,
-            // A resolver identity selects comparison behavior, not a different
-            // wire scalar. Reference inputs accept string outputs; constraints
-            // are checked on the materialized value before planning.
+            // Reference slots deliberately accept any string-based source (reference
+            // inputs accept string outputs; constraints are checked on the materialized
+            // value), and #4384 changed only Reference -> identified String admission.
             (
                 String {
                     identity_layer: _,
@@ -4454,15 +4465,24 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             ) => KnownAssignment::Assignable,
             (
                 Reference {
-                    identity: _,
+                    identity,
                     pattern: _,
-                    length: _,
+                    length,
                 },
                 String {
-                    identity_layer: _,
+                    identity_layer: StringIdentityLayer { binding, .. },
                     member_layer: _,
                 },
-            ) => KnownAssignment::Assignable,
+            ) => match binding {
+                RefinementBinding::MetadataOnly(None) => KnownAssignment::Assignable,
+                RefinementBinding::MetadataOnly(Some(_))
+                | RefinementBinding::Annotation(_)
+                | RefinementBinding::Validator { .. } => KnownAssignment::IdentityAdmission {
+                    source_identity: identity,
+                    source_length: *length,
+                    target_binding: binding,
+                },
+            },
 
             (
                 ResourceHandle {
@@ -6768,6 +6788,7 @@ fn describe_struct_union_members(
                 .collect();
             Some(UnionStructAlternative {
                 name: name.clone(),
+                canonical_fields: fields.iter().map(|field| field.name.clone()).collect(),
                 accepted_fields,
                 required_fields,
             })
@@ -7069,11 +7090,14 @@ fn format_invalid_enum(
 ) -> String {
     let suggestion = value.as_plain().and_then(|value| {
         let input = value.rsplit('.').next().unwrap_or(value);
-        let known = expected
-            .iter()
-            .map(|candidate| candidate.value.0.as_str())
-            .collect::<Vec<_>>();
-        let suggested = suggest_similar_name(input, &known)?;
+        let names = |is_alias| {
+            expected
+                .iter()
+                .filter(move |candidate| candidate.is_alias == is_alias)
+                .map(|candidate| candidate.value.0.as_str())
+                .collect::<Vec<_>>()
+        };
+        let suggested = suggest_similar_name(input, &names(false), &names(true))?;
         expected
             .iter()
             .find(|candidate| candidate.value.0 == suggested)
@@ -7314,6 +7338,8 @@ pub enum UnionStructMismatchReason {
 pub struct UnionStructAlternative {
     /// Declared Struct name.
     pub name: String,
+    /// Canonical field names, in schema declaration order.
+    pub canonical_fields: Vec<String>,
     /// Canonical field names and accepted `block_name` aliases.
     pub accepted_fields: Vec<String>,
     /// Canonical names of fields required by this alternative.
@@ -7478,15 +7504,19 @@ fn format_union_unknown_prefix(
         "one of these forms: "
     };
     if let [field] = unrecognized_fields {
-        let mut known_fields = Vec::new();
+        let mut primary = Vec::new();
+        let mut aliases = Vec::new();
         for alternative in alternatives {
-            for accepted in &alternative.accepted_fields {
-                if !known_fields.contains(&accepted.as_str()) {
-                    known_fields.push(accepted.as_str());
-                }
-            }
+            primary.extend(alternative.canonical_fields.iter().map(String::as_str));
+            aliases.extend(
+                alternative
+                    .accepted_fields
+                    .iter()
+                    .filter(|field| !alternative.canonical_fields.contains(field))
+                    .map(String::as_str),
+            );
         }
-        if let Some(suggestion) = suggest_similar_name(field, &known_fields) {
+        if let Some(suggestion) = suggest_similar_name(field, &primary, &aliases) {
             return format!(
                 "Unknown field '{field}', did you mean '{suggestion}'? Expected {expectation}"
             );
@@ -8152,6 +8182,22 @@ impl From<crate::parser::CustomTypeValidationError> for TypeError {
 }
 
 impl TypeError {
+    /// Use the resource attribute suggestion policy for every declaration owner.
+    pub(crate) fn unknown_attribute(name: &str, primary: &[&str], aliases: &[&str]) -> Self {
+        let id_attribute = format!("{name}_id");
+        let suggestion = if primary.contains(&id_attribute.as_str())
+            || aliases.contains(&id_attribute.as_str())
+        {
+            Some(id_attribute)
+        } else {
+            suggest_similar_name(name, primary, aliases)
+        };
+        Self::UnknownAttribute {
+            name: name.to_owned(),
+            suggestion,
+        }
+    }
+
     fn value_out_of_range(value: DiagnosticNumber, bounds: NumericRangeBounds) -> Self {
         Self::ValueOutOfRange {
             value,
@@ -10533,7 +10579,7 @@ impl ValidatedResourceSchema {
     #[cfg(test)]
     pub(crate) fn validate_with_origins_and_lookup<P: PlaceholderKind, B: BindingAddress>(
         &self,
-        attributes: &HashMap<String, Classification<'_, P, B>>,
+        attributes: &indexmap::IndexMap<String, Classification<'_, P, B>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
@@ -10542,6 +10588,7 @@ impl ValidatedResourceSchema {
         self.as_schema()
             .validate_admission_report(
                 attributes,
+                attributes.iter(),
                 is_string_literal,
                 &value_validation::AttributeAdmission {
                     known: &|_, selected, proof| {
@@ -12821,7 +12868,7 @@ impl<R: PatternForm> PatternResourceSchema<R> {
 
     /// Returns a map of block_name -> canonical attribute name
     /// for all attributes that have a block_name set.
-    pub fn block_name_map(&self) -> HashMap<String, String> {
+    pub fn block_name_map(&self) -> IndexMap<String, String> {
         self.attributes
             .iter()
             .filter_map(|(attr_name, schema)| {
@@ -15545,20 +15592,24 @@ pub(crate) fn levenshtein_distance(a: &str, b: &str) -> usize {
     prev[b_len]
 }
 
-/// Suggest the most similar field name, if one is close enough
-pub fn suggest_similar_name(unknown: &str, known: &[&str]) -> Option<String> {
+/// Suggest the most similar field name, if one is close enough.
+/// Equal distances prefer primary names over aliases, then the lexically
+/// smallest name. Candidate iteration order never affects the result.
+pub fn suggest_similar_name(unknown: &str, primary: &[&str], aliases: &[&str]) -> Option<String> {
     let max_distance = match unknown.len() {
         0..=2 => 1,
         3..=5 => 2,
         _ => 3,
     };
 
-    known
+    primary
         .iter()
-        .map(|name| (*name, levenshtein_distance(unknown, name)))
-        .filter(|(_, dist)| *dist <= max_distance)
-        .min_by_key(|(_, dist)| *dist)
-        .map(|(name, _)| name.to_string())
+        .map(|name| (*name, 0))
+        .chain(aliases.iter().map(|name| (*name, 1)))
+        .map(|(name, tier)| (levenshtein_distance(unknown, name), tier, name))
+        .filter(|(distance, _, _)| *distance <= max_distance)
+        .min()
+        .map(|(_, _, name)| name.to_string())
 }
 
 /// Validate a single IPv6 group (1-4 hex digits)
@@ -15622,21 +15673,6 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 /// use carina_core::schema::no_lookup;
 ///
 /// let _ = no_lookup();
-/// ```
-///
-/// A rootless config type likewise cannot accept an arbitrary lookup:
-///
-/// ```compile_fail,E0624
-/// use std::collections::BTreeMap;
-/// use carina_core::resource::{ConcreteValue, Value};
-/// use carina_core::schema::{AttributeType, ValidatedConfigSchema};
-///
-/// let config = ValidatedConfigSchema::validate(BTreeMap::from([
-///     ("name".to_string(), AttributeType::string()),
-/// ])).unwrap();
-/// let rootless = config.rootless_type("name").unwrap();
-/// let value = Value::Concrete(ConcreteValue::String("ok".into()));
-/// let _ = rootless.validate_with_lookup(&value, &|_, _| Ok(()));
 /// ```
 ///
 /// Resource attributes must enter admission with boundary evidence; an
@@ -15956,6 +15992,18 @@ impl SchemaRegistry {
                     .declared_edges();
                 OwnerBoundResourceSchema::new(owner, schema, reference_forms, assignability_edges)
             })
+    }
+
+    /// Resolve a type path carrying no [`SchemaKind`] (handles/Ref types),
+    /// trying the managed schema first, then the data source.
+    /// #4425 tracks removing this guess.
+    pub fn get_kindless(
+        &self,
+        provider: &str,
+        resource_type: &str,
+    ) -> Option<OwnerBoundResourceSchema<'_>> {
+        self.get(provider, resource_type, SchemaKind::Resource)
+            .or_else(|| self.get(provider, resource_type, SchemaKind::DataSource))
     }
 
     /// Look up the `Managed` schema for a given [`Resource`].
@@ -16405,13 +16453,15 @@ impl PatternResourceSchema<Compiled> {
     }
 
     pub(crate) fn validate_admission_report<
-        'v,
+        'a,
+        'v: 'a,
         P: PlaceholderKind,
         B: BindingAddress,
         T: StructuralPending<'v, P, B>,
     >(
         &self,
-        attributes: &HashMap<String, Classification<'v, P, B, T>>,
+        attributes: &'a indexmap::IndexMap<String, Classification<'v, P, B, T>>,
+        entries: impl IntoIterator<Item = (&'a String, &'a Classification<'v, P, B, T>)>,
         is_string_literal: &dyn Fn(&str) -> bool,
         admission: &value_validation::AttributeAdmission<'_, 'v, P, B, T>,
     ) -> ResourceValueValidation {
@@ -16427,7 +16477,7 @@ impl PatternResourceSchema<Compiled> {
         }
 
         let values = self.validate_value_entries(
-            attributes,
+            entries,
             is_string_literal,
             ValueEntryValidation::FullInput,
             None,
@@ -16479,7 +16529,7 @@ impl PatternResourceSchema<Compiled> {
             >,
     >(
         &self,
-        attributes: &HashMap<
+        attributes: &indexmap::IndexMap<
             String,
             Classification<
                 'v,
@@ -16499,7 +16549,7 @@ impl PatternResourceSchema<Compiled> {
         >,
     ) -> ResourceValueValidation {
         let mut report = self.validate_value_entries(
-            attributes,
+            attributes.iter(),
             is_string_literal,
             ValueEntryValidation::KnownWritableOnly,
             selected,
@@ -16529,13 +16579,14 @@ impl PatternResourceSchema<Compiled> {
     }
 
     fn validate_value_entries<
-        'v,
+        'a,
+        'v: 'a,
         P: PlaceholderKind,
         B: BindingAddress,
-        T: StructuralPending<'v, P, B>,
+        T: StructuralPending<'v, P, B> + 'a,
     >(
         &self,
-        attributes: &HashMap<String, Classification<'v, P, B, T>>,
+        entries: impl IntoIterator<Item = (&'a String, &'a Classification<'v, P, B, T>)>,
         is_string_literal: &dyn Fn(&str) -> bool,
         mode: ValueEntryValidation,
         selected: Option<&HashSet<String>>,
@@ -16546,14 +16597,11 @@ impl PatternResourceSchema<Compiled> {
         // Build block_name -> canonical_name map for alias resolution
         let bn_map = self.block_name_map();
 
-        // Build suggestion candidates (canonical names + block name aliases)
-        let mut known: Vec<&str> = self.attributes.keys().map(|s| s.as_str()).collect();
-        for bn in bn_map.keys() {
-            known.push(bn.as_str());
-        }
+        let known: Vec<&str> = self.attributes.keys().map(String::as_str).collect();
+        let aliases: Vec<&str> = bn_map.keys().map(String::as_str).collect();
 
         // Type check each attribute and reject unknown ones
-        for (name, value) in attributes {
+        for (name, value) in entries {
             if selected.is_some_and(|selected| !selected.contains(name)) {
                 continue;
             }
@@ -16617,16 +16665,9 @@ impl PatternResourceSchema<Compiled> {
                 if let Some(admit) = admission.unknown {
                     report.attributes.insert(name.clone(), admit(name, value));
                 }
-                let id_attribute = format!("{name}_id");
-                let suggestion = if known.contains(&id_attribute.as_str()) {
-                    Some(id_attribute)
-                } else {
-                    suggest_similar_name(name, &known)
-                };
-                report.errors.push(TypeError::UnknownAttribute {
-                    name: name.clone(),
-                    suggestion,
-                });
+                report
+                    .errors
+                    .push(TypeError::unknown_attribute(name, &known, &aliases));
             }
         }
 

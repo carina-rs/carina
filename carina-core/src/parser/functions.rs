@@ -1208,7 +1208,7 @@ fn function_argument_type_error(
 
 pub(crate) fn validate_pending_function_type_check(
     check: &PendingFunctionTypeCheck,
-    functions: &HashMap<String, UserFunction>,
+    functions: &IndexMap<String, UserFunction>,
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), ParseError> {
     let ctx = ParseContext::for_evaluation_in_session(session);
@@ -1406,7 +1406,7 @@ pub(crate) fn evaluate_user_function<Source: super::context::EvaluationSource>(
 /// table from their current (and potentially different) module scope.
 pub(crate) fn evaluate_resolved_user_function(
     function: &UserFunction,
-    functions: &Arc<HashMap<String, UserFunction>>,
+    functions: &Arc<IndexMap<String, UserFunction>>,
     arguments: &[FunctionArgument],
     config: &ProviderContext,
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,

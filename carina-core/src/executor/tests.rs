@@ -1750,9 +1750,7 @@ impl ProviderFactory for AliasFactory {
     fn display_name(&self) -> &str {
         "Test"
     }
-    fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
-        Default::default()
-    }
+
     fn validate_config(
         &self,
         _attributes: &crate::provider::CanonicalProviderConfigAttributes,
@@ -1770,7 +1768,7 @@ impl ProviderFactory for AliasFactory {
     fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
         crate::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            self.provider_config_attribute_types(),
+            Default::default(),
             Default::default(),
             Vec::new(),
         )

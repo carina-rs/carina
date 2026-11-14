@@ -116,7 +116,7 @@ fn provider_analysis_failure(
 trait ProviderAttributeBindingPhase: BindingAddress {
     fn evaluate_resolved_user_function(
         function: &super::UserFunction<Self>,
-        functions: &std::sync::Arc<HashMap<String, super::UserFunction<Self>>>,
+        functions: &std::sync::Arc<IndexMap<String, super::UserFunction<Self>>>,
         arguments: &[crate::resource::FunctionArgument<ParserPlaceholder, Self>],
         config: &ProviderContext,
         session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
@@ -127,7 +127,7 @@ trait ProviderAttributeBindingPhase: BindingAddress {
 impl ProviderAttributeBindingPhase for RelativeBindingName {
     fn evaluate_resolved_user_function(
         function: &super::UserFunction<Self>,
-        functions: &std::sync::Arc<HashMap<String, super::UserFunction<Self>>>,
+        functions: &std::sync::Arc<IndexMap<String, super::UserFunction<Self>>>,
         arguments: &[crate::resource::FunctionArgument<ParserPlaceholder, Self>],
         config: &ProviderContext,
         session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
@@ -142,7 +142,7 @@ impl ProviderAttributeBindingPhase for RelativeBindingName {
 impl ProviderAttributeBindingPhase for AbsoluteBindingAddress {
     fn evaluate_resolved_user_function(
         function: &super::UserFunction<Self>,
-        functions: &std::sync::Arc<HashMap<String, super::UserFunction<Self>>>,
+        functions: &std::sync::Arc<IndexMap<String, super::UserFunction<Self>>>,
         arguments: &[crate::resource::FunctionArgument<ParserPlaceholder, Self>],
         _config: &ProviderContext,
         session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,

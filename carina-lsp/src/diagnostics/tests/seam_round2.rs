@@ -28,7 +28,7 @@ fn check_report_selection(with_empty_map: bool) {
     let tree = carina_core::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
     let empty = HashMap::new();
-    let values = resource.resolved_attributes();
+    let values = resource.attributes().into_owned();
     let (selected, inputs) = select_admission_inputs(
         resource,
         with_empty_map.then_some(&empty),
@@ -139,7 +139,7 @@ fn round5_source_resource_missing_from_report_is_explicitly_unreached() {
             .is_err()
     );
     let map = authored_validation_resources(&tree);
-    let values = resource.resolved_attributes();
+    let values = resource.attributes().into_owned();
     let (selected, inputs) =
         select_admission_inputs(resource, Some(&map), &values, sealed.judged().report());
     let missing = inputs
@@ -297,13 +297,13 @@ fn round6_report_fallback_records_the_matched_authored_slots() {
     let expected =
         carina_core::validation::admission::attributes::ResourceAttributeInputs::from_report(
             authored,
-            &authored.resolved_attributes(),
+            &authored.attributes(),
             sealed.judged().report(),
         );
     let (_, actual) = select_admission_inputs(
         resource,
         Some(&map),
-        &resource.resolved_attributes(),
+        &resource.attributes(),
         sealed.judged().report(),
     );
     let expected = expected.authored_evidence().unwrap_err();
@@ -354,7 +354,7 @@ fn round7_report_fallback_checks_expanded_resource_with_authored_unreached_slots
     let rref = expanded_tree.resources().next().unwrap();
     assert_eq!(source.authored_instance_key(), rref.authored_instance_key());
     assert_ne!(source.id(), rref.id());
-    let values = rref.resolved_attributes();
+    let values = rref.attributes().into_owned();
     assert!(ResourceAttributeInputs::from_resolved(source, &values, judged.report()).is_err());
     let main_inputs = ResourceAttributeInputs::from_report(rref, &values, judged.report());
     let source_inputs = ResourceAttributeInputs::from_report(source, &values, judged.report());

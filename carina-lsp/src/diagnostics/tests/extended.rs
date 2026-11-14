@@ -1664,6 +1664,25 @@ fn failed_backend_user_function_does_not_emit_a_schema_type_mismatch() {
 }
 
 #[test]
+fn failed_backend_builtin_keeps_independent_schema_errors() {
+    let source = "backend s3 {\n  bucket = cidr_subnet('bad', 8, 1)\n  key = 'state.json'\n  encrypt = 'yes'\n  typo = true\n}\n";
+    let diagnostics = backend_directory_diagnostics(source);
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("backend type 's3'"))
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        vec![
+            "Invalid attribute 'encrypt' for backend type 's3': Type mismatch: expected Bool, got String",
+            "Unknown attribute 'typo' for backend type 's3'",
+        ],
+        "diagnostics: {diagnostics:#?}"
+    );
+}
+
+#[test]
 fn retained_backend_function_does_not_hide_other_sorted_attribute_errors() {
     let sibling_source = "fn backend_bucket(): String { true }\n";
     let backend_source = "backend s3 {\n  bucket = backend_bucket()\n  key = \"state.json\"\n  region = true\n  encrypt = \"yes\"\n}\n";

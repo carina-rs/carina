@@ -9,6 +9,51 @@ use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Keep supplied keys and values, taking matched slots' order from their owner.
+/// Canonical aliases share the authored slot's occurrence and instance. Names
+/// outside that inventory retain their producer's order and report-only handling.
+pub(super) fn in_resource_order<'v, B: BindingAddress, D, V>(
+    resource: &crate::parser::AnalysisResourceRef<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+    values: &'v IndexMap<String, V>,
+) -> std::vec::IntoIter<(&'v String, &'v V)>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    let mut names_by_slot = HashMap::<_, Vec<_>>::new();
+    for (index, name) in values.keys().enumerate() {
+        if let Ok(slot) = resource.authored_slot(name) {
+            names_by_slot
+                .entry((slot.occurrence(), slot.instance()))
+                .or_default()
+                .push(index);
+        }
+    }
+    let mut included = vec![false; values.len()];
+    let mut ordered = Vec::with_capacity(values.len());
+    let mut include = |index: usize| {
+        if !included[index] {
+            included[index] = true;
+            ordered.push(values.get_index(index).expect("supplied attribute index"));
+        }
+    };
+    for name in resource.attributes().keys() {
+        if let Some(index) = values.get_index_of(name) {
+            include(index);
+        }
+        if let Ok(slot) = resource.authored_slot(name)
+            && let Some(aliases) = names_by_slot.get(&(slot.occurrence(), slot.instance()))
+        {
+            for index in aliases {
+                include(*index);
+            }
+        }
+    }
+    for index in 0..values.len() {
+        include(index);
+    }
+    ordered.into_iter()
+}
+
 /// Producer-owned attribute projections and their authored authority.
 ///
 /// Classify `values()` after producing/evaluating these inputs. Admission only
@@ -110,7 +155,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             D,
             B,
         >,
-        values: &HashMap<String, Value<ParserPlaceholder, B>>,
+        values: &IndexMap<String, Value<ParserPlaceholder, B>>,
         report: &crate::parser::retained::ExpressionReport<B>,
     ) -> Self
     where
@@ -134,7 +179,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             D,
             B,
         >,
-        values: &HashMap<String, Value<ParserPlaceholder, B>>,
+        values: &IndexMap<String, Value<ParserPlaceholder, B>>,
         report: &crate::parser::retained::ExpressionReport<B>,
         unchecked: crate::parser::retained::NoAuthoredEvidence,
     ) -> Self
@@ -145,8 +190,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             owner: resource.id().clone(),
             evidence: ResourceEvidence::NoAuthoredEvidence(Arc::new(unchecked)),
             report: Some(Arc::new(report.clone())),
-            inputs: values
-                .iter()
+            inputs: in_resource_order(resource, values)
                 .map(|(name, value)| (name.clone(), StoredInput::Reported(Arc::new(value.clone()))))
                 .collect(),
         }
@@ -175,14 +219,14 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             D,
             B,
         >,
-        values: &HashMap<String, Value<ParserPlaceholder, B>>,
+        values: &IndexMap<String, Value<ParserPlaceholder, B>>,
         report: &crate::parser::retained::ExpressionReport<B>,
     ) -> Result<Self, MissingEvidence>
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
         let report = report.for_resource(resource.id())?;
-        let mut inputs = Self::prepare(resource, values.iter(), true);
+        let mut inputs = Self::prepare(resource, in_resource_order(resource, values), true);
         inputs.report = Some(Arc::new(report.clone()));
         Ok(inputs)
     }
@@ -292,7 +336,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         &'a self,
         context: &KnowledgeContext<'_, ParserPlaceholder, B, S>,
         failed: impl FnMut(&str, KnowledgeError<B>),
-    ) -> HashMap<String, Classification<'a, ParserPlaceholder, B>> {
+    ) -> IndexMap<String, Classification<'a, ParserPlaceholder, B>> {
         collect_classified_attributes(
             self.values().map(|(name, value)| (name.to_owned(), value)),
             context,
@@ -304,12 +348,12 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     /// Unchanged values keep their allocations and their existing proofs.
     pub fn materialize_and_classify<'a, S: ClassificationStage>(
         &'a mut self,
-        values: &HashMap<String, Value<ParserPlaceholder, B>>,
+        values: &IndexMap<String, Value<ParserPlaceholder, B>>,
         context: &KnowledgeContext<'_, ParserPlaceholder, B, S>,
         failed: impl FnMut(&str, KnowledgeError<B>),
     ) -> (
         &'a Self,
-        HashMap<String, Classification<'a, ParserPlaceholder, B>>,
+        IndexMap<String, Classification<'a, ParserPlaceholder, B>>,
     ) {
         // Additional resolved names have no authored authority. Preserve
         // main's classified/report path instead of inventing a seam finding.
@@ -322,9 +366,10 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         self.apply_materializations(values);
         let inputs: &Self = self;
         let classified = collect_classified_attributes(
-            values
-                .keys()
-                .filter_map(|name| inputs.value(name).map(|value| (name.clone(), value))),
+            inputs
+                .values()
+                .filter(|(name, _)| values.contains_key(*name))
+                .map(|(name, value)| (name.to_owned(), value)),
             context,
             failed,
         );
@@ -336,7 +381,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     #[cfg(test)]
     pub(crate) fn materialize(
         &mut self,
-        values: &HashMap<String, Value<ParserPlaceholder, B>>,
+        values: &IndexMap<String, Value<ParserPlaceholder, B>>,
     ) -> Result<(), MissingEvidence> {
         let unmatched = self.unmatched_materializations(values);
         if !unmatched.is_empty() {
@@ -351,7 +396,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
 
     fn unmatched_materializations(
         &self,
-        values: &HashMap<String, Value<ParserPlaceholder, B>>,
+        values: &IndexMap<String, Value<ParserPlaceholder, B>>,
     ) -> Vec<(String, MissingEvidence)> {
         values
             .keys()
@@ -365,7 +410,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             .collect()
     }
 
-    fn apply_materializations(&mut self, values: &HashMap<String, Value<ParserPlaceholder, B>>) {
+    fn apply_materializations(&mut self, values: &IndexMap<String, Value<ParserPlaceholder, B>>) {
         for (name, input) in &mut self.inputs {
             let Some(value) = values.get(name) else {
                 continue;

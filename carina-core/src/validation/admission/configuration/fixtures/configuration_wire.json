@@ -1,0 +1,4 @@
+{
+  "saved_provider_configs": "[{\"name\":\"owner\",\"attributes\":{\"second\":{\"Bool\":true},\"first\":{\"String\":\"value\"},\"token\":{\"String\":\"test-token\"}}}]",
+  "wire": "[[\"first\",\"value\",false],[\"second\",true,false],[\"token\",\"test-token\",false]]"
+}

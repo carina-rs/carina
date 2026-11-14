@@ -24,7 +24,7 @@ use crate::resource::{
 };
 use crate::schema::{
     AttrTypeKind, CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
-    SchemaKind, SchemaRegistry,
+    SchemaRegistry,
 };
 pub use crate::static_type::InferenceError;
 use crate::static_type::{
@@ -867,8 +867,7 @@ fn lookup_schema<'a>(
     resource_type: &str,
 ) -> Option<&'a ResourceSchema> {
     schemas
-        .get(provider, resource_type, SchemaKind::Resource)
-        .or_else(|| schemas.get(provider, resource_type, SchemaKind::DataSource))
+        .get_kindless(provider, resource_type)
         .map(|schema| schema.schema().as_schema())
 }
 

@@ -1,3 +1,8 @@
+#[cfg(feature = "test-utils")]
+use crate::admission_coverage::{
+    self as replay_coverage, ExpandedDeclineReason, Path as AdmissionPath,
+};
+
 mod buffer;
 mod checks;
 mod validation;
@@ -5,6 +10,7 @@ mod validation;
 #[cfg(test)]
 mod tests;
 
+use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -51,7 +57,7 @@ fn select_admission_inputs<'r, 'a>(
             &'r carina_core::parser::AnalysisResourceRef<'a>,
         >,
     >,
-    values: &HashMap<String, Value>,
+    values: &IndexMap<String, Value>,
     report: &carina_core::parser::retained::ExpressionReport,
 ) -> (
     &'r carina_core::parser::AnalysisResourceRef<'a>,
@@ -451,15 +457,30 @@ impl ExpandedDiagnosticValidationInputs<'_> {
         resource_id: &carina_core::resource::ResourceId,
         session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Option<carina_core::schema::ResourceValueValidation> {
-        let resource = *self.resources.get(resource_id)?;
+        let Some(&resource) = self.resources.get(resource_id) else {
+            #[cfg(feature = "test-utils")]
+            replay_coverage::declined(ExpandedDeclineReason::MissingResource);
+            return None;
+        };
         let schemas = self.configuration.schemas();
-        let schema = resource.schema(schemas)?;
-        let inputs =
+        let Some(schema) = resource.schema(schemas) else {
+            #[cfg(feature = "test-utils")]
+            {
+                replay_coverage::missing_schema(AdmissionPath::Expanded, &resource_id.provider);
+                replay_coverage::declined(ExpandedDeclineReason::MissingSchema);
+            }
+            return None;
+        };
+        let Ok(inputs) =
             carina_core::validation::admission::attributes::ResourceAttributeInputs::for_resource(
                 resource,
                 self.configuration.report(),
             )
-            .ok()?;
+        else {
+            #[cfg(feature = "test-utils")]
+            replay_coverage::declined(ExpandedDeclineReason::MissingReport);
+            return None;
+        };
         let mut classified = inputs.classify(
             &carina_core::resource::knowledge::KnowledgeContext::validation(),
             |_, _| {},
@@ -471,7 +492,7 @@ impl ExpandedDiagnosticValidationInputs<'_> {
                     .filter(|value| inputs.value(name).is_some_and(|source| source != value))
                     .map(|value| (name.clone(), value))
             })
-            .collect::<HashMap<_, _>>();
+            .collect::<IndexMap<_, _>>();
         let mut evaluated_inputs = inputs.clone();
         let (evaluated_inputs, updated) = evaluated_inputs.materialize_and_classify(
             &evaluated,
@@ -479,6 +500,8 @@ impl ExpandedDiagnosticValidationInputs<'_> {
             |_, _| {},
         );
         classified.extend(updated);
+        #[cfg(feature = "test-utils")]
+        replay_coverage::reached(AdmissionPath::Expanded);
         Some(
             carina_core::validation::admission::attributes::resource_attribute_admissions(
                 resource,
@@ -559,6 +582,7 @@ pub struct DiagnosticEngine {
     provider_names: Vec<String>,
     known_provider_names: HashSet<String>,
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
+    configuration_factories: Vec<Box<dyn ProviderFactory>>,
     /// Providers that failed to load: name -> error reason.
     provider_errors: HashMap<String, String>,
     /// Cached provider context with custom type validators from schemas.
@@ -841,6 +865,12 @@ impl DiagnosticRun<'_> {
         } else {
             false
         };
+        let reported_directory_failure = merged_attempt
+            .as_ref()
+            .and_then(|attempt| attempt.as_ref().err())
+            .and_then(|error| error.element_diagnostic())
+            .filter(|_| directory_error_emitted)
+            .map(|finding| finding.location().clone());
         let mut merged_result = merged_attempt.and_then(Result::ok);
         // Keep the parsed input stable while module-analysis results are filled
         // in. Cloning this Arc preserves the exact sealed directory without
@@ -1154,6 +1184,7 @@ impl DiagnosticRun<'_> {
                 merged_result.as_ref(),
                 preferred_analysis,
                 buffer_parsed,
+                reported_directory_failure.as_ref(),
             ));
 
             // Check provider region
@@ -1676,6 +1707,8 @@ impl DiagnosticRun<'_> {
                     let Some(report) =
                         inputs.resource_admissions(&resource.id, self.provider_context)
                     else {
+                        #[cfg(feature = "test-utils")]
+                        replay_coverage::declined_outcome(false);
                         continue;
                     };
                     for error in report.errors() {
@@ -1755,6 +1788,8 @@ impl DiagnosticRun<'_> {
                 let full_resource_type = format!("{}.{}", provider, resource_id.resource_type);
 
                 if resource_schema().is_none() {
+                    #[cfg(feature = "test-utils")]
+                    replay_coverage::missing_schema(AdmissionPath::Relative, provider);
                     let provider_loaded = self.provider_names.contains(&provider.to_string());
 
                     let (severity, message) = if let Some(reason) =
@@ -1838,8 +1873,8 @@ impl DiagnosticRun<'_> {
                     let bn_map = schema.block_name_map();
                     let resolved_attrs = semantic_resource_attributes
                         .as_ref()
-                        .map(carina_core::resource::attrs_to_hashmap)
-                        .unwrap_or_else(|| rref.resolved_attributes());
+                        .cloned()
+                        .unwrap_or_else(|| rref.attributes().into_owned());
                     let (admission_resource, inputs) = select_admission_inputs(
                         rref,
                         authored_resources.as_ref(),
@@ -1891,7 +1926,7 @@ impl DiagnosticRun<'_> {
                             })
                             .map(|value| (name.clone(), value))
                         })
-                        .collect::<HashMap<_, _>>();
+                        .collect::<IndexMap<_, _>>();
                     let mut evaluated_inputs = inputs.clone();
                     let (evaluated_inputs, updated) = evaluated_inputs.materialize_and_classify(
                         &evaluated_attrs,
@@ -1911,10 +1946,21 @@ impl DiagnosticRun<'_> {
                     });
                     let mut value_validation = expanded_validation_inputs.as_mut()
                         .filter(|_| uses_composition_output)
-                        .and_then(|inputs| inputs.resource_admissions(resource_id, self.provider_context))
-                        .unwrap_or_else(|| carina_core::validation::admission::attributes::resource_attribute_admissions(
-                            admission_resource, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, evaluated_inputs, &binding_index, self.provider_context, &self.schemas, &mut authored_coverage,
-                        ));
+                        .and_then(|inputs| {
+                            let result = inputs.resource_admissions(resource_id, self.provider_context);
+                            #[cfg(feature = "test-utils")]
+                            if result.is_none() {
+                                replay_coverage::declined_outcome(true);
+                            }
+                            result
+                        })
+                        .unwrap_or_else(|| {
+                            #[cfg(feature = "test-utils")]
+                            replay_coverage::reached(AdmissionPath::Relative);
+                            carina_core::validation::admission::attributes::resource_attribute_admissions(
+                                admission_resource, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, evaluated_inputs, &binding_index, self.provider_context, &self.schemas, &mut authored_coverage,
+                            )
+                        });
                     // Attribute rendering consumes its report entries. Preserve
                     // core's diagnostic ownership before taking those entries.
                     let resource_diagnostic_errors = value_validation
@@ -2592,6 +2638,7 @@ impl DiagnosticEngine {
             provider_names: Vec::new(),
             known_provider_names: HashSet::new(),
             factories: Arc::new(Vec::new()),
+            configuration_factories: Vec::new(),
             provider_errors: HashMap::new(),
             provider_context: DiagnosticProviderContext::Unloaded(Arc::new(
                 carina_core::parser::ProviderContext::new(environment),
@@ -2615,6 +2662,7 @@ impl DiagnosticEngine {
             provider_names,
             known_provider_names,
             factories,
+            configuration_factories: Vec::new(),
             provider_errors: HashMap::new(),
             provider_context,
         }
@@ -2622,6 +2670,13 @@ impl DiagnosticEngine {
 
     pub fn schema_count(&self) -> usize {
         self.schemas.len()
+    }
+
+    /// Host-owned resources retain their catalog; configuration still needs
+    /// the native factory's declaration and semantic admission hook.
+    pub(crate) fn with_configuration_factory(mut self, factory: Box<dyn ProviderFactory>) -> Self {
+        self.configuration_factories.push(factory);
+        self
     }
 
     pub fn with_provider_errors(mut self, errors: HashMap<String, String>) -> Self {

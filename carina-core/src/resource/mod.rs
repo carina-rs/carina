@@ -4049,8 +4049,7 @@ pub enum DeferredValue<P: ValueKind = NoPlaceholder, B: BindingAddress = Absolut
         function: std::sync::Arc<crate::parser::UserFunction<B>>,
         /// Lexical function scope captured with `function`. Function bodies
         /// may call sibling helpers after this outer call is deferred.
-        functions:
-            std::sync::Arc<std::collections::HashMap<String, crate::parser::UserFunction<B>>>,
+        functions: std::sync::Arc<IndexMap<String, crate::parser::UserFunction<B>>>,
         args: Vec<FunctionArgument<P, B>>,
         source_line: DiagnosticSourceLine,
     },
@@ -8981,6 +8980,11 @@ pub enum ProviderModuleSource {}
 /// expansion must derive the same instance-qualified identity from either.
 #[doc(hidden)]
 pub trait AnonymousIdentityModuleSource {
+    #[cfg(feature = "test-utils")]
+    fn recording_module_calls(&self) -> Option<Vec<crate::parser::ModuleCallId>> {
+        None
+    }
+
     fn anonymous_outer_instance_identity(&self) -> Option<ResourceIdentity>;
 
     fn anonymous_scope(&self) -> Option<(String, String)>;
@@ -8989,6 +8993,21 @@ pub trait AnonymousIdentityModuleSource {
 }
 
 impl AnonymousIdentityModuleSource for ModuleSource {
+    #[cfg(feature = "test-utils")]
+    fn recording_module_calls(&self) -> Option<Vec<crate::parser::ModuleCallId>> {
+        Some(
+            self.module_call()
+                .map(|module| {
+                    module
+                        .module_call_path()
+                        .calls()
+                        .map(|call| call.id.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        )
+    }
+
     fn anonymous_outer_instance_identity(&self) -> Option<ResourceIdentity> {
         self.outer_instance_identity()
     }
@@ -9011,6 +9030,11 @@ impl AnonymousIdentityModuleSource for ModuleSource {
 }
 
 impl AnonymousIdentityModuleSource for SavedModuleSource {
+    #[cfg(feature = "test-utils")]
+    fn recording_module_calls(&self) -> Option<Vec<crate::parser::ModuleCallId>> {
+        None
+    }
+
     fn anonymous_outer_instance_identity(&self) -> Option<ResourceIdentity> {
         match self {
             Self::Root => None,
@@ -9041,6 +9065,11 @@ impl AnonymousIdentityModuleSource for SavedModuleSource {
 }
 
 impl AnonymousIdentityModuleSource for ProviderModuleSource {
+    #[cfg(feature = "test-utils")]
+    fn recording_module_calls(&self) -> Option<Vec<crate::parser::ModuleCallId>> {
+        match *self {}
+    }
+
     fn anonymous_outer_instance_identity(&self) -> Option<ResourceIdentity> {
         match *self {}
     }

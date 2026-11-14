@@ -4,7 +4,9 @@ use std::sync::Arc;
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
 use crate::document::Document;
-use crate::enclosing_block::{EnclosingBlock, ResourceTypePatterns, StructPath, enclosing_block};
+use crate::enclosing_block::{
+    EnclosingBlock, SchemaSelector, StructPath, enclosing_block, resource_header,
+};
 use carina_core::builtins;
 use carina_core::parser::{ArgumentParameter, display_string_literal};
 use carina_core::resource::{
@@ -13,6 +15,8 @@ use carina_core::resource::{
 use carina_core::schema::EffectiveSchemaNode;
 #[cfg(test)]
 use carina_core::schema::ResourceSchema;
+#[cfg(test)]
+use carina_core::schema::SchemaKind;
 use carina_core::schema::{CompletionValue, SchemaRegistry, ValidatedResourceSchema};
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
@@ -310,16 +314,13 @@ fn format_hover_display(mut hover: Hover) -> Hover {
 pub struct HoverProvider {
     schemas: Arc<SchemaRegistry>,
     region_completions: Vec<CompletionValue>,
-    resource_type_patterns: ResourceTypePatterns,
 }
 
 impl HoverProvider {
     pub fn new(schemas: Arc<SchemaRegistry>, region_completions: Vec<CompletionValue>) -> Self {
-        let resource_type_patterns = ResourceTypePatterns::from_schemas(&schemas);
         Self {
             schemas,
             region_completions,
-            resource_type_patterns,
         }
     }
 
@@ -361,10 +362,10 @@ impl HoverProvider {
     ) -> Option<Hover> {
         let word = doc.word_at(position)?;
         let text = doc.text();
-        let enclosing_block = enclosing_block(&text, position, &self.resource_type_patterns);
+        let enclosing_block = enclosing_block(&text, position);
 
         // Check for resource type hover
-        if let Some(hover) = self.resource_type_hover(&word) {
+        if let Some(hover) = self.resource_type_hover(&word, &text, position) {
             return Some(hover);
         }
 
@@ -377,12 +378,12 @@ impl HoverProvider {
 
         match &enclosing_block {
             EnclosingBlock::Resource {
-                resource_type,
+                selector,
                 struct_path,
                 binding: _binding,
             } => match struct_path {
                 StructPath::Known(struct_path) => {
-                    if let Some(hover) = self.attribute_hover(&word, resource_type, struct_path) {
+                    if let Some(hover) = self.attribute_hover(&word, selector, struct_path) {
                         return Some(hover);
                     }
                 }
@@ -570,23 +571,13 @@ impl HoverProvider {
         })
     }
 
-    fn resource_type_hover(&self, word: &str) -> Option<Hover> {
-        // Check against all schema keys (provider.resource_type)
-        for (provider, resource_type, _kind, schema) in self.schemas.iter() {
-            let key = if provider.is_empty() {
-                resource_type.to_string()
-            } else {
-                format!("{}.{}", provider, resource_type)
-            };
-            if word == key || word.contains(key.as_str()) {
-                // Avoid matching substrings like "vpc_id" for "vpc"
-                if word.contains(&format!("{}_", key)) || word.contains(&format!("_{}", key)) {
-                    continue;
-                }
-                return self.schema_hover(&key, schema);
-            }
+    fn resource_type_hover(&self, word: &str, text: &str, position: Position) -> Option<Hover> {
+        let header = resource_header(&crate::lex::lex(text), position)?;
+        if header.selector.path().to_string() != word {
+            return None;
         }
-        None
+        let schema = header.selector.lookup(&self.schemas)?;
+        self.schema_hover(word, schema.schema())
     }
 
     fn schema_hover(&self, resource_name: &str, schema: &ValidatedResourceSchema) -> Option<Hover> {
@@ -656,33 +647,14 @@ impl HoverProvider {
     fn attribute_hover(
         &self,
         word: &str,
-        resource_type: &str,
+        selector: &SchemaSelector,
         struct_path: &[String],
     ) -> Option<Hover> {
         // When we know the enclosing resource, only its schema is authoritative.
         // Falling back to a global scan would return a lookalike attribute from
         // an unrelated schema (nondeterministic via HashMap iteration order) —
         // see #1988.
-        let (provider, resource_type) = resource_type.split_once('.')?;
-        if provider.is_empty() {
-            return None;
-        }
-        let lookup = |provider: &str, resource_type: &str| {
-            self.schemas
-                .get(
-                    provider,
-                    resource_type,
-                    carina_core::schema::SchemaKind::Resource,
-                )
-                .or_else(|| {
-                    self.schemas.get(
-                        provider,
-                        resource_type,
-                        carina_core::schema::SchemaKind::DataSource,
-                    )
-                })
-        };
-        let schema = lookup(provider, resource_type)?;
+        let schema = selector.lookup(&self.schemas)?;
         let mut path = struct_path.to_vec();
         path.push(word.to_string());
         let attribute = schema.effective_node_at_authored_path(&path)?;
@@ -866,9 +838,11 @@ mod tests {
                 .unwrap(),
         );
         let provider = super::HoverProvider::new(std::sync::Arc::new(schemas), vec![]);
+        let header =
+            resource_header(&crate::lex::lex("gcp.Cloud {"), Position::new(0, 10)).unwrap();
         assert!(
             provider
-                .attribute_hover("region", "gcp.Cloud", &[])
+                .attribute_hover("region", &header.selector, &[])
                 .is_none()
         );
     }
@@ -1023,6 +997,243 @@ mod tests {
             })
     }
 
+    #[test]
+    fn resource_type_hover_uses_exact_path_and_syntax_kind() {
+        let source = "let short = mock.ec2.Vpc{\n  vpc_id = 'vpc-123'\n}\n\
+            let long = read mock.ec2.VpcEndpoint{}\n\
+            let lookup = read\n  /* lookup schema */\n  mock.ec2.Vpc{}\n\
+            let managed = mock.ec2.VpcEndpoint{}\n\
+            let unknown = mock.ec2.VpcEndpointMissing{}\n\
+            let suffix = mock.ec2.Vpc_id{}\n";
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("main.crn"), source).unwrap();
+        std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        let doc = Document::new_with_path(
+            source.into(),
+            directory.path().join("main.crn"),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+
+        for managed_endpoint in [false, true] {
+            let mut schemas = SchemaRegistry::new();
+            for (name, data_source, description) in [
+                ("ec2.Vpc", false, "Managed VPC"),
+                ("ec2.Vpc", true, "Existing VPC"),
+                ("ec2.VpcEndpoint", true, "Existing endpoint"),
+                ("ec2.VpcEndpoint", false, "Managed endpoint"),
+            ] {
+                if name == "ec2.VpcEndpoint" && !data_source && !managed_endpoint {
+                    continue;
+                }
+                let schema = ResourceSchema::new(name)
+                    .with_description(description)
+                    .attribute(
+                        AttributeSchema::optional("vpc_id", AttributeType::string()).build(),
+                    );
+                let schema = if data_source {
+                    schema.as_data_source()
+                } else {
+                    schema
+                };
+                schemas.insert("mock", schema.validate().unwrap());
+            }
+            // With no managed endpoint, iter() visits the managed Vpc before
+            // either data source, guaranteeing the old substring lookup fails.
+            let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+            for (needle, occurrence, path, description) in [
+                ("mock.ec2.Vpc{", 0, "mock.ec2.Vpc", "Managed VPC"),
+                (
+                    "mock.ec2.VpcEndpoint{",
+                    0,
+                    "mock.ec2.VpcEndpoint",
+                    "Existing endpoint",
+                ),
+                ("mock.ec2.Vpc{", 1, "mock.ec2.Vpc", "Existing VPC"),
+                ("vpc_id", 0, "vpc_id", "No description"),
+            ] {
+                let position = hover_position(source, needle, occurrence);
+                assert_eq!(doc.word_at(position).as_deref(), Some(path));
+                // Backend::hover uses this entry with the directory and filename.
+                let hover = provider
+                    .hover_with_context(&doc, position, Some(directory.path()), Some("main.crn"))
+                    .expect("registered type or attribute must have hover");
+                let HoverContents::Markup(content) = hover.contents else {
+                    panic!("expected markdown hover")
+                };
+                assert_eq!(
+                    content.value.lines().next(),
+                    Some(format!("## {path}").as_str())
+                );
+                assert!(content.value.contains(description), "{}", content.value);
+            }
+
+            let managed = provider.hover_with_context(
+                &doc,
+                hover_position(source, "mock.ec2.VpcEndpoint{", 1),
+                Some(directory.path()),
+                Some("main.crn"),
+            );
+            if managed_endpoint {
+                let HoverContents::Markup(content) = managed.unwrap().contents else {
+                    panic!("expected markdown hover")
+                };
+                assert_eq!(
+                    content.value.lines().next(),
+                    Some("## mock.ec2.VpcEndpoint")
+                );
+                assert!(
+                    content.value.contains("Managed endpoint"),
+                    "{}",
+                    content.value
+                );
+            } else {
+                assert!(
+                    managed.is_none(),
+                    "must not fall back to the data-source schema"
+                );
+            }
+            for needle in ["mock.ec2.VpcEndpointMissing", "mock.ec2.Vpc_id"] {
+                assert!(
+                    provider
+                        .hover_with_context(
+                            &doc,
+                            hover_position(source, needle, 0),
+                            Some(directory.path()),
+                            Some("main.crn"),
+                        )
+                        .is_none(),
+                    "unregistered path {needle} must not have resource hover"
+                );
+            }
+        }
+    }
+
+    fn schema_selection_hover(source: &str) -> Option<String> {
+        let cursor = source.find('|').unwrap();
+        let source = source.replacen('|', "", 1);
+        let position = crate::position::byte_offset_to_position(&source, cursor).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("main.crn"), &source).unwrap();
+        std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        let doc = Document::new_with_path(
+            source,
+            directory.path().join("main.crn"),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        let mut schemas = SchemaRegistry::new();
+        for (name, kind, attribute, description) in [
+            (
+                "ec2.Vpc",
+                SchemaKind::Resource,
+                "managed_only",
+                "Managed VPC",
+            ),
+            ("ec2.Vpc", SchemaKind::DataSource, "filter", "Existing VPC"),
+            (
+                "ec2.ManagedOnly",
+                SchemaKind::Resource,
+                "filter",
+                "Managed only",
+            ),
+            (
+                "ec2.LookupOnly",
+                SchemaKind::DataSource,
+                "filter",
+                "Lookup only",
+            ),
+        ] {
+            let schema = ResourceSchema::new(name)
+                .with_description(description)
+                .attribute(
+                    AttributeSchema::optional(attribute, AttributeType::string())
+                        .with_description(description)
+                        .build(),
+                )
+                .attribute(
+                    AttributeSchema::optional("shared", AttributeType::string())
+                        .with_description(description)
+                        .build(),
+                );
+            let schema = if kind == SchemaKind::DataSource {
+                schema.as_data_source()
+            } else {
+                schema
+            };
+            schemas.insert("mock", schema.validate().unwrap());
+        }
+        HoverProvider::new(Arc::new(schemas), vec![])
+            .hover_with_context(&doc, position, Some(directory.path()), Some("main.crn"))
+            .map(|hover| match hover.contents {
+                HoverContents::Markup(content) => content.value,
+                _ => panic!("expected markdown hover"),
+            })
+    }
+
+    #[test]
+    fn schema_selection_read_attribute_hover() {
+        let hover = schema_selection_hover("let v = read mock.ec2.Vpc {\n  fil|ter = 'x'\n}")
+            .expect("data-source-only attribute must have hover");
+        assert!(hover.contains("Existing VPC"), "{hover}");
+    }
+
+    #[test]
+    fn schema_selection_read_shared_attribute_hover() {
+        let hover =
+            schema_selection_hover("let v = read mock.ec2.Vpc {\n  sha|red = 'x'\n}").unwrap();
+        assert!(hover.contains("Existing VPC"), "{hover}");
+        assert!(!hover.contains("Managed VPC"), "{hover}");
+    }
+
+    #[test]
+    fn schema_selection_multiline_attribute_hover() {
+        for header in [
+            "read\n mock.ec2.Vpc",
+            "read // lookup\n /* read mock.ec2.ManagedOnly */\n mock.ec2.Vpc",
+            "read /* lookup */ mock.ec2.Vpc",
+        ] {
+            let source = format!("let v = {header} {{\n  fil|ter = 'x'\n}}");
+            let hover = schema_selection_hover(&source).expect("read must survive header trivia");
+            assert!(hover.contains("Existing VPC"), "{source}: {hover}");
+        }
+    }
+
+    #[test]
+    fn schema_selection_attribute_hover_requires_exact_kind() {
+        for header in ["read mock.ec2.ManagedOnly", "mock.ec2.LookupOnly"] {
+            let source = format!("let v = {header} {{\n  fil|ter = 'x'\n}}");
+            assert!(schema_selection_hover(&source).is_none(), "{source}");
+        }
+    }
+
+    #[test]
+    fn schema_selection_hover_mid_word_after_multibyte_text() {
+        for source in [
+            "let v = /* 🌏 */ read /* 日本語 */ mock.ec2.V|pc {}",
+            "let v = read mock.ec2.Vpc { shared = '🌏', fil|ter = 'x' }",
+        ] {
+            let hover =
+                schema_selection_hover(source).expect("UTF-16 cursor must keep schema kind");
+            assert!(hover.contains("Existing VPC"), "{source}: {hover}");
+        }
+    }
+
+    #[test]
+    fn schema_selection_hover_ignores_read_in_comments_and_strings() {
+        for header in [
+            "/* read */ mock.ec2.Vpc",
+            "'read'\n mock.ec2.Vpc",
+            "already_read\n mock.ec2.Vpc",
+        ] {
+            let source = format!("let v = {header} {{\n  sha|red = 'x'\n}}");
+            let hover = schema_selection_hover(&source).unwrap();
+            assert!(hover.contains("Managed VPC"), "{source}: {hover}");
+        }
+    }
+
     fn nested_attribute_hover_provider() -> HoverProvider {
         let alias_target = AttributeType::struct_(
             "AliasTarget",
@@ -1087,6 +1298,18 @@ mod tests {
                 .expect("schema fixture must be valid"),
         );
         schemas.insert("aws", vpc.validate().expect("schema fixture must be valid"));
+        schemas.insert(
+            "aws",
+            ResourceSchema::new("ec2.Vpc")
+                .as_data_source()
+                .attribute(
+                    AttributeSchema::optional("description", AttributeType::string())
+                        .with_description("REAL DATA SOURCE DESCRIPTION")
+                        .build(),
+                )
+                .validate()
+                .expect("schema fixture must be valid"),
+        );
         HoverProvider::new(Arc::new(schemas), vec![])
     }
 
@@ -2176,10 +2399,19 @@ EOT
     #[test]
     fn valid_resource_headers_keep_attribute_hover() {
         let provider = resource_header_hover_provider();
-        for text in [
-            "aws.ec2.SecurityGroup {\n  description = 'direct'\n}\n",
-            "let x = read aws.ec2.Vpc {\n  description = 'read'\n}\n",
-            "for item in items {\n  aws.ec2.SecurityGroup {\n    description = item\n  }\n}\n",
+        for (text, description) in [
+            (
+                "aws.ec2.SecurityGroup {\n  description = 'direct'\n}\n",
+                "REAL RESOURCE DESCRIPTION",
+            ),
+            (
+                "let x = read aws.ec2.Vpc {\n  description = 'read'\n}\n",
+                "REAL DATA SOURCE DESCRIPTION",
+            ),
+            (
+                "for item in items {\n  aws.ec2.SecurityGroup {\n    description = item\n  }\n}\n",
+                "REAL RESOURCE DESCRIPTION",
+            ),
         ] {
             let doc = Document::new(
                 text.to_string(),
@@ -2194,7 +2426,7 @@ EOT
                 None,
             )
             .unwrap_or_else(|| panic!("valid resource header lost attribute hover:\n{text}"));
-            assert!(content.contains("REAL RESOURCE DESCRIPTION"), "{content}");
+            assert!(content.contains(description), "{content}");
         }
     }
 

@@ -1275,7 +1275,12 @@ where
     // Graph membership comes from the ordering pass's exact
     // dependency computation. Provenance only anchors those
     // edges; retained references never add graph edges.
-    for binding in crate::deps::get_resource_dependencies(managed) {
+    let mut bindings = crate::deps::get_resource_dependencies(managed)
+        .into_iter()
+        .collect::<Vec<_>>();
+    // This membership set has no authored order; sorting stabilizes the first invariant error.
+    bindings.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    for binding in bindings {
         let explicit = dependencies
             .iter()
             .find(|dependency| dependency.operand().binding_reference() == binding);
@@ -1766,7 +1771,7 @@ pub struct AnalysisTree<
     validation_values: Vec<Located<FunctionValidationValue<'a, P, B>>>,
     iterables: Vec<AnalysisForRef<'a, P, B>>,
     arguments: &'a [super::ArgumentParameter<super::TypeExpr, P, B>],
-    functions: &'a std::collections::HashMap<String, super::UserFunction<B>>,
+    functions: &'a indexmap::IndexMap<String, super::UserFunction<B>>,
     module_calls: &'a [super::ModuleCall<P, B>],
     binding_names: std::collections::HashSet<String>,
     backend_location: Option<&'a DeclarationLocation>,
@@ -2367,13 +2372,13 @@ where
                     .attributes
                     .iter()
                     .rev()
-                    .find(|attribute| attribute.detail() == key)
+                    .find(|attribute| &attribute.key == key)
                     .ok_or_else(|| {
                         AnalysisTreeError::new(AnalysisTreeErrorKind::MissingSyntaxProvenance {
                             element: format!("provider {} attribute {key}", provider.name),
                         })
                     })?;
-                locations.insert(key.clone(), location.location().clone());
+                locations.insert(key.clone(), location.value_location.clone());
             }
             provider_attribute_locations.push(locations);
         }
@@ -2647,8 +2652,26 @@ where
             .attributes
             .iter()
             .rev()
-            .find(|attribute| name.equivalent(attribute.detail()))
-            .map_or(declaration.location(), |attribute| attribute.location())
+            .find(|attribute| name.equivalent(&attribute.key))
+            .map_or(declaration.location(), |attribute| {
+                &attribute.value_location
+            })
+    }
+
+    pub fn provider_attribute_key_location<
+        Q: indexmap::Equivalent<super::AttributeKey> + ?Sized,
+    >(
+        &self,
+        index: usize,
+        name: &Q,
+    ) -> &DeclarationLocation {
+        let declaration = self.provider_declaration(index);
+        declaration
+            .attributes
+            .iter()
+            .rev()
+            .find(|key| name.equivalent(&key.key))
+            .map_or(declaration.location(), |key| &key.key_location)
     }
 
     fn provider_declaration(&self, index: usize) -> &Located<super::elements::ProviderDeclaration> {
@@ -2670,6 +2693,9 @@ where
     }
     pub fn backend_location(&self) -> Option<&'a DeclarationLocation> {
         self.backend_location
+    }
+    pub fn backend_attribute_value(&self, name: &super::AttributeKey) -> Option<&'a Value<P, B>> {
+        self.file.backend.as_ref()?.attributes.get(name)
     }
     pub fn backend_attribute_location<Q: indexmap::Equivalent<super::AttributeKey> + ?Sized>(
         &self,
@@ -3200,5 +3226,89 @@ mod location_tests {
         assert!(
             matches!(error.kind(), AnalysisTreeErrorKind::MissingElementProvenance { element, .. } if element == "attribute value enabled")
         );
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_order_tests {
+    #[test]
+    fn missing_dependency_provenance_reports_the_first_binding_in_key_order() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/diagnostic_order/metadata_values");
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::config_loader::parse_directory(
+            &crate::paths::ResolvedPath::new(root).unwrap(),
+            &context,
+        )
+        .unwrap()
+        .into_parsed();
+        let tree = super::AnalysisTree::try_from_file(&parsed).unwrap();
+        let location = tree
+            .top_level_resources()
+            .next()
+            .unwrap()
+            .location()
+            .clone();
+        let mut resource = parsed.resources[0].clone();
+        resource.attributes = ["zulu", "alpha", "quartz", "bravo", "mango", "delta"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_owned(),
+                    crate::resource::Value::resource_ref(name, "name", vec![]),
+                )
+            })
+            .collect();
+        for _ in 0..8 {
+            let error = super::managed_dependency_origins(&parsed, &resource, &[], &[], &location)
+                .unwrap_err();
+            assert!(
+                matches!(error.kind(), super::AnalysisTreeErrorKind::MissingElementProvenance { element, .. }
+                if element == "dependency edge to alpha"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_missing_annotation_reports_the_first_declared_function() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/diagnostic_order/functions/undefined_references");
+        let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let mut parsed = crate::config_loader::parse_directory(
+            &crate::paths::ResolvedPath::new(root).unwrap(),
+            &config,
+        )
+        .unwrap()
+        .into_parsed();
+        let annotations = parsed
+            .user_functions
+            .iter_mut()
+            .map(|(name, function)| (name.clone(), std::mem::take(&mut function.type_annotations)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            annotations
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["zebra", "mango", "quartz", "delta", "alpha", "bravo"]
+        );
+        for (name, annotations) in annotations {
+            let error = crate::parser::AnalysisTree::try_from_file(&parsed)
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "missing parser syntax provenance for function return type '{name}' annotation"
+                )
+            );
+            parsed
+                .user_functions
+                .get_mut(&name)
+                .unwrap()
+                .type_annotations = annotations;
+        }
+        assert!(crate::parser::AnalysisTree::try_from_file(&parsed).is_ok());
     }
 }

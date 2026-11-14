@@ -1377,7 +1377,7 @@ fn check_upstream_state_field_references_inner<
                     location: context.to_string(),
                     binding: binding.to_string(),
                     field: field.to_string(),
-                    suggestion: suggest_similar_name(field, known),
+                    suggestion: suggest_similar_name(field, known, &[]),
                 }),
             ));
         }));
@@ -1398,10 +1398,7 @@ fn check_upstream_state_field_references_inner<
         }
     }
 
-    // HashMap-backed walks (parsed.variables, resource.attributes,
-    // call.arguments) visit entries in nondeterministic order. Sort the
-    // final error list so CLI output and any snapshot-style assertions
-    // stay stable across runs.
+    // Preserve the established grouping by source location, binding, and field.
     errors.sort_by(|a, b| {
         (a.detail().location(), a.binding(), a.field()).cmp(&(
             b.detail().location(),

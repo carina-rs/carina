@@ -1,0 +1,2 @@
+fn alpha(value: String): String { value }
+fn bravo(value: String): String { value }
