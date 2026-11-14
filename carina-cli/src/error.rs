@@ -1911,7 +1911,7 @@ pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static))
 }
 
 /// Evidence stays typed through human rendering. Ordinary multiline messages
-/// retain their existing per-line error prefixes; only RootEvidence is a note.
+/// retain their existing per-line error prefixes; declaration evidence is a note.
 pub use carina_core::module_resolver::DiagnosticLine as HumanErrorLine;
 
 fn prefix_first_message(lines: &mut [HumanErrorLine], prefix: &str) {
@@ -1988,10 +1988,12 @@ pub fn human_error_lines(error: &AppError) -> Vec<HumanErrorLine> {
         _ => vec![HumanErrorLine::Message(error.to_string())],
     };
     // Keep source-chain and replan rendering identical for every other error.
-    if !lines
-        .iter()
-        .any(|line| matches!(line, HumanErrorLine::RootEvidence(_)))
-    {
+    if !lines.iter().any(|line| {
+        matches!(
+            line,
+            HumanErrorLine::RootEvidence(_) | HumanErrorLine::ModuleEvidence(_)
+        )
+    }) {
         return vec![HumanErrorLine::Message(format_error_with_source_chain(
             error,
         ))];
@@ -2004,10 +2006,13 @@ pub fn human_error_lines(error: &AppError) -> Vec<HumanErrorLine> {
     lines
 }
 
-pub(crate) fn has_root_placement_notes(error: &AppError) -> bool {
-    human_error_lines(error)
-        .iter()
-        .any(|line| matches!(line, HumanErrorLine::RootEvidence(_)))
+pub(crate) fn has_directory_evidence_notes(error: &AppError) -> bool {
+    human_error_lines(error).iter().any(|line| {
+        matches!(
+            line,
+            HumanErrorLine::RootEvidence(_) | HumanErrorLine::ModuleEvidence(_)
+        )
+    })
 }
 
 /// Lint keeps its warning prefix while indenting typed evidence continuations.
@@ -2017,6 +2022,7 @@ pub(crate) fn lint_error_message(error: &AppError) -> String {
         .map(|line| match line {
             HumanErrorLine::Message(message) => message,
             HumanErrorLine::RootEvidence(evidence) => format!("  Note: {}", evidence.note()),
+            HumanErrorLine::ModuleEvidence(evidence) => format!("  Note: {}", evidence.note()),
         })
         .collect::<Vec<_>>()
         .join("\n")

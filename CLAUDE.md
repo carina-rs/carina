@@ -1061,13 +1061,18 @@ merged uniformly — no file name (including `main.crn`) is privileged.
 
 The canonical root/module definition is in
 [Root Configurations and Module Templates](site/src/content/reference/dsl/modules.md#root-configurations-and-module-templates).
-Keep directory classification in the loader, using the complete sibling
+Keep directory classification in the loader, using the sibling
 inventory and one typed verdict shared by declaration checks and require
 admission and importability. Root verdicts carry their authored provider/backend
 evidence location; render it without searching again. Module evidence includes
 arguments, attributes, and require (empty blocks count). The distinct no-evidence
 verdict is a module when imported and a root on direct/LSP/upstream/metadata entry.
-Unknown snapshots defer placement checks. Importability never depends on entry
+Readable provider/backend evidence establishes Root even with unavailable siblings
+or without a directory snapshot. Otherwise incomplete snapshots remain Unknown
+and defer placement and provider/backend schema checks. ModuleTemplate retains
+its first module evidence location: upstream_state sources with this verdict
+are typed errors with that evidence, since module definitions have no state to read.
+Importability never depends on entry
 counts; an empty directory has a typed no-configuration-files error.
 A root require's condition is not inferred or evaluated after
 parsing succeeds. Loading alone can retain a finding; commands reject it when

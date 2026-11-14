@@ -499,6 +499,7 @@ pub struct UpstreamResolveFailure {
 #[derive(Debug, Clone)]
 enum UpstreamResolveCause {
     Message,
+    ModuleTemplate(crate::config_loader::ModuleTemplateDeclarations),
     Boundaries(Vec<crate::validation::ExportBoundaryError>),
     Parse(std::sync::Arc<crate::config_loader::DirectoryParseFailure>),
     Module {
@@ -568,16 +569,52 @@ impl UpstreamResolveFailure {
             },
         }
     }
+    fn module_template(
+        binding: String,
+        source: std::path::PathBuf,
+        template: crate::config_loader::ModuleTemplateDeclarations,
+    ) -> Self {
+        Self {
+            legacy: UpstreamResolveError {
+                binding,
+                source,
+                reason: String::new(),
+            },
+            cause: UpstreamResolveCause::ModuleTemplate(template),
+        }
+    }
+    pub fn module_evidence(&self) -> Option<&crate::config_loader::ModuleEvidence> {
+        match &self.cause {
+            UpstreamResolveCause::ModuleTemplate(template) => Some(template.evidence()),
+            UpstreamResolveCause::Message
+            | UpstreamResolveCause::Boundaries(_)
+            | UpstreamResolveCause::Parse(_)
+            | UpstreamResolveCause::Module { base: _, error: _ } => None,
+        }
+    }
+    fn module_template_message(&self) -> String {
+        format!(
+            "upstream_state `{}`: source `{}` is a module definition and has no state to read",
+            self.legacy.binding,
+            self.legacy.source.display()
+        )
+    }
     pub fn boundary_errors(&self) -> &[crate::validation::ExportBoundaryError] {
         match &self.cause {
             UpstreamResolveCause::Boundaries(errors) => errors,
-            _ => &[],
+            UpstreamResolveCause::Message
+            | UpstreamResolveCause::ModuleTemplate(_)
+            | UpstreamResolveCause::Parse(_)
+            | UpstreamResolveCause::Module { base: _, error: _ } => &[],
         }
     }
     pub fn parse_failure(&self) -> Option<&crate::config_loader::DirectoryParseFailure> {
         match &self.cause {
             UpstreamResolveCause::Parse(error) => Some(error),
-            _ => None,
+            UpstreamResolveCause::Message
+            | UpstreamResolveCause::ModuleTemplate(_)
+            | UpstreamResolveCause::Boundaries(_)
+            | UpstreamResolveCause::Module { base: _, error: _ } => None,
         }
     }
     pub fn module_failure(
@@ -585,12 +622,19 @@ impl UpstreamResolveFailure {
     ) -> Option<(&std::path::Path, &crate::module_resolver::ModuleError)> {
         match &self.cause {
             UpstreamResolveCause::Module { base, error } => Some((base, error)),
-            _ => None,
+            UpstreamResolveCause::Message
+            | UpstreamResolveCause::ModuleTemplate(_)
+            | UpstreamResolveCause::Boundaries(_)
+            | UpstreamResolveCause::Parse(_) => None,
         }
     }
     pub fn diagnostic_lines(&self) -> Vec<crate::module_resolver::DiagnosticLine> {
         use crate::module_resolver::DiagnosticLine;
         match &self.cause {
+            UpstreamResolveCause::ModuleTemplate(template) => vec![
+                DiagnosticLine::Message(self.module_template_message()),
+                DiagnosticLine::ModuleEvidence(template.evidence().clone()),
+            ],
             UpstreamResolveCause::Module { base: _, error } => {
                 let mut lines = error.diagnostic_lines_relative_to(None);
                 if let Some(DiagnosticLine::Message(message)) = lines.first_mut() {
@@ -608,8 +652,11 @@ impl UpstreamResolveFailure {
         }
     }
 
-    /// Editor projection keeps located root evidence in related information.
+    /// Editor projection keeps declaration evidence in related information.
     pub fn lsp_message(&self) -> String {
+        if self.module_evidence().is_some() {
+            return self.module_template_message();
+        }
         if let Some((_, error)) = self.module_failure()
             && let Some(rejection) = error.root_cause().require_outside_module()
         {
@@ -625,8 +672,19 @@ impl UpstreamResolveFailure {
     fn into_legacy(mut self) -> UpstreamResolveError {
         // Only the explicit compatibility API requests a location-free String
         // container. Diagnostic callers retain typed causes via the accessors.
-        if let UpstreamResolveCause::Module { error, .. } = &self.cause {
-            self.legacy.reason = error.to_string();
+        match &self.cause {
+            UpstreamResolveCause::Module { error, base: _ } => {
+                self.legacy.reason = error.to_string()
+            }
+            UpstreamResolveCause::ModuleTemplate(template) => {
+                self.legacy.reason = format!(
+                    "source is a module definition and has no state to read\nNote: {}",
+                    template.evidence().note()
+                )
+            }
+            UpstreamResolveCause::Message
+            | UpstreamResolveCause::Boundaries(_)
+            | UpstreamResolveCause::Parse(_) => {}
         }
         self.legacy
     }
@@ -637,7 +695,15 @@ impl std::fmt::Display for UpstreamResolveFailure {
             UpstreamResolveCause::Module { error, .. } => {
                 self.legacy.fmt_reason(formatter, error.as_ref())
             }
-            _ => self.legacy.fmt(formatter),
+            UpstreamResolveCause::ModuleTemplate(template) => write!(
+                formatter,
+                "{}\nNote: {}",
+                self.module_template_message(),
+                template.evidence().note()
+            ),
+            UpstreamResolveCause::Message
+            | UpstreamResolveCause::Boundaries(_)
+            | UpstreamResolveCause::Parse(_) => self.legacy.fmt(formatter),
         }
     }
 }
@@ -960,6 +1026,8 @@ fn resolve_upstream_exports_context_report<B: BindingAddress>(
 /// Failure to compute a source surface is distinct from an analysis invariant.
 #[derive(Debug, thiserror::Error)]
 pub enum UpstreamExportSourceError {
+    #[error("source is a module definition and has no state to read\nNote: {}", .0.evidence().note())]
+    ModuleTemplate(crate::config_loader::ModuleTemplateDeclarations),
     #[error(transparent)]
     Invariant(#[from] crate::parser::AnalysisTreeError),
     #[error("{0}")]
@@ -981,7 +1049,10 @@ impl UpstreamExportSourceError {
     ) -> Option<(&std::path::Path, &crate::module_resolver::ModuleError)> {
         match self {
             Self::Module { base, error } => Some((base, error)),
-            _ => None,
+            Self::ModuleTemplate(_)
+            | Self::Invariant(_)
+            | Self::Unavailable(_)
+            | Self::Boundaries(_) => None,
         }
     }
 
@@ -991,6 +1062,9 @@ impl UpstreamExportSourceError {
         source: std::path::PathBuf,
     ) -> UpstreamResolveFailure {
         match self {
+            Self::ModuleTemplate(template) => {
+                UpstreamResolveFailure::module_template(binding, source, template)
+            }
             Self::Unavailable(reason) => UpstreamResolveFailure::message(binding, source, reason),
             Self::Module { base, error } => {
                 UpstreamResolveFailure::module(binding, source, base, *error)
@@ -1010,6 +1084,14 @@ pub fn resolve_upstream_exports_from_parsed(
     schemas: Option<&crate::schema::SchemaRegistry>,
     overrides: &crate::config_loader::SourceOverrides,
 ) -> Result<UpstreamExportEntries, UpstreamExportSourceError> {
+    match parsed.complete_directory_verdict() {
+        crate::config_loader::DirectoryVerdict::Root(_)
+        | crate::config_loader::DirectoryVerdict::NoEvidence(_) => {}
+        crate::config_loader::DirectoryVerdict::ModuleTemplate(template) => {
+            return Err(UpstreamExportSourceError::ModuleTemplate(template));
+        } // Unknown is uninhabited after the complete source-loading parse;
+          // unavailable sources retain their existing parse/load diagnostics.
+    }
     let provider_context =
         crate::validation::typecheck::TypecheckProviderContext::for_session(config);
     let parsed = parsed.try_update(|parsed| {
@@ -2015,6 +2097,56 @@ mod tests {
         LoadedProviderContext::empty_for_test()
     }
 
+    #[test]
+    fn module_template_upstream_rejection_retains_the_first_issued_evidence() {
+        for declaration in [
+            "arguments {}",
+            "attributes {}",
+            "require false, 'PRIVATE_GUARD'",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let evidence_path = directory.path().join("a-declarations.crn");
+            fs::write(
+                &evidence_path,
+                format!("// first module evidence\n{declaration}\n"),
+            )
+            .unwrap();
+            write_crn(
+                directory.path(),
+                "z-later.crn",
+                "require true, 'later evidence'\n",
+            );
+            let root = ResolvedPath::new(directory.path()).unwrap();
+            let context = ctx();
+            let parsed = crate::config_loader::parse_directory(&root, &context).unwrap();
+            let crate::config_loader::DirectoryVerdict::ModuleTemplate(template) =
+                parsed.complete_directory_verdict()
+            else {
+                panic!("expected module template");
+            };
+            let evidence = template.evidence().clone();
+            assert_eq!(evidence.file_locator().to_path_buf(), evidence_path);
+            assert_eq!(evidence.location().span().start_line(), 2);
+            // Removing the authored file after admission must not change the
+            // verdict or cause a consumer to search for replacement evidence.
+            fs::remove_file(evidence_path).unwrap();
+            crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                let error = resolve_upstream_exports_from_parsed(
+                    parsed,
+                    &root,
+                    session,
+                    None,
+                    &Default::default(),
+                )
+                .unwrap_err();
+                let UpstreamExportSourceError::ModuleTemplate(template) = error else {
+                    panic!("expected typed module-template rejection: {error}");
+                };
+                assert_eq!(template.evidence(), &evidence);
+            });
+        }
+    }
+
     fn round4_discovery_authority() -> (LoadedProviderContext, SchemaRegistry) {
         let identity = crate::schema::TypeIdentity::from_schema_type("test", "types", "Identifier");
         let owned = crate::parser::OwnedTypeIdentity::provider(
@@ -2078,8 +2210,16 @@ mod tests {
         schemas: &SchemaRegistry,
     ) -> (UpstreamExports, Vec<Located<UpstreamResolveError>>) {
         let (_directory, base) = round4_directory(source);
+        round4_loaded_directory_discovery(&base, context, schemas)
+    }
+
+    fn round4_loaded_directory_discovery(
+        base: &ResolvedPath,
+        context: &LoadedProviderContext,
+        schemas: &SchemaRegistry,
+    ) -> (UpstreamExports, Vec<Located<UpstreamResolveError>>) {
         let parsed = crate::config_loader::parse_directory_for_metadata(
-            &base,
+            base,
             context,
             &Default::default(),
             schemas,
@@ -2087,7 +2227,7 @@ mod tests {
         .unwrap();
         let tree = AnalysisTree::try_from_file(parsed.parsed()).unwrap();
         crate::validation::deferred_types::with_session_for_test(context, |session| {
-            super::resolve_upstream_exports_with_schemas(&base, &tree, session, Some(schemas))
+            super::resolve_upstream_exports_with_schemas(base, &tree, session, Some(schemas))
                 .unwrap()
         })
     }
@@ -2141,10 +2281,10 @@ mod tests {
     }
 
     #[test]
-    fn round4_discovery_registers_resource_type_argument_in_upstream_root() {
+    fn round4_discovery_registers_resource_type_argument_but_rejects_template_source() {
         let (context, schemas) = round4_discovery_authority();
         let source = "arguments { item: test.Item }\nexports { identifier = item.identifier }\n";
-        let (_directory, base) = round4_directory(source);
+        let (directory, base) = round4_directory(source);
         crate::validation::deferred_types::with_session_for_test(&context, |session| {
             let discovery = UpstreamDiscoveryContext {
                 context: session,
@@ -2161,7 +2301,35 @@ mod tests {
                 "the resource argument must register as a structural handle"
             );
         });
-        let (exports, errors) = round4_directory_discovery(source, &context, &schemas);
+        let (exports, errors) = round4_loaded_directory_discovery(&base, &context, &schemas);
+        assert!(exports.is_empty(), "{exports:?}");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(
+            errors[0].detail().reason,
+            format!(
+                "source is a module definition and has no state to read\nNote: directory is a module definition because of the arguments block at {}:1.",
+                crate::paths::DisplayPath::for_diagnostics(
+                    directory.path().join("upstream/exports.crn")
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn upstream_root_infers_a_called_modules_resource_argument() {
+        let (context, schemas) = round4_discovery_authority();
+        let (directory, base) = round4_directory(
+            "let item = test.Item {}\nlet reader = use { source = './reader' }\nlet result = reader { item = item }\nexports { identifier = result.identifier }\n",
+        );
+        let module = directory.path().join("upstream/reader");
+        fs::create_dir(&module).unwrap();
+        write_crn(&module, "arguments.crn", "arguments { item: test.Item }\n");
+        write_crn(
+            &module,
+            "attributes.crn",
+            "attributes { identifier = item.identifier }\n",
+        );
+        let (exports, errors) = round4_loaded_directory_discovery(&base, &context, &schemas);
         assert!(errors.is_empty(), "{errors:?}");
         let UpstreamExportType::Static(ExportStaticType::Inferred(StaticType::Known(known))) =
             &exports["ups"]["identifier"].static_type
@@ -5863,13 +6031,19 @@ mod tests {
     fn resolve_upstream_exports_resolves_declarations_before_inference() {
         let tmp = tempfile::tempdir().unwrap();
         let upstream_dir = tmp.path().join("upstream");
-        fs::create_dir(&upstream_dir).unwrap();
+        let module_dir = upstream_dir.join("typed");
+        fs::create_dir_all(&module_dir).unwrap();
         write_crn(
             &upstream_dir,
             "main.crn",
+            "let seed = test.Item {}\nlet typed = use { source = './typed' }\nlet result = typed { value = seed.identifier }\nexports { out = result.out reversed = result.reversed }\n",
+        );
+        write_crn(
+            &module_dir,
+            "main.crn",
             "arguments { value: test.types.Identifier }\n\
              let item = test.Item {}\n\
-             exports {\n\
+             attributes {\n\
                out = [value, item.identifier]\n\
                reversed = [item.identifier, value]\n\
              }\n",

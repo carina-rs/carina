@@ -207,9 +207,9 @@ fn parser_placeholder_boundary(
 
 /// The verdict supplies both the source and UTF-16 columns from its sealed
 /// snapshot, including unsaved siblings. Rendering never rereads evidence.
-fn attach_root_evidence(
+fn attach_directory_evidence(
     diagnostic: &mut Diagnostic,
-    evidence: &carina_core::config_loader::RootEvidence,
+    evidence: &impl carina_core::config_loader::DirectoryDeclarationEvidence,
 ) {
     let location = evidence.location();
     let (start, end) = evidence.utf16_columns();
@@ -231,7 +231,7 @@ fn attach_root_evidence(
                     Position::new((span.end_line() - 1) as u32, end),
                 ),
             },
-            message: evidence.related_message().to_string(),
+            message: evidence.related_message(),
         }]);
 }
 
@@ -732,17 +732,19 @@ impl DiagnosticRun<'_> {
         // then reuse its judged file for placement and expression reporting.
         let recovery_configuration = match (
             merged_attempt.as_ref(),
-            base_path,
             doc.parsed_buffer(),
             buffer_analysis.as_ref(),
         ) {
-            (Some(Err(_)), Some(base), Some(buffer), Some(_)) => {
-                carina_core::config_loader::DirectoryBufferSnapshot::capture(
-                    base,
-                    buffer.clone(),
-                    &overrides,
-                )
-                .ok()
+            (Some(Ok(_)), _, _) | (_, None, _) | (_, _, None) => None,
+            (Some(Err(_)) | None, Some(buffer), Some(_)) => base_path
+                .and_then(|base| {
+                    carina_core::config_loader::DirectoryBufferSnapshot::capture(
+                        base,
+                        buffer.clone(),
+                        &overrides,
+                    )
+                    .ok()
+                })
                 .map(|snapshot| {
                     carina_core::config_loader::load_buffer_configuration_in_directory(
                         snapshot,
@@ -750,8 +752,14 @@ impl DiagnosticRun<'_> {
                         self.provider_context.catalog(),
                     )
                 })
-            }
-            _ => None,
+                .or_else(|| {
+                    carina_core::config_loader::load_buffer_configuration_without_directory(
+                        buffer,
+                        &self.schemas,
+                        self.provider_context.catalog(),
+                    )
+                    .ok()
+                }),
         };
         let recovered_parsed = recovery_configuration
             .as_ref()
@@ -1144,7 +1152,8 @@ impl DiagnosticRun<'_> {
             diagnostics.extend(self.check_backend_config(
                 doc,
                 merged_result.as_ref(),
-                merged_analysis.as_ref(),
+                preferred_analysis,
+                buffer_parsed,
             ));
 
             // Check provider region
@@ -1257,7 +1266,7 @@ impl DiagnosticRun<'_> {
                     render_merged(doc, finding, DiagnosticSeverity::ERROR, message)
                 {
                     if let Some(root) = root {
-                        attach_root_evidence(&mut diagnostic, root.root_evidence());
+                        attach_directory_evidence(&mut diagnostic, root.root_evidence());
                     }
                     if diagnostics.contains(&diagnostic) {
                         continue;

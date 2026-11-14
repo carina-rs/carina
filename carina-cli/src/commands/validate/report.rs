@@ -579,6 +579,9 @@ impl ValidateReport {
                             crate::error::HumanErrorLine::RootEvidence(evidence) => {
                                 writeln!(stderr, "  Note: {}", evidence.note())?
                             }
+                            crate::error::HumanErrorLine::ModuleEvidence(evidence) => {
+                                writeln!(stderr, "  Note: {}", evidence.note())?
+                            }
                             crate::error::HumanErrorLine::Message(message) => {
                                 for line in message.lines() {
                                     writeln!(stderr, "{prefix} {line}")?;

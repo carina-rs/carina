@@ -266,7 +266,10 @@ pub(crate) fn collapse_errors(errors: Vec<AppError>) -> AppError {
     if errors.len() == 1 {
         return errors.into_iter().next().unwrap();
     }
-    if errors.iter().any(crate::error::has_root_placement_notes) {
+    if errors
+        .iter()
+        .any(crate::error::has_directory_evidence_notes)
+    {
         return AppError::RootPlacementGroup(Box::new(crate::error::RootPlacementErrors::new(
             errors,
         )));

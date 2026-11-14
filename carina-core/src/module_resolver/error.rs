@@ -60,6 +60,7 @@ pub struct ModuleErrorDiagnostic<'a> {
 pub enum DiagnosticLine {
     Message(String),
     RootEvidence(crate::config_loader::RootEvidence),
+    ModuleEvidence(crate::config_loader::ModuleEvidence),
 }
 
 fn require_outside_module_message(

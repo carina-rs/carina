@@ -1989,3 +1989,95 @@ fn imported_empty_exports_reports_the_exports_prohibition() {
         "Error: checked: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n"
     );
 }
+
+#[test]
+fn upstream_module_templates_report_their_declaration_evidence() {
+    for (declaration, kind) in [
+        ("require false, 'PRIVATE_GUARD'", "require statement"),
+        ("arguments {}", "arguments block"),
+        ("attributes {}", "attributes block"),
+    ] {
+        let directory = Directory::new("true");
+        directory.clear_root_require();
+        let upstream = directory.project.join("upstream");
+        fs::create_dir(&upstream).unwrap();
+        fs::write(
+            upstream.join("declarations.crn"),
+            format!("// authored module\n{declaration}\n"),
+        )
+        .unwrap();
+        fs::write(upstream.join("locals.crn"), "// sibling\n").unwrap();
+        fs::write(
+            directory.project.join("main.crn"),
+            "let prior = upstream_state { source = './upstream' }\n",
+        )
+        .unwrap();
+        let message = "upstream_state `prior`: source `./upstream` is a module definition and has no state to read";
+        let note = format!(
+            "Note: directory is a module definition because of the {kind} at upstream/declarations.crn:2."
+        );
+        let human = directory.run(&["validate", "."]);
+        assert_eq!(human.status.code(), Some(1), "{}", output_text(&human));
+        assert_eq!(String::from_utf8(human.stdout).unwrap(), "Validating...\n");
+        assert_eq!(
+            String::from_utf8(human.stderr).unwrap(),
+            format!("Error: ./main.crn:1:39: {message}\n  {note}\n")
+        );
+        let output = directory.run(&["validate", "--json", "."]);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stderr.is_empty());
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["errors"].as_array().unwrap().len(), 1);
+        assert_eq!(report["errors"][0]["message"], format!("{message}\n{note}"));
+        assert_eq!(report["errors"][0]["location"]["file"], "main.crn");
+        assert_eq!(
+            report["errors"][0]["location"]["range"],
+            json!({"start":{"line":1,"column":39},"end":{"line":1,"column":51}})
+        );
+        assert!(!report.to_string().contains("PRIVATE_GUARD"));
+    }
+}
+
+#[test]
+fn incomplete_root_directory_reports_only_the_sibling_load_failure() {
+    let directory = Directory::new("true");
+    directory.clear_root_require();
+    fs::write(
+        directory.project.join("main.crn"),
+        "arguments {}\nrequire false, 'PRIVATE_GUARD'\n",
+    )
+    .unwrap();
+    for (broken, message, range) in [
+        (
+            &b"let broken = [\n"[..],
+            "Syntax error: expected primary",
+            json!({"start":{"line":2,"column":1},"end":{"line":2,"column":1}}),
+        ),
+        (
+            &b"\xff"[..],
+            "Failed to read ./z-broken.crn: stream did not contain valid UTF-8",
+            Value::Null,
+        ),
+    ] {
+        fs::write(directory.project.join("z-broken.crn"), broken).unwrap();
+        let human = directory.run(&["validate", "."]);
+        assert_eq!(human.status.code(), Some(1), "{}", output_text(&human));
+        assert!(human.stdout.is_empty());
+        let text = output_text(&human);
+        assert!(text.contains("z-broken.crn"), "{text}");
+        assert!(
+            !text.contains("only allowed inside")
+                && !text.contains("arguments blocks")
+                && !text.contains("PRIVATE_GUARD"),
+            "{text}"
+        );
+        let output = directory.run(&["validate", "--json", "."]);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stderr.is_empty());
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["errors"],
+            json!([{"message":message,"severity":"error","code":null,"location":{"file":"z-broken.crn","range":range}}])
+        );
+    }
+}

@@ -648,7 +648,7 @@ impl DiagnosticRun<'_> {
                     finding.detail().lsp_message(),
                 )?;
                 if let Some(evidence) = finding.detail().root_evidence() {
-                    super::attach_root_evidence(&mut diagnostic, evidence);
+                    super::attach_directory_evidence(&mut diagnostic, evidence);
                 }
                 Some(diagnostic)
             })
@@ -662,14 +662,20 @@ impl DiagnosticRun<'_> {
         doc: &Document,
         merged: Option<&MergedParseResult>,
         tree: Option<&carina_core::parser::AnalysisTree<'_>>,
+        buffer: Option<&ParsedFile>,
     ) -> Vec<Diagnostic> {
-        let (Some(merged), Some(tree)) = (merged, tree) else {
+        let Some(tree) = tree else {
             return Vec::new();
         };
-        // CLI validation reports only the structural backend-in-module error
-        // for a module-definition directory. Keep editor diagnostics at the
-        // same layer instead of adding backend-schema errors.
-        match merged.directory.parsed.directory_verdict() {
+        let Some(parsed) = merged
+            .map(|merged| merged.directory.parsed.parsed())
+            .or(buffer)
+        else {
+            return Vec::new();
+        };
+        // Partial snapshots run root checks only with authored root evidence.
+        // Template and Unknown checks remain deferred.
+        match parsed.directory_verdict() {
             carina_core::config_loader::DirectoryVerdict::Root(_)
             | carina_core::config_loader::DirectoryVerdict::NoEvidence(_) => {}
             carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
@@ -677,10 +683,24 @@ impl DiagnosticRun<'_> {
         }
         // A duplicate backend has no single semantic owner. The parser
         // inventory still supplies every declaration for placement checks.
-        if merged.directory.sole_backend_file.is_none() {
+        if let Some(merged) = merged {
+            if merged.directory.sole_backend_file.is_none() {
+                return Vec::new();
+            }
+        } else if parsed
+            .parser_binding_metadata
+            .syntax()
+            .configuration_blocks()
+            .iter()
+            .filter(|block| {
+                block.detail().kind() == carina_core::parser::ConfigurationBlock::Backend
+            })
+            .count()
+            != 1
+        {
             return Vec::new();
         }
-        let Some(backend) = merged.directory.parsed.backend.as_ref() else {
+        let Some(backend) = parsed.backend.as_ref() else {
             return Vec::new();
         };
         let Err(error) = carina_state::BackendConfig::try_from(backend) else {
@@ -698,7 +718,7 @@ impl DiagnosticRun<'_> {
                 .get(error.attribute())
                 .is_some_and(|value| {
                     contains_matching_function_call(value, &|name| {
-                        merged.directory.parsed.user_functions.contains_key(name)
+                        parsed.user_functions.contains_key(name)
                     })
                 })
             {
@@ -1015,7 +1035,7 @@ impl DiagnosticRun<'_> {
         );
         if let Some(evidence) = residual.root_evidence() {
             for diagnostic in &mut diagnostics {
-                super::attach_root_evidence(diagnostic, evidence);
+                super::attach_directory_evidence(diagnostic, evidence);
             }
         }
         diagnostics
@@ -1226,10 +1246,13 @@ impl DiagnosticRun<'_> {
                 if let Some((_, error)) = finding.detail().module_failure()
                     && let Some(rejection) = error.root_cause().require_outside_module()
                 {
-                    super::attach_root_evidence(
+                    super::attach_directory_evidence(
                         &mut diagnostic,
                         rejection.detail().root_evidence(),
                     );
+                }
+                if let Some(evidence) = finding.detail().module_evidence() {
+                    super::attach_directory_evidence(&mut diagnostic, evidence);
                 }
                 Some(diagnostic)
             })

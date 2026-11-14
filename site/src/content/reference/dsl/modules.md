@@ -10,10 +10,10 @@ handle.
 
 ## Root Configurations and Module Templates
 
-Carina determines the declaration scope from the complete directory, including
-all sibling `.crn` files:
+Carina determines the declaration scope from the directory, including all sibling
+`.crn` files. With a complete inventory:
 
-| Evidence in the complete directory | Direct CLI, LSP, `upstream_state`, `module info` and TUI | Imported with `use` |
+| Evidence in the complete directory | Direct CLI, LSP, `module info` and TUI | Imported with `use` |
 | --- | --- | --- |
 | Any authored `provider` or `backend` block, including a provider instance bound with `let` | Root configuration | Rejected: provider/backend blocks belong to the root |
 | No root evidence, and an `arguments` block, `attributes` block, or `require` statement | Module template; empty blocks count | Module |
@@ -35,10 +35,22 @@ blocks count too. These declarations do not supply root evidence.
 A directory with no provider/backend can be applied directly as a root and also
 imported by another root, which would manage its resources twice.
 
-If a sibling cannot be read or parsed, or an editor buffer has no directory
-snapshot, the verdict is unknown. Carina defers placement checks; ordinary
-expression checks still run. `module info` displays neutral file metadata for
-an unknown snapshot.
+An `upstream_state` source must be a root configuration. A source with module
+evidence and no provider/backend is a module definition with no state to read,
+so Carina reports an error. Its note identifies the first `arguments` block,
+`attributes` block, or `require` statement that established the template; the
+language server attaches this location as related information. A source with
+neither kind of evidence is read as a root.
+
+Root evidence is decisive even when a sibling cannot be read or parsed: any
+readable authored provider/backend block, including one in an unsaved buffer,
+establishes a root. Without root evidence, an incomplete directory or an editor
+buffer without a directory snapshot remains unknown. Module evidence alone
+cannot settle an incomplete inventory. Under unknown, Carina defers placement
+and provider/backend schema checks; ordinary expression checks still run.
+This partial recovery is specific to the language server; CLI directory loads
+still report the sibling read or parse failure.
+`module info` displays neutral file metadata for an unknown snapshot.
 
 Each root-placement diagnostic carries the provider/backend evidence from the
 verdict. The CLI includes an indented note naming its file and line; the

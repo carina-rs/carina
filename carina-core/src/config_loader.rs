@@ -445,17 +445,22 @@ impl<E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder>> Root
     }
 }
 
-/// The sole directory classification, issued from one complete sibling inventory.
+/// The sole directory classification, issued from the readable sibling inventories.
+/// Authored root evidence is decisive even when the inventory is incomplete.
 /// Evidence witnesses have private constructors: callers can borrow and
 /// clone a verdict, but cannot manufacture a complete directory classification.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DirectoryVerdict<Incomplete = ()> {
+pub enum DirectoryVerdict<
+    Incomplete = (),
+    Template = ModuleTemplateDeclarations,
+    Neutral = DirectoryWithoutEvidence,
+> {
     Unknown(Incomplete),
     Root(RootDirectoryVerdict),
-    ModuleTemplate(ModuleTemplateDeclarations),
+    ModuleTemplate(Template),
     /// A complete directory with neither root nor module evidence. Entry points
     /// interpret it as a root when direct, and as a module when imported.
-    NoEvidence(DirectoryWithoutEvidence),
+    NoEvidence(Neutral),
 }
 
 /// The same verdict after all sibling inventories were read and parsed. The
@@ -466,6 +471,37 @@ pub enum DirectoryVerdict<Incomplete = ()> {
 /// let _: CompleteDirectoryVerdict = DirectoryVerdict::Unknown(());
 /// ```
 pub type CompleteDirectoryVerdict = DirectoryVerdict<std::convert::Infallible>;
+
+/// An incomplete inventory may establish an authored root, but can establish
+/// neither a template nor absence of evidence.
+///
+/// ```compile_fail,E0308
+/// use carina_core::config_loader::{IncompleteDirectoryVerdict, CompleteDirectoryVerdict, DirectoryVerdict};
+/// fn cannot_promote(complete: CompleteDirectoryVerdict) -> IncompleteDirectoryVerdict {
+///     match complete {
+///         DirectoryVerdict::ModuleTemplate(module) => DirectoryVerdict::ModuleTemplate(module),
+///         _ => unreachable!(),
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail,E0308
+/// use carina_core::config_loader::{IncompleteDirectoryVerdict, DirectoryWithoutEvidence, DirectoryVerdict};
+/// fn cannot_mint_neutral(neutral: DirectoryWithoutEvidence) -> IncompleteDirectoryVerdict {
+///     DirectoryVerdict::NoEvidence(neutral)
+/// }
+/// ```
+pub type IncompleteDirectoryVerdict =
+    DirectoryVerdict<(), std::convert::Infallible, std::convert::Infallible>;
+
+impl IncompleteDirectoryVerdict {
+    fn for_retained_nodes(self) -> DirectoryVerdict {
+        match self {
+            Self::Unknown(()) => DirectoryVerdict::Unknown(()),
+            Self::Root(root) => DirectoryVerdict::Root(root),
+        }
+    }
+}
 
 impl Default for DirectoryVerdict {
     fn default() -> Self {
@@ -490,7 +526,100 @@ pub struct RootDirectoryVerdict {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModuleTemplateDeclarations(());
+pub struct ModuleTemplateDeclarations(std::sync::Arc<ModuleEvidence>);
+
+impl ModuleTemplateDeclarations {
+    pub fn evidence(&self) -> &ModuleEvidence {
+        &self.0
+    }
+}
+
+/// First authored module declaration, retained by the single directory issuer.
+/// The location and pinned path cannot be replaced independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleEvidence {
+    kind: ModuleEvidenceKind,
+    location: parser::DeclarationLocation,
+    file: crate::paths::PersistedPath,
+    utf16_columns: (u32, u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModuleEvidenceKind {
+    Arguments,
+    Attributes,
+    Require,
+}
+
+impl ModuleEvidence {
+    fn declaration(&self) -> &'static str {
+        match self.kind {
+            ModuleEvidenceKind::Arguments => "arguments block",
+            ModuleEvidenceKind::Attributes => "attributes block",
+            ModuleEvidenceKind::Require => "require statement",
+        }
+    }
+    pub fn file_locator(&self) -> &crate::paths::PersistedPath {
+        &self.file
+    }
+    pub fn location(&self) -> &parser::DeclarationLocation {
+        &self.location
+    }
+    pub fn utf16_columns(&self) -> (u32, u32) {
+        self.utf16_columns
+    }
+    pub fn related_message(&self) -> String {
+        format!(
+            "This {} makes the directory a module definition.",
+            self.declaration()
+        )
+    }
+    pub fn note(&self) -> String {
+        format!(
+            "directory is a module definition because of the {} at {}:{}.",
+            self.declaration(),
+            crate::paths::DisplayPath::for_diagnostics(self.location.file().path()),
+            self.location.span().start_line()
+        )
+    }
+}
+
+/// The shared renderer consumes evidence already owned by the verdict.
+pub trait DirectoryDeclarationEvidence {
+    fn file_locator(&self) -> &crate::paths::PersistedPath;
+    fn location(&self) -> &parser::DeclarationLocation;
+    fn utf16_columns(&self) -> (u32, u32);
+    fn related_message(&self) -> String;
+}
+
+impl DirectoryDeclarationEvidence for ModuleEvidence {
+    fn file_locator(&self) -> &crate::paths::PersistedPath {
+        self.file_locator()
+    }
+    fn location(&self) -> &parser::DeclarationLocation {
+        self.location()
+    }
+    fn utf16_columns(&self) -> (u32, u32) {
+        self.utf16_columns()
+    }
+    fn related_message(&self) -> String {
+        self.related_message()
+    }
+}
+impl DirectoryDeclarationEvidence for RootEvidence {
+    fn file_locator(&self) -> &crate::paths::PersistedPath {
+        self.file_locator()
+    }
+    fn location(&self) -> &parser::DeclarationLocation {
+        self.location()
+    }
+    fn utf16_columns(&self) -> (u32, u32) {
+        self.utf16_columns()
+    }
+    fn related_message(&self) -> String {
+        self.related_message().into()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectoryWithoutEvidence(());
@@ -511,7 +640,7 @@ pub enum RootEvidence {
     },
 }
 
-impl<U> DirectoryVerdict<U> {
+impl<U, T, N> DirectoryVerdict<U, T, N> {
     pub fn root(&self) -> Option<&RootDirectoryVerdict> {
         match self {
             Self::Root(root) => Some(root),
@@ -631,7 +760,8 @@ fn mark_complete_directory_files(
     files: &mut [(PathBuf, DirectoryResolvedFile)],
     config: &ProviderContext,
 ) -> CompleteDirectoryVerdict {
-    let verdict = CompleteDirectoryInventories {
+    let verdict = DirectoryInventories {
+        completeness: CompleteInventory,
         inventories: files
             .iter()
             .map(|(_, file)| {
@@ -657,19 +787,51 @@ fn mark_complete_directory_files(
     verdict
 }
 
-/// Constructible only after every member of one sealed source snapshot has
-/// yielded a complete syntax inventory. Both semantic loading and recovery
-/// use this single issuer; recovery need not evaluate sibling values.
-struct CompleteDirectoryInventories<'a> {
+/// One issuer for complete loading and partial editor snapshots. Its typed
+/// completeness determines what may be concluded when no root evidence exists.
+struct DirectoryInventories<'a, C> {
     inventories: Vec<(&'a parser::SyntaxInventory, &'a crate::paths::PersistedPath)>,
+    completeness: C,
+}
+struct CompleteInventory;
+struct IncompleteInventory;
+trait InventoryCompleteness {
+    type Unknown;
+    type Template;
+    type Neutral;
+    fn without_root(
+        self,
+        evidence: Option<ModuleEvidence>,
+    ) -> DirectoryVerdict<Self::Unknown, Self::Template, Self::Neutral>;
+}
+impl InventoryCompleteness for CompleteInventory {
+    type Unknown = std::convert::Infallible;
+    type Template = ModuleTemplateDeclarations;
+    type Neutral = DirectoryWithoutEvidence;
+    fn without_root(self, evidence: Option<ModuleEvidence>) -> CompleteDirectoryVerdict {
+        match evidence {
+            Some(evidence) => DirectoryVerdict::ModuleTemplate(ModuleTemplateDeclarations(
+                std::sync::Arc::new(evidence),
+            )),
+            None => DirectoryVerdict::NoEvidence(DirectoryWithoutEvidence(())),
+        }
+    }
+}
+impl InventoryCompleteness for IncompleteInventory {
+    type Unknown = ();
+    type Template = std::convert::Infallible;
+    type Neutral = std::convert::Infallible;
+    fn without_root(self, _: Option<ModuleEvidence>) -> IncompleteDirectoryVerdict {
+        DirectoryVerdict::Unknown(())
+    }
 }
 
-impl CompleteDirectoryInventories<'_> {
-    fn issue(self) -> CompleteDirectoryVerdict {
+impl<C: InventoryCompleteness> DirectoryInventories<'_, C> {
+    fn issue(self) -> DirectoryVerdict<C::Unknown, C::Template, C::Neutral> {
         use parser::ConfigurationBlock;
         let mut evidence = None;
         let mut additional_evidence = None;
-        let mut module_block = false;
+        let mut module_evidence = None;
         for (inventory, file) in self.inventories {
             for block in inventory.configuration_blocks() {
                 let authored = match block.detail().kind() {
@@ -686,7 +848,23 @@ impl CompleteDirectoryInventories<'_> {
                     ConfigurationBlock::Arguments
                     | ConfigurationBlock::Attributes
                     | ConfigurationBlock::Require => {
-                        module_block = true;
+                        module_evidence.get_or_insert_with(|| ModuleEvidence {
+                            kind: match block.detail().kind() {
+                                ConfigurationBlock::Arguments => ModuleEvidenceKind::Arguments,
+                                ConfigurationBlock::Attributes => ModuleEvidenceKind::Attributes,
+                                ConfigurationBlock::Require => ModuleEvidenceKind::Require,
+                                ConfigurationBlock::Provider
+                                | ConfigurationBlock::Backend
+                                | ConfigurationBlock::State
+                                | ConfigurationBlock::UpstreamState
+                                | ConfigurationBlock::Exports => {
+                                    unreachable!("matched module declaration")
+                                }
+                            },
+                            location: block.location().clone(),
+                            file: file.clone(),
+                            utf16_columns: block.detail().utf16_columns(),
+                        });
                         None
                     }
                     ConfigurationBlock::State
@@ -708,13 +886,12 @@ impl CompleteDirectoryInventories<'_> {
                 }
             }
         }
-        match (evidence, module_block) {
-            (Some(evidence), _) => DirectoryVerdict::Root(RootDirectoryVerdict {
+        match evidence {
+            Some(evidence) => DirectoryVerdict::Root(RootDirectoryVerdict {
                 evidence: std::sync::Arc::new(evidence),
                 additional_evidence,
             }),
-            (None, true) => DirectoryVerdict::ModuleTemplate(ModuleTemplateDeclarations(())),
-            (None, false) => DirectoryVerdict::NoEvidence(DirectoryWithoutEvidence(())),
+            None => self.completeness.without_root(module_evidence),
         }
     }
 }
@@ -856,7 +1033,8 @@ impl<E> RootDirectoryParse<E> {
                 )
             })
             .collect::<Vec<_>>();
-        let verdict = CompleteDirectoryInventories {
+        let verdict = DirectoryInventories {
+            completeness: CompleteInventory,
             inventories: inventories
                 .iter()
                 .map(|(inventory, file)| (inventory, *file))
@@ -1168,7 +1346,7 @@ impl DirectoryBufferSnapshot {
     }
 
     fn require_scope(&self) -> DirectoryRequireScope {
-        let inventories = self
+        let inventories: Vec<_> = self
             .sources
             .iter()
             .map(|source| {
@@ -1180,26 +1358,34 @@ impl DirectoryBufferSnapshot {
                     })
                     .map(|inventory| (inventory, source.file.persisted_path()))
             })
-            .collect::<Option<Vec<_>>>();
-        match inventories {
-            Some(inventories) => {
-                let verdict = CompleteDirectoryInventories {
-                    inventories: inventories
-                        .iter()
-                        .map(|(inventory, file)| (inventory, *file))
-                        .collect(),
-                }
-                .issue();
-                DirectoryRequireScope(verdict.for_retained_nodes())
+            .collect();
+        let readable = inventories
+            .iter()
+            .flatten()
+            .map(|(inventory, file)| (inventory, *file))
+            .collect();
+        let verdict = if inventories.iter().all(Option::is_some) {
+            DirectoryInventories {
+                inventories: readable,
+                completeness: CompleteInventory,
             }
-            None => DirectoryRequireScope(DirectoryVerdict::Unknown(())),
-        }
+            .issue()
+            .for_retained_nodes()
+        } else {
+            DirectoryInventories {
+                inventories: readable,
+                completeness: IncompleteInventory,
+            }
+            .issue()
+            .for_retained_nodes()
+        };
+        DirectoryRequireScope(verdict)
     }
 }
 
 /// Judge the buffer parsed from the exact member text of this sealed snapshot.
-/// Incomplete syntax knowledge retains ordinary expression checks without a
-/// directory verdict. Every known classification requires the complete snapshot.
+/// Readable authored root evidence decides Root even with unavailable siblings.
+/// Without it, incomplete knowledge defers placement and schema checks.
 pub fn load_buffer_configuration_in_directory<'a>(
     snapshot: DirectoryBufferSnapshot,
     schemas: &'a SchemaRegistry,
@@ -1213,6 +1399,33 @@ pub fn load_buffer_configuration_in_directory<'a>(
     BufferConfiguration {
         judged: crate::parser::retained::JudgedFile::new(parsed, schemas, config),
     }
+}
+
+/// Judge an isolated buffer without claiming knowledge of its siblings. Only
+/// authored root evidence can establish a verdict from this incomplete input.
+pub fn load_buffer_configuration_without_directory<'a>(
+    buffer: &ParsedSourceBuffer,
+    schemas: &'a SchemaRegistry,
+    config: &ProviderContext,
+) -> std::io::Result<BufferConfiguration<'a>> {
+    let file = ResolvedPath::new(buffer.file.path())?;
+    let verdict = DirectoryInventories {
+        inventories: vec![(
+            buffer.parsed.parser_binding_metadata.syntax(),
+            file.persisted_path(),
+        )],
+        completeness: IncompleteInventory,
+    }
+    .issue()
+    .for_retained_nodes();
+    let mut parsed = buffer.parsed().clone();
+    crate::parser::retained::set_directory_require_scope(
+        &mut parsed,
+        DirectoryRequireScope(verdict),
+    );
+    Ok(BufferConfiguration {
+        judged: crate::parser::retained::JudgedFile::new(parsed, schemas, config),
+    })
 }
 
 impl LoadedConfig {
@@ -2956,6 +3169,56 @@ mod tests {
     use super::*;
     use crate::resource::Value;
     use std::fs;
+
+    #[test]
+    fn incomplete_snapshots_can_only_establish_readable_root_evidence() {
+        for broken in [&b"let broken = [\n"[..], &b"\xff"[..]] {
+            for (declaration, is_root) in [
+                ("provider mock {}", true),
+                ("backend local { path = 'state.json' }", true),
+                ("arguments {}", false),
+                ("attributes {}", false),
+                ("require false, 'PRIVATE_GUARD'", false),
+                ("// no evidence", false),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let evidence = directory.path().join("evidence.crn");
+                fs::write(&evidence, format!("// authored evidence\n{declaration}\n")).unwrap();
+                fs::write(directory.path().join("broken.crn"), broken).unwrap();
+                let path = directory.path().join("unsaved.crn");
+                let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+                let buffer =
+                    ParsedSourceBuffer::parse("// unsaved buffer\n", &path, &context).unwrap();
+                let snapshot = DirectoryBufferSnapshot::capture(
+                    &ResolvedPath::new(directory.path()).unwrap(),
+                    buffer,
+                    &SourceOverrides::default(),
+                )
+                .unwrap();
+                let schemas = SchemaRegistry::new();
+                let configuration =
+                    load_buffer_configuration_in_directory(snapshot, &schemas, &context);
+                match configuration.parsed().directory_verdict() {
+                    DirectoryVerdict::Root(root) => {
+                        assert!(
+                            is_root,
+                            "module evidence cannot establish an incomplete verdict"
+                        );
+                        assert_eq!(root.evidence().file_locator().to_path_buf(), evidence);
+                        assert_eq!(root.evidence().location().span().start_line(), 2);
+                    }
+                    DirectoryVerdict::Unknown(()) => {
+                        assert!(!is_root, "readable root evidence is decisive")
+                    }
+                    DirectoryVerdict::ModuleTemplate(_) | DirectoryVerdict::NoEvidence(_) => {
+                        panic!(
+                            "an incomplete inventory cannot establish a template or absence of evidence"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     // macOS APFS rejects non-UTF-8 names.
     #[cfg(target_os = "linux")]

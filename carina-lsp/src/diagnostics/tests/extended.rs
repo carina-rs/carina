@@ -4661,7 +4661,26 @@ awscc.ec2.Vpc {
     });
     assert!(
         provider_diag.is_none(),
-        "an unclassified buffer has no placement verdict: {diagnostics:#?}"
+        "the authored provider makes this buffer a root: {diagnostics:#?}"
+    );
+    let arguments_diag = diagnostics.iter().find(|d| d.message == "arguments blocks are only valid inside module definitions, not in root configurations.").expect("authored buffer root evidence enables placement checks");
+    assert_eq!(arguments_diag.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(
+        arguments_diag.range.start,
+        tower_lsp::lsp_types::Position::new(0, 0)
+    );
+    let related = arguments_diag.related_information.as_ref().unwrap();
+    assert_eq!(related.len(), 1);
+    assert_eq!(
+        related[0].message,
+        "This provider block makes the directory a root configuration."
+    );
+    assert_eq!(
+        related[0].location.range,
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(4, 0),
+            tower_lsp::lsp_types::Position::new(4, 14)
+        )
     );
 }
 
@@ -4980,9 +4999,21 @@ backend local {
         d.message
             .contains("arguments blocks are only valid inside module definitions")
     });
-    assert!(
-        arguments_diag.is_none(),
-        "an unclassified buffer has no placement verdict: {diagnostics:#?}"
+    let arguments_diag =
+        arguments_diag.expect("an authored backend decides Root even without directory context");
+    assert_eq!(arguments_diag.severity, Some(DiagnosticSeverity::ERROR));
+    let related = arguments_diag.related_information.as_ref().unwrap();
+    assert_eq!(related.len(), 1);
+    assert_eq!(
+        related[0].message,
+        "This backend block makes the directory a root configuration."
+    );
+    assert_eq!(
+        related[0].location.range,
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(4, 0),
+            tower_lsp::lsp_types::Position::new(4, 7)
+        )
     );
 }
 

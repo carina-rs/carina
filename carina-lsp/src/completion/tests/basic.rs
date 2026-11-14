@@ -2406,41 +2406,48 @@ fn module_call_value_completion_offers_upstream_state_export_ref() {
     use std::fs;
     use tempfile::tempdir;
 
-    let provider = test_provider();
-    let temp_dir = tempdir().expect("Failed to create temp dir");
-    let base_path = temp_dir.path();
+    for (upstream_source, offers_export) in [
+        (
+            "arguments {\n  oidc_provider_arn: IamOidcProviderArn\n}\n\nexports {\n  oidc_provider_arn: IamOidcProviderArn = oidc_provider_arn\n}\n",
+            false,
+        ),
+        (
+            "exports {\n  oidc_provider_arn: IamOidcProviderArn = 'arn:aws:iam::123456789012:oidc-provider/example.invalid'\n}\n",
+            true,
+        ),
+    ] {
+        let provider = test_provider();
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let base_path = temp_dir.path();
 
-    // Upstream project (`../bootstrap`): publishes `oidc_provider_arn`.
-    let upstream_dir = base_path.join("registry").join("dev").join("bootstrap");
-    fs::create_dir_all(&upstream_dir).expect("Failed to create upstream dir");
-    fs::write(
-        upstream_dir.join("main.crn"),
-        "arguments {\n  oidc_provider_arn: IamOidcProviderArn\n}\n\nexports {\n  oidc_provider_arn: IamOidcProviderArn = oidc_provider_arn\n}\n",
-    )
-    .expect("Failed to write upstream main.crn");
+        // Upstream project (`../bootstrap`): publishes `oidc_provider_arn`.
+        let upstream_dir = base_path.join("registry").join("dev").join("bootstrap");
+        fs::create_dir_all(&upstream_dir).expect("Failed to create upstream dir");
+        fs::write(upstream_dir.join("main.crn"), upstream_source)
+            .expect("Failed to write upstream main.crn");
 
-    // Consumer module: receives `IamOidcProviderArn` argument.
-    let module_dir = base_path.join("usecases").join("registry-deploy");
-    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
-    fs::write(
-        module_dir.join("main.crn"),
-        "arguments {\n  oidc_provider_arn: IamOidcProviderArn\n}\n",
-    )
-    .expect("Failed to write module");
+        // Consumer module: receives `IamOidcProviderArn` argument.
+        let module_dir = base_path.join("usecases").join("registry-deploy");
+        fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+        fs::write(
+            module_dir.join("main.crn"),
+            "arguments {\n  oidc_provider_arn: IamOidcProviderArn\n}\n",
+        )
+        .expect("Failed to write module");
 
-    // Caller: `let bootstrap = upstream_state {...}` in backend.crn,
-    // module call in main.crn.
-    let consumer_dir = base_path
-        .join("registry")
-        .join("dev")
-        .join("registry-deploy");
-    fs::create_dir_all(&consumer_dir).expect("Failed to create consumer dir");
-    fs::write(
-        consumer_dir.join("backend.crn"),
-        "let bootstrap = upstream_state {\n  source = '../bootstrap'\n}\n",
-    )
-    .expect("Failed to write backend.crn");
-    let main_content = r#"let registry_deploy = use {
+        // Caller: `let bootstrap = upstream_state {...}` in backend.crn,
+        // module call in main.crn.
+        let consumer_dir = base_path
+            .join("registry")
+            .join("dev")
+            .join("registry-deploy");
+        fs::create_dir_all(&consumer_dir).expect("Failed to create consumer dir");
+        fs::write(
+            consumer_dir.join("backend.crn"),
+            "let bootstrap = upstream_state {\n  source = '../bootstrap'\n}\n",
+        )
+        .expect("Failed to write backend.crn");
+        let main_content = r#"let registry_deploy = use {
   source = '../../../usecases/registry-deploy'
 }
 
@@ -2448,19 +2455,21 @@ let rd = registry_deploy {
   oidc_provider_arn =
 }
 "#;
-    fs::write(consumer_dir.join("main.crn"), main_content).expect("Failed to write main.crn");
+        fs::write(consumer_dir.join("main.crn"), main_content).expect("Failed to write main.crn");
 
-    let doc = create_document(main_content);
-    let position = Position {
-        line: 5,
-        character: 22,
-    };
-    let completions = provider.complete_for_test(&doc, position, Some(consumer_dir.as_path()));
-    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
-    assert!(
-        labels.contains(&"bootstrap.oidc_provider_arn"),
-        "expected `bootstrap.oidc_provider_arn` upstream-state ref, got: {labels:?}"
-    );
+        let doc = create_document(main_content);
+        let position = Position {
+            line: 5,
+            character: 22,
+        };
+        let completions = provider.complete_for_test(&doc, position, Some(consumer_dir.as_path()));
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            labels.contains(&"bootstrap.oidc_provider_arn"),
+            offers_export,
+            "upstream-state completion must admit roots and reject module templates: {labels:?}"
+        );
+    }
 }
 
 /// Issue #2621: at the value position of a module-call argument the

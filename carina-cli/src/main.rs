@@ -823,6 +823,9 @@ fn render_app_error(
                     error::HumanErrorLine::RootEvidence(evidence) => {
                         format!("  Note: {}\n", evidence.note())
                     }
+                    error::HumanErrorLine::ModuleEvidence(evidence) => {
+                        format!("  Note: {}\n", evidence.note())
+                    }
                     error::HumanErrorLine::Message(message) => {
                         format_error_lines(color_mode, &message)
                     }

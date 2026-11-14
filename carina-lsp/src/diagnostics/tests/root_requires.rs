@@ -547,18 +547,43 @@ fn root_require_unreadable_sibling_keeps_unknown_scope() {
 }
 
 #[test]
-fn broken_sibling_keeps_module_buffer_provider_and_backend_checks_provisional() {
+fn broken_sibling_with_backend_runs_root_provider_and_backend_checks() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("main.crn");
     let source = "arguments { x: String }\nunknown.test.resource { name = x }\nbackend s3 { bucket = 'x' key = 'state' region = 'invalid' }\n";
     std::fs::write(&path, source).unwrap();
     std::fs::write(directory.path().join("broken.crn"), "let broken = {\n").unwrap();
     let diagnostics = test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
-    assert!(
-        diagnostics
-            .iter()
-            .all(|d| d.severity != Some(DiagnosticSeverity::ERROR)),
-        "{diagnostics:#?}"
+    for message in [
+        "arguments blocks are only valid inside module definitions, not in root configurations.",
+        "Provider 'unknown' has no loaded schema for this file: no provider block for it was found in this file's configuration.",
+    ] {
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|d| d.message == message && d.severity == Some(DiagnosticSeverity::ERROR))
+                .count(),
+            1,
+            "{diagnostics:#?}"
+        );
+    }
+    let placement = diagnostics
+        .iter()
+        .find(|d| d.message.starts_with("arguments blocks"))
+        .unwrap();
+    let related = placement.related_information.as_ref().unwrap();
+    assert_eq!(related.len(), 1);
+    assert_eq!(
+        related[0].message,
+        "This backend block makes the directory a root configuration."
+    );
+    assert_eq!(
+        related[0].location.uri,
+        tower_lsp::lsp_types::Url::from_file_path(&path).unwrap()
+    );
+    assert_eq!(
+        related[0].location.range,
+        Range::new(Position::new(2, 0), Position::new(2, 7))
     );
 }
 
@@ -796,5 +821,159 @@ fn direct_template_root_only_blocks_are_rejected_in_the_authored_sibling() {
             );
             assert!(diagnostics[0].related_information.is_none());
         }
+    }
+}
+
+#[test]
+fn upstream_module_templates_keep_module_evidence_as_related_information() {
+    for (declaration, kind, end) in [
+        ("require false, 'PRIVATE_GUARD'", "require statement", 30),
+        ("arguments {}", "arguments block", 9),
+        ("attributes {}", "attributes block", 10),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let caller = directory.path().join("caller");
+        let upstream = directory.path().join("upstream");
+        std::fs::create_dir(&caller).unwrap();
+        std::fs::create_dir(&upstream).unwrap();
+        let evidence = upstream.join("declarations.crn");
+        std::fs::write(&evidence, format!("// authored module\n{declaration}\n")).unwrap();
+        std::fs::write(upstream.join("locals.crn"), "// sibling\n").unwrap();
+        std::fs::write(caller.join("locals.crn"), "// caller sibling\n").unwrap();
+        let path = caller.join("main.crn");
+        let source = "let prior = upstream_state { source = '../upstream' }\n";
+        std::fs::write(&path, source).unwrap();
+        let diagnostics =
+            test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .collect();
+        assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            errors[0].message,
+            "upstream_state `prior`: source `../upstream` is a module definition and has no state to read"
+        );
+        assert_eq!(
+            errors[0].range,
+            Range::new(Position::new(0, 38), Position::new(0, 51))
+        );
+        let related = errors[0].related_information.as_ref().unwrap();
+        assert_eq!(related.len(), 1);
+        assert_eq!(
+            related[0].message,
+            format!("This {kind} makes the directory a module definition.")
+        );
+        assert_eq!(
+            related[0].location.uri,
+            tower_lsp::lsp_types::Url::from_file_path(&evidence).unwrap()
+        );
+        assert_eq!(
+            related[0].location.range,
+            Range::new(Position::new(1, 0), Position::new(1, end))
+        );
+    }
+}
+
+#[test]
+fn unsaved_buffer_root_evidence_controls_schema_checks() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("broken.crn"), "let broken = [\n").unwrap();
+    let path = directory.path().join("unsaved.crn");
+    for directory_context in [None, Some(path.as_path())] {
+        let source = "provider x {}\nx.test.resource { name = 'root' }\n";
+        let diagnostics =
+            test_engine().analyze(&create_document_at(source, path.clone()), directory_context);
+        assert_eq!(diagnostics.iter().filter(|d| d.message == "Provider 'x' has no loaded schema for this file: no provider block for it was found in this file's configuration.").count(), 1, "{diagnostics:#?}");
+        let source = "x.test.resource { name = 'root' }\n";
+        let diagnostics =
+            test_engine().analyze(&create_document_at(source, path.clone()), directory_context);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| !d.message.contains("no loaded schema")),
+            "{diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn readable_provider_decides_root_despite_a_broken_sibling() {
+    let directory = tempfile::tempdir().unwrap();
+    let providers = directory.path().join("providers.crn");
+    std::fs::write(&providers, "// authored evidence\nprovider x {}\n").unwrap();
+    std::fs::write(directory.path().join("broken.crn"), "let broken = [\n").unwrap();
+    let path = directory.path().join("main.crn");
+    let source =
+        "arguments {}\nrequire false, 'PRIVATE_GUARD'\nx.test.resource { name = 'root' }\n";
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    for message in [
+        "arguments blocks are only valid inside module definitions, not in root configurations.",
+        "`require` is only allowed inside a module",
+        "Provider 'x' has no loaded schema for this file: no provider block for it was found in this file's configuration.",
+    ] {
+        let matching: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message == message)
+            .collect();
+        assert_eq!(matching.len(), 1, "{diagnostics:#?}");
+        if message
+            != "Provider 'x' has no loaded schema for this file: no provider block for it was found in this file's configuration."
+        {
+            let related = matching[0].related_information.as_ref().unwrap();
+            assert_eq!(related.len(), 1);
+            assert_eq!(
+                related[0].location.uri,
+                tower_lsp::lsp_types::Url::from_file_path(&providers).unwrap()
+            );
+            assert_eq!(
+                related[0].location.range,
+                Range::new(Position::new(1, 0), Position::new(1, 10))
+            );
+        }
+    }
+}
+
+#[test]
+fn readable_arguments_do_not_decide_a_template_with_a_broken_sibling() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("arguments.crn"),
+        "arguments { x: String }\n",
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("broken.crn"), "let broken = [\n").unwrap();
+    let path = directory.path().join("main.crn");
+    let source = "require false, 'PRIVATE_GUARD'\nunknown.test.resource { name = x }\n";
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert!(
+        diagnostics
+            .iter()
+            .all(|d| !d.message.contains("no loaded schema")
+                && !d.message.contains("only allowed inside")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn unsaved_backend_decides_root_and_runs_schema_checks() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("broken.crn"), "let broken = [\n").unwrap();
+    let path = directory.path().join("unsaved.crn");
+    let source = "arguments {}\nbackend s3 { bucket = 'state' key = 'state.json' typo = true }\n";
+    for directory_context in [None, Some(path.as_path())] {
+        let diagnostics =
+            test_engine().analyze(&create_document_at(source, path.clone()), directory_context);
+        assert_eq!(diagnostics.iter().filter(|d| d.message == "arguments blocks are only valid inside module definitions, not in root configurations.").count(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|d| d.message.contains("Unknown attribute 'typo'"))
+                .count(),
+            1,
+            "{diagnostics:#?}"
+        );
     }
 }
