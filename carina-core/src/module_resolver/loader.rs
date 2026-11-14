@@ -47,32 +47,87 @@ pub enum ModuleLoadError {
     Unavailable(ModuleError),
     #[error("{error}")]
     NotModule {
-        error: Box<ModuleError>,
+        error: Box<ModuleRejection>,
         /// Imports remain available to the static walk without exposing the
         /// rejected directory's expressions or placement report.
         imports: Vec<crate::parser::UseStatement>,
     },
 }
 
+/// Successfully inspected inputs that cannot be imported. The payload cannot
+/// contain an unrelated resolver error or grow a silently ignored cause.
+#[derive(Debug, Clone)]
+pub enum ModuleRejection {
+    NotADirectory {
+        path: String,
+    },
+    NoConfigurationFiles {
+        path: crate::paths::DisplayPath,
+    },
+    Root {
+        root: crate::config_loader::RootDirectoryVerdict,
+        body: Vec<ModuleBodyProhibition>,
+    },
+}
+#[derive(Debug, Clone, Copy)]
+pub enum ModuleBodyProhibition {
+    State,
+    UpstreamState,
+    Exports,
+}
+impl ModuleBodyProhibition {
+    fn into_error(self) -> ModuleError {
+        match self {
+            Self::State => ModuleError::StateBlockInModule,
+            Self::UpstreamState => ModuleError::UpstreamStateInModule,
+            Self::Exports => ModuleError::ExportsInModule,
+        }
+    }
+}
+impl ModuleRejection {
+    fn into_nonempty_errors(self) -> (ModuleError, Vec<ModuleError>) {
+        match self {
+            Self::NotADirectory { path } => (ModuleError::NotADirectory { path }, vec![]),
+            Self::NoConfigurationFiles { path } => {
+                (ModuleError::NoConfigurationFiles { path }, vec![])
+            }
+            Self::Root { root, body } => {
+                let (first, mut rest) = root.import_prohibitions();
+                rest.extend(body.into_iter().map(ModuleBodyProhibition::into_error));
+                (first, rest)
+            }
+        }
+    }
+    pub fn into_errors(self) -> Vec<ModuleError> {
+        let (first, rest) = self.into_nonempty_errors();
+        std::iter::once(first).chain(rest).collect()
+    }
+    fn into_error(self) -> ModuleError {
+        let (first, rest) = self.into_nonempty_errors();
+        ModuleError::from_nonempty_errors(first, rest)
+    }
+}
+impl std::fmt::Display for ModuleRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.clone().into_error().fmt(formatter)
+    }
+}
+impl std::error::Error for ModuleRejection {}
 impl ModuleLoadError {
     pub(crate) fn into_error(self) -> ModuleError {
         match self {
             Self::Unavailable(error) => error,
-            Self::NotModule { error, imports: _ } => *error,
+            Self::NotModule { error, imports: _ } => error.into_error(),
         }
     }
-
     pub fn into_errors(self) -> Vec<ModuleError> {
-        let error = match self {
-            Self::Unavailable(error) => error,
-            Self::NotModule { error, imports: _ } => *error,
-        };
-        match error {
-            ModuleError::Multiple(errors) => errors.into_vec(),
-            error => vec![error],
+        match self {
+            Self::Unavailable(ModuleError::Multiple(errors)) => errors.into_vec(),
+            Self::Unavailable(error) => vec![error],
+            Self::NotModule { error, imports: _ } => error.into_errors(),
         }
     }
-    fn rejected(error: ModuleError) -> Self {
+    fn rejected(error: ModuleRejection) -> Self {
         Self::NotModule {
             error: Box::new(error),
             imports: Vec::new(),
@@ -154,7 +209,7 @@ pub(crate) fn load_imported_directory(
         .metadata()
         .map_err(|e| Unavailable(ModuleError::Io(e)))?;
     if !metadata.is_dir() {
-        return Err(ModuleLoadError::rejected(ModuleError::NotADirectory {
+        return Err(ModuleLoadError::rejected(ModuleRejection::NotADirectory {
             path: dir_path.source_label().to_string_lossy().into_owned(),
         }));
     }
@@ -185,7 +240,7 @@ pub(crate) fn load_imported_directory(
             display
         };
         return Err(ModuleLoadError::rejected(
-            ModuleError::NoConfigurationFiles { path: display },
+            ModuleRejection::NoConfigurationFiles { path: display },
         ));
     }
     let duplicate_declarations =
@@ -205,9 +260,11 @@ pub(crate) fn load_imported_directory(
     // rejection even if a public AST list is later changed: the evidence itself
     // still identifies a prohibited root block.
     match module.verdict {
-        crate::config_loader::DirectoryVerdict::Root(_) => {
-            let error = ModuleError::from_errors(module.placement_errors())
-                .expect("issued root evidence supplies at least one import prohibition");
+        crate::config_loader::DirectoryVerdict::Root(ref root) => {
+            let error = ModuleRejection::Root {
+                root: root.clone(),
+                body: module.body_prohibitions(),
+            };
             return Err(ModuleLoadError::NotModule {
                 error: Box::new(error),
                 imports: module.parsed.uses,
@@ -225,30 +282,36 @@ pub(crate) fn load_imported_directory(
 }
 
 impl LoadedModule {
-    pub(crate) fn placement_errors(&self) -> Vec<ModuleError> {
-        let root = self.verdict.root();
-        let provider = root
-            .and_then(|root| root.provider_evidence())
-            .map(|evidence| ModuleError::ProviderInModule.with_root_evidence(evidence.clone()));
-        let backend = root
-            .and_then(|root| root.backend_evidence())
-            .map(|evidence| ModuleError::BackendInModule.with_root_evidence(evidence.clone()));
+    fn body_prohibitions(&self) -> Vec<ModuleBodyProhibition> {
         [
-            provider,
-            backend,
             crate::validation::validate_no_state_blocks_in_module(self)
                 .err()
-                .map(|_| ModuleError::StateBlockInModule),
+                .map(|_| ModuleBodyProhibition::State),
             crate::validation::validate_no_upstream_states_in_module(self)
                 .err()
-                .map(|_| ModuleError::UpstreamStateInModule),
+                .map(|_| ModuleBodyProhibition::UpstreamState),
             crate::validation::validate_no_exports_in_module(self)
                 .err()
-                .map(|_| ModuleError::ExportsInModule),
+                .map(|_| ModuleBodyProhibition::Exports),
         ]
         .into_iter()
         .flatten()
         .collect()
+    }
+    pub(crate) fn placement_errors(&self) -> Vec<ModuleError> {
+        let mut errors = match self.verdict.root() {
+            Some(root) => {
+                let (first, rest) = root.import_prohibitions();
+                std::iter::once(first).chain(rest).collect()
+            }
+            None => Vec::new(),
+        };
+        errors.extend(
+            self.body_prohibitions()
+                .into_iter()
+                .map(ModuleBodyProhibition::into_error),
+        );
+        errors
     }
 }
 
@@ -665,7 +728,7 @@ mod importability_tests {
             panic!("empty directory must have a typed rejection");
         };
         assert!(matches!(
-            error.root_cause(),
+            error.into_error().root_cause(),
             ModuleError::NoConfigurationFiles { .. }
         ));
         fs::write(directory.path().join("arguments.crn"), "arguments {}\n").unwrap();
@@ -686,6 +749,7 @@ mod importability_tests {
         let Err(ModuleLoadError::NotModule { error, .. }) = load_module(&path, &context) else {
             panic!("root evidence must prohibit import");
         };
+        let error = error.into_error();
         assert!(matches!(error.root_cause(), ModuleError::ProviderInModule));
         assert!(error.root_evidence().is_some());
     }

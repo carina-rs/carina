@@ -2154,6 +2154,10 @@ fn round12_assert_template_rejection(output: &Output, kind: &str, evidence_dir: 
         evidence_dir.join("declarations.crn").display()
     );
     assert_eq!(stderr.matches(message).count(), 1, "{stderr}");
+    assert!(
+        stderr.starts_with(&format!("Error: ./upstream.crn:1:39: {message}")),
+        "{stderr}"
+    );
     assert!(stderr.contains(&note), "{stderr}");
     assert!(!stderr.contains("PRIVATE_GUARD"), "{stderr}");
 }
@@ -2185,7 +2189,7 @@ fn round12_template_blocks_state_command(args: &[&str]) {
             ];
             let before = paths.each_ref().map(|path| fs::read(path).ok());
             let output = directory.run(args);
-            round12_assert_template_rejection(&output, kind, &upstream);
+            round12_assert_template_rejection(&output, kind, std::path::Path::new("../mod"));
             assert!(!output_text(&output).contains("invalid state sentinel"));
             assert_eq!(before, paths.each_ref().map(|path| fs::read(path).ok()));
         }
@@ -2263,7 +2267,7 @@ fn round12_saved_plan_apply_rejects_current_upstream_template() {
         round12_assert_template_rejection(
             &directory.run(&["apply", "--auto-approve", "saved.plan"]),
             kind,
-            &upstream,
+            std::path::Path::new("../mod"),
         );
         assert_eq!(before, paths.each_ref().map(|path| fs::read(path).unwrap()));
     }
@@ -2293,7 +2297,11 @@ fn round12_secret_provider_keeps_template_evidence_without_map_keys() {
         ];
         let before = paths.each_ref().map(|path| fs::read(path).unwrap());
         let output = directory.run(args);
-        round12_assert_template_rejection(&output, "arguments block", &upstream);
+        round12_assert_template_rejection(
+            &output,
+            "arguments block",
+            std::path::Path::new("../mod"),
+        );
         assert!(!output_text(&output).contains("PRIVATE_UPSTREAM_MAP_KEY"));
         assert_eq!(before, paths.each_ref().map(|path| fs::read(path).unwrap()));
     }

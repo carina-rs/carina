@@ -5224,6 +5224,7 @@ async fn saved_plan_provider_validation_preserves_typed_source_and_replan_hint()
             source_dir: tmp.path(),
         },
         &source,
+        &[],
         cancel.clone(),
         &observer_factory,
         NonZeroUsize::new(1).unwrap(),

@@ -7996,7 +7996,7 @@ pub struct ConfigurationPlacementDiagnostic {
     root: Option<crate::config_loader::RootDirectoryVerdict>,
 }
 impl ConfigurationPlacementDiagnostic {
-    pub fn root_evidence(&self) -> Option<&crate::config_loader::RootEvidence> {
+    pub fn root_evidence(&self) -> Option<crate::config_loader::RootEvidence> {
         self.root.as_ref().map(|root| root.evidence())
     }
     pub fn lsp_message(&self) -> String {

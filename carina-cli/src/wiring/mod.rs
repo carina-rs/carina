@@ -5191,14 +5191,22 @@ pub(crate) fn validate_module_internal_ref_types(
     errors
 }
 
-fn rejected_module_errors(
-    module_walk: &ModuleWalk,
-    accepts: impl Fn(&carina_core::module_resolver::ModuleError) -> bool,
-) -> Vec<AppError> {
+/// Every rejected load is rendered once; loaded bodies keep their independent
+/// placement checks. Cause routing is exhaustive at ModuleRejection's boundary.
+pub(crate) fn validate_module_boundaries(module_walk: &ModuleWalk) -> Vec<AppError> {
+    let mut errors = rejected_module_errors(module_walk);
+    errors.extend(validate_no_provider_in_modules(module_walk));
+    errors.extend(validate_no_backend_in_modules(module_walk));
+    errors.extend(validate_no_state_blocks_in_modules(module_walk));
+    errors.extend(validate_no_upstream_states_in_modules(module_walk));
+    errors.extend(validate_no_exports_in_modules(module_walk));
+    errors
+}
+
+fn rejected_module_errors(module_walk: &ModuleWalk) -> Vec<AppError> {
     module_walk
         .rejections()
         .iter()
-        .filter(|rejection| accepts(rejection.error.root_cause()))
         .map(|rejection| AppError::ModuleImport {
             path: rejection.label.clone(),
             error: rejection.error.clone(),
@@ -5222,13 +5230,6 @@ pub(crate) fn validate_no_provider_in_modules(module_walk: &ModuleWalk) -> Vec<A
             )));
         }
     }
-    errors.extend(rejected_module_errors(module_walk, |error| {
-        matches!(
-            error,
-            carina_core::module_resolver::ModuleError::ProviderInModule
-                | carina_core::module_resolver::ModuleError::NoConfigurationFiles { .. }
-        )
-    }));
     errors
 }
 
@@ -5247,12 +5248,6 @@ pub(crate) fn validate_no_state_blocks_in_modules(module_walk: &ModuleWalk) -> V
             )));
         }
     }
-    errors.extend(rejected_module_errors(module_walk, |error| {
-        matches!(
-            error,
-            carina_core::module_resolver::ModuleError::StateBlockInModule
-        )
-    }));
     errors
 }
 
@@ -5270,12 +5265,6 @@ pub(crate) fn validate_no_backend_in_modules(module_walk: &ModuleWalk) -> Vec<Ap
             )));
         }
     }
-    errors.extend(rejected_module_errors(module_walk, |error| {
-        matches!(
-            error,
-            carina_core::module_resolver::ModuleError::BackendInModule
-        )
-    }));
     errors
 }
 
@@ -5293,12 +5282,6 @@ pub(crate) fn validate_no_upstream_states_in_modules(module_walk: &ModuleWalk) -
             )));
         }
     }
-    errors.extend(rejected_module_errors(module_walk, |error| {
-        matches!(
-            error,
-            carina_core::module_resolver::ModuleError::UpstreamStateInModule
-        )
-    }));
     errors
 }
 
@@ -5316,12 +5299,6 @@ pub(crate) fn validate_no_exports_in_modules(module_walk: &ModuleWalk) -> Vec<Ap
             )));
         }
     }
-    errors.extend(rejected_module_errors(module_walk, |error| {
-        matches!(
-            error,
-            carina_core::module_resolver::ModuleError::ExportsInModule
-        )
-    }));
     errors
 }
 

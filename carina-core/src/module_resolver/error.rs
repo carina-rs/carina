@@ -644,12 +644,15 @@ impl ModuleError {
         let mut errors = errors.into_iter();
         let first = errors.next()?;
         let rest = errors.collect::<Vec<_>>();
+        Some(Self::from_nonempty_errors(first, rest))
+    }
+    pub(crate) fn from_nonempty_errors(first: Self, rest: Vec<Self>) -> Self {
         if rest.is_empty() {
-            Some(first)
+            first
         } else {
-            Some(Self::Multiple(MultipleModuleErrors(
+            Self::Multiple(MultipleModuleErrors(
                 std::iter::once(first).chain(rest).collect(),
-            )))
+            ))
         }
     }
 

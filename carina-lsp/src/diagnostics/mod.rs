@@ -865,12 +865,6 @@ impl DiagnosticRun<'_> {
         } else {
             false
         };
-        let reported_directory_failure = merged_attempt
-            .as_ref()
-            .and_then(|attempt| attempt.as_ref().err())
-            .and_then(|error| error.element_diagnostic())
-            .filter(|_| directory_error_emitted)
-            .map(|finding| finding.location().clone());
         let mut merged_result = merged_attempt.and_then(Result::ok);
         // Keep the parsed input stable while module-analysis results are filled
         // in. Cloning this Arc preserves the exact sealed directory without
@@ -1179,13 +1173,7 @@ impl DiagnosticRun<'_> {
             preferred_analysis,
         ) {
             diagnostics.extend(self.check_configuration_placement(doc, preferred_tree));
-            diagnostics.extend(self.check_backend_config(
-                doc,
-                merged_result.as_ref(),
-                preferred_analysis,
-                buffer_parsed,
-                reported_directory_failure.as_ref(),
-            ));
+            diagnostics.extend(self.check_backend_config(doc, preferred_analysis));
 
             // Check provider region
             diagnostics.extend(self.check_provider_region(
@@ -1297,7 +1285,7 @@ impl DiagnosticRun<'_> {
                     render_merged(doc, finding, DiagnosticSeverity::ERROR, message)
                 {
                     if let Some(root) = root {
-                        attach_directory_evidence(&mut diagnostic, root.root_evidence());
+                        attach_directory_evidence(&mut diagnostic, &root.root_evidence());
                     }
                     if diagnostics.contains(&diagnostic) {
                         continue;

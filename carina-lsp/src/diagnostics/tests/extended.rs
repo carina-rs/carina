@@ -1664,6 +1664,54 @@ fn failed_backend_user_function_does_not_emit_a_schema_type_mismatch() {
 }
 
 #[test]
+fn failed_backend_builtins_are_not_admitted_from_recovery() {
+    let source = "backend s3 {\n  bucket = cidr_subnet('bad', 8, 1)\n  key = cidr_subnet('bad', 8, 1)\n  encrypt = 'yes'\n}\n";
+    let diagnostics =
+        backend_directory_diagnostics_with_sibling("let ordinary = 'value'\n", source);
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("backend type 's3'"))
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        vec![
+            "Invalid attribute 'encrypt' for backend type 's3': Type mismatch: expected Bool, got String"
+        ],
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn failed_backend_interpolation_is_not_admitted_from_recovery() {
+    let source =
+        "backend s3 {\n  bucket = \"${cidr_subnet('bad', 8, 1)}\"\n  key = 'state.json'\n}\n";
+    let diagnostics =
+        backend_directory_diagnostics_with_sibling("let ordinary = 'value'\n", source);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("Invalid attribute 'bucket'")),
+        "{diagnostics:#?}"
+    );
+    assert_backend_typo_is_diagnosed("let ordinary = 'value'\n", source);
+}
+
+#[test]
+fn failed_backend_sibling_let_is_not_admitted_from_recovery() {
+    let sibling = "let b = cidr_subnet('bad', 8, 1)\n";
+    let source = "backend s3 {\n  bucket = b\n  key = 'state.json'\n}\n";
+    let diagnostics = backend_directory_diagnostics_with_sibling(sibling, source);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("Invalid attribute 'bucket'")),
+        "{diagnostics:#?}"
+    );
+    assert_backend_typo_is_diagnosed(sibling, source);
+}
+
+#[test]
 fn failed_backend_builtin_keeps_independent_schema_errors() {
     let source = "backend s3 {\n  bucket = cidr_subnet('bad', 8, 1)\n  key = 'state.json'\n  encrypt = 'yes'\n  typo = true\n}\n";
     let diagnostics = backend_directory_diagnostics(source);

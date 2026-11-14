@@ -14,11 +14,7 @@ use carina_core::parser::ProviderContext;
 
 use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
-use crate::wiring::{
-    ProviderLoad, validate_no_backend_in_modules, validate_no_exports_in_modules,
-    validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
-    validate_no_upstream_states_in_modules,
-};
+use crate::wiring::{ProviderLoad, validate_module_boundaries};
 
 /// A lint warning with file, line, and message info.
 struct LintWarning {
@@ -309,11 +305,7 @@ fn lint_result(
         &provider_context.environment,
         &carina_core::schema::SchemaRegistry::new(),
     );
-    let mut module_boundary_findings = validate_no_provider_in_modules(&module_walk);
-    module_boundary_findings.extend(validate_no_backend_in_modules(&module_walk));
-    module_boundary_findings.extend(validate_no_state_blocks_in_modules(&module_walk));
-    module_boundary_findings.extend(validate_no_upstream_states_in_modules(&module_walk));
-    module_boundary_findings.extend(validate_no_exports_in_modules(&module_walk));
+    let module_boundary_findings = validate_module_boundaries(&module_walk);
 
     let (providers, provider_factory_error) = ProviderLoad::load_reporting(
         runtime,

@@ -3915,6 +3915,18 @@ async fn run_apply_from_plan_with_observer_factory(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     );
+    let upstream_source_locations = loaded_current_config
+        .as_ref()
+        .ok()
+        .map(|loaded| {
+            loaded
+                .parsed
+                .parser_binding_metadata
+                .syntax()
+                .upstream_sources()
+                .to_vec()
+        })
+        .unwrap_or_default();
     let (inspected_plan, parsed_backend) = match inspected_plan {
         InspectedPlanFile::Verified(plan) => {
             let parsed_backend = match loaded_current_config {
@@ -4007,6 +4019,7 @@ async fn run_apply_from_plan_with_observer_factory(
         state_lock,
         apply_target,
         base_dir,
+        &upstream_source_locations,
         cancel.clone(),
         observer_factory,
         parallelism,
@@ -4033,6 +4046,9 @@ async fn run_apply_from_plan_locked_owned(
     lock: StateLock,
     apply_target: ApplyTarget<'_>,
     source: &ResolvedPath,
+    upstream_source_locations: &[carina_core::parser::Located<
+        carina_core::resource::RelativeBindingName,
+    >],
     cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_, SavedModuleSource>,
     parallelism: NonZeroUsize,
@@ -4321,7 +4337,7 @@ async fn run_apply_from_plan_locked_owned(
                 wiring.runtime(), rehydrated_plan_file.upstream_sources(), source,
                 wiring.provider_context().as_provider_context(), wiring.schemas(),
                 rehydrated_plan_file.upstream_snapshot(), apply_target,
-            )?;
+            ).map_err(|error| error.with_upstream_source_locations(upstream_source_locations, source))?;
 
             // Persist migrations only after successful re-admission, using
             // the heartbeat's serialized lock owner.
@@ -4722,6 +4738,7 @@ async fn run_apply_from_plan_locked(
         lock,
         apply_target,
         &source,
+        &[],
         cancel.clone(),
         observer_factory,
         parallelism,

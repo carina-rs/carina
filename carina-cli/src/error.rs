@@ -1278,7 +1278,7 @@ pub enum AppError {
 
     /// A runtime source was rejected before its backend could be read.
     #[error("{0}")]
-    UpstreamSourceRejected(Box<carina_core::upstream_exports::UpstreamResolveFailure>),
+    UpstreamSourceRejected(Box<carina_core::upstream_exports::UpstreamModuleTemplateRejection>),
 
     #[error("{0}")]
     AttributePrefix(Box<carina_core::identifier::AttributePrefixError>),
@@ -2404,11 +2404,35 @@ impl From<crate::wiring::PlanPreparationError> for AppError {
     }
 }
 
+impl AppError {
+    pub(crate) fn with_upstream_source_locations<B: carina_core::resource::BindingAddress>(
+        self,
+        locations: &[carina_core::parser::Located<B>],
+        root: &carina_core::paths::ResolvedPath,
+    ) -> Self {
+        match self {
+            Self::UpstreamSourceRejected(rejection) => {
+                match locations
+                    .iter()
+                    .find(|source| source.detail().to_string() == rejection.binding())
+                {
+                    Some(source) => Self::UpstreamResolution(Box::new(
+                        rejection.at_call(source.location(), root),
+                    )),
+                    None => Self::UpstreamSourceRejected(rejection),
+                }
+            }
+            error => error,
+        }
+    }
+}
+
 impl From<carina_core::upstream_exports::UpstreamSourceLoadError> for AppError {
     fn from(error: carina_core::upstream_exports::UpstreamSourceLoadError) -> Self {
         match error {
             error @ carina_core::upstream_exports::UpstreamSourceLoadError::Configuration {
-                ..
+                binding: _,
+                message: _,
             } => Self::Config(error.to_string()),
             carina_core::upstream_exports::UpstreamSourceLoadError::Invariant(error) => {
                 error.into()

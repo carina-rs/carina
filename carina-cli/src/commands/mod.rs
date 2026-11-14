@@ -29,8 +29,8 @@ use carina_core::parser::ProviderContext;
 use carina_core::resource::{BindingAddress, PlaceholderKind};
 use carina_core::validation::admission::configuration::backend::LocatedBackendError;
 use carina_state::{
-    BackendConfig as StateBackendConfig, BackendDrift, BackendLock, BackendSelection,
-    MutationBackendSelection, ResolvedReadBackend, VerifiedMutationBackendSelection,
+    BackendDrift, BackendLock, BackendSelection, MutationBackendSelection, ResolvedReadBackend,
+    VerifiedMutationBackendSelection,
 };
 
 pub use carina_state::{BackendDriftStatus, inspect_backend_drift};
@@ -45,10 +45,8 @@ use crate::wiring::{
     compute_anonymous_identifiers_with_policy_with_ctx,
     compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx, resolve_file_names_with_ctx,
     validate_deferred_populate_refs_with_ctx,
-    validate_module_attribute_refs_after_expansion_failure, validate_module_internal_ref_types,
-    validate_no_backend_in_modules, validate_no_exports_in_modules,
-    validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
-    validate_no_upstream_states_in_modules, validate_wait_bindings_with_ctx,
+    validate_module_attribute_refs_after_expansion_failure, validate_module_boundaries,
+    validate_module_internal_ref_types, validate_wait_bindings_with_ctx,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -531,23 +529,13 @@ pub(crate) fn validate_root_backend<E: carina_core::parser::ExportParamLike>(
 fn validate_unlocated_root_backend<E>(
     parsed: &carina_core::config_loader::RootDirectoryParse<E>,
 ) -> Vec<AppError> {
-    match parsed.complete_directory_verdict() {
-        carina_core::config_loader::DirectoryVerdict::Root(root) if root.has_sole_backend() => {}
-        carina_core::config_loader::DirectoryVerdict::Root(_)
-        | carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
-        | carina_core::config_loader::DirectoryVerdict::NoEvidence(_) => return Vec::new(),
-    }
-    if let Some(backend) = &parsed.backend
-        && let Err(error) = StateBackendConfig::try_from(backend)
-    {
-        error
-            .into_unlocated()
-            .into_iter()
-            .map(|error| AppError::UnlocatedBackend(Box::new(error)))
-            .collect()
-    } else {
-        Vec::new()
-    }
+    parsed
+        .admit_backend_unlocated()
+        .and_then(Result::err)
+        .into_iter()
+        .flatten()
+        .map(|error| AppError::UnlocatedBackend(Box::new(error)))
+        .collect()
 }
 
 fn extend_expanded_binding_use_errors<P: carina_core::resource::PlaceholderKind>(
@@ -895,11 +883,7 @@ fn validate_and_resolve_configuration(
     // `skip_resource_validation = true`, bypass this walk, and rely on those
     // backstops while still expanding modules.
     if !skip_resource_validation {
-        errors.extend(validate_no_provider_in_modules(&module_walk));
-        errors.extend(validate_no_backend_in_modules(&module_walk));
-        errors.extend(validate_no_state_blocks_in_modules(&module_walk));
-        errors.extend(validate_no_upstream_states_in_modules(&module_walk));
-        errors.extend(validate_no_exports_in_modules(&module_walk));
+        errors.extend(validate_module_boundaries(&module_walk));
     }
 
     // Non-module-call failures do not have a sound expansion path. Authored

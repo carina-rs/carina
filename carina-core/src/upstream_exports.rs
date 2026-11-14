@@ -173,6 +173,21 @@ impl UpstreamSourceIdentity {
                 message,
             }
         })?;
+        // The original loaded verdict is decisive before re-resolution or any
+        // backend/value conversion can turn this rejection into unavailability.
+        match loaded.parsed.complete_directory_verdict() {
+            crate::config_loader::DirectoryVerdict::ModuleTemplate(template) => {
+                return Err(UpstreamSourceLoadError::Rejected(Box::new(
+                    UpstreamModuleTemplateRejection::new(
+                        self.binding.clone(),
+                        self.declared_source.clone(),
+                        template,
+                    ),
+                )));
+            }
+            crate::config_loader::DirectoryVerdict::Root(_)
+            | crate::config_loader::DirectoryVerdict::NoEvidence(_) => {}
+        }
         let surface = resolve_upstream_source_surface(&loaded, self, context, schemas)?;
         Ok(ResolvedUpstreamSource {
             identity: self.clone(),
@@ -193,7 +208,7 @@ pub enum UpstreamSourceLoadError {
     #[error("upstream_state '{binding}': {message}")]
     Configuration { binding: String, message: String },
     #[error("{0}")]
-    Rejected(Box<UpstreamResolveFailure>),
+    Rejected(Box<UpstreamModuleTemplateRejection>),
     #[error(transparent)]
     Invariant(#[from] crate::parser::AnalysisTreeError),
     #[error(transparent)]
@@ -293,7 +308,7 @@ fn resolve_upstream_source_surface(
             Err(UpstreamExportSourceError::Invariant(error)) => return Err(error.into()),
             Err(UpstreamExportSourceError::ModuleTemplate(template)) => {
                 return Err(UpstreamSourceLoadError::Rejected(Box::new(
-                    UpstreamResolveFailure::module_template(
+                    UpstreamModuleTemplateRejection::new(
                         identity.binding.clone(),
                         identity.declared_source.clone(),
                         template,
@@ -504,21 +519,14 @@ impl<D: UpstreamRefDiagnostic + std::fmt::Debug> std::error::Error for UpstreamD
 /// be parsed. Downstream field-reference checks against this binding are
 /// skipped (we don't know what it exports), but the failure itself must be
 /// surfaced — otherwise a broken upstream silently masks downstream typos.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpstreamResolveError {
+#[derive(Debug, Clone)]
+struct UpstreamResolveContext {
     pub binding: String,
     pub source: std::path::PathBuf,
     pub reason: String,
-    kind: UpstreamResolveErrorKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UpstreamResolveErrorKind {
-    ParseFailure,
-    ModuleTemplate,
-}
-
-impl UpstreamResolveError {
+impl UpstreamResolveContext {
     fn fmt_reason(
         &self,
         f: &mut std::fmt::Formatter<'_>,
@@ -534,27 +542,91 @@ impl UpstreamResolveError {
     }
 }
 
+/// Compatibility projection; its rendering is derived from the same typed
+/// cause as the report API rather than a second error-kind discriminator.
+#[derive(Debug, Clone)]
+pub struct UpstreamResolveError {
+    pub binding: String,
+    pub source: std::path::PathBuf,
+    pub reason: String,
+    failure: Box<UpstreamResolveFailure>,
+}
 impl std::fmt::Display for UpstreamResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.kind {
-            UpstreamResolveErrorKind::ParseFailure => self.fmt_reason(f, &self.reason),
-            UpstreamResolveErrorKind::ModuleTemplate => write!(
-                f,
-                "upstream_state `{}`: source `{}` {}",
-                self.binding,
-                self.source.display(),
-                self.reason
-            ),
-        }
+        self.failure.fmt(f)
     }
 }
-
 impl std::error::Error for UpstreamResolveError {}
+
+/// A declaration-only rejection. Its private constructor requires an issued
+/// module-template witness; value/parse failures cannot inhabit this type.
+#[derive(Debug, Clone)]
+pub struct UpstreamModuleTemplateRejection {
+    binding: String,
+    source: std::path::PathBuf,
+    template: crate::config_loader::ModuleTemplateDeclarations,
+}
+impl UpstreamModuleTemplateRejection {
+    fn new(
+        binding: String,
+        source: std::path::PathBuf,
+        template: crate::config_loader::ModuleTemplateDeclarations,
+    ) -> Self {
+        Self {
+            binding,
+            source,
+            template,
+        }
+    }
+    pub fn binding(&self) -> &str {
+        &self.binding
+    }
+    pub fn module_evidence(&self) -> &crate::config_loader::ModuleEvidence {
+        self.template.evidence()
+    }
+    fn message(&self) -> String {
+        format!(
+            "upstream_state `{}`: source `{}` is a module definition and has no state to read",
+            self.binding,
+            self.source.display()
+        )
+    }
+    pub fn diagnostic_lines(&self) -> Vec<crate::module_resolver::DiagnosticLine> {
+        vec![
+            crate::module_resolver::DiagnosticLine::Message(self.message()),
+            crate::module_resolver::DiagnosticLine::ModuleEvidence(self.module_evidence().clone()),
+        ]
+    }
+    /// Attach the current caller's parser provenance and use its display root
+    /// for both the prefix and the evidence continuation.
+    pub fn at_call(
+        self,
+        location: &crate::parser::DeclarationLocation,
+        root: &ResolvedPath,
+    ) -> Located<UpstreamResolveFailure> {
+        let template = self.template.displayed_from(root);
+        Located::new(
+            location.displayed_from(root),
+            UpstreamResolveFailure::module_template(self.binding, self.source, template),
+        )
+    }
+}
+impl std::fmt::Display for UpstreamModuleTemplateRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}\nNote: {}",
+            self.message(),
+            self.module_evidence().note()
+        )
+    }
+}
+impl std::error::Error for UpstreamModuleTemplateRejection {}
 
 /// Typed source failures retained separately from their legacy combined display.
 #[derive(Debug, Clone)]
 pub struct UpstreamResolveFailure {
-    legacy: UpstreamResolveError,
+    context: UpstreamResolveContext,
     cause: UpstreamResolveCause,
 }
 #[derive(Debug, Clone)]
@@ -571,11 +643,10 @@ enum UpstreamResolveCause {
 impl UpstreamResolveFailure {
     fn message(binding: String, source: std::path::PathBuf, reason: String) -> Self {
         Self {
-            legacy: UpstreamResolveError {
+            context: UpstreamResolveContext {
                 binding,
                 source,
                 reason,
-                kind: UpstreamResolveErrorKind::ParseFailure,
             },
             cause: UpstreamResolveCause::Message,
         }
@@ -591,11 +662,10 @@ impl UpstreamResolveFailure {
             .collect::<Vec<_>>()
             .join("\n");
         Self {
-            legacy: UpstreamResolveError {
+            context: UpstreamResolveContext {
                 binding,
                 source,
                 reason,
-                kind: UpstreamResolveErrorKind::ParseFailure,
             },
             cause: UpstreamResolveCause::Boundaries(boundaries),
         }
@@ -606,11 +676,10 @@ impl UpstreamResolveFailure {
         error: crate::config_loader::DirectoryParseFailure,
     ) -> Self {
         Self {
-            legacy: UpstreamResolveError {
+            context: UpstreamResolveContext {
                 binding,
                 source,
                 reason: error.to_string(),
-                kind: UpstreamResolveErrorKind::ParseFailure,
             },
             cause: UpstreamResolveCause::Parse(std::sync::Arc::new(error)),
         }
@@ -622,11 +691,10 @@ impl UpstreamResolveFailure {
         error: crate::module_resolver::ModuleError,
     ) -> Self {
         Self {
-            legacy: UpstreamResolveError {
+            context: UpstreamResolveContext {
                 binding,
                 source,
                 reason: String::new(),
-                kind: UpstreamResolveErrorKind::ParseFailure,
             },
             cause: UpstreamResolveCause::Module {
                 base,
@@ -640,11 +708,10 @@ impl UpstreamResolveFailure {
         template: crate::config_loader::ModuleTemplateDeclarations,
     ) -> Self {
         Self {
-            legacy: UpstreamResolveError {
+            context: UpstreamResolveContext {
                 binding,
                 source,
                 reason: String::new(),
-                kind: UpstreamResolveErrorKind::ModuleTemplate,
             },
             cause: UpstreamResolveCause::ModuleTemplate(template),
         }
@@ -661,8 +728,8 @@ impl UpstreamResolveFailure {
     fn module_template_message(&self) -> String {
         format!(
             "upstream_state `{}`: source `{}` is a module definition and has no state to read",
-            self.legacy.binding,
-            self.legacy.source.display()
+            self.context.binding,
+            self.context.source.display()
         )
     }
     pub fn boundary_errors(&self) -> &[crate::validation::ExportBoundaryError] {
@@ -705,7 +772,7 @@ impl UpstreamResolveFailure {
                 let mut lines = error.diagnostic_lines_relative_to(None);
                 if let Some(DiagnosticLine::Message(message)) = lines.first_mut() {
                     *message =
-                        std::fmt::from_fn(|formatter| self.legacy.fmt_reason(formatter, message))
+                        std::fmt::from_fn(|formatter| self.context.fmt_reason(formatter, message))
                             .to_string();
                 }
                 lines
@@ -730,7 +797,7 @@ impl UpstreamResolveFailure {
                 rejection.location().clone(),
                 rejection.detail().lsp_message(),
             );
-            return std::fmt::from_fn(|formatter| self.legacy.fmt_reason(formatter, &message))
+            return std::fmt::from_fn(|formatter| self.context.fmt_reason(formatter, &message))
                 .to_string();
         }
         self.to_string()
@@ -740,10 +807,10 @@ impl UpstreamResolveFailure {
         // container. Diagnostic callers retain typed causes via the accessors.
         match &self.cause {
             UpstreamResolveCause::Module { error, base: _ } => {
-                self.legacy.reason = error.to_string()
+                self.context.reason = error.to_string()
             }
             UpstreamResolveCause::ModuleTemplate(template) => {
-                self.legacy.reason = format!(
+                self.context.reason = format!(
                     "is a module definition and has no state to read\nNote: {}",
                     template.evidence().note()
                 )
@@ -752,14 +819,19 @@ impl UpstreamResolveFailure {
             | UpstreamResolveCause::Boundaries(_)
             | UpstreamResolveCause::Parse(_) => {}
         }
-        self.legacy
+        UpstreamResolveError {
+            binding: self.context.binding.clone(),
+            source: self.context.source.clone(),
+            reason: self.context.reason.clone(),
+            failure: Box::new(self),
+        }
     }
 }
 impl std::fmt::Display for UpstreamResolveFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.cause {
-            UpstreamResolveCause::Module { error, .. } => {
-                self.legacy.fmt_reason(formatter, error.as_ref())
+            UpstreamResolveCause::Module { error, base: _ } => {
+                self.context.fmt_reason(formatter, error.as_ref())
             }
             UpstreamResolveCause::ModuleTemplate(template) => write!(
                 formatter,
@@ -769,7 +841,9 @@ impl std::fmt::Display for UpstreamResolveFailure {
             ),
             UpstreamResolveCause::Message
             | UpstreamResolveCause::Boundaries(_)
-            | UpstreamResolveCause::Parse(_) => self.legacy.fmt(formatter),
+            | UpstreamResolveCause::Parse(_) => {
+                self.context.fmt_reason(formatter, &self.context.reason)
+            }
         }
     }
 }
@@ -2190,6 +2264,14 @@ mod tests {
                         &SchemaRegistry::new(),
                     )
                     .unwrap_err();
+                let UpstreamSourceLoadError::Rejected(rejection) = &error else {
+                    panic!("template must have a dedicated rejection: {error:?}");
+                };
+                assert_eq!(rejection.binding(), "prior");
+                assert_eq!(
+                    rejection.module_evidence().location().span().start_line(),
+                    2
+                );
                 let message = error.to_string();
                 assert!(
                     message

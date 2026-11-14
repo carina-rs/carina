@@ -396,6 +396,7 @@ async fn apply_saved(fixture: &ApplyCancellationFixture, cloud: &Cloud, saved_pl
             source_dir: fixture.config_path(),
         },
         &source,
+        &[],
         fixture.cancel_token(),
         &fixture.observer_factory(),
         NonZeroUsize::new(2).unwrap(),

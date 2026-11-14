@@ -1015,6 +1015,14 @@ impl ConfigurationBlockDeclaration {
     }
 }
 
+/// Evaluation outcome retained by the loader's recovery tree. Only the
+/// evaluator can issue a failure; schema admission must not reinterpret it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackendValueState {
+    Ready,
+    EvaluationFailed,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SyntaxInventory<
     B: crate::resource::BindingAddress = crate::resource::RelativeBindingName,
@@ -1031,6 +1039,7 @@ pub struct SyntaxInventory<
     configuration_blocks: Vec<Located<ConfigurationBlockDeclaration>>,
     directory_verdict: crate::config_loader::DirectoryVerdict,
     backend_keys: Vec<Located<super::AttributeKey>>,
+    backend_value_states: std::collections::HashMap<super::AttributeKey, BackendValueState>,
     anonymous_headers: Vec<DeclarationLocation>,
     loops: Vec<DeclarationLocation>,
     state_targets: Vec<DeclarationLocation>,
@@ -1048,6 +1057,7 @@ impl<B: crate::resource::BindingAddress> Default for SyntaxInventory<B> {
             configuration_blocks: Vec::new(),
             directory_verdict: crate::config_loader::DirectoryVerdict::default(),
             backend_keys: Vec::new(),
+            backend_value_states: Default::default(),
             anonymous_headers: Vec::new(),
             loops: Vec::new(),
             state_targets: Vec::new(),
@@ -1086,6 +1096,19 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
             block.detail_mut().verdict = verdict.clone();
         }
         self.directory_verdict = verdict;
+    }
+    pub(crate) fn backend_value_state(&self, key: &super::AttributeKey) -> BackendValueState {
+        self.backend_value_states
+            .get(key)
+            .copied()
+            .unwrap_or(BackendValueState::Ready)
+    }
+    pub(in crate::parser) fn record_backend_evaluation_failure(
+        &mut self,
+        key: super::AttributeKey,
+    ) {
+        self.backend_value_states
+            .insert(key, BackendValueState::EvaluationFailed);
     }
     pub(crate) fn backend_keys(&self) -> &[Located<super::AttributeKey>] {
         &self.backend_keys
@@ -1127,6 +1150,7 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
         self.upstream_sources.extend(other.upstream_sources);
         self.configuration_blocks.extend(other.configuration_blocks);
         self.backend_keys.extend(other.backend_keys);
+        self.backend_value_states.extend(other.backend_value_states);
         self.anonymous_headers.extend(other.anonymous_headers);
         self.loops.extend(other.loops);
         self.state_targets.extend(other.state_targets);
@@ -1145,6 +1169,7 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
             configuration_blocks: self.configuration_blocks,
             directory_verdict: self.directory_verdict,
             backend_keys: self.backend_keys,
+            backend_value_states: self.backend_value_states,
             anonymous_headers: self.anonymous_headers,
             loops: self.loops,
             state_targets: self.state_targets,

@@ -251,6 +251,44 @@ mod unavailable_tests {
 mod rejected_import_tests {
     use super::*;
     #[test]
+    fn round15_every_rejected_import_is_rendered_once() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("not-a-directory.crn"), "// file\n").unwrap();
+        std::fs::create_dir(directory.path().join("empty")).unwrap();
+        let environment = carina_core::EnvironmentSnapshot::empty();
+        let context = carina_core::parser::ProviderContext::new(environment.clone());
+        let parsed = carina_core::parser::parse_file(
+            "let file = use { source = './not-a-directory.crn' }\nlet empty = use { source = './empty' }\n",
+            &directory.path().join("main.crn"), &context,
+        ).unwrap();
+        let walk = ModuleWalk::load(
+            &parsed,
+            &ResolvedPath::new(directory.path()).unwrap(),
+            &environment,
+            &carina_core::schema::SchemaRegistry::new(),
+        );
+        let errors = crate::wiring::validate_module_boundaries(&walk);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        let messages = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.contains("not-a-directory.crn"))
+                .count(),
+            1,
+            "{messages:?}"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.contains("No .crn files"))
+                .count(),
+            1,
+            "{messages:?}"
+        );
+    }
+
+    #[test]
     fn rejected_import_still_walks_its_nested_imports_without_exposing_placement_findings() {
         let directory = tempfile::tempdir().unwrap();
         let child = directory.path().join("child");

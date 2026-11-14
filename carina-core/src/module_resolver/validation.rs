@@ -27,7 +27,7 @@ impl RequireOutsideModuleDiagnostic {
     pub(crate) fn new(root: crate::config_loader::RootDirectoryVerdict) -> Self {
         Self { root }
     }
-    pub fn root_evidence(&self) -> &crate::config_loader::RootEvidence {
+    pub fn root_evidence(&self) -> crate::config_loader::RootEvidence {
         self.root.evidence()
     }
     pub fn lsp_message(&self) -> String {

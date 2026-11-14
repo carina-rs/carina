@@ -382,57 +382,6 @@ impl SemanticLookup for ParsedExportParam {
     }
 }
 
-/// Locate the `source = '<expected>'` or `source = "<expected>"` line inside
-/// an `upstream_state { ... }` block whose value equals `expected`. Returns
-/// `(line, start_col, end_col)` in character columns, positioned over the
-/// inner value (quotes excluded).
-///
-/// Restricting to `upstream_state` blocks avoids false matches against
-/// `provider` / `module` blocks that also take a `source` attribute.
-fn contains_matching_function_call(value: &Value, matches_name: &impl Fn(&str) -> bool) -> bool {
-    match value {
-        Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
-            matches_name(name)
-                || args.iter().any(|arg| {
-                    arg.value()
-                        .is_some_and(|value| contains_matching_function_call(value, matches_name))
-                })
-        }
-        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
-            matches_name(&function.name)
-                || args.iter().any(|arg| {
-                    arg.value()
-                        .is_some_and(|value| contains_matching_function_call(value, matches_name))
-                })
-        }
-        Value::Concrete(ConcreteValue::List(items)) => items
-            .iter()
-            .any(|item| contains_matching_function_call(item, matches_name)),
-        Value::Concrete(ConcreteValue::Map(entries)) => entries
-            .values()
-            .any(|entry| contains_matching_function_call(entry, matches_name)),
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
-            matches!(
-                part,
-                carina_core::resource::InterpolationPart::Expr(value)
-                    if contains_matching_function_call(value, matches_name)
-            )
-        }),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            inner.visit(|value| contains_matching_function_call(value, matches_name))
-        }
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            contains_matching_function_call(value, matches_name)
-                || contains_matching_function_call(default, matches_name)
-        }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            contains_matching_function_call(expression.lhs(), matches_name)
-                || contains_matching_function_call(expression.rhs(), matches_name)
-        }
-        _ => false,
-    }
-}
-
 /// Whether `deferred` was parsed from the editor's current document.
 /// `DeferredForExpression.file` is stamped with the full source path, so we
 /// compare by basename to the LSP-supplied `current_file_name`.
@@ -651,7 +600,7 @@ impl DiagnosticRun<'_> {
                     finding.detail().lsp_message(),
                 )?;
                 if let Some(evidence) = finding.detail().root_evidence() {
-                    super::attach_directory_evidence(&mut diagnostic, evidence);
+                    super::attach_directory_evidence(&mut diagnostic, &evidence);
                 }
                 Some(diagnostic)
             })
@@ -663,18 +612,9 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_backend_config(
         &self,
         doc: &Document,
-        merged: Option<&MergedParseResult>,
         tree: Option<&carina_core::parser::AnalysisTree<'_>>,
-        buffer: Option<&ParsedFile>,
-        reported_directory_failure: Option<&carina_core::parser::DeclarationLocation>,
     ) -> Vec<Diagnostic> {
         let Some(tree) = tree else {
-            return Vec::new();
-        };
-        let Some(parsed) = merged
-            .map(|merged| merged.directory.parsed.parsed())
-            .or(buffer)
-        else {
             return Vec::new();
         };
         // Backend admission consumes the issued verdict, including cardinality
@@ -686,29 +626,6 @@ impl DiagnosticRun<'_> {
         let attribute_diagnostic =
             |finding: carina_core::parser::Located<BackendAttributeError>| {
                 let error = finding.detail();
-                // A failed evaluation already owns this attribute. Keep other
-                // schema errors active, including unknown keys at this site.
-                if matches!(error, BackendAttributeError::InvalidAttribute { .. })
-                    && reported_directory_failure == Some(finding.location())
-                {
-                    return None;
-                }
-                // Directory resolution deliberately retains user-function calls
-                // that failed evaluation so other editor checks can continue.
-                // Suppress only those calls, including nested ones. A deferred
-                // builtin with unresolved arguments is still a genuine value-type
-                // mismatch and must remain visible, matching CLI validation.
-                if tree
-                    .backend_attribute_value(error.attribute())
-                    .is_some_and(|value| {
-                        contains_matching_function_call(value, &|name| {
-                            parsed.user_functions.contains_key(name)
-                        })
-                    })
-                {
-                    return None;
-                }
-
                 render_merged(doc, &finding, DiagnosticSeverity::ERROR, error.to_string())
             };
 
@@ -1239,7 +1156,7 @@ impl DiagnosticRun<'_> {
                 {
                     super::attach_directory_evidence(
                         &mut diagnostic,
-                        rejection.detail().root_evidence(),
+                        &rejection.detail().root_evidence(),
                     );
                 }
                 if let Some(evidence) = finding.detail().module_evidence() {

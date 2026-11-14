@@ -1431,6 +1431,109 @@ pub(crate) fn resolve_resource_refs_for_diagnostics(
     resolve_resource_refs_in_context(parsed, config, None, diagnostics_resolution_context())
 }
 
+struct BackendAttributeSource<'a> {
+    backend_type: &'a str,
+    key: &'a super::AttributeKey,
+    span: Option<super::SourceSpan>,
+}
+
+fn evaluate_backend_attribute(
+    BackendAttributeSource {
+        backend_type,
+        key,
+        span,
+    }: BackendAttributeSource<'_>,
+    value: &Value,
+    syntax: &super::SyntaxInventory,
+    binding_map: &HashMap<String, HashMap<String, Value>>,
+    config: &ProviderContext,
+    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    resolution: ResolutionContext,
+) -> Result<Value, ParseError> {
+    let evaluated = resolve_function_calls_only(value, binding_map, config, session, resolution)
+        .map_err(|error| {
+            match syntax
+                .backend_keys()
+                .iter()
+                .rev()
+                .find(|record| record.detail() == key)
+            {
+                Some(record) => error.at(record.location()),
+                None => error,
+            }
+        })?;
+    if resolution.backend_is_demanded() && crate::value::contains_secret(&evaluated) {
+        let span = span.ok_or_else(|| ParseError::InternalError {
+            expected: format!("source span for backend attribute '{key}'"),
+            context: "secret-derived backend attribute validation".to_string(),
+        })?;
+        let error = ParseError::SecretDerivedBackendAttribute {
+            backend_type: backend_type.to_owned(),
+            attribute: key.clone(),
+            line: span.start_line(),
+            start_column: span.start_column(),
+            end_column: span.end_column(),
+        };
+        return Err(
+            match syntax
+                .backend_keys()
+                .iter()
+                .rev()
+                .find(|record| record.detail() == key)
+            {
+                Some(record) => error.at(record.location()),
+                None => error,
+            },
+        );
+    }
+    Ok(evaluated)
+}
+
+/// Recover every backend value independently using the same evaluator and
+/// policy as strict loading. A failed value remains authored but cannot be
+/// admitted as an unresolved schema input.
+pub(crate) fn recover_backend_values(
+    target: &mut ParsedFile,
+    source: &ParsedFile,
+    config: &ProviderContext,
+) {
+    let (Some(target_backend), Some(backend)) = (&mut target.backend, &source.backend) else {
+        return;
+    };
+    let bindings = source
+        .iter_top_level_resources()
+        .filter_map(|resource| {
+            Some((
+                resource.binding()?.to_string(),
+                resource.resolved_attributes(),
+            ))
+        })
+        .collect();
+    for (key, value) in &backend.attributes {
+        match evaluate_backend_attribute(
+            BackendAttributeSource {
+                backend_type: &backend.backend_type,
+                key,
+                span: backend.attribute_spans.get(key).copied(),
+            },
+            value,
+            source.parser_binding_metadata.syntax(),
+            &bindings,
+            config,
+            None,
+            strict_resolution_context(),
+        ) {
+            Ok(value) => {
+                target_backend.attributes.insert(key.clone(), value);
+            }
+            Err(_) => target
+                .parser_binding_metadata
+                .syntax
+                .record_backend_evaluation_failure(key.clone()),
+        }
+    }
+}
+
 pub(crate) fn resolve_resource_refs_in_context<E: ExportParamLike>(
     parsed: &mut File<E>,
     config: &ProviderContext,
@@ -1587,51 +1690,20 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
     // secret-derived result before validate/plan/apply can resolve a backend.
     if let Some(backend) = &mut parsed.backend {
         for (key, value) in &mut backend.attributes {
-            let evaluated = resolve_function_calls_only(
+            let evaluated = evaluate_backend_attribute(
+                BackendAttributeSource {
+                    backend_type: &backend.backend_type,
+                    key,
+                    span: backend.attribute_spans.get(key).copied(),
+                },
                 value,
+                &syntax,
                 &binding_map,
                 fn_ctx.config,
                 session,
                 crate::config_loader::backend_resolution_context(resolution),
             )
-            .map_err(|error| {
-                match syntax
-                    .backend_keys()
-                    .iter()
-                    .rev()
-                    .find(|record| record.detail() == key)
-                {
-                    Some(record) => error.at(record.location()),
-                    None => error,
-                }
-            })
             .map_err(RootInputFailure::Backend)?;
-            if resolution.backend_is_demanded() && crate::value::contains_secret(&evaluated) {
-                let span = backend.attribute_spans.get(key).copied().ok_or_else(|| {
-                    ParseError::InternalError {
-                        expected: format!("source span for backend attribute '{key}'"),
-                        context: "secret-derived backend attribute validation".to_string(),
-                    }
-                })?;
-                let error = ParseError::SecretDerivedBackendAttribute {
-                    backend_type: backend.backend_type.clone(),
-                    attribute: key.clone(),
-                    line: span.start_line(),
-                    start_column: span.start_column(),
-                    end_column: span.end_column(),
-                };
-                return Err(RootInputFailure::Backend(
-                    match syntax
-                        .backend_keys()
-                        .iter()
-                        .rev()
-                        .find(|record| record.detail() == key)
-                    {
-                        Some(record) => error.at(record.location()),
-                        None => error,
-                    },
-                ));
-            }
             *value = evaluated;
         }
     }

@@ -493,7 +493,7 @@ fn static_validation_walks_multifile_modules_using_environment_snapshot() {
         panic!("supplied env must allow parsing through to the provider prohibition");
     };
     assert!(matches!(
-        error.root_cause(),
+        error.into_errors()[0].root_cause(),
         carina_core::module_resolver::ModuleError::ProviderInModule
     ));
 

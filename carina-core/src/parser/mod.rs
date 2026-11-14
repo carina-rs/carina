@@ -186,9 +186,10 @@ pub use resolve::{
 };
 pub(crate) use resolve::{
     ProviderInputPreview, ProviderInputStatus, RootInputFailure, collect_seed_bindings_from_parts,
-    preview_expanded_provider_inputs, reject_cyclic_let_bindings_in_variables,
-    resolve_resource_refs_for_diagnostics, resolve_resource_refs_in_context,
-    resolve_resource_refs_with_backend_failure, resolve_snapshot_function_calls_in_context,
+    preview_expanded_provider_inputs, recover_backend_values,
+    reject_cyclic_let_bindings_in_variables, resolve_resource_refs_for_diagnostics,
+    resolve_resource_refs_in_context, resolve_resource_refs_with_backend_failure,
+    resolve_snapshot_function_calls_in_context,
 };
 pub use static_eval::{
     evaluate_expanded_value_for_validation, evaluate_static_value_for_validation,
@@ -221,3 +222,5 @@ mod tests;
 pub(crate) use ast::resolve_loop_directive_value;
 #[cfg(test)]
 pub(crate) use types::bare_type_for_test;
+
+pub(crate) use elements::BackendValueState;

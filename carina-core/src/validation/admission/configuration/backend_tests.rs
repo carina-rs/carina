@@ -200,3 +200,103 @@ fn backend_receipts_keep_the_declaration_field_instance_and_revision() {
         assert_eq!(slot.value(), Some(placed.value()));
     }
 }
+
+#[test]
+fn round15_unlocated_backend_uses_the_same_ownership_gate() {
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    for (sources, expected) in [
+        (
+            vec![
+                ("backend.crn", "backend local { path = 1 }"),
+                ("values.crn", "let ordinary = 'value'"),
+            ],
+            Some(1),
+        ),
+        (
+            vec![
+                ("backend.crn", "backend local { path = 1 }"),
+                ("other.crn", "backend local {}"),
+            ],
+            None,
+        ),
+        (
+            vec![
+                ("declarations.crn", "arguments {}"),
+                ("values.crn", "let ordinary = 'value'"),
+            ],
+            None,
+        ),
+    ] {
+        let directory = crate::test_utils::configuration::ConfigurationDirectory::new(&sources);
+        let parsed = crate::config_loader::parse_directory(
+            &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+            &context,
+        )
+        .unwrap();
+        let unlocated = parsed
+            .admit_backend_unlocated()
+            .map(|result| result.unwrap_err().len());
+        let tree = parser::AnalysisTree::try_from_file(&parsed).unwrap();
+        let located = tree.admit_backend().map(|result| result.unwrap_err().len());
+        assert_eq!(unlocated, expected);
+        assert_eq!(located, expected);
+    }
+
+    // The same issued root may retain a failed user call for diagnostics.
+    // Neither source projection may turn it into an admitted backend.
+    let directory = crate::test_utils::configuration::ConfigurationDirectory::new(&[
+        (
+            "backend.crn",
+            "backend s3 { bucket = backend_bucket() key = 'state.json' }",
+        ),
+        ("functions.crn", "fn backend_bucket(): String { true }"),
+    ]);
+    let parsed = crate::config_loader::parse_directory_with_overrides_and_diagnostics(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &context,
+        &Default::default(),
+    )
+    .unwrap()
+    .parsed;
+    assert!(parsed.admit_backend_unlocated().is_none());
+    assert!(
+        parser::AnalysisTree::try_from_file(&parsed)
+            .unwrap()
+            .admit_backend()
+            .is_none()
+    );
+}
+
+#[test]
+fn round15_recovery_cannot_admit_failed_backend_values() {
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let source = "backend s3 { bucket = cidr_subnet('bad', 8, 1) key = cidr_subnet('bad', 8, 1) }";
+    let directory = crate::test_utils::configuration::ConfigurationDirectory::new(&[
+        ("backend.crn", source),
+        ("values.crn", "let ordinary = 'value'"),
+    ]);
+    let root = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let buffer = crate::config_loader::ParsedSourceBuffer::parse(
+        source,
+        &directory.path().join("backend.crn"),
+        &context,
+    )
+    .unwrap();
+    let snapshot =
+        crate::config_loader::DirectoryBufferSnapshot::capture(&root, buffer, &Default::default())
+            .unwrap();
+    let schemas = crate::schema::SchemaRegistry::new();
+    let configuration =
+        crate::config_loader::load_buffer_configuration_in_directory(snapshot, &schemas, &context);
+    let tree = parser::AnalysisTree::try_from_file(configuration.parsed()).unwrap();
+    for key in ["bucket", "key"] {
+        assert_eq!(
+            tree.syntax().backend_value_state(&key.into()),
+            parser::BackendValueState::EvaluationFailed
+        );
+    }
+    assert!(
+        tree.admit_backend().is_none(),
+        "failed evaluation cannot issue a readiness proof"
+    );
+}
