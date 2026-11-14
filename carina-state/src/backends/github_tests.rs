@@ -1,5 +1,5 @@
 //! Offline Contents store. Every mutation captures the branch head before
-//! yielding, then checks both that head and the target blob precondition.
+//! yielding, then checks the head and GitHub's measured blob preconditions.
 use super::github::*;
 use crate::{
     BackendConfig, BackendError, StateBackend, StateFile, StorageReadiness, lock::LockInfo,
@@ -20,7 +20,9 @@ struct Store {
     missing_branch: bool,
     files: BTreeMap<String, Vec<u8>>,
     history: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
+    parents: BTreeMap<String, Option<String>>,
     head: u64,
+    next_commit: u64,
     requests: Vec<GitHubRequest>,
     contention: usize,
     replace: Option<Vec<u8>>,
@@ -28,8 +30,12 @@ struct Store {
     response: Option<GitHubResponse>,
     responses: VecDeque<GitHubResponse>,
     malformed_success: bool,
+    wrong_blob_sha: bool,
     two_winners: bool,
-    corrupt_inline: bool,
+    compare_response: Option<Value>,
+    fail_read_after_commit: bool,
+    after_commit_error: Option<GitHubError>,
+    after_commit_response: Option<GitHubResponse>,
     after_success: Option<Vec<u8>>,
     after_success_pending: Option<(String, Vec<u8>)>,
     remove_before_mutation: bool,
@@ -87,9 +93,12 @@ fn conflict(status: u16, message: &str) -> GitHubResponse {
 }
 impl Store {
     fn commit(&mut self) -> String {
-        self.head += 1;
+        let parent = (self.head != 0).then(|| format!("{:040x}", self.head));
+        self.next_commit += 1;
+        self.head = self.next_commit;
         let commit = format!("{:040x}", self.head);
         self.history.insert(commit.clone(), self.files.clone());
+        self.parents.insert(commit.clone(), parent);
         commit
     }
 }
@@ -194,7 +203,7 @@ impl GitHubTransport for Fake {
                 && let Some((path, bytes)) = store.after_success_pending.take()
             {
                 // Our 2xx has returned to the client. Publish the rival's
-                // next revision immediately before serving its read-back.
+                // next revision immediately before verifying reachability.
                 store.files.insert(path, bytes);
                 store.commit();
             }
@@ -231,6 +240,40 @@ impl GitHubTransport for Fake {
                 json!({"commit":{"sha":format!("{:040x}", store.head)}}),
             ));
         }
+        if let Some(comparison) = request.path.strip_prefix("/repos/owner/repo/compare/") {
+            assert_eq!(request.method, Method::Get);
+            assert!(request.reference.is_none());
+            let base = comparison
+                .strip_suffix("...states%2Fprod")
+                .expect("encoded compare branch");
+            if let Some(mut response) = store.compare_response.take() {
+                // Isolate status failures from unrelated metadata failures.
+                if response.get("base_commit").is_none() {
+                    response["base_commit"] = json!({"sha":base, "parents":store.parents[base].iter().map(|sha| json!({"sha":sha})).collect::<Vec<_>>()});
+                }
+                return Ok(reply(200, response));
+            }
+            let mut cursor = Some(format!("{:040x}", store.head));
+            let mut ahead = 0;
+            while let Some(commit) = cursor {
+                if commit == base {
+                    return Ok(reply(
+                        200,
+                        json!({
+                            "status": if ahead == 0 { "identical" } else { "ahead" },
+                            "ahead_by": ahead, "behind_by": 0,
+                            "base_commit": {"sha": base, "parents": store.parents[base].iter().map(|sha| json!({"sha": sha})).collect::<Vec<_>>()}
+                        }),
+                    ));
+                }
+                cursor = store.parents.get(&commit).cloned().flatten();
+                ahead += 1;
+            }
+            return Ok(reply(
+                200,
+                json!({"status":"diverged","ahead_by":1,"behind_by":1}),
+            ));
+        }
         let path = request
             .path
             .strip_prefix("/repos/owner/repo/contents/")
@@ -261,12 +304,7 @@ impl GitHubTransport for Fake {
             }
             assert_eq!(request.accept, JSON_MEDIA_TYPE);
             let content = if bytes.len() <= 1_000_000 {
-                let inline = if store.corrupt_inline {
-                    vec![b'!'; bytes.len()]
-                } else {
-                    bytes.clone()
-                };
-                format!("{}\n", STANDARD.encode(inline))
+                format!("{}\n", STANDARD.encode(bytes))
             } else {
                 String::new()
             };
@@ -279,12 +317,6 @@ impl GitHubTransport for Fake {
         assert_eq!(body["branch"], "states/prod");
         assert!(body.get("committer").is_none());
         assert!(body["message"].as_str().unwrap().starts_with("carina: "));
-        if store.remove_before_mutation {
-            store.remove_before_mutation = false;
-            store.files.remove(&path);
-            store.commit();
-            return Ok(conflict(store.loser, "does not match"));
-        }
         if store.contention > 0 {
             store.contention -= 1;
             store.commit();
@@ -297,9 +329,22 @@ impl GitHubTransport for Fake {
         if head != store.head {
             return Ok(conflict(store.loser, "is at X but expected Y"));
         }
+        if store.remove_before_mutation {
+            store.remove_before_mutation = false;
+            store.files.remove(&path);
+            store.commit();
+        }
         let current = store.files.get(&path).map(|b| blob(b));
         let expected = body.get("sha").and_then(Value::as_str);
-        if current.as_deref() != expected {
+        if request.method == Method::Put && current.is_some() && expected.is_none() {
+            // M2: the missing-SHA validation error is HTTP 422, even without a race.
+            return Ok(reply(422, json!({"message":"\"sha\" wasn't supplied."})));
+        }
+        if request.method == Method::Delete && current.is_none() {
+            return Ok(reply(404, json!({"message":"Not Found"})));
+        }
+        // M1: PUT ignores a supplied SHA if the path has disappeared.
+        if current.is_some() && current.as_deref() != expected {
             return Ok(conflict(store.loser, "does not match"));
         }
         let content = if request.method == Method::Put {
@@ -309,28 +354,41 @@ impl GitHubTransport for Fake {
             }
             let sha = blob(&bytes);
             store.files.insert(path.clone(), bytes);
-            json!({"sha":sha})
+            json!({"sha": if store.wrong_blob_sha {blob(b"different acknowledgement")} else {sha}})
         } else {
             assert_eq!(request.method, Method::Delete);
             assert!(expected.is_some());
             store.files.remove(&path);
             Value::Null
         };
-        if store.two_winners {
-            // A broken acknowledgement: our returned commit itself contains
-            // different bytes, rather than a legitimate later publication.
-            store.files.insert(path.clone(), b"another writer".to_vec());
-        }
+        let parent = format!("{:040x}", store.head);
         let commit = store.commit();
+        if store.two_winners {
+            // Our acknowledged commit exists with the exact requested bytes,
+            // but the branch selects a competing child of the same parent.
+            store.head = u64::from_str_radix(&parent, 16).unwrap();
+            store.files = store.history[&parent].clone();
+            store.files.insert(path.clone(), b"another writer".to_vec());
+            store.commit();
+        }
         if let Some(bytes) = store.after_success.take() {
             store.after_success_pending = Some((path, bytes));
         }
         if store.malformed_success {
             return Ok(reply(200, json!({})));
         }
+        if std::mem::take(&mut store.fail_read_after_commit) {
+            store.response = Some(reply(503, json!({"message":"verification unavailable"})));
+        }
+        if let Some(error) = store.after_commit_error.take() {
+            return Err(error);
+        }
+        if let Some(response) = store.after_commit_response.take() {
+            return Ok(response);
+        }
         Ok(reply(
             if current.is_none() { 201 } else { 200 },
-            json!({"content":content,"commit":{"sha":commit}}),
+            json!({"content":content,"commit":{"sha":commit,"parents":[{"sha":parent}]}}),
         ))
     }
 }
@@ -590,7 +648,7 @@ async fn github_rate_limits_carry_retry_hints_and_cleanup_deadlines_are_bounded(
     for (status, header, message) in [
         (403, "retry-after", "slow"),
         (429, "retry-after", "slow"),
-        (403, "x-ratelimit-remaining", "slow"),
+        (403, "x-ratelimit-remaining", "API rate limit exceeded"),
         (403, "", "secondary rate limit"),
     ] {
         let fake = Fake::default();
@@ -1019,7 +1077,7 @@ async fn github_cleanup_protocol_fits_the_flush_budget_with_fifty_ms_transport_l
 }
 
 #[tokio::test]
-async fn github_round1_acquire_readback_ignores_a_later_client_write() {
+async fn github_round2_acquire_compare_accepts_a_later_client_commit() {
     let fake = Fake::default();
     let later = LockInfo::new("later client");
     fake.0.lock().unwrap().after_success = Some(serde_json::to_vec(&later).unwrap());
@@ -1031,11 +1089,11 @@ async fn github_round1_acquire_readback_ignores_a_later_client_write() {
             .id(),
         later.id()
     );
-    assert_pinned_readback(&fake, 1);
+    assert_compare_only(&fake);
 }
 
 #[tokio::test]
-async fn github_round1_release_readback_ignores_a_new_lease() {
+async fn github_round2_release_compare_accepts_a_later_acquisition() {
     let fake = Fake::default();
     let backend = fake.backend();
     let lock = backend.acquire_lock("apply").await.unwrap();
@@ -1052,11 +1110,11 @@ async fn github_round1_release_readback_ignores_a_new_lease() {
             .id(),
         later.id()
     );
-    assert_pinned_readback(&fake, 1);
+    assert_compare_only(&fake);
 }
 
 #[tokio::test]
-async fn github_round1_state_readback_ignores_a_later_state_write() {
+async fn github_round2_state_compare_accepts_a_later_state_commit() {
     let fake = Fake::default();
     let later = StateFile::new();
     let later_bytes = serde_json::to_vec(&later).unwrap();
@@ -1064,14 +1122,14 @@ async fn github_round1_state_readback_ignores_a_later_state_write() {
     let backend = fake.backend();
     backend.write_state(&StateFile::new()).await.unwrap();
     assert_eq!(fake.bytes("state.json").unwrap(), later_bytes);
-    assert_pinned_readback(&fake, 1);
+    assert_compare_only(&fake);
     assert!(matches!(
         backend.write_state(&StateFile::new()).await,
         Err(BackendError::StateWriteConflict { .. })
     ));
 }
 
-fn assert_pinned_readback(fake: &Fake, count: usize) {
+fn assert_compare_only(fake: &Fake) {
     let store = fake.0.lock().unwrap();
     let mutation = store
         .requests
@@ -1079,22 +1137,25 @@ fn assert_pinned_readback(fake: &Fake, count: usize) {
         .rposition(|r| r.method != Method::Get)
         .unwrap();
     let reads = &store.requests[mutation + 1..];
-    assert_eq!(reads.len(), count, "read-back request count");
+    assert_eq!(
+        reads.len(),
+        1,
+        "one reachability request regardless of content size"
+    );
+    assert_eq!(reads[0].method, Method::Get);
     assert_eq!(reads[0].accept, JSON_MEDIA_TYPE);
-    if count == 2 {
-        assert_eq!(reads[1].accept, RAW_MEDIA_TYPE);
-    }
-    for read in reads {
-        assert_eq!(read.method, Method::Get);
-        assert!(read.path.contains("/contents/"));
-        let reference = read.reference.as_ref().expect("pinned ref");
-        assert_eq!(reference.len(), 40);
-        assert_eq!(reference, reads[0].reference.as_ref().unwrap());
-    }
+    assert!(reads[0].reference.is_none());
+    let comparison = reads[0]
+        .path
+        .strip_prefix("/repos/owner/repo/compare/")
+        .expect("compare route");
+    let commit = comparison.strip_suffix("...states%2Fprod").unwrap();
+    assert_eq!(commit.len(), 40);
+    assert!(store.history.contains_key(commit));
 }
 
 #[tokio::test]
-async fn github_round1_readback_uses_inline_content_and_raw_only_for_large_files() {
+async fn github_round2_compare_costs_one_request_for_small_and_large_files() {
     for size in [1_000_000, 1_000_001] {
         let fake = Fake::default();
         let mut state = StateFile::new();
@@ -1104,15 +1165,15 @@ async fn github_round1_readback_uses_inline_content_and_raw_only_for_large_files
             .len();
         state.carina_version = "x".repeat(size - overhead);
         fake.backend().write_state(&state).await.unwrap();
-        assert_pinned_readback(&fake, if size == 1_000_000 { 1 } else { 2 });
+        assert_compare_only(&fake);
     }
     let fake = Fake::default();
     fake.backend().write_state(&StateFile::new()).await.unwrap();
-    assert_pinned_readback(&fake, 1);
+    assert_compare_only(&fake);
 }
 
 #[tokio::test]
-async fn github_round1_cleanup_save_has_one_lease_check_no_renewal_and_pinned_readback() {
+async fn github_round2_cleanup_save_and_release_each_use_four_requests() {
     let fake = Fake::default();
     let backend = fake.backend();
     backend.read_state().await.unwrap();
@@ -1135,15 +1196,15 @@ async fn github_round1_cleanup_save_has_one_lease_check_no_renewal_and_pinned_re
         );
         assert!(store.requests[2].path.ends_with("state.json"));
     }
-    assert_pinned_readback(&fake, 1);
+    assert_compare_only(&fake);
     fake.0.lock().unwrap().requests.clear();
     backend.release_lock_for_cleanup(&lock).await.unwrap();
     assert_eq!(fake.0.lock().unwrap().requests.len(), 4);
-    assert_pinned_readback(&fake, 1);
+    assert_compare_only(&fake);
 }
 
 #[tokio::test]
-async fn github_round1_expired_takeover_retries_create_when_the_old_lease_disappears() {
+async fn github_round2_expired_takeover_accepts_created_when_the_old_lease_disappears() {
     let fake = Fake::default();
     let expired = LockInfo::with_timeout("apply", -1);
     fake.put("state.json.lock", serde_json::to_vec(&expired).unwrap());
@@ -1156,9 +1217,8 @@ async fn github_round1_expired_takeover_retries_create_when_the_old_lease_disapp
         .iter()
         .filter(|r| r.method == Method::Put)
         .collect();
-    assert_eq!(puts.len(), 2);
+    assert_eq!(puts.len(), 1);
     assert!(puts[0].body.as_ref().unwrap().get("sha").is_some());
-    assert!(puts[1].body.as_ref().unwrap().get("sha").is_none());
     assert!(!store.requests.iter().any(|r| r.method == Method::Delete));
 }
 
@@ -1257,16 +1317,6 @@ async fn github_round1_cleanup_never_waits_on_rate_limits() {
     }
 }
 
-#[tokio::test]
-async fn github_round1_readback_rejects_wrong_inline_bytes_even_with_the_expected_sha() {
-    let fake = Fake::default();
-    fake.0.lock().unwrap().corrupt_inline = true;
-    assert!(matches!(
-        fake.backend().write_state(&StateFile::new()).await,
-        Err(BackendError::GitHub(GitHubError::UnexpectedOutcome { .. }))
-    ));
-}
-
 struct RateOnEachRequest {
     fake: Fake,
     calls: std::sync::atomic::AtomicUsize,
@@ -1303,7 +1353,9 @@ async fn github_round1_rate_retry_budget_is_shared_by_the_entire_operation() {
     ));
     assert_eq!(
         transport.calls.load(std::sync::atomic::Ordering::Relaxed),
-        5
+        // Two additional reconciliation reads use the same exhausted retry
+        // budget; neither is allowed to wait or reset the rate retry count.
+        7
     );
     assert_eq!(start.elapsed(), Duration::from_secs(2));
 }
@@ -1352,7 +1404,7 @@ async fn github_round1_rate_hint_must_fit_the_remaining_operation_deadline() {
 }
 
 #[tokio::test]
-async fn github_round1_cleanup_request_counts_cover_cold_and_cached_small_and_large_saves() {
+async fn github_round2_cleanup_request_counts_cover_cold_and_cached_small_and_large_saves() {
     for cached in [false, true] {
         for locked in [false, true] {
             for large in [false, true] {
@@ -1382,8 +1434,7 @@ async fn github_round1_cleanup_request_counts_cover_cold_and_cached_small_and_la
                 } else {
                     backend.write_state_for_cleanup(&state).await.unwrap();
                 }
-                let expected =
-                    2 + usize::from(locked) * 2 + usize::from(!cached) * 2 + usize::from(large);
+                let expected = 2 + usize::from(locked) * 2 + usize::from(!cached) * 2;
                 let store = fake.0.lock().unwrap();
                 assert_eq!(
                     store.requests.len(),
@@ -1404,8 +1455,8 @@ async fn github_round1_cleanup_request_counts_cover_cold_and_cached_small_and_la
                         .iter()
                         .filter(|r| r.accept == RAW_MEDIA_TYPE)
                         .count(),
-                    usize::from(large),
-                    "only read-back needs raw bytes; the old state's SHA needs one metadata GET"
+                    0,
+                    "neither reachability nor the old state precondition needs raw bytes"
                 );
             }
         }
@@ -1442,5 +1493,420 @@ async fn github_round1_cleanup_never_saves_with_an_expired_or_replaced_lease() {
                 .all(|r| r.method == Method::Get)
         );
         assert!(fake.bytes("state.json").is_none());
+    }
+}
+
+#[tokio::test]
+async fn github_round2_success_caches_sha_before_a_failed_verification() {
+    let fake = Fake::default();
+    let backend = fake.backend();
+    let mut state = StateFile::new();
+    backend.write_state(&state).await.unwrap();
+    fake.0.lock().unwrap().fail_read_after_commit = true;
+    state.serial = 1;
+    assert!(matches!(
+        backend.write_state(&state).await,
+        Err(BackendError::GitHub(GitHubError::Api { status: 503, .. }))
+    ));
+    state.serial = 2;
+    backend.write_state(&state).await.unwrap();
+    assert_eq!(
+        fake.backend()
+            .read_state()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_state()
+            .serial,
+        2
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round2_committed_rate_limit_retry_conflict_is_already_applied() {
+    let fake = Fake::default();
+    let backend = fake.backend();
+    let mut state = StateFile::new();
+    backend.write_state(&state).await.unwrap();
+    fake.0.lock().unwrap().requests.clear();
+    fake.0.lock().unwrap().after_commit_response = Some(rate_limit(429, "retry-after", "0".into()));
+    state.serial = 1;
+    backend.write_state(&state).await.unwrap();
+    assert_eq!(
+        fake.0
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| r.method == Method::Put)
+            .count(),
+        2
+    );
+    state.serial = 2;
+    backend.write_state(&state).await.unwrap();
+}
+
+#[tokio::test]
+async fn github_round2_lost_acquire_response_recovers_our_exact_lease() {
+    for error in [
+        GitHubError::Transport {
+            kind: "lost response",
+            source: reqwest::Client::new()
+                .get("http://[invalid")
+                .build()
+                .unwrap_err(),
+        },
+        GitHubError::Deadline,
+    ] {
+        let fake = Fake::default();
+        fake.0.lock().unwrap().after_commit_error = Some(error);
+        let backend = fake.backend();
+        let acquired = backend.acquire_lock("apply").await.unwrap();
+        assert_eq!(
+            fake.bytes("state.json.lock").unwrap(),
+            serde_json::to_vec(&acquired).unwrap()
+        );
+        backend.release_lock(&acquired).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn github_round2_committed_rate_limit_without_a_retry_hint_recovers_state() {
+    let fake = Fake::default();
+    let backend = fake.backend();
+    backend.read_state().await.unwrap();
+    fake.0.lock().unwrap().after_commit_response =
+        Some(reply(429, json!({"message":"rate limited"})));
+    let mut state = StateFile::new();
+    backend.write_state(&state).await.unwrap();
+    state.serial = 1;
+    backend.write_state(&state).await.unwrap();
+}
+
+#[tokio::test]
+async fn github_round2_compare_rejects_a_detached_acknowledgement_with_matching_bytes() {
+    let fake = Fake::default();
+    fake.0.lock().unwrap().two_winners = true;
+    assert!(matches!(
+        fake.backend().write_state(&StateFile::new()).await,
+        Err(BackendError::GitHub(GitHubError::UnexpectedOutcome { .. }))
+    ));
+}
+
+#[tokio::test]
+async fn github_round2_compare_rejects_non_reachable_statuses() {
+    for (status, behind) in [
+        ("behind", 1),
+        ("diverged", 1),
+        ("ahead", 1),
+        ("identical", 1),
+        ("unknown", 0),
+    ] {
+        let fake = Fake::default();
+        fake.0.lock().unwrap().compare_response =
+            Some(json!({"status":status,"ahead_by":1,"behind_by":behind}));
+        assert!(
+            matches!(
+                fake.backend().write_state(&StateFile::new()).await,
+                Err(BackendError::GitHub(GitHubError::UnexpectedOutcome { .. }))
+            ),
+            "{status}, behind={behind}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn github_round2_deleted_lease_renewal_is_rejected_and_its_resurrection_removed() {
+    let fake = Fake::default();
+    let backend = fake.backend();
+    let lock = backend.acquire_lock("apply").await.unwrap();
+    fake.0.lock().unwrap().requests.clear();
+    fake.0.lock().unwrap().remove_before_mutation = true;
+    assert!(
+        matches!(backend.renew_lock(&lock).await, Err(BackendError::LockNotHeld(id)) if id == lock.id())
+    );
+    assert!(fake.bytes("state.json.lock").is_none());
+    let store = fake.0.lock().unwrap();
+    let deletion = store
+        .requests
+        .iter()
+        .find(|r| r.method == Method::Delete)
+        .expect("resurrected lease cleanup");
+    assert!(deletion.body.as_ref().unwrap().get("sha").is_some());
+    assert!(store.requests.iter().any(|r| r.path.contains("/compare/")));
+}
+
+#[tokio::test]
+async fn github_round2_deleted_state_update_reports_conflict_and_keeps_created_state() {
+    let fake = Fake::default();
+    let backend = fake.backend();
+    let mut state = StateFile::new();
+    backend.write_state(&state).await.unwrap();
+    fake.0.lock().unwrap().remove_before_mutation = true;
+    state.serial = 1;
+    let error = backend.write_state(&state).await.unwrap_err();
+    assert!(matches!(
+        &error,
+        BackendError::GitHub(GitHubError::StateDeletedConcurrently)
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains("state file had been deleted concurrently"),
+        "{error:?}"
+    );
+    assert_eq!(
+        fake.bytes("state.json").unwrap(),
+        carina_core::utils::pretty_with_newline_bytes(&state).unwrap()
+    );
+    state.serial = 2;
+    backend.write_state(&state).await.unwrap();
+}
+
+#[tokio::test]
+async fn github_round2_fake_matches_deleted_sha_create_and_existing_missing_sha_validation() {
+    let fake = Fake::default();
+    fake.put("state.json", b"old".to_vec());
+    let request = |sha: Option<&str>| GitHubRequest {
+        method: Method::Put,
+        path: "/repos/owner/repo/contents/state.json".into(),
+        reference: None,
+        accept: JSON_MEDIA_TYPE,
+        body: Some({
+            let mut body = json!({"message":"carina: test","branch":"states/prod","content": STANDARD.encode(b"new")});
+            if let Some(sha) = sha {
+                body["sha"] = json!(sha);
+            }
+            body
+        }),
+    };
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let response = fake.execute(request(None), deadline).await.unwrap();
+    assert_eq!(response.status, 422);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&response.body).unwrap()["message"],
+        "\"sha\" wasn't supplied."
+    );
+    fake.0.lock().unwrap().remove_before_mutation = true;
+    assert_eq!(
+        fake.execute(request(Some(&blob(b"old"))), deadline)
+            .await
+            .unwrap()
+            .status,
+        201
+    );
+    assert_eq!(fake.bytes("state.json").unwrap(), b"new");
+}
+
+#[tokio::test]
+async fn github_round2_locked_saves_require_more_than_sixty_seconds_plus_skew() {
+    for cleanup in [false, true] {
+        // The 5-second skew allowance is part of the documented ownership margin.
+        for (ttl, allowed) in [(1, false), (60, false), (65, false), (66, true)] {
+            let fake = Fake::default();
+            let backend = fake.backend();
+            backend.read_state().await.unwrap();
+            let lock = LockInfo::with_timeout("apply", ttl);
+            fake.put("state.json.lock", serde_json::to_vec(&lock).unwrap());
+            fake.0.lock().unwrap().requests.clear();
+            let result = if cleanup {
+                backend
+                    .write_state_locked_for_cleanup(&StateFile::new(), &lock)
+                    .await
+            } else {
+                backend.write_state_locked(&StateFile::new(), &lock).await
+            };
+            if allowed {
+                result.unwrap();
+            } else {
+                assert!(
+                    matches!(result, Err(BackendError::LockNotHeld(_))),
+                    "cleanup={cleanup}, ttl={ttl}: {result:?}"
+                );
+                assert!(
+                    fake.0
+                        .lock()
+                        .unwrap()
+                        .requests
+                        .iter()
+                        .all(|r| r.method == Method::Get)
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn github_round2_forbidden_with_zero_remaining_requires_a_rate_limit_message() {
+    let fake = Fake::default();
+    let mut response = reply(
+        403,
+        json!({"message":"Resource not accessible by integration"}),
+    );
+    response
+        .headers
+        .insert("x-ratelimit-remaining".into(), "0".into());
+    fake.0.lock().unwrap().response = Some(response);
+    let error = fake.backend().storage_readiness().await.unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            BackendError::GitHub(GitHubError::Api { status: 403, .. })
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("Resource not accessible by integration")
+    );
+}
+
+#[tokio::test]
+async fn github_round2_diagnostics_redact_queries_in_every_response_url_field() {
+    for status in [403, 422, 503] {
+        let fake = Fake::default();
+        let url = "https://raw.githubusercontent.com/owner/repo/state.json?token=github-issued-raw-secret&other=private";
+        fake.0.lock().unwrap().response = Some(reply(
+            status,
+            json!({
+                "message":format!("denied at {url}"), "download_url": url, "git_url":url,
+                "url":url,"other":{"arbitrary":[url,"https://example.com/path?unrelated=also-private"]}
+            }),
+        ));
+        let error = fake.backend().storage_readiness().await.unwrap_err();
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains("github-issued-raw-secret"), "{rendered}");
+            assert!(!rendered.contains("token="), "{rendered}");
+            assert!(!rendered.contains("also-private"), "{rendered}");
+            assert!(
+                rendered
+                    .contains("denied at https://raw.githubusercontent.com/owner/repo/state.json")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn github_round2_acknowledged_blob_sha_must_match_the_exact_sent_bytes() {
+    let fake = Fake::default();
+    fake.0.lock().unwrap().wrong_blob_sha = true;
+    assert!(matches!(
+        fake.backend().write_state(&StateFile::new()).await,
+        Err(BackendError::GitHub(GitHubError::UnexpectedOutcome { .. }))
+    ));
+}
+
+#[tokio::test]
+async fn github_round2_known_created_renewal_still_cleans_up_if_compare_fails() {
+    let fake = Fake::default();
+    let backend = fake.backend();
+    let lock = backend.acquire_lock("apply").await.unwrap();
+    {
+        let mut store = fake.0.lock().unwrap();
+        store.remove_before_mutation = true;
+        store.fail_read_after_commit = true;
+    }
+    assert!(matches!(
+        backend.renew_lock(&lock).await,
+        Err(BackendError::LockNotHeld(_))
+    ));
+    assert!(fake.bytes("state.json.lock").is_none());
+}
+
+#[tokio::test]
+async fn github_round2_resurrection_cleanup_preserves_a_successor_lease() {
+    let fake = Fake::default();
+    let backend = fake.backend();
+    let lock = backend.acquire_lock("apply").await.unwrap();
+    let successor = LockInfo::new("successor");
+    {
+        let mut store = fake.0.lock().unwrap();
+        store.remove_before_mutation = true;
+        store.after_success = Some(serde_json::to_vec(&successor).unwrap());
+    }
+    assert!(matches!(
+        backend.renew_lock(&lock).await,
+        Err(BackendError::LockNotHeld(_))
+    ));
+    assert_eq!(
+        fake.bytes("state.json.lock").unwrap(),
+        serde_json::to_vec(&successor).unwrap()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round2_committed_acquire_rate_retry_recovers_after_missing_sha_422() {
+    let fake = Fake::default();
+    fake.0.lock().unwrap().after_commit_response = Some(rate_limit(429, "retry-after", "0".into()));
+    let acquired = fake.backend().acquire_lock("apply").await.unwrap();
+    assert_eq!(
+        fake.bytes("state.json.lock").unwrap(),
+        serde_json::to_vec(&acquired).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn github_round2_known_created_state_conflict_survives_compare_failure() {
+    let fake = Fake::default();
+    let backend = fake.backend();
+    let mut state = StateFile::new();
+    backend.write_state(&state).await.unwrap();
+    {
+        let mut store = fake.0.lock().unwrap();
+        store.remove_before_mutation = true;
+        store.fail_read_after_commit = true;
+    }
+    state.serial = 1;
+    let error = backend.write_state(&state).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("state file had been deleted concurrently"),
+        "{error:?}"
+    );
+    assert_eq!(
+        fake.bytes("state.json").unwrap(),
+        carina_core::utils::pretty_with_newline_bytes(&state).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn github_round2_compare_rejects_a_different_commit_parent() {
+    let fake = Fake::default();
+    fake.0.lock().unwrap().compare_response = Some(json!({
+        "status":"identical", "ahead_by":0, "behind_by":0,
+        "base_commit":{"sha":format!("{:040x}", 2), "parents":[{"sha":format!("{:040x}", 99)}]}
+    }));
+    assert!(matches!(
+        fake.backend().write_state(&StateFile::new()).await,
+        Err(BackendError::GitHub(GitHubError::UnexpectedOutcome { .. }))
+    ));
+}
+
+#[tokio::test]
+async fn github_round2_unstructured_errors_and_request_ids_redact_url_queries() {
+    for body in [
+        b"denied at https://example.com/state?token=raw-token".to_vec(),
+        br#"<a href="https://example.com/state?token=raw-token">denied</a>"#.to_vec(),
+        br#"{"broken":"https:\/\/example.com\/state?token=raw-token"#.to_vec(),
+        br#"{"message":"https:\/\/example.com\/state?\u0074oken=raw-token"}"#.to_vec(),
+    ] {
+        let fake = Fake::default();
+        fake.0.lock().unwrap().response = Some(GitHubResponse {
+            status: 503,
+            headers: BTreeMap::from([(
+                "x-github-request-id".into(),
+                "https://example.com/id?token=header-token".into(),
+            )]),
+            body,
+        });
+        let error = fake.backend().storage_readiness().await.unwrap_err();
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            for secret in ["token=", "raw-token", "header-token"] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+            assert!(rendered.contains("https://example.com/state"));
+        }
     }
 }

@@ -29,8 +29,8 @@ pub const MAX_BYTES: usize = 10_000_000;
 pub const RAW_MEDIA_TYPE: &str = "application/vnd.github.raw+json";
 pub const JSON_MEDIA_TYPE: &str = "application/vnd.github+json";
 
-/// Terminal protocol failures. Response bodies and credentials are never
-/// included in diagnostics, including malformed and oversized responses.
+/// Terminal protocol failures. Only sanitized API error excerpts enter
+/// diagnostics; state/lease content and credentials are never included.
 #[derive(Debug, Error)]
 pub enum GitHubError {
     #[error("GitHub credentials unavailable: {0}")]
@@ -81,6 +81,10 @@ pub enum GitHubError {
     UnexpectedOutcome { reason: &'static str },
     #[error("GitHub branch contention persisted after {attempts} attempts")]
     Contention { attempts: usize },
+    #[error(
+        "State write conflict: the state file had been deleted concurrently; the PUT recreated it and the created file has been kept"
+    )]
+    StateDeletedConcurrently,
     #[error("GitHub rate limit (HTTP {status}); retry hint: {retry_after:?}")]
     RateLimited {
         status: u16,
@@ -151,9 +155,13 @@ pub struct GitHubBackend {
 
 const OPERATION_BUDGET: Duration = Duration::from_secs(30);
 // The existing finalizer allows 1s to flush and 2s overall. Each complete
-// cleanup operation, including its gate, retries and read-back, is bounded to 900ms.
+// cleanup operation, including its gate, retries and compare, is bounded to 900ms.
 const CLEANUP_BUDGET: Duration = Duration::from_millis(900);
 const MAX_ATTEMPTS: usize = 5;
+// A locked save needs strictly more than 60s remaining, plus 5s for clock
+// skew. This narrows expiry/takeover races without renewing during cleanup.
+const WRITE_TTL_MARGIN: Duration = Duration::from_secs(60);
+const CLOCK_SKEW_ALLOWANCE: Duration = Duration::from_secs(5);
 
 struct Operation {
     deadline: Instant,
@@ -285,7 +293,7 @@ impl GitHubBackend {
                     .headers
                     .get("x-ratelimit-remaining")
                     .is_some_and(|value| value == "0");
-                let secondary = serde_json::from_slice::<Value>(&response.body)
+                let message = serde_json::from_slice::<Value>(&response.body)
                     .ok()
                     .and_then(|value| {
                         value
@@ -293,9 +301,11 @@ impl GitHubBackend {
                             .and_then(Value::as_str)
                             .map(str::to_lowercase)
                     })
-                    .is_some_and(|message| message.contains("secondary rate limit"));
+                    .unwrap_or_default();
+                let secondary = message.contains("secondary rate limit");
+                let rate_message = message.contains("rate limit") || message.contains("rate-limit");
                 if response.status == 429
-                    || primary
+                    || (primary && rate_message)
                     || secondary
                     || response.headers.contains_key("retry-after")
                 {
@@ -326,7 +336,7 @@ impl GitHubBackend {
     fn api_error(response: &GitHubResponse) -> BackendError {
         GitHubError::Api {
             status: response.status,
-            body: String::from_utf8_lossy(&response.body)
+            body: redact_response_body(&response.body)
                 .chars()
                 .filter(|ch| !ch.is_control())
                 .take(2048)
@@ -502,9 +512,71 @@ impl GitHubBackend {
     }
     async fn verify_owner(&self, lock: &LockInfo, operation: &Operation) -> BackendResult<()> {
         match self.lease(operation).await? {
-            Some((current, _)) if current.id() == lock.id() && !current.is_expired() => Ok(()),
+            Some((current, _))
+                if current.id() == lock.id()
+                    && current.time_remaining().to_std().is_ok_and(|remaining| {
+                        remaining > WRITE_TTL_MARGIN + CLOCK_SKEW_ALLOWANCE
+                    }) =>
+            {
+                Ok(())
+            }
             _ => Err(BackendError::LockNotHeld(lock.id().into())),
         }
+    }
+    fn remember_mutation(&self, purpose: &Purpose<'_>, sha: Option<BlobSha>) -> Option<BlobSha> {
+        if matches!(purpose, Purpose::State(_)) {
+            *self.expected_state.lock().expect("state revision mutex") = Some(sha.clone());
+        }
+        sha
+    }
+    async fn verify_reachable(
+        &self,
+        commit: &CommitSha,
+        parent: &CommitSha,
+        operation: &Operation,
+    ) -> BackendResult<()> {
+        let response = self
+            .get(
+                format!(
+                    "{}/compare/{}...{}",
+                    self.repository_route(),
+                    commit.as_str(),
+                    encode_component(self.settings.branch().as_str())
+                ),
+                None,
+                JSON_MEDIA_TYPE,
+                operation,
+            )
+            .await?;
+        if response.status != 200 {
+            return Err(Self::api_error(&response));
+        }
+        let comparison = decode(&response.body)?;
+        // A pinned Contents read only proves a detached commit's contents.
+        // Compare checks that the acknowledged commit is on the branch, even
+        // when later writers have advanced it. It does not fence later writes.
+        let reachable = comparison["behind_by"].as_u64() == Some(0)
+            && match comparison["status"].as_str() {
+                Some("identical") => comparison["ahead_by"].as_u64() == Some(0),
+                Some("ahead") => comparison["ahead_by"]
+                    .as_u64()
+                    .is_some_and(|ahead| ahead > 0),
+                _ => false,
+            };
+        // The base is the acknowledged commit. Keep its parent tied to that
+        // acknowledgement: 201 means the path was absent in this parent.
+        let same_commit = comparison["base_commit"]["sha"].as_str() == Some(commit.as_str())
+            && comparison["base_commit"]["parents"]
+                .as_array()
+                .is_some_and(|parents| {
+                    parents.len() == 1 && parents[0]["sha"].as_str() == Some(parent.as_str())
+                });
+        if !reachable || !same_commit {
+            return Err(GitHubError::UnexpectedOutcome {
+                reason: "acknowledged commit is not on the branch or its parent metadata differs; possible competing winners",
+            }.into());
+        }
+        Ok(())
     }
     fn lost_race(
         purpose: &Purpose<'_>,
@@ -541,15 +613,14 @@ impl GitHubBackend {
             (_, true) => "carina: update lease",
             (_, false) => "carina: release lease",
         };
-        let mut expected = expected.cloned();
         let mut body = json!({"message":message,"branch":self.settings.branch().as_str()});
-        if let Some(sha) = &expected {
+        if let Some(sha) = expected {
             body["sha"] = json!(sha.as_str());
         }
         if let Some(bytes) = bytes {
             body["content"] = json!(STANDARD.encode(bytes));
         }
-        let mut request = GitHubRequest {
+        let request = GitHubRequest {
             method: if bytes.is_some() {
                 Method::Put
             } else {
@@ -568,29 +639,49 @@ impl GitHubBackend {
             if let Some(lock) = lock_to_verify {
                 self.verify_owner(lock, operation).await?;
             }
-            let response = self.request(request.clone(), operation).await?;
-            if response.status == 409 {
+            let response = match self.request(request.clone(), operation).await {
+                Ok(response) => response,
+                Err(
+                    error @ BackendError::GitHub(
+                        GitHubError::Transport { .. }
+                        | GitHubError::TransportDeadline { .. }
+                        | GitHubError::Deadline
+                        | GitHubError::RateLimited { .. },
+                    ),
+                ) if bytes.is_some() => {
+                    // The server may have committed before losing the reply.
+                    // Reconcile only exact bytes, within the original deadline.
+                    if let Ok(Some(current)) = self.observe(path, operation).await
+                        && Some(current.bytes.as_slice()) == bytes
+                    {
+                        return Ok(self.remember_mutation(&purpose, Some(current.sha)));
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
+            if response.status == 409 || (response.status == 422 && bytes.is_some()) {
                 let current = self.observe(path, operation).await?;
-                if matches!(purpose, Purpose::Acquire(_)) && expected.is_some() && current.is_none()
+                if let Some(current) = current.as_ref()
+                    && Some(current.bytes.as_slice()) == bytes
                 {
-                    // A conditional takeover lost to removal of the expired
-                    // lease. Creating an absent path needs no replacement SHA;
-                    // it still competes atomically with other acquirers.
-                    expected = None;
-                    request
-                        .body
-                        .as_mut()
-                        .and_then(Value::as_object_mut)
-                        .expect("mutation object")
-                        .remove("sha");
-                } else if current.as_ref().map(|file| &file.sha) != expected.as_ref() {
+                    return Ok(self.remember_mutation(&purpose, Some(current.sha.clone())));
+                }
+                if response.status == 422 {
+                    return Err(Self::api_error(&response));
+                }
+                // M1: an expired takeover target that vanished can be created
+                // by this same PUT, even with the old SHA. No rebase is needed.
+                let vanished_takeover = matches!(purpose, Purpose::Acquire(_))
+                    && expected.is_some()
+                    && current.is_none();
+                if current.as_ref().map(|file| &file.sha) != expected && !vanished_takeover {
                     return Err(Self::lost_race(&purpose, current, attempt)?);
                 }
                 if attempt == MAX_ATTEMPTS {
                     return Err(GitHubError::Contention { attempts: attempt }.into());
                 }
-                // Branch contention keeps the same bytes and precondition;
-                // only a vanished takeover target changes to absence above.
+                // Branch contention keeps the same bytes and precondition.
                 // A new blob SHA with stale content would overwrite the winner.
                 let jitter = (uuid::Uuid::new_v4().as_u128() % 25) as u64;
                 let delay = Duration::from_millis(10 * attempt as u64 + jitter);
@@ -603,17 +694,19 @@ impl GitHubBackend {
             if !matches!(response.status, 200 | 201) {
                 return Err(Self::api_error(&response));
             }
-            let (commit, success) = (|| -> Result<(CommitSha, Option<BlobSha>), GitHubError> {
-                let value: Value = serde_json::from_slice(&response.body)
-                    .map_err(|_| GitHubError::MalformedResponse)?;
-                let commit = CommitSha::parse(json_string(&value["commit"], "sha")?)?;
+            let value: Value = serde_json::from_slice(&response.body).map_err(|_| {
+                GitHubError::UnexpectedOutcome {
+                    reason: "successful mutation returned malformed metadata",
+                }
+            })?;
+            let success = (|| -> Result<Option<BlobSha>, GitHubError> {
                 if bytes.is_some() {
-                    Ok((
-                        commit,
-                        Some(BlobSha::parse(json_string(&value["content"], "sha")?)?),
-                    ))
+                    Ok(Some(BlobSha::parse(json_string(
+                        &value["content"],
+                        "sha",
+                    )?)?))
                 } else if value.get("content") == Some(&Value::Null) && response.status == 200 {
-                    Ok((commit, None))
+                    Ok(None)
                 } else {
                     Err(GitHubError::MalformedResponse)
                 }
@@ -621,18 +714,74 @@ impl GitHubBackend {
             .map_err(|_| GitHubError::UnexpectedOutcome {
                 reason: "successful mutation returned malformed metadata",
             })?;
-            // Prove what this acknowledgement published, even if another
-            // client has already advanced the live branch (including release
-            // followed immediately by a new acquisition).
-            let observed = self.observe_at(path, &commit, operation).await?;
-            let matches = match (bytes, success.as_ref(), observed.as_ref()) {
-                (Some(bytes), Some(sha), Some(file)) => sha == &file.sha && bytes == file.bytes,
-                (None, None, None) => true,
-                _ => false,
-            };
-            if !matches {
-                return Err(GitHubError::UnexpectedOutcome {reason:"acknowledged mutation differs from read-back; possible competing winners"}.into());
+            // Record the acknowledged blob before verification can fail or be
+            // cancelled, otherwise our next write conflicts with our own PUT.
+            let success = self.remember_mutation(&purpose, success);
+            if let (Some(bytes), Some(sha)) = (bytes, success.as_ref()) {
+                // Git blob identity checks the acknowledged content without
+                // another Contents request, including for large state files.
+                use sha1::{Digest, Sha1};
+                let mut hash = Sha1::new();
+                hash.update(format!("blob {}\0", bytes.len()));
+                hash.update(bytes);
+                if sha.as_str() != format!("{:x}", hash.finalize()) {
+                    return Err(GitHubError::UnexpectedOutcome {
+                        reason: "acknowledged blob SHA differs from the requested bytes",
+                    }
+                    .into());
+                }
             }
+            let (commit, parent) = (|| -> Result<_, GitHubError> {
+                let commit = CommitSha::parse(json_string(&value["commit"], "sha")?)?;
+                let parents = value["commit"]["parents"]
+                    .as_array()
+                    .filter(|parents| parents.len() == 1)
+                    .ok_or(GitHubError::MalformedResponse)?;
+                let parent = CommitSha::parse(json_string(&parents[0], "sha")?)?;
+                Ok((commit, parent))
+            })()
+            .map_err(|_| GitHubError::UnexpectedOutcome {
+                reason: "successful mutation returned malformed commit metadata",
+            })?;
+            let verification = self.verify_reachable(&commit, &parent, operation).await;
+            if response.status == 201 && expected.is_some() {
+                let deletion_error = match purpose {
+                    Purpose::Owned(id) => {
+                        // M1: renew must not resurrect a released/force-unlocked
+                        // lease. Only our returned SHA may be removed. Boxing
+                        // bounds async recursion: DELETE cannot enter this arm.
+                        if Box::pin(self.conditional(
+                            path,
+                            None,
+                            success.as_ref(),
+                            Purpose::Owned(id),
+                            operation,
+                        ))
+                        .await
+                        .is_err()
+                        {
+                            log::warn!(
+                                "GitHub recreated lease cleanup could not be confirmed; inspect the lock file (lock ID: {id})"
+                            );
+                        }
+                        Some(BackendError::LockNotHeld(id.into()))
+                    }
+                    Purpose::State(_) => Some(GitHubError::StateDeletedConcurrently.into()),
+                    Purpose::Acquire(_) => None, // A vanished expired lease may be acquired.
+                };
+                if let Some(error) = deletion_error {
+                    // A known 201 remains a deletion conflict even if compare
+                    // is unavailable. Never skip lease rollback for that reason.
+                    // A proven competing history still keeps its typed error.
+                    return match verification {
+                        Err(
+                            error @ BackendError::GitHub(GitHubError::UnexpectedOutcome { .. }),
+                        ) => Err(error),
+                        _ => Err(error),
+                    };
+                }
+            }
+            verification?;
             return Ok(success);
         }
         unreachable!("bounded conditional loop always returns")
@@ -671,16 +820,14 @@ impl GitHubBackend {
                 sha
             }
         };
-        let sha = self
-            .conditional(
-                self.settings.path().into(),
-                Some(bytes),
-                expected.as_ref(),
-                Purpose::State(lease),
-                operation,
-            )
-            .await?;
-        *self.expected_state.lock().expect("state revision mutex") = Some(sha);
+        self.conditional(
+            self.settings.path().into(),
+            Some(bytes),
+            expected.as_ref(),
+            Purpose::State(lease),
+            operation,
+        )
+        .await?;
         Ok(())
     }
     async fn renew(&self, lock: &LockInfo, operation: &Operation) -> BackendResult<LockInfo> {
@@ -734,9 +881,9 @@ impl GitHubBackend {
         bounded(operation.deadline, async {
             let bytes = Self::state_bytes(state)?;
             let _gate = self.mutations.lock().await;
-            // A renewal adds a mutation and read-back without fencing state
-            // against lease takeover. Use the ordinary owner/expiry check on
-            // every PUT attempt, within the unchanged cleanup deadline.
+            // A renewal adds a mutation and compare without fencing state
+            // against lease takeover. Check ownership and the remaining-TTL
+            // margin on every PUT attempt, within the same cleanup deadline.
             let lease = lock.map_or(WriteLease::Unlocked, WriteLease::Held);
             self.write(&bytes, lease, &operation).await
         })
@@ -777,7 +924,54 @@ fn decode_lease(bytes: &[u8]) -> Result<LockInfo, GitHubError> {
     Ok(lock)
 }
 fn request_id(response: &GitHubResponse) -> Option<String> {
-    response.headers.get("x-github-request-id").cloned()
+    response
+        .headers
+        .get("x-github-request-id")
+        .map(|id| redact_url_queries(id))
+}
+// Response URLs can contain GitHub-issued raw tokens unrelated to our auth
+// token (M4). Redact every URL query before storing an API excerpt in an
+// error, so Display, Debug and downstream logs all receive the same safe text.
+fn redact_response_body(body: &[u8]) -> String {
+    fn redact_value(value: &mut Value) {
+        match value {
+            Value::String(text) => *text = redact_url_queries(text),
+            Value::Array(values) => values.iter_mut().for_each(redact_value),
+            Value::Object(values) => {
+                let original = std::mem::take(values);
+                for (key, mut value) in original {
+                    redact_value(&mut value);
+                    values.insert(redact_url_queries(&key), value);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Ok(mut value) = serde_json::from_slice::<Value>(body) {
+        redact_value(&mut value);
+        value.to_string()
+    } else {
+        redact_url_queries(&String::from_utf8_lossy(body).replace("\\/", "/"))
+    }
+}
+fn redact_url_queries(mut text: &str) -> String {
+    let mut safe = String::with_capacity(text.len());
+    while let Some(scheme) = text.find("://") {
+        let after_scheme = scheme + 3;
+        let end = text[after_scheme..]
+            .find(|ch: char| ch.is_whitespace() || matches!(ch, '\"' | '\'' | '<' | '>'))
+            .map_or(text.len(), |end| after_scheme + end);
+        let url = &text[..end];
+        if let Some(query) = url[after_scheme..].find('?') {
+            safe.push_str(&url[..after_scheme + query]);
+            safe.push_str("?<redacted>");
+        } else {
+            safe.push_str(url);
+        }
+        text = &text[end..];
+    }
+    safe.push_str(text);
+    safe
 }
 fn retry_hint(response: &GitHubResponse) -> Option<Duration> {
     if let Some(value) = response.headers.get("retry-after") {

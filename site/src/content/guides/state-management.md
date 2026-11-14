@@ -217,6 +217,34 @@ These observations do not establish a guarantee during incidents or future
 GitHub changes. Blob SHAs identify content, not monotonically increasing
 generations, and checking the lease and writing state are separate requests.
 
+Also measured: GitHub ignores the sha precondition when the file was deleted.
+On November 15, 2026, a PUT carrying the deleted file's SHA recreated the path
+with HTTP 201. S3's `If-Match` fails when the object has been deleted.
+
+Carina verifies that an acknowledged mutation's commit remains on the branch
+with one compare request. A later commit on the same history is accepted;
+a competing history is an unexpected outcome. This check does not prevent
+later changes to the branch or file.
+
+When a renewal of an existing lease returns 201, Carina reports that the lock
+is no longer held and attempts to delete the recreated lease using its returned
+SHA. An expired lease that disappears during acquisition may still be created.
+When a state write expected an existing file but returns 201, Carina reports
+a concurrent-deletion conflict and keeps the created state file.
+
+Locked state saves, including cleanup saves, require **more than 65 seconds**
+remaining on the observed lease: 60 seconds plus a fixed 5-second clock-skew
+allowance. This adds no request and does not change the cleanup time budget.
+It narrows the expiry window; a force-unlock or takeover can still happen
+between the ownership check and the state PUT. Removal of a recreated lease
+can also fail or race with another client, and does not undo a successor's
+work during that window.
+
+If the mutation response is lost, its 201/200 status and commit parent are
+also lost. Recovery by matching the exact requested bytes can establish the
+intended content, but cannot establish whether that PUT recreated a deleted
+path. This remaining deletion window is not equivalent to S3's `If-Match`.
+
 ### State history is kept
 
 Keep the state repository **private, with narrow access**. Every version stays
