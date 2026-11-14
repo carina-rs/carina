@@ -1771,6 +1771,12 @@ pub enum AppError {
     StateLockLost { error: BackendError },
 }
 
+impl From<carina_state::S3AutoCreateDisabled> for AppError {
+    fn from(error: carina_state::S3AutoCreateDisabled) -> Self {
+        Self::Config(error.to_string())
+    }
+}
+
 impl From<crate::commands::init::InitError> for AppError {
     fn from(error: crate::commands::init::InitError) -> Self {
         Self::Init(Box::new(error))

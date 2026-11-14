@@ -44,9 +44,9 @@ use carina_core::shutdown::{
 };
 #[cfg(test)]
 use carina_state::LockInfo;
-use carina_state::StateBackend;
 #[cfg(test)]
 use carina_state::StateFile;
+use carina_state::{ProtectedBackendBucket, StateBackend};
 
 use carina_core::parser::ProviderContext;
 
@@ -173,10 +173,7 @@ pub async fn run_destroy(
         .map_err(AppError::Backend)?
         .into();
 
-    // Get the state bucket name for protection check (S3 backend only)
-    let protected_bucket = verified_backend
-        .s3_settings()
-        .map(|settings| settings.bucket().to_owned());
+    let protected_bucket = verified_backend.protected_bucket();
 
     // Acquire lock (unless --lock=false)
     let state_lock = if lock {
@@ -390,7 +387,7 @@ async fn run_destroy_locked_owned(
     mut validated_config: ValidatedConfig<carina_core::parser::ExpandedInferredFile>,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
-    protected_bucket: Option<String>,
+    protected_bucket: Option<ProtectedBackendBucket>,
     lock: StateLock,
     refresh: bool,
     force: bool,
@@ -802,9 +799,10 @@ validated_config.provider_plan())
     // Backend protection covers every persisted generation, including rows
     // whose removed current instance no longer has any attributes.
     let mut protected_row_keys: HashSet<StateRowKey> = HashSet::new();
-    if let (Some(state), Some(bucket_name)) = (state_file.as_ref(), protected_bucket.as_deref()) {
+    if let (Some(state), Some(bucket)) = (state_file.as_ref(), protected_bucket.as_ref()) {
+        let bucket_name = bucket.bucket();
         for row in state.resources() {
-            if row.resource_type == carina_state::backends::S3_BACKEND_RESOURCE_TYPE
+            if row.resource_type == bucket.resource_type()
                 && (row
                     .persisted_attributes()
                     .into_iter()
@@ -865,11 +863,10 @@ validated_config.provider_plan())
             }
 
             // Protect the persisted backend bucket even if its configured name changed.
-            let configured_backend_bucket = r.id.resource_type
-                == carina_state::backends::S3_BACKEND_RESOURCE_TYPE
-                && protected_bucket.as_deref().is_some_and(|bucket_name| {
-                    matches!(r.get_attr("bucket"), Some(Value::Concrete(ConcreteValue::String(name)))
-                        if name.expose_plaintext() == bucket_name)
+            let configured_backend_bucket = protected_bucket.as_ref().is_some_and(|bucket| {
+                r.id.resource_type == bucket.resource_type()
+                    && matches!(r.get_attr("bucket"), Some(Value::Concrete(ConcreteValue::String(name)))
+                        if name.expose_plaintext() == bucket.bucket())
                 });
             if configured_backend_bucket
                 || r.id.identity_str().is_some_and(|identity| {
@@ -1675,7 +1672,7 @@ async fn run_destroy_locked(
     parsed: carina_core::parser::InferredFile,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
-    protected_bucket: Option<String>,
+    protected_bucket: Option<ProtectedBackendBucket>,
     lock: StateLock,
     refresh: bool,
     force: bool,
@@ -1743,7 +1740,7 @@ pub(crate) async fn run_destroy_locked_with_ctx(
     validated_config: ValidatedConfig<carina_core::parser::ExpandedInferredFile>,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
-    protected_bucket: Option<String>,
+    protected_bucket: Option<ProtectedBackendBucket>,
     lock: StateLock,
     refresh: bool,
     force: bool,
@@ -2987,6 +2984,23 @@ mod tests {
                 )
                 .unwrap();
                 let project = carina_core::paths::ResolvedPath::new(config_path).unwrap();
+                let backend_config = crate::test_support::parsed_fixture(
+                    "backend s3 { bucket = 'backend-state-bucket' key = 'state.json' auto_create = false }",
+                ).backend.unwrap();
+                carina_state::BackendLock::for_config(Some(&backend_config))
+                    .unwrap()
+                    .save(&project)
+                    .unwrap();
+                let carina_state::MutationBackendSelection::Verified(selection) =
+                    carina_state::BackendSelection::verified_for_mutation(
+                        &project,
+                        Some(&backend_config),
+                    )
+                    .unwrap()
+                else {
+                    panic!("matching S3 backend lock must verify the selection")
+                };
+                let protected_bucket = selection.protected_bucket();
                 let backend: Arc<dyn StateBackend> =
                     crate::commands::local_backend_for_test(dir.path().join("state.json")).into();
                 let mut row = carina_state::ResourceState::try_applied(
@@ -3037,7 +3051,7 @@ mod tests {
                         parsed,
                         true,
                         Arc::clone(&backend),
-                        Some("backend-state-bucket".to_owned()),
+                        protected_bucket.clone(),
                         StateLock::held(lock),
                         refresh,
                         false,

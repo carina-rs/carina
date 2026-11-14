@@ -210,12 +210,33 @@ pub struct VerifiedMutationBackendSelection {
 }
 
 impl VerifiedMutationBackendSelection {
-    pub fn s3_settings(&self) -> Option<&S3BackendSettings> {
-        self.configured.config().as_s3()
+    pub fn protected_bucket(&self) -> Option<ProtectedBackendBucket> {
+        self.configured
+            .config()
+            .as_s3()
+            .map(|settings| ProtectedBackendBucket {
+                bucket: settings.bucket().to_owned(),
+            })
     }
 
     pub async fn resolve(&self) -> BackendResult<Box<dyn crate::StateBackend>> {
         crate::backends::create_backend(&self.configured).await
+    }
+}
+
+/// The state bucket protected by a verified mutation backend selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectedBackendBucket {
+    bucket: String,
+}
+
+impl ProtectedBackendBucket {
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    pub fn resource_type(&self) -> &'static str {
+        S3_BACKEND_RESOURCE_TYPE
     }
 }
 
@@ -712,6 +733,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded_target.into_state().lineage, "configured-new");
+    }
+
+    #[test]
+    fn verified_mutation_selection_owns_protected_bucket_identity() {
+        for config in [s3_config("configured-bucket"), local_config("state.json")] {
+            let directory = tempfile::tempdir().unwrap();
+            let project = ResolvedPath::new(directory.path()).unwrap();
+            BackendLock::for_config(Some(&config))
+                .unwrap()
+                .save(&project)
+                .unwrap();
+            let MutationBackendSelection::Verified(selected) =
+                BackendSelection::verified_for_mutation(&project, Some(&config)).unwrap()
+            else {
+                panic!("matching backend lock must verify the selection")
+            };
+
+            if config.backend_type == "s3" {
+                let protected: crate::ProtectedBackendBucket = selected.protected_bucket().unwrap();
+                assert_eq!(protected.bucket(), "configured-bucket");
+                assert_eq!(protected.resource_type(), "s3.Bucket");
+            } else {
+                assert!(selected.protected_bucket().is_none());
+            }
+        }
     }
 
     #[test]

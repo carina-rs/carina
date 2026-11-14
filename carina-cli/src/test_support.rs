@@ -17,6 +17,20 @@ pub(crate) async fn missing_s3_backend(
     Box<dyn carina_state::StateBackend>,
     Arc<std::sync::Mutex<Vec<winterbaume_core::MockRequest>>>,
 ) {
+    let raw = parsed_fixture(&format!(
+        "backend s3 {{ bucket = \"state-bucket\" key = \"state.json\" auto_create = {auto_create} }}"
+    ));
+    let config = carina_state::BackendConfig::try_from(raw.backend.as_ref().unwrap()).unwrap();
+    missing_s3_backend_with_settings(config.as_s3().unwrap()).await
+}
+
+#[cfg(test)]
+pub(crate) async fn missing_s3_backend_with_settings(
+    settings: &carina_state::S3BackendSettings,
+) -> (
+    Box<dyn carina_state::StateBackend>,
+    Arc<std::sync::Mutex<Vec<winterbaume_core::MockRequest>>>,
+) {
     use winterbaume_core::{MockAws, MockRequest, MockResponse, MockService};
 
     struct MissingBucketService {
@@ -52,13 +66,9 @@ pub(crate) async fn missing_s3_backend(
         })
         .build();
     let sdk_config = mock.sdk_config("us-east-1").await;
-    let raw = parsed_fixture(&format!(
-        "backend s3 {{ bucket = \"state-bucket\" key = \"state.json\" auto_create = {auto_create} }}"
-    ));
-    let config = carina_state::BackendConfig::try_from(raw.backend.as_ref().unwrap()).unwrap();
     let backend = carina_state::s3_backend_for_test(
         aws_sdk_s3::Client::new(&sdk_config),
-        config.as_s3().unwrap(),
+        settings,
         "us-east-1".to_owned(),
     );
     (backend, requests)

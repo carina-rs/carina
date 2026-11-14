@@ -5754,15 +5754,7 @@ fn plan_s3_storage_bootstrap(
     if has_bucket_resource {
         return Ok(None);
     }
-    if !storage.settings().auto_create() {
-        let bucket = match storage.settings().bucket_diagnostic_literal() {
-            Some(bucket) => format!("'{bucket}'"),
-            None => "value from env()".to_string(),
-        };
-        return Err(AppError::Config(format!(
-            "Backend bucket {bucket} not found and auto_create is disabled"
-        )));
-    }
+    storage.check_auto_create()?;
     Ok(Some(storage))
 }
 
@@ -5805,6 +5797,61 @@ mod storage_readiness_tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn storage_readiness_auto_create_environment_diagnostic_and_precedence() {
+        let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([(
+            "STATE_BUCKET".into(),
+            "private-bucket-name".into(),
+        )]));
+        let mut parsed = carina_core::parser::parse_file(
+            "backend s3 { bucket = env('STATE_BUCKET') key = 'state.json' auto_create = false }",
+            Path::new("backend.crn"),
+            &context,
+        )
+        .unwrap();
+        carina_core::parser::resolve_resource_refs_with_config(&mut parsed, &context).unwrap();
+        let config =
+            carina_state::BackendConfig::try_from(parsed.backend.as_ref().unwrap()).unwrap();
+        let (backend, requests) =
+            crate::test_support::missing_s3_backend_with_settings(config.as_s3().unwrap()).await;
+        let StorageReadinessStatus::Provisionable(storage) =
+            backend.storage_readiness().await.unwrap().into_status()
+        else {
+            panic!("fixture bucket must be missing")
+        };
+
+        let policy_error = plan_s3_storage_bootstrap(storage.clone(), false, false).unwrap_err();
+        assert!(matches!(&policy_error, AppError::Config(_)));
+        assert_eq!(
+            policy_error.to_string(),
+            "Backend bucket value from env() not found and auto_create is disabled"
+        );
+        assert!(
+            plan_s3_storage_bootstrap(storage.clone(), true, false)
+                .unwrap()
+                .is_none()
+        );
+        for has_bucket_resource in [true, false] {
+            let error =
+                plan_s3_storage_bootstrap(storage.clone(), has_bucket_resource, true).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Locked backend recorded in carina-backend.lock no longer exists. \
+                 Restore the old state backend or revert backend.crn to match the lock before \
+                 planning this migration."
+            );
+        }
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            ["HEAD"]
+        );
     }
 
     #[tokio::test]

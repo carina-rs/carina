@@ -7,7 +7,7 @@ mod s3_winterbaume_tests;
 mod url;
 
 pub use local::LocalBackend;
-pub use s3::{S3Backend, S3Bootstrap, S3BootstrapInfo};
+pub use s3::{S3AutoCreate, S3AutoCreateDisabled, S3Backend, S3Bootstrap, S3BootstrapInfo};
 pub use url::{
     LocalStateFile, StateUrl, load_encoded_published_exports_from_url, load_local_state_file,
     load_state_from_url,
@@ -23,7 +23,7 @@ use crate::backend_selection::ConfiguredBackend;
 pub(crate) const S3_BACKEND_PROVIDER_NAME: &str = "aws";
 
 /// Resource type used to surface the state bucket in Carina state.
-pub const S3_BACKEND_RESOURCE_TYPE: &str = "s3.Bucket";
+pub(crate) const S3_BACKEND_RESOURCE_TYPE: &str = "s3.Bucket";
 
 /// Create the backend named by an opaque, operation-specific selection token.
 ///

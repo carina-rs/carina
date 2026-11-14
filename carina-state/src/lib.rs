@@ -89,12 +89,13 @@ pub use backend_lock::BackendLock;
 pub use backend_selection::{
     BackendConfigurationSource, BackendDrift, BackendDriftStatus, BackendSelection,
     BucketDeleteBackendSelection, BucketDeleteSelectionError, MigrationBackends,
-    MutationBackendSelection, ReadBackendOrigin, ReadBackendSelection, ResolvedReadBackend,
-    VerifiedMutationBackendSelection, inspect_backend_drift,
+    MutationBackendSelection, ProtectedBackendBucket, ReadBackendOrigin, ReadBackendSelection,
+    ResolvedReadBackend, VerifiedMutationBackendSelection, inspect_backend_drift,
 };
 pub use backends::{
-    LocalBackend, LocalStateFile, S3Bootstrap, S3BootstrapInfo, StateUrl, anchored_local_path,
-    load_encoded_published_exports_from_url, load_local_state_file, load_state_from_url,
+    LocalBackend, LocalStateFile, S3AutoCreate, S3AutoCreateDisabled, S3Bootstrap, S3BootstrapInfo,
+    StateUrl, anchored_local_path, load_encoded_published_exports_from_url, load_local_state_file,
+    load_state_from_url,
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use backends::{local_backend_for_test, s3_backend_for_test};
