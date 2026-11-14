@@ -2191,6 +2191,49 @@ pub fn resolve_modules_with_diagnostics_and_overrides<
     resolve_modules_with_diagnostics_and_resolver(parsed.parsed(), resolver, covered_findings)
 }
 
+/// Provider-value query result; this deliberately exposes no authored graph or
+/// conversion findings from the metadata parse's foreign NodeIds.
+pub enum ProviderMetadataResolution {
+    Expanded(Result<(), crate::parser::AnalysisResolutionError>),
+    Unavailable,
+}
+
+/// Finalize projected provider values using the editor's diagnostic expansion.
+/// Unlike operational expansion, this retains argument-dependent templates.
+/// The owning document run reports authored findings; this separate metadata
+/// query returns only its provider-finalization result.
+pub fn finalize_provider_metadata_with_module_overrides(
+    parsed: &ParsedRootDirectory,
+    base_dir: &ResolvedPath,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    schemas: &SchemaRegistry,
+    overrides: &crate::config_loader::SourceOverrides,
+) -> ProviderMetadataResolution {
+    let report = resolve_modules_with_diagnostics_and_overrides(
+        parsed,
+        base_dir,
+        config,
+        schemas,
+        &[],
+        overrides,
+    );
+    match report.outcome {
+        ModuleResolutionDiagnosticResult::Expanded { mut graph } => {
+            ProviderMetadataResolution::Expanded(
+                crate::parser::resolve_expanded_provider_unresolved_attributes_for_analysis(
+                    &mut graph,
+                    config.catalog(),
+                )
+                .and_then(|()| crate::parser::finalize_provider_configs_for_analysis(&mut graph)),
+            )
+        }
+        ModuleResolutionDiagnosticResult::ConstraintFailed { .. }
+        | ModuleResolutionDiagnosticResult::Unowned { .. } => {
+            ProviderMetadataResolution::Unavailable
+        }
+    }
+}
+
 /// Editor/bootstrap diagnostic expansion with provider-owned value checks
 /// unavailable by construction.
 pub fn resolve_modules_with_providerless_diagnostics<

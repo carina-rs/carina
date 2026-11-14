@@ -204,3 +204,102 @@ fn r16_reinstanced_omitted_sources_keep_the_twins_ordinary_gate() {
         );
     }
 }
+
+#[test]
+fn r18_provider_finalization_preserves_mains_forwarded_template_query() {
+    use carina_core::{
+        config_loader::SourceOverrides, module_resolver::ModuleResolutionDiagnosticResult,
+        paths::ResolvedPath,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("child");
+    std::fs::create_dir(&module).unwrap();
+    let root = "arguments { flag: Bool }\nlet child = use { source = './child' }\nlet instance = child { flag = flag }\nprovider awscc { default_tags = instance.tags }\n";
+    let child = "arguments { flag: Bool }\nlet optional = if flag { mock.test.Thing { value = 'present' } }\nattributes { tags = 'not a map' }\n";
+    std::fs::write(directory.path().join("main.crn"), root).unwrap();
+    std::fs::write(module.join("main.crn"), child).unwrap();
+    let document = create_document_at(root, directory.path().join("main.crn"));
+    let engine = test_engine();
+    let (old, actual, strict_error) = engine.with_run_for_test(|run| {
+        let base = ResolvedPath::new(directory.path()).unwrap();
+        let doc = document.for_diagnostics().unwrap();
+        let overrides = SourceOverrides::from([(doc.source_file().to_path_buf(), doc.text())]);
+        let parsed =
+            carina_core::config_loader::parse_directory_for_metadata_with_source_overrides_report(
+                &base,
+                run.provider_context.catalog(),
+                &overrides,
+                &run.schemas,
+            )
+            .unwrap();
+        let strict_error = carina_core::module_resolver::resolve_modules_with_config_and_overrides(
+            parsed.clone(),
+            &base,
+            run.provider_context,
+            &run.schemas,
+            &overrides,
+        )
+        .err()
+        .map(|error| error.to_string());
+        let mut validation =
+            carina_core::test_utils::conversion_validation::<std::convert::Infallible>();
+        let resolution =
+            carina_core::module_resolver::resolve_modules_with_diagnostics_and_overrides(
+                &parsed,
+                &base,
+                run.provider_context,
+                &run.schemas,
+                &[],
+                &overrides,
+            )
+            .into_validation(&mut validation);
+        let old = match resolution {
+            ModuleResolutionDiagnosticResult::Expanded { mut graph } => {
+                carina_core::parser::resolve_expanded_provider_unresolved_attributes_for_analysis(
+                    &mut graph,
+                    run.provider_context.catalog(),
+                )
+                .and_then(|()| {
+                    carina_core::parser::finalize_provider_configs_for_analysis(&mut graph)
+                })
+                .err()
+                .map(|error| error.to_string())
+            }
+            ModuleResolutionDiagnosticResult::ConstraintFailed { findings, errors } => panic!(
+                "unexpected constraints: {findings:?}, {} residual errors",
+                errors.len()
+            ),
+            ModuleResolutionDiagnosticResult::Unowned { errors } => panic!(
+                "unexpected resolution errors: {:?}",
+                errors
+                    .iter()
+                    .map(|error| error.display_relative_to(directory.path()))
+                    .collect::<Vec<_>>()
+            ),
+        };
+        assert!(validation.complete().into_presented().is_empty());
+        let actual = run
+            .finalize_provider_diagnostic(&doc, Some("main.crn"), &base)
+            .map(|error| error.to_string());
+        (old, actual, strict_error)
+    });
+    println!(
+        "R18-METADATA {}",
+        serde_json::json!({"root":root,"child":child,"main_query":old,"branch_query":actual,"strict_error":strict_error})
+    );
+    assert!(
+        strict_error
+            .as_deref()
+            .is_some_and(|error| error.contains("deferred module conditionals")),
+        "strict control: {strict_error:?}"
+    );
+    assert!(
+        old.as_deref()
+            .is_some_and(|error| error.contains("default_tags must resolve to a map")),
+        "main diagnostic control: {old:?}"
+    );
+    assert_eq!(
+        actual, old,
+        "metadata finalization must preserve main's diagnostic expansion"
+    );
+}

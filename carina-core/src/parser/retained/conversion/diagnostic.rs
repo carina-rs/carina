@@ -104,7 +104,6 @@ impl std::ops::DerefMut for ConversionError {
         std::sync::Arc::make_mut(&mut self.0)
     }
 }
-impl Eq for ConversionError {}
 impl std::fmt::Debug for ConversionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConversionError")

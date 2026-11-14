@@ -1089,26 +1089,17 @@ impl DiagnosticRun<'_> {
         // This is a projected provider-value query, not authored admission.
         // It returns only provider finalization errors and publishes no AST
         // findings from its deliberately separate metadata parse.
-        let module_resolution =
-            carina_core::module_resolver::resolve_modules_with_config_and_overrides(
-                merged.clone(),
-                base_path,
-                self.provider_context,
-                &self.schemas,
-                &overrides,
-            );
-        if let Ok(graph) = module_resolution {
-            let mut resolved = graph;
-            if let Err(error) =
-                carina_core::parser::resolve_expanded_provider_unresolved_attributes_for_analysis(
-                    &mut resolved,
-                    self.provider_context.catalog(),
-                )
-            {
-                return Some(error);
+        match carina_core::module_resolver::finalize_provider_metadata_with_module_overrides(
+            &merged,
+            base_path,
+            self.provider_context,
+            &self.schemas,
+            &overrides,
+        ) {
+            carina_core::module_resolver::ProviderMetadataResolution::Expanded(result) => {
+                return result.err();
             }
-            return carina_core::parser::finalize_provider_configs_for_analysis(&mut resolved)
-                .err();
+            carina_core::module_resolver::ProviderMetadataResolution::Unavailable => {}
         }
         let mut merged = merged.into_parsed();
         {

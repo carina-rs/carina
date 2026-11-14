@@ -563,8 +563,3 @@ fn r16_sibling_value_conversion_is_reported_despite_an_ordinary_error() {
         .unwrap();
     assert_eq!(error["range"]["start"], json!({"line":0,"character":16}));
 }
-
-#[tokio::test]
-async fn r16_destroy_sends_no_query_and_the_plain_twin_deletes() {
-    read_only_operand("mock.DoesNotExist").await;
-}

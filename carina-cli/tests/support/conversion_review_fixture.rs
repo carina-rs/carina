@@ -196,6 +196,50 @@ impl ProviderFactory for MeasuringFactory {
                 .validate()
                 .unwrap(),
         );
+        schemas.push(
+            ResourceSchema::new("AliasedQuery")
+                .as_data_source()
+                .attribute(
+                    AttributeSchema::optional(
+                        "rules",
+                        AttributeType::list(AttributeType::struct_(
+                            "Rule",
+                            vec![StructField::optional(
+                                "conditions",
+                                AttributeType::list(AttributeType::struct_(
+                                    "Condition",
+                                    vec![StructField::optional("name", named()).build()],
+                                )),
+                            )
+                            .with_block_name("condition")
+                            .build()],
+                        )),
+                    )
+                    .with_block_name("rule")
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        schemas.push(
+            ResourceSchema::new("StructUnionQuery")
+                .as_data_source()
+                .attribute(AttributeSchema::optional(
+                    "attr",
+                    AttributeType::union(vec![
+                        AttributeType::struct_(
+                            "A",
+                            vec![StructField::required("a", AttributeType::string()).build()],
+                        ),
+                        AttributeType::struct_(
+                            "B",
+                            vec![StructField::optional("b", named()).build()],
+                        ),
+                    ]),
+                ).build())
+                .validate()
+                .unwrap(),
+        );
         for (query, sink, destination) in [
             (
                 "AmbiguousQuery",

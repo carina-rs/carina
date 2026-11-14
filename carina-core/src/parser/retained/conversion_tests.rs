@@ -1035,3 +1035,75 @@ fn r7_declines_expand_shared_conversion_provenance_once_per_probe() {
         );
     }
 }
+
+#[test]
+fn r18_rejudging_rebuilds_conversion_records_while_remapping_keeps_their_findings() {
+    let catalog = crate::conversion::tests::catalog();
+    let mut schemas = crate::schema::SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        crate::schema::ResourceSchema::new("Sink")
+            .attribute(
+                crate::schema::AttributeSchema::optional(
+                    "target",
+                    crate::schema::AttributeType::refined_string(
+                        Some(crate::schema::TypeIdentity::from_dotted("mock.Name")),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let mut parsed = super::super::parse_file(
+        "mock.Sink { target = 7 as mock.Name }",
+        Path::new("rejudge.crn"),
+        &catalog,
+    )
+    .unwrap();
+    judge_configuration(&mut parsed, &schemas, &catalog);
+    let first = parsed.expression_report().clone();
+    assert_eq!(first.placements.findings().len(), 1);
+    // Binding remapping shares judged data only together with its placements.
+    let remapped = first.map_bindings(&mut |binding| binding);
+    assert_eq!(remapped.placements.findings().len(), 1);
+    let records = |report: &ExpressionReport| {
+        report
+            .syntax_nodes
+            .iter()
+            .filter_map(|((instance, id), node)| {
+                if matches!(node.kind, ExprKind::Convert { .. }) {
+                    Some(std::ptr::from_ref(
+                        report
+                            .node(instance, *id)
+                            .unwrap()
+                            .conversion_type_judgement()
+                            .unwrap(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = records(&first);
+    assert_eq!(before.len(), 1);
+    assert_eq!(records(&remapped), before);
+    // The old Arc remains alive while a new pass replaces its report. A latch
+    // on that old record cannot mute the new pass's independent placements.
+    judge_configuration(&mut parsed, &schemas, &catalog);
+    let second = parsed.expression_report();
+    let after = records(second);
+    assert_eq!(after.len(), 1);
+    assert_ne!(before, after);
+    let findings = ConversionValidation::<std::convert::Infallible>::new(second)
+        .complete()
+        .into_presented();
+    assert_eq!(
+        crate::conversion::tests::conversion_errors(&findings).len(),
+        1
+    );
+}

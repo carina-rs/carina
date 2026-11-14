@@ -3777,9 +3777,16 @@ mod judgement {
                 ExprJudgement::Typed { ty, .. } => Some(ty),
                 ExprJudgement::Rejected { source, .. } => match source.as_ref() {
                     ExprJudgement::Typed { ty, .. } => Some(ty),
-                    _ => None,
+                    ExprJudgement::Rejected { .. }
+                    | ExprJudgement::Failed { .. }
+                    | ExprJudgement::ValueDependent { .. }
+                    | ExprJudgement::AuthorityUnavailable(_)
+                    | ExprJudgement::Declaration => None,
                 },
-                _ => None,
+                ExprJudgement::Failed { .. }
+                | ExprJudgement::ValueDependent { .. }
+                | ExprJudgement::AuthorityUnavailable(_)
+                | ExprJudgement::Declaration => None,
             }
         }
         fn is_enum_identifier(&self) -> bool {

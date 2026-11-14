@@ -354,15 +354,16 @@ mod tests {
             &config,
         )
         .unwrap_err();
+        let InferenceError::TypeResolution { error: cause } = &error else {
+            panic!("expected typed type-resolution cause: {error:?}");
+        };
         assert!(
-            error
-                .source()
-                .and_then(
-                    |cause| cause.downcast_ref::<crate::static_type::StaticTypeResolutionError>()
-                )
-                .is_some(),
-            "{error:?}"
+            matches!(cause, crate::static_type::StaticTypeResolutionError::UnknownCustomType { name } if name == "absent.Type")
         );
+        assert_eq!(error.to_string(), cause.to_string());
+        // Transparent adapters keep the typed payload and forward its source
+        // chain; they add no context or duplicate terminal cause layer.
+        assert!(error.source().is_none());
     }
 
     #[test]
@@ -377,13 +378,13 @@ mod tests {
             .child(Some(&declaration), StaticChild::List)
             .unwrap_err();
         match error {
-            JudgeSourceError::Ordinary(error) => assert!(
-                error
-                    .source()
-                    .and_then(|cause| cause.downcast_ref::<Box<crate::schema::TypeError>>())
-                    .is_some(),
-                "{error:?}"
-            ),
+            JudgeSourceError::Ordinary(error) => {
+                let InferenceError::SchemaResolution { error: cause } = &error else {
+                    panic!("expected typed schema-resolution cause: {error:?}");
+                };
+                assert_eq!(error.to_string(), cause.to_string());
+                assert!(error.source().is_none());
+            }
             JudgeSourceError::Conversion => {
                 panic!("ordinary schema lookup must not be conversion finding")
             }

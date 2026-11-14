@@ -47,9 +47,11 @@ pub(crate) use resolver::{
 };
 pub use resolver::{
     ConstraintScopeReport, ModuleCallConstraintReport, ModuleCallConstraintReports,
-    ModuleResolutionDiagnosticResult, ModuleResolutionReport, ResidualModuleResolutionDiagnostic,
-    ResidualModuleResolutionError, ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
-    ResolvedModuleConstraintStatus, ensure_expanded_root_graph, prepare_root_export_validation,
+    ModuleResolutionDiagnosticResult, ModuleResolutionReport, ProviderMetadataResolution,
+    ResidualModuleResolutionDiagnostic, ResidualModuleResolutionError,
+    ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
+    ResolvedModuleConstraintStatus, ensure_expanded_root_graph,
+    finalize_provider_metadata_with_module_overrides, prepare_root_export_validation,
     resolve_module_template_with_config, resolve_module_template_with_providerless_config,
     resolve_modules_providerless, resolve_modules_with_config,
     resolve_modules_with_config_and_overrides, resolve_modules_with_diagnostics,
