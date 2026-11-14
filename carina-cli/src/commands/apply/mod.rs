@@ -1015,6 +1015,7 @@ fn diff_upstream_snapshot(
     current: &AdmittedRemoteBindings,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), String> {
+    #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
     for (binding, planned_attrs) in snapshot {
         match current.get(binding) {
             None => {
@@ -1031,6 +1032,7 @@ fn diff_upstream_snapshot(
             Some(_) => {}
         }
     }
+    #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
     for binding in current.keys() {
         if !snapshot.contains_key(binding) {
             return Err(format!(

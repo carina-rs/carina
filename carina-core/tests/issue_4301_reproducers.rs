@@ -505,7 +505,7 @@ fn r5_metadata_discovery_leaves_unconsumed_secret_backend_deferred() {
         carina_core::config_loader::parse_directory_for_metadata(
             &path,
             &context,
-            &std::collections::HashMap::new(),
+            &indexmap::IndexMap::new(),
             &schemas
         )
         .unwrap()

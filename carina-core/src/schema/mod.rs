@@ -4150,7 +4150,7 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     /// annotations, module/export boundaries and function signatures use identified
     /// refinements or unconstrained scalars. Resolved resource/data-source inputs
     /// pass through `admit_apply_resource`/`admit_apply_data_source`; provider/backend
-    /// configuration enters `admit()` through `validation/admission/configuration/`.
+    /// configuration has its own field admission in `validation/admission/configuration/`.
     /// These checks validate the full destination declaration before dispatch,
     /// preserving #2218's safety without static containment. Function parameters/returns also
     /// have runtime constraint checks; backend schemas have no anonymous refinements.
@@ -14925,6 +14925,8 @@ fn builtin_identified_declarations()
         OnceLock::new();
     DECLARATIONS.get_or_init(|| {
         let mut declarations = HashMap::new();
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: fixed consistent builtin declarations have no competing definitions
         for builtin in builtin_type_registry().values() {
             visit_identified_declarations(builtin, (), &mut |declaration, ()| {
                 declarations.insert(declaration.identity().clone(), declaration);
@@ -14990,6 +14992,8 @@ pub fn builtin_validator_registry()
         OnceLock::new();
     REGISTRY.get_or_init(|| {
         let mut validators = HashMap::new();
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: builtin validators have unique scalar identities
         for attr_type in builtin_type_registry().values() {
             let (kind, binding) = match &attr_type.kind {
                 AttrTypeKind::UnloadedSchemaType(_) => {
@@ -15781,8 +15785,8 @@ impl std::ops::Deref for OwnerBoundResourceSchema<'_> {
 /// See `notes/specs/2026-05-02-resource-vs-data-source-design.md` (Decision 1-2).
 #[derive(Debug, Clone, Default)]
 pub struct SchemaRegistry {
-    managed: HashMap<(SchemaTypeOwner, String), ValidatedResourceSchema>,
-    data_sources: HashMap<(SchemaTypeOwner, String), ValidatedResourceSchema>,
+    managed: BTreeMap<(SchemaTypeOwner, String), ValidatedResourceSchema>,
+    data_sources: BTreeMap<(SchemaTypeOwner, String), ValidatedResourceSchema>,
     reference_forms: BTreeMap<String, ReferenceForms>,
     witness_backed_reference_forms: HashSet<String>,
     assignability_closures: BTreeMap<SchemaTypeOwner, AssignabilityClosure>,

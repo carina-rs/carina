@@ -8,7 +8,7 @@
 
 use crate::resource::ResolvedResourceId;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::detail_rows::DetailRow;
 use crate::effect::Effect;
@@ -157,7 +157,7 @@ pub fn render_deferred_for_template_value<P: crate::resource::ValueKind>(
 pub struct DependencyGraph {
     pub binding_to_effect: HashMap<crate::resource::AbsoluteBindingAddress, usize>,
     pub id_to_effect: HashMap<ResolvedResourceId, usize>,
-    pub effect_deps: HashMap<usize, crate::resource::ResolvedDependencies>,
+    pub effect_deps: BTreeMap<usize, crate::resource::ResolvedDependencies>,
     pub effect_bindings: HashMap<usize, String>,
     pub effect_types: HashMap<usize, String>,
 }
@@ -263,7 +263,7 @@ where
     let mut graph = DependencyGraph {
         binding_to_effect: HashMap::new(),
         id_to_effect: HashMap::new(),
-        effect_deps: HashMap::new(),
+        effect_deps: BTreeMap::new(),
         effect_bindings: HashMap::new(),
         effect_types: HashMap::new(),
     };
@@ -371,6 +371,8 @@ where
     // Index all producers before resolving value references so declaration
     // order cannot drop an edge. The result has one complete-ID representation
     // for the CLI, TUI, and plan-image consumers.
+    #[allow(clippy::iter_over_hash_type)]
+    // keyed rebuild: each effect independently unions its dependency BTreeSet
     for (index, references) in value_references {
         graph
             .effect_deps
@@ -449,7 +451,7 @@ pub fn build_single_parent_tree<S, V: crate::resource::PlanValueKind>(
     // Step 3: Nest no-dep resources under their first dependent (Issue #928)
     // A no-dep resource can be nested only if every dependent has at least one
     // other dependency in the plan (besides this resource).
-    let mut nested_under_dependent: HashSet<usize> = HashSet::new();
+    let mut nested_under_dependent: BTreeSet<usize> = BTreeSet::new();
     for &idx in &initial_roots {
         let mut children = all_dependents.get(&idx).cloned().unwrap_or_default();
         children.sort_by(compare_effects);
@@ -544,6 +546,7 @@ pub fn build_single_parent_tree<S, V: crate::resource::PlanValueKind>(
     }
 
     // Step 7: Sort each parent's children by the total effect order.
+    #[allow(clippy::iter_over_hash_type)] // keyed rebuild: child buckets are independently sorted
     for children in dependents.values_mut() {
         children.sort_by(compare_effects);
     }

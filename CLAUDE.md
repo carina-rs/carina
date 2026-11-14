@@ -727,8 +727,11 @@ A struct type represents a nested object with typed fields.
   `NeedsLocal` exists only in the admission-facing reference relation, requiring
   a `ReferenceCandidate`; it cannot convert back into general type compatibility.
   Resource/data-source final inputs use `admit_apply_resource` and
-  `admit_apply_data_source`. Provider/backend configuration enters `admit()` through
-  `validation/admission/configuration/`, including compact-list callbacks.
+  `admit_apply_data_source`. Provider/backend configuration has its own field admission
+  in `validation/admission/configuration/`, including compact-list callbacks.
+  `ConfigurationKind` destinations carry a `ConfigurationContract` with no resource
+  lookup; configuration kinds cannot name `PendingAdmission` and cannot be passed
+  to `admit` or `discharge`.
   Complete admissions own the canonical payload and placements; analysis cannot
   authorize construction. Undeclared keys are rejected before value checks or
   factory validation, using resource unknown-attribute suggestions. The payload

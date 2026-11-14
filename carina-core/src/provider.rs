@@ -16293,6 +16293,8 @@ mod tests {
                 Box::pin(async move {
                     for (id, saved_attrs) in saved {
                         if let Some(state) = states.get_mut(id) {
+                            #[allow(clippy::iter_over_hash_type)]
+                            // keyed rebuild: test hydration fills distinct missing saved attribute keys
                             for (key, value) in saved_attrs {
                                 state
                                     .attributes

@@ -629,6 +629,7 @@ fn carry_struct_fields<R: ReferenceEquality>(
     };
     let mut pending_removal = false;
 
+    #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
     for (key, prior_child) in prior_children {
         match (desired_fields.get(key), fresh_fields.get(key)) {
             (Some(desired_child), Some(fresh_child)) => {
@@ -1030,6 +1031,8 @@ fn collect_authored_paths(
         }
         ExplicitFields::Struct { children } => {
             let before = paths.len();
+            #[allow(clippy::iter_over_hash_type)]
+            // keyed rebuild: authored paths accumulate in a BTreeSet without comparison callbacks
             for (key, child) in children {
                 if matches!(child, ExplicitFields::Unrecorded) {
                     continue;
@@ -1301,6 +1304,8 @@ pub fn merge(a: ExplicitFields, b: ExplicitFields) -> ExplicitFields {
                 children: b_children,
             },
         ) => {
+            #[allow(clippy::iter_over_hash_type)]
+            // keyed rebuild: distinct children merge with fixed left/right precedence
             for (k, v) in b_children {
                 let merged = match a_children.remove(&k) {
                     Some(existing) => merge(existing, v),
@@ -1412,6 +1417,8 @@ fn widen_authoring(
         match (prior, desired) {
             (ExplicitFields::Struct { children }, ExplicitFields::Struct { children: desired }) => {
                 let mut children = children.clone();
+                #[allow(clippy::iter_over_hash_type)]
+                // keyed rebuild: distinct desired children widen independently
                 for (key, desired) in desired {
                     let effective = match children.remove(&key) {
                         Some(prior) => widen(&prior, desired),
@@ -2008,6 +2015,8 @@ fn project_value_inner<R: ReferenceEquality>(
                     defs,
                     comparison,
                 );
+                #[allow(clippy::iter_over_hash_type)]
+                // keyed rebuild: injective child-prefix replacement preserves distinct origin keys
                 for (path, origin) in projected.origins {
                     let suffix = path
                         .strip_prefix(&paths[0])

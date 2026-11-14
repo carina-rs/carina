@@ -18601,6 +18601,8 @@ fn round11_builtin_matching_requires_a_shared_callback() {
         !same_builtin_declaration(&declarations[0], &declarations[0]),
         "absence of both callbacks is not pointer identity"
     );
+    #[allow(clippy::iter_over_hash_type)]
+    // commutative: builtin callback assertions are independent per declaration
     for builtin in builtin_identified_declarations().values() {
         let IdentityDefinition::Scalar(parts) = builtin.definition() else {
             panic!("canonical builtins must have scalar definitions");

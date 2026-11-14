@@ -5232,7 +5232,9 @@ fn build_plan_file_contents<E>(
         .map(|resource| (resource.id.clone(), resource.as_inner().clone()))
         .collect();
     let provider_configs = SavedProviderConfigs::from(provider_configs).redact_secrets()?;
+    #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
     for (binding, attributes) in &ctx.upstream_snapshot {
+        #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
         for (key, value) in attributes.iter() {
             // Export validation rejects secret-valued exports before an
             // upstream state snapshot can be produced. Keep this guard for
@@ -6486,6 +6488,8 @@ pub(crate) fn check_exports_pre_apply<D>(
                 let mut secret_aware_current = input.managed_current.clone();
                 if let Some(state_file) = input.state_file {
                     let moved_origins = MovedOrigins::from_plan(input.plan);
+                    #[allow(clippy::iter_over_hash_type)]
+                    // keyed rebuild: secret masking operates independently per resource
                     for (id, current) in &mut secret_aware_current {
                         let Some(persisted) = moved_origins.find_persisted_row(state_file, id)
                         else {
@@ -6495,6 +6499,8 @@ pub(crate) fn check_exports_pre_apply<D>(
                         if let (Some(persisted_attributes), Some(attributes)) =
                             (persisted_attributes, current.attributes_mut())
                         {
+                            #[allow(clippy::iter_over_hash_type)]
+                            // keyed rebuild: each attribute uses its own persisted secret shape without fallible callbacks
                             for (key, value) in attributes {
                                 *value =
                                     carina_core::value::mask_plaintext_using_persisted_attribute(
@@ -6614,6 +6620,8 @@ pub fn compute_export_diffs(
     }
 
     // Removed: exports in state but not in desired params
+    #[allow(clippy::iter_over_hash_type)]
+    // sorted immediately after: export changes are sorted by unique export name
     for (name, old) in current_exports {
         if !seen.contains(name) {
             changes.push(ExportChange::Removed {

@@ -12,12 +12,27 @@ use crate::parser::ConfigurationAttributes;
 use crate::provider::{ProviderInstanceKey, ProviderWireTarget, WireAttributes, WireReady};
 use crate::schema::{ValidatedConfigSchema, ValidatedCustomTypeLookup};
 
+mod contract {
+    #[derive(Debug, Clone)]
+    pub struct ConfigurationContract {
+        pub(super) schema: std::sync::Arc<crate::schema::ValidatedConfigSchema>,
+        pub(super) attribute: String,
+    }
+}
+pub(super) use self::contract::ConfigurationContract;
+
+impl ConfigurationContract {
+    fn attr(&self) -> &CompiledAttributeType {
+        &self.schema.parts()[&self.attribute]
+    }
+}
+
 pub mod backend;
 pub mod provider;
 
 /// The two sealed configuration destinations and their exact payloads.
 /// Backend settings do not acquire a provider transport or provider identity.
-pub trait ConfigurationKind: DestinationKind {
+pub trait ConfigurationKind: DestinationKind<Contract = Box<ConfigurationContract>> {
     type Payload: std::fmt::Debug + Clone;
     type Instance: std::fmt::Debug + Clone + PartialEq;
     #[doc(hidden)]
@@ -102,84 +117,75 @@ impl ConfigurationDeclaration {
                     revision,
                 }),
                 label: key.to_string(),
-                contract: Some(Box::new(DestinationContract {
-                    schema: ContractSchema::Configuration(Arc::clone(&self.schema)),
+                contract: Box::new(ConfigurationContract {
+                    schema: Arc::clone(&self.schema),
                     attribute: name.clone(),
-                    owner: self.owner.clone(),
-                    ancestry: FieldAncestry::WRITABLE,
-                    path: LeafPath::from_segments([]),
-                })),
+                }),
                 kind: PhantomData,
             },
         })
     }
 }
 
-/// Configuration is a concrete-value boundary, not a resource assignment.
-/// It uses the same declaration walk with final-input callback policy, including
-/// compact lists. Resource authored/reference policy remains with its owner.
-pub(super) fn admit_field<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
+/// Configuration is a concrete-value boundary. Unresolved sites are returned
+/// to the configuration caller; resource discharge is never available here.
+#[derive(Debug)]
+enum ConfigurationAdmission<K: ConfigurationKind, P: PlaceholderKind, B: BindingAddress> {
+    Ready(PlacedValue<K, P, B>),
+    Unresolved(Vec<PendingSite<B>>),
+}
+
+/// Validates one configuration field against its declaration; unresolved sites
+/// are returned instead of being held as a pending obligation.
+fn admit_field<K: ConfigurationKind, P: PlaceholderKind, B: BindingAddress>(
     destination: &Destination<K>,
-    candidate: Candidate<P, B>,
-    context: &AdmissionContext<'_, P, B>,
+    value: &Value<P, B>,
+    proof: crate::resource::knowledge::Classification<'_, P, B>,
     lookup: &dyn ValidatedCustomTypeLookup,
-) -> Result<Admission<K, P, B>, AdmissionErrors> {
-    let contract = destination
-        .contract
-        .as_ref()
-        .expect("configuration destination contract");
-    let AdmissionProof::Validation(proof) = &context.proof else {
-        unreachable!("configuration context is constructed from one classification")
-    };
+) -> Result<ConfigurationAdmission<K, P, B>, ConfigurationErrors> {
     let checked = crate::schema::value_validation::validate_final_provider_value(
-        contract.attr(),
-        proof,
-        contract.defs(),
-        contract.ancestry,
+        destination.contract.attr(),
+        &proof,
+        crate::schema::empty_defs_for_schema_walks(),
+        FieldAncestry::WRITABLE,
         lookup,
     );
     // Keep rootless configuration's established primary-local-error policy.
-    let findings = match checked.local_error() {
-        Some(error) => vec![AdmissionFinding {
-            path: contract.path.clone(),
-            error: error.clone(),
-        }],
+    let errors: Vec<_> = match checked.local_error() {
+        Some(error) => vec![error.clone()],
         None => checked
             .clone()
             .into_located()
             .into_iter()
-            .map(|(path, error)| AdmissionFinding { path, error })
+            .map(|(_, error)| error)
             .collect(),
     };
-    if !findings.is_empty() {
-        let mut error = constraints(findings);
-        error.findings = Some(Box::new(checked));
-        return Err(error);
+    if !errors.is_empty() {
+        return Err(ConfigurationErrors {
+            errors: errors
+                .into_iter()
+                .map(|error| match error {
+                    TypeError::ResourceValidationFailed { message, .. } => {
+                        TypeError::ValidationFailed { message }
+                    }
+                    error => error,
+                })
+                .collect(),
+        });
     }
-    let sites = context.sites();
+    let sites: Vec<_> = proof.sites().collect();
     if sites.is_empty() {
-        Ok(Admission::Ready(PlacedValue::admitted(
+        Ok(ConfigurationAdmission::Ready(PlacedValue::admitted(
             destination,
-            candidate.value,
+            value.clone(),
             checked,
         )))
     } else {
-        // Knownness is the outstanding work; discharge always re-enters this
-        // destination's full declaration with the newly known value.
-        Ok(Admission::Pending(PendingAdmission {
-            destination: destination.clone(),
-            inner: Box::new(PendingCandidate {
-                candidate,
-                findings: checked,
-                assignment: AssignmentVerdict::NeedsSchema(SchemaObligation::default()),
-                sites,
-            }),
-        }))
+        Ok(ConfigurationAdmission::Unresolved(sites))
     }
 }
 
-/// Configuration classification failures keep their schema error category.
-/// Admission failures retain the findings minted by this configuration owner.
+/// Configuration classification and validation retain their schema categories.
 #[derive(Debug)]
 struct ConfigurationErrors {
     errors: Vec<TypeError>,
@@ -191,50 +197,21 @@ impl<B: BindingAddress> From<KnowledgeError<B>> for ConfigurationErrors {
         }
     }
 }
-impl From<AdmissionErrors> for ConfigurationErrors {
-    fn from(mut error: AdmissionErrors) -> Self {
-        let findings = error
-            .take_findings()
-            .expect("configuration admission retains its findings");
-        let errors: Vec<_> = match findings.local_error() {
-            Some(error) => vec![error.clone()],
-            None => findings
-                .into_located()
-                .into_iter()
-                .map(|(_, error)| error)
-                .collect(),
-        };
-        Self {
-            errors: errors
-                .into_iter()
-                .map(|error| match error {
-                    TypeError::ResourceValidationFailed { message, .. } => {
-                        TypeError::ValidationFailed { message }
-                    }
-                    error => error,
-                })
-                .collect(),
-        }
-    }
-}
 
 fn field<K: ConfigurationKind, P: PlaceholderKind, B: BindingAddress>(
     destination: &Destination<K>,
     value: &Value<P, B>,
-    session: &dyn ProviderTypeCheckContext,
     lookup: &dyn ValidatedCustomTypeLookup,
-) -> Result<Admission<K, P, B>, ConfigurationErrors> {
+) -> Result<ConfigurationAdmission<K, P, B>, ConfigurationErrors> {
     let proof = value
         .knowledge(&KnowledgeContext::validation())?
         .into_classification();
-    let (candidate, context) = Candidate::configuration(value, session, lookup, proof);
-    admit(destination, candidate, &context).map_err(Into::into)
+    admit_field(destination, value, proof, lookup)
 }
 
 fn complete_field<K: ConfigurationKind, P: PlaceholderKind, B: BindingAddress>(
     destination: &Destination<K>,
     value: &Value<P, B>,
-    session: &dyn ProviderTypeCheckContext,
     lookup: &dyn ValidatedCustomTypeLookup,
 ) -> Result<PlacedValue<K, P, B>, ConfigurationErrors> {
     let proof = value.knowledge(&KnowledgeContext::apply(&ResolvedBindings::default()))?;
@@ -248,17 +225,15 @@ fn complete_field<K: ConfigurationKind, P: PlaceholderKind, B: BindingAddress>(
         | KnowledgeError::UnavailableHistoricalSecret(_)
         | KnowledgeError::UnresolvedAtBoundary { .. }) => error,
     })?;
-    let (candidate, context) = Candidate::configuration(
+    match admit_field(
+        destination,
         value,
-        session,
-        lookup,
         crate::resource::knowledge::Classification::Known(known),
-    );
-    match admit(destination, candidate, &context)? {
-        Admission::Ready(placed) => Ok(placed),
-        Admission::Pending(pending) => Err(KnowledgeError::<B>::UnresolvedAtBoundary {
-            sites: pending.inner.sites,
+        lookup,
+    )? {
+        ConfigurationAdmission::Ready(placed) => Ok(placed),
+        ConfigurationAdmission::Unresolved(sites) => {
+            Err(KnowledgeError::<B>::UnresolvedAtBoundary { sites }.into())
         }
-        .into()),
     }
 }

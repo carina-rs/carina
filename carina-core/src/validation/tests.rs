@@ -2147,6 +2147,8 @@ fn unloaded_schema_nominals_defer_values_and_resolve_when_catalog_loads() {
 
 #[test]
 fn lift_type_expr_preserves_every_builtin_scalar_kind() {
+    #[allow(clippy::iter_over_hash_type)]
+    // commutative: builtin scalar-kind assertions are independent per identity
     for (kind, identity) in crate::schema::builtin_validator_registry().keys() {
         let expr =
             crate::parser::bare_type_for_test(crate::parser::pascal_to_snake(&identity.kind));

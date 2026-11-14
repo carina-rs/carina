@@ -2,6 +2,8 @@
 //!
 //! Core library for an infrastructure management tool that treats side effects as values
 
+#![deny(clippy::iter_over_hash_type)]
+
 #[cfg(all(feature = "provider-host", target_arch = "wasm32"))]
 compile_error!(
     "carina-core host plumbing is not available to wasm32 guest providers; remove the `provider-host` feature from guest dependencies"

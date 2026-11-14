@@ -668,7 +668,11 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
     ) -> Result<Self, ReplacementAdmissionError> {
         let mut effects = effects.to_vec();
         let mut lineage = ReplacementLineage::default();
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: replacement source memberships are unioned by target
         for (target, sources) in associations {
+            #[allow(clippy::iter_over_hash_type)]
+            // keyed rebuild: lineage membership union is idempotent
             for source in sources {
                 lineage.associate(target, source);
             }
@@ -1360,6 +1364,8 @@ impl ReplacementScheduling {
         effects: &[impl AsRef<Effect<S, P>>],
         deps: &mut HashMap<usize, HashSet<usize>>,
     ) -> HashSet<(usize, usize)> {
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: each gate independently unions its prerequisite set
         for (&delete, gates) in &self.gate_barriers {
             deps.entry(delete).or_default().extend(gates);
         }
@@ -1777,6 +1783,8 @@ mod tests {
                     );
                     let graph = admitted.dependency_analysis(std::iter::empty()).unwrap();
                     let edges = graph.into_deps_of();
+                    #[allow(clippy::iter_over_hash_type)]
+                    // commutative: cycle assertions are independent per dependency edge
                     for (&node, dependencies) in &edges {
                         assert!(!dependencies.iter().any(|dependency| dependency_reaches(
                             &edges,
