@@ -126,7 +126,7 @@ fn fixture_in<R>(
     f(catalog, &schemas, &bindings, &destination)
 }
 
-fn validate<K: DestinationKind>(
+fn validate<K: AssignmentKind>(
     destination: &Destination<K>,
     value: &Value,
     bindings: &BindingIndex<'_, AbsoluteBindingAddress>,
@@ -166,9 +166,7 @@ fn destination_contracts_share_the_registered_schema_allocation() {
             .unwrap();
         for destination in [&destination, &destination.clone()] {
             let contract = destination.contract.as_deref().unwrap();
-            let ContractSchema::Resource(schema) = &contract.schema else {
-                panic!("resource destination")
-            };
+            let schema = &contract.schema;
             assert!(std::ptr::eq(
                 schema.as_ref(),
                 registered.schema().as_schema()
@@ -319,15 +317,13 @@ fn ambiguous_union_rejects_reference_fitting_no_member_and_checks_existence() {
 fn ambiguous_union_checks_no_member_and_all_members_for_every_kind() {
     ambiguous_union_checks_members::<kind::ResourceAttribute>();
     ambiguous_union_checks_members::<kind::DataSourceAttribute>();
-    ambiguous_union_checks_members::<kind::ProviderConfigAttribute>();
-    ambiguous_union_checks_members::<kind::BackendAttribute>();
     ambiguous_union_checks_members::<kind::ModuleArgument>();
     ambiguous_union_checks_members::<kind::AnnotatedAttribute>();
     ambiguous_union_checks_members::<kind::Export>();
     ambiguous_union_checks_members::<kind::UpstreamExport>();
 }
 
-fn ambiguous_union_checks_members<K: DestinationKind + std::fmt::Debug>() {
+fn ambiguous_union_checks_members<K: AssignmentKind + std::fmt::Debug>() {
     for (source, accepted) in [
         (AttributeType::int(), false),
         (AttributeType::string(), true),
@@ -1431,8 +1427,8 @@ fn candidate_cannot_use_another_candidates_boundary_proof() {
 }
 
 #[test]
-fn pending_is_holdable_and_discharged_for_every_unmigrated_kind() {
-    fn check<K: DestinationKind + std::fmt::Debug>(
+fn pending_is_holdable_and_discharged_for_every_assignment_kind() {
+    fn check<K: AssignmentKind + std::fmt::Debug>(
         destination: &Destination<kind::ResourceAttribute>,
         bindings: &BindingIndex<'_, AbsoluteBindingAddress>,
         session: &dyn ProviderTypeCheckContext,
@@ -1464,8 +1460,8 @@ fn pending_is_holdable_and_discharged_for_every_unmigrated_kind() {
         AttributeType::string(),
         |catalog, _, bindings, destination| {
             with_session_for_test(catalog, |session| {
-                check::<kind::ProviderConfigAttribute>(destination, bindings, session);
-                check::<kind::BackendAttribute>(destination, bindings, session);
+                check::<kind::ResourceAttribute>(destination, bindings, session);
+                check::<kind::DataSourceAttribute>(destination, bindings, session);
                 check::<kind::ModuleArgument>(destination, bindings, session);
                 check::<kind::AnnotatedAttribute>(destination, bindings, session);
                 check::<kind::Export>(destination, bindings, session);
@@ -2666,7 +2662,7 @@ mod identity_member_obligations {
 }
 
 #[test]
-fn every_destination_kind_retains_the_same_member_obligation() {
+fn every_assignment_kind_retains_the_same_member_obligation() {
     use crate::schema::{PatternMatch, PatternSpec, StringIdentityLayer, StringMemberConstraints};
     let ty = |member| {
         AttributeType::string_member(
@@ -2684,7 +2680,7 @@ fn every_destination_kind_retains_the_same_member_obligation() {
             Some((Some(3), Some(6))),
         )),
         |catalog, _, bindings, resource| {
-            fn check<K: DestinationKind>(
+            fn check<K: AssignmentKind>(
                 resource: &Destination<kind::ResourceAttribute>,
                 bindings: &BindingIndex<'_, AbsoluteBindingAddress>,
                 session: &dyn ProviderTypeCheckContext,
@@ -2729,8 +2725,6 @@ fn every_destination_kind_retains_the_same_member_obligation() {
             with_session_for_test(catalog, |session| {
                 check::<kind::ResourceAttribute>(resource, bindings, session);
                 check::<kind::DataSourceAttribute>(resource, bindings, session);
-                check::<kind::ProviderConfigAttribute>(resource, bindings, session);
-                check::<kind::BackendAttribute>(resource, bindings, session);
                 check::<kind::ModuleArgument>(resource, bindings, session);
                 check::<kind::AnnotatedAttribute>(resource, bindings, session);
                 check::<kind::Export>(resource, bindings, session);

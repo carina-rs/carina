@@ -139,14 +139,7 @@ fn backend_receipts_keep_the_declaration_field_instance_and_revision() {
     for placed in admitted.placements().values() {
         assert_eq!(
             placed.value(),
-            &admitted.attributes()[placed
-                .inner
-                .destination
-                .contract
-                .as_ref()
-                .unwrap()
-                .attribute
-                .as_str()]
+            &admitted.attributes()[placed.inner.destination.contract.attribute.as_str()]
         );
     }
     let placed = admitted.placements().values().next().unwrap().clone();

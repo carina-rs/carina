@@ -136,7 +136,9 @@ Every typed destination uses one String/Int identity rule: same identity
 or an allowed structural/provider widening. This includes binding/export
 annotations, map/list element annotations, module arguments, and user-function
 parameters and returns. Destination member constraints remain resolved-value
-obligations; every destination kind supports the existing `NeedsLocal` path.
+obligations; every assignment destination kind supports the existing `NeedsLocal`
+path. Provider and backend configuration validate concrete values at their own
+field boundary and cannot hold a pending obligation.
 Same-identity value admission, including admission with a declared source,
 defers overlapping identity bounds through `NeedsLocal`; provably disjoint bounds
 reject statically. Different-identity widening retains String length / Int range
