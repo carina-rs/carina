@@ -361,8 +361,11 @@ fn lsp_findings(
         SchemaRegistry::new(),
         carina_core::EnvironmentSnapshot::empty(),
     );
-    let engine =
-        carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+    let engine = carina_lsp::test_support::Diagnostics::new(
+        directory,
+        Arc::new(loaded),
+        vec!["mock".into()],
+    );
     generated
         .files
         .iter()

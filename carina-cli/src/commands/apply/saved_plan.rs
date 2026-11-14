@@ -5,7 +5,8 @@ use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::differ::{Orphan, Orphans, restore_current_move_source};
 use carina_core::input_rules::{InputAdmissionFailure, InputCheckedPlan, InputTypeContext};
 use carina_core::parser::{
-    ExpandedInferredExportParam as InferredExportParam, SavedProviderConfigs,
+    ExpandedInferredExportParam as InferredExportParam, ProviderContext, ResolvedProviderConfigs,
+    SavedProviderConfigs,
 };
 type ExecutableSavedPlan = carina_core::saved_replay::AdmittedSavedPlanReplay;
 use carina_core::provider::{HostProvider, PersistedAttributes, ProviderRouter, ReadRequest};
@@ -17,9 +18,11 @@ use carina_state::{RefreshRows, RefreshableCurrent, ResourceState, StateFile};
 
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
-    DecodedPlanFile, MovedOrigins, PlanSchemaReferences, PlanWaitBinding, RecordedProviderArtifact,
-    RecordedProviderScopes, ReloadedCurrentStateEntry, ReloadedPlanFile, ResolvedProviderInputs,
-    SavedPlanResource, UnresolvedReloadedPlanFile, UpstreamSource, recorded_provider_artifacts,
+    DecodedPlanFile, MovedOrigins, PlanSchemaReferences, PlanWaitBinding, PreparedPlanIdentityData,
+    RecordedProviderArtifact, RecordedProviderScopes, ReloadedCurrentStateEntry, ReloadedPlanFile,
+    ResolvedProviderInputs, SavedPlanResource, UnresolvedReloadedPlanFile,
+    UpstreamMissingStatePolicy, UpstreamSource, prepare_plan_identity_and_provider_inputs,
+    recorded_provider_artifacts,
 };
 use crate::error::{
     AppError, SavedPlanProviderArtifactDifference, SavedPlanProviderArtifactMismatchError,
@@ -27,7 +30,7 @@ use crate::error::{
 };
 use crate::wiring::{
     CheckedSavedPlanInputs, CompleteProviderLoad, ExpandedCanonicalResources, SavedPlanReplayMoves,
-    ValidatedConfig, WiringContext,
+    StateBlockResolution, ValidatedConfig, WiringContext,
 };
 
 pub(super) type PlannedSecretHashes = HashMap<ResourceId, PersistedAttributes>;
@@ -533,11 +536,115 @@ fn saved_orphan_from_current(current: Current, row: &ResourceState) -> Orphan {
 /// [`ExpandedCanonicalResources`] witness, so a pending saved plan cannot be
 /// verified accidentally against the parser's pre-expansion resource view.
 pub(super) struct SavedPlanSecretCandidates {
-    pub(super) source: carina_core::paths::ResolvedPath,
+    source: carina_core::paths::ResolvedPath,
     validated: ValidatedConfig<
         ExpandedCanonicalResources<carina_core::parser::ExpandedInferredExportParam>,
     >,
-    provider_inputs: ResolvedProviderInputs,
+    provider_inputs: VerifiedSavedPlanProviderInputs,
+}
+
+/// Current source values are candidates for hash verification, never
+/// construction configuration. Only verification can unwrap them.
+pub(super) struct SavedPlanCurrentCandidates {
+    inputs: ResolvedProviderInputs,
+}
+
+pub(super) async fn prepare_current_candidates(
+    validated: &mut ValidatedConfig,
+    state_file: &mut Option<StateFile>,
+    base_dir: &ResolvedPath,
+    provider_context: &ProviderContext,
+) -> Result<(SavedPlanCurrentCandidates, StateBlockResolution), AppError> {
+    let PreparedPlanIdentityData {
+        provider_inputs,
+        state_blocks,
+    } = prepare_plan_identity_and_provider_inputs(
+        validated,
+        state_file,
+        base_dir,
+        provider_context,
+        UpstreamMissingStatePolicy::Strict,
+    )
+    .await?;
+    Ok((
+        SavedPlanCurrentCandidates {
+            inputs: provider_inputs,
+        },
+        state_blocks,
+    ))
+}
+
+/// Only recorded values whose secret hashes have been verified can initialize
+/// saved-plan providers or normalizers. Construction takes this owner rather
+/// than the current source inputs.
+pub(crate) struct VerifiedSavedPlanProviderInputs<S = SavedProviderConfigs<NoPlaceholder>> {
+    configs: ResolvedProviderConfigs,
+    saved: S,
+}
+
+/// The recorded values have moved into the live plan; construction retains
+/// the same verified configuration projection.
+pub(super) struct RehydratedProviderInputs;
+
+impl VerifiedSavedPlanProviderInputs {
+    fn from_recorded(
+        saved: SavedProviderConfigs<NoPlaceholder>,
+        apply_target: ApplyTarget<'_>,
+    ) -> Result<Self, AppError> {
+        let configs = ResolvedProviderConfigs::try_from(saved.clone()).map_err(|error| {
+            AppError::SavedProviderConfig {
+                error,
+                replan_command: apply_target.replan_command().to_string(),
+            }
+        })?;
+        Ok(Self { configs, saved })
+    }
+
+    pub(super) fn into_rehydrated(
+        self,
+    ) -> (
+        SavedProviderConfigs<NoPlaceholder>,
+        VerifiedSavedPlanProviderInputs<RehydratedProviderInputs>,
+    ) {
+        (
+            self.saved,
+            VerifiedSavedPlanProviderInputs {
+                configs: self.configs,
+                saved: RehydratedProviderInputs,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(configs: ResolvedProviderConfigs) -> Self {
+        let snapshot = SavedProviderConfigs::from(&configs);
+        let saved = snapshot
+            .rehydrate_secrets(&snapshot)
+            .expect("resolved fixture configurations contain no unavailable secrets");
+        Self { configs, saved }
+    }
+}
+
+impl<S> VerifiedSavedPlanProviderInputs<S> {
+    pub(crate) fn configs(&self) -> &ResolvedProviderConfigs {
+        &self.configs
+    }
+
+    pub(super) async fn create_providers(
+        &self,
+        context: &WiringContext,
+        plan: &carina_core::provider::ProviderPlan,
+    ) -> Result<ProviderRouter, AppError> {
+        crate::wiring::create_providers_from_configs_with_ctx(context, self, plan).await
+    }
+
+    pub(super) async fn create_normalizers(
+        &self,
+        context: &WiringContext,
+        plan: &carina_core::provider::ProviderPlan,
+    ) -> Result<carina_core::provider::NormalizerRouter, AppError> {
+        crate::wiring::create_normalizers_from_configs_with_ctx(context, self, plan).await
+    }
 }
 
 #[cfg(test)]
@@ -558,15 +665,11 @@ impl TestSavedPlanSecretCandidates {
 }
 
 impl SavedPlanSecretCandidates {
-    pub(super) fn provider_context(&self) -> &carina_core::parser::LoadedProviderContext {
-        self.validated.context().provider_context()
-    }
-
     pub(super) fn from_expansion(
         validated: ValidatedConfig<
             ExpandedCanonicalResources<carina_core::parser::ExpandedInferredExportParam>,
         >,
-        provider_inputs: ResolvedProviderInputs,
+        provider_inputs: VerifiedSavedPlanProviderInputs,
         source: carina_core::paths::ResolvedPath,
     ) -> Self {
         Self {
@@ -586,14 +689,6 @@ impl SavedPlanSecretCandidates {
             provider_inputs,
         }
     }
-
-    pub(super) fn parsed(&self) -> &carina_core::parser::ExpandedInferredFile {
-        self.validated.resources().parsed()
-    }
-
-    pub(super) fn provider_inputs(&self) -> &ResolvedProviderInputs {
-        &self.provider_inputs
-    }
 }
 
 /// Schema-checked saved plan whose desired secret placeholders still need
@@ -603,6 +698,31 @@ pub(crate) struct SchemaCheckedPendingPlanFile {
 }
 
 impl SchemaCheckedPendingPlanFile {
+    pub(super) fn verify_provider_inputs(
+        &self,
+        candidates: SavedPlanCurrentCandidates,
+        apply_target: ApplyTarget<'_>,
+    ) -> Result<
+        (
+            VerifiedSavedPlanProviderInputs,
+            carina_core::upstream_exports::AdmittedRemoteBindings,
+        ),
+        AppError,
+    > {
+        let SavedPlanCurrentCandidates { inputs } = candidates;
+        let (configs, remote_bindings) = inputs.into_parts();
+        let fresh = SavedProviderConfigs::from(&configs);
+        let saved = self
+            .plan_file
+            .provider_configs()
+            .rehydrate_secrets(&fresh)
+            .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
+        Ok((
+            VerifiedSavedPlanProviderInputs::from_recorded(saved, apply_target)?,
+            remote_bindings,
+        ))
+    }
+
     pub(super) fn verify_provider_scopes(
         &self,
         provider: &ProviderRouter,
@@ -698,16 +818,37 @@ impl SchemaCheckedPendingPlanFile {
         self,
         candidates: SavedPlanSecretCandidates,
         apply_target: ApplyTarget<'_>,
-    ) -> Result<ValidatedDesiredPlan, AppError> {
+    ) -> Result<
+        (
+            ValidatedDesiredPlan,
+            VerifiedSavedPlanProviderInputs<RehydratedProviderInputs>,
+        ),
+        AppError,
+    > {
         let planned_secret_hashes = planned_secret_hashes(self.plan_file.sorted_resources());
-        let plan_file =
-            super::rehydrate_desired_plan_file(self.plan_file, &candidates, apply_target)?;
-        Ok(ValidatedDesiredPlan::with_current_config(
-            DesiredPlanFile::NeedsHistoricalVerification(DesiredVerifiedPlanFile {
-                plan_file,
-                planned_secret_hashes,
-            }),
-            candidates.validated,
+        let SavedPlanSecretCandidates {
+            source,
+            validated,
+            provider_inputs,
+        } = candidates;
+        let (plan_file, provider_inputs) =
+            super::rehydrate_desired_plan_file_with_verified_configs(
+                self.plan_file,
+                validated.resources().parsed(),
+                provider_inputs,
+                &source,
+                apply_target,
+                validated.context().provider_context(),
+            )?;
+        Ok((
+            ValidatedDesiredPlan::with_current_config(
+                DesiredPlanFile::NeedsHistoricalVerification(DesiredVerifiedPlanFile {
+                    plan_file,
+                    planned_secret_hashes,
+                }),
+                validated,
+            ),
+            provider_inputs,
         ))
     }
 }
@@ -764,6 +905,16 @@ impl ValidatedDesiredPlan {
 
     pub(super) fn provider_configs(&self) -> &SavedProviderConfigs<NoPlaceholder> {
         self.plan.provider_configs()
+    }
+
+    pub(super) fn provider_inputs(
+        &self,
+        apply_target: ApplyTarget<'_>,
+    ) -> Result<VerifiedSavedPlanProviderInputs, AppError> {
+        VerifiedSavedPlanProviderInputs::from_recorded(
+            self.provider_configs().clone(),
+            apply_target,
+        )
     }
 
     pub(super) fn provider_plan(&self) -> carina_core::provider::ProviderPlan {
@@ -2173,5 +2324,212 @@ mod tests {
             verified.attributes.get("token"),
             Some(&plaintext.to_snapshot())
         );
+    }
+
+    #[derive(Debug)]
+    struct ReceivedConfiguration {
+        phase: &'static str,
+        binding: Option<String>,
+        attributes: carina_core::parser::ConfigurationAttributes<Value>,
+    }
+
+    struct ConfigurationRecordingFactory {
+        received: std::sync::Arc<std::sync::Mutex<Vec<ReceivedConfiguration>>>,
+    }
+
+    impl ProviderFactory for ConfigurationRecordingFactory {
+        fn name(&self) -> &str {
+            "test"
+        }
+        fn display_name(&self) -> &str {
+            "Configuration recording fixture"
+        }
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            Vec::new()
+        }
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            use carina_core::schema::{
+                AttributeType, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+            };
+            let config = ValidatedConfigSchema::validate(
+                ["setting", "token", "current_only"]
+                    .into_iter()
+                    .map(|name| (name.to_string(), AttributeType::string()))
+                    .collect(),
+            )
+            .unwrap();
+            ValidatedProviderSchemaWitness::new(Vec::new(), config, Default::default(), Vec::new())
+                .unwrap()
+        }
+        fn validate_config(
+            &self,
+            attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+            _: &carina_core::provider::ProviderValidationInputs,
+        ) -> ProviderResult<()> {
+            self.received.lock().unwrap().push(ReceivedConfiguration {
+                phase: "validate",
+                binding: None,
+                attributes: attributes.attributes().clone(),
+            });
+            Ok(())
+        }
+        fn create_provider(
+            &self,
+            session: &carina_core::provider::ProviderSession,
+            _: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
+            self.received.lock().unwrap().push(ReceivedConfiguration {
+                phase: "provider",
+                binding: session.binding().map(str::to_owned),
+                attributes: session.configuration().attributes().clone(),
+            });
+            Box::pin(async {
+                Ok(carina_core::provider::InitializeOutcome::unavailable()
+                    .with_provider(carina_core::test_utils::provider_text::idle_provider()))
+            })
+        }
+        fn create_normalizer(
+            &self,
+            session: &carina_core::provider::ProviderSession,
+            _: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn carina_core::provider::ProviderNormalizer>>>
+        {
+            self.received.lock().unwrap().push(ReceivedConfiguration {
+                phase: "normalizer",
+                binding: session.binding().map(str::to_owned),
+                attributes: session.configuration().attributes().clone(),
+            });
+            Box::pin(async {
+                Ok(Box::new(carina_core::provider::NoopNormalizer)
+                    as Box<dyn carina_core::provider::ProviderNormalizer>)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_plan_provider_and_normalizer_receive_only_recorded_fields() {
+        for with_secret in [false, true] {
+            for has_default in [false, true] {
+                let bindings = if has_default {
+                    vec![None, Some("secondary")]
+                } else {
+                    vec![Some("primary"), Some("secondary")]
+                };
+                let mut recorded: Vec<ExpandedProviderConfig> = Vec::new();
+                for binding in bindings {
+                    let mut config = provider_config("test");
+                    config.binding = binding.map(str::to_owned);
+                    config.attributes.insert(
+                        "setting",
+                        Value::Concrete(ConcreteValue::String(
+                            format!("recorded-{}", binding.unwrap_or("default")).into(),
+                        )),
+                    );
+                    if with_secret {
+                        config.attributes.insert(
+                            "token",
+                            Value::Deferred(DeferredValue::Secret(
+                                Box::new(Value::Concrete(ConcreteValue::String(
+                                    "verified-token".into(),
+                                )))
+                                .into(),
+                            )),
+                        );
+                    }
+                    recorded.push(config);
+                }
+                let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let context = ValidatedConfig::from_factories_for_test_with_provider_phase(
+                    &crate::test_support::TestCommandRuntime::new(),
+                    (),
+                    vec![Box::new(ConfigurationRecordingFactory {
+                        received: received.clone(),
+                    })],
+                    &recorded,
+                );
+                let mut contents = empty_plan_contents(recorded.clone());
+                contents.provider_configs = contents.provider_configs.redact_secrets().unwrap();
+                let pending = SchemaCheckedPendingPlanFile {
+                    plan_file: contents
+                        .record_for_test(&context, Vec::new())
+                        .unwrap()
+                        .decode_for_test()
+                        .reload_in_flight_from_locked_state(None)
+                        .unwrap()
+                        .resolve_with_schemas(context.context().schemas())
+                        .unwrap(),
+                };
+                let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+                parsed.providers = recorded.clone();
+                for config in &mut parsed.providers {
+                    config.attributes.insert(
+                        "setting",
+                        Value::Concrete(ConcreteValue::String("unrecorded-current-setting".into())),
+                    );
+                    config.attributes.insert(
+                        "current_only",
+                        Value::Concrete(ConcreteValue::String("must-not-reach-factory".into())),
+                    );
+                }
+                let base = carina_core::paths::ResolvedPath::new(".").unwrap();
+                let inputs = crate::commands::plan::load_and_resolve_provider_configs(
+                    context.context().runtime(),
+                    &parsed,
+                    &base,
+                    context.context().provider_context().as_provider_context(),
+                    context.context().schemas(),
+                    crate::commands::plan::UpstreamMissingStatePolicy::Strict,
+                )
+                .await
+                .unwrap();
+                let (verified, _remote_bindings) = pending
+                    .verify_provider_inputs(
+                        super::SavedPlanCurrentCandidates { inputs },
+                        apply_target(),
+                    )
+                    .unwrap();
+                assert!(
+                    received.lock().unwrap().is_empty(),
+                    "verification must not call the factory"
+                );
+                let plan = carina_core::provider::ProviderPlan::state_only();
+                let _providers = verified
+                    .create_providers(context.context(), &plan)
+                    .await
+                    .unwrap();
+                let _normalizers = verified
+                    .create_normalizers(context.context(), &plan)
+                    .await
+                    .unwrap();
+                let received = received.lock().unwrap();
+                for event in received.iter() {
+                    assert!(
+                        recorded
+                            .iter()
+                            .any(|config| config.attributes == event.attributes),
+                        "{event:?}"
+                    );
+                    if event.phase != "validate" {
+                        assert_eq!(
+                            event.attributes,
+                            recorded
+                                .iter()
+                                .find(|config| config.binding == event.binding)
+                                .unwrap()
+                                .attributes
+                        );
+                    }
+                }
+                for (phase, count) in [
+                    ("provider", recorded.len()),
+                    ("normalizer", 2 * recorded.len()),
+                ] {
+                    assert_eq!(
+                        received.iter().filter(|event| event.phase == phase).count(),
+                        count
+                    );
+                }
+            }
+        }
     }
 }

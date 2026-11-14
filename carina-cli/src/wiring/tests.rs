@@ -4536,7 +4536,9 @@ async fn sourced_default_provider_executes_the_factory_retained_by_wiring_contex
 
     let router = create_providers_from_configs_with_ctx(
         &ctx,
-        &configs,
+        &crate::commands::apply::saved_plan::VerifiedSavedPlanProviderInputs::for_test(
+            configs.clone(),
+        ),
         &carina_core::provider::ProviderPlan::state_only(),
     )
     .await
@@ -15944,7 +15946,9 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                 std::fs::write(&maximum, "existing observation").unwrap();
                 let _normalizers = create_normalizers_from_configs_with_ctx(
                     ctx,
-                    &resolved,
+                    &crate::commands::apply::saved_plan::VerifiedSavedPlanProviderInputs::for_test(
+                        resolved.clone(),
+                    ),
                     &carina_core::provider::ProviderPlan::state_only(),
                 )
                 .await
@@ -16306,7 +16310,9 @@ async fn builtin_normalization_uses_only_its_dedicated_factory() {
     let (ctx, configs) = builtin_normalization_fixture();
     create_normalizers_from_configs_with_ctx(
         &ctx,
-        &configs,
+        &crate::commands::apply::saved_plan::VerifiedSavedPlanProviderInputs::for_test(
+            configs.clone(),
+        ),
         &provider_mod::ProviderPlan::state_only(),
     )
     .await

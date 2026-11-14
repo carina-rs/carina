@@ -160,8 +160,11 @@ fn conversion_module_output_cli_and_lsp_use_the_same_admission_and_completion() 
         SchemaRegistry::new(),
         carina_core::EnvironmentSnapshot::empty(),
     );
-    let engine =
-        carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+    let engine = carina_lsp::test_support::Diagnostics::new(
+        directory.path(),
+        Arc::new(loaded),
+        vec!["mock".into()],
+    );
     let path = directory.path().join("main.crn");
     for (attributes, rejected) in [
         ("attr = net.out as mock.Name", false),
@@ -394,8 +397,11 @@ fn round3_early_ordinary_failure_does_not_reject_a_valid_conversion_cli_and_lsp(
         SchemaRegistry::new(),
         carina_core::EnvironmentSnapshot::empty(),
     );
-    let engine =
-        carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+    let engine = carina_lsp::test_support::Diagnostics::new(
+        directory.path(),
+        Arc::new(loaded),
+        vec!["mock".into()],
+    );
     for named in [false, true] {
         let mut cli_findings = Vec::new();
         let mut lsp_findings = Vec::new();
@@ -496,8 +502,11 @@ fn merge_1b_reference_findings(
         SchemaRegistry::new(),
         carina_core::EnvironmentSnapshot::empty(),
     );
-    let engine =
-        carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+    let engine = carina_lsp::test_support::Diagnostics::new(
+        directory.path(),
+        Arc::new(loaded),
+        vec!["mock".into()],
+    );
     let document = carina_lsp::document::Document::new_with_path(
         source,
         path.clone(),
@@ -801,7 +810,8 @@ fn round4_alias_schema_unknown_use_does_not_reject_and_is_rechecked_after_load()
             SchemaRegistry::new(),
             carina_core::EnvironmentSnapshot::empty(),
         );
-        let engine = carina_lsp::diagnostics::DiagnosticEngine::new(
+        let engine = carina_lsp::test_support::Diagnostics::new(
+            directory.path(),
             Arc::new(loaded_providers),
             vec!["mock".into()],
         );
@@ -850,8 +860,11 @@ fn round4_lsp_sibling_failure_does_not_create_a_conversion_invariant_error() {
         SchemaRegistry::new(),
         carina_core::EnvironmentSnapshot::empty(),
     );
-    let engine =
-        carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+    let engine = carina_lsp::test_support::Diagnostics::new(
+        directory.path(),
+        Arc::new(loaded),
+        vec!["mock".into()],
+    );
     let document = carina_lsp::document::Document::new_with_path(
         source.into(),
         path.clone(),
@@ -1075,8 +1088,11 @@ fn round4_cross_file_alias_has_one_rejection_owned_by_its_definition() {
         SchemaRegistry::new(),
         carina_core::EnvironmentSnapshot::empty(),
     );
-    let engine =
-        carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+    let engine = carina_lsp::test_support::Diagnostics::new(
+        directory.path(),
+        Arc::new(loaded),
+        vec!["mock".into()],
+    );
     let path = directory.path().join("definition.crn");
     let document = carina_lsp::document::Document::new_with_path(
         source.into(),
@@ -1115,8 +1131,11 @@ fn round4_directory_module_failure_stops_admission_when_an_unrelated_file_is_ope
         SchemaRegistry::new(),
         carina_core::EnvironmentSnapshot::empty(),
     );
-    let engine =
-        carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+    let engine = carina_lsp::test_support::Diagnostics::new(
+        directory.path(),
+        Arc::new(loaded),
+        vec!["mock".into()],
+    );
     let path = directory.path().join("providers.crn");
     let document = carina_lsp::document::Document::new_with_path(
         source.into(),
@@ -1167,8 +1186,11 @@ fn r5c_configuration_boundaries_reject_once_in_cli_and_lsp() {
             SchemaRegistry::new(),
             carina_core::EnvironmentSnapshot::empty(),
         );
-        let engine =
-            carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+        let engine = carina_lsp::test_support::Diagnostics::new(
+            directory.path(),
+            Arc::new(loaded),
+            vec!["mock".into()],
+        );
         for (source, rejected) in [(plain, false), (converted, true)] {
             std::fs::write(&path, source).unwrap();
             let cli = carina_cli::commands::validate::validate_diagnostics_with_factories(
@@ -1228,8 +1250,11 @@ fn r6_secret_conversion_causes_are_masked_in_cli_json_and_lsp() {
         SchemaRegistry::new(),
         carina_core::EnvironmentSnapshot::empty(),
     );
-    let engine =
-        carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+    let engine = carina_lsp::test_support::Diagnostics::new(
+        directory.path(),
+        Arc::new(loaded),
+        vec!["mock".into()],
+    );
     let path = directory.path().join("main.crn");
     for alias in [false, true] {
         let source = if alias {

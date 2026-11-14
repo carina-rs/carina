@@ -76,7 +76,9 @@ fn r10_provider_finalization_observes_unsaved_imported_module_values() {
             .map(|error| error.to_string());
         (old, actual, notices.len())
     });
-    let ordinary_analysis = engine.analyze(&document, Some(&module.join("main.crn")));
+    let ordinary_analysis =
+        crate::test_support::Diagnostics::from_schemas(directory.path(), SchemaRegistry::new())
+            .analyze(&document, Some(&module.join("main.crn")));
     println!(
         "R10-FINALIZE {}",
         serde_json::json!({"root":root_source,"module_disk":disk,"module_unsaved":unsaved,"main_query":old,"branch_query":actual,"presented_metadata_findings":notices,"analyze_module_file":ordinary_analysis})
@@ -116,7 +118,7 @@ fn r10_reinstanced_omitted_slots_keep_source_evidence_in_the_lsp_fallback() {
             .validate()
             .unwrap(),
     );
-    let engine = custom_engine(schemas);
+    let engine = custom_engine(schemas.clone());
     for module in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
@@ -170,7 +172,9 @@ fn r10_reinstanced_omitted_slots_keep_source_evidence_in_the_lsp_fallback() {
             assert!(rows.iter().all(|row|row["runtime_value_present"]==false && row["for_resource_succeeded"]==true && row["cursor_carries"]==true), "{rows:?}");
             serde_json::json!({"buffer_selections":selections,"expanded_slots":rows})
         });
-        let diagnostics = engine.analyze(&document, Some(&path));
+        let diagnostics =
+            crate::test_support::Diagnostics::from_schemas(directory.path(), schemas.clone())
+                .analyze(&document, Some(&path));
         println!("R10-FALLBACK {}", serde_json::json!({"module":module,"source":source,"body":body,"evidence":measured,"lsp":diagnostics}).to_string().replace(directory.path().to_str().unwrap(), "<fixture>"));
         assert!(
             diagnostics

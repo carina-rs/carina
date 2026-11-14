@@ -124,8 +124,11 @@ fn lsp(directory: &std::path::Path, source: String) -> Vec<tower_lsp::lsp_types:
         SchemaRegistry::new(),
         carina_core::EnvironmentSnapshot::empty(),
     );
-    let engine =
-        carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+    let engine = carina_lsp::test_support::Diagnostics::new(
+        directory,
+        Arc::new(loaded),
+        vec!["mock".into()],
+    );
     let path = directory.join("main.crn");
     let document = carina_lsp::document::Document::new_with_path(
         source,

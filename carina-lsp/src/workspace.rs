@@ -9,6 +9,85 @@ use carina_core::parser::{self, ProviderConfig, ProviderContext};
 use carina_core::paths::{CanonicalPath, PathIdentity, ResolvedPath};
 use carina_core::resource::ParserPlaceholder;
 
+/// Production discovery is unrestricted. Replay can prune build/output trees
+/// without changing the default editor scan.
+#[derive(Clone, Debug, Default)]
+pub struct DiscoveryScope {
+    #[cfg(feature = "test-utils")]
+    replay: Option<ReplayDiscovery>,
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Clone, Debug)]
+struct ReplayDiscovery {
+    root: PathBuf,
+    identity: PathIdentity,
+    exclusions: HashSet<PathIdentity>,
+}
+
+impl DiscoveryScope {
+    #[cfg(feature = "test-utils")]
+    pub fn replay(
+        root: &Path,
+        exclusions: Vec<PathBuf>,
+        documents: &[PathBuf],
+    ) -> Result<Self, String> {
+        let identity =
+            PathIdentity::from(CanonicalPath::new(root).map_err(|error| error.to_string())?);
+        let root = carina_core::paths::PersistedPath::new(root)
+            .map_err(|error| error.to_string())?
+            .to_path_buf();
+        let exclusions = exclusions
+            .iter()
+            .map(PathIdentity::new)
+            .chain([
+                PathIdentity::new(root.join("target")),
+                PathIdentity::new(root.join(".worktrees")),
+            ])
+            .collect();
+        let scope = Self {
+            replay: Some(ReplayDiscovery {
+                root,
+                identity,
+                exclusions,
+            }),
+        };
+        if let Some(document) = documents.iter().find(|document| scope.prunes(document)) {
+            return Err(format!(
+                "replay pruning would omit target document {}",
+                document.display()
+            ));
+        }
+        Ok(scope)
+    }
+
+    pub fn prunes(&self, path: &Path) -> bool {
+        #[cfg(feature = "test-utils")]
+        if let Some(scope) = &self.replay {
+            let identity = PathIdentity::new(path);
+            if identity == scope.identity {
+                return false;
+            }
+            if identity
+                .ancestors()
+                .any(|ancestor| scope.exclusions.contains(&ancestor))
+            {
+                return true;
+            }
+            return identity
+                .ancestors()
+                .any(|ancestor| ancestor == scope.identity)
+                && path.strip_prefix(&scope.root).is_ok_and(|relative| {
+                    relative.components().any(|part| {
+                        part.as_os_str() == "target" || part.as_os_str() == ".worktrees"
+                    })
+                });
+        }
+        let _ = path;
+        false
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct DiscoveredProviderConfig {
     comparison_key: ProviderConfig<ParserPlaceholder>,
@@ -71,13 +150,22 @@ impl From<&DiscoveredProviderConfig> for ProviderInstanceKey {
 /// providers. Within a directory, duplicate provider instances are identified
 /// by provider kind and optional binding; the first declaration in sorted path
 /// order wins.
+#[cfg(test)]
 pub(crate) fn discover_providers_by_dir(
     workspace_root: &Path,
     environment: &carina_core::EnvironmentSnapshot,
 ) -> HashMap<PathBuf, Vec<DiscoveredProviderConfig>> {
+    discover_providers_in_scope(workspace_root, environment, &DiscoveryScope::default())
+}
+
+pub(crate) fn discover_providers_in_scope(
+    workspace_root: &Path,
+    environment: &carina_core::EnvironmentSnapshot,
+    scope: &DiscoveryScope,
+) -> HashMap<PathBuf, Vec<DiscoveredProviderConfig>> {
     let mut result: HashMap<PathBuf, Vec<DiscoveredProviderConfig>> = HashMap::new();
     if let Ok(root) = ResolvedPath::new(workspace_root) {
-        discover_by_dir_recursive(&root, &mut result, &mut HashSet::new(), environment);
+        discover_by_dir_recursive(&root, &mut result, &mut HashSet::new(), environment, scope);
     }
     result
 }
@@ -87,8 +175,9 @@ fn discover_by_dir_recursive(
     result: &mut HashMap<PathBuf, Vec<DiscoveredProviderConfig>>,
     visited: &mut HashSet<CanonicalPath>,
     environment: &carina_core::EnvironmentSnapshot,
+    scope: &DiscoveryScope,
 ) {
-    if !visited.insert(dir.identity()) {
+    if scope.prunes(&dir.source_label()) || !visited.insert(dir.identity()) {
         return;
     }
     let entries = match dir.entries() {
@@ -103,7 +192,7 @@ fn discover_by_dir_recursive(
             continue;
         };
         if path.is_dir() {
-            discover_by_dir_recursive(&path, result, visited, environment);
+            discover_by_dir_recursive(&path, result, visited, environment, scope);
         } else if path.display().extension().is_some_and(|ext| ext == "crn")
             && let Ok(content) = path.read_to_string()
         {
@@ -140,9 +229,17 @@ pub fn discover_import_map(
     workspace_root: &Path,
     environment: &carina_core::EnvironmentSnapshot,
 ) -> ModuleImportMap {
+    discover_imports_in_scope(workspace_root, environment, &DiscoveryScope::default())
+}
+
+pub(crate) fn discover_imports_in_scope(
+    workspace_root: &Path,
+    environment: &carina_core::EnvironmentSnapshot,
+    scope: &DiscoveryScope,
+) -> ModuleImportMap {
     let mut result = ModuleImportMap::new();
     if let Ok(root) = ResolvedPath::new(workspace_root) {
-        discover_imports_recursive(&root, &mut result, &mut HashSet::new(), environment);
+        discover_imports_recursive(&root, &mut result, &mut HashSet::new(), environment, scope);
     }
     result
 }
@@ -152,8 +249,9 @@ fn discover_imports_recursive(
     result: &mut ModuleImportMap,
     visited: &mut HashSet<CanonicalPath>,
     environment: &carina_core::EnvironmentSnapshot,
+    scope: &DiscoveryScope,
 ) {
-    if !visited.insert(dir.identity()) {
+    if scope.prunes(&dir.source_label()) || !visited.insert(dir.identity()) {
         return;
     }
     let entries = match dir.entries() {
@@ -168,7 +266,7 @@ fn discover_imports_recursive(
             continue;
         };
         if path.is_dir() {
-            discover_imports_recursive(&path, result, visited, environment);
+            discover_imports_recursive(&path, result, visited, environment, scope);
         } else if path.display().extension().is_some_and(|ext| ext == "crn")
             && let Ok(content) = path.read_to_string()
         {

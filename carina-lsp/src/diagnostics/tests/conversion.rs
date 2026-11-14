@@ -25,8 +25,8 @@ fn conversion_module_output_and_its_sibling_share_admission_coverage() {
             .validate()
             .unwrap(),
     );
-    let engine = custom_engine(schemas);
     let directory = tempfile::tempdir().unwrap();
+    let engine = crate::test_support::Diagnostics::from_schemas(directory.path(), schemas);
     std::fs::create_dir(directory.path().join("child")).unwrap();
     std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
     std::fs::write(
@@ -73,11 +73,14 @@ fn conversion_lsp_chains_report_one_outer_diagnostic() {
             .validate()
             .unwrap(),
     );
-    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("main.crn");
+    let engine = crate::test_support::Diagnostics::from_schemas(directory.path(), schemas);
     for depth in [2, 3] {
         let body = format!("mock.Sink {{ name = 'ok'{} }}", " as String".repeat(depth));
         let source = format!("provider mock {{}}\n{body}\n");
-        let diagnostics = engine.analyze(&create_document(&source), None);
+        std::fs::write(&path, &source).unwrap();
+        let diagnostics = engine.analyze(&create_document_at(&source, path.clone()), Some(&path));
         let errors = diagnostics
             .iter()
             .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
@@ -118,7 +121,7 @@ fn conversion_lsp_parse_rejection_keeps_the_convert_range_and_cause() {
             .validate()
             .unwrap(),
     );
-    let engine = DiagnosticEngine::new(loaded_test_providers(schemas.clone()), vec!["mock".into()]);
+    let engine = crate::test_support::Diagnostics::from_schemas(directory.path(), schemas.clone());
     let document = create_document_at(source, path.clone());
     let diagnostics = engine.analyze(&document, Some(&path));
     let errors = diagnostics
@@ -178,7 +181,7 @@ fn conversion_lsp_directory_alias_rejection_is_reported_once_at_convert() {
             .validate()
             .unwrap(),
     );
-    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let engine = crate::test_support::Diagnostics::from_schemas(directory.path(), schemas);
     let document = create_document_at(source, path.clone());
     let diagnostics = engine.analyze(&document, Some(&path));
     let errors = diagnostics
@@ -231,7 +234,7 @@ fn conversion_sibling_coverage_preserves_ordinary_provider_callback_counts() {
             .validate()
             .unwrap(),
     );
-    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let engine = crate::test_support::Diagnostics::from_schemas(directory.path(), schemas);
     let document = create_document_at(source, path.clone());
     engine.analyze(&document, Some(&path));
     assert_eq!(

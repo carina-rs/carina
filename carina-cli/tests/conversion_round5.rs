@@ -32,8 +32,11 @@ fn lsp(source: &str, path: &std::path::Path) -> Vec<tower_lsp::lsp_types::Diagno
         SchemaRegistry::new(),
         carina_core::EnvironmentSnapshot::empty(),
     );
-    let engine =
-        carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+    let engine = carina_lsp::test_support::Diagnostics::new(
+        path.parent().unwrap(),
+        Arc::new(loaded),
+        vec!["mock".into()],
+    );
     let doc = carina_lsp::document::Document::new_with_path(
         source.into(),
         path.to_path_buf(),

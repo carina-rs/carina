@@ -345,8 +345,11 @@ impl Fixture {
             SchemaRegistry::new(),
             carina_core::EnvironmentSnapshot::empty(),
         );
-        let engine =
-            carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+        let engine = carina_lsp::test_support::Diagnostics::new(
+            self.path(),
+            Arc::new(loaded),
+            vec!["mock".into()],
+        );
         let path = self.path().join(file);
         let document = carina_lsp::document::Document::new_with_path(
             text.into(),
@@ -900,7 +903,8 @@ async fn r10_schema_absence_is_owned_by_ordinary_diagnostics() {
                 SchemaRegistry::new(),
                 carina_core::EnvironmentSnapshot::empty(),
             );
-            let engine = carina_lsp::diagnostics::DiagnosticEngine::new(
+            let engine = carina_lsp::test_support::Diagnostics::new(
+                fixture.path(),
                 Arc::new(snapshot),
                 if loaded { vec!["mock".into()] } else { vec![] },
             );

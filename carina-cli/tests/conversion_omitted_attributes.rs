@@ -197,8 +197,11 @@ impl Fixture {
             SchemaRegistry::new(),
             carina_core::EnvironmentSnapshot::empty(),
         );
-        let engine =
-            carina_lsp::diagnostics::DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+        let engine = carina_lsp::test_support::Diagnostics::new(
+            self.directory.path(),
+            Arc::new(loaded),
+            vec!["mock".into()],
+        );
         let document = carina_lsp::document::Document::new_with_path(
             source,
             path.clone(),

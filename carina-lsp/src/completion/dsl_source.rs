@@ -18,13 +18,22 @@
 //!   `.crn` content. Built once per LSP request via
 //!   [`DslSource::resolve_directory`]; every helper called under the
 //!   same `src` then shares the same `&str`, so the disk read is
-//!   single-shot even though multiple helpers scan the source.
+//!   single-shot even though multiple helpers scan the source. File ranges
+//!   preserve lexical boundaries for scans that carry state across lines.
+
+use std::ops::Range;
+
+#[derive(Default)]
+pub(crate) struct DslSourceStorage {
+    merged: String,
+    sibling_ranges: Vec<Range<usize>>,
+}
 
 /// Explicit contract for what a text-scanning helper is allowed to see.
 ///
 /// `Copy` so helpers can take it by value without ceremony. Both
-/// variants hold a borrowed `&str`; the directory variant's `&str`
-/// comes from a `String` owned by the caller's stack (see
+/// variants borrow text; the directory variant's merged text and file ranges
+/// come from storage owned by the caller's stack (see
 /// [`DslSource::resolve_directory`]).
 #[derive(Clone, Copy)]
 pub(crate) enum DslSource<'a> {
@@ -37,7 +46,11 @@ pub(crate) enum DslSource<'a> {
     /// sibling `.crn` under the original `base_path`. Construct via
     /// [`DslSource::resolve_directory`] so the sibling read happens
     /// exactly once per request.
-    DirectoryScoped { merged: &'a str },
+    DirectoryScoped {
+        buffer: &'a str,
+        merged: &'a str,
+        sibling_ranges: &'a [Range<usize>],
+    },
 }
 
 impl<'a> DslSource<'a> {
@@ -48,30 +61,50 @@ impl<'a> DslSource<'a> {
     /// Typical pattern at an LSP completion entry point:
     ///
     /// ```ignore
-    /// let mut src_buf = String::new();
+    /// let mut src_buf = DslSourceStorage::default();
     /// let src = DslSource::resolve_directory(&text, base_path, &mut src_buf);
     /// // pass `src` to as many helpers as needed — no extra disk reads.
     /// ```
     pub(crate) fn resolve_directory(
         buffer: &'a str,
         base_path: Option<&carina_core::paths::ResolvedPath>,
-        storage: &'a mut String,
+        storage: &'a mut DslSourceStorage,
     ) -> Self {
-        storage.clear();
-        storage.push_str(buffer);
-        if !storage.ends_with('\n') {
-            storage.push('\n');
+        storage.merged.clear();
+        storage.sibling_ranges.clear();
+        storage.merged.push_str(buffer);
+        if !storage.merged.ends_with('\n') {
+            storage.merged.push('\n');
         }
-        storage.push_str(&read_sibling_crn(base_path));
-        DslSource::DirectoryScoped { merged: storage }
+        read_sibling_crn(base_path, storage);
+        DslSource::DirectoryScoped {
+            buffer,
+            merged: &storage.merged,
+            sibling_ranges: &storage.sibling_ranges,
+        }
     }
 
     /// Borrow the scanned text. Zero-alloc for both variants.
     pub(crate) fn merged_text(&self) -> &'a str {
         match *self {
             DslSource::BufferOnly(buffer) => buffer,
-            DslSource::DirectoryScoped { merged } => merged,
+            DslSource::DirectoryScoped { merged, .. } => merged,
         }
+    }
+
+    /// Buffer first, then each sibling independently in canonical path order.
+    /// Lexing this iterator never carries strings, comments, or walk-back
+    /// context from one file into another.
+    pub(crate) fn file_texts(&self) -> impl Iterator<Item = &'a str> {
+        let (buffer, merged, ranges) = match *self {
+            Self::BufferOnly(buffer) => (buffer, "", &[][..]),
+            Self::DirectoryScoped {
+                buffer,
+                merged,
+                sibling_ranges,
+            } => (buffer, merged, sibling_ranges),
+        };
+        std::iter::once(buffer).chain(ranges.iter().map(move |range| &merged[range.clone()]))
     }
 }
 
@@ -84,21 +117,24 @@ impl<'a> DslSource<'a> {
 /// canonical loader's ordering contract (#2449, #2855). Iterating
 /// `std::fs::read_dir` directly would yield filesystem-dependent order,
 /// which makes downstream merged-text scanning non-deterministic.
-pub(crate) fn read_sibling_crn(base_path: Option<&carina_core::paths::ResolvedPath>) -> String {
+fn read_sibling_crn(
+    base_path: Option<&carina_core::paths::ResolvedPath>,
+    storage: &mut DslSourceStorage,
+) {
     let Some(base) = base_path else {
-        return String::new();
+        return;
     };
     let Ok(files) = carina_core::config_loader::find_crn_files_in_dir(base) else {
-        return String::new();
+        return;
     };
-    let mut out = String::new();
     for path in files {
         if let Ok(content) = path.read_to_string() {
-            out.push_str(&content);
-            out.push('\n');
+            let start = storage.merged.len();
+            storage.merged.push_str(&content);
+            storage.sibling_ranges.push(start..storage.merged.len());
+            storage.merged.push('\n');
         }
     }
-    out
 }
 
 #[cfg(test)]
@@ -113,7 +149,7 @@ mod tests {
 
     #[test]
     fn resolve_directory_without_base_path_is_buffer_only() {
-        let mut storage = String::new();
+        let mut storage = DslSourceStorage::default();
         let src = DslSource::resolve_directory("let a = 1\n", None, &mut storage);
         assert_eq!(src.merged_text(), "let a = 1\n");
     }
@@ -131,7 +167,10 @@ mod tests {
         std::fs::write(base.join("a.crn"), "let a = 1\n").unwrap();
         std::fs::write(base.join("m.crn"), "let m = 13\n").unwrap();
 
-        let merged = read_sibling_crn(Some(&carina_core::paths::ResolvedPath::new(base).unwrap()));
+        let mut storage = DslSourceStorage::default();
+        let base = carina_core::paths::ResolvedPath::new(base).unwrap();
+        let src = DslSource::resolve_directory("", Some(&base), &mut storage);
+        let merged = src.merged_text();
         let pos_a = merged.find("let a = 1").expect("a.crn missing");
         let pos_m = merged.find("let m = 13").expect("m.crn missing");
         let pos_z = merged.find("let z = 26").expect("z.crn missing");
@@ -149,7 +188,7 @@ mod tests {
         std::fs::write(base.join("main.crn"), "let a = 1\n").unwrap();
         std::fs::write(base.join("exports.crn"), "let b = 2\n").unwrap();
         let buffer = "let c = 3\n"; // unsaved buffer, not on disk
-        let mut storage = String::new();
+        let mut storage = DslSourceStorage::default();
         let src = DslSource::resolve_directory(
             buffer,
             Some(&carina_core::paths::ResolvedPath::new(base).unwrap()),
