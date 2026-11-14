@@ -64,7 +64,7 @@ carina-core = { path = "../carina-core", features = ["test-shutdown", "test-util
 carina-plugin-host = { path = "../carina-plugin-host", features = ["test-utils"] }
 carina-provider-resolver = { path = "../carina-provider-resolver", features = ["test-utils"] }
 carina-state = { path = "../carina-state", features = ["test-utils"] }
-carina-lsp = { path = "../carina-lsp" }
+carina-lsp = { path = "../carina-lsp", features = ["test-utils"] }
 insta = "1"
 tokio = { version = "1", features = ["test-util"] }
 # Real PTY for the refresh-separator regression test (#3150). The bug only

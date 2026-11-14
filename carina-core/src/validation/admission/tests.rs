@@ -6,6 +6,9 @@ use crate::schema::{
 use crate::validation::deferred_types::with_session_for_test;
 use std::collections::HashMap;
 
+#[path = "tests/slot_inputs.rs"]
+mod slot_inputs;
+
 #[path = "tests/seam_round4.rs"]
 mod seam_round4;
 
@@ -48,6 +51,12 @@ fn count_admission_work<R>(operation: impl FnOnce() -> R) -> (R, AdmissionWork) 
     let _reset = Reset(ADMISSION_WORK.replace(Some(AdmissionWork::default())));
     let result = operation();
     (result, ADMISSION_WORK.get().unwrap())
+}
+
+pub(super) fn without_admission_work<R>(operation: impl FnOnce() -> R) -> R {
+    let (result, work) = count_admission_work(operation);
+    assert_eq!(work, AdmissionWork::default());
+    result
 }
 
 fn text(value: &str) -> Value {
@@ -229,23 +238,22 @@ fn retained_reference_boundaries_are_built_per_attribute_not_per_leaf() {
                 .unwrap();
             let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
             let inputs = attributes::ResourceAttributeInputs::new(resource);
-            let attributes = inputs.classify(&KnowledgeContext::validation(), |_, error| {
-                panic!("classification: {error:?}")
-            });
             with_session_for_test(&catalog, |session| {
                 let (findings, work) = count_admission_work(|| {
-                    attributes::resource_attribute_admissions(
+                    let outcome = attributes::resource_attribute_admissions(
                         resource,
                         judged.file(),
                         resource.schema(&schemas).unwrap(),
-                        &attributes,
                         resource.quoted_string_attrs(),
-                        &inputs,
+                        inputs,
+                        crate::validation::admission::attributes::ValidationEvaluation::None,
                         &bindings,
                         session,
                         &schemas,
                         &mut Default::default(),
-                    )
+                    );
+                    assert!(outcome.classification_diagnostics.0.is_empty());
+                    outcome.values
                 });
                 assert_eq!(findings.errors().count(), 0, "{leaf}: {findings:?}");
                 assert_eq!(
