@@ -6663,6 +6663,10 @@ impl<C> ResolvedProviderInputs<C> {
     pub(crate) fn remote_bindings(&self) -> &AdmittedRemoteBindings {
         &self.remote_bindings
     }
+
+    pub(crate) fn into_parts(self) -> (C, AdmittedRemoteBindings) {
+        (self.configs, self.remote_bindings)
+    }
 }
 
 fn provider_config_resolution_error(

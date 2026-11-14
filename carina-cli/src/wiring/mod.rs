@@ -569,7 +569,12 @@ pub(crate) struct ReportingProviderLoad {
 /// module can construct it. That keeps the pipeline's raw canonical-pair
 /// result behind the owner-minting transitions.
 pub(crate) struct ValidationPipelineAccess {
-    _private: (),
+    provider_configuration: ProviderConfigurationPurpose,
+}
+
+enum ProviderConfigurationPurpose {
+    SourceExecution,
+    SavedPlanSecretCandidates,
 }
 
 /// Marker for a configuration that may still contain reusable module-template
@@ -587,7 +592,40 @@ pub struct ExpandedConfig;
 
 impl ValidationPipelineAccess {
     fn new() -> Self {
-        Self { _private: () }
+        Self {
+            provider_configuration: ProviderConfigurationPurpose::SourceExecution,
+        }
+    }
+
+    fn saved_plan_secret_candidates() -> Self {
+        Self {
+            provider_configuration: ProviderConfigurationPurpose::SavedPlanSecretCandidates,
+        }
+    }
+
+    pub(crate) fn check_provider_configuration<E>(
+        &self,
+        ctx: &WiringContext,
+        parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    ) -> Vec<AppError> {
+        match self.provider_configuration {
+            ProviderConfigurationPurpose::SourceExecution => {
+                validate_provider_region_with_ctx(ctx, parsed)
+            }
+            // Current values supply only secret candidates. Full admission and
+            // factory callbacks belong to the verified recorded configuration.
+            ProviderConfigurationPurpose::SavedPlanSecretCandidates => {
+                carina_core::validation::admission::configuration::provider::validate_keys(
+                    &parsed.providers,
+                    &ctx.configuration_factories(),
+                )
+                .err()
+                .into_iter()
+                .flat_map(|error| error.into_diagnostics())
+                .map(|error| AppError::ProviderConfiguration(Box::new(error)))
+                .collect()
+            }
+        }
     }
 
     /// Resolve both configuration snapshots inside the sealed validation
@@ -1374,6 +1412,7 @@ fn sorted_provider_load_errors(load_errors: &HashMap<String, String>) -> Vec<App
 
 #[allow(clippy::too_many_arguments)]
 fn resolve_config_pair_errors_with_context(
+    access: &ValidationPipelineAccess,
     context: &WiringContext,
     load_errors: &HashMap<String, String>,
     parsed: carina_core::config_loader::InferredRootDirectory,
@@ -1390,6 +1429,7 @@ fn resolve_config_pair_errors_with_context(
         skip_resource_validation,
     );
     resolve_config_pair_errors_with_catalog(
+        access,
         ProviderValidationInputs {
             context,
             catalog,
@@ -1415,6 +1455,7 @@ struct ProviderValidationInputs<'a> {
 
 /// Resolve and settle using the same catalog through binding readiness.
 fn resolve_config_pair_errors_with_catalog(
+    access: &ValidationPipelineAccess,
     providers: ProviderValidationInputs<'_>,
     parsed: carina_core::config_loader::InferredRootDirectory,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
@@ -1430,7 +1471,7 @@ fn resolve_config_pair_errors_with_catalog(
     let checks =
         carina_core::validation::deferred_types::TypeCheckSession::run(&catalog, |catalog| {
             let result = crate::commands::validate_and_resolve_errors_inner(
-                &ValidationPipelineAccess::new(),
+                access,
                 parsed,
                 base_dir,
                 context,
@@ -1476,6 +1517,7 @@ fn resolve_config_pair_with_context(
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> Result<ReadyConfigPair, AppError> {
     resolve_config_pair_errors_with_context(
+        &ValidationPipelineAccess::new(),
         context,
         load_errors,
         parsed,
@@ -1764,6 +1806,7 @@ impl ProviderLoad {
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<ValidatedConfig, AppError> {
         let canonical_resources = match resolve_config_pair_errors_with_context(
+            &ValidationPipelineAccess::new(),
             &self.context,
             &self.load_errors,
             parsed,
@@ -1899,8 +1942,9 @@ impl MigrationCheckProviderLoad {
 }
 
 impl CompleteProviderLoad {
-    /// Validate the current config once and retain its canonical pair with the
-    /// exact complete load that will verify and execute a saved plan.
+    /// Check current source for secret candidates, retaining its canonical pair
+    /// with this load. Provider-config value callbacks wait for verification of
+    /// the recorded configuration; current keys receive host-only checks.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn check_saved_plan_config_pair(
         self,
@@ -1910,7 +1954,8 @@ impl CompleteProviderLoad {
         skip_resource_validation: bool,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<CheckedSavedPlanInputs, AppError> {
-        let canonical_resources = resolve_config_pair_with_context(
+        let canonical_resources = resolve_config_pair_errors_with_context(
+            &ValidationPipelineAccess::saved_plan_secret_candidates(),
             &self.context,
             &HashMap::new(),
             parsed,
@@ -1918,7 +1963,8 @@ impl CompleteProviderLoad {
             base_dir,
             skip_resource_validation,
             duplicate_declarations,
-        )?;
+        )
+        .map_err(|errors| crate::commands::collapse_errors(errors.into_vec()))?;
         Ok(CheckedSavedPlanInputs {
             load: self,
             canonical_resources: Box::new(canonical_resources),
@@ -5526,36 +5572,24 @@ fn take_unverified_official_load_error<E>(
         .unwrap_or_else(|_| unreachable!("the identity failure was checked as unverified")))
 }
 
-/// Build a router exclusively from factories already retained by `ctx`.
-/// Read/delete configuration cannot select this desired-provider entry.
-///
-/// ```compile_fail,E0308
-/// use carina_cli::wiring::{WiringContext, create_providers_from_configs_with_ctx};
-/// use carina_core::{parser::ReadOnlyProviderConfigs, provider::ProviderPlan};
-/// fn desired(ctx: &WiringContext, config: &ReadOnlyProviderConfigs, plan: &ProviderPlan) {
-///     let _ = create_providers_from_configs_with_ctx(ctx, config, plan);
-/// }
-/// ```
-pub async fn create_providers_from_configs_with_ctx(
+/// Construct saved-plan providers only from verified recorded configuration.
+pub(crate) async fn create_providers_from_configs_with_ctx<S>(
     ctx: &WiringContext,
-    configs: &ResolvedProviderConfigs,
+    inputs: &crate::commands::apply::saved_plan::VerifiedSavedPlanProviderInputs<S>,
     plan: &provider_mod::ProviderPlan,
 ) -> Result<ProviderRouter, AppError> {
-    build_provider_router(ctx, configs, ProgressSink::Human, plan).await
+    build_provider_router(ctx, inputs.configs(), ProgressSink::Human, plan).await
 }
 
-/// Build only the desired-state normalizers needed to reproduce the plan-time
-/// candidate shape. Runtime providers are intentionally not constructed here:
-/// saved-plan secret verification must finish before CRUD-capable objects
-/// become available to the apply path.
-pub(crate) async fn create_normalizers_from_configs_with_ctx(
+/// Reproduce plan-time normalization using verified recorded configuration.
+pub(crate) async fn create_normalizers_from_configs_with_ctx<S>(
     ctx: &WiringContext,
-    configs: &ResolvedProviderConfigs,
+    inputs: &crate::commands::apply::saved_plan::VerifiedSavedPlanProviderInputs<S>,
     plan: &provider_mod::ProviderPlan,
 ) -> Result<NormalizerRouter, AppError> {
     let mut router = NormalizerRouter::new();
 
-    for config in configs.iter() {
+    for config in inputs.configs().iter() {
         if let Some(factory) = provider_mod::find_factory(ctx.factories(), config.name()) {
             let construction = prepare_provider_construction(factory, config, plan)?;
             router.add_initialized_normalizer(
