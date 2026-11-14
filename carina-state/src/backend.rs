@@ -888,6 +888,8 @@ pub const LOCAL_BACKEND_TYPE: &str = "local";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend_config::{BackendConfig, BackendConfigError};
+    use crate::lock::LockInfo;
 
     #[test]
     fn storage_readiness_status_preserves_ready_and_unavailable() {
@@ -916,8 +918,6 @@ mod tests {
             }
         }
     }
-    use crate::backend_config::{BackendConfig, BackendConfigError};
-    use crate::lock::LockInfo;
 
     #[test]
     fn round3_upstream_read_preserves_legacy_identity_classification() {

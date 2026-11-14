@@ -320,10 +320,6 @@ fn select_s3_bucket_bootstrap(
     }
 }
 
-async fn create_auto_bootstrap_bucket(bootstrap: S3AutoCreate) -> Result<(), AppError> {
-    bootstrap.create().await.map_err(AppError::Backend)
-}
-
 async fn create_checked_bootstrap_resource(
     color_mode: crate::output_style::ColorMode,
     operation_provider: &dyn HostProvider,
@@ -2093,7 +2089,7 @@ async fn run_apply_with_observer_factory(
                         "Auto-creating state bucket: {}",
                         bucket_name.cyan(color_mode)
                     );
-                    create_auto_bootstrap_bucket(auto_create).await?;
+                    auto_create.create().await.map_err(AppError::Backend)?;
                     println!("  {} Created state bucket", "✓".green(color_mode));
 
                     let backend_provider_name = storage.provider_name();

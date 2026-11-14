@@ -12431,7 +12431,7 @@ async fn auto_create_backend_bucket_declared_resource_precedes_disabled_policy()
 }
 
 #[tokio::test]
-async fn auto_create_backend_bucket_environment_policy_keeps_redacted_configuration_error() {
+async fn auto_create_backend_bucket_apply_redacts_env_bucket_like_plan() {
     let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([(
         "STATE_BUCKET".into(),
         "private-bucket-name".into(),
@@ -12453,6 +12453,7 @@ async fn auto_create_backend_bucket_environment_policy_keeps_redacted_configurat
 
     let error = select_s3_bucket_bootstrap(bootstrap, None).unwrap_err();
     assert!(matches!(&error, AppError::Config(_)));
+    // The disabled-policy message is shared with plan, including env() redaction.
     assert_eq!(
         error.to_string(),
         "Backend bucket value from env() not found and auto_create is disabled"
@@ -12495,7 +12496,7 @@ async fn auto_create_backend_bucket_does_not_require_provider_schema() {
     else {
         panic!("an undeclared bucket with auto-create enabled must obtain creation authority")
     };
-    create_auto_bootstrap_bucket(auto_create).await.unwrap();
+    auto_create.create().await.unwrap();
     let requests = requests.lock().unwrap();
     assert_eq!(
         requests
@@ -12532,9 +12533,7 @@ async fn auto_create_backend_bucket_is_outside_provider_input_admission() {
         StorageReadiness::Provisionable(bootstrap) => bootstrap,
         StorageReadiness::Unavailable(error) => panic!("S3 storage must be provisionable: {error}"),
     };
-    create_auto_bootstrap_bucket(bootstrap.auto_create().unwrap())
-        .await
-        .unwrap();
+    bootstrap.auto_create().unwrap().create().await.unwrap();
     let requests = requests.lock().unwrap();
     assert_eq!(requests.iter().filter(|r| r.method == "PUT").count(), 2);
     assert!(requests.iter().any(|r| r.uri.contains("publicAccessBlock")));
