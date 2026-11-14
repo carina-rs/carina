@@ -1148,6 +1148,7 @@ name = "carina-lsp"
 version = "0.15.0"
 dependencies = [
  "carina-core",
+ "carina-lsp",
  "carina-plugin-host",
  "carina-provider-mock",
  "carina-provider-resolver",
@@ -1160,6 +1161,7 @@ dependencies = [
  "ropey",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tower-lsp",
