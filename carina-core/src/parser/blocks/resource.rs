@@ -11,8 +11,7 @@ use crate::parser::context::{
 };
 use crate::parser::error::ParseError;
 use crate::parser::resource_body::{
-    BlockContent, BlockContents, ClassifiedResourceDirectives, DirectiveBlock, DirectiveEntry,
-    ResourceBody, ResourceDirectives,
+    BlockContent, BlockContents, DirectiveBlock, DirectiveEntry, ResourceBody, ResourceDirectives,
 };
 use crate::parser::util::expression_is_plain_string_literal;
 use crate::parser::{BoundDeferredTarget, Rule};
@@ -63,16 +62,12 @@ pub(crate) fn parse_resource_for_target(
     preprocessed_file: &crate::parser::PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<Resource, ParseError> {
-    let declaration = crate::parser::DeclarationProvenance::from_pair(
-        &pair,
-        preprocessed_file,
-        source_file,
-        &ctx.resource_directives,
-    );
+    let declaration =
+        crate::parser::DeclarationProvenance::from_pair(&pair, preprocessed_file, source_file);
     let syntax = pair.clone();
     let (resource_type, contents) = ResourceBody::from_pair(pair)
         .expect("resource parser requires a resource body")
-        .into_parts();
+        .into_parts(preprocessed_file, source_file);
     let namespaced_type = resource_type.as_str().to_string();
 
     // Extract resource type from namespace (aws.s3_bucket -> s3_bucket)
@@ -248,16 +243,10 @@ fn parse_block_contents_with_quoted(
                 // Keep the first block, including when it is empty. The
                 // inventory reports duplicates and inspects every block;
                 // later blocks cannot overwrite or evaluate runtime settings.
-                match block.classification(&local_ctx.resource_directives) {
+                match block.classification() {
                     DirectiveBlock::First => {
-                        check_directives_depends_on_elements(
-                            block.clone(),
-                            &local_ctx.resource_directives,
-                        )?;
-                        check_directives_provider_value(
-                            block.clone(),
-                            &local_ctx.resource_directives,
-                        )?;
+                        check_directives_depends_on_elements(&block)?;
+                        check_directives_provider_value(&block)?;
                         directives = Some(parse_directives(block, &local_ctx)?);
                     }
                     DirectiveBlock::Duplicate(_finding) => {}
@@ -453,16 +442,12 @@ pub(crate) fn parse_read_resource_expr(
     preprocessed_file: &crate::parser::PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<DataSource, ParseError> {
-    let declaration = crate::parser::DeclarationProvenance::from_pair(
-        &pair,
-        preprocessed_file,
-        source_file,
-        &ctx.resource_directives,
-    );
+    let declaration =
+        crate::parser::DeclarationProvenance::from_pair(&pair, preprocessed_file, source_file);
     let syntax = pair.clone();
     let (resource_type, contents) = ResourceBody::from_pair(pair)
         .expect("read parser requires a resource body")
-        .into_parts();
+        .into_parts(preprocessed_file, source_file);
     let namespaced_type = resource_type.as_str().to_string();
 
     // Extract resource type from namespace (aws.s3_bucket -> s3_bucket)
@@ -533,7 +518,7 @@ fn parse_directives(
 ) -> Result<ParsedDirectives, ParseError> {
     let mut parsed_directives = ParsedDirectives::default();
 
-    for (attr, entry) in block.entries(&ctx.resource_directives) {
+    for (attr, entry) in block.entries() {
         let directive = match entry {
             DirectiveEntry::Valid(directive) => *directive,
             DirectiveEntry::Invalid(_finding) => continue,
@@ -782,11 +767,8 @@ fn eval_as_binding_name(
 /// reject any `depends_on = [...]` element that is a string literal — bare
 /// binding identifiers and string literals collapse to the same `Value`
 /// later, so this is the only place we can tell `[role]` from `["role"]`.
-fn check_directives_depends_on_elements(
-    block: ResourceDirectives<'_>,
-    classified: &ClassifiedResourceDirectives,
-) -> Result<(), ParseError> {
-    for (attr, entry) in block.entries(classified) {
+fn check_directives_depends_on_elements(block: &ResourceDirectives<'_>) -> Result<(), ParseError> {
+    for (attr, entry) in block.entries() {
         let directive = match entry {
             DirectiveEntry::Valid(directive) => *directive,
             DirectiveEntry::Invalid(_finding) => continue,
@@ -828,11 +810,8 @@ fn check_directives_depends_on_elements(
 
 /// Reject `provider = "<string>"` at the pest layer, where a quoted literal
 /// remains distinguishable from a bare binding identifier.
-fn check_directives_provider_value(
-    block: ResourceDirectives<'_>,
-    classified: &ClassifiedResourceDirectives,
-) -> Result<(), ParseError> {
-    for (attr, entry) in block.entries(classified) {
+fn check_directives_provider_value(block: &ResourceDirectives<'_>) -> Result<(), ParseError> {
+    for (attr, entry) in block.entries() {
         let directive = match entry {
             DirectiveEntry::Valid(directive) => *directive,
             DirectiveEntry::Invalid(_finding) => continue,
@@ -906,6 +885,45 @@ mod tests {
                 assert_eq!(value, &Value::Concrete(ConcreteValue::Bool(true)));
             }
         }
+    }
+
+    #[test]
+    fn directive_classifications_travel_with_blocks_without_context_inventory() {
+        let source = "mock.test.resource {\n  name = 'example'\n  directives {\n    'prevent_destroy' = true\n    prevent_destory = absent\n    unsupported {}\n    let ignored = absent\n  }\n  directives { force_delete = absent }\n}\n";
+        let path = Path::new("resources.crn");
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let file = std::sync::Arc::new(crate::parser::preprocess_file(source).unwrap());
+        let pair = file
+            .parse()
+            .unwrap()
+            .flatten()
+            .find(|pair| pair.as_rule() == Rule::anonymous_resource)
+            .unwrap();
+        let ctx = ParseContext::new(&config, path, file.clone());
+        let resource = parse_anonymous_resource(pair, &ctx, &file, path)
+            .expect("a fresh context needs no detached directive inventory");
+        let mut lifecycle_count = 0;
+        resource.directives.clone().map_expressions(|expression| {
+            lifecycle_count += 1;
+            assert_eq!(
+                expression.value(),
+                &Value::Concrete(ConcreteValue::Bool(true))
+            );
+        });
+        assert_eq!(lifecycle_count, 1);
+        assert!(resource.directives.force_delete.is_none());
+
+        let metadata = crate::parser::parse_syntax_inventory(source, path).unwrap();
+        let findings = crate::validation::resource_directive_findings(&metadata);
+        assert_eq!(findings.len(), 4, "{findings:?}");
+        assert_eq!(
+            findings[0].detail().to_string(),
+            "Unknown directive 'prevent_destory', did you mean 'prevent_destroy'?"
+        );
+        assert_eq!(
+            findings[3].detail().to_string(),
+            "Duplicate attribute 'directives' (first defined on line 3)"
+        );
     }
 
     #[test]

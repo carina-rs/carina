@@ -440,12 +440,11 @@ impl DeclarationProvenance {
         pair: &pest::iterators::Pair<'_, Rule>,
         file: &PreprocessedFile,
         source: &Path,
-        directives: &super::resource_body::ClassifiedResourceDirectives,
     ) -> Self {
         Self {
             location: Some(DeclarationLocation::from_pair(pair, file, source)),
             elements: Arc::new(super::elements::ElementLocations::from_pair(
-                pair, file, source, directives,
+                pair, file, source,
             )),
         }
     }

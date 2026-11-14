@@ -2,8 +2,7 @@
 use pest::iterators::{Pair, Pairs};
 
 use super::resource_body::{
-    BlockContent, BlockContents, ClassifiedResourceDirectives, DirectiveBlock, DirectiveEntry,
-    ResourceBody,
+    BlockContent, BlockContents, DirectiveBlock, DirectiveEntry, ResourceBody,
 };
 use super::{DeclarationLocation, Located, PreprocessedFile, Rule};
 use crate::resource::ResourceDirective;
@@ -318,16 +317,15 @@ impl ElementLocations {
         pair: &Pair<'_, Rule>,
         file: &PreprocessedFile,
         path: &Path,
-        directives: &ClassifiedResourceDirectives,
     ) -> Self {
         let mut out = Self { ..Self::default() };
         if let Some(body) = ResourceBody::from_pair(pair.clone()) {
-            let (resource_type, contents) = body.into_parts();
+            let (resource_type, contents) = body.into_parts(file, path);
             out.values.push((
                 ElementKind::ResourceType,
                 DeclarationLocation::from_pair(&resource_type, file, path),
             ));
-            collect_keys(contents, &[], file, path, directives, &mut out);
+            collect_keys(contents, &[], file, path, &mut out);
         } else if pair.as_rule() == Rule::wait_expr {
             let mut inner = pair.clone().into_inner();
             let target = inner.next().expect("wait grammar has a target");
@@ -359,7 +357,6 @@ impl ElementLocations {
                 &[],
                 file,
                 path,
-                directives,
                 &mut out,
             );
         }
@@ -380,7 +377,6 @@ fn collect_keys(
     parent: &[super::AttributePathSegment],
     file: &PreprocessedFile,
     source: &Path,
-    directives: &ClassifiedResourceDirectives,
     out: &mut ElementLocations,
 ) {
     use super::AttributePathSegment as Segment;
@@ -391,11 +387,11 @@ fn collect_keys(
             BlockContent::Directives(block) => {
                 // Runtime parsing keeps the first block, so its element
                 // provenance must also come only from that block.
-                match block.classification(directives) {
+                match block.classification() {
                     DirectiveBlock::First => {}
                     DirectiveBlock::Duplicate(_finding) => continue,
                 }
-                for (attribute, entry) in block.entries(directives) {
+                for (attribute, entry) in block.entries() {
                     let directive = match entry {
                         DirectiveEntry::Valid(directive) => *directive,
                         DirectiveEntry::Invalid(_finding) => continue,
@@ -463,14 +459,7 @@ fn collect_keys(
                         list_literal: false,
                         literal_container: true,
                     });
-                    collect_keys(
-                        BlockContents::ordinary(inner),
-                        &path,
-                        file,
-                        source,
-                        directives,
-                        out,
-                    );
+                    collect_keys(BlockContents::ordinary(inner), &path, file, source, out);
                 } else if let Some(value) = inner.next() {
                     out.attribute_values
                         .push(value_location(&value, &path, file, source));
@@ -480,7 +469,7 @@ fn collect_keys(
                             DeclarationLocation::from_pair(&value, file, source),
                         ));
                     }
-                    collect_value_keys(value, &path, file, source, directives, out);
+                    collect_value_keys(value, &path, file, source, out);
                 }
             }
             Rule::block_content => collect_keys(
@@ -488,7 +477,6 @@ fn collect_keys(
                 parent,
                 file,
                 source,
-                directives,
                 out,
             ),
             _ => {}
@@ -501,7 +489,6 @@ fn collect_value_keys(
     parent: &[super::AttributePathSegment],
     file: &PreprocessedFile,
     source: &Path,
-    directives: &ClassifiedResourceDirectives,
     out: &mut ElementLocations,
 ) {
     if pair.as_rule() == Rule::map {
@@ -510,7 +497,6 @@ fn collect_value_keys(
             parent,
             file,
             source,
-            directives,
             out,
         );
     } else if pair.as_rule() == Rule::list {
@@ -519,11 +505,11 @@ fn collect_value_keys(
             path.push(super::AttributePathSegment::ListIndex(index));
             out.attribute_values
                 .push(value_location(&value, &path, file, source));
-            collect_value_keys(value, &path, file, source, directives, out);
+            collect_value_keys(value, &path, file, source, out);
         }
     } else {
         for child in pair.into_inner() {
-            collect_value_keys(child, parent, file, source, directives, out);
+            collect_value_keys(child, parent, file, source, out);
         }
     }
 }
@@ -1180,8 +1166,12 @@ impl SyntaxInventory {
         pairs: Pairs<'_, Rule>,
         file: &PreprocessedFile,
         source: &Path,
-    ) -> (Self, ClassifiedResourceDirectives) {
-        let directives = ClassifiedResourceDirectives::from_pairs(pairs.clone(), file, source);
+    ) -> (
+        Self,
+        Vec<Located<crate::validation::ResourceDirectiveFinding>>,
+    ) {
+        let directive_findings =
+            super::resource_body::directive_findings(pairs.clone(), file, source);
         let expressions = super::retained::Expressions::from_pairs(pairs.clone(), file, source);
         let declarations = declaration_inventory(pairs.clone(), file, source);
         use crate::validation::{
@@ -1320,7 +1310,6 @@ impl SyntaxInventory {
                     &[super::AttributePathSegment::Attribute(name.to_string())],
                     file,
                     source,
-                    &directives,
                     &mut attributes,
                 );
             }
@@ -1363,8 +1352,7 @@ impl SyntaxInventory {
                         .flatten()
                         .filter(|p| p.as_rule() == Rule::upstream_state_expr)
                     {
-                        let elements =
-                            ElementLocations::from_pair(&upstream, file, source, &directives);
+                        let elements = ElementLocations::from_pair(&upstream, file, source);
                         for (kind, location) in elements.values {
                             if kind == ElementKind::Source {
                                 out.upstream_sources
@@ -1375,6 +1363,6 @@ impl SyntaxInventory {
                 }
             }
         }
-        (out, directives)
+        (out, directive_findings)
     }
 }

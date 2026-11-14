@@ -308,10 +308,10 @@ pub fn parse_syntax_inventory(
     let parse = || {
         let file = super::preprocess_file(input)?;
         let pairs = file.parse()?;
-        let (syntax, directives) = super::SyntaxInventory::from_pairs(pairs, &file, path);
+        let (syntax, directive_findings) = super::SyntaxInventory::from_pairs(pairs, &file, path);
         let mut metadata = ParserBindingMetadata::default();
         metadata.syntax = Box::new(syntax);
-        metadata.directive_findings = directives.findings();
+        metadata.directive_findings = directive_findings;
         Ok(metadata)
     };
     parse().map_err(|error| Box::new(super::FileScoped::new(path, error)))
@@ -990,7 +990,7 @@ fn parse_with_seeded_bindings_inner(
 ) -> Result<ParsedFile, super::resolve::RootInputFailure> {
     let preprocessed_file = Arc::new(super::preprocess_file(input)?);
     let pairs = preprocessed_file.parse()?;
-    let (mut syntax, resource_directives) =
+    let (mut syntax, directive_findings) =
         super::SyntaxInventory::from_pairs(pairs.clone(), &preprocessed_file, source_file);
     // Bootstrap passes use provisional sibling names and exist only to
     // classify declarations. The final pass both emits source warnings and
@@ -1003,7 +1003,6 @@ fn parse_with_seeded_bindings_inner(
 
     let mut ctx = ParseContext::new(config, source_file, Arc::clone(&preprocessed_file));
     ctx.set_authored_nodes(syntax.expressions().captured_nodes());
-    ctx.resource_directives = Arc::new(resource_directives);
     ctx.defer_provisional_static_conditions = !bindings_fully_classified;
     ctx.extend_warnings(single_quote_warnings);
     seed_bindings(&mut ctx, seeds);
@@ -1380,7 +1379,7 @@ fn parse_with_seeded_bindings_inner(
     // `get_variable`, so the closure was already available where it
     // mattered.
     let mut parser_binding_metadata = ParserBindingMetadata::default();
-    parser_binding_metadata.directive_findings = ctx.resource_directives.findings();
+    parser_binding_metadata.directive_findings = directive_findings;
     for (name, binding) in &ctx.bindings {
         // Directory seeds are context, not declarations owned by this file.
         // In particular a provisional seed means only "this name exists";
