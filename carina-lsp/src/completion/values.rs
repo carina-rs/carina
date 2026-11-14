@@ -13,8 +13,8 @@ use carina_core::paths::{CanonicalPath, ResolvedPath};
 use carina_core::provider_text::DiagnosticText;
 use carina_core::resource::EnumValueResolver;
 use carina_core::schema::{
-    AssignmentSink, CompiledAttributeType as AttributeType, EffectiveType, SchemaRegistry, Shape,
-    TypeIdentity, TypeInSchema,
+    AssignmentSink, CompiledAttributeType as AttributeType, EffectiveType, SchemaKind,
+    SchemaRegistry, Shape, TypeIdentity, TypeInSchema,
 };
 use carina_core::static_type::{
     ConsumerExportStaticType, ConsumerInferredUncheckedReason, InferenceError, NotInferableReason,
@@ -252,6 +252,7 @@ fn type_expr_source_is_assignable_to(
 struct BindingDotContext {
     binding_name: String,
     resource_type: String,
+    kind: SchemaKind,
 }
 
 /// Caller mode for [`CompletionProvider::in_scope_binding_completions`].
@@ -357,6 +358,7 @@ impl CompletionProvider {
             .attribute_params
             .iter()
             .find(|attribute| attribute.name == output_name)?;
+        // Resource capabilities and Ref annotations denote managed resources.
         let resource_type = output
             .value
             .as_ref()
@@ -365,7 +367,9 @@ impl CompletionProvider {
             .or_else(|| match output.static_type.as_ref() {
                 Some(TypeExpr::Ref(path)) => Some(path.to_string()),
                 Some(TypeExpr::DottedUnresolved(path))
-                    if self.lookup_schema(&path.to_string()).is_some() =>
+                    if self
+                        .lookup_schema(&path.to_string(), SchemaKind::Resource)
+                        .is_some() =>
                 {
                     Some(path.to_string())
                 }
@@ -391,6 +395,7 @@ impl CompletionProvider {
         Some(self.binding_attribute_completions(
             &format!("{call_binding}.{output_name}"),
             &resource_type,
+            SchemaKind::Resource,
             Range::new(Position::new(position.line, start_character), position),
         ))
     }
@@ -398,6 +403,7 @@ impl CompletionProvider {
     pub(super) fn attribute_completions_for_type(
         &self,
         resource_type: &str,
+        kind: SchemaKind,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
 
@@ -409,7 +415,7 @@ impl CompletionProvider {
         };
 
         // Get schema for specific resource type
-        if let Some(schema) = self.lookup_schema(resource_type) {
+        if let Some(schema) = self.lookup_schema(resource_type, kind) {
             for attr in schema.effective_attributes().filter(|a| !a.is_read_only()) {
                 let detail = attr.description().map(str::to_owned);
                 let required_marker = if attr.is_required() {
@@ -487,8 +493,9 @@ impl CompletionProvider {
         let schema_target = match target {
             AttributeValueTarget::SchemaAttribute {
                 resource_type,
+                kind,
                 attr_name,
-            } => self.lookup_schema(resource_type).and_then(|schema| {
+            } => self.lookup_schema(resource_type, *kind).and_then(|schema| {
                 schema
                     .schema()
                     .as_schema()
@@ -507,6 +514,7 @@ impl CompletionProvider {
             return self.binding_attribute_completions(
                 &dot_binding.binding_name,
                 &dot_binding.resource_type,
+                dot_binding.kind,
                 ref_edit_range,
             );
         }
@@ -548,14 +556,16 @@ impl CompletionProvider {
         // for upstream bindings and intentionally omitted.
         if let Some((_, schema, attr_schema)) = schema_target {
             if let Some(target_name) = Self::extract_custom_type_name(attr_schema.attr_type()) {
-                for (binding_name, binding_resource_type) in &self.extract_resource_bindings(src) {
+                for (binding_name, binding_resource_type, kind) in
+                    &self.extract_resource_bindings(src)
+                {
                     if binding_resource_type.is_empty() {
                         continue;
                     }
                     if current_binding.is_some_and(|cb| cb == binding_name) {
                         continue;
                     }
-                    if let Some(binding_schema) = self.lookup_schema(binding_resource_type) {
+                    if let Some(binding_schema) = self.lookup_schema(binding_resource_type, *kind) {
                         for binding_attr in
                             binding_schema.schema().as_schema().attributes().values()
                         {
@@ -836,7 +846,7 @@ impl CompletionProvider {
             return None;
         }
 
-        for (binding_name, binding_resource_type) in &self.extract_resource_bindings(src) {
+        for (binding_name, binding_resource_type, kind) in &self.extract_resource_bindings(src) {
             if binding_name == candidate_binding && !binding_resource_type.is_empty() {
                 // Skip self-references
                 if current_binding.is_some_and(|cb| cb == binding_name) {
@@ -845,6 +855,7 @@ impl CompletionProvider {
                 return Some(BindingDotContext {
                     binding_name: binding_name.clone(),
                     resource_type: binding_resource_type.clone(),
+                    kind: *kind,
                 });
             }
         }
@@ -858,10 +869,11 @@ impl CompletionProvider {
         &self,
         binding_name: &str,
         binding_resource_type: &str,
+        kind: SchemaKind,
         edit_range: Range,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
-        if let Some(schema) = self.lookup_schema(binding_resource_type) {
+        if let Some(schema) = self.lookup_schema(binding_resource_type, kind) {
             for attr in schema.schema().as_schema().attributes().values() {
                 let full_ref = format!("{}.{}", binding_name, attr.name());
                 completions.push(CompletionItem {
@@ -1205,6 +1217,7 @@ impl CompletionProvider {
     pub(super) fn directives_ignore_changes_completions(
         &self,
         resource_type: &str,
+        kind: SchemaKind,
     ) -> Vec<CompletionItem> {
         fn push_nested_paths(
             value_type: EffectiveType<'_>,
@@ -1247,7 +1260,7 @@ impl CompletionProvider {
             }
         }
 
-        let Some(schema) = self.lookup_schema(resource_type) else {
+        let Some(schema) = self.lookup_schema(resource_type, kind) else {
             return Vec::new();
         };
         let mut labels = std::collections::BTreeSet::new();
@@ -1511,7 +1524,7 @@ impl CompletionProvider {
     ) -> std::collections::HashSet<String> {
         self.extract_resource_bindings(src)
             .into_iter()
-            .filter_map(|(name, resource_type)| (!resource_type.is_empty()).then_some(name))
+            .filter_map(|(name, resource_type, _kind)| (!resource_type.is_empty()).then_some(name))
             .collect()
     }
 
@@ -1995,11 +2008,11 @@ impl CompletionProvider {
         let mut items: Vec<CompletionItem> = Vec::new();
         let mut src_buf = String::new();
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
-        for (binding_name, resource_type) in self.extract_resource_bindings(src) {
+        for (binding_name, resource_type, kind) in self.extract_resource_bindings(src) {
             if resource_type.is_empty() {
                 continue;
             }
-            let Some(schema) = self.lookup_schema(&resource_type) else {
+            let Some(schema) = self.lookup_schema(&resource_type, kind) else {
                 continue;
             };
             for attr in schema.schema().as_schema().attributes().values() {

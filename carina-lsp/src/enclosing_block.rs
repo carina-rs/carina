@@ -1,69 +1,71 @@
-use carina_core::schema::SchemaRegistry;
+use carina_core::parser::ResourceTypePath;
+use carina_core::schema::SchemaKind;
 use tower_lsp::lsp_types::Position;
 
-use crate::lex::{LexKind, lex};
+use crate::lex::{LexKind, LexedDocument, lex};
 
-/// Schema keys in the only ordering that source matching may use.
-///
-/// Keeping the sorted, deduplicated list behind this type prevents hover and
-/// completion from rebuilding subtly different resource-header matchers.
-pub(crate) struct ResourceTypePatterns(Vec<String>);
-
-struct ResourceHeader<'a> {
-    resource_type: &'a str,
+pub(crate) struct ResourceHeader {
+    pub(crate) resource_type: ResourceTypePath,
+    pub(crate) kind: SchemaKind,
     binding: Option<String>,
+    is_block_header: bool,
 }
 
-impl ResourceTypePatterns {
-    pub(crate) fn from_schemas(schemas: &SchemaRegistry) -> Self {
-        let mut patterns: Vec<String> = schemas
-            .iter()
-            .map(|(provider, resource_type, _kind, _schema)| {
-                if provider.is_empty() {
-                    resource_type.to_string()
-                } else {
-                    format!("{provider}.{resource_type}")
-                }
-            })
-            .collect();
-        patterns.sort();
-        patterns.dedup();
-        patterns.sort_by_key(|pattern| std::cmp::Reverse(pattern.len()));
-        Self(patterns)
+/// Parse the complete type-path token at the cursor (or before a block opener).
+/// Only the preceding code token `read` selects a data source; masked trivia may
+/// span physical lines. Schema registration never affects this syntax decision.
+pub(crate) fn resource_header(lexed: &LexedDocument, position: Position) -> Option<ResourceHeader> {
+    let line_index = position.line as usize;
+    let code = lexed.lines().get(line_index)?.masked_code();
+    let code = code.as_str();
+    let is_path_char = |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.');
+    let offset = crate::position::line_prefix(code, position.character).len();
+    let end = offset
+        + code[offset..]
+            .find(|ch| !is_path_char(ch))
+            .unwrap_or(code.len() - offset);
+    let before_end = code[..end].trim_end();
+    let start = before_end
+        .rmatch_indices(|ch| !is_path_char(ch))
+        .next()
+        .map_or(0, |(index, ch)| index + ch.len());
+    let token = &before_end[start..];
+    if !token.split('.').all(is_module_identifier) {
+        return None;
     }
-
-    pub(crate) fn find_in<'a>(&'a self, segment: &str) -> Option<&'a str> {
-        self.0
-            .iter()
-            .find(|pattern| segment.contains(pattern.as_str()))
-            .map(String::as_str)
+    let resource_type = ResourceTypePath::parse(token)?;
+    let mut before_type = code[..start].trim_end().to_string();
+    let mut previous_line = line_index;
+    while before_type.is_empty() && previous_line > 0 {
+        previous_line -= 1;
+        before_type = lexed.lines()[previous_line]
+            .masked_code()
+            .as_str()
+            .trim_end()
+            .to_string();
     }
-
-    fn resource_header<'a>(&'a self, segment: &str) -> Option<ResourceHeader<'a>> {
-        let trimmed = segment.trim();
-        let assignment = parse_let_assignment(trimmed);
-        let (binding, after_binding) = match assignment {
-            Some(assignment) => (Some(assignment.binding.to_string()), assignment.expression),
-            None => (None, trimmed),
-        };
-        let candidate = strip_keyword(after_binding, "read")
-            .unwrap_or(after_binding)
-            .trim();
-
-        self.0
-            .iter()
-            .find(|pattern| candidate == pattern.as_str())
-            .map(|pattern| ResourceHeader {
-                resource_type: pattern,
-                binding,
-            })
-    }
+    let (kind, before_expression) = match before_type
+        .strip_suffix("read")
+        .filter(|prefix| !prefix.ends_with(is_path_char))
+    {
+        Some(prefix) => (SchemaKind::DataSource, prefix),
+        None => (SchemaKind::Resource, &code[..start]),
+    };
+    let prefix = before_expression.rsplit(['{', '}', ',']).next()?.trim();
+    let assignment = parse_let_assignment(prefix).filter(|a| a.expression.is_empty());
+    Some(ResourceHeader {
+        resource_type,
+        kind,
+        binding: assignment.as_ref().map(|a| a.binding.to_string()),
+        is_block_header: prefix.is_empty() || assignment.is_some(),
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum EnclosingBlock {
     Resource {
         resource_type: String,
+        kind: SchemaKind,
         struct_path: StructPath,
         binding: Option<String>,
     },
@@ -109,6 +111,7 @@ struct LineSegment {
 enum BraceOpener {
     Resource {
         resource_type: String,
+        kind: SchemaKind,
         binding: Option<String>,
     },
     Path(PathSegment),
@@ -144,11 +147,7 @@ struct PathSegment {
 /// Classify the block enclosing `position` with one lexer-aware backwards walk.
 /// Only ordinary code punctuation is structural: interpolation expressions,
 /// strings, comments, and heredoc bodies are deliberately invisible here.
-pub(crate) fn enclosing_block(
-    text: &str,
-    position: Position,
-    resource_types: &ResourceTypePatterns,
-) -> EnclosingBlock {
+pub(crate) fn enclosing_block(text: &str, position: Position) -> EnclosingBlock {
     let lexed = lex(text);
     let source_lines: Vec<&str> = text
         .split('\n')
@@ -214,10 +213,20 @@ pub(crate) fn enclosing_block(
                         char_index,
                         SegmentScanMode::BeforeOpener,
                     );
+                    let header = resource_header(
+                        &lexed,
+                        Position::new(
+                            line_index as u32,
+                            crate::position::char_offset_to_utf16_offset(
+                                source_lines[line_index],
+                                char_index,
+                            ),
+                        ),
+                    );
                     match pending_element {
                         PendingElement::None => {}
                         PendingElement::Unnamed => {
-                            match classify_brace_opener(&segment, resource_types) {
+                            match classify_brace_opener(&segment, header.as_ref()) {
                                 BraceOpener::Path(PathSegment {
                                     name,
                                     syntax: SegmentSyntax::Assignment,
@@ -236,10 +245,12 @@ pub(crate) fn enclosing_block(
                                 BraceOpener::ControlFlow => continue,
                                 BraceOpener::Resource {
                                     resource_type,
+                                    kind,
                                     binding,
                                 } => {
                                     return EnclosingBlock::Resource {
                                         resource_type,
+                                        kind,
                                         struct_path: StructPath::Unresolvable,
                                         binding,
                                     };
@@ -257,13 +268,15 @@ pub(crate) fn enclosing_block(
                             }
                         }
                     }
-                    match classify_brace_opener(&segment, resource_types) {
+                    match classify_brace_opener(&segment, header.as_ref()) {
                         BraceOpener::Resource {
                             resource_type,
+                            kind,
                             binding,
                         } => {
                             return EnclosingBlock::Resource {
                                 resource_type,
+                                kind,
                                 struct_path: resource_struct_path(reverse_path),
                                 binding,
                             };
@@ -488,14 +501,12 @@ fn parse_list_attribute_segment(segment: &LineSegment) -> Option<PathSegment> {
     })
 }
 
-fn classify_brace_opener(
-    segment: &LineSegment,
-    resource_types: &ResourceTypePatterns,
-) -> BraceOpener {
-    if let Some(header) = resource_types.resource_header(&segment.code) {
+fn classify_brace_opener(segment: &LineSegment, header: Option<&ResourceHeader>) -> BraceOpener {
+    if let Some(header) = header.filter(|header| header.is_block_header) {
         BraceOpener::Resource {
             resource_type: header.resource_type.to_string(),
-            binding: header.binding,
+            kind: header.kind,
+            binding: header.binding.clone(),
         }
     } else if is_else_segment(&segment.code) {
         BraceOpener::Else

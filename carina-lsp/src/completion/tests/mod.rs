@@ -11,6 +11,153 @@ use carina_core::schema::{
 mod basic;
 mod extended;
 
+fn schema_selection_completions(source: &str) -> Vec<CompletionItem> {
+    let cursor = source.find('|').unwrap();
+    let source = source.replacen('|', "", 1);
+    let position = crate::position::byte_offset_to_position(&source, cursor).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("main.crn"), &source).unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    let doc = Document::new_with_path(
+        source,
+        directory.path().join("main.crn"),
+        Arc::new(ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
+    );
+    let mut schemas = SchemaRegistry::new();
+    for (name, kind, attribute, description) in [
+        (
+            "ec2.Vpc",
+            SchemaKind::Resource,
+            "managed_only",
+            "Managed VPC",
+        ),
+        ("ec2.Vpc", SchemaKind::DataSource, "filter", "Existing VPC"),
+        (
+            "ec2.VpcEndpoint",
+            SchemaKind::Resource,
+            "endpoint_only",
+            "Endpoint",
+        ),
+        (
+            "ec2.ManagedOnly",
+            SchemaKind::Resource,
+            "filter",
+            "Managed only",
+        ),
+        (
+            "ec2.LookupOnly",
+            SchemaKind::DataSource,
+            "filter",
+            "Lookup only",
+        ),
+    ] {
+        let schema = ResourceSchema::new(name)
+            .attribute(AttributeSchema::optional(attribute, AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("shared", AttributeType::string())
+                    .with_description(description)
+                    .build(),
+            );
+        let schema = if kind == SchemaKind::DataSource {
+            schema.as_data_source()
+        } else {
+            schema
+        };
+        schemas.insert("mock", schema.validate().unwrap());
+    }
+    CompletionProvider::new(Arc::new(schemas), vec!["mock".into()], vec![], vec![])
+        .complete_for_test(&doc, position, Some(directory.path()))
+}
+
+#[test]
+fn schema_selection_read_attribute_completion() {
+    let items = schema_selection_completions("let v = read mock.ec2.Vpc {\n  |\n}");
+    assert!(items.iter().any(|item| item.label == "filter"), "{items:?}");
+    assert!(
+        !items.iter().any(|item| item.label == "managed_only"),
+        "{items:?}"
+    );
+    assert_eq!(
+        find_completion(&items, "shared").detail.as_deref(),
+        Some("Existing VPC")
+    );
+}
+
+#[test]
+fn schema_selection_multiline_attribute_completion() {
+    for header in [
+        "read\n mock.ec2.Vpc",
+        "read // lookup\n /* read mock.ec2.ManagedOnly */\n mock.ec2.Vpc",
+        "read /* lookup */ mock.ec2.Vpc",
+    ] {
+        let source = format!("let v = {header} {{\n  |\n}}");
+        let items = schema_selection_completions(&source);
+        assert!(
+            items.iter().any(|item| item.label == "filter"),
+            "{source}: {items:?}"
+        );
+        assert!(
+            !items.iter().any(|item| item.label == "managed_only"),
+            "{source}: {items:?}"
+        );
+        assert_eq!(
+            find_completion(&items, "shared").detail.as_deref(),
+            Some("Existing VPC")
+        );
+    }
+}
+
+#[test]
+fn schema_selection_attribute_completion_requires_exact_kind() {
+    for header in ["read mock.ec2.ManagedOnly", "mock.ec2.LookupOnly"] {
+        let source = format!("let v = {header} {{\n  |\n}}");
+        let items = schema_selection_completions(&source);
+        assert!(
+            !items.iter().any(|item| item.label == "filter"),
+            "{source}: {items:?}"
+        );
+    }
+}
+
+#[test]
+fn schema_selection_exact_path_completion() {
+    let items = schema_selection_completions("let x = mock.ec2.VpcEndpointMissing {\n  |\n}");
+    assert!(
+        !items.iter().any(|item| item.label == "endpoint_only"),
+        "{items:?}"
+    );
+    // Exercise extract_resource_type as well as the enclosing-block walk.
+    let items = schema_selection_completions(
+        "let x = mock.ec2.VpcEndpointMissing {}\nlet v = mock.ec2.Vpc {\n  shared = x.|\n}",
+    );
+    assert!(
+        !items.iter().any(|item| item.label == "x.endpoint_only"),
+        "{items:?}"
+    );
+}
+
+#[test]
+fn schema_selection_completion_ignores_read_in_comments_and_strings() {
+    for header in [
+        "/* read */ mock.ec2.Vpc",
+        "'read'\n mock.ec2.Vpc",
+        "already_read\n mock.ec2.Vpc",
+    ] {
+        let source = format!("let v = {header} {{\n  |\n}}");
+        let items = schema_selection_completions(&source);
+        assert!(
+            items.iter().any(|item| item.label == "managed_only"),
+            "{source}: {items:?}"
+        );
+        assert!(
+            !items.iter().any(|item| item.label == "filter"),
+            "{source}: {items:?}"
+        );
+    }
+}
+
 #[test]
 fn loaded_schema_lookup_rejects_cross_provider_identity_mismatch() {
     let context = carina_core::parser::LoadedProviderContext::empty_for_test();
@@ -48,24 +195,27 @@ fn loaded_schema_lookup_rejects_cross_provider_identity_mismatch() {
             .unwrap(),
     );
     let provider = CompletionProvider::new(Arc::new(schemas), vec!["gcp".into()], vec![], vec![]);
-    for key in ["gcp.Cloud", "Cloud"] {
-        let schema = provider
-            .lookup_schema(key)
-            .expect("registered schema must retain its owner");
-        assert_eq!(schema.owner(), "gcp");
-        let sink = schema.as_schema().attributes()["region"].attr_type();
-        assert_eq!(
-            carina_core::schema::TypeInSchema::schemaless(&source)
-                .assignment_to(schema.assignment_sink(sink, &context.custom_types))
-                .require_loaded(),
-            Ok(false),
-            "{key}: loaded cross-provider mismatches must not report ProvidersNotLoaded",
-        );
-    }
+    assert!(
+        provider
+            .lookup_schema("Cloud", SchemaKind::Resource)
+            .is_none()
+    );
+    let schema = provider
+        .lookup_schema("gcp.Cloud", SchemaKind::Resource)
+        .expect("registered schema must retain its owner");
+    assert_eq!(schema.owner(), "gcp");
+    let sink = schema.as_schema().attributes()["region"].attr_type();
+    assert_eq!(
+        carina_core::schema::TypeInSchema::schemaless(&source)
+            .assignment_to(schema.assignment_sink(sink, &context.custom_types))
+            .require_loaded(),
+        Ok(false),
+        "loaded cross-provider mismatches must not report ProvidersNotLoaded",
+    );
 }
 
 #[test]
-fn unqualified_schema_lookup_retains_the_registered_owner() {
+fn qualified_schema_lookup_retains_the_registered_owner_and_kind() {
     for kind in [SchemaKind::Resource, SchemaKind::DataSource] {
         let mut schemas = SchemaRegistry::new();
         let schema = match kind {
@@ -74,7 +224,16 @@ fn unqualified_schema_lookup_retains_the_registered_owner() {
         };
         schemas.insert("gcp", schema.validate().unwrap());
         let provider = CompletionProvider::new(Arc::new(schemas), vec![], vec![], vec![]);
-        assert_eq!(provider.lookup_schema("Cloud").unwrap().owner(), "gcp");
+        assert_eq!(
+            provider.lookup_schema("gcp.Cloud", kind).unwrap().owner(),
+            "gcp"
+        );
+        assert!(provider.lookup_schema("Cloud", kind).is_none());
+        let other_kind = match kind {
+            SchemaKind::Resource => SchemaKind::DataSource,
+            SchemaKind::DataSource => SchemaKind::Resource,
+        };
+        assert!(provider.lookup_schema("gcp.Cloud", other_kind).is_none());
     }
 }
 
@@ -85,8 +244,18 @@ fn unqualified_schema_lookup_does_not_choose_between_owners() {
         schemas.insert(owner, ResourceSchema::new("Cloud").validate().unwrap());
     }
     let provider = CompletionProvider::new(Arc::new(schemas), vec![], vec![], vec![]);
-    assert!(provider.lookup_schema("Cloud").is_none());
-    assert_eq!(provider.lookup_schema("gcp.Cloud").unwrap().owner(), "gcp");
+    assert!(
+        provider
+            .lookup_schema("Cloud", SchemaKind::Resource)
+            .is_none()
+    );
+    assert_eq!(
+        provider
+            .lookup_schema("gcp.Cloud", SchemaKind::Resource)
+            .unwrap()
+            .owner(),
+        "gcp"
+    );
 }
 
 impl CompletionProvider {

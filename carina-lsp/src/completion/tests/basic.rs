@@ -653,7 +653,11 @@ outer {
 fn shared_definition_fields_are_offered_only_on_the_writable_reference_path() {
     let provider = test_provider_with_shared_definition_paths();
 
-    let writable = provider.struct_field_completions("test.shared.resource", &["tags".to_string()]);
+    let writable = provider.struct_field_completions(
+        "test.shared.resource",
+        SchemaKind::Resource,
+        &["tags".to_string()],
+    );
     assert_eq!(
         writable
             .iter()
@@ -662,8 +666,11 @@ fn shared_definition_fields_are_offered_only_on_the_writable_reference_path() {
         vec!["key"]
     );
 
-    let read_only =
-        provider.struct_field_completions("test.shared.resource", &["effective_tags".to_string()]);
+    let read_only = provider.struct_field_completions(
+        "test.shared.resource",
+        SchemaKind::Resource,
+        &["effective_tags".to_string()],
+    );
     assert!(
         read_only.is_empty(),
         "a provider-populated path must not offer its declared-required field"
@@ -770,6 +777,7 @@ security_group_ingress {
             context,
             CompletionContext::InsideStructBlock {
                 ref resource_type,
+                kind: SchemaKind::Resource,
                 ref attr_path,
             } if resource_type == "awscc.ec2.SecurityGroup" && attr_path == &["security_group_ingress".to_string()]
         ),

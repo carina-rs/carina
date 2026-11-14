@@ -343,12 +343,20 @@ impl CompletionProvider {
 
     /// Extract resource binding names and their resource types from `src`
     /// (variables defined with `let binding_name = awscc.ec2.Vpc {`).
-    /// Returns Vec<(binding_name, resource_type)> where resource_type is the schema key
-    /// (e.g., "awscc.ec2.Vpc"). See [`DslSource`] for buffer-vs-directory choice.
-    pub(super) fn extract_resource_bindings(&self, src: DslSource<'_>) -> Vec<(String, String)> {
+    /// Returns `(binding_name, exact_type_path, syntax_kind)` entries.
+    /// See [`DslSource`] for buffer-vs-directory choice.
+    pub(super) fn extract_resource_bindings(
+        &self,
+        src: DslSource<'_>,
+    ) -> Vec<(String, String, super::SchemaKind)> {
         Self::extract_let_bindings(src)
             .into_iter()
-            .map(|(name, rhs)| (name, self.extract_resource_type(&rhs).unwrap_or_default()))
+            .map(|(name, rhs)| {
+                let (path, kind) = self
+                    .extract_resource_type(&rhs)
+                    .unwrap_or_else(|| (String::new(), super::SchemaKind::Resource));
+                (name, path, kind)
+            })
             .collect()
     }
 
