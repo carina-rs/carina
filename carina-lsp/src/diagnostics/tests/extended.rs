@@ -17881,7 +17881,7 @@ fn review_r7_skipped_lookup_does_not_suppress_a_list_constraint() {
     );
 }
 
-fn widening_member_obligation_parity(decoded: bool) {
+fn widening_member_obligation_lsp_validate_parity(decoded: bool) {
     use carina_core::binding_index::BindingIndex;
     use carina_core::schema::{
         AttributeSchema, AttributeType, PatternMatch, PatternSpec, ResourceSchema,
@@ -18000,59 +18000,53 @@ fn widening_member_obligation_parity(decoded: bool) {
         "{diagnostics:#?}"
     );
 
-    carina_core::validation::deferred_types::with_session_for_test(
-        &engine.provider_context,
-        |_session| {
-            let long = format!("arn:aws:iam::123456789012:role/{}", "A".repeat(1600));
-            for (raw, failure) in [
-                ("bad", Some("does not match required pattern")),
-                (&long, Some("outside allowed range")),
-                ("arn:aws:iam::123456789012:role/Good", None),
-            ] {
-                let literal_source =
-                    source.replace("producer.arn", &serde_json::to_string(raw).unwrap());
-                let diagnostics = engine.analyze(&create_document(&literal_source), None);
-                let checked = carina_core::validation::validate_resources(
-                    &parse(&literal_source),
-                    &engine.schemas,
-                    &providers,
-                    &engine.provider_context,
-                    &mut Vec::new(),
+    let long = format!("arn:aws:iam::123456789012:role/{}", "A".repeat(1600));
+    for (raw, failure) in [
+        ("bad", Some("does not match required pattern")),
+        (&long, Some("outside allowed range")),
+        ("arn:aws:iam::123456789012:role/Good", None),
+    ] {
+        let literal_source = source.replace("producer.arn", &serde_json::to_string(raw).unwrap());
+        let diagnostics = engine.analyze(&create_document(&literal_source), None);
+        let checked = carina_core::validation::validate_resources(
+            &parse(&literal_source),
+            &engine.schemas,
+            &providers,
+            &engine.provider_context,
+            &mut Vec::new(),
+        );
+        match failure {
+            None => {
+                checked.unwrap();
+                assert!(
+                    !diagnostics.iter().any(|d| d.message.contains("role_arn")),
+                    "{diagnostics:#?}"
                 );
-                match failure {
-                    None => {
-                        checked.unwrap();
-                        assert!(
-                            !diagnostics.iter().any(|d| d.message.contains("role_arn")),
-                            "{diagnostics:#?}"
-                        );
-                    }
-                    Some(fragment) => {
-                        let message = checked.unwrap_err();
-                        assert_eq!(message.matches(fragment).count(), 1, "{message}");
-                        assert_eq!(
-                            diagnostics
-                                .iter()
-                                .filter(|d| d.message.contains(fragment))
-                                .count(),
-                            1,
-                            "{diagnostics:#?}"
-                        );
-                    }
-                }
             }
-        },
-    );
+            Some(fragment) => {
+                let message = checked.unwrap_err();
+                assert_eq!(message.matches(fragment).count(), 1, "{message}");
+                assert_eq!(
+                    diagnostics
+                        .iter()
+                        .filter(|d| d.message.contains(fragment))
+                        .count(),
+                    1,
+                    "{diagnostics:#?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
-fn widening_member_obligation_has_lsp_validate_and_resolved_value_parity() {
-    widening_member_obligation_parity(false);
+fn widening_member_obligation_has_lsp_validate_parity() {
+    widening_member_obligation_lsp_validate_parity(false);
 }
 
 #[test]
 fn decoded_widening_member_obligation_has_lsp_validate_parity() {
-    widening_member_obligation_parity(true);
+    widening_member_obligation_lsp_validate_parity(true);
 }
 
 #[test]

@@ -1,3 +1,4 @@
+// Boundary/directory must stay in sync with carina-core/tests/support/refined_destinations.rs.
 //! Directory-backed forwarding boundaries. Authored annotations name an
 //! identity; the final schema slot owns its separate member constraints.
 use crate::{
@@ -179,6 +180,7 @@ pub fn check(
 }
 
 mod fixture {
+    // Factory schemas must stay in sync with carina-core/tests/support/refined_annotations.rs.
     use crate::{
         provider::{
             BoxFuture, CanonicalProviderConfigAttributes, InitializeOutcomeMint,

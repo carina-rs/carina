@@ -1071,15 +1071,15 @@ impl AdmissionErrors {
 /// assignment applies; a raw value cannot supply reference-origin evidence.
 ///
 /// ```
-/// use carina_core::{resource::Value, validation::admission::Candidate};
+/// use carina_core::validation::admission::Candidate;
 /// fn inspect(value: Candidate) {
-///     let _: Candidate = value;
+///     let _: Candidate = value.into();
 /// }
 /// ```
-/// ```compile_fail,E0308
+/// ```compile_fail,E0277
 /// use carina_core::{resource::Value, validation::admission::Candidate};
 /// fn bypass(value: Value) {
-///     let _: Candidate = value;
+///     let _: Candidate = value.into();
 /// }
 /// ```
 ///

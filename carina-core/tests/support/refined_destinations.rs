@@ -1,3 +1,4 @@
+// Boundary/directory must stay in sync with carina-core/src/validation/admission/tests/refined_destinations.rs.
 //! Directory-backed forwarding boundaries. Authored annotations name an
 //! identity; the final schema slot owns its separate member constraints.
 use super::fixture;

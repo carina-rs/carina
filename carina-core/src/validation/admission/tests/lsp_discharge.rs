@@ -310,10 +310,10 @@ fn widening_member_obligation_discharge_parity(decoded: bool) {
                 admit(&destination, candidate, &boundary)
             };
             let long = format!("arn:aws:iam::123456789012:role/{}", "A".repeat(1600));
-            for (raw, failure) in [
-                ("bad", Some("does not match required pattern")),
-                (&long, Some("outside allowed range")),
-                ("arn:aws:iam::123456789012:role/Good", None),
+            for (raw, accepted) in [
+                ("bad", false),
+                (&long, false),
+                ("arn:aws:iam::123456789012:role/Good", true),
             ] {
                 let pending = judge(&reference).unwrap().ready().unwrap_err();
                 assert!(pending.local_obligation().is_some());
@@ -324,23 +324,20 @@ fn widening_member_obligation_discharge_parity(decoded: bool) {
                     HashMap::from([("arn".into(), literal.clone())]),
                     BindingValueSource::Local,
                 );
-                match failure {
-                    None => {
-                        assert!(pending.discharge(&resolved, session).is_ok());
-                    }
-                    Some(_) => {
-                        let expected = judge(&target(literal)).unwrap_err();
-                        let error = pending.discharge(&resolved, session).unwrap_err();
-                        assert_eq!(error.resolution_error(), expected.resolution_error());
-                        assert_eq!(
-                            error
-                                .resolution_error()
-                                .to_string()
-                                .matches("target.role_arn")
-                                .count(),
-                            1
-                        );
-                    }
+                if accepted {
+                    assert!(pending.discharge(&resolved, session).is_ok());
+                } else {
+                    let expected = judge(&target(literal)).unwrap_err();
+                    let error = pending.discharge(&resolved, session).unwrap_err();
+                    assert_eq!(error.resolution_error(), expected.resolution_error());
+                    assert_eq!(
+                        error
+                            .resolution_error()
+                            .to_string()
+                            .matches("target.role_arn")
+                            .count(),
+                        1
+                    );
                 }
             }
         },
