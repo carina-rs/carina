@@ -2003,6 +2003,7 @@ async fn run_apply_with_observer_factory(
         .map_err(AppError::Backend)?
         .into();
 
+    // Must stay before acquire_lock and before operation providers are built.
     let validated_config = prepare_apply_storage(
         runtime,
         project,

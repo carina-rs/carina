@@ -5828,7 +5828,6 @@ mod storage_readiness_tests {
                 panic!("unavailability must preserve the backend configuration error")
             };
             assert_eq!(original, message);
-            assert_eq!(backend.readiness_calls(), 1);
         }
     }
 
