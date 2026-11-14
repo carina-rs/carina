@@ -80,6 +80,8 @@ use legacy_migration::DeferredForExpansionWitness;
 pub(crate) use legacy_migration::{
     MaterializedConfiguration, classify_legacy_state, replay_legacy_migration,
 };
+#[cfg(feature = "test-utils")]
+pub mod identity_probe;
 mod legacy_migration;
 
 use std::collections::hash_map::Entry;
