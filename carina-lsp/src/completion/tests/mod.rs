@@ -214,11 +214,12 @@ fn loaded_schema_lookup_rejects_cross_provider_identity_mismatch() {
     let provider = CompletionProvider::new(Arc::new(schemas), vec!["gcp".into()], vec![], vec![]);
     assert!(
         schema_selector("Cloud", SchemaKind::Resource)
-            .and_then(|selector| provider.lookup_schema(&selector))
+            .and_then(|selector| selector.lookup(&provider.schemas))
             .is_none()
     );
-    let schema = provider
-        .lookup_schema(&schema_selector("gcp.Cloud", SchemaKind::Resource).unwrap())
+    let schema = schema_selector("gcp.Cloud", SchemaKind::Resource)
+        .unwrap()
+        .lookup(&provider.schemas)
         .expect("registered schema must retain its owner");
     assert_eq!(schema.owner(), "gcp");
     let sink = schema.as_schema().attributes()["region"].attr_type();
@@ -242,15 +243,16 @@ fn qualified_schema_lookup_retains_the_registered_owner_and_kind() {
         schemas.insert("gcp", schema.validate().unwrap());
         let provider = CompletionProvider::new(Arc::new(schemas), vec![], vec![], vec![]);
         assert_eq!(
-            provider
-                .lookup_schema(&schema_selector("gcp.Cloud", kind).unwrap())
+            schema_selector("gcp.Cloud", kind)
+                .unwrap()
+                .lookup(&provider.schemas)
                 .unwrap()
                 .owner(),
             "gcp"
         );
         assert!(
             schema_selector("Cloud", kind)
-                .and_then(|selector| provider.lookup_schema(&selector))
+                .and_then(|selector| selector.lookup(&provider.schemas))
                 .is_none()
         );
         let other_kind = match kind {
@@ -258,8 +260,9 @@ fn qualified_schema_lookup_retains_the_registered_owner_and_kind() {
             SchemaKind::DataSource => SchemaKind::Resource,
         };
         assert!(
-            provider
-                .lookup_schema(&schema_selector("gcp.Cloud", other_kind).unwrap())
+            schema_selector("gcp.Cloud", other_kind)
+                .unwrap()
+                .lookup(&provider.schemas)
                 .is_none()
         );
     }
@@ -274,12 +277,13 @@ fn unqualified_schema_lookup_does_not_choose_between_owners() {
     let provider = CompletionProvider::new(Arc::new(schemas), vec![], vec![], vec![]);
     assert!(
         schema_selector("Cloud", SchemaKind::Resource)
-            .and_then(|selector| provider.lookup_schema(&selector))
+            .and_then(|selector| selector.lookup(&provider.schemas))
             .is_none()
     );
     assert_eq!(
-        provider
-            .lookup_schema(&schema_selector("gcp.Cloud", SchemaKind::Resource).unwrap())
+        schema_selector("gcp.Cloud", SchemaKind::Resource)
+            .unwrap()
+            .lookup(&provider.schemas)
             .unwrap()
             .owner(),
         "gcp"

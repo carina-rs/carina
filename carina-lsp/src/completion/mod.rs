@@ -20,8 +20,8 @@ use crate::enclosing_block::{
 };
 use carina_core::paths::ResolvedPath;
 use carina_core::schema::{
-    CompiledAttributeType as AttributeType, CompletionValue, OwnerBoundResourceSchema,
-    SchemaRegistry, Shape, ValidatedResourceSchema,
+    CompiledAttributeType as AttributeType, CompletionValue, SchemaRegistry, Shape,
+    ValidatedResourceSchema,
 };
 
 pub struct CompletionProvider {
@@ -69,13 +69,6 @@ impl CompletionProvider {
             region_completions_data,
             custom_type_names,
         }
-    }
-
-    pub(super) fn lookup_schema(
-        &self,
-        selector: &SchemaSelector,
-    ) -> Option<OwnerBoundResourceSchema<'_>> {
-        selector.lookup(&self.schemas)
     }
 
     pub fn complete(
@@ -656,7 +649,7 @@ impl CompletionProvider {
             arguments: None,
         };
 
-        if let Some(schema) = self.lookup_schema(selector) {
+        if let Some(schema) = selector.lookup(&self.schemas) {
             // Try struct field completions first
             if let Some(resolved) = schema.effective_node_at_authored_path(attr_path)
                 && !resolved.is_read_only()
@@ -768,7 +761,7 @@ impl CompletionProvider {
         } = target;
         let mut completions = Vec::new();
         let mut field_is_enum = false;
-        if let Some(schema) = self.lookup_schema(selector)
+        if let Some(schema) = selector.lookup(&self.schemas)
             && let Some(resolved) = schema.effective_node_at_authored_path(attr_path)
             && !resolved.is_read_only()
         {

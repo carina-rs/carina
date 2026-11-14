@@ -160,6 +160,23 @@ fn data_source_only_module_handle_completion() {
 }
 
 #[test]
+fn unregistered_module_output_type_falls_through_to_later_completers() {
+    let fixture = Fixture::new(
+        "let local_module = use { source = './local' }\nlet m = local_module {}\n",
+        "exports {}\n",
+    );
+    fixture.write("local/values.crn", "let value = 'non-handle'\n");
+    fixture.write(
+        "local/attributes.crn",
+        "attributes { out: foo.bar.Baz = value }\n",
+    );
+    let items = fixture.complete("exports.crn", "let x = m.out.|\n");
+    let labels = labels(&items);
+    assert!(labels.contains(&"let"), "{labels:?}");
+    assert!(labels.contains(&"mock.ec2.Vpc"), "{labels:?}");
+}
+
+#[test]
 fn data_source_only_module_origin_hover() {
     let fixture = module_fixture();
     let hover = fixture
@@ -638,7 +655,12 @@ fn completed_image_source(marked: &str, wrapped: bool, after_read: bool) -> Stri
     let Some(CompletionTextEdit::Edit(edit)) = &item.text_edit else {
         panic!("expected snippet edit: {item:?}")
     };
-    let expected_start = if wrapped {
+    let binding_in_additional_edit = item
+        .additional_text_edits
+        .iter()
+        .flatten()
+        .any(|edit| edit.new_text == "let ${1:name} = ");
+    let expected_start = if wrapped && !binding_in_additional_edit {
         "let ${1:name} = read mock.compute.Image {"
     } else if after_read {
         "mock.compute.Image {"
@@ -757,15 +779,10 @@ fn typed_read_keeps_path_filter_range() {
         };
         assert_eq!(edit.range.start, start);
         assert_eq!(item.filter_text.as_deref(), Some("mock.compute.Image"));
+        let expanded = completed_image_source(marked, true, true);
         if let Some(comment) = comment {
-            assert!(item.additional_text_edits.is_none(), "{item:?}");
-            let mut expanded = marked.replacen('|', "", 1);
-            let start = carina_lsp::position::position_to_byte_offset(&expanded, edit.range.start);
-            let end = carina_lsp::position::position_to_byte_offset(&expanded, edit.range.end);
-            expanded.replace_range(start..end, &edit.new_text);
             assert!(expanded.contains(comment), "{expanded}");
-        } else {
-            completed_image_source(marked, true, true);
+            assert!(expanded.starts_with("let img = read "), "{expanded}");
         }
     }
 }

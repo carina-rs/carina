@@ -61,6 +61,14 @@ impl CompletionProvider {
         let after_read = read_start.is_some();
         let in_control_flow_body = crate::enclosing_block::in_control_flow_body(&lexed, position);
         let expression_position = after_let_binding || in_control_flow_body;
+        let keep_read = read_start.is_some_and(|start| {
+            let start = crate::position::position_to_byte_offset(text, start) + 4;
+            let end = crate::position::position_to_byte_offset(text, replacement_range.start);
+            expression_position
+                || !text
+                    .get(start..end)
+                    .is_some_and(|between| between.trim().is_empty())
+        });
         let first_tab_stop = if expression_position { 1 } else { 2 };
         let read_snippet = wrap_read_snippet(
             &format!(
@@ -266,11 +274,7 @@ impl CompletionProvider {
                 .to_string();
 
             // Build snippet with required attributes
-            let snippet_type = if after_read && expression_position {
-                &path
-            } else {
-                &key
-            };
+            let snippet_type = if keep_read { &path } else { &key };
             let mut snippet = format!("{} {{\n", snippet_type);
             let mut tab_stop = if kind == SchemaKind::DataSource {
                 first_tab_stop
@@ -284,29 +288,29 @@ impl CompletionProvider {
                 }
             }
             snippet.push('}');
-            if kind == SchemaKind::DataSource {
+            if kind == SchemaKind::DataSource && !keep_read {
                 snippet = wrap_read_snippet(&snippet, expression_position);
             }
 
-            // Keep filtering scoped to the path the client is matching. A
-            // top-level wrapper replaces the earlier `read` in a separate edit,
-            // provided only whitespace lies between it and the path.
-            let additional_text_edits = read_start
-                .filter(|start| {
-                    let start = crate::position::position_to_byte_offset(text, *start) + 4;
-                    let end =
-                        crate::position::position_to_byte_offset(text, replacement_range.start);
-                    !expression_position && text[start..end].trim().is_empty()
-                })
-                .map(|start| {
-                    vec![TextEdit {
-                        range: Range {
-                            start,
-                            end: replacement_range.start,
+            // Keep filtering scoped to the path. Remove a whitespace-only `read`
+            // prefix, or insert the binding before it to preserve comments.
+            let additional_text_edits = read_start.filter(|_| !expression_position).map(|start| {
+                vec![TextEdit {
+                    range: Range {
+                        start,
+                        end: if keep_read {
+                            start
+                        } else {
+                            replacement_range.start
                         },
-                        new_text: String::new(),
-                    }]
-                });
+                    },
+                    new_text: if keep_read {
+                        "let ${1:name} = ".to_string()
+                    } else {
+                        String::new()
+                    },
+                }]
+            });
 
             completions.push(CompletionItem {
                 label: key.clone(),
@@ -416,7 +420,7 @@ impl CompletionProvider {
             .map(|(name, selector)| {
                 (
                     name,
-                    selector.filter(|selector| self.lookup_schema(selector).is_some()),
+                    selector.filter(|selector| selector.lookup(&self.schemas).is_some()),
                 )
             })
             .collect()

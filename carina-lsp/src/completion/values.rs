@@ -370,8 +370,10 @@ impl CompletionProvider {
             .and_then(carina_core::parser::BoundaryExpression::handle)
             .map(|handle| SchemaSelector::kindless(handle.resource_type().clone()))
             .or_else(|| match output.static_type.as_ref() {
-                Some(TypeExpr::Ref(path) | TypeExpr::DottedUnresolved(path)) => {
-                    Some(SchemaSelector::kindless(path.clone()))
+                Some(TypeExpr::Ref(path)) => Some(SchemaSelector::kindless(path.clone())),
+                Some(TypeExpr::DottedUnresolved(path)) => {
+                    let selector = SchemaSelector::kindless(path.clone());
+                    selector.lookup(&self.schemas).map(|_| selector)
                 }
                 Some(
                     TypeExpr::String
@@ -412,7 +414,7 @@ impl CompletionProvider {
         };
 
         // Get schema for specific resource type
-        if let Some(schema) = self.lookup_schema(selector) {
+        if let Some(schema) = selector.lookup(&self.schemas) {
             for attr in schema.effective_attributes().filter(|a| !a.is_read_only()) {
                 let detail = attr.description().map(str::to_owned);
                 let required_marker = if attr.is_required() {
@@ -491,7 +493,7 @@ impl CompletionProvider {
             AttributeValueTarget::SchemaAttribute {
                 selector,
                 attr_name,
-            } => self.lookup_schema(selector).and_then(|schema| {
+            } => selector.lookup(&self.schemas).and_then(|schema| {
                 schema
                     .schema()
                     .as_schema()
@@ -556,7 +558,7 @@ impl CompletionProvider {
                     if current_binding.is_some_and(|cb| cb == binding_name) {
                         continue;
                     }
-                    if let Some(binding_schema) = self.lookup_schema(&selector) {
+                    if let Some(binding_schema) = selector.lookup(&self.schemas) {
                         for binding_attr in
                             binding_schema.schema().as_schema().attributes().values()
                         {
@@ -868,7 +870,7 @@ impl CompletionProvider {
         edit_range: Range,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
-        if let Some(schema) = self.lookup_schema(selector) {
+        if let Some(schema) = selector.lookup(&self.schemas) {
             for attr in schema.schema().as_schema().attributes().values() {
                 let full_ref = format!("{}.{}", binding_name, attr.name());
                 completions.push(CompletionItem {
@@ -1254,7 +1256,7 @@ impl CompletionProvider {
             }
         }
 
-        let Some(schema) = self.lookup_schema(selector) else {
+        let Some(schema) = selector.lookup(&self.schemas) else {
             return Vec::new();
         };
         let mut labels = std::collections::BTreeSet::new();
@@ -2004,7 +2006,7 @@ impl CompletionProvider {
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
         for (binding_name, selector) in self.extract_resource_bindings(src) {
             let Some(selector) = selector else { continue };
-            let Some(schema) = self.lookup_schema(&selector) else {
+            let Some(schema) = selector.lookup(&self.schemas) else {
                 continue;
             };
             for attr in schema.schema().as_schema().attributes().values() {
@@ -2304,7 +2306,7 @@ impl CompletionProvider {
                     }
                     let selector =
                         SchemaSelector::kindless(ResourceTypePath::new(provider, resource_type));
-                    let schema = self.lookup_schema(&selector)?;
+                    let schema = selector.lookup(&self.schemas)?;
                     let description = schema
                         .as_schema()
                         .description()
