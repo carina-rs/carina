@@ -76,7 +76,13 @@ impl ProviderFactory for ForTestFactory {
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            Default::default(),
+            carina_core::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from(
+                [(
+                    "region".into(),
+                    carina_core::schema::AttributeType::string(),
+                )],
+            ))
+            .unwrap(),
             Default::default(),
             Vec::new(),
         )

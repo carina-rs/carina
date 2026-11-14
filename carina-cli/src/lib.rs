@@ -14,6 +14,9 @@ pub mod signal;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_support;
 pub mod wiring;
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub use wiring::identity_probe;
 
 pub(crate) mod legacy_name_overrides;
 pub(crate) mod module_walk;

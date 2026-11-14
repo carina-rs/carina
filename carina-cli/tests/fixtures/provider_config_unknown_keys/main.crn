@@ -1,0 +1,1 @@
+let pending = mock.test.resource { name = 'pending' }

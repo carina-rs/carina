@@ -1,0 +1,5 @@
+backend s3 {
+  bucket = 1
+  key = 2
+  region = aws.Region.ap_northeast_1
+}

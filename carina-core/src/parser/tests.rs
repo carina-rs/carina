@@ -21866,7 +21866,7 @@ fn round6_interpolated_attribute_keys_keep_authored_identity() {
     assert_eq!(
         diagnostic_keys
             .iter()
-            .map(|key| key.detail())
+            .map(|attribute| &attribute.key)
             .collect::<HashSet<_>>()
             .len(),
         2
@@ -21874,7 +21874,7 @@ fn round6_interpolated_attribute_keys_keep_authored_identity() {
     assert_eq!(
         diagnostic_keys
             .iter()
-            .map(|key| key.detail().to_string())
+            .map(|attribute| attribute.key.to_string())
             .collect::<Vec<_>>(),
         ["\"${secret(<redacted>)}\"", "\"${secret(<redacted>)}\""]
     );

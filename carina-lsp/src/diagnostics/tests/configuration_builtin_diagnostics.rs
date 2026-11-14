@@ -13,10 +13,29 @@ fn assert_builtin_diagnostics(case: &str) {
         Default::default(),
         carina_provider_mock::MockScope::memory(),
     );
-    let engine = DiagnosticEngine::new(
-        loaded_providers_from_factories(vec![Box::new(factory)]),
-        vec!["mock".into()],
-    );
+    let engine = if case == "provider" {
+        let config_factory = carina_core::test_utils::configuration::ConfigFactory::new(
+            carina_core::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from(
+                [(
+                    "target".into(),
+                    carina_core::schema::AttributeType::string(),
+                )],
+            ))
+            .unwrap(),
+        )
+        .named("mock");
+        let mut schemas = SchemaRegistry::new();
+        schemas
+            .insert_provider_witness("mock", &factory.schema_witness())
+            .unwrap();
+        DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()])
+            .with_configuration_factory(Box::new(config_factory))
+    } else {
+        DiagnosticEngine::new(
+            loaded_providers_from_factories(vec![Box::new(factory)]),
+            vec!["mock".into()],
+        )
+    };
     let errors: Vec<_> = engine
         .analyze(&create_document_at(&source, path.clone()), Some(&path))
         .into_iter()

@@ -952,10 +952,37 @@ impl CarinaProvider for MockProcessProvider {
     }
 
     fn provider_config_attribute_types(&self) -> CoreValidatedConfigSchema {
-        CoreValidatedConfigSchema::validate(BTreeMap::from([
-            ("reference_table".into(), CoreAttributeType::string()),
+        let attributes = std::collections::BTreeMap::from([
             (
-                "unique_values".to_string(),
+                "__mock_reference_scope_region__".into(),
+                CoreAttributeType::string(),
+            ),
+            (
+                "__mock_validate_config_cause__".into(),
+                CoreAttributeType::string(),
+            ),
+            (
+                "__mock_validate_config_captured_cause__".into(),
+                CoreAttributeType::string(),
+            ),
+            (
+                "__mock_initialize_cause__".into(),
+                CoreAttributeType::string(),
+            ),
+            (
+                "__mock_validate_config_trap__".into(),
+                CoreAttributeType::bool(),
+            ),
+            ("validate_config_trap".into(), CoreAttributeType::bool()),
+            (
+                "__mock_initialize_error__".into(),
+                CoreAttributeType::bool(),
+            ),
+            ("validate_delay_millis".into(), CoreAttributeType::int()),
+            ("reference_table".into(), CoreAttributeType::string()),
+            // Schema-only exception: host-side list-uniqueness fixture; the guest does not read it.
+            (
+                "unique_values".into(),
                 CoreAttributeType::refined_list(
                     CoreAttributeType::string(),
                     true,
@@ -963,8 +990,9 @@ impl CarinaProvider for MockProcessProvider {
                     carina_core::schema::ListElements::Unique,
                 ),
             ),
-        ]))
-        .expect("mock provider config schema must be valid")
+        ]);
+        CoreValidatedConfigSchema::validate(attributes)
+            .expect("mock provider config schema must be valid")
     }
 
     fn validate_config(&self, attrs: &BTreeMap<String, Value>) -> Result<(), ProviderError> {
@@ -982,7 +1010,11 @@ impl CarinaProvider for MockProcessProvider {
             )
             .with_status(403));
         }
-        if attrs.contains_key("__mock_validate_config_trap__") || attrs.contains_key(CONFIG_TRAP) {
+        if matches!(
+            attrs.get("__mock_validate_config_trap__"),
+            Some(Value::Bool(true))
+        ) || matches!(attrs.get(CONFIG_TRAP), Some(Value::Bool(true)))
+        {
             panic!("intentional mock validate_config trap");
         }
         if let Some(Value::Int(delay_millis)) = attrs.get("validate_delay_millis")
@@ -1011,7 +1043,10 @@ impl CarinaProvider for MockProcessProvider {
                 ProviderError::from_diagnostic(ProviderErrorKind::InvalidInput, error)
             })?;
         }
-        if attrs.contains_key("__mock_initialize_error__") {
+        if matches!(
+            attrs.get("__mock_initialize_error__"),
+            Some(Value::Bool(true))
+        ) {
             return Err(Self::configuration_error(
                 "intentional mock initialization failure",
             ));
@@ -2168,3 +2203,61 @@ fn main() {}
 
 // Share the original panic site so public diagnostic coordinates stay stable.
 const CONFIG_TRAP: &str = "validate_config_trap";
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::*;
+    use carina_core::resource::{ConcreteValue, Value as CoreValue};
+
+    #[test]
+    fn false_configuration_trap_flags_do_not_trap() {
+        for key in [
+            "__mock_validate_config_trap__",
+            "validate_config_trap",
+            "__mock_initialize_error__",
+        ] {
+            let attrs = BTreeMap::from([(key.into(), Value::Bool(false))]);
+            let mut provider = MockProcessProvider::default();
+            provider.validate_config(&attrs).unwrap();
+            provider.initialize(&attrs).unwrap();
+        }
+    }
+
+    #[test]
+    fn wasm_configuration_controls_have_the_types_the_guest_reads() {
+        let schema = MockProcessProvider::default().provider_config_attribute_types();
+        // unique_values is the deliberate schema-only host uniqueness fixture;
+        // every other setting below is consumed by the guest.
+        assert!(schema.parts().contains_key("unique_values"));
+        assert_eq!(schema.parts().len(), 10);
+        for (key, value) in [
+            (
+                "__mock_reference_scope_region__",
+                ConcreteValue::String("region".into()),
+            ),
+            (
+                "__mock_validate_config_cause__",
+                ConcreteValue::String("cause".into()),
+            ),
+            (
+                "__mock_validate_config_captured_cause__",
+                ConcreteValue::String("cause".into()),
+            ),
+            (
+                "__mock_initialize_cause__",
+                ConcreteValue::String("cause".into()),
+            ),
+            ("__mock_validate_config_trap__", ConcreteValue::Bool(true)),
+            ("validate_config_trap", ConcreteValue::Bool(true)),
+            ("__mock_initialize_error__", ConcreteValue::Bool(true)),
+            ("validate_delay_millis", ConcreteValue::Int(1)),
+            ("reference_table", ConcreteValue::String("table".into())),
+        ] {
+            let ty = schema.rootless_type(key).unwrap();
+            let value: CoreValue = CoreValue::Concrete(value);
+            ty.validate(&value).unwrap();
+            let wrong: CoreValue = CoreValue::Concrete(ConcreteValue::Map(Default::default()));
+            assert!(ty.validate(&wrong).is_err(), "{key}");
+        }
+    }
+}

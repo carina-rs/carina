@@ -293,6 +293,8 @@ impl<P: super::PlaceholderKind> SecretPayload<P, super::AbsoluteBindingAddress> 
         &self,
         previous: Option<&super::RedactedSecretHash>,
     ) -> Result<super::RedactedSecretHash, crate::value::SerializationError> {
+        #[cfg(feature = "test-utils")]
+        let _recording = crate::identity_recording::payload_hash_context();
         self.try_inspect(|value| {
             crate::value::canonical_secret_hash_material(value)
                 .map(|material| super::RedactedSecretHash::reuse_or_generate(&material, previous))

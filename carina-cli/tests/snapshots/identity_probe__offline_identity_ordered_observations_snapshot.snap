@@ -1,0 +1,1652 @@
+---
+source: carina-cli/tests/identity_probe.rs
+expression: first
+---
+{
+  "format": "carina-identity-probe-v3",
+  "redaction": "raw-synthetic",
+  "resources": [
+    {
+      "address": "probe.Declared.probe_declared_a40a62db",
+      "declaration": {
+        "column": 1,
+        "end_byte": 35,
+        "file": "main.crn",
+        "line": 1,
+        "start_byte": 0
+      },
+      "expansion": {
+        "instances": [],
+        "loop": {}
+      },
+      "hash_inputs": [
+        {
+          "boundary": "declared-identity",
+          "context": [
+            "resource:<root>/main.crn#0"
+          ],
+          "feature_count": null,
+          "finishes": [
+            {
+              "after_writes": 15,
+              "operation": "finalize",
+              "output": {
+                "hex": "a40a62dbfee881e9bfacd03f94c44e639e5ec930d14ce40fd99ca16ca6a6965a"
+              }
+            }
+          ],
+          "writes": [
+            {
+              "hex": "1c00000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "636172696e612d616e6f6e796d6f75732d6964656e746974792d7631",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "0600000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "726567696f6e",
+              "operation": "update"
+            },
+            {
+              "hex": "1800000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "537472696e6728226f66666c696e652d726567696f6e2229",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            },
+            {
+              "hex": "0400000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "6e616d65",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            },
+            {
+              "hex": "0700000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "6c69746572616c",
+              "operation": "update"
+            }
+          ]
+        }
+      ],
+      "identity_basis": "stable",
+      "ordinal": 0,
+      "resolved_prefixes": [],
+      "resource_id": {
+        "identity": "probe_declared_a40a62db",
+        "provider": "probe",
+        "resource_type": "Declared"
+      },
+      "secret_material": []
+    },
+    {
+      "address": "probe.Declared.probe_declared_a0bf5787",
+      "declaration": {
+        "column": 1,
+        "end_byte": 68,
+        "file": "main.crn",
+        "line": 2,
+        "start_byte": 36
+      },
+      "expansion": {
+        "instances": [],
+        "loop": {}
+      },
+      "hash_inputs": [
+        {
+          "boundary": "declared-identity",
+          "context": [
+            "resource:<root>/main.crn#1"
+          ],
+          "feature_count": null,
+          "finishes": [
+            {
+              "after_writes": 15,
+              "operation": "finalize",
+              "output": {
+                "hex": "a0bf5787ba598ebe738026b0370025dd403ddf9713348982e347064265e92218"
+              }
+            }
+          ],
+          "writes": [
+            {
+              "hex": "1c00000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "636172696e612d616e6f6e796d6f75732d6964656e746974792d7631",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "0600000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "726567696f6e",
+              "operation": "update"
+            },
+            {
+              "hex": "1800000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "537472696e6728226f66666c696e652d726567696f6e2229",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            },
+            {
+              "hex": "0400000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "6e616d65",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            },
+            {
+              "hex": "0700000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "6b6e6f776e2d61",
+              "operation": "update"
+            }
+          ]
+        }
+      ],
+      "identity_basis": "stable",
+      "ordinal": 1,
+      "resolved_prefixes": [],
+      "resource_id": {
+        "identity": "probe_declared_a0bf5787",
+        "provider": "probe",
+        "resource_type": "Declared"
+      },
+      "secret_material": []
+    },
+    {
+      "address": "probe.Declared.probe_declared_a53573df",
+      "declaration": {
+        "column": 1,
+        "end_byte": 109,
+        "file": "main.crn",
+        "line": 3,
+        "start_byte": 69
+      },
+      "expansion": {
+        "instances": [],
+        "loop": {}
+      },
+      "hash_inputs": [
+        {
+          "boundary": "declared-identity",
+          "context": [
+            "resource:<root>/main.crn#2"
+          ],
+          "feature_count": null,
+          "finishes": [
+            {
+              "after_writes": 15,
+              "operation": "finalize",
+              "output": {
+                "hex": "a53573df6ac09f26c51c61afde15de003aba05f2366d0aa6581624b19f22e7ab"
+              }
+            }
+          ],
+          "writes": [
+            {
+              "hex": "1c00000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "636172696e612d616e6f6e796d6f75732d6964656e746974792d7631",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "0600000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "726567696f6e",
+              "operation": "update"
+            },
+            {
+              "hex": "1800000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "537472696e6728226f66666c696e652d726567696f6e2229",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            },
+            {
+              "hex": "0400000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "6e616d65",
+              "operation": "update"
+            },
+            {
+              "hex": "01",
+              "operation": "update"
+            },
+            {
+              "hex": "1b00000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "5265736f7572636552656628756e6b6e6f776e5f622e6e616d6529",
+              "operation": "update"
+            }
+          ]
+        }
+      ],
+      "identity_basis": "stable",
+      "ordinal": 2,
+      "resolved_prefixes": [],
+      "resource_id": {
+        "identity": "probe_declared_a53573df",
+        "provider": "probe",
+        "resource_type": "Declared"
+      },
+      "secret_material": []
+    },
+    {
+      "address": "probe.Chained.probe_chained_a0bf5787",
+      "declaration": {
+        "column": 1,
+        "end_byte": 141,
+        "file": "main.crn",
+        "line": 4,
+        "start_byte": 110
+      },
+      "expansion": {
+        "instances": [],
+        "loop": {}
+      },
+      "hash_inputs": [
+        {
+          "boundary": "declared-identity",
+          "context": [
+            "resource:<root>/main.crn#3"
+          ],
+          "feature_count": null,
+          "finishes": [
+            {
+              "after_writes": 15,
+              "operation": "finalize",
+              "output": {
+                "hex": "a0bf5787ba598ebe738026b0370025dd403ddf9713348982e347064265e92218"
+              }
+            }
+          ],
+          "writes": [
+            {
+              "hex": "1c00000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "636172696e612d616e6f6e796d6f75732d6964656e746974792d7631",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "0600000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "726567696f6e",
+              "operation": "update"
+            },
+            {
+              "hex": "1800000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "537472696e6728226f66666c696e652d726567696f6e2229",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            },
+            {
+              "hex": "0400000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "6e616d65",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            },
+            {
+              "hex": "0700000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "6b6e6f776e2d61",
+              "operation": "update"
+            }
+          ]
+        }
+      ],
+      "identity_basis": "stable",
+      "ordinal": 3,
+      "resolved_prefixes": [],
+      "resource_id": {
+        "identity": "probe_chained_a0bf5787",
+        "provider": "probe",
+        "resource_type": "Chained"
+      },
+      "secret_material": []
+    },
+    {
+      "address": "probe.CreateOnly.probe_create_only_a8162111",
+      "declaration": {
+        "column": 1,
+        "end_byte": 186,
+        "file": "main.crn",
+        "line": 5,
+        "start_byte": 142
+      },
+      "expansion": {
+        "instances": [],
+        "loop": {}
+      },
+      "hash_inputs": [
+        {
+          "boundary": "create-only",
+          "context": [
+            "resource:<root>/main.crn#4"
+          ],
+          "feature_count": null,
+          "finishes": [
+            {
+              "after_writes": 8,
+              "operation": "finish",
+              "output": {
+                "hex": "112116a81f2ffbd9"
+              }
+            }
+          ],
+          "writes": [
+            {
+              "hex": "726567696f6e",
+              "operation": "write"
+            },
+            {
+              "hex": "ff",
+              "operation": "write_u8"
+            },
+            {
+              "hex": "537472696e6728226f66666c696e652d726567696f6e2229",
+              "operation": "write"
+            },
+            {
+              "hex": "ff",
+              "operation": "write_u8"
+            },
+            {
+              "hex": "6e616d65",
+              "operation": "write"
+            },
+            {
+              "hex": "ff",
+              "operation": "write_u8"
+            },
+            {
+              "hex": "537472696e6728226c65676163792d6c69746572616c2229",
+              "operation": "write"
+            },
+            {
+              "hex": "ff",
+              "operation": "write_u8"
+            }
+          ]
+        }
+      ],
+      "identity_basis": "stable",
+      "ordinal": 4,
+      "resolved_prefixes": [],
+      "resource_id": {
+        "identity": "probe_create_only_a8162111",
+        "provider": "probe",
+        "resource_type": "CreateOnly"
+      },
+      "secret_material": []
+    },
+    {
+      "address": "probe.CreateOnly.probe_create_only_16ca9e65",
+      "declaration": {
+        "column": 1,
+        "end_byte": 221,
+        "file": "main.crn",
+        "line": 6,
+        "start_byte": 187
+      },
+      "expansion": {
+        "instances": [],
+        "loop": {}
+      },
+      "hash_inputs": [
+        {
+          "boundary": "create-only",
+          "context": [
+            "resource:<root>/main.crn#5"
+          ],
+          "feature_count": null,
+          "finishes": [
+            {
+              "after_writes": 8,
+              "operation": "finish",
+              "output": {
+                "hex": "659eca16e161b70a"
+              }
+            }
+          ],
+          "writes": [
+            {
+              "hex": "726567696f6e",
+              "operation": "write"
+            },
+            {
+              "hex": "ff",
+              "operation": "write_u8"
+            },
+            {
+              "hex": "537472696e6728226f66666c696e652d726567696f6e2229",
+              "operation": "write"
+            },
+            {
+              "hex": "ff",
+              "operation": "write_u8"
+            },
+            {
+              "hex": "6e616d65",
+              "operation": "write"
+            },
+            {
+              "hex": "ff",
+              "operation": "write_u8"
+            },
+            {
+              "hex": "537472696e6728226b6e6f776e2d612229",
+              "operation": "write"
+            },
+            {
+              "hex": "ff",
+              "operation": "write_u8"
+            }
+          ]
+        }
+      ],
+      "identity_basis": "stable",
+      "ordinal": 5,
+      "resolved_prefixes": [],
+      "resource_id": {
+        "identity": "probe_create_only_16ca9e65",
+        "provider": "probe",
+        "resource_type": "CreateOnly"
+      },
+      "secret_material": []
+    },
+    {
+      "address": "probe.CreateOnly.probe_create_only_b5f83535",
+      "declaration": {
+        "column": 1,
+        "end_byte": 264,
+        "file": "main.crn",
+        "line": 7,
+        "start_byte": 222
+      },
+      "expansion": {
+        "instances": [],
+        "loop": {}
+      },
+      "hash_inputs": [
+        {
+          "boundary": "create-only",
+          "context": [
+            "resource:<root>/main.crn#6"
+          ],
+          "feature_count": null,
+          "finishes": [
+            {
+              "after_writes": 8,
+              "operation": "finish",
+              "output": {
+                "hex": "3535f8b5a50d58d9"
+              }
+            }
+          ],
+          "writes": [
+            {
+              "hex": "726567696f6e",
+              "operation": "write"
+            },
+            {
+              "hex": "ff",
+              "operation": "write_u8"
+            },
+            {
+              "hex": "537472696e6728226f66666c696e652d726567696f6e2229",
+              "operation": "write"
+            },
+            {
+              "hex": "ff",
+              "operation": "write_u8"
+            },
+            {
+              "hex": "6e616d65",
+              "operation": "write"
+            },
+            {
+              "hex": "ff",
+              "operation": "write_u8"
+            },
+            {
+              "hex": "5265736f7572636552656628756e6b6e6f776e5f622e6e616d6529",
+              "operation": "write"
+            },
+            {
+              "hex": "ff",
+              "operation": "write_u8"
+            }
+          ]
+        }
+      ],
+      "identity_basis": "stable",
+      "ordinal": 6,
+      "resolved_prefixes": [],
+      "resource_id": {
+        "identity": "probe_create_only_b5f83535",
+        "provider": "probe",
+        "resource_type": "CreateOnly"
+      },
+      "secret_material": []
+    },
+    {
+      "address": "probe.Mutable.probe_mutable_4041028d90274108",
+      "declaration": {
+        "column": 1,
+        "end_byte": 307,
+        "file": "main.crn",
+        "line": 8,
+        "start_byte": 265
+      },
+      "expansion": {
+        "instances": [],
+        "loop": {}
+      },
+      "hash_inputs": [
+        {
+          "boundary": "simhash",
+          "context": [
+            "resource:<root>/main.crn#7"
+          ],
+          "feature_count": 2,
+          "finishes": [
+            {
+              "after_writes": 0,
+              "operation": "simhash",
+              "output": {
+                "hex": "084127908d024140"
+              }
+            }
+          ],
+          "writes": []
+        },
+        {
+          "boundary": "simhash-feature",
+          "context": [
+            "resource:<root>/main.crn#7"
+          ],
+          "feature_count": null,
+          "finishes": [
+            {
+              "after_writes": 2,
+              "operation": "finish",
+              "output": {
+                "hex": "0c51a790cd7661c4"
+              }
+            }
+          ],
+          "writes": [
+            {
+              "hex": "6e616d653d537472696e67282273696d686173682d6c69746572616c2229",
+              "operation": "write"
+            },
+            {
+              "hex": "ff",
+              "operation": "write_u8"
+            }
+          ]
+        },
+        {
+          "boundary": "simhash-feature",
+          "context": [
+            "resource:<root>/main.crn#7"
+          ],
+          "feature_count": null,
+          "finishes": [
+            {
+              "after_writes": 2,
+              "operation": "finish",
+              "output": {
+                "hex": "ca6b2fd08f82d773"
+              }
+            }
+          ],
+          "writes": [
+            {
+              "hex": "726567696f6e3d537472696e6728226f66666c696e652d726567696f6e2229",
+              "operation": "write"
+            },
+            {
+              "hex": "ff",
+              "operation": "write_u8"
+            }
+          ]
+        }
+      ],
+      "identity_basis": "attribute-derived",
+      "ordinal": 7,
+      "resolved_prefixes": [],
+      "resource_id": {
+        "identity": "probe_mutable_4041028d90274108",
+        "provider": "probe",
+        "resource_type": "Mutable"
+      },
+      "secret_material": []
+    },
+    {
+      "address": "probe.Declared.probe_declared_da0d6114",
+      "declaration": {
+        "column": 1,
+        "end_byte": 355,
+        "file": "main.crn",
+        "line": 9,
+        "start_byte": 308
+      },
+      "expansion": {
+        "instances": [],
+        "loop": {}
+      },
+      "hash_inputs": [
+        {
+          "boundary": "declared-identity",
+          "context": [
+            "resource:<root>/main.crn#8"
+          ],
+          "feature_count": null,
+          "finishes": [
+            {
+              "after_writes": 15,
+              "operation": "finalize",
+              "output": {
+                "hex": "da0d611413a4da11d922e94cec87724b20f54ef627246926f6cbd89ab23f7d94"
+              }
+            }
+          ],
+          "writes": [
+            {
+              "hex": "1c00000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "636172696e612d616e6f6e796d6f75732d6964656e746974792d7631",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "0600000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "726567696f6e",
+              "operation": "update"
+            },
+            {
+              "hex": "1800000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "537472696e6728226f66666c696e652d726567696f6e2229",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            },
+            {
+              "hex": "0400000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "6e616d65",
+              "operation": "update"
+            },
+            {
+              "hex": "02",
+              "operation": "update"
+            },
+            {
+              "hex": "1600000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "507265666978282266697865642d7072656669782229",
+              "operation": "update"
+            }
+          ]
+        }
+      ],
+      "identity_basis": "stable",
+      "ordinal": 8,
+      "resolved_prefixes": [
+        {
+          "attribute": "name",
+          "value": "fixed-prefix"
+        }
+      ],
+      "resource_id": {
+        "identity": "probe_declared_da0d6114",
+        "provider": "probe",
+        "resource_type": "Declared"
+      },
+      "secret_material": []
+    },
+    {
+      "address": "probe.Declared.probe_declared_bb65fff5",
+      "declaration": {
+        "column": 3,
+        "end_byte": 433,
+        "file": "main.crn",
+        "line": 12,
+        "start_byte": 403
+      },
+      "expansion": {
+        "instances": [],
+        "loop": {
+          "direct": {
+            "kind": {
+              "element": {
+                "kind": "index",
+                "value": 0
+              },
+              "kind": "for"
+            },
+            "legacy": "_for0[0]",
+            "source": {
+              "column": 1,
+              "display_file": "main.crn",
+              "kind": "for",
+              "line": 11,
+              "system_identity": "_loop_76f3ece31dac22cc"
+            }
+          }
+        }
+      },
+      "hash_inputs": [
+        {
+          "boundary": "loop-system-identity",
+          "context": [],
+          "feature_count": null,
+          "finishes": [
+            {
+              "after_writes": 6,
+              "operation": "finalize",
+              "output": {
+                "hex": "76f3ece31dac22cc911b48f4f8aa3744d8dff0127b5e2675061eb63757d3dd85"
+              }
+            }
+          ],
+          "writes": [
+            {
+              "hex": "0000000000000008",
+              "operation": "update"
+            },
+            {
+              "hex": "6d61696e2e63726e",
+              "operation": "update"
+            },
+            {
+              "hex": "0000000000000165",
+              "operation": "update"
+            },
+            {
+              "hex": "00000000000001b3",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            }
+          ]
+        },
+        {
+          "boundary": "declared-identity",
+          "context": [
+            "resource:<root>/main.crn#9"
+          ],
+          "feature_count": null,
+          "finishes": [
+            {
+              "after_writes": 15,
+              "operation": "finalize",
+              "output": {
+                "hex": "bb65fff5943beb72aa662c6bf4ac64d0b9c5e8ecf6a45c33e1a1d2b7fcfaf00b"
+              }
+            }
+          ],
+          "writes": [
+            {
+              "hex": "1c00000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "636172696e612d616e6f6e796d6f75732d6964656e746974792d7631",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "0600000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "726567696f6e",
+              "operation": "update"
+            },
+            {
+              "hex": "1800000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "537472696e6728226f66666c696e652d726567696f6e2229",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            },
+            {
+              "hex": "0400000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "6e616d65",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            },
+            {
+              "hex": "0a00000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "6c6f6f702d6669727374",
+              "operation": "update"
+            }
+          ]
+        }
+      ],
+      "identity_basis": "stable",
+      "ordinal": 9,
+      "resolved_prefixes": [],
+      "resource_id": {
+        "identity": "probe_declared_bb65fff5",
+        "provider": "probe",
+        "resource_type": "Declared"
+      },
+      "secret_material": []
+    },
+    {
+      "address": "probe.Declared.probe_declared_b2001f4a",
+      "declaration": {
+        "column": 3,
+        "end_byte": 433,
+        "file": "main.crn",
+        "line": 12,
+        "start_byte": 403
+      },
+      "expansion": {
+        "instances": [],
+        "loop": {
+          "direct": {
+            "kind": {
+              "element": {
+                "kind": "index",
+                "value": 1
+              },
+              "kind": "for"
+            },
+            "legacy": "_for0[1]",
+            "source": {
+              "column": 1,
+              "display_file": "main.crn",
+              "kind": "for",
+              "line": 11,
+              "system_identity": "_loop_76f3ece31dac22cc"
+            }
+          }
+        }
+      },
+      "hash_inputs": [
+        {
+          "boundary": "loop-system-identity",
+          "context": [],
+          "feature_count": null,
+          "finishes": [
+            {
+              "after_writes": 6,
+              "operation": "finalize",
+              "output": {
+                "hex": "76f3ece31dac22cc911b48f4f8aa3744d8dff0127b5e2675061eb63757d3dd85"
+              }
+            }
+          ],
+          "writes": [
+            {
+              "hex": "0000000000000008",
+              "operation": "update"
+            },
+            {
+              "hex": "6d61696e2e63726e",
+              "operation": "update"
+            },
+            {
+              "hex": "0000000000000165",
+              "operation": "update"
+            },
+            {
+              "hex": "00000000000001b3",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            }
+          ]
+        },
+        {
+          "boundary": "declared-identity",
+          "context": [
+            "resource:<root>/main.crn#9"
+          ],
+          "feature_count": null,
+          "finishes": [
+            {
+              "after_writes": 15,
+              "operation": "finalize",
+              "output": {
+                "hex": "b2001f4a81fcdd6443637b9f20c0c1e154b3ca34f307f82fc8ac83db866ade34"
+              }
+            }
+          ],
+          "writes": [
+            {
+              "hex": "1c00000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "636172696e612d616e6f6e796d6f75732d6964656e746974792d7631",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "0600000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "726567696f6e",
+              "operation": "update"
+            },
+            {
+              "hex": "1800000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "537472696e6728226f66666c696e652d726567696f6e2229",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            },
+            {
+              "hex": "0400000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "6e616d65",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            },
+            {
+              "hex": "0b00000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "6c6f6f702d7365636f6e64",
+              "operation": "update"
+            }
+          ]
+        }
+      ],
+      "identity_basis": "stable",
+      "ordinal": 10,
+      "resolved_prefixes": [],
+      "resource_id": {
+        "identity": "probe_declared_b2001f4a",
+        "provider": "probe",
+        "resource_type": "Declared"
+      },
+      "secret_material": []
+    },
+    {
+      "address": "probe.Secrets.secrets",
+      "declaration": {
+        "column": 15,
+        "end_byte": 688,
+        "file": "main.crn",
+        "line": 19,
+        "start_byte": 574
+      },
+      "expansion": {
+        "instances": [],
+        "loop": {}
+      },
+      "hash_inputs": [],
+      "identity_basis": "named",
+      "ordinal": 11,
+      "resolved_prefixes": [],
+      "resource_id": {
+        "identity": "secrets",
+        "provider": "probe",
+        "resource_type": "Secrets"
+      },
+      "secret_material": [
+        {
+          "inputs": [
+            {
+              "boundary": "secret-material",
+              "context": [
+                "secret-payload-hash"
+              ],
+              "feature_count": null,
+              "finishes": [],
+              "writes": [
+                {
+                  "hex": "226c69746572616c2d73656372657422",
+                  "operation": "canonical-json"
+                }
+              ]
+            }
+          ],
+          "path": "literal",
+          "producer": "secret-payload-hash",
+          "status": "available"
+        },
+        {
+          "inputs": [
+            {
+              "boundary": "secret-material",
+              "context": [
+                "secret-payload-hash"
+              ],
+              "feature_count": null,
+              "finishes": [],
+              "writes": [
+                {
+                  "hex": "226b6e6f776e2d6122",
+                  "operation": "canonical-json"
+                }
+              ]
+            }
+          ],
+          "path": "known",
+          "producer": "secret-payload-hash",
+          "status": "available"
+        },
+        {
+          "path": "unknown",
+          "producer": "secret-payload-hash",
+          "reason": "secret is not known offline",
+          "status": "unavailable"
+        }
+      ]
+    },
+    {
+      "address": "probe.Source.a",
+      "declaration": {
+        "column": 9,
+        "end_byte": 41,
+        "file": "sources.crn",
+        "line": 1,
+        "start_byte": 8
+      },
+      "expansion": {
+        "instances": [],
+        "loop": {}
+      },
+      "hash_inputs": [],
+      "identity_basis": "named",
+      "ordinal": 12,
+      "resolved_prefixes": [],
+      "resource_id": {
+        "identity": "a",
+        "provider": "probe",
+        "resource_type": "Source"
+      },
+      "secret_material": []
+    },
+    {
+      "address": "probe.Source.b",
+      "declaration": {
+        "column": 9,
+        "end_byte": 80,
+        "file": "sources.crn",
+        "line": 2,
+        "start_byte": 50
+      },
+      "expansion": {
+        "instances": [],
+        "loop": {}
+      },
+      "hash_inputs": [],
+      "identity_basis": "named",
+      "ordinal": 13,
+      "resolved_prefixes": [],
+      "resource_id": {
+        "identity": "b",
+        "provider": "probe",
+        "resource_type": "Source"
+      },
+      "secret_material": []
+    },
+    {
+      "address": "probe.Source.unknown_b",
+      "declaration": {
+        "column": 17,
+        "end_byte": 112,
+        "file": "sources.crn",
+        "line": 3,
+        "start_byte": 97
+      },
+      "expansion": {
+        "instances": [],
+        "loop": {}
+      },
+      "hash_inputs": [],
+      "identity_basis": "named",
+      "ordinal": 14,
+      "resolved_prefixes": [],
+      "resource_id": {
+        "identity": "unknown_b",
+        "provider": "probe",
+        "resource_type": "Source"
+      },
+      "secret_material": []
+    },
+    {
+      "address": "probe.Declared.instance.probe_declared_e4c53e45",
+      "declaration": {
+        "column": 1,
+        "end_byte": 30,
+        "file": "child/main.crn",
+        "line": 1,
+        "start_byte": 0
+      },
+      "expansion": {
+        "instances": [
+          {
+            "declaration": "main.crn",
+            "instance": "instance",
+            "start_byte": 491
+          }
+        ],
+        "loop": {}
+      },
+      "hash_inputs": [
+        {
+          "boundary": "declared-identity",
+          "context": [
+            "resource:<root>/child/main.crn#0"
+          ],
+          "feature_count": null,
+          "finishes": [
+            {
+              "after_writes": 15,
+              "operation": "finalize",
+              "output": {
+                "hex": "e4c53e45b8687b34a630728fd2589139a5ec4c9271d1280995e2651b39c7e519"
+              }
+            }
+          ],
+          "writes": [
+            {
+              "hex": "1c00000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "636172696e612d616e6f6e796d6f75732d6964656e746974792d7631",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "0600000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "726567696f6e",
+              "operation": "update"
+            },
+            {
+              "hex": "1800000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "537472696e6728226f66666c696e652d726567696f6e2229",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            },
+            {
+              "hex": "0400000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "6e616d65",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            },
+            {
+              "hex": "0c00000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "6d6f64756c652d626f756e64",
+              "operation": "update"
+            }
+          ]
+        }
+      ],
+      "identity_basis": "stable",
+      "ordinal": 15,
+      "resolved_prefixes": [],
+      "resource_id": {
+        "identity": "instance.probe_declared_e4c53e45",
+        "provider": "probe",
+        "resource_type": "Declared"
+      },
+      "secret_material": []
+    },
+    {
+      "address": "probe.Declared.child_208300a382800445.probe_declared_33f119d0",
+      "declaration": {
+        "column": 1,
+        "end_byte": 30,
+        "file": "child/main.crn",
+        "line": 1,
+        "start_byte": 0
+      },
+      "expansion": {
+        "instances": [
+          {
+            "declaration": "main.crn",
+            "instance": "child_208300a382800445",
+            "start_byte": 523
+          }
+        ],
+        "loop": {}
+      },
+      "hash_inputs": [
+        {
+          "boundary": "simhash",
+          "context": [
+            "module:<root>/main.crn:523"
+          ],
+          "feature_count": 2,
+          "finishes": [
+            {
+              "after_writes": 0,
+              "operation": "simhash",
+              "output": {
+                "hex": "45048082a3008320"
+              }
+            }
+          ],
+          "writes": []
+        },
+        {
+          "boundary": "simhash-feature",
+          "context": [
+            "module:<root>/main.crn:523"
+          ],
+          "feature_count": null,
+          "finishes": [
+            {
+              "after_writes": 2,
+              "operation": "finish",
+              "output": {
+                "hex": "5724c497f702ebe3"
+              }
+            }
+          ],
+          "writes": [
+            {
+              "hex": "5f6d6f64756c653d6368696c64",
+              "operation": "write"
+            },
+            {
+              "hex": "ff",
+              "operation": "write_u8"
+            }
+          ]
+        },
+        {
+          "boundary": "simhash-feature",
+          "context": [
+            "module:<root>/main.crn:523"
+          ],
+          "feature_count": null,
+          "finishes": [
+            {
+              "after_writes": 2,
+              "operation": "finish",
+              "output": {
+                "hex": "65c59bc2a3258720"
+              }
+            }
+          ],
+          "writes": [
+            {
+              "hex": "6e616d653d537472696e6728226d6f64756c652d616e6f6e796d6f75732229",
+              "operation": "write"
+            },
+            {
+              "hex": "ff",
+              "operation": "write_u8"
+            }
+          ]
+        },
+        {
+          "boundary": "declared-identity",
+          "context": [
+            "resource:<root>/child/main.crn#0"
+          ],
+          "feature_count": null,
+          "finishes": [
+            {
+              "after_writes": 15,
+              "operation": "finalize",
+              "output": {
+                "hex": "33f119d0dd3c7b7e484fe9ae52e2cbaed0be46e02a6d738f573f5815739bf33f"
+              }
+            }
+          ],
+          "writes": [
+            {
+              "hex": "1c00000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "636172696e612d616e6f6e796d6f75732d6964656e746974792d7631",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "0600000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "726567696f6e",
+              "operation": "update"
+            },
+            {
+              "hex": "1800000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "537472696e6728226f66666c696e652d726567696f6e2229",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "0100000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            },
+            {
+              "hex": "0400000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "6e616d65",
+              "operation": "update"
+            },
+            {
+              "hex": "00",
+              "operation": "update"
+            },
+            {
+              "hex": "1000000000000000",
+              "operation": "update"
+            },
+            {
+              "hex": "6d6f64756c652d616e6f6e796d6f7573",
+              "operation": "update"
+            }
+          ]
+        }
+      ],
+      "identity_basis": "stable",
+      "ordinal": 16,
+      "resolved_prefixes": [],
+      "resource_id": {
+        "identity": "child_208300a382800445.probe_declared_33f119d0",
+        "provider": "probe",
+        "resource_type": "Declared"
+      },
+      "secret_material": []
+    }
+  ],
+  "status": {
+    "deferred": [],
+    "kind": "ok"
+  },
+  "unattributed": [
+    {
+      "input": {
+        "boundary": "loop-system-identity",
+        "context": [],
+        "feature_count": null,
+        "finishes": [
+          {
+            "after_writes": 6,
+            "operation": "finalize",
+            "output": {
+              "hex": "dc3e81260dcd9f933464c924c8278ed7f1c89cf8e75e71075e0b1258d2faa551"
+            }
+          }
+        ],
+        "writes": [
+          {
+            "hex": "0000000000000026",
+            "operation": "update"
+          },
+          {
+            "hex": "74657374732f66697874757265732f6964656e746974795f70726f62652f6d61696e2e63726e",
+            "operation": "update"
+          },
+          {
+            "hex": "0000000000000165",
+            "operation": "update"
+          },
+          {
+            "hex": "00000000000001b3",
+            "operation": "update"
+          },
+          {
+            "hex": "00",
+            "operation": "update"
+          },
+          {
+            "hex": "00",
+            "operation": "update"
+          }
+        ]
+      },
+      "reason": "preparatory loop template identity not retained by the expanded graph"
+    }
+  ]
+}

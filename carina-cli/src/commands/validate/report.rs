@@ -223,6 +223,14 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
             code: None,
             ..Diagnostic::parse(error)
         },
+        AppError::BackendAttribute(finding) => Diagnostic::located(
+            format_error_with_source_chain(finding.detail()),
+            finding.location(),
+        ),
+        AppError::UnsupportedBackend(finding) => Diagnostic::located(
+            format_error_with_source_chain(finding.detail()),
+            finding.location(),
+        ),
         AppError::UpstreamReference(error) => {
             let (location, message) = error.diagnostic();
             Diagnostic::located(message, location)
@@ -1195,3 +1203,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod provider_configuration_tests;

@@ -2089,6 +2089,11 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn builtin_native_configuration_declaration_is_empty() {
+        assert!(builtin_schema_witness().config().parts().is_empty());
+    }
+
+    #[test]
     fn builtin_schemas_are_all_valid() {
         let schemas = builtin_schemas();
         assert!(!schemas.is_empty());
