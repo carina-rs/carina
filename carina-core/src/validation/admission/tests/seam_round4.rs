@@ -387,22 +387,23 @@ fn round5_module_body_slots_keep_per_instance_authored_roots() {
             let slot = resource.authored_slot("input").unwrap();
             let root = slot.cursor().unwrap().canonical().unwrap();
             let inputs = ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap();
-            let classified = inputs.classify(&KnowledgeContext::validation(), |_, error| {
-                panic!("{error}")
-            });
             let mut coverage = Default::default();
-            let report = attributes::resource_attribute_admissions(
-                resource,
-                judged.file(),
-                resource.schema(&schemas).unwrap(),
-                &classified,
-                resource.quoted_string_attrs(),
-                &inputs,
-                &bindings,
-                session,
-                &schemas,
-                &mut coverage,
-            );
+            let report = {
+                let outcome = attributes::resource_attribute_admissions(
+                    resource,
+                    judged.file(),
+                    resource.schema(&schemas).unwrap(),
+                    resource.quoted_string_attrs(),
+                    inputs,
+                    crate::validation::admission::attributes::ValidationEvaluation::None,
+                    &bindings,
+                    session,
+                    &schemas,
+                    &mut coverage,
+                );
+                assert!(outcome.classification_diagnostics.0.is_empty());
+                outcome.values
+            };
             assert_eq!(report.errors().count(), 0, "{report:?}");
             assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");
             assert!(

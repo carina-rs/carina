@@ -5855,22 +5855,19 @@ fn resource_admission_report<
                             continue;
                         }
                     };
-                    let classified = inputs.classify(
-                        &crate::resource::knowledge::KnowledgeContext::validation(),
-                        |_, _| {},
-                    );
                     let values = admission::attributes::resource_attribute_admissions(
                         resource,
                         parsed,
                         schema,
-                        &classified,
                         resource.quoted_string_attrs(),
-                        &inputs,
+                        inputs,
+                        admission::attributes::ValidationEvaluation::None,
                         bindings,
                         session,
                         registry,
                         &mut coverage,
-                    );
+                    )
+                    .values;
                     let location = resource.diagnostic_label();
                     for (attribute, path, error) in values.symbolic_errors() {
                         let start = all_errors.0.len();

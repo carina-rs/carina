@@ -24,6 +24,7 @@ pub struct AdmissionCoverage {
     pub expanded: AdmissionPathCoverage,
     pub expanded_declined_fell_back: BTreeMap<ExpandedDeclineReason, u64>,
     pub expanded_declined_skipped_module_resource: BTreeMap<ExpandedDeclineReason, u64>,
+    pub resolved_inputs_fell_back: u64,
 }
 
 pub fn with_admission_coverage<T>(analyze: impl FnOnce() -> T) -> (T, AdmissionCoverage) {
@@ -85,6 +86,10 @@ pub(crate) fn missing_schema(path: Path, provider: &str) {
 
 pub(crate) fn declined(reason: ExpandedDeclineReason) {
     update(|observation| observation.decline = Some(reason));
+}
+
+pub(crate) fn resolved_inputs_fell_back() {
+    update(|observation| observation.coverage.resolved_inputs_fell_back += 1);
 }
 
 pub(crate) fn declined_outcome(fell_back: bool) {

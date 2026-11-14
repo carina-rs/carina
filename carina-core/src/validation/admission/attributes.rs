@@ -5,8 +5,12 @@ use crate::resource::ResourceId;
 use crate::schema::{LeafPathSegment, SchemaKind, SchemaRegistry};
 
 mod inputs;
-use inputs::AttributeInput;
-pub use inputs::ResourceAttributeInputs;
+use inputs::{AttributeInput, with_classified_inputs};
+pub use inputs::{
+    ClassificationDiagnostics, ExpandedEvaluation, RelativeStaticEvaluation,
+    ResourceAdmissionOutcome, ResourceAttributeInputs, ValidationEvaluation,
+    classification_preflight,
+};
 
 /// A catalog descriptor requires a registered schema owner.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -569,6 +573,53 @@ pub fn uses_resource_attribute_admission(kind: crate::parser::AnalysisItemKind) 
 }
 
 /// Admit every analysis item using the same destination-kind policy.
+///
+/// Classifications cannot be supplied independently of the consumed inputs.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{binding_index::BindingIndex, parser::{AnalysisResourceRef, ParsedFile},
+///     resource::{ParserPlaceholder, RelativeBindingName}, resource::knowledge::Classification,
+///     schema::{OwnerBoundResourceSchema, SchemaRegistry}, validation::admission::{WalkCoverage,
+///         attributes::{ResourceAttributeInputs, resource_attribute_admissions}},
+///     validation::deferred_types::ProviderTypeCheckContext};
+/// fn old_call(resource: &AnalysisResourceRef<'_>, parsed: &ParsedFile,
+///     schema: OwnerBoundResourceSchema<'_>, classifications: &indexmap::IndexMap<String,
+///         Classification<'_, ParserPlaceholder, RelativeBindingName>>,
+///     quoted: &std::collections::HashSet<String>, inputs: &ResourceAttributeInputs<RelativeBindingName>,
+///     bindings: &BindingIndex<'_, RelativeBindingName>, session: &dyn ProviderTypeCheckContext,
+///     schemas: &SchemaRegistry, coverage: &mut WalkCoverage) {
+///     resource_attribute_admissions(resource, parsed, schema, classifications,
+///         quoted, inputs, bindings, session, schemas, coverage);
+/// }
+/// ```
+///
+/// A slot's classification and cursor are paired inside admission.
+///
+/// ```
+/// use carina_core::{binding_index::BindingIndex, parser::retained::JudgedSlot,
+///     resource::{ParserPlaceholder, RelativeBindingName}, resource::knowledge::Classification,
+///     validation::{admission::Candidate, deferred_types::ProviderTypeCheckContext}};
+/// fn paired<'a>(slot: &'a JudgedSlot<RelativeBindingName>,
+///     proof: Classification<'a, ParserPlaceholder, RelativeBindingName>,
+///     bindings: Option<&'a BindingIndex<'a, RelativeBindingName>>,
+///     provider: &'a dyn ProviderTypeCheckContext) {
+///     let _: Option<Candidate<ParserPlaceholder, RelativeBindingName>> = None;
+///     let _ = (slot, proof, bindings, provider);
+/// }
+/// ```
+///
+/// ```compile_fail,E0624
+/// use carina_core::{binding_index::BindingIndex, parser::retained::JudgedSlot,
+///     resource::{ParserPlaceholder, RelativeBindingName}, resource::knowledge::Classification,
+///     validation::{admission::Candidate, deferred_types::ProviderTypeCheckContext}};
+/// fn paired<'a>(slot: &'a JudgedSlot<RelativeBindingName>,
+///     proof: Classification<'a, ParserPlaceholder, RelativeBindingName>,
+///     bindings: Option<&'a BindingIndex<'a, RelativeBindingName>>,
+///     provider: &'a dyn ProviderTypeCheckContext) {
+///     let _: Option<Candidate<ParserPlaceholder, RelativeBindingName>> = None;
+///     let _ = Candidate::validation_slot(slot, proof, bindings, provider);
+/// }
+/// ```
 #[allow(clippy::too_many_arguments)]
 pub fn resource_attribute_admissions<
     B: BindingAddress,
@@ -594,34 +645,38 @@ pub fn resource_attribute_admissions<
         B,
     >,
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
-    attributes: &indexmap::IndexMap<
-        String,
-        crate::resource::knowledge::Classification<'_, crate::resource::ParserPlaceholder, B>,
-    >,
     quoted: &std::collections::HashSet<String>,
-    inputs: &ResourceAttributeInputs<B>,
+    inputs: ResourceAttributeInputs<B>,
+    evaluation: ValidationEvaluation<B>,
     bindings: &BindingIndex<'_, B>,
     session: &dyn ProviderTypeCheckContext,
     schemas: &SchemaRegistry,
     coverage: &mut WalkCoverage,
-) -> crate::schema::ResourceValueValidation {
-    if let Err(missing) = inputs.authored_evidence() {
-        coverage.no_authored_evidence(missing);
+) -> ResourceAdmissionOutcome<B> {
+    let (values, classification_diagnostics) =
+        with_classified_inputs(&inputs, evaluation, session, |inputs, attributes| {
+            if let Err(missing) = inputs.authored_evidence() {
+                coverage.no_authored_evidence(missing);
+            }
+            let visits = std::cell::RefCell::new(std::mem::take(coverage));
+            let findings = if uses_resource_attribute_admission(resource.kind()) {
+                typed_resource_attribute_admissions::<kind::ResourceAttribute, _, _, _>(
+                    resource, parsed, schema, attributes, quoted, inputs, bindings, session,
+                    schemas, &visits,
+                )
+            } else {
+                typed_resource_attribute_admissions::<kind::DataSourceAttribute, _, _, _>(
+                    resource, parsed, schema, attributes, quoted, inputs, bindings, session,
+                    schemas, &visits,
+                )
+            };
+            *coverage = visits.into_inner();
+            findings
+        });
+    ResourceAdmissionOutcome {
+        values,
+        classification_diagnostics,
     }
-    let visits = std::cell::RefCell::new(std::mem::take(coverage));
-    let findings = if uses_resource_attribute_admission(resource.kind()) {
-        typed_resource_attribute_admissions::<kind::ResourceAttribute, _, _, _>(
-            resource, parsed, schema, attributes, quoted, inputs, bindings, session, schemas,
-            &visits,
-        )
-    } else {
-        typed_resource_attribute_admissions::<kind::DataSourceAttribute, _, _, _>(
-            resource, parsed, schema, attributes, quoted, inputs, bindings, session, schemas,
-            &visits,
-        )
-    };
-    *coverage = visits.into_inner();
-    findings
 }
 
 /// Retained expressions supply computed-access and arithmetic evidence to admit.
