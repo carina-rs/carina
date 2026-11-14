@@ -61,6 +61,15 @@ impl Fixture {
         }
         schemas.insert(
             "mock",
+            ResourceSchema::new("ec2.Subnet")
+                .attribute(
+                    AttributeSchema::optional("subnet_only", AttributeType::string()).build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        schemas.insert(
+            "mock",
             ResourceSchema::new("compute.Image")
                 .as_data_source()
                 .with_description("Existing image")
@@ -407,14 +416,213 @@ fn walk_back_let_preserves_current_binding() {
     }
 }
 
-#[test]
-fn conditional_binding_is_not_a_resource_binding() {
-    let fixture = Fixture::new(
-        "let x = if true { mock.ec2.Vpc {} } else { mock.ec2.Vpc {} }\n",
-        "exports {}\n",
-    );
+fn assert_sibling_selector(rhs: &str, attribute: Option<&str>) {
+    let source = format!("let x = {rhs}\n");
+    carina_core::parser::parse_syntax_inventory(&source, std::path::Path::new("main.crn"))
+        .unwrap_or_else(|error| panic!("fixture must be grammar-valid: {source}: {error:?}"));
+    assert_sibling_selector_source(&source, attribute);
+}
+
+fn assert_sibling_selector_source(source: &str, attribute: Option<&str>) {
+    let fixture = Fixture::new(source, "exports {}\n");
     let items = fixture.complete("exports.crn", "attributes {\n  value = x.|\n}\n");
-    assert!(!labels(&items).contains(&"x.managed_only"), "{items:?}");
+    let labels = labels(&items);
+    for candidate in ["managed_only", "lookup_only", "subnet_only", "filter", "id"] {
+        assert_eq!(
+            labels.contains(&format!("x.{candidate}").as_str()),
+            attribute == Some(candidate) || attribute == Some("filter") && candidate == "id",
+            "{source}: {labels:?}"
+        );
+    }
+}
+
+#[test]
+fn conditional_binding_same_type_single_line() {
+    assert_sibling_selector(
+        "if c { mock.ec2.Vpc {} } else { mock.ec2.Vpc {} }",
+        Some("managed_only"),
+    );
+}
+
+#[test]
+fn conditional_binding_same_type_multiline() {
+    for rhs in [
+        "if c {\n  mock.ec2.Vpc {}\n} else {\n  mock.ec2.Vpc {}\n}",
+        "\n  if c {\n    mock.ec2.Vpc {}\n  }\n  else {\n    mock.ec2.Vpc {}\n  }",
+        "if c {\r\n  mock.ec2.Vpc {}\r\n} else {\r\n  mock.ec2.Vpc {}\r\n}",
+        "if c {\n  mock.ec2.Vpc\n  {}\n} else {\n  mock.ec2.Vpc\n  {}\n}",
+    ] {
+        assert_sibling_selector(rhs, Some("managed_only"));
+    }
+}
+
+#[test]
+fn conditional_binding_uses_branch_results_not_condition_or_locals() {
+    for rhs in [
+        "if settings.enabled { mock.ec2.Vpc {} } else { mock.ec2.Vpc {} }",
+        "if check('literal { else }') { mock.ec2.Vpc {} } else { mock.ec2.Vpc {} }",
+        "if mock.ec2.Subnet {} { mock.ec2.Vpc {} } else { mock.ec2.Vpc {} }",
+        "if c { let local = mock.ec2.Subnet {} mock.ec2.Vpc {} } else { mock.ec2.Vpc {} }",
+        "if c { let local = mock.ec2.Subnet {} ?? mock.ec2.Vpc {} mock.ec2.Vpc {} } else { mock.ec2.Vpc {} }",
+    ] {
+        assert_sibling_selector(rhs, Some("managed_only"));
+    }
+}
+
+#[test]
+fn conditional_binding_same_read_type() {
+    assert_sibling_selector(
+        "if c { read mock.ec2.Vpc {} } else { read mock.ec2.Vpc {} }",
+        Some("lookup_only"),
+    );
+}
+
+#[test]
+fn conditional_binding_different_types_is_untyped() {
+    assert_sibling_selector("if c { mock.ec2.Vpc {} } else { mock.ec2.Subnet {} }", None);
+}
+
+#[test]
+fn conditional_binding_different_kinds_is_untyped() {
+    for rhs in [
+        "if c { read mock.ec2.Vpc {} } else { mock.ec2.Vpc {} }",
+        "if c { mock.ec2.Vpc {} } else { read mock.ec2.Vpc {} }",
+    ] {
+        assert_sibling_selector(rhs, None);
+    }
+}
+
+#[test]
+fn conditional_binding_non_resource_branch_is_untyped() {
+    for rhs in [
+        "if c { mock.ec2.Vpc {} } else { y }",
+        "if c { y } else { mock.ec2.Vpc {} }",
+        "if c { mock.ec2.Vpc {} } else { 'mock.ec2.Vpc' }",
+        "if c { mock.ec2.Vpc {} } else { mod {} }",
+    ] {
+        assert_sibling_selector(rhs, None);
+    }
+}
+
+#[test]
+fn conditional_binding_missing_branch_is_untyped() {
+    for source in [
+        "let x = if c { mock.ec2.Vpc {} } else {\n",
+        "let x = if c { mock.ec2.Vpc {} } else {}\n",
+        "let x = if c { mock.ec2.Vpc {}\n",
+        "let x = if c { mock.ec2.Vpc {} } else\n",
+    ] {
+        assert_sibling_selector_source(source, None);
+    }
+}
+
+#[test]
+fn conditional_binding_without_else_uses_single_branch() {
+    for rhs in ["if c { mock.ec2.Vpc {} }", "if c {\n  mock.ec2.Vpc {}\n}"] {
+        assert_sibling_selector(rhs, Some("managed_only"));
+    }
+}
+
+#[test]
+fn conditional_binding_nested_else_if() {
+    assert_sibling_selector(
+        "if c { mock.ec2.Vpc {} } else { if d { mock.ec2.Vpc {} } else { mock.ec2.Vpc {} } }",
+        Some("managed_only"),
+    );
+    assert_sibling_selector(
+        "if c { mock.ec2.Vpc {} } else { if d { mock.ec2.Vpc {} } else { mock.ec2.Subnet {} } }",
+        None,
+    );
+    let invalid = "let x = if c { mock.ec2.Vpc {} } else if d { mock.ec2.Vpc {} }";
+    assert!(
+        carina_core::parser::parse_syntax_inventory(invalid, std::path::Path::new("main.crn"))
+            .is_err(),
+        "else if requires a braced else body"
+    );
+    assert_sibling_selector_source(invalid, None);
+}
+
+#[test]
+fn parenthesized_resource_binding() {
+    for rhs in [
+        "(mock.ec2.Vpc {})",
+        "((mock.ec2.Vpc {}))",
+        "(\n  mock.ec2.Vpc {}\n)",
+        "(if c { mock.ec2.Vpc {} } else { mock.ec2.Vpc {} })",
+    ] {
+        assert_sibling_selector(rhs, Some("managed_only"));
+    }
+}
+
+#[test]
+fn parenthesized_read_binding() {
+    for rhs in ["(read mock.ec2.Vpc {})", "(read\n  mock.ec2.Vpc {})"] {
+        assert_sibling_selector(rhs, Some("lookup_only"));
+    }
+}
+
+#[test]
+fn coalesced_resource_binding() {
+    for rhs in [
+        "mock.ec2.Vpc {} ?? mock.ec2.Vpc {}",
+        "(mock.ec2.Vpc {}) ?? (mock.ec2.Vpc {}) ?? mock.ec2.Vpc {}",
+        "(\n  mock.ec2.Vpc {}\n) ?? (\n  mock.ec2.Vpc {}\n)",
+    ] {
+        assert_sibling_selector(rhs, Some("managed_only"));
+    }
+}
+
+#[test]
+fn coalesced_read_binding() {
+    assert_sibling_selector(
+        "read mock.ec2.Vpc {} ?? read mock.ec2.Vpc {}",
+        Some("lookup_only"),
+    );
+}
+
+#[test]
+fn coalesced_non_resource_operand_keeps_resource_selector() {
+    for rhs in [
+        "y ?? mock.ec2.Vpc {}",
+        "mock.ec2.Vpc {} ?? y",
+        "y ?? mock.ec2.Vpc {} ?? z",
+        "'default' ?? (mock.ec2.Vpc {})",
+        "'mock.ec2.Subnet' ?? mock.ec2.Vpc {}",
+        "\"${f('mock.ec2.Subnet')}\" ?? mock.ec2.Vpc {}",
+        "<<EOT\nfallback\nEOT\n?? mock.ec2.Vpc {}",
+        "(if c { y } else { z }) ?? mock.ec2.Vpc {}",
+        "provider mock {} ?? mock.ec2.Vpc {}",
+        "wait y { until = y.a == 'done' } ?? mock.ec2.Vpc {}",
+        "(y ?? mock.ec2.Vpc {})",
+    ] {
+        assert_sibling_selector(rhs, Some("managed_only"));
+    }
+}
+
+#[test]
+fn coalesced_different_resource_operands_are_untyped() {
+    for rhs in [
+        "mock.ec2.Vpc {} ?? mock.ec2.Subnet {}",
+        "y ?? mock.ec2.Vpc {} ?? mock.ec2.Subnet {}",
+        "mock.ec2.Vpc {} ?? read mock.ec2.Vpc {}",
+        "read mock.ec2.Vpc {} ?? mock.ec2.Vpc {}",
+        "(mock.ec2.Vpc {} ?? mock.ec2.Subnet {}) ?? mock.ec2.Vpc {}",
+    ] {
+        assert_sibling_selector(rhs, None);
+    }
+}
+
+#[test]
+fn resource_nested_in_non_resource_value_does_not_type_binding() {
+    for rhs in [
+        "[mock.ec2.Vpc {}]",
+        "{ vpc = mock.ec2.Vpc {} }",
+        "f(mock.ec2.Vpc {})",
+        "mock.ec2.Vpc {}.shared",
+        "for v in ['x'] { mock.ec2.Vpc {} }",
+    ] {
+        assert_sibling_selector(rhs, None);
+    }
 }
 
 #[test]
@@ -702,6 +910,17 @@ fn data_source_type_after_let_is_bare_expression() {
     completed_image_source("let img = mock.|", false, false);
 }
 
+#[test]
+fn data_source_type_completion_applies_inside_existing_let_rhs() {
+    for marked in ["let x = |", "let x = read |", "let x = mock.|"] {
+        let expanded = completed_image_source(marked, false, marked.contains("read"));
+        assert_eq!(
+            expanded, "let x = read mock.compute.Image {\n    filter = 'linux'\n}",
+            "{marked}"
+        );
+    }
+}
+
 fn assert_control_flow_body_completions(marked: &str) {
     let fixture = module_fixture();
     let items = fixture.complete("main.crn", marked);
@@ -712,6 +931,7 @@ fn assert_control_flow_body_completions(marked: &str) {
         [
             "let",
             "local_module",
+            "mock.ec2.Subnet",
             "mock.ec2.Vpc",
             "read",
             "read mock.compute.Image",
