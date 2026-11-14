@@ -5570,36 +5570,24 @@ fn take_unverified_official_load_error<E>(
         .unwrap_or_else(|_| unreachable!("the identity failure was checked as unverified")))
 }
 
-/// Build a router exclusively from factories already retained by `ctx`.
-/// Read/delete configuration cannot select this desired-provider entry.
-///
-/// ```compile_fail,E0308
-/// use carina_cli::wiring::{WiringContext, create_providers_from_configs_with_ctx};
-/// use carina_core::{parser::ReadOnlyProviderConfigs, provider::ProviderPlan};
-/// fn desired(ctx: &WiringContext, config: &ReadOnlyProviderConfigs, plan: &ProviderPlan) {
-///     let _ = create_providers_from_configs_with_ctx(ctx, config, plan);
-/// }
-/// ```
-pub async fn create_providers_from_configs_with_ctx(
+/// Construct saved-plan providers only from verified recorded configuration.
+pub(crate) async fn create_providers_from_configs_with_ctx<S>(
     ctx: &WiringContext,
-    configs: &ResolvedProviderConfigs,
+    inputs: &crate::commands::apply::saved_plan::VerifiedSavedPlanProviderInputs<S>,
     plan: &provider_mod::ProviderPlan,
 ) -> Result<ProviderRouter, AppError> {
-    build_provider_router(ctx, configs, ProgressSink::Human, plan).await
+    build_provider_router(ctx, inputs.configs(), ProgressSink::Human, plan).await
 }
 
-/// Build only the desired-state normalizers needed to reproduce the plan-time
-/// candidate shape. Runtime providers are intentionally not constructed here:
-/// saved-plan secret verification must finish before CRUD-capable objects
-/// become available to the apply path.
-pub(crate) async fn create_normalizers_from_configs_with_ctx(
+/// Reproduce plan-time normalization using verified recorded configuration.
+pub(crate) async fn create_normalizers_from_configs_with_ctx<S>(
     ctx: &WiringContext,
-    configs: &ResolvedProviderConfigs,
+    inputs: &crate::commands::apply::saved_plan::VerifiedSavedPlanProviderInputs<S>,
     plan: &provider_mod::ProviderPlan,
 ) -> Result<NormalizerRouter, AppError> {
     let mut router = NormalizerRouter::new();
 
-    for config in configs.iter() {
+    for config in inputs.configs().iter() {
         if let Some(factory) = provider_mod::find_factory(ctx.factories(), config.name()) {
             let construction = prepare_provider_construction(factory, config, plan)?;
             router.add_initialized_normalizer(

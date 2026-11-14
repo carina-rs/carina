@@ -315,11 +315,6 @@ impl ResolvedProviderConfigs {
     pub fn as_provider_configs(&self) -> &[RuntimeProviderConfig] {
         &self.provider_configs
     }
-
-    /// Move resolved values into the live saved-plan representation.
-    pub fn into_saved(self) -> SavedProviderConfigs<NoPlaceholder> {
-        SavedProviderConfigs(self.provider_configs)
-    }
 }
 
 impl provider_configuration_sealed::Collection for ResolvedProviderConfigs {}

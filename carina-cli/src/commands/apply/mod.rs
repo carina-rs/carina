@@ -92,8 +92,8 @@ use crate::wiring::{ValidatedWiring, WiringContext, read_with_retry};
 use carina_core::hint::ProjectCommand;
 use saved_plan::{
     HistoricalResourceAddresses, InputCheckedExecutablePlanFile, InspectedPlanFile,
-    ProviderBoundPlanFile, ReloadedProviderBoundPlanFile, SavedPlanSecretCandidates,
-    SchemaCheckedPendingPlanFile,
+    ProviderBoundPlanFile, RehydratedProviderInputs, ReloadedProviderBoundPlanFile,
+    SavedPlanSecretCandidates, SchemaCheckedPendingPlanFile, VerifiedSavedPlanProviderInputs,
 };
 
 /// Re-export ExecutionResult as the public API for apply results.
@@ -3397,8 +3397,8 @@ async fn prepare_saved_plan_secret_candidates(
     )
     .await?;
 
-    let verified_inputs = pending_plan.verify_provider_inputs(&provider_inputs, apply_target)?;
-    let remote_bindings = provider_inputs.into_remote_bindings();
+    let (verified_inputs, remote_bindings) =
+        pending_plan.verify_provider_inputs(provider_inputs, apply_target)?;
 
     // Reuse the exact I/O-free prelude the plan path uses. `candidate_state`
     // is the identity-reconciled state view produced above; the current-state
@@ -3492,24 +3492,40 @@ fn rehydrate_desired_plan_file_from_parts(
         .provider_configs()
         .rehydrate_secrets(&fresh)
         .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
+    let provider_inputs = VerifiedSavedPlanProviderInputs::for_test(
+        ResolvedProviderConfigs::try_from(provider_configs).map_err(|error| {
+            AppError::SavedProviderConfig {
+                error,
+                replan_command: apply_target.replan_command().to_string(),
+            }
+        })?,
+    );
     rehydrate_desired_plan_file_with_verified_configs(
         plan_file,
         parsed,
-        provider_configs,
+        provider_inputs,
         source,
         apply_target,
         provider_context,
     )
+    .map(|(plan_file, _provider_inputs)| plan_file)
 }
 
 fn rehydrate_desired_plan_file_with_verified_configs(
     plan_file: ReloadedPlanFile<SnapshotLeaf>,
     parsed: &carina_core::parser::ExpandedInferredFile,
-    provider_configs: carina_core::parser::SavedProviderConfigs<NoPlaceholder>,
+    provider_inputs: VerifiedSavedPlanProviderInputs,
     source: &ResolvedPath,
     apply_target: ApplyTarget<'_>,
     provider_context: &carina_core::parser::LoadedProviderContext,
-) -> Result<ReloadedPlanFile, AppError> {
+) -> Result<
+    (
+        ReloadedPlanFile,
+        VerifiedSavedPlanProviderInputs<RehydratedProviderInputs>,
+    ),
+    AppError,
+> {
+    let (provider_configs, provider_inputs) = provider_inputs.into_rehydrated();
     crate::wiring::settle_type_checks(
         carina_core::validation::deferred_types::TypeCheckSession::run(
             provider_context,
@@ -3625,7 +3641,7 @@ fn rehydrate_desired_plan_file_with_verified_configs(
             },
         ),
         AppError::Validation,
-    )
+    ).map(|plan_file| (plan_file, provider_inputs))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4132,9 +4148,15 @@ async fn run_apply_from_plan_locked_owned(
             // both that exact load and its retained current-config pair, so
             // validation is not repeated under the lock and execution cannot
             // substitute either half.
-            let (validated_plan, initialized_provider) = match inspected_plan {
+            let (validated_plan, provider, verified_provider_inputs) = match inspected_plan {
                 ReloadedProviderBoundPlanFile::Verified { plan, providers } => {
-                    (plan.verify_provider_load(providers, apply_target)?, None)
+                    let validated_plan = plan.verify_provider_load(providers, apply_target)?;
+                    let provider_inputs = validated_plan.provider_inputs(apply_target)?;
+                    let provider = provider_inputs
+                        .create_providers(validated_plan.context(), &validated_plan.provider_plan())
+                        .await?;
+                    let (_saved, provider_inputs) = provider_inputs.into_rehydrated();
+                    (validated_plan, provider, provider_inputs)
                 }
                 ReloadedProviderBoundPlanFile::NeedsSecretVerification { plan, providers } => {
                     let (pending, validated_config) =
@@ -4153,28 +4175,14 @@ async fn run_apply_from_plan_locked_owned(
                         candidates,
                         provider,
                     } = prepared;
-                    (
-                        pending.verify_desired(candidates, apply_target)?,
-                        Some(provider),
-                    )
+                    let (validated_plan, provider_inputs) =
+                        pending.verify_desired(candidates, apply_target)?;
+                    (validated_plan, provider, provider_inputs)
                 }
             };
-            let wiring = validated_plan.context();
-
-            let verified_provider_inputs = validated_plan.provider_inputs(apply_target)?;
             let resolved_provider_configs = verified_provider_inputs.configs();
             let raw_provider_configs = resolved_provider_configs.as_provider_configs();
 
-            // Secret-bearing plans initialize once while reproducing the
-            // provider-aware expansion used to verify desired values. Plans
-            // without desired placeholders initialize here. Either way, the
-            // same initialized instances continue through drift and execution.
-            let provider = match initialized_provider {
-                Some(provider) => provider,
-                None => verified_provider_inputs
-                    .create_providers(wiring, &validated_plan.provider_plan())
-                    .await?,
-            };
             let validated_plan = validated_plan.verify_provider_scopes(provider, apply_target)?;
             let wiring = validated_plan.context();
 

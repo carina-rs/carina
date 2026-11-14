@@ -6664,8 +6664,8 @@ impl<C> ResolvedProviderInputs<C> {
         &self.remote_bindings
     }
 
-    pub(crate) fn into_remote_bindings(self) -> AdmittedRemoteBindings {
-        self.remote_bindings
+    pub(crate) fn into_parts(self) -> (C, AdmittedRemoteBindings) {
+        (self.configs, self.remote_bindings)
     }
 }
 

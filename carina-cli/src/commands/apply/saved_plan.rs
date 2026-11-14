@@ -544,25 +544,56 @@ pub(super) struct SavedPlanSecretCandidates {
 /// Only recorded values whose secret hashes have been verified can initialize
 /// saved-plan providers or normalizers. Construction takes this owner rather
 /// than the current source inputs.
-pub(super) struct VerifiedSavedPlanProviderInputs {
+pub(crate) struct VerifiedSavedPlanProviderInputs<S = SavedProviderConfigs<NoPlaceholder>> {
     configs: ResolvedProviderConfigs,
+    saved: S,
 }
+
+/// The recorded values have moved into the live plan; construction retains
+/// the same verified configuration projection.
+pub(super) struct RehydratedProviderInputs;
 
 impl VerifiedSavedPlanProviderInputs {
     fn from_recorded(
         saved: SavedProviderConfigs<NoPlaceholder>,
         apply_target: ApplyTarget<'_>,
     ) -> Result<Self, AppError> {
-        let configs = ResolvedProviderConfigs::try_from(saved).map_err(|error| {
+        let configs = ResolvedProviderConfigs::try_from(saved.clone()).map_err(|error| {
             AppError::SavedProviderConfig {
                 error,
                 replan_command: apply_target.replan_command().to_string(),
             }
         })?;
-        Ok(Self { configs })
+        Ok(Self { configs, saved })
     }
 
-    pub(super) fn configs(&self) -> &ResolvedProviderConfigs {
+    pub(super) fn into_rehydrated(
+        self,
+    ) -> (
+        SavedProviderConfigs<NoPlaceholder>,
+        VerifiedSavedPlanProviderInputs<RehydratedProviderInputs>,
+    ) {
+        (
+            self.saved,
+            VerifiedSavedPlanProviderInputs {
+                configs: self.configs,
+                saved: RehydratedProviderInputs,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(configs: ResolvedProviderConfigs) -> Self {
+        let snapshot = SavedProviderConfigs::from(&configs);
+        let saved = snapshot
+            .rehydrate_secrets(&snapshot)
+            .expect("resolved fixture configurations contain no unavailable secrets");
+        Self { configs, saved }
+    }
+}
+
+impl<S> VerifiedSavedPlanProviderInputs<S> {
+    pub(crate) fn configs(&self) -> &ResolvedProviderConfigs {
         &self.configs
     }
 
@@ -571,7 +602,7 @@ impl VerifiedSavedPlanProviderInputs {
         context: &WiringContext,
         plan: &carina_core::provider::ProviderPlan,
     ) -> Result<ProviderRouter, AppError> {
-        crate::wiring::create_providers_from_configs_with_ctx(context, &self.configs, plan).await
+        crate::wiring::create_providers_from_configs_with_ctx(context, self, plan).await
     }
 
     pub(super) async fn create_normalizers(
@@ -579,7 +610,7 @@ impl VerifiedSavedPlanProviderInputs {
         context: &WiringContext,
         plan: &carina_core::provider::ProviderPlan,
     ) -> Result<carina_core::provider::NormalizerRouter, AppError> {
-        crate::wiring::create_normalizers_from_configs_with_ctx(context, &self.configs, plan).await
+        crate::wiring::create_normalizers_from_configs_with_ctx(context, self, plan).await
     }
 }
 
@@ -636,16 +667,26 @@ pub(crate) struct SchemaCheckedPendingPlanFile {
 impl SchemaCheckedPendingPlanFile {
     pub(super) fn verify_provider_inputs(
         &self,
-        inputs: &ResolvedProviderInputs,
+        inputs: ResolvedProviderInputs,
         apply_target: ApplyTarget<'_>,
-    ) -> Result<VerifiedSavedPlanProviderInputs, AppError> {
-        let fresh = SavedProviderConfigs::from(inputs.configs());
+    ) -> Result<
+        (
+            VerifiedSavedPlanProviderInputs,
+            carina_core::upstream_exports::AdmittedRemoteBindings,
+        ),
+        AppError,
+    > {
+        let (configs, remote_bindings) = inputs.into_parts();
+        let fresh = SavedProviderConfigs::from(&configs);
         let saved = self
             .plan_file
             .provider_configs()
             .rehydrate_secrets(&fresh)
             .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
-        VerifiedSavedPlanProviderInputs::from_recorded(saved, apply_target)
+        Ok((
+            VerifiedSavedPlanProviderInputs::from_recorded(saved, apply_target)?,
+            remote_bindings,
+        ))
     }
 
     pub(super) fn verify_provider_scopes(
@@ -743,27 +784,37 @@ impl SchemaCheckedPendingPlanFile {
         self,
         candidates: SavedPlanSecretCandidates,
         apply_target: ApplyTarget<'_>,
-    ) -> Result<ValidatedDesiredPlan, AppError> {
+    ) -> Result<
+        (
+            ValidatedDesiredPlan,
+            VerifiedSavedPlanProviderInputs<RehydratedProviderInputs>,
+        ),
+        AppError,
+    > {
         let planned_secret_hashes = planned_secret_hashes(self.plan_file.sorted_resources());
         let SavedPlanSecretCandidates {
             source,
             validated,
             provider_inputs,
         } = candidates;
-        let plan_file = super::rehydrate_desired_plan_file_with_verified_configs(
-            self.plan_file,
-            validated.resources().parsed(),
-            provider_inputs.configs.into_saved(),
-            &source,
-            apply_target,
-            validated.context().provider_context(),
-        )?;
-        Ok(ValidatedDesiredPlan::with_current_config(
-            DesiredPlanFile::NeedsHistoricalVerification(DesiredVerifiedPlanFile {
-                plan_file,
-                planned_secret_hashes,
-            }),
-            validated,
+        let (plan_file, provider_inputs) =
+            super::rehydrate_desired_plan_file_with_verified_configs(
+                self.plan_file,
+                validated.resources().parsed(),
+                provider_inputs,
+                &source,
+                apply_target,
+                validated.context().provider_context(),
+            )?;
+        Ok((
+            ValidatedDesiredPlan::with_current_config(
+                DesiredPlanFile::NeedsHistoricalVerification(DesiredVerifiedPlanFile {
+                    plan_file,
+                    planned_secret_hashes,
+                }),
+                validated,
+            ),
+            provider_inputs,
         ))
     }
 }
@@ -2397,8 +2448,8 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                let verified = pending
-                    .verify_provider_inputs(&inputs, apply_target())
+                let (verified, _remote_bindings) = pending
+                    .verify_provider_inputs(inputs, apply_target())
                     .unwrap();
                 assert!(
                     received.lock().unwrap().is_empty(),
