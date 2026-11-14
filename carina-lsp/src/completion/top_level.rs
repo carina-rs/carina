@@ -59,8 +59,8 @@ impl CompletionProvider {
         });
         let read_start = expression_prefix.and_then(|prefix| prefix.read_start);
         let after_read = read_start.is_some();
-        let expression_position =
-            after_let_binding || crate::enclosing_block::in_control_flow_body(&lexed, position);
+        let in_control_flow_body = crate::enclosing_block::in_control_flow_body(&lexed, position);
+        let expression_position = after_let_binding || in_control_flow_body;
         let first_tab_stop = if expression_position { 1 } else { 2 };
         let read_snippet = wrap_read_snippet(
             &format!(
@@ -210,6 +210,11 @@ impl CompletionProvider {
             },
         ];
 
+        // Both body grammars allow local bindings before the resource/module expression.
+        if in_control_flow_body {
+            completions.retain(|item| matches!(item.label.as_str(), "let" | "read"));
+        }
+
         // Generate module binding completions from `use` statements
         // e.g., "let github = use { source = '...' }" → suggest "github" with call scaffold.
         // Resolve `DslSource` once so the directory's sibling `.crn`
@@ -284,16 +289,24 @@ impl CompletionProvider {
             }
 
             // Keep filtering scoped to the path the client is matching. A
-            // top-level wrapper replaces the earlier `read` in a separate edit.
-            let additional_text_edits = read_start.filter(|_| !expression_position).map(|start| {
-                vec![TextEdit {
-                    range: Range {
-                        start,
-                        end: replacement_range.start,
-                    },
-                    new_text: String::new(),
-                }]
-            });
+            // top-level wrapper replaces the earlier `read` in a separate edit,
+            // provided only whitespace lies between it and the path.
+            let additional_text_edits = read_start
+                .filter(|start| {
+                    let start = crate::position::position_to_byte_offset(text, *start) + 4;
+                    let end =
+                        crate::position::position_to_byte_offset(text, replacement_range.start);
+                    !expression_position && text[start..end].trim().is_empty()
+                })
+                .map(|start| {
+                    vec![TextEdit {
+                        range: Range {
+                            start,
+                            end: replacement_range.start,
+                        },
+                        new_text: String::new(),
+                    }]
+                });
 
             completions.push(CompletionItem {
                 label: key.clone(),

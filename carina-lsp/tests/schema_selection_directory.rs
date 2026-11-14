@@ -349,19 +349,32 @@ fn read_kind_in_ignore_changes_completion() {
 #[test]
 fn walk_back_annotation_is_not_resource_header() {
     let fixture = Fixture::new("", "exports {}\n");
-    let source = "arguments {\n  sg:\n    mock.ec2.Vpc {\n      sha|red\n    }\n}\n";
-    assert!(fixture.hover("main.crn", source, true).is_none());
-    let items = fixture.complete("main.crn", source);
+    let source = "arguments {\n  sg:\n    mock.ec2.Vpc {\n      shared\n    }\n}\nlet v = mock.ec2.Vpc {\n  shared = 'x'\n}\n";
+    let marked = source.replacen("shared", "sha|red", 1);
+    assert!(fixture.hover("main.crn", &marked, true).is_none());
+    let items = fixture.complete("main.crn", &marked);
     assert!(!labels(&items).contains(&"managed_only"), "{items:?}");
+    let marked = source.replace("shared = 'x'", "sha|red = 'x'");
+    let hover = fixture.hover("main.crn", &marked, true).unwrap();
+    assert!(hover.contains("Managed VPC"), "{hover}");
+    let items = fixture.complete("main.crn", &marked);
+    assert!(labels(&items).contains(&"managed_only"), "{items:?}");
 }
 
 #[test]
 fn walk_back_assignment_is_not_resource_header() {
     let fixture = Fixture::new("", "exports {}\n");
-    let source = "attr =\n  mock.ec2.Vpc {\n    sha|red\n  }\n";
-    assert!(fixture.hover("main.crn", source, true).is_none());
-    let items = fixture.complete("main.crn", source);
+    let source =
+        "attr =\n  mock.ec2.Vpc {\n    shared\n  }\nlet v = mock.ec2.Vpc {\n  shared = 'x'\n}\n";
+    let marked = source.replacen("shared", "sha|red", 1);
+    assert!(fixture.hover("main.crn", &marked, true).is_none());
+    let items = fixture.complete("main.crn", &marked);
     assert!(!labels(&items).contains(&"managed_only"), "{items:?}");
+    let marked = source.replace("shared = 'x'", "sha|red = 'x'");
+    let hover = fixture.hover("main.crn", &marked, true).unwrap();
+    assert!(hover.contains("Managed VPC"), "{hover}");
+    let items = fixture.complete("main.crn", &marked);
+    assert!(labels(&items).contains(&"managed_only"), "{items:?}");
 }
 
 #[test]
@@ -601,12 +614,15 @@ fn binding_scan_walk_back_stops_at_file_boundary() {
     let fixture = Fixture::new("", "exports {}\n");
     fixture.write("a.crn", "let s =\n");
     fixture.write("b.crn", "mock.ec2.Vpc {}\n");
+    fixture.write("c.crn", "let v = mock.ec2.Vpc {}\n");
     let items = fixture.complete("main.crn", "attributes {\n  value = s.|\n}\n");
     assert!(
         !labels(&items).contains(&"s.managed_only"),
         "{:?}",
         labels(&items)
     );
+    let items = fixture.complete("main.crn", "attributes {\n  value = v.|\n}\n");
+    assert!(labels(&items).contains(&"v.managed_only"), "{items:?}");
 }
 
 fn completed_image_source(marked: &str, wrapped: bool, after_read: bool) -> String {
@@ -664,13 +680,48 @@ fn data_source_type_after_let_is_bare_expression() {
     completed_image_source("let img = mock.|", false, false);
 }
 
+fn assert_control_flow_body_completions(marked: &str) {
+    let fixture = module_fixture();
+    let items = fixture.complete("main.crn", marked);
+    let mut actual = labels(&items);
+    actual.sort_unstable();
+    assert_eq!(
+        actual,
+        [
+            "let",
+            "local_module",
+            "mock.ec2.Vpc",
+            "read",
+            "read mock.compute.Image",
+            "read mock.ec2.Vpc",
+        ]
+    );
+    for (label, snippet) in [
+        ("mock.ec2.Vpc", "mock.ec2.Vpc {\n}"),
+        ("read mock.ec2.Vpc", "read mock.ec2.Vpc {\n}"),
+        (
+            "read mock.compute.Image",
+            "read mock.compute.Image {\n    filter = ${1}\n}",
+        ),
+    ] {
+        let item = items.iter().find(|item| item.label == label).unwrap();
+        let Some(CompletionTextEdit::Edit(edit)) = &item.text_edit else {
+            panic!("expected snippet edit: {item:?}")
+        };
+        assert_eq!(edit.new_text, snippet);
+    }
+    completed_image_source(marked, false, false);
+}
+
 #[test]
 fn data_source_type_in_for_body_is_bare_expression() {
+    assert_control_flow_body_completions("let imgs = for x in ['linux'] {\n  |\n}");
     completed_image_source("let imgs = for x in ['linux'] {\n  mock.|\n}", false, false);
 }
 
 #[test]
 fn data_source_type_in_if_body_is_bare_expression() {
+    assert_control_flow_body_completions("let img = if true {\n  |\n}");
     completed_image_source("let img = if true {\n  mock.|\n}", false, false);
 }
 
@@ -682,9 +733,19 @@ fn data_source_type_after_top_level_read_wraps_binding() {
 #[test]
 fn typed_read_keeps_path_filter_range() {
     let fixture = Fixture::new("", "exports {}\n");
-    for (marked, start) in [
-        ("read mock.|", Position::new(0, 5)),
-        ("read // lookup\n  mock.|", Position::new(1, 2)),
+    for (marked, start, comment) in [
+        ("read mock.|", Position::new(0, 5), None),
+        ("read\n  mock.|", Position::new(1, 2), None),
+        (
+            "read // lookup\n  mock.|",
+            Position::new(1, 2),
+            Some("// lookup"),
+        ),
+        (
+            "read /* lookup */ mock.|",
+            Position::new(0, 18),
+            Some("/* lookup */"),
+        ),
     ] {
         let items = fixture.complete("main.crn", marked);
         let item = items
@@ -696,7 +757,16 @@ fn typed_read_keeps_path_filter_range() {
         };
         assert_eq!(edit.range.start, start);
         assert_eq!(item.filter_text.as_deref(), Some("mock.compute.Image"));
-        completed_image_source(marked, true, true);
+        if let Some(comment) = comment {
+            assert!(item.additional_text_edits.is_none(), "{item:?}");
+            let mut expanded = marked.replacen('|', "", 1);
+            let start = carina_lsp::position::position_to_byte_offset(&expanded, edit.range.start);
+            let end = carina_lsp::position::position_to_byte_offset(&expanded, edit.range.end);
+            expanded.replace_range(start..end, &edit.new_text);
+            assert!(expanded.contains(comment), "{expanded}");
+        } else {
+            completed_image_source(marked, true, true);
+        }
     }
 }
 
