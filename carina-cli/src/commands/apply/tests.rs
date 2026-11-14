@@ -3031,6 +3031,41 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
 }
 
 #[test]
+fn bootstrap_reload_rejects_unknown_directive_keys() {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let fixture = tempfile::tempdir().unwrap();
+    let path = carina_core::paths::ResolvedPath::new(fixture.path()).unwrap();
+    let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    std::fs::write(fixture.path().join("main.crn"), "provider mock {}\n").unwrap();
+    let loaded = load_configuration_with_config(&path, &config, &SchemaRegistry::new()).unwrap();
+    let providers = ProviderLoad::load(
+        &runtime,
+        &loaded.parsed.providers,
+        &path,
+        &mut crate::commands::human_provider_notices(runtime.color_mode()),
+    )
+    .unwrap();
+    let wiring = ValidatedWiring::from_load_for_test(providers);
+    let validated = validated_reload_owner_for_test(&wiring);
+    std::fs::write(
+        fixture.path().join("resources.crn"),
+        "mock.test.resource {\n  name = 'example'\n  directives {\n    prevent_destory = true\n  }\n}\n",
+    )
+    .unwrap();
+    let error = reload_apply_configuration_after_bootstrap(
+        &path,
+        &path,
+        &config,
+        validated,
+        loaded.unresolved_parsed,
+    )
+    .expect_err("post-bootstrap reload must reject invalid directives even with skip=true");
+    let message = crate::error::format_error_with_source_chain(&error);
+    assert!(message.contains("resources.crn:4:5: Unknown directive 'prevent_destory', did you mean 'prevent_destroy'?"), "{message}");
+    assert_eq!(message.matches("Unknown directive").count(), 1, "{message}");
+}
+
+#[test]
 fn bootstrap_reload_rejects_nested_forwarding_mismatch() {
     let user_dirs = crate::test_support::TestCommandRuntime::new();
     let fixture = tempfile::tempdir().expect("tempdir");

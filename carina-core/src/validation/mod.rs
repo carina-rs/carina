@@ -8,6 +8,8 @@ pub mod admission;
 pub mod deferred_populate;
 pub mod deferred_types;
 pub mod depends_on;
+mod directive_keys;
+pub use directive_keys::{ResourceDirectiveFinding, resource_directive_findings};
 mod parameter_findings;
 pub(crate) mod presentation;
 pub use presentation::{
@@ -888,6 +890,8 @@ pub enum ResolveFileError {
     Unjudged(#[from] crate::parser::retained::UnjudgedConfiguration),
     #[error(transparent)]
     Expression(Box<crate::parser::Located<inference::InferenceError>>),
+    #[error(transparent)]
+    ResourceDirective(Box<crate::parser::Located<ResourceDirectiveFinding>>),
     #[error(transparent)]
     BindingUse(#[from] BindingUseReport),
     #[error(transparent)]
@@ -2410,6 +2414,11 @@ fn finish_binding_resolution<E: crate::parser::IntoExpandedExportParam<AbsoluteB
     schemas: &SchemaRegistry,
     provider_context: &ProviderContext,
 ) -> Result<ResolvedFile<E::Expanded>, ResolveFileError> {
+    if let Some(finding) = resource_directive_findings(&file.parser_binding_metadata).first() {
+        return Err(ResolveFileError::ResourceDirective(Box::new(
+            finding.clone(),
+        )));
+    }
     if let Some(finding) = file.expression_report().findings().first() {
         return Err(ResolveFileError::Expression(Box::new(finding.clone())));
     }

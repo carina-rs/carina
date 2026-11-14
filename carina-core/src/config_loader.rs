@@ -856,11 +856,20 @@ impl DirectoryBufferSnapshot {
             .collect::<Vec<_>>();
         if inventories.iter().all(Option::is_some) {
             CompleteDirectoryInventories {
-                inventories: inventories.iter().filter_map(Option::as_ref).collect(),
+                inventories: inventories
+                    .iter()
+                    .filter_map(Option::as_ref)
+                    .map(|metadata| metadata.syntax())
+                    .collect(),
             }
             .require_scope()
         } else {
-            require_scope_from_inventories(inventories.iter().filter_map(Option::as_ref))
+            require_scope_from_inventories(
+                inventories
+                    .iter()
+                    .filter_map(Option::as_ref)
+                    .map(|metadata| metadata.syntax()),
+            )
         }
     }
 }
@@ -1132,7 +1141,7 @@ pub fn find_duplicate_declarations_in_source(
         return Vec::new();
     };
     let mut occurrences = BTreeMap::new();
-    collect_inventory_declarations(path, &inventory, &mut occurrences);
+    collect_inventory_declarations(path, inventory.syntax(), &mut occurrences);
     duplicate_groups(occurrences)
 }
 

@@ -847,6 +847,27 @@ impl DiagnosticRun<'_> {
         let provider_validation_deduplicator = ProviderValidationDeduplicator::default();
         let text = doc.text();
         let buffer_parsed = doc.parsed();
+        // Duplicate declarations can prevent runtime parsing while leaving a
+        // complete syntax inventory. Keep directive diagnostics in that case.
+        let recovered_metadata = buffer_parsed
+            .is_none()
+            .then(|| carina_core::parser::parse_syntax_inventory(&text, doc.source_file()).ok())
+            .flatten();
+        let buffer_metadata = buffer_parsed
+            .map(|parsed| &parsed.parser_binding_metadata)
+            .or(recovered_metadata.as_ref());
+        if let Some(metadata) = buffer_metadata {
+            for finding in carina_core::validation::resource_directive_findings(metadata) {
+                if let Some(diagnostic) = render_merged(
+                    doc,
+                    finding,
+                    DiagnosticSeverity::ERROR,
+                    finding.detail().to_string(),
+                ) {
+                    diagnostics.push(diagnostic);
+                }
+            }
+        }
         let buffer_analysis =
             buffer_parsed.and_then(|parsed| analysis_tree(doc, parsed, &mut diagnostics));
         let pinned_base = current_file_path
